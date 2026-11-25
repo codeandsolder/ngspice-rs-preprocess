@@ -364,13 +364,8 @@ pub(super) fn dependency_order(graph: &Graph) -> Result<Vec<Vec<String>>> {
             "recursive original X circuit at {scope:?}"
         );
         active.push(scope.to_vec());
-        let owner = graph.scopes.get(scope).context("missing lexical X scope")?;
-        for item in &owner.items {
-            if let Item::Statement(statement) = item
-                && let Some(call) = graph.call(statement, scope)?
-            {
-                visit(graph, &call.target, active, visited, ordered)?;
-            }
+        for call in graph.occurrences(scope)?.calls() {
+            visit(graph, &call.target, active, visited, ordered)?;
         }
         active.pop();
         if visited.insert(scope.to_vec()) {
@@ -405,7 +400,7 @@ pub(super) fn witnessed_analog_contacts(
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     super::global_nodes::project_physical_contacts(graph, &mut contacts)?;
-    let callers = index_call_sites(graph)?;
+    let callers = index_call_sites(graph);
     for scope in scopes {
         let Some(calls) = callers.get(scope) else {
             continue;
@@ -419,7 +414,9 @@ pub(super) fn witnessed_analog_contacts(
             .filter_map(|(index, formal)| witnessed.contains(formal).then_some(index))
             .collect::<Vec<_>>();
         for (parent, call) in calls {
-            let actual = contacts.get_mut(parent).context("missing witness caller")?;
+            let actual = contacts
+                .get_mut(*parent)
+                .context("missing witness caller")?;
             actual.extend(indices.iter().map(|index| call.actual[*index].clone()));
         }
     }
@@ -440,14 +437,8 @@ fn physical_analog_contacts(
         let mut occurrences =
             BTreeMap::<(Vec<String>, String), Vec<(Vec<String>, String, bool)>>::new();
         let mut parent_contacts = BTreeSet::new();
-        for (path, scope) in &graph.scopes {
-            for item in &scope.items {
-                let Item::Statement(statement) = item else {
-                    continue;
-                };
-                let Some(call) = graph.call(statement, path)? else {
-                    continue;
-                };
+        for (path, index) in &graph.occurrences {
+            for call in index.calls() {
                 let child = graph
                     .scopes
                     .get(&call.target)
@@ -568,23 +559,19 @@ fn boundaries_for_analog_node(
     Ok(discovered)
 }
 
-type Callers = BTreeMap<Vec<String>, Vec<(Vec<String>, super::Call)>>;
+type Callers<'a> = BTreeMap<Vec<String>, Vec<(&'a [String], &'a super::Call)>>;
 
-fn index_call_sites(graph: &Graph) -> Result<Callers> {
+fn index_call_sites(graph: &Graph) -> Callers<'_> {
     let mut callers = Callers::new();
-    for (path, owner) in &graph.scopes {
-        for item in &owner.items {
-            if let Item::Statement(statement) = item
-                && let Some(call) = graph.call(statement, path)?
-            {
-                callers
-                    .entry(call.target.clone())
-                    .or_default()
-                    .push((path.clone(), call));
-            }
+    for (path, index) in &graph.occurrences {
+        for call in index.calls() {
+            callers
+                .entry(call.target.clone())
+                .or_default()
+                .push((path, call));
         }
     }
-    Ok(callers)
+    callers
 }
 
 fn lift_adc_to_call(
@@ -688,7 +675,7 @@ fn consolidate_adc_boundaries(
     scopes: &[Vec<String>],
     mut found: Vec<DiscoveredAlbBoundary>,
 ) -> Result<Vec<DiscoveredAlbBoundary>> {
-    let callers = index_call_sites(graph)?;
+    let callers = index_call_sites(graph);
     for scope in scopes {
         let Some(calls) = callers.get(scope) else {
             continue;
@@ -760,12 +747,7 @@ pub fn discover_original_alb_boundaries_with_opaque_x_interfaces(
     let definitions = opaque_x_interfaces(external)?;
     let items = parse_items(source)?;
     let models = compile_explicit_alb_source_models(source)?;
-    let mut graph = Graph {
-        scopes: BTreeMap::new(),
-        models,
-        globals: BTreeSet::new(),
-    };
-    graph.collect(&items, &[], None)?;
+    let mut graph = Graph::new(&items, Some(models))?;
     let scopes = dependency_order(&graph)?;
     super::global_nodes::prepare(&mut graph, &scopes)?;
     let mut found = Vec::new();

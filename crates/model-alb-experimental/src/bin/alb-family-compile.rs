@@ -1,8 +1,9 @@
 //! Compile original ALB source, specializing occurrences before logical
 //! cuts and physical pin triples are assigned.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use model_alb_experimental::{
-    expand_logical_alb_source_with_opaque_x_interfaces, specialize_family_occurrences,
+    annotations::compiled_include_name, expand_logical_alb_source_with_opaque_x_interfaces,
+    specialize_family_occurrences,
 };
 use std::{env, fs, path::Path};
 
@@ -22,14 +23,7 @@ fn run() -> Result<()> {
     config.verify(source_path, &source)?;
     let output = Path::new(output);
     let compiled = Path::new(compiled);
-    ensure!(
-        output != compiled && output.parent() == compiled.parent(),
-        "compiled ALB include and final source must be distinct files in the same directory"
-    );
-    let include_name = compiled
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("compiled ALB file name is not UTF-8")?;
+    let include_name = compiled_include_name(output, compiled)?;
     let plan = specialize_family_occurrences(&source, &config.occurrences, &config.definitions)?;
     // Resolve contracts in the directory from which the final deck is run,
     // before creating its generated include. The specialized original deck

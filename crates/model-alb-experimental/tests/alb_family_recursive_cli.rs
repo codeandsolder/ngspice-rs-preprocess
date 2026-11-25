@@ -3,23 +3,18 @@
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::{Command, Output},
-};
+use std::{fs, path::Path, process::Output};
 
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/xspice/fixtures/family")
-}
-fn compile(src: &Path, cfg: &Path, dir: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_alb-family-compile"))
-        .arg(src)
-        .arg(cfg)
-        .arg(fixtures().join("auto-models.json"))
-        .arg(dir.join("final.cir"))
-        .arg(dir.join("generated.inc"))
-        .output()?)
+#[path = "support/family.rs"]
+mod harness;
+use harness::fixtures;
+fn compile(source: &Path, config: &Path, dir: &Path) -> Result<Output> {
+    harness::run(
+        env!("CARGO_BIN_EXE_alb-family-compile"),
+        &[source, config, &fixtures().join("auto-models.json")],
+        dir,
+        &["final.cir", "generated.inc"],
+    )
 }
 
 #[test]
