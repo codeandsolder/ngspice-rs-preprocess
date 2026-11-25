@@ -15,7 +15,8 @@ use std::{
 
 const USAGE: &str = "\
 Usage: ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
-Formats: native-deck, native-library, simplis-deck, simetrix-deck,
+Formats: native-deck, native-library, hspice-deck, hspice-library,
+         simplis-deck, simetrix-deck,
          expanded-deck, expanded-library, simplis-library, simetrix-library
 Options:
   --device-config PATH        Request-local SIMetrix device configuration
@@ -170,7 +171,7 @@ struct ManifestArtifact<'a> {
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 7,
+        version: 8,
         input_format: bundle.format,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,

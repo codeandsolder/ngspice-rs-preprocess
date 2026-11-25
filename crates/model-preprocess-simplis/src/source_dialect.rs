@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Default bound for the standalone source projection.
 pub const DEFAULT_PROJECTION_BYTES: usize = 128 * 1024 * 1024;
+mod hspice;
 mod identity;
 pub mod model_mapping;
 mod power;
@@ -51,6 +52,15 @@ pub enum SourceKind {
 }
 
 impl DialectContext {
+    /// Standalone HSPICE source language, with no device separator.
+    #[must_use]
+    pub const fn hspice() -> Self {
+        Self {
+            language: SourceLanguage::Hspice,
+            separator: None,
+        }
+    }
+
     /// Resolve the legal header declaration; declarations later in the
     /// resource are comments and cannot change the active language.
     #[must_use = "the resolved context must be applied to this resource"]
@@ -349,13 +359,68 @@ fn split_arguments(input: &str) -> Result<Vec<&str>> {
     Ok(args)
 }
 
+#[derive(Clone, Copy)]
+struct ExpressionProfile {
+    language: SourceLanguage,
+    standalone_hspice: Option<HspiceExpressionKind>,
+}
+
+impl ExpressionProfile {
+    const fn compatibility(language: SourceLanguage) -> Self {
+        Self {
+            language,
+            standalone_hspice: None,
+        }
+    }
+}
+
+/// The native arithmetic evaluator differs between static parameter
+/// expressions and behavioral devices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HspiceExpressionKind {
+    Static,
+    Behavioral,
+}
+
+/// Convert an expression in the standalone HSPICE language, not the
+/// SIMetrix compatibility interpretation of HSPICE source.
+///
+/// # Errors
+/// Invalid numeric literals, expression delimiters, function arity or
+/// exceeded expression expansion budget.
+pub fn lower_hspice_expression(
+    input: &str,
+    kind: HspiceExpressionKind,
+    limit: usize,
+) -> Result<String> {
+    rewrite_expression(
+        input,
+        ExpressionProfile {
+            language: SourceLanguage::Hspice,
+            standalone_hspice: Some(kind),
+        },
+        0,
+        false,
+        limit,
+    )
+}
+
 fn lower_call(
     name: &str,
     body: &str,
-    language: SourceLanguage,
+    profile: ExpressionProfile,
     depth: usize,
     limit: usize,
 ) -> Result<String> {
+    if let Some(kind) = profile.standalone_hspice {
+        let args = split_arguments(body)?;
+        let args = args
+            .iter()
+            .map(|arg| rewrite_expression(arg, profile, depth + 1, true, limit))
+            .collect::<Result<Vec<_>>>()?;
+        return hspice::lower_call(name, &args, kind, limit);
+    }
+    let language = profile.language;
     if name.eq_ignore_ascii_case("LOG") {
         let args = split_arguments(body)?;
         ensure!(
@@ -369,7 +434,7 @@ fn lower_call(
         };
         return Ok(format!(
             "{target}({})",
-            rewrite_expression(body, language, depth + 1, true, limit)?
+            rewrite_expression(body, profile, depth + 1, true, limit)?
         ));
     }
     let args = split_arguments(body)?;
@@ -380,8 +445,8 @@ fn lower_call(
         !base.is_empty() && !exponent.is_empty(),
         "PWR requires two arguments"
     );
-    let base = rewrite_expression(base, language, depth + 1, true, limit)?;
-    let exponent = rewrite_expression(exponent, language, depth + 1, true, limit)?;
+    let base = rewrite_expression(base, profile, depth + 1, true, limit)?;
+    let exponent = rewrite_expression(exponent, profile, depth + 1, true, limit)?;
     if language == SourceLanguage::Simetrix {
         return power::guarded(&base, &exponent, limit);
     }
@@ -410,7 +475,7 @@ fn lower_call(
 
 fn rewrite_expression(
     input: &str,
-    language: SourceLanguage,
+    profile: ExpressionProfile,
     depth: usize,
     grouped: bool,
     limit: usize,
@@ -451,13 +516,21 @@ fn rewrite_expression(
             output.push(if grouped { '(' } else { '{' });
             output.push_str(&rewrite_expression(
                 &input[offset + 1..end],
-                language,
+                profile,
                 depth + 1,
                 true,
                 limit.saturating_sub(output.len()),
             )?);
             output.push(if grouped { ')' } else { '}' });
             offset = end + 1;
+        } else if profile.standalone_hspice.is_some()
+            && (ch.is_ascii_digit()
+                || (ch == '.' && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit)))
+            && (offset == 0 || !symbol_byte(bytes[offset - 1]))
+        {
+            let (number, consumed) = hspice::number(&input[offset..])?;
+            output.push_str(&number);
+            offset += consumed;
         } else if (ch.is_ascii_alphabetic() || ch == '_')
             && (offset == 0 || !symbol_byte(bytes[offset - 1]))
         {
@@ -472,9 +545,10 @@ fn rewrite_expression(
                 open += 1;
             }
             if bytes.get(open) == Some(&b'(')
-                && ["LOG", "PWR", "V", "I"]
+                && (["LOG", "PWR", "V", "I"]
                     .iter()
                     .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                    || (profile.standalone_hspice.is_some() && hspice::is_intrinsic(name)))
             {
                 let end = group_end(input, open)?;
                 if name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I") {
@@ -484,7 +558,7 @@ fn rewrite_expression(
                     output.push_str(&lower_call(
                         name,
                         &input[open + 1..end],
-                        language,
+                        profile,
                         depth,
                         limit.saturating_sub(output.len()),
                     )?);
@@ -502,7 +576,9 @@ fn rewrite_expression(
             "source expression expansion byte budget exceeded"
         );
     }
-    if grouped && language == SourceLanguage::Simetrix {
+    if profile.standalone_hspice.is_some() {
+        power::lower_hspice(&output, limit)
+    } else if grouped && profile.language == SourceLanguage::Simetrix {
         power::lower(&output, limit)
     } else {
         Ok(output)
@@ -576,7 +652,7 @@ pub(super) fn lower_statement(
     let mut output = trimmed[..prefix_end].to_owned();
     output.push_str(&rewrite_expression(
         &trimmed[prefix_end..],
-        language,
+        ExpressionProfile::compatibility(language),
         0,
         false,
         limit.saturating_sub(prefix_end),

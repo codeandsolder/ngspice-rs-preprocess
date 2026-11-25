@@ -1,4 +1,5 @@
 //! Shared dialect source preparation and artifact construction.
+mod standalone;
 use super::analysis_plan::{
     self, AnalysisDialect, AnalysisPlan, DirectiveOrigin, PlanKind, SourceDeclaration,
 };
@@ -19,7 +20,7 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_scoped_statements, parse_library_for_simulator, parse_scoped_library,
-    preprocess_netlist_linked, project_resource, source_include_target,
+    preprocess_netlist_linked, project_language_resource, project_resource, source_include_target,
 };
 use model_translate_simplis::{
     capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
@@ -139,6 +140,7 @@ struct SourceExpansion<'a> {
     stack: Vec<(PathBuf, Option<String>)>,
     limit: usize,
     simulator: LibrarySimulator,
+    standalone: bool,
     search_paths: &'a [PathBuf],
     statements: Vec<ScopedStatement>,
     declarations: Vec<SourceDeclaration>,
@@ -155,6 +157,7 @@ impl<'a> SourceExpansion<'a> {
             stack: Vec::new(),
             limit: options.output_bytes,
             simulator: projection(request.format),
+            standalone: request.format.standalone_context().is_some(),
             search_paths: &request.search_paths,
             statements: Vec::new(),
             declarations: Vec::new(),
@@ -219,8 +222,11 @@ impl<'a> SourceExpansion<'a> {
         kind: SourceKind,
         section: Option<&str>,
     ) -> Result<DialectContext> {
-        let (context, mut projected) =
-            project_resource(&source.bytes, inherited, kind, self.simulator)?;
+        let (context, mut projected) = if self.standalone {
+            project_language_resource(&source.bytes, inherited, kind)?
+        } else {
+            project_resource(&source.bytes, inherited, kind, self.simulator)?
+        };
         if let Some(section) = section {
             let selected = select_named_section_lines(
                 projected.iter().map(|line| line.text.as_str()),
@@ -239,6 +245,12 @@ impl<'a> SourceExpansion<'a> {
         let mut projected = projected.into_iter();
         while let Some(line) = projected.next() {
             let name = analysis_plan::command(&line.text);
+            if self.standalone {
+                ensure!(
+                    !matches!(name.as_str(), ".CONTROL" | ".FILE"),
+                    "opaque {name} is not a qualified standalone source-language directive"
+                );
+            }
             if let Some(start) = model_translate_simplis::syntax::file_boundary(&line.text) {
                 embedded = start;
             }
@@ -314,7 +326,7 @@ impl<'a> SourceExpansion<'a> {
         original: &model_preprocess_simplis::source_dialect::ProjectedStatement,
         line: &str,
     ) -> Result<()> {
-        if self.simulator == LibrarySimulator::Simetrix {
+        if self.standalone || self.simulator == LibrarySimulator::Simetrix {
             self.statements.push(ScopedStatement {
                 source: display_path(&source.path),
                 context,
@@ -340,9 +352,9 @@ impl<'a> SourceExpansion<'a> {
                 .extension()
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| value.eq_ignore_ascii_case("init"));
-            let path = if init {
+            let path = if init && !self.standalone {
                 Some(resolve_init(self.session, &source.path, target)?)
-            } else if self.simulator == LibrarySimulator::Simetrix {
+            } else if self.standalone || self.simulator == LibrarySimulator::Simetrix {
                 self.resolve_resource(&source.path, target)?
             } else {
                 None
@@ -352,8 +364,13 @@ impl<'a> SourceExpansion<'a> {
                 self.expand(&snapshot, context, SourceKind::Include, None)?;
                 return Ok(true);
             }
+            ensure!(
+                !self.standalone,
+                "cannot resolve standalone source include {}",
+                target.display()
+            );
         }
-        if self.simulator == LibrarySimulator::Simetrix
+        if (self.standalone || self.simulator == LibrarySimulator::Simetrix)
             && let Some((target, section)) = external_library_reference(line)?
         {
             let normalized = target.replace('\\', "/");
@@ -806,6 +823,9 @@ pub fn prepare(
         InputFormat::ExpandedDeck | InputFormat::ExpandedLibrary => expanded(root, request.format),
         InputFormat::SimplisDeck | InputFormat::SimetrixDeck => {
             linked(root, request, options, cancellation, session)
+        }
+        InputFormat::HspiceDeck | InputFormat::HspiceLibrary => {
+            standalone::prepare(root, request, options, session)
         }
         InputFormat::NativeDeck | InputFormat::NativeLibrary => {
             bail!("native input is not a dialect translation request")

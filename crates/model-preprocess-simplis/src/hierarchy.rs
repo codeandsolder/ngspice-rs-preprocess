@@ -965,8 +965,53 @@ pub fn project_resource(
     crate::source_dialect::DialectContext,
     Vec<crate::source_dialect::ProjectedStatement>,
 )> {
+    let (context, statements) = project_language(
+        input,
+        inherited,
+        kind,
+        simulator == LibrarySimulator::Simetrix,
+    )?;
+    let selected =
+        selected_library_lines(statements.iter().map(|line| line.text.as_str()), simulator)?;
+    let selected = selected.into_iter().collect::<BTreeSet<_>>();
+    Ok((
+        context,
+        statements
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, line)| selected.contains(&i).then_some(line))
+            .collect(),
+    ))
+}
+
+/// Project one standalone SPICE-language resource without interpreting
+/// SIMetrix/SIMPLIS simulator-selection directives. Retain exact admitted
+/// physical spans and inherit its language through ordinary includes.
+///
+/// # Errors
+/// Invalid encoding or malformed continuation/opaque source block.
+pub fn project_language_resource(
+    input: &[u8],
+    inherited: crate::source_dialect::DialectContext,
+    kind: crate::source_dialect::SourceKind,
+) -> Result<(
+    crate::source_dialect::DialectContext,
+    Vec<crate::source_dialect::ProjectedStatement>,
+)> {
+    project_language(input, inherited, kind, true)
+}
+
+fn project_language(
+    input: &[u8],
+    inherited: crate::source_dialect::DialectContext,
+    kind: crate::source_dialect::SourceKind,
+    declared_language: bool,
+) -> Result<(
+    crate::source_dialect::DialectContext,
+    Vec<crate::source_dialect::ProjectedStatement>,
+)> {
     use crate::source_dialect::{DialectContext, SourceKind, logical_source};
-    let decoded = if kind == SourceKind::Deck && simulator == LibrarySimulator::Simetrix {
+    let decoded = if kind == SourceKind::Deck && declared_language {
         // A title is data, even when it looks like a directive or a device.
         let mut protected = Vec::with_capacity(input.len().saturating_add(2));
         let first = input
@@ -982,23 +1027,13 @@ pub fn project_resource(
     } else {
         decode_simplis_text(input)?
     };
-    let context = if simulator == LibrarySimulator::Simetrix {
+    let context = if declared_language {
         DialectContext::resolve(&decoded, inherited, kind)
     } else {
         inherited
     };
     let statements = logical_source(&decoded, context)?;
-    let selected =
-        selected_library_lines(statements.iter().map(|line| line.text.as_str()), simulator)?;
-    let selected = selected.into_iter().collect::<BTreeSet<_>>();
-    Ok((
-        context,
-        statements
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, line)| selected.contains(&i).then_some(line))
-            .collect(),
-    ))
+    Ok((context, statements))
 }
 
 /// Lower expressions only after simulator and named-section selection.

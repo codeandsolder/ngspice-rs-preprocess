@@ -26,6 +26,7 @@ struct Token {
 
 struct Lowerer {
     limit: usize,
+    hspice: bool,
 }
 
 struct Cursor<'a> {
@@ -258,7 +259,15 @@ impl Lowerer {
             for pair in tokens[start + 1..index].as_chunks::<2>().0 {
                 let rhs = pair[1].text.trim();
                 lhs = if pair[0].kind == Kind::AbsolutePower {
-                    guarded(&lhs, rhs, self.limit.saturating_sub(output.len()))?
+                    if self.hspice {
+                        super::hspice::infix_power(
+                            &lhs,
+                            rhs,
+                            self.limit.saturating_sub(output.len()),
+                        )?
+                    } else {
+                        guarded(&lhs, rhs, self.limit.saturating_sub(output.len()))?
+                    }
                 } else {
                     ensure!(
                         lhs.len().saturating_add(rhs.len()).saturating_add(8) <= self.limit,
@@ -317,7 +326,19 @@ pub(super) fn guarded(base: &str, exponent: &str, limit: usize) -> Result<String
 }
 
 pub(super) fn lower(input: &str, limit: usize) -> Result<String> {
-    Lowerer { limit }.expression(input, 0)
+    Lowerer {
+        limit,
+        hspice: false,
+    }
+    .expression(input, 0)
+}
+
+pub(super) fn lower_hspice(input: &str, limit: usize) -> Result<String> {
+    Lowerer {
+        limit,
+        hspice: true,
+    }
+    .expression(input, 0)
 }
 
 #[cfg(test)]

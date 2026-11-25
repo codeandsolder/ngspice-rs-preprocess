@@ -30,6 +30,10 @@ pub enum InputFormat {
     NativeDeck,
     /// Native-compatible library; emit include-safe text.
     NativeLibrary,
+    /// Standalone HSPICE deck; emit qualified native SPICE.
+    HspiceDeck,
+    /// Standalone HSPICE library; emit include-safe native SPICE.
+    HspiceLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,
     /// `SIMetrix` source deck with optional library catalog.
@@ -53,6 +57,8 @@ impl InputFormat {
         match value {
             "native-deck" => Ok(Self::NativeDeck),
             "native-library" => Ok(Self::NativeLibrary),
+            "hspice-deck" => Ok(Self::HspiceDeck),
+            "hspice-library" => Ok(Self::HspiceLibrary),
             "simplis-deck" => Ok(Self::SimplisDeck),
             "simetrix-deck" => Ok(Self::SimetrixDeck),
             "expanded-deck" => Ok(Self::ExpandedDeck),
@@ -60,6 +66,16 @@ impl InputFormat {
             "simplis-library" => Ok(Self::SimplisLibrary),
             "simetrix-library" => Ok(Self::SimetrixLibrary),
             _ => anyhow::bail!("unknown input format {value:?}"),
+        }
+    }
+
+    pub(crate) const fn standalone_context(
+        self,
+    ) -> Option<model_preprocess_simplis::source_dialect::DialectContext> {
+        use model_preprocess_simplis::source_dialect::DialectContext;
+        match self {
+            Self::HspiceDeck | Self::HspiceLibrary => Some(DialectContext::hspice()),
+            _ => None,
         }
     }
 }
@@ -155,6 +171,8 @@ pub struct OriginLine {
     pub source: PathBuf,
     /// One-based physical line in the admitted source.
     pub line: usize,
+    /// Last physical line of the admitted source statement.
+    pub last_line: usize,
 }
 
 /// Provenance of an artifact. Generated dialect output is not falsely given
@@ -290,6 +308,7 @@ fn native(
             Ok(OriginLine {
                 source: mapped.path.clone(),
                 line: mapped.line,
+                last_line: mapped.line,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -334,6 +353,8 @@ fn validate_request(request: &Request) -> Result<()> {
                 request.format,
                 InputFormat::NativeDeck
                     | InputFormat::NativeLibrary
+                    | InputFormat::HspiceDeck
+                    | InputFormat::HspiceLibrary
                     | InputFormat::SimetrixDeck
                     | InputFormat::SimetrixLibrary
             ),
