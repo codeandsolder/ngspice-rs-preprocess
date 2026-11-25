@@ -516,7 +516,7 @@ pub(super) fn translate_level17_mos(
 pub(super) struct Scope<'a> {
     prefix: &'a str,
     path: String,
-    parent: Option<&'a Scope<'a>>,
+    parent: Option<&'a Self>,
     declarations: BTreeMap<String, Option<RawLevel17Mos>>,
 }
 
@@ -598,10 +598,10 @@ impl<'a> Scope<'a> {
     }
 
     fn lookup(&self, name: &str) -> Option<&RawLevel17Mos> {
-        match self.declarations.get(name) {
-            Some(model) => model.as_ref(),
-            None => self.parent.and_then(|parent| parent.lookup(name)),
-        }
+        self.declarations.get(name).map_or_else(
+            || self.parent.and_then(|parent| parent.lookup(name)),
+            Option::as_ref,
+        )
     }
 
     pub(super) fn declared(&self, name: &str) -> Option<&RawLevel17Mos> {
@@ -614,6 +614,9 @@ impl<'a> Scope<'a> {
     pub(super) fn emit_inherited(&self, items: &[super::Item], output: &mut String) -> Result<()> {
         let mut emitted = std::collections::BTreeSet::new();
         for statement in super::electrical_statements(items) {
+            if !statement.trim_start().starts_with(['M', 'm']) {
+                continue;
+            }
             let tokens = statement_tokens(&normalized_statement(statement))?;
             if !tokens
                 .first()

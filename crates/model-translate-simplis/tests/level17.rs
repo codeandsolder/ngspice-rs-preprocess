@@ -81,7 +81,7 @@ fn compare(
             0.
         };
         ensure!(
-            fraction >= -1e-6 && fraction <= 1.000_001,
+            (-1e-6..=1.000_001).contains(&fraction),
             "reference outside native vector"
         );
         ensure!(
@@ -270,7 +270,7 @@ fn level17_ac_jacobian_and_terminal_charge_conservation() -> Result<()> {
             row.len()
         );
         let mut gate_row = vec![row[0]];
-        for (case, ports) in row[1..].chunks_exact(8).enumerate() {
+        for (case, ports) in row[1..].as_chunks::<8>().0.iter().enumerate() {
             gate_row.extend_from_slice(&ports[..2]);
             let scale = ports.iter().fold(0.0f64, |a, b| a.max(b.abs()));
             for component in 0..2 {
