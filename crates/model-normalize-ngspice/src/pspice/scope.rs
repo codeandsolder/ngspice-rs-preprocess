@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Default)]
 struct Scope {
     parent: Option<usize>,
+    path: Vec<String>,
     models: BTreeMap<String, Vec<usize>>,
     functions: BTreeSet<String>,
     instances: BTreeSet<String>,
@@ -77,8 +78,15 @@ impl Scopes {
             if first == ".subckt" {
                 let parent = scope;
                 scope = result.entries.len();
+                let mut path = result.entries[parent].path.clone();
+                let name = text
+                    .split_ascii_whitespace()
+                    .nth(1)
+                    .context("missing PSpice subcircuit name")?;
+                path.push(name.to_owned());
                 result.entries.push(Scope {
                     parent: Some(parent),
+                    path,
                     ..Scope::default()
                 });
             }
@@ -125,6 +133,10 @@ impl Scopes {
             .get(&line)
             .copied()
             .context("missing PSpice source scope")
+    }
+
+    pub(super) fn path(&self, scope: usize) -> &[String] {
+        &self.entries[scope].path
     }
 
     pub(super) const fn local_ground(&self, scope: usize) -> bool {

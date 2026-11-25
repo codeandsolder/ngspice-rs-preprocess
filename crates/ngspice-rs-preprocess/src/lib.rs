@@ -292,10 +292,27 @@ fn native(
     } else {
         linker.link_admitted(root, kind, limits, session)?
     };
-    let normalized = if pspice {
-        model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?
+    let (normalized, device_identities) = if pspice {
+        let normalized = model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?;
+        let identities = normalized
+            .renamed
+            .into_iter()
+            .map(|device| {
+                let origin = linked
+                    .origin(device.input_line)
+                    .context("missing renamed device origin")?;
+                Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
+                    source: display_path(&origin.path),
+                    scope: device.scope,
+                    displayed: device.declared.clone(),
+                    declared: device.declared,
+                    linked: device.linked,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (normalized.mapped, identities)
     } else {
-        normalize_mapped(&linked.bytes, kind)?
+        (normalize_mapped(&linked.bytes, kind)?, Vec::new())
     };
     let lines = normalized
         .input_lines
@@ -328,7 +345,7 @@ fn native(
         },
         companions: Vec::new(),
         normalization: normalized.model.passes,
-        device_identities: Vec::new(),
+        device_identities,
         model_selections: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,

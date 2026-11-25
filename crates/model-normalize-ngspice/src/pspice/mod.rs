@@ -48,6 +48,7 @@ struct Functions {
     identifiers: BTreeSet<Vec<u8>>,
     temperature: bool,
     gmin: bool,
+    renamed: Vec<RenamedDevice>,
 }
 
 impl Functions {
@@ -73,6 +74,7 @@ impl Functions {
             identifiers,
             temperature: false,
             gmin: false,
+            renamed: Vec::new(),
         })
     }
 
@@ -342,7 +344,7 @@ impl SwitchLaw {
     }
 }
 
-fn switch_instance(text: &str, functions: &mut Functions) -> Result<String> {
+fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result<String> {
     let Some(first) = text.as_bytes().first().map(u8::to_ascii_lowercase) else {
         return Ok(text.to_owned());
     };
@@ -378,9 +380,20 @@ fn switch_instance(text: &str, functions: &mut Functions) -> Result<String> {
             "continuous PSpice switch instance assignments are unsupported"
         );
     }
-    Ok(law
-        .lower_instance(&fields, functions)?
-        .unwrap_or_else(|| text.to_owned()))
+    let Some(rewritten) = law.lower_instance(&fields, functions)? else {
+        return Ok(text.to_owned());
+    };
+    functions.renamed.push(RenamedDevice {
+        input_line: line,
+        scope: functions.scopes.path(functions.scope).to_vec(),
+        declared: fields[0].to_owned(),
+        linked: rewritten
+            .split_ascii_whitespace()
+            .next()
+            .context("missing lowered switch name")?
+            .to_owned(),
+    });
+    Ok(rewritten)
 }
 
 fn model(line: usize, functions: &mut Functions) -> Result<String> {
@@ -493,7 +506,14 @@ fn rewrite(text: &str, line: usize, functions: &mut Functions) -> Result<String>
     Ok(format!("{prefix}{tail}"))
 }
 
-fn lower_body(body: &[u8]) -> Result<(Vec<u8>, Vec<usize>, String)> {
+struct LoweredBody {
+    bytes: Vec<u8>,
+    lines: Vec<usize>,
+    definitions: String,
+    renamed: Vec<RenamedDevice>,
+}
+
+fn lower_body(body: &[u8]) -> Result<LoweredBody> {
     let statements = lexical::statements(body)?;
     let scopes = Scopes::collect(&statements)?;
     let mut functions = Functions::new(body, scopes)?;
@@ -532,7 +552,7 @@ fn lower_body(body: &[u8]) -> Result<(Vec<u8>, Vec<usize>, String)> {
                 false,
                 |node| functions.scopes.hierarchical_ground(functions.scope, node),
             )?;
-            switch_instance(&rewritten, &mut functions)?
+            switch_instance(&rewritten, statement.line, &mut functions)?
         };
         rewritten_statements.push(rewritten);
     }
@@ -586,7 +606,34 @@ fn lower_body(body: &[u8]) -> Result<(Vec<u8>, Vec<usize>, String)> {
             std::iter::repeat_n(line, inserted.get(&line).copied().unwrap_or_default() + 1)
         })
         .collect();
-    Ok((bytes, lines, functions.definitions()?))
+    Ok(LoweredBody {
+        bytes,
+        lines,
+        definitions: functions.definitions()?,
+        renamed: functions.renamed,
+    })
+}
+
+/// A declaration whose designator changed during native lowering.
+#[derive(Debug)]
+pub struct RenamedDevice {
+    /// One-based input physical line, including the deck title.
+    pub input_line: usize,
+    /// Enclosing source subcircuit declarations.
+    pub scope: Vec<String>,
+    /// Original source device identifier.
+    pub declared: String,
+    /// Native emitted device identifier.
+    pub linked: String,
+}
+
+/// Native normalization plus identity changes for downstream occurrence binding.
+#[derive(Debug)]
+pub struct PspiceNormalization {
+    /// Emitted artifact and ordered physical source mapping.
+    pub mapped: MappedNormalization,
+    /// Renamed electrical declarations.
+    pub renamed: Vec<RenamedDevice>,
 }
 
 /// Lower a linked `PSpice` artifact and retain physical source provenance.
@@ -594,7 +641,7 @@ fn lower_body(body: &[u8]) -> Result<(Vec<u8>, Vec<usize>, String)> {
 ///
 /// # Errors
 /// Malformed statements, unsupported physical source semantics or invalid provenance.
-pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<MappedNormalization> {
+pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<PspiceNormalization> {
     let shared = super::normalize_mapped(input, kind)?;
     let first = usize::from(kind == RootKind::Deck);
     let title_end = if first != 0 {
@@ -607,7 +654,18 @@ pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<MappedNormalizat
     } else {
         0
     };
-    let (body, lines, definitions) = lower_body(&shared.model.bytes[title_end..])?;
+    let LoweredBody {
+        bytes: body,
+        lines,
+        definitions,
+        mut renamed,
+    } = lower_body(&shared.model.bytes[title_end..])?;
+    for device in &mut renamed {
+        device.input_line = *shared
+            .input_lines
+            .get(first + device.input_line - 1)
+            .context("missing renamed device origin")?;
+    }
     let mut bytes = shared.model.bytes[..title_end].to_vec();
     let mut input_lines = shared.input_lines[..first].to_vec();
     let origin = shared.input_lines.get(first).copied().unwrap_or(1);
@@ -630,8 +688,11 @@ pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<MappedNormalizat
         input_lines.len() == bytes.split_inclusive(|b| *b == b'\n').count(),
         "PSpice source mapping is inconsistent"
     );
-    Ok(MappedNormalization {
-        model: crate::NormalizedModel { bytes, passes },
-        input_lines,
+    Ok(PspiceNormalization {
+        mapped: MappedNormalization {
+            model: crate::NormalizedModel { bytes, passes },
+            input_lines,
+        },
+        renamed,
     })
 }

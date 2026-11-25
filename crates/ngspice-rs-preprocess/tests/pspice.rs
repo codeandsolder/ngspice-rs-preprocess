@@ -344,3 +344,52 @@ quit
         close(row[2], 2.);
     })
 }
+
+#[test]
+fn switch_identity_tracks_source_scope_and_collision_free_native_name() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let lib = dir.path().join("cell.lib");
+    fs::write(
+        &root,
+        b"Switch identities\n.lib cell.lib\nX1 a b c 0 CELL\n.end\n",
+    )?;
+    fs::write(&lib, b".subckt CELL a b c n\nS1 a b c n SM\n.model SM VSWITCH(VON=1 VOFF=0 RON=10 ROFF=1k)\nR1 a A__ps_S1 1k\n.ends CELL\n")?;
+    let prepared = prepare_source(&root, InputFormat::PspiceDeck)?;
+    assert_eq!(prepared.device_identities.len(), 1);
+    let identity = &prepared.device_identities[0];
+    assert_eq!(identity.source, lib.canonicalize()?.to_string_lossy());
+    assert_eq!(identity.scope, ["CELL"]);
+    assert_eq!(identity.declared, "S1");
+    assert_eq!(identity.displayed, "S1");
+    assert_ne!(identity.linked.to_ascii_lowercase(), "a__ps_s1");
+    let native = std::str::from_utf8(&prepared.primary.bytes)?;
+    assert!(native.contains(&format!("{} %gd(c n) %gd(a b) SM", identity.linked)));
+    Ok(())
+}
+
+#[test]
+fn continuous_current_switch_matches_clamped_log_linear_law() -> Result<()> {
+    let source = br"PSpice current switch
+I1 0 c -1
+V1 c 0 0
+V2 supply 0 1
+W1 supply out V1 MOD1
+R1 out 0 100
+.model MOD1 ISWITCH(ION=1 IOFF=0 RON=10 ROFF=1000)
+.control
+set wr_singlescale
+set wr_vecnames
+dc I1 -0.5 1.5 0.25
+wrdata response.dat v(out) i(V1)
+quit
+.endc
+.end
+";
+    compare(source, |row| {
+        let x = row[0].clamp(0., 1.);
+        let resistance = (1000_f64.ln() + (10_f64.ln() - 1000_f64.ln()) * x).exp();
+        close(row[1], 100. / (100. + resistance));
+        close(row[2], row[0]);
+    })
+}
