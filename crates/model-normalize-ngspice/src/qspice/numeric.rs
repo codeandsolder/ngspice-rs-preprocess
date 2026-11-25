@@ -2,7 +2,7 @@
 //! changing node, branch, model, parameter or function names.
 //!
 //! Numeric suffix exceptions documented by the simulator author:
-//! https://forum.qorvo.com/t/bug-unit-prefixes/14163
+//! <https://forum.qorvo.com/t/bug-unit-prefixes/14163>
 
 use super::{Feature, reject};
 use crate::{
