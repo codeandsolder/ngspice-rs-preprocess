@@ -51,7 +51,7 @@ pub enum TranslationKind {
     VoltageControlledSwitch,
     /// SIMPLIS switch with strict hysteresis and initial-state suggestion.
     HystereticSwitch,
-    /// SIMetrix voltage-controlled switch with explicit delay and slew phase.
+    /// `SIMetrix` voltage-controlled switch with explicit delay and slew phase.
     TimedVoltageControlledSwitch,
     /// SIMPLIS LEVEL=1 simple transistor switch.
     TransistorSwitchLevel1,

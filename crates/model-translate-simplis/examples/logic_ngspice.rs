@@ -809,6 +809,49 @@ Rr p r 100
     verify(runtime, source, &checks)
 }
 
+// Vendor extrema from the 1 ns sampled SIMetrix 9.40d trace of a
+// self-controlled RC relaxation oscillator. The switch's branch current
+// determines its own future threshold crossings.
+fn timed_switch_closed_loop(runtime: &Path) -> Result<()> {
+    let source = "Vbias p 0 PWL(0 0 1n 5 10u 5)
+Rcharge p c 1k
+Cstore c 0 1n
+S1 c 0 c 0 swmod IC=0
+.model swmod VSWITCH(RON=100 ROFF=1Meg VT=2.5 VH=0.5 TON=100n TOFF=200n TD_ON=50n TD_OFF=30n TIMETOL=10p)
+.options reltol=1e-6 abstol=1e-13
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "tran 1n 10u 0 1n\nmeas tran check0 max v(c) from=1.8u to=2u\nmeas tran check1 max_at v(c) from=1.8u to=2u\nmeas tran check2 min v(c) from=2u to=2.2u\nmeas tran check3 min_at v(c) from=2u to=2.2u\nmeas tran check4 max v(c) from=9u to=9.2u\nmeas tran check5 max_at v(c) from=9u to=9.2u\nmeas tran check6 min v(c) from=9.2u to=9.4u\nmeas tran check7 min_at v(c) from=9.2u to=9.4u\n",
+    )?;
+    let values = measurements(&stdout);
+    for (index, expected) in [
+        3.199_790_93,
+        1.929e-6,
+        1.285_854_69,
+        2.078e-6,
+        3.199_789_77,
+        9.12e-6,
+        1.285_860_32,
+        9.269e-6,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let actual = *values
+            .get(&index)
+            .with_context(|| format!("missing oscillator measurement {index}: {stdout}"))?;
+        let tolerance = if index % 2 == 0 { 1e-4 } else { 2e-9 };
+        ensure!(
+            (actual - expected).abs() <= tolerance,
+            "oscillator {index}: {actual} != {expected}"
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -830,6 +873,7 @@ fn main() -> Result<()> {
     timed_switch_vendor_waveforms(&runtime)?;
     timed_switch_runtime_parameters(&runtime)?;
     timed_switch_small_signal_and_stiff_load(&runtime)?;
+    timed_switch_closed_loop(&runtime)?;
     println!("All native ngspice logic regressions passed");
     Ok(())
 }
