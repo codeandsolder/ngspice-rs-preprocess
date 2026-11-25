@@ -9,9 +9,11 @@ pub mod avalanche;
 pub mod binding;
 pub mod charge;
 pub mod depletion;
+pub mod device;
 pub mod noise;
 pub mod parasitic;
 pub mod resistance;
+pub mod shared;
 pub mod temperature;
 pub mod transport;
 

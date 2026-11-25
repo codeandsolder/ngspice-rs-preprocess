@@ -98,6 +98,12 @@ pub struct Output {
     pub qbco: Charge1,
 }
 
+pub(super) struct Physics {
+    pub charge: Output,
+    pub transport: transport::Output,
+    pub parasitic: parasitic::Output,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Prepared {
     p: Parameters,
@@ -162,6 +168,12 @@ impl Prepared {
     /// # Errors
     /// Returns an invalid voltage/domain or numerical overflow error.
     pub fn evaluate(&self, bias: Bias) -> Result<Output, EvaluationError> {
+        Ok(self.evaluate_physics(bias)?.charge)
+    }
+
+    // Charge, transport, and parasitic branches share the same evaluated
+    // depletion integrals and minority-carrier state.
+    pub(super) fn evaluate_physics(&self, bias: Bias) -> Result<Physics, EvaluationError> {
         if ![
             bias.vbei, bias.vbex, bias.vbci, bias.vbcx, bias.vbep, bias.vbcp, bias.vbe, bias.vbc,
         ]
@@ -254,7 +266,11 @@ impl Prepared {
         {
             return Err(EvaluationError::NonFiniteResult);
         }
-        Ok(output)
+        Ok(Physics {
+            charge: output,
+            transport: trans,
+            parasitic: para,
+        })
     }
 
     fn forward_time(
