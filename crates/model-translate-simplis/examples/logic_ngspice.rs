@@ -515,14 +515,14 @@ fn switch_startup_and_load_lines(runtime: &Path) -> Result<()> {
                                 )?;
                                 writeln!(source, "Rq{q} {rail} q{q} 100")?;
                                 let off = bias / (1.0 + 100.0 / 1e6);
-                                let sat = (bias * 10.0 + 100.0 * vsat) / 110.0;
+                                let sat = 100.0_f64.mul_add(vsat, bias * 10.0) / 110.0;
                                 let overdrive = if negative {
                                     3.0 - control
                                 } else {
                                     control - 2.0
                                 };
-                                let active =
-                                    (bias - 100.0 * sign * 0.002 * overdrive) / (1.0 + 100.0 / 1e6);
+                                let active = (100.0 * sign * 0.002).mul_add(-overdrive, bias)
+                                    / (1.0 + 100.0 / 1e6);
                                 let expected = if !closed {
                                     off
                                 } else if level == 1 {
