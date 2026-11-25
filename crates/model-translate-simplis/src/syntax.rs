@@ -226,25 +226,12 @@ pub fn parse_numeric(input: &str) -> Result<f64> {
 /// # Errors
 /// Returns an error for unbalanced quotes or braces.
 pub fn statement_tokens(input: &str) -> Result<Vec<String>> {
-    tokenize_statement(input, false)
-}
-
-/// Tokenize model-card delimiters outside quoted or braced expressions.
-///
-/// # Errors
-/// Unbalanced parentheses, braces or quotes.
-pub fn model_statement_tokens(input: &str) -> Result<Vec<String>> {
-    tokenize_statement(input, true)
-}
-
-fn tokenize_statement(input: &str, model_delimiters: bool) -> Result<Vec<String>> {
     if input.trim_start().starts_with('*') {
         return Ok(Vec::new());
     }
     let mut tokens = Vec::new();
     let mut token = String::new();
     let mut brace_depth = 0usize;
-    let mut model_depth = 0usize;
     let mut quote = false;
     for character in input.chars() {
         match character {
@@ -264,28 +251,8 @@ fn tokenize_statement(input: &str, model_delimiters: bool) -> Result<Vec<String>
                     .ok_or_else(|| anyhow::anyhow!("unmatched SIMPLIS closing brace"))?;
                 token.push(character);
             }
-            '(' if model_delimiters && !quote && brace_depth == 0 => {
-                model_depth = model_depth
-                    .checked_add(1)
-                    .context("model parenthesis nesting overflow")?;
-                if !token.is_empty() {
-                    tokens.push(std::mem::take(&mut token));
-                }
-            }
-            ')' if model_delimiters && !quote && brace_depth == 0 => {
-                model_depth = model_depth
-                    .checked_sub(1)
-                    .context("unmatched model closing parenthesis")?;
-                if !token.is_empty() {
-                    tokens.push(std::mem::take(&mut token));
-                }
-            }
             ';' if !quote && brace_depth == 0 => break,
-            character
-                if (character.is_whitespace() || (model_delimiters && character == ','))
-                    && !quote
-                    && brace_depth == 0 =>
-            {
+            character if character.is_whitespace() && !quote && brace_depth == 0 => {
                 if !token.is_empty() {
                     tokens.push(std::mem::take(&mut token));
                 }
@@ -293,8 +260,8 @@ fn tokenize_statement(input: &str, model_delimiters: bool) -> Result<Vec<String>
             _ => token.push(character),
         }
     }
-    if quote || brace_depth != 0 || model_depth != 0 {
-        bail!("unterminated quote, brace or model parenthesis in SIMPLIS statement");
+    if quote || brace_depth != 0 {
+        bail!("unterminated quote or brace in SIMPLIS statement");
     }
     if !token.is_empty() {
         tokens.push(token);
@@ -599,79 +566,30 @@ pub fn model_header(statement: &str) -> Option<(String, String)> {
     })
 }
 
-pub(crate) fn simple_assignment_span(statement: &str, name: &str) -> Option<(usize, usize, usize)> {
-    let upper = statement.to_ascii_uppercase();
-    let needle = name.to_ascii_uppercase();
-    let mut offset = 0usize;
-    while let Some(found) = upper[offset..].find(&needle) {
-        let start = offset + found;
-        let boundary = start == 0
-            || upper.as_bytes()[start - 1].is_ascii_whitespace()
-            || matches!(upper.as_bytes()[start - 1], b'(' | b',');
-        let mut cursor = start + needle.len();
-        if !boundary
-            || upper
-                .as_bytes()
-                .get(cursor)
-                .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
-        {
-            offset = cursor;
-            continue;
-        }
-        while upper
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            cursor += 1;
-        }
-        if upper.as_bytes().get(cursor) != Some(&b'=') {
-            offset = cursor;
-            continue;
-        }
-        cursor += 1;
-        while upper
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            cursor += 1;
-        }
-        let value_start = cursor;
-        if upper.as_bytes().get(cursor) == Some(&b'{') {
-            cursor = matching_behavioral_delimiter(
-                statement,
-                cursor,
-                '{',
-                '}',
-                "assignment brace underflow",
-                "unterminated assignment expression",
-            )
-            .ok()?
-                + 1;
-        } else {
-            while upper
-                .as_bytes()
-                .get(cursor)
-                .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b')' | b','))
-            {
-                cursor += 1;
-            }
-        }
-        if cursor == value_start {
+pub(crate) fn simple_assignment_span(
+    statement: &str,
+    name: &str,
+) -> Result<Option<(usize, usize, usize)>> {
+    use model_normalize_ngspice::model_card::{ModelTermination, statement_field_spans};
+    let fields = statement_field_spans(statement, &[], ModelTermination::Complete)?;
+    Ok(fields.into_iter().find_map(|field| {
+        if !statement[field.name.clone()].eq_ignore_ascii_case(name) {
             return None;
         }
-        return Some((start, value_start, cursor));
-    }
-    None
+        let value = field.value?;
+        Some((field.name.start, value.start, value.end))
+    }))
 }
 
-/// Return a named scalar assignment, including balanced braces.
-#[must_use = "the returned value is the requested assignment"]
-pub fn simple_assignment_value(statement: &str, name: &str) -> Option<String> {
+/// Return a top-level named assignment, preserving nested and quoted values.
+/// Bare fields are distinct from explicitly assigned values.
+///
+/// # Errors
+/// Rejects malformed assignments and unbalanced delimiters.
+pub fn simple_assignment_value(statement: &str, name: &str) -> Result<Option<String>> {
     let normalized = normalized_statement(statement);
-    let (_, value_start, value_end) = simple_assignment_span(&normalized, name)?;
-    Some(normalized[value_start..value_end].to_owned())
+    Ok(simple_assignment_span(&normalized, name)?
+        .map(|(_, value_start, value_end)| normalized[value_start..value_end].to_owned()))
 }
 
 #[cfg(test)]

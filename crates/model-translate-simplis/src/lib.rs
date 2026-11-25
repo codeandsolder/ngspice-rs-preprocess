@@ -9,9 +9,7 @@ use serde::Serialize;
 use std::fmt::Write as _;
 
 pub mod syntax;
-use syntax::{
-    model_statement_tokens, normalized_statement, parse_numeric, statement_tokens, validate_node,
-};
+use syntax::{normalized_statement, parse_numeric, statement_tokens, validate_node};
 mod whole;
 pub use whole::{
     SplitDeckTranslation, WholeModelTranslation, capture_artifact_initial_conditions,
