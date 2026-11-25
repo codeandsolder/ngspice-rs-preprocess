@@ -13,6 +13,7 @@ pub use model_preprocess_command::{
     AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, SourceSession,
 };
 pub use model_preprocess_simplis::{LibrarySimulator, ParsedLibrary};
+pub use model_translate_simplis::CodeModelRuntime;
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
@@ -166,6 +167,9 @@ pub struct Artifact {
     pub provenance: Provenance,
     /// Companion library identities required by this artifact.
     pub dependencies: Vec<String>,
+    /// Supplemental code-model schemas introduced by this translation.
+    /// Native input is preserved without inferring arbitrary external models.
+    pub required_code_models: Vec<CodeModelRuntime>,
 }
 
 /// Deterministic primary artifact and any generated companion libraries.
@@ -187,6 +191,18 @@ impl PreparedBundle {
     /// Iterate primary first, then companions in deterministic order.
     pub fn artifacts(&self) -> impl Iterator<Item = &Artifact> {
         std::iter::once(&self.primary).chain(&self.companions)
+    }
+
+    /// Unique supplemental model runtimes required across the closed bundle.
+    #[must_use]
+    pub fn required_code_models(&self) -> Vec<CodeModelRuntime> {
+        let mut runtimes = self
+            .artifacts()
+            .flat_map(|artifact| artifact.required_code_models.iter().copied())
+            .collect::<Vec<_>>();
+        runtimes.sort_unstable();
+        runtimes.dedup();
+        runtimes
     }
 }
 
@@ -251,6 +267,7 @@ fn native(
             bytes: normalized.model.bytes,
             provenance: Provenance::Native { lines },
             dependencies: Vec::new(),
+            required_code_models: Vec::new(),
         },
         companions: Vec::new(),
         normalization: normalized.model.passes,

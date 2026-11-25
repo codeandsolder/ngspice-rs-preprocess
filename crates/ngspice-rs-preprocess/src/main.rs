@@ -139,6 +139,7 @@ struct Manifest<'a> {
     primary: &'a str,
     artifacts: Vec<ManifestArtifact<'a>>,
     normalization: &'a [model_normalize_ngspice::NormalizationPass],
+    required_code_models: Vec<ngspice_rs_preprocess::CodeModelRuntime>,
 }
 
 #[derive(Serialize)]
@@ -147,11 +148,12 @@ struct ManifestArtifact<'a> {
     bytes: usize,
     provenance: &'a ngspice_rs_preprocess::Provenance,
     dependencies: &'a [String],
+    required_code_models: &'a [ngspice_rs_preprocess::CodeModelRuntime],
 }
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 1,
+        version: 2,
         input_format: bundle.format,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,
@@ -162,9 +164,11 @@ fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
                 bytes: artifact.bytes.len(),
                 provenance: &artifact.provenance,
                 dependencies: &artifact.dependencies,
+                required_code_models: &artifact.required_code_models,
             })
             .collect(),
         normalization: &bundle.normalization,
+        required_code_models: bundle.required_code_models(),
     }
 }
 

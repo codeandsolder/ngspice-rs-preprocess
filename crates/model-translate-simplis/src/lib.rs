@@ -87,6 +87,38 @@ pub enum TranslationKind {
     DeviceVoltageControlledSource,
 }
 
+/// Code-model library needed by generated native-ngspice statements.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeModelRuntime {
+    /// Event-timed gates, hysteretic receivers and committed latches.
+    Logic,
+}
+
+impl CodeModelRuntime {
+    /// Matching C-reference module filename. Native execution may implement
+    /// the corresponding model schemas directly instead of loading a C module.
+    #[must_use]
+    pub const fn reference_module(self) -> &'static str {
+        match self {
+            Self::Logic => "ngspice_preprocess_logic.cm",
+        }
+    }
+}
+
+impl TranslationKind {
+    /// Additional simulator runtime required by this electrical primitive.
+    #[must_use]
+    pub const fn required_runtime(self) -> Option<CodeModelRuntime> {
+        match self {
+            Self::AndGate | Self::OrGate | Self::SrLatch | Self::SrFlipFlop => {
+                Some(CodeModelRuntime::Logic)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// One translated primitive plus provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Translation {
@@ -813,16 +845,42 @@ fn emit_digital_buffer(spec: &DigitalBufferSpec) -> Result<Translation> {
 enum LogicGateKind {
     And,
     Or,
+    Nand,
+    Nor,
 }
 
-#[derive(Debug)]
-struct AndSpec {
-    kind: LogicGateKind,
-    stem: String,
-    out: String,
-    out_bar: String,
-    rtn: String,
-    inputs: Vec<String>,
+impl LogicGateKind {
+    const fn inverted(self) -> bool {
+        matches!(self, Self::Nand | Self::Nor)
+    }
+
+    const fn conjunction(self) -> bool {
+        matches!(self, Self::And | Self::Nand)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicPolarity {
+    Positive,
+    Negative,
+}
+
+impl LogicPolarity {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "POS" => Ok(Self::Positive),
+            "NEG" => Ok(Self::Negative),
+            _ => bail!("invalid SIMPLIS LOGIC={value}"),
+        }
+    }
+
+    const fn negative(self) -> bool {
+        matches!(self, Self::Negative)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicIo {
     rin: f64,
     rout: f64,
     hystwd: f64,
@@ -832,97 +890,249 @@ struct AndSpec {
     threshold: f64,
 }
 
-fn emit_logic_and(spec: &AndSpec) -> Result<Translation> {
-    let mut output = String::new();
-    let mut states = Vec::with_capacity(spec.inputs.len());
-    for (index, input) in spec.inputs.iter().enumerate() {
-        let number = index + 1;
-        let state = format!("__{}_S{number}", spec.stem);
-        let diff = format!("__{}_D{number}", spec.stem);
-        let model = format!("__{}_H{number}", spec.stem);
-        write!(output, "R__{}_RIN{number} {input} {} ", spec.stem, spec.rtn)?;
-        write_number(&mut output, spec.rin)?;
+#[derive(Clone, Copy, Debug)]
+struct LogicReceiver {
+    polarity: LogicPolarity,
+    initial: bool,
+}
+
+impl LogicReceiver {
+    const fn digital1(polarity: LogicPolarity) -> Self {
+        Self {
+            polarity,
+            initial: polarity.negative(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LogicGateMode {
+    Classic {
+        polarity: LogicPolarity,
+        initial: bool,
+    },
+    Digital1 {
+        inverted_inputs: usize,
+    },
+}
+
+impl LogicGateMode {
+    const fn receiver(self, kind: LogicGateKind, index: usize, arity: usize) -> LogicReceiver {
+        match self {
+            // Every undecided input takes the state satisfying the suggested
+            // classic output whenever possible.
+            Self::Classic { polarity, initial } => LogicReceiver {
+                polarity,
+                initial: initial ^ kind.inverted(),
+            },
+            // DIGITAL1 receivers start physically low, independent of IC.
+            Self::Digital1 { inverted_inputs } => {
+                let inverted = index >= arity - inverted_inputs;
+                let polarity = if inverted {
+                    LogicPolarity::Negative
+                } else {
+                    LogicPolarity::Positive
+                };
+                LogicReceiver::digital1(polarity)
+            }
+        }
+    }
+
+    const fn output_negative(self) -> bool {
+        match self {
+            Self::Classic { polarity, .. } => polarity.negative(),
+            Self::Digital1 { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LogicGateSpec {
+    kind: LogicGateKind,
+    stem: String,
+    out: String,
+    out_bar: Option<String>,
+    rtn: String,
+    inputs: Vec<String>,
+    io: LogicIo,
+    mode: LogicGateMode,
+}
+
+// The numeric discriminants are the interface of preprocess_logic_event,
+// shared with the independent native reference code model.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+enum LogicOperation {
+    And,
+    Or,
+    Nand,
+    Nor,
+    ResetDominant,
+    SetDominant,
+    HoldWhenEqual,
+}
+
+impl From<LogicGateKind> for LogicOperation {
+    fn from(kind: LogicGateKind) -> Self {
+        match kind {
+            LogicGateKind::And => Self::And,
+            LogicGateKind::Or => Self::Or,
+            LogicGateKind::Nand => Self::Nand,
+            LogicGateKind::Nor => Self::Nor,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicTiming {
+    operation: LogicOperation,
+    delay: f64,
+    inertial: bool,
+    initial: bool,
+}
+
+fn emit_logic_event(
+    output: &mut String,
+    stem: &str,
+    rtn: &str,
+    inputs: &[String],
+    receivers: &[LogicReceiver],
+    io: LogicIo,
+    timing: LogicTiming,
+) -> Result<String> {
+    let upper = io.threshold + io.hystwd / 2.0;
+    let lower = io.threshold - io.hystwd / 2.0;
+    if !upper.is_finite() || !lower.is_finite() {
+        bail!("SIMPLIS logic thresholds overflow");
+    }
+    if inputs.len() != receivers.len() {
+        bail!("inconsistent logic receiver count");
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        write!(output, "R__{stem}_RIN_I{} {input} {rtn} ", index + 1)?;
+        write_number(output, io.rin)?;
         output.push('\n');
-        writeln!(
-            output,
-            "E__{}_D{number} {diff} 0 {input} {} 1",
-            spec.stem, spec.rtn
-        )?;
-        writeln!(output, "A__{}_H{number} {diff} {state} {model}", spec.stem)?;
-        write!(output, ".model {model} hyst(in_low=")?;
-        write_number(&mut output, spec.threshold)?;
-        output.push_str(" in_high=");
-        write_number(&mut output, spec.threshold)?;
-        output.push_str(" hyst=");
-        write_number(&mut output, spec.hystwd / 2.0)?;
-        output.push_str(" out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)\n");
-        states.push(state);
     }
-    let raw = format!("__{}_RAW", spec.stem);
-    write!(output, "B__{}_LOGIC {raw} 0 V='", spec.stem)?;
-    match spec.kind {
-        LogicGateKind::And => {
-            for (index, state) in states.iter().enumerate() {
-                if index != 0 {
-                    output.push('*');
-                }
-                write!(output, "v({state})")?;
-            }
-        }
-        LogicGateKind::Or => {
-            output.push_str("1-(");
-            for (index, state) in states.iter().enumerate() {
-                if index != 0 {
-                    output.push('*');
-                }
-                write!(output, "(1-v({state}))")?;
-            }
-            output.push(')');
-        }
+    let state = format!("__{stem}_Q_STATE");
+    let model = format!("__{stem}_EVENT_M");
+    write!(output, "A__{stem}_EVENT %vd [")?;
+    for input in inputs {
+        write!(output, " {input} {rtn}")?;
     }
-    output.push_str("'\n");
-    let logic = if spec.delay == 0.0 {
-        raw
+    writeln!(output, " ] {state} {model}")?;
+    write!(
+        output,
+        ".model {model} preprocess_logic_event(operation={} delay=",
+        timing.operation as u8
+    )?;
+    write_number(output, timing.delay)?;
+    write!(
+        output,
+        " inertial={} ic={} low={lower:.17e} high={upper:.17e} inverted=[",
+        timing.inertial,
+        u8::from(timing.initial)
+    )?;
+    for receiver in receivers {
+        write!(output, " {}", receiver.polarity.negative())?;
+    }
+    output.push_str(" ] rx_ic=[");
+    for receiver in receivers {
+        write!(output, " {}", u8::from(receiver.initial))?;
+    }
+    output.push_str(" ])\n");
+    Ok(state)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicOutput {
+    negative: bool,
+    complement: bool,
+}
+
+fn emit_logic_output(
+    output: &mut String,
+    io: LogicIo,
+    stem: &str,
+    out: &str,
+    rtn: &str,
+    state: &str,
+    output_mode: LogicOutput,
+) -> Result<()> {
+    let suffix = if output_mode.complement { "B" } else { "" };
+    let internal = format!("__{stem}_OUT{suffix}_INT");
+    let model = format!("__{stem}_OUT{suffix}_M");
+    let (low, high) = if output_mode.complement ^ output_mode.negative {
+        (io.voh, io.vol)
     } else {
-        let delayed = format!("__{}_DELAYED", spec.stem);
-        let model = format!("__{}_DELAY_M", spec.stem);
-        writeln!(output, "A__{}_DELAY {raw} {delayed} 0 {model}", spec.stem)?;
-        write!(output, ".model {model} delay(delay=")?;
-        write_number(&mut output, spec.delay)?;
-        output.push_str(" buffer_size=2048)\n");
-        delayed
+        (io.vol, io.voh)
     };
-    let out_int = format!("__{}_OUT_INT", spec.stem);
-    let out_bar_int = format!("__{}_OUTB_INT", spec.stem);
-    write!(output, "B__{}_OUTV {out_int} {} V='", spec.stem, spec.rtn)?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*v({logic})'")?;
-    write!(output, "R__{}_OUT {out_int} {} ", spec.stem, spec.out)?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
-    write!(
+    writeln!(
         output,
-        "B__{}_OUTBV {out_bar_int} {} V='",
-        spec.stem, spec.rtn
+        "A__{stem}_OUT{suffix}V {state} %vd({internal} {rtn}) {model}"
     )?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*(1-v({logic}))'")?;
-    write!(
-        output,
-        "R__{}_OUTB {out_bar_int} {} ",
-        spec.stem, spec.out_bar
-    )?;
-    write_number(&mut output, spec.rout)?;
+    write!(output, ".model {model} preprocess_logic_voltage(out_low=")?;
+    write_number(output, low)?;
+    output.push_str(" out_high=");
+    write_number(output, high)?;
+    output.push_str(")\n");
+    write!(output, "R__{stem}_OUT{suffix} {internal} {out} ")?;
+    write_number(output, io.rout)?;
     output.push('\n');
+    Ok(())
+}
+
+fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
+    let mut output = String::new();
+    let receivers = (0..spec.inputs.len())
+        .map(|index| spec.mode.receiver(spec.kind, index, spec.inputs.len()))
+        .collect::<Vec<_>>();
+    let state = emit_logic_event(
+        &mut output,
+        &spec.stem,
+        &spec.rtn,
+        &spec.inputs,
+        &receivers,
+        spec.io,
+        LogicTiming {
+            operation: spec.kind.into(),
+            delay: spec.io.delay,
+            inertial: matches!(spec.mode, LogicGateMode::Digital1 { .. }),
+            initial: false,
+        },
+    )?;
+    let output_negative = spec.mode.output_negative();
+    emit_logic_output(
+        &mut output,
+        spec.io,
+        &spec.stem,
+        &spec.out,
+        &spec.rtn,
+        &state,
+        LogicOutput {
+            negative: output_negative,
+            complement: false,
+        },
+    )?;
+    if let Some(out_bar) = &spec.out_bar {
+        emit_logic_output(
+            &mut output,
+            spec.io,
+            &spec.stem,
+            out_bar,
+            &spec.rtn,
+            &state,
+            LogicOutput {
+                negative: output_negative,
+                complement: true,
+            },
+        )?;
+    }
     Ok(Translation {
         bytes: output.into_bytes(),
-        kind: match spec.kind {
-            LogicGateKind::And => TranslationKind::AndGate,
-            LogicGateKind::Or => TranslationKind::OrGate,
+        kind: if spec.kind.conjunction() {
+            TranslationKind::AndGate
+        } else {
+            TranslationKind::OrGate
         },
     })
 }

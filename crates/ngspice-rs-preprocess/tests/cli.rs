@@ -42,7 +42,8 @@ fn cli_and_library_have_identical_artifacts_and_manifest() -> Result<()> {
     );
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
-    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["version"], 2);
+    assert_eq!(manifest["required_code_models"], serde_json::json!([]));
     assert_eq!(manifest["input_format"], "native-deck");
     assert_eq!(manifest["primary"], "deck.cir");
     assert_eq!(
@@ -169,5 +170,45 @@ fn translated_piecewise_resistor_matches_independent_dc_law() -> Result<()> {
         };
         assert!((current + expected).abs() < 1e-10);
     }
+    Ok(())
+}
+
+#[test]
+fn linked_logic_runtime_is_declared_by_companion_and_bundle() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("input.net");
+    let library = dir.path().join("parts.lb");
+    let output = dir.path().join("bundle");
+    fs::write(
+        &root,
+        b".include parts.lb\nV1 a 0 5\nV2 b 0 5\nX1 a b q 0 GATE\nR1 q 0 100\n.end\n",
+    )?;
+    fs::write(&library, b".subckt GATE a b q rtn\n!D1 q rtn a b M IC=0\n.MODEL M AND2 RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 DELAY=500n LOGIC=POS\n.ends GATE\n")?;
+    let execution = run(
+        "simplis-deck",
+        &root,
+        &output,
+        &["--library", library.to_str().context("non-UTF-8 path")?],
+    )?;
+    assert!(execution.status.success(), "{execution:?}");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    assert_eq!(
+        manifest["required_code_models"],
+        serde_json::json!(["logic"])
+    );
+    let artifacts = manifest["artifacts"]
+        .as_array()
+        .context("missing artifacts")?;
+    assert_eq!(artifacts.len(), 2);
+    assert_eq!(artifacts[0]["required_code_models"], serde_json::json!([]));
+    assert_eq!(
+        artifacts[1]["required_code_models"],
+        serde_json::json!(["logic"])
+    );
+    let filename = artifacts[1]["filename"]
+        .as_str()
+        .context("missing filename")?;
+    assert!(fs::read_to_string(output.join(filename))?.contains("preprocess_logic_event"));
     Ok(())
 }
