@@ -5,11 +5,12 @@
 //! distinction avoids silently evaluating vendor symbols with wrong defaults.
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 /// A model parameter in original source order; duplicates are deliberately
 /// retained for source-dialect resolution rather than guessed here.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelParameter {
     /// Case-preserved identifier.
     pub name: String,
@@ -33,7 +34,7 @@ impl ModelParameter {
 }
 
 /// Lexical field spans in the original logical statement.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FieldSpan {
     /// Case-preserved field identifier or bare positional token.
     pub name: Range<usize>,
@@ -53,7 +54,7 @@ pub enum ModelTermination {
 }
 
 /// One lexed `.model` statement. This is deliberately model-family agnostic.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelCard {
     /// Declared model identifier.
     pub name: String,
@@ -61,7 +62,8 @@ pub struct ModelCard {
     pub family: String,
     /// Named parameter tokens, preserving expression text and ordering.
     pub parameters: Vec<ModelParameter>,
-    /// 1-based physical source line where the `.model` begins.
+    /// 1-based physical source line where the `.model` begins, or zero
+    /// when only a projected logical statement is available.
     pub source_line: usize,
 }
 
@@ -364,6 +366,27 @@ pub fn parse_model_card(
     })
 }
 
+/// Parse a joined SPICE assignment/flag list with the model-card grammar.
+///
+/// Positional value names are explicit at the call site. Source ranges are
+/// relative to the supplied assignment list.
+///
+/// # Errors
+/// Invalid fields, missing values or unbalanced delimiters.
+pub fn parse_parameter_fields(input: &str, positional: &[&str]) -> Result<Vec<ModelParameter>> {
+    let mut source = Source {
+        text: input,
+        offset: 0,
+    };
+    source.skip_space();
+    Ok(
+        field_spans(&mut source, positional, ModelTermination::Complete)?
+            .into_iter()
+            .map(|span| ModelParameter::from_span(input, span))
+            .collect(),
+    )
+}
+
 fn model_header_source(statement: &str) -> Result<(&str, &str, Source<'_>)> {
     let mut source = Source {
         text: statement,
@@ -444,6 +467,7 @@ pub fn statement_field_spans(
             offset: 0,
         }
     };
+    source.skip_space();
     field_spans(&mut source, positional, termination)
 }
 
@@ -474,7 +498,11 @@ pub fn parse_spice_constant(raw: &str) -> Result<f64> {
         }
     }
     ensure!(digits > 0, "not a scalar SPICE number: {raw}");
-    if matches!(bytes.get(offset), Some(b'e' | b'E' | b'd' | b'D')) {
+    if matches!(bytes.get(offset), Some(b'e' | b'E' | b'd' | b'D'))
+        && !["db", "deg"]
+            .iter()
+            .any(|unit| raw[offset..].eq_ignore_ascii_case(unit))
+    {
         offset += 1;
         if matches!(bytes.get(offset), Some(b'+' | b'-')) {
             offset += 1;
@@ -494,7 +522,12 @@ pub fn parse_spice_constant(raw: &str) -> Result<f64> {
         suffix.bytes().all(|byte| byte.is_ascii_alphabetic()),
         "invalid SPICE unit suffix in {raw}"
     );
-    let scale = if suffix.starts_with("meg") {
+    let scale = if matches!(
+        suffix.as_str(),
+        "hz" | "v" | "ohm" | "s" | "rad" | "db" | "deg"
+    ) {
+        1.0
+    } else if suffix.starts_with("meg") {
         1e6
     } else if suffix.starts_with("mil") {
         25.4e-6
@@ -641,6 +674,12 @@ mod tests {
             (".5pF", 5e-13),
             ("+6", 6.0),
             ("1a", 1e-18),
+            ("1.0e7Hz", 1e7),
+            ("100V", 100.0),
+            ("45deg", 45.0),
+            ("3dB", 3.0),
+            ("20rad", 20.0),
+            ("10Ohm", 10.0),
         ] {
             let actual = parse_spice_constant(raw)?;
             assert!(

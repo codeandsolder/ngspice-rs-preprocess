@@ -1,3 +1,5 @@
+mod classic_state;
+use classic_state::{ClassicStateModel, classic_state_model, translate_classic_state_device};
 mod passive_ic;
 mod pwls;
 mod waveforms;
@@ -298,6 +300,11 @@ fn residual_simplis_reason(statement: &str) -> Option<&'static str> {
                         | "COMP"
                         | "XOR"
                         | "SRFF"
+                        | "CLK_SRFF"
+                        | "CLK_JKFF"
+                        | "CLK_DFF"
+                        | "CLK_TFF"
+                        | "LATCH"
                         | "CLK_SRFF"
                         | "CLK_JKFF"
                         | "CLK_DFF"
@@ -1300,53 +1307,6 @@ fn raw_vcsw_model(
 }
 
 #[derive(Clone, Debug)]
-struct RawSrffModel {
-    rin: f64,
-    rout: f64,
-    threshold: f64,
-    hystwd: f64,
-    vol: f64,
-    voh: f64,
-    logic: String,
-    delay: f64,
-}
-
-fn raw_srff_model(
-    card: &model_normalize_ngspice::model_card::ModelCard,
-) -> Result<Option<(String, RawSrffModel)>> {
-    if !card.family.eq_ignore_ascii_case("SRFF") {
-        return Ok(None);
-    }
-    let parameters = model_parameters(card, 0)?;
-    let model = RawSrffModel {
-        rin: numeric_parameter(&parameters, "RIN")?,
-        rout: numeric_parameter(&parameters, "ROUT")?,
-        threshold: numeric_parameter(&parameters, "TH")?,
-        hystwd: numeric_parameter(&parameters, "HYSTWD")?,
-        vol: numeric_parameter(&parameters, "VOL")?,
-        voh: numeric_parameter(&parameters, "VOH")?,
-        delay: if parameters.contains_key("DELAY") {
-            numeric_parameter(&parameters, "DELAY")?
-        } else {
-            0.0
-        },
-        logic: parameters.get("LOGIC").map_or_else(
-            || "POS".to_owned(),
-            |value| value.trim_matches('\'').to_ascii_uppercase(),
-        ),
-    };
-    if !(model.rin > 0.0
-        && model.rout > 0.0
-        && model.hystwd >= 0.0
-        && model.delay >= 0.0
-        && model.voh > model.vol)
-    {
-        bail!("invalid SIMPLIS SRFF model {}", card.name);
-    }
-    Ok(Some((card.name.to_ascii_uppercase(), model)))
-}
-
-#[derive(Clone, Debug)]
 struct RawNumberedLogicModel {
     kind: LogicGateKind,
     polarity: LogicPolarity,
@@ -1612,99 +1572,61 @@ fn bracket_groups(tokens: &[String]) -> Result<Vec<Vec<String>>> {
 }
 
 #[derive(Clone, Copy)]
-struct SrStateSpec<'a> {
+struct StateElementSpec<'a> {
     stem: &'a str,
-    out: &'a str,
-    out_bar: &'a str,
+    outputs: &'a [&'a str],
     rtn: &'a str,
     inputs: &'a [String],
-    initial: usize,
-    operation: LogicOperation,
-    input_polarity: LogicPolarity,
+    receiver: LogicReceiver,
     output_polarity: LogicPolarity,
+    timing: LogicTiming,
     kind: TranslationKind,
 }
 
-fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Translation> {
-    let SrStateSpec {
+fn emit_state_element(io: LogicIo, spec: &StateElementSpec<'_>) -> Result<Translation> {
+    let StateElementSpec {
         stem,
-        out,
-        out_bar,
+        outputs,
         rtn,
         inputs,
-        initial,
-        operation,
-        input_polarity,
+        receiver,
         output_polarity,
+        timing,
         kind,
     } = *spec;
-    if inputs.len() != 2 || initial > 1 {
-        bail!("invalid SIMPLIS S-R state element");
-    }
-    let set = &inputs[0];
-    let reset = &inputs[1];
-    for node in [out, out_bar, rtn, set, reset] {
+    for node in outputs
+        .iter()
+        .copied()
+        .chain(std::iter::once(rtn))
+        .chain(inputs.iter().map(String::as_str))
+    {
         validate_node(node)?;
     }
-    let io = LogicIo {
-        rin: model.rin,
-        rout: model.rout,
-        hystwd: model.hystwd,
-        vol: model.vol,
-        voh: model.voh,
-        delay: model.delay,
-        threshold: model.threshold,
-    };
     let mut output = String::new();
-    let inertial = kind == TranslationKind::SrLatch;
-    let receiver = if inertial {
-        LogicReceiver::digital1(input_polarity)
-    } else {
-        LogicReceiver {
-            polarity: input_polarity,
-            initial: false,
-        }
-    };
     emit_logic_input_loads(&mut output, stem, rtn, inputs, io.rin)?;
     let state = emit_logic_event(
         &mut output,
         stem,
         rtn,
         inputs,
-        &[receiver; 2],
+        &vec![receiver; inputs.len()],
         io.thresholds(),
-        LogicTiming {
-            operation,
-            delay: model.delay,
-            inertial,
-            initial: initial == 1,
-        },
+        timing,
     )?;
-    let negative = output_polarity.negative();
-    emit_logic_output(
-        &mut output,
-        io,
-        stem,
-        out,
-        rtn,
-        &state,
-        LogicOutput {
-            negative,
-            complement: false,
-        },
-    )?;
-    emit_logic_output(
-        &mut output,
-        io,
-        stem,
-        out_bar,
-        rtn,
-        &state,
-        LogicOutput {
-            negative,
-            complement: true,
-        },
-    )?;
+    for (index, node) in outputs.iter().enumerate() {
+        emit_logic_output(
+            &mut output,
+            io,
+            stem,
+            node,
+            rtn,
+            &state,
+            LogicOutput {
+                negative: output_polarity.negative(),
+                complement: index == 1,
+            },
+        )?;
+    }
     Ok(Translation {
         bytes: output.into_bytes(),
         kind,
@@ -1731,18 +1653,34 @@ fn emit_raw_sr_latch(
         "NONE" => LogicOperation::HoldWhenEqual,
         other => bail!("invalid SIMPLIS DIGITAL1 D_SRLATCH DOM={other}"),
     };
-    emit_sr_state(
-        model,
-        &SrStateSpec {
+    anyhow::ensure!(
+        inputs.len() == 2 && initial <= 1,
+        "invalid SIMPLIS S-R state element"
+    );
+    let io = LogicIo {
+        rin: model.rin,
+        rout: model.rout,
+        hystwd: model.hystwd,
+        vol: model.vol,
+        voh: model.voh,
+        delay: model.delay,
+        threshold: model.threshold,
+    };
+    emit_state_element(
+        io,
+        &StateElementSpec {
             stem,
-            out,
-            out_bar,
+            outputs: &[out, out_bar],
             rtn,
             inputs,
-            initial,
-            operation,
-            input_polarity,
+            receiver: LogicReceiver::digital1(input_polarity),
             output_polarity: LogicPolarity::Positive,
+            timing: LogicTiming {
+                operation,
+                delay: io.delay,
+                inertial: true,
+                initial: initial == 1,
+            },
             kind: TranslationKind::SrLatch,
         },
     )
@@ -2241,6 +2179,11 @@ fn translate_device_voltage_controlled_source(
     statement: &str,
     branches: &std::collections::BTreeMap<String, (String, String)>,
 ) -> Result<Option<Translation>> {
+    if model_normalize_ngspice::controlled_transfer::parse(&normalized_statement(statement))?
+        .is_some()
+    {
+        return Ok(None);
+    }
     let trimmed = statement.trim_start();
     let Some(kind) = trimmed.as_bytes().first().map(u8::to_ascii_uppercase) else {
         return Ok(None);
@@ -2296,7 +2239,7 @@ fn translate_device_voltage_controlled_source(
     }))
 }
 
-fn current_controlled_source_stem(name: &str) -> String {
+fn escaped_device_stem(name: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(name.len());
     for byte in name.bytes() {
@@ -2358,7 +2301,7 @@ fn translated_current_branches(
             if let Some(name) = tokens.first() {
                 branches.insert(
                     name.to_ascii_uppercase(),
-                    format!("B__{}", current_controlled_source_stem(name)),
+                    format!("B__{}", escaped_device_stem(name)),
                 );
             }
         }
@@ -2597,7 +2540,7 @@ fn translate_current_controlled_source(
             .get(2)
             .context("current-controlled source has no negative node")?,
     )?;
-    let stem = current_controlled_source_stem(
+    let stem = escaped_device_stem(
         tokens
             .first()
             .context("current-controlled source has no name")?,
@@ -3286,59 +3229,6 @@ fn translate_raw_vcsw_device(
     Ok(Some(translation))
 }
 
-fn translate_raw_srff_device(
-    statement: &str,
-    models: &std::collections::BTreeMap<String, RawSrffModel>,
-) -> Result<Option<Translation>> {
-    if !statement.trim_start().starts_with('!') {
-        return Ok(None);
-    }
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 7 {
-        return Ok(None);
-    }
-    let Some(model) = models.get(&tokens[6].to_ascii_uppercase()) else {
-        return Ok(None);
-    };
-    let polarity = LogicPolarity::parse(&model.logic)?;
-    let parameters = parse_assignments(&tokens[7..])?;
-    let initial = if parameters.contains_key("IC") {
-        integer_parameter(&parameters, "IC")?
-    } else {
-        0
-    };
-    let io = RawDigitalModel {
-        kind: RawDigitalKind::SrLatch,
-        rin: model.rin,
-        rout: model.rout,
-        threshold: model.threshold,
-        hystwd: model.hystwd,
-        vol: model.vol,
-        voh: model.voh,
-        delay: model.delay,
-        num_inverted_inputs: 0,
-        set_reset_level: 1,
-        dominance: "HOLD".to_owned(),
-    };
-    let stem = sanitized_name(tokens[0].trim_start_matches('!'));
-    emit_sr_state(
-        &io,
-        &SrStateSpec {
-            stem: &stem,
-            out: &tokens[1],
-            out_bar: &tokens[2],
-            rtn: &tokens[3],
-            inputs: &tokens[4..6],
-            initial,
-            operation: LogicOperation::HoldWhenEqual,
-            input_polarity: polarity,
-            output_polarity: polarity,
-            kind: TranslationKind::SrFlipFlop,
-        },
-    )
-    .map(Some)
-}
-
 fn source_kind(name: &str) -> Result<char> {
     match name.as_bytes().first().map(u8::to_ascii_uppercase) {
         Some(b'V') => Ok('V'),
@@ -3838,7 +3728,7 @@ fn statement_with_init_override(
 ) -> Result<String> {
     let normalized = normalized_statement(statement);
     let tokens = statement_tokens(&normalized)?;
-    let Some(name) = tokens.first() else {
+    let Some(name) = tokens.first().cloned() else {
         return Ok(statement.to_owned());
     };
     let Some(value) = overrides.get(&name.to_ascii_uppercase()) else {
@@ -3846,11 +3736,29 @@ fn statement_with_init_override(
     };
     let mut output = Vec::with_capacity(tokens.len().saturating_add(1));
     let mut replaced = false;
-    for token in tokens {
-        if token
+    let mut tokens = tokens.into_iter().peekable();
+    while let Some(token) = tokens.next() {
+        let assigned = token
             .split_once('=')
-            .is_some_and(|(key, _)| key.eq_ignore_ascii_case("IC"))
-        {
+            .filter(|(key, _)| key.eq_ignore_ascii_case("IC"));
+        let separate = token.eq_ignore_ascii_case("IC")
+            && tokens.peek().is_some_and(|next| next.starts_with('='));
+        if assigned.is_some() || separate {
+            anyhow::ensure!(!replaced, "duplicate initial condition on {name}");
+            let rhs = if let Some((_, rhs)) = assigned {
+                rhs.to_owned()
+            } else {
+                tokens
+                    .next()
+                    .context("missing initial assignment")?
+                    .strip_prefix('=')
+                    .context("missing initial assignment separator")?
+                    .to_owned()
+            };
+            if rhs.is_empty() {
+                let old = tokens.next().context("missing initial condition value")?;
+                anyhow::ensure!(!old.starts_with('='), "missing initial condition value");
+            }
             output.push(format!("IC={value}"));
             replaced = true;
         } else {
@@ -4152,7 +4060,7 @@ struct ScopeAnalysis {
     comp: std::collections::BTreeMap<String, RawCompModel>,
     adc_schmitt: std::collections::BTreeMap<String, RawAdcSchmittModel>,
     native_bridges: std::collections::BTreeMap<String, NativeBridgeModel>,
-    srff: std::collections::BTreeMap<String, RawSrffModel>,
+    srff: std::collections::BTreeMap<String, ClassicStateModel>,
     digital: std::collections::BTreeMap<String, RawDigitalModel>,
     numbered_logic: std::collections::BTreeMap<String, RawNumberedLogicModel>,
     vcsw: std::collections::BTreeMap<String, RawVcswModel>,
@@ -4310,10 +4218,7 @@ impl ScopeAnalysis {
             if !self.voltage_branches.contains_key(&target) {
                 bail!("SIMPLIS switch references unknown current branch {target}");
             }
-            let stem = format!(
-                "V__{}_CONTROL_SENSE",
-                current_controlled_source_stem(&target)
-            );
+            let stem = format!("V__{}_CONTROL_SENSE", escaped_device_stem(&target));
             let source = allocate_branch_identifier(&stem, &mut reserved)?;
             let node = allocate_branch_identifier(&format!("__{source}_NODE"), &mut reserved)?;
             self.current_branches.insert(target.clone(), source.clone());
@@ -4372,6 +4277,11 @@ impl ScopeAnalysis {
                     | "ICSW"
                     | "VSWITCH"
                     | "SRFF"
+                    | "CLK_SRFF"
+                    | "CLK_JKFF"
+                    | "CLK_DFF"
+                    | "CLK_TFF"
+                    | "LATCH"
                     | "DIGITAL1"
             ) && numbered_logic_kind(&kind).is_none()
             {
@@ -4454,8 +4364,12 @@ impl ScopeAnalysis {
             "VCSW" | "ICSW" | "VSWITCH" => {
                 insert_unique_model(&mut self.vcsw, raw_vcsw_model(card)?, "SIMPLIS VCSW model")?
             }
-            "SRFF" => {
-                insert_unique_model(&mut self.srff, raw_srff_model(card)?, "SIMPLIS SRFF model")?
+            "SRFF" | "CLK_SRFF" | "CLK_JKFF" | "CLK_DFF" | "CLK_TFF" | "LATCH" => {
+                insert_unique_model(
+                    &mut self.srff,
+                    classic_state_model(card)?,
+                    "SIMPLIS classic state model",
+                )?
             }
             "DIGITAL1" => insert_unique_model(
                 &mut self.digital,
@@ -4720,7 +4634,7 @@ fn translate_deck_primitive(
         translate_raw_mutual_inductance(statement, &models.inductors),
         translate_raw_pwl_device(statement, &models.pwl),
         translate_raw_reactive_device(statement, &models.reactive),
-        translate_raw_srff_device(statement, &models.srff),
+        translate_classic_state_device(statement, &models.srff),
         translate_raw_comp_device(statement, &models.comp),
         translate_raw_digital_device(statement, &models.digital),
         translate_raw_numbered_logic_device(statement, &models.numbered_logic),
@@ -5430,8 +5344,13 @@ pub fn translate_simplis_deck(input: &[u8]) -> Result<WholeModelTranslation> {
     };
     output.push_str(".end\n");
     reject_residual_simplis(&output)?;
+    let bytes =
+        match model_normalize_ngspice::controlled_transfer::lower_sources(output.as_bytes())? {
+            Some(lowered) => lowered.bytes,
+            None => output.into_bytes(),
+        };
     Ok(WholeModelTranslation {
-        bytes: output.into_bytes(),
+        bytes,
         primitives,
         required_code_models,
         stripped_directives,
