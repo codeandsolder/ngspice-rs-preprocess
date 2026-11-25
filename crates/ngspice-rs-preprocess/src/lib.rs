@@ -30,6 +30,10 @@ pub enum InputFormat {
     NativeDeck,
     /// Native-compatible library; emit include-safe text.
     NativeLibrary,
+    /// TINA plaintext SPICE deck.
+    TinaDeck,
+    /// TINA plaintext SPICE library; emit include-safe native SPICE.
+    TinaLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,
     /// `SIMetrix` source deck with optional library catalog.
@@ -53,6 +57,8 @@ impl InputFormat {
         match value {
             "native-deck" => Ok(Self::NativeDeck),
             "native-library" => Ok(Self::NativeLibrary),
+            "tina-deck" => Ok(Self::TinaDeck),
+            "tina-library" => Ok(Self::TinaLibrary),
             "simplis-deck" => Ok(Self::SimplisDeck),
             "simetrix-deck" => Ok(Self::SimetrixDeck),
             "expanded-deck" => Ok(Self::ExpandedDeck),
@@ -262,12 +268,22 @@ fn native(
     options: &Options,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let kind = if request.format == InputFormat::NativeDeck {
+    let kind = if matches!(
+        request.format,
+        InputFormat::NativeDeck | InputFormat::TinaDeck
+    ) {
         RootKind::Deck
     } else {
         RootKind::Include
     };
     let origin = root.path.clone();
+    let tina = matches!(
+        request.format,
+        InputFormat::TinaDeck | InputFormat::TinaLibrary
+    );
+    if tina {
+        model_normalize_ngspice::tina::validate_plaintext(&root.bytes)?;
+    }
     let linked = SourceLinker {
         search_paths: request.search_paths.clone(),
     }
@@ -279,7 +295,11 @@ fn native(
         },
         session,
     )?;
-    let normalized = normalize_mapped(&linked.bytes, kind)?;
+    let normalized = if tina {
+        model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind)?
+    } else {
+        normalize_mapped(&linked.bytes, kind)?
+    };
     let lines = normalized
         .input_lines
         .into_iter()
@@ -334,6 +354,8 @@ fn validate_request(request: &Request) -> Result<()> {
                 request.format,
                 InputFormat::NativeDeck
                     | InputFormat::NativeLibrary
+                    | InputFormat::TinaDeck
+                    | InputFormat::TinaLibrary
                     | InputFormat::SimetrixDeck
                     | InputFormat::SimetrixLibrary
             ),
@@ -364,9 +386,10 @@ pub fn prepare(
     let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
     let root = request.input.admit(&mut session)?;
     let mut result = match request.format {
-        InputFormat::NativeDeck | InputFormat::NativeLibrary => {
-            native(&root, request, options, &mut session)
-        }
+        InputFormat::NativeDeck
+        | InputFormat::NativeLibrary
+        | InputFormat::TinaDeck
+        | InputFormat::TinaLibrary => native(&root, request, options, &mut session),
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
     if request.format == InputFormat::SimetrixDeck
