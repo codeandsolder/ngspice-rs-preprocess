@@ -13,7 +13,7 @@ pub struct OutputResistance {
 }
 
 impl OutputResistance {
-    #[must_use]
+    #[must_use = "the returned resistance represents both drive directions"]
     pub const fn symmetric(ohms: f64) -> Self {
         Self {
             positive: ohms,
@@ -58,7 +58,7 @@ impl PhysicalOutputDrive {
         Ok(())
     }
 
-    #[must_use]
+    #[must_use = "the returned drive configuration contains the specified resistance"]
     pub const fn unrestricted(resistance: OutputResistance) -> Self {
         Self {
             resistance,
@@ -92,7 +92,7 @@ pub struct PhysicalOutputLoad {
 }
 
 impl PhysicalOutputLoad {
-    #[must_use]
+    #[must_use = "the returned load represents the specified capacitance"]
     pub const fn capacitive(capacitance_f: f64) -> Self {
         Self {
             capacitance_f,
@@ -101,12 +101,12 @@ impl PhysicalOutputLoad {
         }
     }
 
-    #[must_use]
+    #[must_use = "the result indicates whether the electrical load is numerically valid"]
     pub const fn is_finite(self) -> bool {
         self.capacitance_f.is_finite() && self.sink_a.is_finite() && self.source_a.is_finite()
     }
 
-    #[must_use]
+    #[must_use = "the result indicates exact electrical parameter equality"]
     pub const fn same_bits(self, other: Self) -> bool {
         self.capacitance_f.to_bits() == other.capacitance_f.to_bits()
             && self.sink_a.to_bits() == other.sink_a.to_bits()
