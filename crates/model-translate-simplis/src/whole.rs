@@ -1679,39 +1679,24 @@ fn bracket_groups(tokens: &[String]) -> Result<Vec<Vec<String>>> {
     Ok(groups)
 }
 
-struct SrInput<'a> {
-    label: &'a str,
-    input: &'a str,
-    diff: &'a str,
-    state: &'a str,
-    hyst_model: &'a str,
-}
-
 fn emit_sr_hysteretic_input(
     output: &mut String,
     io: LogicIo,
     stem: &str,
     rtn: &str,
-    spec: &SrInput<'_>,
+    label: &str,
+    input: &str,
     polarity: LogicPolarity,
-) -> Result<()> {
-    write!(output, "R__{stem}_RIN_{} {} {rtn} ", spec.label, spec.input)?;
+) -> Result<String> {
+    let diff = format!("__{stem}_{label}_DIFF");
+    let state = format!("__{stem}_{label}_STATE");
+    let hyst_model = format!("__{stem}_{label}_HYST_M");
+    write!(output, "R__{stem}_RIN_{label} {input} {rtn} ")?;
     write_number(output, io.rin)?;
     output.push('\n');
-    writeln!(
-        output,
-        "E__{stem}_{}_DIFF {} 0 {} {rtn} 1",
-        spec.label, spec.diff, spec.input
-    )?;
-    emit_logic_receiver(
-        output,
-        io,
-        spec.diff,
-        spec.state,
-        spec.hyst_model,
-        polarity,
-        false,
-    )
+    writeln!(output, "E__{stem}_{label}_DIFF {diff} 0 {input} {rtn} 1")?;
+    emit_logic_receiver(output, io, &diff, &state, &hyst_model, polarity, false)?;
+    Ok(state)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1766,14 +1751,8 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
     for node in [out, out_bar, rtn, set, reset] {
         validate_node(node)?;
     }
-    let set_diff = format!("__{stem}_S_DIFF");
-    let reset_diff = format!("__{stem}_R_DIFF");
-    let set_state = format!("__{stem}_S_STATE");
-    let reset_state = format!("__{stem}_R_STATE");
     let latch_input = format!("__{stem}_LATCH_IN");
     let raw_state = format!("__{stem}_RAW_STATE");
-    let set_model = format!("__{stem}_S_HYST_M");
-    let reset_model = format!("__{stem}_R_HYST_M");
     let latch_model = format!("__{stem}_LATCH_HYST_M");
     let io = LogicIo {
         rin: model.rin,
@@ -1785,24 +1764,9 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
         threshold: model.threshold,
     };
     let mut output = String::new();
-    for spec in [
-        SrInput {
-            label: "S",
-            input: set,
-            diff: &set_diff,
-            state: &set_state,
-            hyst_model: &set_model,
-        },
-        SrInput {
-            label: "R",
-            input: reset,
-            diff: &reset_diff,
-            state: &reset_state,
-            hyst_model: &reset_model,
-        },
-    ] {
-        emit_sr_hysteretic_input(&mut output, io, stem, rtn, &spec, input_polarity)?;
-    }
+    let set_state = emit_sr_hysteretic_input(&mut output, io, stem, rtn, "S", set, input_polarity)?;
+    let reset_state =
+        emit_sr_hysteretic_input(&mut output, io, stem, rtn, "R", reset, input_polarity)?;
     let (set_weight, reset_weight) = behavior.weights();
     let command = format!("{set_weight}*v({set_state})-{reset_weight}*v({reset_state})");
     let command = if initial == 1 {
