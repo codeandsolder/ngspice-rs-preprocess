@@ -32,4 +32,7 @@ cargo run --locked -p model-translate-simplis --example logic_ngspice -- \
 cargo run --locked -p ngspice-rs-preprocess --example logic_bundle_ngspice -- \
     "$temporary/reference/lib/ngspice"
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
-cargo build --locked --workspace --release
+# Production release builds use the default members; experimental crates
+# remain an explicit opt-in and are tested by the workspace-wide checks above.
+cargo build --locked --release
+cargo build --locked -p model-alb-experimental -p model-alb-xspice-ffi --release

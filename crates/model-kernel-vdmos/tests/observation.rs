@@ -1,6 +1,6 @@
 //! Observation laws must never modify the electrical or thermal residual.
 use model_kernel_vdmos::{
-    Bias, Instance, Model, ParameterError, Polarity, compile_ngspice,
+    Bias, Instance, Model, ParameterError, Polarity, PreparedModel, compile_ngspice,
     observation::{ObservationTemperature, SoaQuantity, SoaSample},
 };
 use model_normalize_ngspice::{model_card::parse_model_cards, vdmos_card::vdmos_literals};
@@ -225,6 +225,38 @@ const fn warning_name(quantity: SoaQuantity) -> &'static str {
     }
 }
 
+// Use the kernel's constitutive value, not the diagnostic data, to
+// independently check that explicit diagnostic fields leave DC intact.
+fn check_independent_channel(
+    model: &PreparedModel,
+    fixture: &str,
+    polarity: Polarity,
+    vgs: f64,
+    vds: f64,
+    temp: f64,
+    output: &str,
+) -> Result<()> {
+    let point = model.bind(Instance::default())?.evaluate(Bias {
+        vgs,
+        vds,
+        vds_external: vds,
+        vdiode: -vds * polarity.sign(),
+        temperature: temp,
+        ..Bias::default()
+    })?;
+    let expected = value(output, "@m1[id]")?;
+    assert!(
+        point
+            .channel
+            .value
+            .mul_add(polarity.sign(), -expected)
+            .abs()
+            < 2e-5 * expected.abs().max(1.),
+        "{fixture}"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires installed ngspice 47 C reference"]
 fn independent_native_diagnostic_warning_oracle() -> Result<()> {
@@ -309,27 +341,8 @@ fn independent_native_diagnostic_warning_oracle() -> Result<()> {
                     <= 5e-4 * reference_limit.abs().max(1.)
             );
         }
-        // Use the kernel's constitutive value, not the diagnostic data, to
-        // independently check that explicit diagnostic fields leave DC intact.
         if let ObservationTemperature::Fixed(temp) = temperature {
-            let point = model.bind(Instance::default())?.evaluate(Bias {
-                vgs,
-                vds,
-                vds_external: vds,
-                vdiode: -vds * polarity.sign(),
-                temperature: temp,
-                ..Bias::default()
-            })?;
-            let expected = value(&output, "@m1[id]")?;
-            assert!(
-                point
-                    .channel
-                    .value
-                    .mul_add(polarity.sign(), -expected)
-                    .abs()
-                    < 2e-5 * expected.abs().max(1.),
-                "{fixture}"
-            );
+            check_independent_channel(&model, fixture, polarity, vgs, vds, temp, &output)?;
         }
     }
     Ok(())
