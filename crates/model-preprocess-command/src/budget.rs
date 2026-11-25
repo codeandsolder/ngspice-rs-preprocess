@@ -132,6 +132,7 @@ impl WorkBudget {
             "{}",
             state.failure.as_deref().unwrap_or_default()
         );
+        drop(state);
         Ok(())
     }
 
@@ -164,12 +165,14 @@ impl WorkBudget {
         let counter = resource.counter(&mut state.remaining);
         if let Some(remaining) = counter.checked_sub(amount) {
             *counter = remaining;
+            drop(state);
             Ok(())
         } else {
             let error = format!(
                 "cumulative preprocessing {resource:?} budget exceeded (requested {amount}, remaining {counter})"
             );
             state.failure = Some(error.clone());
+            drop(state);
             Err(anyhow::anyhow!(error))
         }
     }
@@ -193,8 +196,10 @@ impl WorkBudget {
             let error =
                 format!("cumulative preprocessing recursion depth budget exceeded ({limit})");
             state.failure = Some(error.clone());
+            drop(state);
             return Err(anyhow::anyhow!(error));
         }
+        drop(state);
         Ok(())
     }
 
@@ -218,9 +223,11 @@ impl WorkBudget {
             let error =
                 format!("cumulative preprocessing recursion depth budget exceeded ({limit})");
             state.failure = Some(error.clone());
+            drop(state);
             return Err(anyhow::anyhow!(error));
         }
         state.depth += 1;
+        drop(state);
         Ok(DepthGuard(self.clone()))
     }
 }

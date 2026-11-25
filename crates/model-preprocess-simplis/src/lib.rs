@@ -896,10 +896,12 @@ fn get_option_function(name: &str, args: &[Value], env: &Environment) -> Result<
     let Value::Text(option_name) = &args[0] else {
         bail!("{name} option name must be a string");
     };
-    Ok(env
-        .get_option(option_name)
-        .cloned()
-        .unwrap_or_else(|| Value::Text("FALSE".to_owned())))
+    if let Some(value) = env.get_option(option_name) {
+        value.charge_copy(&env.budget)?;
+        Ok(value.clone())
+    } else {
+        Ok(Value::Text("FALSE".to_owned()))
+    }
 }
 
 fn vector_add_sub(left: Value, right: Value, add: bool, eval: Evaluation<'_>) -> Result<Value> {
@@ -1207,7 +1209,12 @@ fn while_limit(expression: Option<&str>, env: &Environment) -> Result<usize> {
     Ok(count)
 }
 
-fn find_if_bounds(lines: &[&str], start: usize, end: usize) -> Result<(Option<usize>, usize)> {
+fn find_if_bounds(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    budget: &WorkBudget,
+) -> Result<(Option<usize>, usize)> {
     let mut depth = 1usize;
     let mut else_index = None;
     for (index, line) in lines
@@ -1216,6 +1223,8 @@ fn find_if_bounds(lines: &[&str], start: usize, end: usize) -> Result<(Option<us
         .take(end)
         .skip(start.saturating_add(1))
     {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, line.len())?;
         if directive(line, "IF").is_some() {
             depth = depth.saturating_add(1);
         } else if directive(line, "ENDIF").is_some() {
@@ -1235,7 +1244,7 @@ fn find_if_bounds(lines: &[&str], start: usize, end: usize) -> Result<(Option<us
     bail!("unterminated SIMPLIS .IF at line {}", start + 1)
 }
 
-fn find_while_end(lines: &[&str], start: usize, end: usize) -> Result<usize> {
+fn find_while_end(lines: &[&str], start: usize, end: usize, budget: &WorkBudget) -> Result<usize> {
     let mut depth = 1usize;
     for (index, line) in lines
         .iter()
@@ -1243,6 +1252,8 @@ fn find_while_end(lines: &[&str], start: usize, end: usize) -> Result<usize> {
         .take(end)
         .skip(start.saturating_add(1))
     {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, line.len())?;
         if directive(line, "WHILE").is_some() {
             depth = depth.saturating_add(1);
         } else if directive(line, "ENDWHILE").is_some() {
@@ -1331,11 +1342,7 @@ fn process_range(
             .budget
             .charge(Resource::ScannedBytes, line.len())?;
         if let Some(condition) = directive(line, "IF") {
-            let (else_index, endif_index) = find_if_bounds(lines, index, end)?;
-            state
-                .env
-                .budget
-                .charge(Resource::Statements, endif_index - index)?;
+            let (else_index, endif_index) = find_if_bounds(lines, index, end, &state.env.budget)?;
             let active = Evaluation::new(state.env)
                 .truthy(&eval_expression(unwrap_then(condition), state.env)?)?;
             *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
@@ -1356,11 +1363,7 @@ fn process_range(
             bail!("unexpected SIMPLIS IF terminator at line {}", index + 1);
         }
         if let Some(header) = directive(line, "WHILE") {
-            let endwhile_index = find_while_end(lines, index, end)?;
-            state
-                .env
-                .budget
-                .charge(Resource::Statements, endwhile_index - index)?;
+            let endwhile_index = find_while_end(lines, index, end, &state.env.budget)?;
             process_while(lines, index, endwhile_index, header, state)?;
             index = endwhile_index.saturating_add(1);
             continue;

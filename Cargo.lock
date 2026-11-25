@@ -237,6 +237,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "model-normalize-ngspice",
+ "model-preprocess-command",
  "model-preprocess-simplis",
  "serde",
  "serde_json",

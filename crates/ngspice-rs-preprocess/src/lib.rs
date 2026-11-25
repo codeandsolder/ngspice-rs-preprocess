@@ -275,7 +275,13 @@ fn native(
         },
         session,
     )?;
+    session
+        .budget()
+        .charge(Resource::ScannedBytes, linked.bytes.len())?;
     let normalized = normalize_mapped(&linked.bytes, kind)?;
+    session
+        .budget()
+        .charge(Resource::EmittedBytes, normalized.model.bytes.len())?;
     let lines = normalized
         .input_lines
         .into_iter()
@@ -368,7 +374,7 @@ pub fn prepare(
     if request.format == InputFormat::SimetrixDeck
         && options.conditioning == ConditioningPolicy::PrivateDifferentiators
     {
-        condition_generated_bundle(&mut result)?;
+        condition_generated_bundle(&mut result, &budget)?;
     }
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     for declaration in &result.waveforms {
@@ -391,9 +397,9 @@ pub fn prepare(
     Ok(result)
 }
 
-fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
+fn condition_generated_bundle(bundle: &mut PreparedBundle, budget: &WorkBudget) -> Result<()> {
     use model_normalize_ngspice::conditioning::{
-        ConditioningInput, condition_private_differentiators,
+        ConditioningInput, condition_private_differentiators_with_budget,
     };
     let inputs = bundle
         .artifacts()
@@ -402,10 +408,11 @@ fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
             bytes: &artifact.bytes,
         })
         .collect::<Vec<_>>();
-    let outputs = condition_private_differentiators(
+    let outputs = condition_private_differentiators_with_budget(
         &inputs,
         bundle.initial_conditions.as_ref(),
         &bundle.waveforms,
+        budget,
     )?;
     let mut changed = false;
     for (artifact, output) in std::iter::once(&mut bundle.primary)

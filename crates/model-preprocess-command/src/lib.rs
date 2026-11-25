@@ -243,6 +243,7 @@ impl SourceSession {
         path: PathBuf,
         read: impl FnOnce(&Self, &Path) -> Result<Arc<[u8]>>,
     ) -> Result<AdmittedSource> {
+        self.budget.check()?;
         if let Some(snapshot) = self.sources.get(&path) {
             let bytes = snapshot
                 .as_ref()

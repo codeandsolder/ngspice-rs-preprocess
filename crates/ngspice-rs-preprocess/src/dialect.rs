@@ -21,8 +21,8 @@ use model_preprocess_simplis::{
 };
 use model_translate_simplis::{
     capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
-    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
-    translate_simplis_expanded_library,
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime,
+    translate_simplis_deck_with_budget, translate_simplis_expanded_library_with_budget,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -558,9 +558,9 @@ fn expanded(
         &mut waveforms,
     )?;
     let translated = if include {
-        translate_simplis_expanded_library(&source)?
+        translate_simplis_expanded_library_with_budget(&source, budget)?
     } else {
-        translate_simplis_deck(&source)?
+        translate_simplis_deck_with_budget(&source, budget)?
     };
     check_closed_includes(&translated.bytes, &BTreeSet::new())?;
     let artifact = generated(
@@ -584,11 +584,12 @@ fn translate_companions(
     root_sources: &BTreeSet<String>,
     initial_conditions: &mut Option<super::passive_ic::InitialConditions>,
     mut remaining: usize,
+    budget: &model_preprocess_command::WorkBudget,
 ) -> Result<(Vec<Artifact>, Vec<String>)> {
     let mut companions = Vec::new();
     let mut dependencies = Vec::new();
     for library in &linked.libraries {
-        let mut translated = translate_simplis_expanded_library(&library.bytes)
+        let mut translated = translate_simplis_expanded_library_with_budget(&library.bytes, budget)
             .with_context(|| format!("translating linked library {}", library.source_id))?;
         if let Some(policy) = &mut *initial_conditions {
             capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
@@ -687,7 +688,8 @@ fn linked(
         .iter()
         .map(|library| library.filename.as_str())
         .collect::<BTreeSet<_>>();
-    let mut translated_root = translate_simplis_deck(&linked.root_bytes)?;
+    let mut translated_root =
+        translate_simplis_deck_with_budget(&linked.root_bytes, session.budget())?;
     if request.format == InputFormat::SimplisDeck {
         initial_conditions = Some(super::passive_ic::InitialConditions {
             mode: Some("1".to_owned()),
@@ -710,6 +712,7 @@ fn linked(
         &root_sources,
         &mut initial_conditions,
         remaining,
+        session.budget(),
     )?;
     let primary = generated(
         "deck.cir".to_owned(),
