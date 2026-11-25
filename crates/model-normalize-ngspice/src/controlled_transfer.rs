@@ -541,7 +541,10 @@ fn emit_table(
     match &source.control {
         Control::Expression(expression) => {
             write!(text, " TABLE {{{expression}}}=")?;
-            for [x, y] in points {
+            for (index, [x, y]) in points.iter().enumerate() {
+                if index != 0 {
+                    text.push(' ');
+                }
                 write!(text, "({},{})", native_scalar(x), native_scalar(y))?;
             }
         }
@@ -674,7 +677,17 @@ pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
         };
         let generated = match &transfer.transfer {
             Transfer::Table { points, multiplier } => {
-                if !wrapped && !table_needs_rewrite(points, multiplier.as_deref()) {
+                // ngspice parses adjacent tuples containing braced ordinates
+                // incorrectly. Separate the tuples even when already braced.
+                let symbolic_expression_table = matches!(transfer.control, Control::Expression(_))
+                    && points
+                        .iter()
+                        .flatten()
+                        .any(|value| crate::model_card::parse_spice_constant(value).is_err());
+                if !wrapped
+                    && !symbolic_expression_table
+                    && !table_needs_rewrite(points, multiplier.as_deref())
+                {
                     continue;
                 }
                 emit_table(&transfer, points, multiplier.as_deref())?
@@ -687,6 +700,9 @@ pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
                 statement.line,
             )?,
         };
+        if generated.as_bytes() == text {
+            continue;
+        }
         let physical = input[statement.start..]
             .split_inclusive(|b| *b == b'\n')
             .next()
@@ -856,7 +872,7 @@ mod tests {
         let output = normalize_ngspice(input)?;
         assert_eq!(
             output.bytes,
-            b"Gtab p 0 TABLE {v(in)}=({lo},0)({hi},{gain}) m={mult}"
+            b"Gtab p 0 TABLE {v(in)}=({lo},0) ({hi},{gain}) m={mult}"
         );
         assert!(parse("E1 p 0 TABLE {v(in)}=(0,1)(1,2)(0,3)").is_err());
         assert!(parse("E1 p 0 TABLE {v(in)}=0 (1,2) 3").is_err());

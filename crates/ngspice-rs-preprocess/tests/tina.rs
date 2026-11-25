@@ -143,3 +143,34 @@ fn tina_container_is_not_a_netlist() -> Result<()> {
     assert!(format!("{error:#}").contains("plaintext SPICE netlist"));
     Ok(())
 }
+
+#[test]
+fn tina_parameterized_table_preserves_instance_scope() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let deck = directory.path().join("table.cir");
+    fs::write(
+        &deck,
+        "TINA table scope reference\n.param scale=10 gain=100\nVinput in 0 0\n.subckt mapper a b PARAMS : gain=2 .param scale=500m\nEtab b 0 TABLE {V(a)*scale} = (0,0)(1,{gain})(2,{gain+1})\n.ends mapper\nX1 in out mapper PARAMS : gain=4\nX2 in other mapper\n.control\nset numdgt=17\nset wr_singlescale\ndc Vinput 0.5 3.5 1\nwrdata dc.dat v(out) v(other)\nquit\n.endc\n.end\n",
+    )?;
+    let result = prepared(InputFormat::TinaDeck, &deck)?;
+    let native = directory.path().join("native.cir");
+    fs::write(&native, &result.primary.bytes)?;
+    let simulation = Command::new("ngspice")
+        .current_dir(directory.path())
+        .args(["-b", "-n", "native.cir"])
+        .output()?;
+    assert!(simulation.status.success(), "{simulation:?}");
+    let dc = rows(&directory.path().join("dc.dat"))?;
+    assert_eq!(dc.len(), 4);
+    for row in dc {
+        let [input, out, other] = row.as_slice() else {
+            anyhow::bail!("unexpected DC columns");
+        };
+        let x = input * 0.5;
+        for (gain, actual) in [(4.0, out), (2.0, other)] {
+            let expected = if x < 1.0 { x * gain } else { gain + x - 1.0 };
+            assert!((actual - expected).abs() < 1e-10, "{actual} vs {expected}");
+        }
+    }
+    Ok(())
+}
