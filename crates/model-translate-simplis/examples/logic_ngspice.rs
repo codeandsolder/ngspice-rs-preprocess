@@ -35,13 +35,8 @@ fn run_native(runtime: &Path, source: &str, control: &str) -> Result<String> {
     Ok(stdout)
 }
 
-fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result<()> {
-    let mut control = String::from("tran 10n 9u\n");
-    for (index, (node, time, _)) in checks.iter().enumerate() {
-        writeln!(control, "meas tran check{index} find v({node}) at={time}u")?;
-    }
-    let stdout = run_native(runtime, source, &control)?;
-    let actual = stdout
+fn measurements(stdout: &str) -> BTreeMap<usize, f64> {
+    stdout
         .lines()
         .filter_map(|line| {
             let (key, value) = line.split_once('=')?;
@@ -50,7 +45,16 @@ fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result
                 value.split_whitespace().next()?.parse::<f64>().ok()?,
             ))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect()
+}
+
+fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result<()> {
+    let mut control = String::from("tran 10n 9u\n");
+    for (index, (node, time, _)) in checks.iter().enumerate() {
+        writeln!(control, "meas tran check{index} find v({node}) at={time}u")?;
+    }
+    let stdout = run_native(runtime, source, &control)?;
+    let actual = measurements(&stdout);
     for (index, (node, time, expected)) in checks.iter().enumerate() {
         let value = *actual
             .get(&index)
@@ -546,6 +550,227 @@ fn switch_startup_and_load_lines(runtime: &Path) -> Result<()> {
     verify(runtime, &source, &checks)
 }
 
+// Direct SIMetrix 9.40d printed waveform samples from a 1 V biased
+// switch. Reference maxstep 0.25 ns, print interval 1 ns, RELTOL=1e-6.
+fn check_timed_switch(
+    runtime: &Path,
+    drive: &str,
+    tolerance: &str,
+    samples: &[(f64, f64)],
+) -> Result<()> {
+    let source = format!(
+        "Vref rtn 0 0.75\nVdrive a rtn {drive}\nVbias p rtn 1\nS1 p rtn a rtn m IC=0\n.model m VSWITCH(RON=10 ROFF=1Meg VT=2.5 VH=0.5 TON=100n TOFF=200n TD_ON=500n TD_OFF=300n TIMETOL={tolerance} GIN=0.125)\n.options reltol=1e-6 abstol=1e-13\n.end\n"
+    );
+    let mut control = String::from("tran 1n 6u 0 0.25n\n");
+    for (index, (time, _)) in samples.iter().enumerate() {
+        writeln!(control, "meas tran check{index} find i(vbias) at={time}n")?;
+    }
+    let stdout = run_native(runtime, &source, &control)?;
+    let values = measurements(&stdout);
+    for (index, (time, expected)) in samples.iter().enumerate() {
+        let actual = -*values
+            .get(&index)
+            .with_context(|| format!("missing switch current at {time} ns: {stdout}"))?;
+        ensure!(
+            (actual - expected).abs() <= expected.abs() * 0.002 + 1e-12,
+            "TIMETOL={tolerance}, {time} ns: {actual} A != vendor {expected} A"
+        );
+    }
+    Ok(())
+}
+
+fn timed_switch_vendor_waveforms(runtime: &Path) -> Result<()> {
+    let baseline = "PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)";
+    let baseline_samples = [
+        (0.0, 1e-6),
+        (1550.0, 1e-6),
+        (3500.0, 1e-6),
+        (3510.0, 1.05512e-6),
+        (3540.0, 2.19091e-5),
+        (3560.0, 0.000_629_491),
+        (3580.0, 0.014_503_464),
+        (3600.0, 0.088_730_93),
+        (3610.0, 0.1),
+        (4300.0, 0.1),
+        (4310.0, 0.098_649_46),
+        (4350.0, 0.024_021_974),
+        (4400.0, 0.000_530_782),
+        (4450.0, 9.04963e-6),
+        (4500.0, 1.03098e-6),
+        (4520.0, 1e-6),
+    ];
+    for tolerance in ["1f", "1p", "10p", "100p", "1n", "10n", "100n"] {
+        check_timed_switch(runtime, baseline, tolerance, &baseline_samples)?;
+    }
+
+    // Pulse width exactly equal to propagation delay has no excursion.
+    // Width equal to delay + slew duration reverses at the endpoint;
+    // a longer pulse reaches a stable rail and incurs the turn-off delay.
+    for (width, samples) in [
+        (
+            499,
+            [
+                (1507.0, 1e-6),
+                (1606.0, 1e-6),
+                (1700.0, 1e-6),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            500,
+            [
+                (1507.0, 1e-6),
+                (1606.0, 1e-6),
+                (1700.0, 1e-6),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            501,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 1e-6),
+                (1700.0, 1e-6),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            550,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 6.04492e-6),
+                (1700.0, 1e-6),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            599,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 0.099_236_131),
+                (1700.0, 0.000_409_877),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            600,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 0.099_999_991),
+                (1700.0, 0.000_530_782),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            601,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 0.099_999_991),
+                (1700.0, 0.1),
+                (1900.0, 0.1),
+            ],
+        ),
+        (
+            650,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 0.099_999_991),
+                (1700.0, 0.1),
+                (1900.0, 0.1),
+            ],
+        ),
+    ] {
+        let end = 1000 + width;
+        let drive = format!("PWL(0 0 1u 0 1.01u 5 {end}n 5 {}n 0 6u 0)", end + 10);
+        check_timed_switch(runtime, &drive, "10p", &samples)?;
+    }
+    check_timed_switch(
+        runtime,
+        "PWL(0 5 1u 5 1.01u 0 1.35u 0 1.36u 5 6u 5)",
+        "10p",
+        &[
+            (0.0, 0.1),
+            (1300.0, 0.1),
+            (1356.0, 0.016_553_53),
+            (1380.0, 0.099_654_058),
+            (1400.0, 0.1),
+        ],
+    )
+}
+
+fn timed_switch_runtime_parameters(runtime: &Path) -> Result<()> {
+    let source = "Vref rtn 0 0.75
+Vdrive a rtn 2.5
+Vbias p rtn 1
+X1 p rtn a rtn T
+.subckt T p n cp cn params: R=10 OFF=1Meg TOL=100p INIT=1
+S1 p n cp cn M IC={INIT}
+.model M VSWITCH(RON={max(R,1)}, ROFF={OFF}, VT=2.5, VH=0.5, TIMETOL={max(TOL,1p)}, GIN=0.125)
+.ends T
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "tran 10n 1u\nmeas tran check0 find i(vbias) at=0\nmeas tran check1 find i(vdrive) at=0\n",
+    )?;
+    let actual = measurements(&stdout);
+    for (index, expected) in [-0.1, -0.3125].into_iter().enumerate() {
+        let value = *actual
+            .get(&index)
+            .with_context(|| format!("missing runtime measurement: {stdout}"))?;
+        ensure!(
+            (value - expected).abs() <= 1e-8,
+            "runtime measurement {index}: {value} != {expected}"
+        );
+    }
+    Ok(())
+}
+
+fn timed_switch_small_signal_and_stiff_load(runtime: &Path) -> Result<()> {
+    let source = "Vdrive a 0 DC 5 AC 1
+Vbias p 0 DC 1 AC 1
+S1 p 0 a 0 M IC=0
+.model M VSWITCH(RON=10 ROFF=1Meg VT=2.5 VH=0.5 GIN=0.125)
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "ac lin 3 1k 3k\nlet ib=real(i(vbias))\nlet ic=real(i(vdrive))\nmeas ac check0 find ib at=2k\nmeas ac check1 find ic at=2k\n",
+    )?;
+    let actual = measurements(&stdout);
+    for (index, expected) in [-0.1, -0.125].into_iter().enumerate() {
+        let value = *actual
+            .get(&index)
+            .with_context(|| format!("missing AC measurement: {stdout}"))?;
+        ensure!(
+            (value - expected).abs() <= 1e-8,
+            "AC measurement {index}: {value} != {expected}"
+        );
+    }
+    let source = "Vdrive a 0 5
+Vbias p 0 1
+Rload p b 1
+S1 b 0 a 0 M IC=0
+.model M VSWITCH(RON=1n ROFF=1T VT=2.5 VH=0.5)
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "tran 10n 1u\nmeas tran check0 find v(b) at=0.5u\n",
+    )?;
+    let value = *measurements(&stdout)
+        .get(&0)
+        .with_context(|| format!("missing stiff load measurement: {stdout}"))?;
+    ensure!(
+        (value - 1e-9 / (1.0 + 1e-9)).abs() < 1e-14,
+        "stiff load voltage {value}"
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -563,6 +788,9 @@ fn main() -> Result<()> {
     vendor_timing(&runtime)?;
     threshold_plateau_and_latch_cancellation(&runtime)?;
     switch_startup_and_load_lines(&runtime)?;
+    timed_switch_vendor_waveforms(&runtime)?;
+    timed_switch_runtime_parameters(&runtime)?;
+    timed_switch_small_signal_and_stiff_load(&runtime)?;
     println!("All native ngspice logic regressions passed");
     Ok(())
 }

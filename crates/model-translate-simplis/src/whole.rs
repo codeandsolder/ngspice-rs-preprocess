@@ -5,9 +5,9 @@ use super::{
     LogicGateSpec, LogicIo, LogicOperation, LogicOutput, LogicPolarity, LogicReceiver,
     LogicThresholds, LogicTiming, Point, Translation, TranslationKind, emit_digital_buffer,
     emit_logic_event, emit_logic_gate, emit_logic_input_loads, emit_logic_output,
-    emit_logic_voltage, indexed_points, integer_parameter, normalized_statement, numeric_parameter,
-    parse_assignments, sanitized_name, statement_tokens, translate_charge_capacitor,
-    translate_ipwlr, translate_vpwlr, validate_node, write_number,
+    emit_logic_voltage, indexed_points, integer_parameter, model_statement_tokens,
+    normalized_statement, numeric_parameter, parse_assignments, sanitized_name, statement_tokens,
+    translate_charge_capacitor, translate_ipwlr, translate_vpwlr, validate_node, write_number,
 };
 use crate::alb::{
     KnownTruthTable, StatefulProgram, TimedCombinationalGraph, TimingEnvironment, analyze_body,
@@ -1201,6 +1201,7 @@ struct SimetrixTimedVswitch {
     toff: RuntimeNumeric,
     td_on: RuntimeNumeric,
     td_off: RuntimeNumeric,
+    timetol: RuntimeNumeric,
     gin: RuntimeNumeric,
 }
 
@@ -1273,6 +1274,7 @@ fn parse_vswitch_transfer(
         td
     };
     let gin = runtime_numeric_or(parameters, "GIN", 0.0)?;
+    let timetol = runtime_numeric_or(parameters, "TIMETOL", 10.0e-12)?;
     for (name, value, allow_zero) in [
         ("VH", &vh, true),
         ("TON", &ton, false),
@@ -1280,6 +1282,7 @@ fn parse_vswitch_transfer(
         ("TD_ON", &td_on, true),
         ("TD_OFF", &td_off, true),
         ("GIN", &gin, true),
+        ("TIMETOL", &timetol, true),
     ] {
         if let RuntimeNumeric::Constant(value) = value
             && (*value < 0.0 || (!allow_zero && *value == 0.0))
@@ -1287,11 +1290,27 @@ fn parse_vswitch_transfer(
             bail!("invalid timed VSWITCH {name} on model {model_name}");
         }
     }
-    if let Some(value) = parameters.get("TIMETOL") {
-        let timetol = runtime_numeric_value("TIMETOL", value)?;
-        if !matches!(timetol, RuntimeNumeric::Constant(value) if (value - 10.0e-12).abs() <= 1.0e-24)
-        {
-            bail!("non-default timed VSWITCH TIMETOL is not yet supported");
+    if let RuntimeNumeric::Constant(value) = timetol
+        && value < 1.0e-15
+    {
+        bail!("timed VSWITCH TIMETOL below 1 fs on {model_name}");
+    }
+    for name in parameters.keys() {
+        if !matches!(
+            name.as_str(),
+            "RON"
+                | "ROFF"
+                | "VT"
+                | "VH"
+                | "TON"
+                | "TOFF"
+                | "TD"
+                | "TD_ON"
+                | "TD_OFF"
+                | "TIMETOL"
+                | "GIN"
+        ) {
+            bail!("unsupported timed VSWITCH model parameter {name} on {model_name}");
         }
     }
     Ok(VcswTransfer::SimetrixTimedHysteresis(
@@ -1304,6 +1323,7 @@ fn parse_vswitch_transfer(
             toff,
             td_on,
             td_off,
+            timetol,
             gin,
         },
     ))
@@ -1319,8 +1339,7 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
         return Ok(None);
     }
     let normalized = normalized_statement(statement);
-    let separated = normalized.replace(['(', ')', ','], " ");
-    let tokens = statement_tokens(&separated)?;
+    let tokens = model_statement_tokens(&normalized)?;
     if tokens.len() < 3 {
         return Ok(None);
     }
@@ -3220,89 +3239,46 @@ fn emit_simetrix_timed_vswitch(
         bail!("timed VSWITCH IC must be 0 or 1");
     }
     let stem = sanitized_name(&instance.tokens[0]);
-    let vt = runtime_numeric_expression(&model.vt)?;
-    let vh = runtime_numeric_expression(&model.vh)?;
-    let ton = runtime_numeric_expression(&model.ton)?;
-    let toff = runtime_numeric_expression(&model.toff)?;
-    let td_on = runtime_numeric_expression(&model.td_on)?;
-    let td_off = runtime_numeric_expression(&model.td_off)?;
-    let ron = runtime_numeric_expression(&model.ron)?;
-    let roff = runtime_numeric_expression(&model.roff)?;
-    let gin = runtime_numeric_expression(&model.gin)?;
-    let ic = runtime_numeric_expression(&ic)?;
-    let control = format!("__{stem}_TIMED_CTRL");
-    let raw = format!("__{stem}_TIMED_RAW");
-    let delayed_on = format!("__{stem}_TIMED_ON");
-    let delayed_off = format!("__{stem}_TIMED_OFF");
-    let event = format!("__{stem}_TIMED_EVENT");
-    let latched = format!("__{stem}_TIMED_LATCHED");
-    let phase = format!("__{stem}_TIMED_PHASE");
+    let model_name = format!("__{stem}_TIMED_M");
     let mut output = String::new();
-    let sensed_control = format!("v({},{})", instance.control_p, instance.control_n);
     writeln!(
         output,
-        "B__{stem}_TIMED_CTRL {control} 0 V='(time<=0 ? (({sensed_control})>(({vt})+({vh})) ? ({sensed_control}) : (({sensed_control})<(({vt})-({vh})) ? ({sensed_control}) : (({ic})>=0.5 ? (({vt})+({vh}))+1 : (({vt})-({vh}))-1))) : ({sensed_control}))'"
+        "A__{stem}_TIMED %vd({} {}) %gd({} {}) {model_name}",
+        instance.control_p, instance.control_n, instance.tokens[1], instance.tokens[2]
     )?;
-    writeln!(
+    write!(output, ".model {model_name} preprocess_timed_switch(")?;
+    for (index, (name, value)) in [
+        ("ron", &model.ron),
+        ("roff", &model.roff),
+        ("vt", &model.vt),
+        ("vh", &model.vh),
+        ("ton", &model.ton),
+        ("toff", &model.toff),
+        ("td_on", &model.td_on),
+        ("td_off", &model.td_off),
+        ("timetol", &model.timetol),
+        ("ic", &ic),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index != 0 {
+            output.push(' ');
+        }
+        write!(output, "{name}=")?;
+        write_runtime_numeric(&mut output, value)?;
+    }
+    output.push_str(")\n");
+    write!(
         output,
-        "A__{stem}_TIMED_RAW {control} {raw} __{stem}_TIMED_RAW_HYST"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_RAW_HYST hyst(in_low={{{vt}}} in_high={{{vt}}} hyst={{{vh}}} out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)"
-    )?;
-    writeln!(
-        output,
-        "A__{stem}_TIMED_ON {raw} {delayed_on} 0 __{stem}_TIMED_ON_DELAY"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_ON_DELAY delay(delay={{{td_on}}})"
-    )?;
-    writeln!(
-        output,
-        "A__{stem}_TIMED_OFF {raw} {delayed_off} 0 __{stem}_TIMED_OFF_DELAY"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_OFF_DELAY delay(delay={{{td_off}}})"
-    )?;
-    // Select the directional delayed state with the current Schmitt state. This keeps
-    // TD_ON and TD_OFF independent and cancels a pending edge if the control reverses
-    // before that edge's delay expires.
-    writeln!(
-        output,
-        "B__{stem}_TIMED_EVENT {event} 0 V='v({raw})*v({delayed_on})-(1-v({raw}))*(1-v({delayed_off}))'"
-    )?;
-    writeln!(
-        output,
-        "A__{stem}_TIMED_LATCH {event} {latched} __{stem}_TIMED_LATCH_HYST"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_LATCH_HYST hyst(in_low=0 in_high=0 hyst=0.5 out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)"
-    )?;
-    writeln!(
-        output,
-        "A__{stem}_TIMED_SLEW {latched} {phase} __{stem}_TIMED_SLEW"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_SLEW slew(rise_slope={{1/({ton})}} fall_slope={{1/({toff})}})"
-    )?;
-    writeln!(
-        output,
-        "B__{stem}_TIMED_BRANCH {} {} I='v({},{})*exp(-0.5*ln(({ron})*({roff}))-ln(({ron})/({roff}))*(v({phase})-0.5)*(1.5-2*(v({phase})-0.5)^2))'",
-        instance.tokens[1], instance.tokens[2], instance.tokens[1], instance.tokens[2]
-    )?;
-    writeln!(
-        output,
-        "G__{stem}_TIMED_GIN {} {} {} {} {{{gin}}}",
+        "G__{stem}_TIMED_GIN {} {} {} {} ",
         instance.control_p, instance.control_n, instance.control_p, instance.control_n
     )?;
+    write_runtime_numeric(&mut output, &model.gin)?;
+    output.push('\n');
     Ok(Translation {
         bytes: output.into_bytes(),
-        kind: TranslationKind::VoltageControlledSwitch,
+        kind: TranslationKind::TimedVoltageControlledSwitch,
     })
 }
 
@@ -7955,22 +7931,55 @@ S1 p n cp cn SW IC={IC}
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("TIMED_RAW_HYST hyst"));
-        assert!(text.contains("time<=0 ? ((v(cp,cn))>((TH)+(H))"));
-        assert!(text.contains("(v(cp,cn))<((TH)-(H))"));
-        assert!(text.contains("((IC)>=0.5 ? ((TH)+(H))+1 : ((TH)-(H))-1)"));
-        assert!(text.contains("delay(delay={TDON})"));
-        assert!(text.contains("A__S1_TIMED_OFF __S1_TIMED_RAW __S1_TIMED_OFF"));
-        assert!(text.contains("delay(delay={TDOFF})"));
-        assert!(text.contains(
-            "V='v(__S1_TIMED_RAW)*v(__S1_TIMED_ON)-(1-v(__S1_TIMED_RAW))*(1-v(__S1_TIMED_OFF))'"
-        ));
-        assert!(!text.contains("TIMED_INV"));
-        assert!(text.contains("slew(rise_slope={1/(TON)} fall_slope={1/(TOFF)})"));
-        assert!(text.contains("exp(-0.5*ln((RON)*(ROFF))"));
-        assert!(text.contains("G__S1_TIMED_GIN cp cn cp cn {0.00000000000000000e0}"));
+        assert_eq!(
+            translated.required_code_models,
+            vec![CodeModelRuntime::Logic]
+        );
+        assert_eq!(
+            translated.primitives,
+            vec![TranslationKind::TimedVoltageControlledSwitch]
+        );
+        assert!(text.contains("A__S1_TIMED %vd(cp cn) %gd(p n) __S1_TIMED_M"));
+        assert!(text.contains("preprocess_timed_switch(ron={RON} roff={ROFF} vt={TH} vh={H} ton={TON} toff={TOFF} td_on={TDON} td_off={TDOFF}"));
+        assert!(text.contains("ic={IC}"));
+        assert!(text.contains("G__S1_TIMED_GIN cp cn cp cn 0.00000000000000000e0"));
+        assert!(!text.contains("delay(delay="));
         assert!(!text.to_ascii_uppercase().contains(" VSWITCH"));
         Ok(())
+    }
+
+    #[test]
+    fn timed_switch_preserves_nested_runtime_expressions_and_tolerance() -> Result<()> {
+        let source = br".subckt T p n cp cn params: tol=1p R=10
+S1 p n cp cn SW IC=1
+.model SW VSWITCH(RON={max(R,1)}, ROFF=1Meg, VT=2.5, TIMETOL={max(tol,2p)}, TD=4n, TD_OFF=3n)
+.ends T
+.end
+";
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        assert!(text.contains("ron={max(R,1)}"));
+        assert!(text.contains("timetol={max(tol,2p)}"));
+        assert!(text.contains("td_on=4.00000000000000025e-9"));
+        assert!(
+            text.contains("td_off=3.00000000000000039e-9")
+                || text.contains("td_off=3.00000000000000000e-9")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timed_switch_rejects_negative_tolerance_and_unsupported_parameters() {
+        for extra in [
+            "TIMETOL=-1n",
+            "TIMETOL=0",
+            "TIMETOL=0.5f",
+            "TON=0",
+            "UNKNOWN=1",
+        ] {
+            let source = format!("S1 a 0 c 0 M IC=0\n.MODEL M VSWITCH VT=2.5 {extra}\n.end\n");
+            assert!(translate_simplis_deck(source.as_bytes()).is_err());
+        }
     }
 
     #[test]

@@ -51,6 +51,8 @@ pub enum TranslationKind {
     VoltageControlledSwitch,
     /// SIMPLIS switch with strict hysteresis and initial-state suggestion.
     HystereticSwitch,
+    /// SIMetrix voltage-controlled switch with explicit delay and slew phase.
+    TimedVoltageControlledSwitch,
     /// SIMPLIS LEVEL=1 simple transistor switch.
     TransistorSwitchLevel1,
     /// SIMPLIS LEVEL=2 transistor switch with active/saturated/reverse-biased regions.
@@ -118,6 +120,7 @@ impl TranslationKind {
             | Self::SrLatch
             | Self::SrFlipFlop
             | Self::HystereticSwitch
+            | Self::TimedVoltageControlledSwitch
             | Self::TransistorSwitchLevel1
             | Self::TransistorSwitchLevel2 => Some(CodeModelRuntime::Logic),
             _ => None,
@@ -561,12 +564,21 @@ fn parse_numeric(input: &str) -> Result<f64> {
 }
 
 fn statement_tokens(input: &str) -> Result<Vec<String>> {
+    tokenize_statement(input, false)
+}
+
+fn model_statement_tokens(input: &str) -> Result<Vec<String>> {
+    tokenize_statement(input, true)
+}
+
+fn tokenize_statement(input: &str, model_delimiters: bool) -> Result<Vec<String>> {
     if input.trim_start().starts_with('*') {
         return Ok(Vec::new());
     }
     let mut tokens = Vec::new();
     let mut token = String::new();
     let mut brace_depth = 0usize;
+    let mut model_depth = 0usize;
     let mut quote = false;
     for character in input.chars() {
         match character {
@@ -586,8 +598,28 @@ fn statement_tokens(input: &str) -> Result<Vec<String>> {
                     .ok_or_else(|| anyhow::anyhow!("unmatched SIMPLIS closing brace"))?;
                 token.push(character);
             }
+            '(' if model_delimiters && !quote && brace_depth == 0 => {
+                model_depth = model_depth
+                    .checked_add(1)
+                    .context("model parenthesis nesting overflow")?;
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            ')' if model_delimiters && !quote && brace_depth == 0 => {
+                model_depth = model_depth
+                    .checked_sub(1)
+                    .context("unmatched model closing parenthesis")?;
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
             ';' if !quote && brace_depth == 0 => break,
-            character if character.is_whitespace() && !quote && brace_depth == 0 => {
+            character
+                if (character.is_whitespace() || (model_delimiters && character == ','))
+                    && !quote
+                    && brace_depth == 0 =>
+            {
                 if !token.is_empty() {
                     tokens.push(std::mem::take(&mut token));
                 }
@@ -595,8 +627,8 @@ fn statement_tokens(input: &str) -> Result<Vec<String>> {
             _ => token.push(character),
         }
     }
-    if quote || brace_depth != 0 {
-        bail!("unterminated quote or brace in SIMPLIS statement");
+    if quote || brace_depth != 0 || model_depth != 0 {
+        bail!("unterminated quote, brace or model parenthesis in SIMPLIS statement");
     }
     if !token.is_empty() {
         tokens.push(token);

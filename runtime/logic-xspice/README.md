@@ -1,6 +1,6 @@
 # Event-based logic runtime for ngspice 47
 
-The SIMPLIS translator emits two XSPICE models for numbered AND/OR/NAND/NOR
+The SIMPLIS translator emits XSPICE models for numbered AND/OR/NAND/NOR
 gates, DIGITAL1 AND/OR and S-R latches, and classic SRFF. This runtime is
 independent of the experimental ALB runtime. Translation results advertise
 the required code-model library through `required_code_models`. The unified
@@ -53,3 +53,27 @@ The analog voltage bridge represents the state as an exact 0 or 1 for
 the branch current law. Simple switches preserve their specified RON
 and ROFF, while transistor switches retain their LEVEL=1 or LEVEL=2
 current law and support current as well as voltage control.
+
+Timed SIMetrix VSWITCH (the VT form) uses the separate
+`preprocess_timed_switch` model. Its differential voltage input has no
+implicit loading; the translator emits the specified GIN conductance.
+The branch has conductance
+
+    G(x) = exp(-log(ROFF) + x*x*(3 - 2*x)*(log(ROFF) - log(RON)))
+
+for phase x in [0,1], with exact reciprocal resistance at either endpoint.
+The phase moves at 1/TON or -1/TOFF. A stable endpoint starts moving only
+after the corresponding TD_ON or TD_OFF deadline; a threshold reversal
+during the ramp reverses it immediately without another delay. Equal
+pulse width and delay cancels the pending transition. A reversal exactly
+at ramp completion still belongs to the active ramp. DC initializes from
+the control and IC hint, and small-signal analysis freezes that state.
+Accepted analog history holds the phase anchor, requested direction and
+pending deadline so rejected solver trials cannot commit transitions.
+
+TIMETOL defaults to 10 ps and accepts values of at least 1 fs. It controls
+crossing localization, not the propagation delay or slew duration.
+Threshold crossings and ramp endpoints request solver breakpoints;
+actual localization remains limited by solver resolution. RON, ROFF,
+TON and TOFF must be positive, and delays nonnegative. Subcircuit
+parameter expressions are retained in the emitted model parameters.
