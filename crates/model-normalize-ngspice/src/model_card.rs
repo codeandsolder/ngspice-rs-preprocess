@@ -119,7 +119,7 @@ pub(crate) fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
         ensure!(
             field.explicit_equals,
             "parameter {} requires name=value",
-            &input[field.name.clone()]
+            &input[field.name]
         );
         parsed.push(ModelParameter::from_span(input, field));
     }
@@ -420,6 +420,7 @@ fn field_spans(
 }
 
 /// Parse model fields from a joined logical statement, retaining exact source spans.
+///
 /// For non-model statements, skip the optional model wrapper and scan top-level
 /// fields and positional tokens with the same lexical grammar.
 ///

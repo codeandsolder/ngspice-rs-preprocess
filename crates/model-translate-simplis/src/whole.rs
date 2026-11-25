@@ -532,9 +532,6 @@ fn raw_level17_model(
     }) {
         bail!("unsupported SIMetrix LEVEL=17 MOS parameter {unknown}");
     }
-    if integer_parameter(&parameters, "LEVEL")? != 17 {
-        return Ok(None);
-    }
     let vto = if parameters.contains_key("VTO") {
         numeric_parameter(&parameters, "VTO")?
     } else {
@@ -4383,62 +4380,7 @@ impl ScopeAnalysis {
             let normalized = normalized_statement(statement);
             let card = model_normalize_ngspice::model_card::parse_model_card(&normalized, 1, &[])?;
             self.collect_model_compatibility(&card, &name, &kind)?;
-            let translated = match kind.as_str() {
-                "NMOS" | "PMOS" => insert_unique_model(
-                    &mut self.level17,
-                    raw_level17_model(&card)?,
-                    "SIMetrix LEVEL=17 MOS model",
-                )?,
-                "PWLC" | "PWLL" => insert_unique_model(
-                    &mut self.reactive,
-                    raw_reactive_model(&card)?,
-                    "SIMPLIS reactive model",
-                )?,
-                "VPWLR" | "IPWLR" => {
-                    insert_unique_model(&mut self.pwl, raw_pwl_model(&card)?, "SIMPLIS PWL model")?
-                }
-                "COMP" => insert_unique_model(
-                    &mut self.comp,
-                    raw_comp_model(&card)?,
-                    "SIMPLIS COMP model",
-                )?,
-                "ADC_SCHMITT" => insert_unique_model(
-                    &mut self.adc_schmitt,
-                    raw_adc_schmitt_model(&card)?,
-                    "SIMetrix adc_schmitt model",
-                )?,
-                "ADC_BRIDGE" | "DAC_BRIDGE" => insert_unique_model(
-                    &mut self.native_bridges,
-                    native_bridge_model(&card)?,
-                    "mixed-signal bridge model",
-                )?,
-                "VCQPOS" | "VCQNEG" | "ICQPOS" | "ICQNEG" => insert_unique_model(
-                    &mut self.vcq,
-                    raw_vcq_model(&card)?,
-                    "SIMPLIS transistor-switch model",
-                )?,
-                "VCSW" | "ICSW" | "VSWITCH" => insert_unique_model(
-                    &mut self.vcsw,
-                    raw_vcsw_model(&card)?,
-                    "SIMPLIS VCSW model",
-                )?,
-                "SRFF" => insert_unique_model(
-                    &mut self.srff,
-                    raw_srff_model(&card)?,
-                    "SIMPLIS SRFF model",
-                )?,
-                "DIGITAL1" => insert_unique_model(
-                    &mut self.digital,
-                    raw_digital_model(&card)?,
-                    "SIMPLIS DIGITAL1 model",
-                )?,
-                numbered if numbered_logic_kind(numbered).is_some() => insert_unique_model(
-                    &mut self.numbered_logic,
-                    raw_numbered_logic_model(&card)?,
-                    "numbered SIMPLIS logic model",
-                )?,
-                _ => false,
-            };
+            let translated = self.dispatch_model(&card, &kind)?;
             let emission = if translated {
                 match kind.as_str() {
                     "NMOS" | "PMOS" => Some(emit_level17_core_model(
@@ -4470,6 +4412,63 @@ impl ScopeAnalysis {
             }
         }
         Ok(())
+    }
+
+    fn dispatch_model(
+        &mut self,
+        card: &model_normalize_ngspice::model_card::ModelCard,
+        kind: &str,
+    ) -> Result<bool> {
+        Ok(match kind {
+            "NMOS" | "PMOS" => insert_unique_model(
+                &mut self.level17,
+                raw_level17_model(card)?,
+                "SIMetrix LEVEL=17 MOS model",
+            )?,
+            "PWLC" | "PWLL" => insert_unique_model(
+                &mut self.reactive,
+                raw_reactive_model(card)?,
+                "SIMPLIS reactive model",
+            )?,
+            "VPWLR" | "IPWLR" => {
+                insert_unique_model(&mut self.pwl, raw_pwl_model(card)?, "SIMPLIS PWL model")?
+            }
+            "COMP" => {
+                insert_unique_model(&mut self.comp, raw_comp_model(card)?, "SIMPLIS COMP model")?
+            }
+            "ADC_SCHMITT" => insert_unique_model(
+                &mut self.adc_schmitt,
+                raw_adc_schmitt_model(card)?,
+                "SIMetrix adc_schmitt model",
+            )?,
+            "ADC_BRIDGE" | "DAC_BRIDGE" => insert_unique_model(
+                &mut self.native_bridges,
+                native_bridge_model(card)?,
+                "mixed-signal bridge model",
+            )?,
+            "VCQPOS" | "VCQNEG" | "ICQPOS" | "ICQNEG" => insert_unique_model(
+                &mut self.vcq,
+                raw_vcq_model(card)?,
+                "SIMPLIS transistor-switch model",
+            )?,
+            "VCSW" | "ICSW" | "VSWITCH" => {
+                insert_unique_model(&mut self.vcsw, raw_vcsw_model(card)?, "SIMPLIS VCSW model")?
+            }
+            "SRFF" => {
+                insert_unique_model(&mut self.srff, raw_srff_model(card)?, "SIMPLIS SRFF model")?
+            }
+            "DIGITAL1" => insert_unique_model(
+                &mut self.digital,
+                raw_digital_model(card)?,
+                "SIMPLIS DIGITAL1 model",
+            )?,
+            numbered if numbered_logic_kind(numbered).is_some() => insert_unique_model(
+                &mut self.numbered_logic,
+                raw_numbered_logic_model(card)?,
+                "numbered SIMPLIS logic model",
+            )?,
+            _ => false,
+        })
     }
 
     fn collect_model_compatibility(

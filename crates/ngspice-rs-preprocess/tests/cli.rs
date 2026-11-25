@@ -132,13 +132,22 @@ fn native_reference_dc_and_ac_through_unified_cli() -> Result<()> {
 
 #[test]
 fn translated_piecewise_resistor_matches_independent_dc_law() -> Result<()> {
+    let variants = [
+        "V1 a 0 0\n!R1 a 0 NSEG=2 X0=0 Y0=0 X1=1 Y1=1m X2=2 Y2=3m IC=1\n.end\n",
+        "V1 a 0 0\n!R1 a 0 M IC=1\n.MODEL M VPWLR NSEG=2 X0=0 Y0=0 X1=1 Y1=1m X2=2 Y2=3m\n.end\n",
+        "V1 a 0 0\n!R1 a 0 M IC=1\n.model M vpwlr (NSEG = 2, x0=0, y0=0, X1=1, Y1=999m,\n+ y1 = {0.5m + 0.5m}, x2=2, y2 = 3m)\n.end\n",
+    ];
+    for source in variants {
+        assert_piecewise_resistor_dc_law(source)?;
+    }
+    Ok(())
+}
+
+fn assert_piecewise_resistor_dc_law(source: &str) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("input.net");
     let output = dir.path().join("bundle");
-    fs::write(
-        &root,
-        b"V1 a 0 0\n!R1 a 0 NSEG=2 X0=0 Y0=0 X1=1 Y1=1m X2=2 Y2=3m IC=1\n.end\n",
-    )?;
+    fs::write(&root, source)?;
     let prepared = run("expanded-deck", &root, &output, &[])?;
     assert!(prepared.status.success(), "{prepared:?}");
     let bytes = fs::read(output.join("deck.cir"))?;
