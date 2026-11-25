@@ -28,7 +28,7 @@ impl GlobalOptions {
                 ".endif" => {
                     conditional_depth = conditional_depth
                         .checked_sub(1)
-                        .context("unmatched PSpice .ENDIF")?
+                        .context("unmatched PSpice .ENDIF")?;
                 }
                 ".options" | ".option" => {
                     let spans = lexical::tokens(text.as_bytes())?;
