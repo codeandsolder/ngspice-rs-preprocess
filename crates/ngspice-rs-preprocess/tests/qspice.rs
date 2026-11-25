@@ -35,7 +35,7 @@ fn whole_file_nested_section_and_physical_provenance() -> Result<()> {
         b".lib slow\nRbad a b 9k\n.endl slow\n.lib fast\n.lib nested.lib\n.endl fast\n",
     )?;
     fs::write(models.join("nested.lib"), b".subckt coil a b\r\nL1 a b 1m\r\n+ Rpar = 0\r\n+ Rser=0 ; ideal winding\r\n.ends coil\r\n.end\r\n")?;
-    fs::write(&root, b"* QSPICE circuit\n.lib models\\part.lib fast\nV1 a 0 1\nX1 a b coil\nR1 b 0 10\n.op\n.end\n")?;
+    fs::write(&root, b"* QSPICE circuit\n.lib models\\part.lib fast\nV1 a 0 1\nX1 a b coil\nR1 b 0 10\n.libpath models\n.op\n.end\n")?;
     let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
     assert!(!text.contains("Rbad"));
@@ -91,6 +91,10 @@ fn diagnostics_preserve_original_resource_and_line() -> Result<()> {
             Feature::SpecialDevice,
         ),
         (&b"* comment\n.libpath models\n"[..], Feature::Directive),
+        (
+            &b"* comment\n* undefined \x81\n"[..],
+            Feature::SourceEncoding,
+        ),
         (&b"* comment\n.tran 1m\n"[..], Feature::TransientTiming),
     ] {
         fs::write(&part, content)?;
@@ -116,6 +120,41 @@ fn diagnostics_preserve_original_resource_and_line() -> Result<()> {
             .feature,
         Feature::NonTextResource
     );
+    Ok(())
+}
+
+#[test]
+fn root_search_order_and_legacy_encoding() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("deck.cir");
+    let first = dir.path().join("first dir");
+    let second = dir.path().join("second");
+    fs::create_dir(&first)?;
+    fs::create_dir(&second)?;
+    fs::write(
+        first.join("part.lib"),
+        b"* legacy \x95\n.model d\x95x D(IS=1e-18)\n",
+    )?;
+    fs::write(second.join("part.lib"), b".model wrong D\n")?;
+    fs::write(&root, b"* legacy title \x95\n.lib part.lib\nV1 a 0 1\nD1 a 0 d\x95x\n.libpath \"first dir\"\n.libpath second\n.op\n.end\n")?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.starts_with("* legacy title •\n"));
+    assert!(text.contains(".model d•x D(IS=1e-18)"));
+    assert!(text.contains("D1 a 0 d•x"));
+    assert!(!text.contains(".model wrong"));
+    assert!(!text.lines().any(|line| line.starts_with(".libpath")));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        bail!("missing source map");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    fs::write(
+        dir.path().join("part.lib"),
+        b"\xef\xbb\xbf.model d\xe2\x80\xa2x D(IS=2e-18)\n",
+    )?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".model d•x D(IS=2e-18)"));
     Ok(())
 }
 

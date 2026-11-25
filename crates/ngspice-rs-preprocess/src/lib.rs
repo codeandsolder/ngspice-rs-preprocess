@@ -284,7 +284,7 @@ fn native(
     let linked = SourceLinker {
         search_paths: request.search_paths.clone(),
         library_syntax: if qspice {
-            LibrarySyntax::WholeFileOrSection
+            LibrarySyntax::Qspice
         } else {
             LibrarySyntax::NamedSections
         },

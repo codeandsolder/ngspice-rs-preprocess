@@ -53,7 +53,7 @@ pub enum LibrarySyntax {
     NamedSections,
     /// A single operand references an entire file outside a selected section.
     /// Two operands reference a named section in another file.
-    WholeFileOrSection,
+    Qspice,
 }
 
 /// Root source treatment. Included resources are always include-safe.
@@ -86,6 +86,8 @@ struct LinkState<'a> {
     limits: LinkLimits,
     stack: Vec<(PathBuf, Option<String>)>,
     output: LinkedSource,
+    source_root: PathBuf,
+    source_search_paths: Vec<PathBuf>,
 }
 
 fn directive<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -282,6 +284,12 @@ impl SourceLinker {
             admission,
             limits,
             stack: Vec::new(),
+            source_root: source
+                .path
+                .parent()
+                .context("source root has no containing directory")?
+                .to_path_buf(),
+            source_search_paths: Vec::new(),
             output: LinkedSource {
                 bytes: Vec::new(),
                 origins: Vec::new(),
@@ -292,22 +300,41 @@ impl SourceLinker {
     }
 }
 
+fn portable_qspice_path(path: &Path) -> Result<PathBuf> {
+    let text = path.to_str().context("non-UTF-8 QSPICE resource path")?;
+    if !cfg!(windows) {
+        ensure!(
+            !text.starts_with("\\\\") && text.as_bytes().get(1).is_none_or(|byte| *byte != b':'),
+            "QSPICE Windows absolute resource path {} requires an explicit host path",
+            path.display()
+        );
+    }
+    Ok(PathBuf::from(text.replace('\\', "/")))
+}
+
 impl LinkState<'_> {
     fn resolve(&self, path: &Path, parent: &Path) -> Result<PathBuf> {
-        // Source paths in whole-file library dialects commonly use Windows
-        // separators. Normalize relative paths without inventing a drive mapping.
         let portable;
-        let path = if self.settings.library_syntax == LibrarySyntax::WholeFileOrSection {
-            portable = path
-                .to_str()
-                .context("non-UTF-8 resource path")?
-                .replace('\\', "/");
-            Path::new(&portable)
+        let qspice = self.settings.library_syntax == LibrarySyntax::Qspice;
+        let path = if qspice {
+            portable = portable_qspice_path(path)?;
+            portable.as_path()
         } else {
             path
         };
-        let local = parent.parent().into_iter().map(|dir| dir.join(path));
-        let candidates = local.chain(self.settings.search_paths.iter().map(|dir| dir.join(path)));
+        // QSPICE's library search is rooted in the original deck, not the
+        // current nested resource. Source-declared paths are ordered and the
+        // explicit caller directories are additional search roots.
+        let local = if qspice {
+            Some(self.source_root.as_path())
+        } else {
+            parent.parent()
+        };
+        let candidates = local
+            .into_iter()
+            .chain(self.source_search_paths.iter().map(PathBuf::as_path))
+            .chain(self.settings.search_paths.iter().map(PathBuf::as_path))
+            .map(|dir| dir.join(path));
         for candidate in candidates {
             match self.admission.resolve_path(&candidate) {
                 Ok(canonical) => return Ok(canonical),
@@ -395,30 +422,34 @@ impl LinkState<'_> {
         kind: RootKind,
     ) -> Result<()> {
         let path = &source.path;
-        if self.settings.library_syntax == LibrarySyntax::WholeFileOrSection {
-            crate::qspice::validate_resource(path, &source.bytes)?;
-        }
-        crate::lexical::ensure_textual(&source.bytes)?;
+        let decoded = if self.settings.library_syntax == LibrarySyntax::Qspice {
+            crate::qspice::decode_resource(path, &source.bytes)?
+        } else {
+            std::borrow::Cow::Borrowed(&source.bytes[..])
+        };
+        crate::lexical::ensure_textual(&decoded)?;
         let (body, first_line) = if kind == RootKind::Deck {
-            let title = source
-                .bytes
+            let title = decoded
                 .split_inclusive(|byte| *byte == b'\n')
                 .next()
                 .context("native deck has no title line")?;
             self.emit(path, 1, title)?;
-            (&source.bytes[title.len()..], 2)
+            (&decoded[title.len()..], 2)
         } else {
-            (&source.bytes[..], 1)
+            (&decoded[..], 1)
         };
+        let records = records(body, first_line)?;
+        if self.settings.library_syntax == LibrarySyntax::Qspice && self.stack.len() == 1 {
+            self.collect_source_paths(path, &records)?;
+        }
         let mut selection = SectionSelection::new(section);
         let mut in_control = false;
         let physical = body
             .split_inclusive(|byte| *byte == b'\n')
             .collect::<Vec<_>>();
-        for record in records(body, first_line)? {
-            // Recognize non-ASCII device classes before decoding the statement;
-            // QSPICE netlists may use either ANSI or UTF-8 device prefixes.
-            if self.settings.library_syntax == LibrarySyntax::WholeFileOrSection
+        for record in records {
+            // Non-ASCII QSPICE device designators require a qualified kernel.
+            if self.settings.library_syntax == LibrarySyntax::Qspice
                 && record.logical.first().is_some_and(|byte| !byte.is_ascii())
             {
                 if selection.selected() {
@@ -469,6 +500,47 @@ impl LinkState<'_> {
         selection.finish(path)
     }
 
+    fn collect_source_paths(&mut self, path: &Path, records: &[Record]) -> Result<()> {
+        let mut depth = 0usize;
+        for record in records {
+            let text = std::str::from_utf8(&record.logical)?;
+            if [".if", ".subckt", ".control"]
+                .iter()
+                .any(|name| directive(text, name).is_some())
+            {
+                depth = depth
+                    .checked_add(1)
+                    .context("QSPICE source scope overflow")?;
+            } else if [".endif", ".ends", ".endc"]
+                .iter()
+                .any(|name| directive(text, name).is_some())
+            {
+                depth = depth.saturating_sub(1);
+            }
+            if let Some(rest) = directive(text, ".libpath") {
+                ensure!(
+                    depth == 0,
+                    "{}:{}: .libpath in a conditional or nested scope requires source-specific binding",
+                    path.display(),
+                    record.line
+                );
+                let args = operands(rest)?;
+                let [directory] = args.as_slice() else {
+                    bail!(
+                        "{}:{}: .libpath requires one directory",
+                        path.display(),
+                        record.line
+                    );
+                };
+                let portable = portable_qspice_path(Path::new(directory))
+                    .with_context(|| format!("{}:{}: .libpath", path.display(), record.line))?;
+                self.source_search_paths
+                    .push(self.source_root.join(portable));
+            }
+        }
+        Ok(())
+    }
+
     fn emit_record(&mut self, path: &Path, record: &Record, physical: &[&[u8]]) -> Result<()> {
         for (offset, line) in physical[record.physical.clone()].iter().enumerate() {
             self.emit(path, record.line + offset, line)?;
@@ -497,7 +569,7 @@ impl LinkState<'_> {
         if let Some(args) = library_marker(text)? {
             return match args.as_slice() {
                 [file, section] => self.expand(Path::new(file), path, Some(section)),
-                [file] if self.settings.library_syntax == LibrarySyntax::WholeFileOrSection => {
+                [file] if self.settings.library_syntax == LibrarySyntax::Qspice => {
                     self.expand(Path::new(file), path, None)
                 }
                 _ => bail!(
@@ -506,8 +578,12 @@ impl LinkState<'_> {
                 ),
             };
         }
-        if kind == RootKind::Include && text.eq_ignore_ascii_case(".end") {
-            // An included terminator must not terminate the consuming deck.
+        if (kind == RootKind::Include && text.eq_ignore_ascii_case(".end"))
+            || (self.settings.library_syntax == LibrarySyntax::Qspice
+                && self.stack.len() == 1
+                && directive(text, ".libpath").is_some())
+        {
+            // Consumed search paths and included terminators stay mapped as comments.
             // Keep one mapped comment for each physical source line.
             for (offset, line) in physical[record.physical.clone()].iter().enumerate() {
                 let mut comment = b"* ".to_vec();

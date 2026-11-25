@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
+    borrow::Cow,
     fmt,
     ops::Range,
     path::{Path, PathBuf},
@@ -16,6 +17,8 @@ use std::{
 pub enum Feature {
     /// Schematic, symbol, raw output or compiled resource.
     NonTextResource,
+    /// Invalid byte sequence for the selected source encoding.
+    SourceEncoding,
     /// Digital, specialized or compiled device class.
     SpecialDevice,
     /// Simulator-specific command, search path or execution directive.
@@ -32,6 +35,7 @@ impl fmt::Display for Feature {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::NonTextResource => "non-netlist resource",
+            Self::SourceEncoding => "source encoding",
             Self::SpecialDevice => "specialized device class",
             Self::Directive => "simulator-specific directive",
             Self::PassiveParasitics => "passive parasitics",
@@ -80,6 +84,8 @@ fn unsupported(path: &Path, line: usize, feature: Feature, detail: &str) -> anyh
 
 pub(crate) fn validate_resource(path: &Path, input: &[u8]) -> Result<()> {
     if input.contains(&0)
+        || input.starts_with(b"\xff\xd8\xff")
+        || input.starts_with("ÿØÿÛ".as_bytes())
         || path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -97,6 +103,90 @@ pub(crate) fn validate_resource(path: &Path, input: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+// Windows-1252's 0x80..0x9f extension; undefined code points are
+// diagnosed instead of inserting replacement characters into names.
+const EXTENDED: [Option<char>; 32] = [
+    Some('€'),
+    None,
+    Some('‚'),
+    Some('ƒ'),
+    Some('„'),
+    Some('…'),
+    Some('†'),
+    Some('‡'),
+    Some('ˆ'),
+    Some('‰'),
+    Some('Š'),
+    Some('‹'),
+    Some('Œ'),
+    None,
+    Some('Ž'),
+    None,
+    None,
+    Some('‘'),
+    Some('’'),
+    Some('“'),
+    Some('”'),
+    Some('•'),
+    Some('–'),
+    Some('—'),
+    Some('˜'),
+    Some('™'),
+    Some('š'),
+    Some('›'),
+    Some('œ'),
+    None,
+    Some('ž'),
+    Some('Ÿ'),
+];
+
+// QSPICE documents Windows-1252 netlists. UTF-8 is accepted only with an
+// explicit BOM, avoiding heuristic reinterpretation of valid legacy bytes.
+// https://forum.qorvo.com/t/can-text-comment-support-chinese-utf8/16722/3
+pub(crate) fn decode_resource<'a>(path: &Path, input: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+    validate_resource(path, input)?;
+    if let Some(utf8) = input.strip_prefix(b"\xef\xbb\xbf") {
+        if let Err(error) = std::str::from_utf8(utf8) {
+            let line = utf8[..error.valid_up_to()]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count()
+                + 1;
+            return Err(unsupported(
+                path,
+                line,
+                Feature::SourceEncoding,
+                "invalid explicitly marked UTF-8",
+            ));
+        }
+        return Ok(Cow::Borrowed(utf8));
+    }
+    if input.is_ascii() {
+        return Ok(Cow::Borrowed(input));
+    }
+    let mut decoded = String::with_capacity(input.len());
+    let mut line = 1;
+    for &byte in input {
+        let character = if (0x80..=0x9f).contains(&byte) {
+            EXTENDED[usize::from(byte - 0x80)].ok_or_else(|| {
+                unsupported(
+                    path,
+                    line,
+                    Feature::SourceEncoding,
+                    "undefined Windows-1252 byte",
+                )
+            })?
+        } else {
+            char::from(byte)
+        };
+        decoded.push(character);
+        if byte == b'\n' {
+            line += 1;
+        }
+    }
+    Ok(Cow::Owned(decoded.into_bytes()))
 }
 
 pub(crate) fn reject_special_device(path: &Path, line: usize) -> Result<()> {
