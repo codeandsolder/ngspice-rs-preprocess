@@ -6,6 +6,7 @@
 //! The intrinsic kernel returns signed current and stored charge with their
 //! exact voltage derivatives. Units are SI, with temperature in kelvin.
 
+pub mod artifact;
 mod parameters;
 mod physics;
 
