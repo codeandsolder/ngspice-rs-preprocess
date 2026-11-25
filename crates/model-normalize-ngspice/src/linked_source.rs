@@ -41,6 +41,18 @@ impl LinkedSource {
 pub struct SourceLinker {
     /// Directories to search after the including file's containing directory.
     pub search_paths: Vec<PathBuf>,
+    /// Source-specific interpretation of library references.
+    pub library_syntax: LibrarySyntax,
+}
+
+/// Meaning of a single-operand .lib statement outside a named section.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LibrarySyntax {
+    /// Native SPICE .lib section boundary.
+    #[default]
+    NamedSections,
+    /// LTspice whole-file .lib reference; named sections remain supported.
+    Ltspice,
 }
 
 /// Root source treatment. Included resources are always include-safe.
@@ -64,6 +76,43 @@ impl Default for LinkLimits {
         Self {
             output_bytes: 128 * 1024 * 1024,
         }
+    }
+}
+
+/// A library import suppresses electrical cards outside its subcircuits.
+/// Ordinary includes inherit the containing resource's projection.
+#[derive(Debug, Default)]
+enum Projection {
+    #[default]
+    All,
+    Library {
+        depth: usize,
+    },
+}
+
+impl Projection {
+    fn retain(&mut self, text: &str) -> Result<bool> {
+        let Self::Library { depth } = self else {
+            return Ok(true);
+        };
+        if directive(text, ".subckt").is_some() {
+            *depth = depth
+                .checked_add(1)
+                .context("LTspice library scope overflow")?;
+        } else if directive(text, ".ends").is_some() {
+            *depth = depth
+                .checked_sub(1)
+                .context("unmatched .ends in LTspice library")?;
+        } else if *depth == 0
+            && text
+                .trim_start()
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -274,7 +323,7 @@ impl SourceLinker {
                 origins: Vec::new(),
             },
         };
-        state.expand_source(source, None, kind)?;
+        state.expand_source(source, None, kind, &mut Projection::All)?;
         Ok(state.output)
     }
 }
@@ -323,11 +372,47 @@ impl LinkState<'_> {
         Ok(())
     }
 
-    fn expand(&mut self, requested: &Path, parent: &Path, section: Option<&str>) -> Result<()> {
+    fn expand(
+        &mut self,
+        requested: &Path,
+        parent: &Path,
+        section: Option<&str>,
+        projection: &mut Projection,
+    ) -> Result<()> {
+        let portable;
+        let requested = if self.settings.library_syntax == LibrarySyntax::Ltspice {
+            let text = requested
+                .to_str()
+                .context("non-UTF-8 LTspice resource path")?;
+            portable = PathBuf::from(text.replace('\\', "/"));
+            portable.as_path()
+        } else {
+            requested
+        };
         let path = self.resolve(requested, parent)?;
         // Resolve an existing admitted snapshot before interpreting its syntax.
         let source = self.admission.load(&path)?;
-        self.expand_source(&source, section, RootKind::Include)
+        self.expand_source(&source, section, RootKind::Include, projection)
+    }
+
+    fn expand_library(
+        &mut self,
+        requested: &Path,
+        parent: &Path,
+        section: Option<&str>,
+        containing: &mut Projection,
+    ) -> Result<()> {
+        if self.settings.library_syntax != LibrarySyntax::Ltspice {
+            return self.expand(requested, parent, section, containing);
+        }
+        let mut projection = Projection::Library { depth: 0 };
+        self.expand(requested, parent, section, &mut projection)?;
+        ensure!(
+            matches!(projection, Projection::Library { depth: 0 }),
+            "unterminated subcircuit in LTspice library {}",
+            requested.display()
+        );
+        Ok(())
     }
 
     fn expand_source(
@@ -335,6 +420,7 @@ impl LinkState<'_> {
         source: &AdmittedSource,
         section: Option<&str>,
         kind: RootKind,
+        projection: &mut Projection,
     ) -> Result<()> {
         let path = &source.path;
         ensure!(
@@ -352,7 +438,7 @@ impl LinkState<'_> {
             section.map_or_else(String::new, |name| format!(" section {name}"))
         );
         self.stack.push((path.clone(), section_key));
-        let result = self.expand_inner(source, section, kind);
+        let result = self.expand_inner(source, section, kind, projection);
         self.stack.pop();
         result.with_context(|| {
             format!(
@@ -368,6 +454,7 @@ impl LinkState<'_> {
         source: &AdmittedSource,
         section: Option<&str>,
         kind: RootKind,
+        projection: &mut Projection,
     ) -> Result<()> {
         let path = &source.path;
         crate::lexical::ensure_textual(&source.bytes)?;
@@ -397,7 +484,16 @@ impl LinkState<'_> {
             })?;
             let control_start = directive(text, ".control").is_some();
             let control_end = directive(text, ".endc").is_some();
-            if !in_control && !control_start && !selection.observe(text, path, record.line)? {
+            let whole_file_reference = !in_control
+                && !control_start
+                && self.settings.library_syntax == LibrarySyntax::Ltspice
+                && (section.is_none() || selection.active.is_some())
+                && library_marker(text)?.is_some_and(|args| args.len() == 1);
+            if !in_control
+                && !control_start
+                && !whole_file_reference
+                && !selection.observe(text, path, record.line)?
+            {
                 continue;
             }
             let selected = selection.selected();
@@ -407,8 +503,8 @@ impl LinkState<'_> {
             if selected {
                 if in_control || control_end {
                     self.emit_record(path, &record, &physical)?;
-                } else {
-                    self.expand_record(path, &record, &physical, text, kind)?;
+                } else if projection.retain(text)? {
+                    self.expand_record(path, &record, &physical, text, kind, projection)?;
                 }
             }
             if control_end {
@@ -437,6 +533,7 @@ impl LinkState<'_> {
         physical: &[&[u8]],
         text: &str,
         kind: RootKind,
+        projection: &mut Projection,
     ) -> Result<()> {
         let physical_line = record.line;
         if let Some(rest) = directive(text, ".include").or_else(|| directive(text, ".inc")) {
@@ -446,15 +543,18 @@ impl LinkState<'_> {
                 "{}:{physical_line}: .include requires one pathname",
                 path.display()
             );
-            return self.expand(Path::new(&args[0]), path, None);
+            return self.expand(Path::new(&args[0]), path, None, projection);
         }
         if let Some(args) = library_marker(text)? {
+            if self.settings.library_syntax == LibrarySyntax::Ltspice && args.len() == 1 {
+                return self.expand_library(Path::new(&args[0]), path, None, projection);
+            }
             ensure!(
                 args.len() == 2,
                 "{}:{physical_line}: native .lib requires a file and section",
                 path.display()
             );
-            return self.expand(Path::new(&args[0]), path, Some(&args[1]));
+            return self.expand_library(Path::new(&args[0]), path, Some(&args[1]), projection);
         }
         if kind == RootKind::Include && text.eq_ignore_ascii_case(".end") {
             // An included terminator must not terminate the consuming deck.
@@ -699,6 +799,7 @@ mod tests {
         fs::write(&root,b"title\n.include part.inc\n.lib disabled\n.model invalid vdmos(vto=1)\n.endl disabled\n.model accepted vdmos (kp={scale})\n")?;
         let linked = SourceLinker {
             search_paths: vec![libs],
+            ..SourceLinker::default()
         }
         .link(&root)?;
         let library = ModelLibrary::parse(&linked.bytes)?;

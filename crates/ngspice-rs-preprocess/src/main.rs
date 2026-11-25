@@ -15,7 +15,8 @@ use std::{
 
 const USAGE: &str = "\
 Usage: ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
-Formats: native-deck, native-library, simplis-deck, simetrix-deck,
+Formats: native-deck, native-library, ltspice-deck, ltspice-library,
+         simplis-deck, simetrix-deck,
          expanded-deck, expanded-library, simplis-library, simetrix-library
 Options:
   --library PATH              Raw catalog library (repeatable)

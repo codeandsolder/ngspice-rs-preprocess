@@ -7,7 +7,7 @@ mod dialect;
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
     NormalizationPass,
-    linked_source::{LinkLimits, RootKind, SourceLinker},
+    linked_source::{LibrarySyntax, LinkLimits, RootKind, SourceLinker},
     normalize_mapped,
 };
 pub use model_normalize_ngspice::{passive_ic, waveform};
@@ -30,6 +30,10 @@ pub enum InputFormat {
     NativeDeck,
     /// Native-compatible library; emit include-safe text.
     NativeLibrary,
+    /// Complete LTspice source deck, emitted in native syntax.
+    LtspiceDeck,
+    /// LTspice source library, emitted as include-safe native syntax.
+    LtspiceLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,
     /// `SIMetrix` source deck with optional library catalog.
@@ -53,6 +57,8 @@ impl InputFormat {
         match value {
             "native-deck" => Ok(Self::NativeDeck),
             "native-library" => Ok(Self::NativeLibrary),
+            "ltspice-deck" => Ok(Self::LtspiceDeck),
+            "ltspice-library" => Ok(Self::LtspiceLibrary),
             "simplis-deck" => Ok(Self::SimplisDeck),
             "simetrix-deck" => Ok(Self::SimetrixDeck),
             "expanded-deck" => Ok(Self::ExpandedDeck),
@@ -254,14 +260,26 @@ fn native(
     options: &Options,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let kind = if request.format == InputFormat::NativeDeck {
+    let kind = if matches!(
+        request.format,
+        InputFormat::NativeDeck | InputFormat::LtspiceDeck
+    ) {
         RootKind::Deck
     } else {
         RootKind::Include
     };
     let origin = root.path.clone();
+    let ltspice = matches!(
+        request.format,
+        InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary
+    );
     let linked = SourceLinker {
         search_paths: request.search_paths.clone(),
+        library_syntax: if ltspice {
+            LibrarySyntax::Ltspice
+        } else {
+            LibrarySyntax::NamedSections
+        },
     }
     .link_admitted(
         root,
@@ -271,7 +289,10 @@ fn native(
         },
         session,
     )?;
-    let normalized = normalize_mapped(&linked.bytes, kind)?;
+    let mut normalized = normalize_mapped(&linked.bytes, kind)?;
+    if ltspice {
+        normalized = model_normalize_ngspice::ltspice::normalize(normalized, kind)?;
+    }
     let lines = normalized
         .input_lines
         .into_iter()
@@ -325,6 +346,8 @@ fn validate_request(request: &Request) -> Result<()> {
                 request.format,
                 InputFormat::NativeDeck
                     | InputFormat::NativeLibrary
+                    | InputFormat::LtspiceDeck
+                    | InputFormat::LtspiceLibrary
                     | InputFormat::SimetrixDeck
                     | InputFormat::SimetrixLibrary
             ),
@@ -351,9 +374,10 @@ pub fn prepare(
     let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
     let root = request.input.admit(&mut session)?;
     let mut result = match request.format {
-        InputFormat::NativeDeck | InputFormat::NativeLibrary => {
-            native(&root, request, options, &mut session)
-        }
+        InputFormat::NativeDeck
+        | InputFormat::NativeLibrary
+        | InputFormat::LtspiceDeck
+        | InputFormat::LtspiceLibrary => native(&root, request, options, &mut session),
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
     if request.format == InputFormat::SimetrixDeck

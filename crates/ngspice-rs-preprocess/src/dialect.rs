@@ -704,7 +704,10 @@ pub fn prepare(
         InputFormat::SimplisDeck | InputFormat::SimetrixDeck => {
             linked(root, request, options, cancellation, session)
         }
-        InputFormat::NativeDeck | InputFormat::NativeLibrary => {
+        InputFormat::NativeDeck
+        | InputFormat::NativeLibrary
+        | InputFormat::LtspiceDeck
+        | InputFormat::LtspiceLibrary => {
             bail!("native input is not a dialect translation request")
         }
     }

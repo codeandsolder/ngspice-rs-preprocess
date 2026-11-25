@@ -11,6 +11,7 @@ pub fn statement_token_spans(text: &str) -> anyhow::Result<Vec<std::ops::Range<u
     lexical::tokens(text.as_bytes())
 }
 pub mod linked_source;
+pub mod ltspice;
 pub mod model_card;
 pub mod param_expression;
 pub mod parameter_scope;
@@ -51,6 +52,12 @@ pub enum NormalizationPass {
     NormalizeNbspWhitespace,
     /// Expand `LTspice`'s `L ... Rser=` extension to an ideal inductor plus resistor.
     LtspiceInductorRser,
+    /// Comment the schematic-only LTspice backannotation directive.
+    LtspiceBackannotation,
+    /// Disable native resistor noise for the explicit LTspice flag.
+    LtspiceNoiselessResistor,
+    /// Translate source-specific scalar intrinsic functions.
+    LtspiceIntrinsics,
     /// Map `PSpice` `arctan()` to ngspice `atan()`.
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.
