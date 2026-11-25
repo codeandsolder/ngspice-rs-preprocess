@@ -231,6 +231,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-statistics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "model-touchstone"
 version = "0.1.0"
 
@@ -241,6 +250,7 @@ dependencies = [
  "anyhow",
  "model-normalize-ngspice",
  "model-preprocess-simplis",
+ "model-statistics",
  "serde",
  "serde_json",
  "tempfile",
@@ -255,6 +265,7 @@ dependencies = [
  "model-normalize-ngspice",
  "model-preprocess-command",
  "model-preprocess-simplis",
+ "model-statistics",
  "model-translate-simplis",
  "rustix",
  "serde",

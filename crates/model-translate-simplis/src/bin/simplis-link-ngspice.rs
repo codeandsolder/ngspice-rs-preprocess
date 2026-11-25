@@ -169,7 +169,7 @@ fn main() -> Result<()> {
 
     let mut linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
     if simulator == LibrarySimulator::Simetrix {
-        lower_simetrix_linked_runtime(&mut linked)?;
+        lower_simetrix_linked_runtime(&mut linked, None)?;
         let initialization = capture_passive_initial_conditions(&mut linked)?;
         if !initialization.devices.is_empty() || !initialization.nodes.is_empty() {
             bail!(

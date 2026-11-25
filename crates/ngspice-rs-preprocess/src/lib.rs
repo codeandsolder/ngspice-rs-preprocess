@@ -121,6 +121,9 @@ pub enum ConditioningPolicy {
     PrivateDifferentiators,
 }
 
+/// Explicit deterministic statistical sample selection.
+pub use model_statistics::Realization as StatisticalSample;
+
 /// Admission, conditioning and artifact publication options.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -134,6 +137,8 @@ pub struct Options {
     /// Explicit request-local device configuration file for `SIMetrix` decks.
     /// It is admitted as data, without the source transformation command.
     pub device_config: Option<PathBuf>,
+    /// Explicit experiment seed and sample; absent means nominal.
+    pub statistical_sample: Option<StatisticalSample>,
 }
 
 impl Default for Options {
@@ -143,6 +148,7 @@ impl Default for Options {
             output_bytes: 128 * 1024 * 1024,
             conditioning: ConditioningPolicy::default(),
             device_config: None,
+            statistical_sample: None,
         }
     }
 }
@@ -359,6 +365,10 @@ pub fn prepare(
     ensure!(
         options.device_config.is_none() || request.format == InputFormat::SimetrixDeck,
         "device configuration is only valid for SIMetrix decks"
+    );
+    ensure!(
+        options.statistical_sample.is_none() || request.format == InputFormat::SimetrixDeck,
+        "statistical sample selection is only valid for SIMetrix decks"
     );
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
