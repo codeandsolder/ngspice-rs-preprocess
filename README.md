@@ -35,12 +35,18 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | --- | --- | --- |
 | `native-deck` | Native-compatible circuit; link static includes and preserve title/analysis/terminator | `deck.cir` |
 | `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
+| `ltspice-deck` | Explicit LTspice source normalization (partial dialect coverage) | `deck.cir` |
+| `ltspice-library` | Explicit LTspice library normalization (partial dialect coverage) | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
 | `expanded-library` | Lower already expanded dialect source as an include | `model.lib` |
 | `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
 | `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
+
+The LTspice formats normalize whole-file library imports, relative Windows-style paths, `noiseless` resistor flags, `.backanno`, scalar intrinsics and operator precedence, runtime versus parameter-phase evaluation, endpoint-clamped numeric tables (including phase-specialized macros), explicit capacitor/inductor series resistance, the uncoupled inductor default series resistance, closed nonnegative voltage-source series resistance, and explicit transient timing (including omitted or zero plotting step). PULSE, PWL and SINE share occurrence-bound prepared waveform declarations with the native source binder. Relative PWL times are accumulated, signed scales applied, and duplicate-time ordinates averaged before interpolation. Closed waveforms with exact native representations are emitted directly; symbolic coefficients or finite sine trains require the typed waveform manifest, which separates explicit DC bias from transient startup. These passes preserve source provenance and do not require a simulator-wide compatibility mode.
+
+The source-specific transformations have native ngspice OP/DC/AC/transient/noise regressions based on independent LTspice XVII and 24.0.12 measurements. Successful normalization alone does not establish equivalence for arbitrary decks. Idealized diode and smooth-switch models, passive IC and richer parasitic networks, structured/triggered waveforms, source shunt capacitance, negative or occurrence-parametric voltage-source series resistance, and unsupported expression forms require additional typed preparation or solver support. End-to-end Rust solver acceptance of the generated scalar functions and mandatory waveform declarations depends on its native parameter-expression, macro-expansion and prepared-waveform binding support.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:
