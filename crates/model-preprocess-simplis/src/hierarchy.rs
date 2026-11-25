@@ -1949,6 +1949,13 @@ impl InitTree {
         self.children.entry(head).or_default().insert(tail, value)
     }
 
+    fn overlay(&mut self, ancestor: Self) {
+        self.local.extend(ancestor.local);
+        for (name, child) in ancestor.children {
+            self.children.entry(name).or_default().overlay(child);
+        }
+    }
+
     fn hash_into(&self, hasher: &mut Sha256) {
         for (name, value) in &self.local {
             hasher.update(*b"L");
@@ -1994,74 +2001,103 @@ impl InitTree {
 ///
 /// Returns an error for malformed reactive wrappers or an empty target.
 pub fn parse_init_target_path(name: &str) -> Result<Vec<String>> {
-    let mut target = name.trim().to_owned();
-    let upper = target.to_ascii_uppercase();
-    if (upper.starts_with("V(") || upper.starts_with("I(")) && target.ends_with(')') {
-        target = target[2..target.len() - 1].to_owned();
-    } else if upper.starts_with("V(") || upper.starts_with("I(") {
-        bail!("malformed reactive SIMPLIS .INIT target {name}");
-    }
-    if target.to_ascii_uppercase().ends_with(":IC") {
-        target.truncate(target.len() - 3);
-    }
+    let raw = name.trim();
+    let upper = raw.to_ascii_uppercase();
+    let (target, reactive) = if upper.starts_with("V(") || upper.starts_with("I(") {
+        let inner = raw[2..]
+            .strip_suffix(')')
+            .context("malformed reactive SIMPLIS .INIT target")?;
+        (inner, Some(upper.as_bytes()[0]))
+    } else {
+        (raw, None)
+    };
+    let target = if target.to_ascii_uppercase().ends_with(":IC") {
+        &target[..target.len() - 3]
+    } else {
+        target
+    };
     let path = target
         .split('.')
         .map(str::trim)
-        .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if path.is_empty() {
-        bail!("empty SIMPLIS .INIT target {name}");
+    anyhow::ensure!(
+        path.iter().all(|part| !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'!'))),
+        "invalid SIMPLIS .INIT path {name}"
+    );
+    let leaf = path.last().context("empty SIMPLIS .INIT target")?;
+    if let Some(kind) = reactive {
+        let device = leaf
+            .trim_start_matches('!')
+            .as_bytes()
+            .first()
+            .map(u8::to_ascii_uppercase);
+        anyhow::ensure!(
+            matches!((kind, device), (b'V', Some(b'C')) | (b'I', Some(b'L'))),
+            "reactive SIMPLIS .INIT target {name} has wrong device kind"
+        );
     }
     Ok(path)
 }
 
 type InitAssignment = (Vec<String>, String);
 
-fn parse_init_statement(statement: &str) -> Result<Option<Vec<InitAssignment>>> {
+/// Parse all assignments of one logical source .INIT directive, checking
+/// reactive target orientation before canonicalizing to the device path.
+///
+/// # Errors
+/// Invalid target, assignment, or expression.
+pub fn parse_init_statement(statement: &str) -> Result<Option<Vec<InitAssignment>>> {
     if !is_directive(statement, "INIT") {
         return Ok(None);
     }
-    let trimmed = statement.trim_start();
-    let body = trimmed
+    let active = active_statement_prefix(statement).trim_start();
+    let body = active
         .get(5..)
-        .context("malformed SIMPLIS .INIT directive")?
-        .trim();
-    let Some((name, value)) = body.split_once('=') else {
-        bail!("SIMPLIS .INIT directive is missing '=': {statement}");
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        bail!("SIMPLIS .INIT directive has no value: {statement}");
-    }
-    if value.split_whitespace().count() != 1 {
-        bail!("linked SIMPLIS .INIT supports one scalar assignment per directive: {statement}");
-    }
-    Ok(Some(vec![(
-        parse_init_target_path(name.trim())?,
-        value.to_owned(),
-    )]))
+        .context("malformed SIMPLIS .INIT directive")?;
+    let assignments = crate::named_assignments(body, true)?;
+    anyhow::ensure!(!assignments.is_empty(), "empty SIMPLIS .INIT directive");
+    assignments
+        .into_iter()
+        .map(|(name, value)| Ok((parse_init_target_path(name)?, value.to_owned())))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
-fn inject_local_init(bytes: &[u8], init: &InitTree) -> Result<Vec<u8>> {
-    if init.local.is_empty() {
-        return Ok(bytes.to_vec());
-    }
+fn merge_local_init(bytes: &[u8], inherited: InitTree) -> Result<(Vec<u8>, InitTree)> {
     let text = std::str::from_utf8(bytes)?;
-    let newline = text
-        .find('\n')
-        .context("SIMPLIS subcircuit with .INIT state has no body")?;
-    let mut output = String::with_capacity(text.len() + init.local.len() * 32);
-    output.push_str(&text[..=newline]);
-    for (name, value) in &init.local {
-        output.push_str(".INIT ");
-        output.push_str(name);
-        output.push('=');
-        output.push_str(value);
-        output.push('\n');
+    let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut local = InitTree::default();
+    let mut retained = Vec::new();
+    for statement in logical_statements(&lines) {
+        if let Some(assignments) = parse_init_statement(&statement)? {
+            for (path, value) in assignments {
+                local.insert(&path, value)?;
+            }
+        } else {
+            retained.push(statement);
+        }
     }
-    output.push_str(&text[newline + 1..]);
-    Ok(output.into_bytes())
+    if local.is_empty() && inherited.is_empty() {
+        return Ok((bytes.to_vec(), local));
+    }
+    local.overlay(inherited);
+    let header = retained
+        .first()
+        .context("SIMPLIS subcircuit with .INIT state has no header")?;
+    let mut output = String::new();
+    use std::fmt::Write as _;
+    writeln!(output, "{header}")?;
+    for (name, value) in &local.local {
+        writeln!(output, ".INIT {name}={value}")?;
+    }
+    for statement in retained.iter().skip(1) {
+        writeln!(output, "{statement}")?;
+    }
+    Ok((output.into_bytes(), local))
 }
 
 fn instance_name(statement: &str) -> Option<String> {
@@ -2336,7 +2372,7 @@ fn make_linked_unit(
     } else {
         (definition.bytes.clone(), inherited.clone())
     };
-    let bytes = inject_local_init(&bytes, &init)?;
+    let (bytes, init) = merge_local_init(&bytes, init)?;
     let (bytes, runtime) = if simetrix {
         let actuals = if explicit_vars { "" } else { override_text };
         let (prepared, runtime) = RuntimeScope::prepare(&bytes, &definition.scope_id, actuals)
@@ -3409,12 +3445,24 @@ R1 1 2 {V}
     }
 
     #[test]
-    fn linked_init_rejects_multiple_assignments_per_directive() {
-        let source = b".INIT X1.S1=CLOSE X2.S1=OPEN\n.end\n";
-        let error = preprocess_netlist_linked(source, &SubcircuitCatalog::new())
-            .err()
-            .map(|value| value.to_string());
-        assert!(error.is_some_and(|value| value.contains("one scalar assignment")));
+    fn linked_init_accepts_multiple_reactive_assignments() -> Result<()> {
+        let source = br".INIT V(X1.C1)=3 I(X2.L1)=-2m
+X1 a b CELL
+X2 c d CELL
+.subckt CELL p n
+C1 p n 1u IC=0
+L1 p n 1u IC=0
+.ends CELL
+.end
+";
+        let linked = preprocess_netlist_linked(source, &SubcircuitCatalog::new())?;
+        let text = std::str::from_utf8(&linked.libraries[0].bytes)?;
+        assert!(text.contains(".INIT C1=3"));
+        assert!(text.contains(".INIT L1=-2m"));
+        assert!(
+            preprocess_netlist_linked(b".INIT V(L1)=1\n.end\n", &SubcircuitCatalog::new()).is_err()
+        );
+        Ok(())
     }
 
     #[test]
