@@ -190,6 +190,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngspice-rs-preprocess"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "model-normalize-ngspice",
+ "model-preprocess-command",
+ "model-preprocess-simplis",
+ "model-translate-simplis",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

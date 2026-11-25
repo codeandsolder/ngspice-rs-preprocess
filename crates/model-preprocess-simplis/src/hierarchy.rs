@@ -3,7 +3,7 @@ use super::{
     specialize_subcircuit, specialize_subcircuit_control_flow_with_base,
     specialize_subcircuit_with_base,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::SourceSession;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -135,6 +135,7 @@ impl ParsedLibrary {
 #[derive(Clone, Debug)]
 struct SourceMetadata {
     source_name: String,
+    source_names: BTreeSet<String>,
     support_lines: Vec<String>,
     aliases: Vec<Alias>,
 }
@@ -153,6 +154,62 @@ pub struct SubcircuitCatalog {
     aliases: BTreeMap<String, Vec<AliasBinding>>,
     sources: BTreeMap<String, SourceMetadata>,
     next_anonymous_source: usize,
+}
+
+/// Parse a static dialect include path, with literal Windows separators.
+///
+/// # Errors
+///
+/// Malformed include operands or unterminated quotes.
+pub fn source_include_target(statement: &str) -> Result<Option<&str>> {
+    let trimmed = statement.trim_start();
+    let mut fields = trimmed.splitn(2, char::is_whitespace);
+    let directive = fields.next().unwrap_or_default();
+    if !directive.eq_ignore_ascii_case(".include") && !directive.eq_ignore_ascii_case(".inc") {
+        return Ok(None);
+    }
+    let rest = fields
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("include has no path")?;
+    let (target, tail) = if let Some(quote) = rest
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '\'' | '"'))
+    {
+        let end = rest[1..]
+            .find(quote)
+            .context("unterminated quoted include path")?
+            + 1;
+        (&rest[1..end], &rest[end + 1..])
+    } else {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        (&rest[..end], &rest[end..])
+    };
+    ensure!(!target.is_empty(), "empty include path");
+    ensure!(
+        tail.trim().is_empty()
+            || tail.trim_start().starts_with([';', '$'])
+            || tail.trim_start().starts_with("//"),
+        "unexpected text after include path"
+    );
+    Ok(Some(target))
+}
+
+fn path_suffix_matches(source: &str, include: &str) -> bool {
+    fn components(path: &str) -> impl Iterator<Item = &str> {
+        path.rsplit(['/', '\\'])
+            .filter(|part| !part.is_empty() && *part != ".")
+    }
+    let source = components(source).collect::<Vec<_>>();
+    let include = components(include).collect::<Vec<_>>();
+    !include.is_empty()
+        && include.len() <= source.len()
+        && include
+            .iter()
+            .zip(source)
+            .all(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
 }
 
 impl SubcircuitCatalog {
@@ -239,9 +296,12 @@ impl SubcircuitCatalog {
             .entry(source_id.clone())
             .or_insert_with(|| SourceMetadata {
                 source_name: source_name.clone(),
+                source_names: BTreeSet::new(),
                 support_lines: parsed.support_lines.clone(),
                 aliases: parsed.aliases.clone(),
-            });
+            })
+            .source_names
+            .insert(source_name.clone());
         for alias in &parsed.aliases {
             let bindings = self
                 .aliases
@@ -293,29 +353,34 @@ impl SubcircuitCatalog {
         path.rsplit(['/', '\\']).next().unwrap_or(path)
     }
 
-    fn included_basename(statement: &str) -> Option<&str> {
-        if !is_directive(statement, "INCLUDE") {
-            return None;
+    fn matches_supplied_include(&self, statement: &str) -> Result<bool> {
+        let Some(include) = source_include_target(statement)? else {
+            return Ok(false);
+        };
+        let mut suffix_matches = BTreeSet::new();
+        let mut basename_matches = BTreeSet::new();
+        for (identity, metadata) in &self.sources {
+            for name in &metadata.source_names {
+                if path_suffix_matches(name, include) {
+                    suffix_matches.insert(identity);
+                }
+                if Self::path_basename(name).eq_ignore_ascii_case(Self::path_basename(include)) {
+                    basename_matches.insert(identity);
+                }
+            }
         }
-        let trimmed = statement.trim_start();
-        let offset = trimmed.find(char::is_whitespace)?;
-        let argument = trimmed[offset..].trim_start();
-        let path = if let Some(rest) = argument.strip_prefix('"') {
-            let end = rest.find('"')?;
-            &rest[..end]
+        // Explicit path suffixes distinguish same-name libraries; basename
+        // fallback supports relocated vendor source paths only when unique.
+        let candidates = if suffix_matches.is_empty() {
+            basename_matches
         } else {
-            argument.split_whitespace().next()?
+            suffix_matches
         };
-        Some(Self::path_basename(path))
-    }
-
-    fn matches_supplied_include(&self, statement: &str) -> bool {
-        let Some(include) = Self::included_basename(statement) else {
-            return false;
-        };
-        self.sources.values().any(|metadata| {
-            Self::path_basename(&metadata.source_name).eq_ignore_ascii_case(include)
-        })
+        anyhow::ensure!(
+            candidates.len() <= 1,
+            "ambiguous supplied library include {include:?}"
+        );
+        Ok(!candidates.is_empty())
     }
 
     fn model_statement<'a>(statement: &'a str, name: &str) -> Option<Vec<&'a str>> {
@@ -601,8 +666,7 @@ pub fn parse_library_for_simulator(
     simulator: LibrarySimulator,
 ) -> Result<ParsedLibrary> {
     let source_name = source.into();
-    let text = decode_simplis_text(input)?;
-    let selected_view = select_library_view(&text, simulator)?;
+    let selected_view = project_source(input, simulator)?;
     let parsed = extract_definitions(&selected_view)?;
     let (support_lines, aliases) = parse_library_root(&parsed.root_lines)?;
     let mut definitions = parsed.definitions;
@@ -620,6 +684,16 @@ pub fn parse_library_for_simulator(
         aliases,
         definitions,
     })
+}
+
+/// Select the requested simulator projection before source interpretation.
+///
+/// # Errors
+///
+/// Invalid source encoding, selector or subcircuit nesting.
+pub fn project_source(input: &[u8], simulator: LibrarySimulator) -> Result<String> {
+    let text = decode_simplis_text(input)?;
+    select_library_view(&text, simulator)
 }
 
 fn select_library_view(input: &str, simulator: LibrarySimulator) -> Result<String> {
@@ -2252,7 +2326,7 @@ fn link_root_statements(
         if is_directive(&statement, "INIT") {
             continue;
         }
-        if external.matches_supplied_include(&statement) {
+        if external.matches_supplied_include(&statement)? {
             root_output.push_str("* ngspice-rs-preprocess: consumed supplied SIMPLIS include ");
             root_output.push_str(statement.trim());
             root_output.push('\n');
@@ -2442,7 +2516,7 @@ mod tests {
                 executable: "/bin/sh".into(),
                 arguments: vec![
                     "-c".into(),
-                    r#"printf x >> calls; sed 's/PLACEHOLDER/HELPER/g; s/VALUE/47/g'"#.into(),
+                    "printf x >> calls; sed 's/PLACEHOLDER/HELPER/g; s/VALUE/47/g'".into(),
                     "fixture".into(),
                 ],
                 working_directory: None,

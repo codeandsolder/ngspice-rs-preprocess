@@ -11,6 +11,86 @@ The simulator owns numerical circuit orchestration. Source admission is
 handled by `model-preprocess-command` before normalization, linking or model
 preparation. The default does not launch any external process.
 
+## Unified library and CLI
+
+Use the `ngspice-rs-preprocess` package for source preparation. The library
+entry point `prepare(&Request, &Options, &Cancellation)` returns a
+`PreparedBundle` with exact artifact bytes, companion identities and
+provenance. It does not create files or execute a numerical analysis.
+`SourceInput::File` and `SourceInput::Bytes` both carry an original path;
+in-memory sources require an existing parent directory. Each call owns one
+source-admission session. A frontend that already has a native parser can
+instead use the re-exported `SourceSession` for admission alone.
+
+The CLI invokes the same function:
+
+```text
+ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
+```
+
+| Format | Meaning | Primary artifact |
+| --- | --- | --- |
+| `native-deck` | Native-compatible circuit; link static includes and preserve title/analysis/terminator | `deck.cir` |
+| `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
+| `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
+| `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
+| `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
+| `expanded-library` | Lower already expanded dialect source as an include | `model.lib` |
+| `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
+| `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
+
+No extension-based format guessing or implicit transformation is performed.
+For example:
+
+```sh
+ngspice-rs-preprocess native-deck input.cir prepared --search ./models
+ngspice-rs-preprocess simplis-library parts.lb compiled
+ngspice-rs-preprocess simplis-deck circuit.net translated --parsed-library compiled/library.json
+ngspice-rs-preprocess native-library model.lib normalized \
+  --command /absolute/path/to/adapter --command-arg --mode --command-arg raw
+```
+
+Use repeatable `--library PATH` for raw catalog members, or
+`--parsed-library PATH` for previously compiled JSON artifacts. Explicit
+library path suffixes take priority over a unique portable basename;
+ambiguous includes fail. Content-equivalent library aliases retain all
+source names. A compiled artifact is never passed to the source command.
+Recursive relative `.init` resources are admitted in the same session and
+only in the selected simulator projection. Missing, ambiguous and
+recursive resources are errors. Dialect translation emits only the native
+electrical circuit and known generated libraries; attach the desired
+analysis separately. Residual external includes are rejected rather than
+silently referring to the original working directory. Experimental ALB
+compilation remains an explicit specialized workflow, not an automatic
+fallback from the unified entry point.
+
+Native linking preserves physical source lines, comments, continuations,
+scope boundaries and the root title. Static `.include`, `.inc` and named
+`.lib path section` resources are resolved relative to their containing
+source, followed by explicitly supplied search paths. Included standalone
+`.end` directives become comments; a complete deck retains its own
+terminator. Control-language commands are preserved, not executed or
+interpreted as static source includes. Dynamic resources in control
+commands still require their original runtime context.
+
+The CLI publishes the complete artifact directory only after successful
+preparation, using a temporary sibling directory and a rename. The parent
+directory must already exist; the output directory must not exist. A
+versioned `manifest.json` records format, primary filename, artifact byte
+counts, dependencies and provenance. On Linux publication uses a
+no-replacement rename. Native line maps are exact at the admitted-source
+boundary, including synthetic elements created during compatibility
+normalization. Generated dialect artifacts retain source identities and
+dependencies, but no invented one-to-one output line mapping. Native
+library callers receive exact source path values; the JSON manifest uses
+their display spellings.
+
+The combined artifact/intermediate-link byte limit defaults to 128 MiB and
+is configurable with `--max-output-bytes`. Per-source and command limits are
+available with `--max-input-bytes`, `--max-command-output-bytes`,
+`--max-diagnostic-bytes`, and `--timeout-ms`. These do not replace the
+separate cumulative evaluation and hierarchy work limits.
+
 ## Optional external source command
 
 Configure one `AdmissionConfig` and share a `SourceSession` across the whole

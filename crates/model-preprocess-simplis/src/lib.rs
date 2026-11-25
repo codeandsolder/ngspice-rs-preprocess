@@ -14,10 +14,11 @@ pub use hierarchy::{
     ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, linked_library_filename,
     parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
     preprocess_netlist, preprocess_netlist_file, preprocess_netlist_linked,
-    preprocess_netlist_linked_file,
+    preprocess_netlist_linked_file, project_source, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
+    anyhow::ensure!(!input.contains(&0), "SIMPLIS source contains a NUL byte");
     if let Ok(text) = std::str::from_utf8(input) {
         return Ok(text.to_owned());
     }
