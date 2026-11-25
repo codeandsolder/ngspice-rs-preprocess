@@ -150,6 +150,7 @@ struct Manifest<'a> {
     required_code_models: Vec<ngspice_rs_preprocess::CodeModelRuntime>,
     device_identities: &'a [model_preprocess_simplis::source_dialect::DeviceIdentity],
     initial_conditions: &'a Option<ngspice_rs_preprocess::passive_ic::InitialConditions>,
+    waveforms: &'a [ngspice_rs_preprocess::waveform::PreparedWaveform],
 }
 
 #[derive(Serialize)]
@@ -164,7 +165,7 @@ struct ManifestArtifact<'a> {
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 4,
+        version: 5,
         input_format: bundle.format,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,
@@ -183,6 +184,7 @@ fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
         required_code_models: bundle.required_code_models(),
         device_identities: &bundle.device_identities,
         initial_conditions: &bundle.initial_conditions,
+        waveforms: &bundle.waveforms,
     }
 }
 

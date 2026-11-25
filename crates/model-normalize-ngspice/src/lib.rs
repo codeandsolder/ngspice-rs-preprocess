@@ -9,6 +9,7 @@ pub mod parameter_scope;
 pub mod passive_ic;
 pub mod vdmos_card;
 pub mod vdmos_ltspice;
+pub mod waveform;
 
 use anyhow::{Context, Result, bail};
 use model_preprocess_command::{Cancellation, ProcessLimits, capture};

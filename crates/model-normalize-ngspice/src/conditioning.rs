@@ -99,12 +99,14 @@ struct Source {
     parameters: ModelLibrary,
     references: BTreeMap<String, Vec<usize>>,
     constrained_capacitors: BTreeSet<usize>,
+    waveform_sources: BTreeSet<usize>,
 }
 
 impl Source {
     fn parse(
         inputs: &[ConditioningInput<'_>],
         initialization: Option<&crate::passive_ic::InitialConditions>,
+        waveforms: &[crate::waveform::PreparedWaveform],
     ) -> Result<Self> {
         let mut cards = Vec::new();
         let mut scopes = vec![Scope::default()];
@@ -202,11 +204,40 @@ impl Source {
             parameters,
             references,
             constrained_capacitors: BTreeSet::new(),
+            waveform_sources: BTreeSet::new(),
         };
         if let Some(initialization) = initialization {
             source.add_initialization_paths(inputs, initialization);
         }
+        source.reserve_waveform_sources(inputs, waveforms);
         Ok(source)
+    }
+
+    fn reserve_waveform_sources(
+        &mut self,
+        inputs: &[ConditioningInput<'_>],
+        waveforms: &[crate::waveform::PreparedWaveform],
+    ) {
+        // A DC=0 placeholder is not an ideal zero-voltage current sensor.
+        // Treat its actual terminals as an ordinary nonmember electrical
+        // path until the proof is extended to independent time functions.
+        for waveform in waveforms {
+            for &index in self
+                .references
+                .get(&waveform.source.to_ascii_lowercase())
+                .into_iter()
+                .flatten()
+            {
+                let card = &self.cards[index];
+                if card.kind() == Some(b'V')
+                    && card.first().eq_ignore_ascii_case(&waveform.source)
+                    && inputs[card.artifact].filename == waveform.artifact
+                    && self.scopes[card.scope].path == waveform.scope
+                {
+                    self.waveform_sources.insert(index);
+                }
+            }
+        }
     }
 
     fn add_initialization_paths(
@@ -405,7 +436,9 @@ impl VoltageGraph {
         let mut edges = Vec::new();
         let mut adjacency = BTreeMap::<String, Vec<usize>>::new();
         for &index in &scope.cards {
-            if let Some(edge) = edge(&source.cards[index], index) {
+            if !source.waveform_sources.contains(&index)
+                && let Some(edge) = edge(&source.cards[index], index)
+            {
                 for node in &edge.nodes {
                     adjacency.entry(node.clone()).or_default().push(edges.len());
                 }
@@ -805,6 +838,7 @@ fn plan(source: &Source, circuit: &Loop) -> Option<Plan> {
 pub fn condition_private_differentiators(
     inputs: &[ConditioningInput<'_>],
     initialization: Option<&crate::passive_ic::InitialConditions>,
+    waveforms: &[crate::waveform::PreparedWaveform],
 ) -> Result<Vec<ConditionedArtifact>> {
     let mut result = inputs
         .iter()
@@ -813,7 +847,7 @@ pub fn condition_private_differentiators(
             scalings: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let Ok(source) = Source::parse(inputs, initialization) else {
+    let Ok(source) = Source::parse(inputs, initialization, waveforms) else {
         return Ok(result);
     };
     let mut plans = Vec::new();

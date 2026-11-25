@@ -98,7 +98,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 4 includes
+counts, dependencies and provenance. Manifest version 5 includes
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
 `Artifact::required_code_models` and `PreparedBundle::required_code_models()`.
@@ -243,7 +243,7 @@ or capacitances, or requires unchanged internal current observations, select
 ### Analysis-scoped passive initialization
 
 The SIMetrix deck policy is carried separately from ordinary electrical
-artifacts in `PreparedBundle::initial_conditions` and manifest v4.
+artifacts in `PreparedBundle::initial_conditions` and manifest v5.
 It retains source-specific `INITCONDMODE`, `ICRES`, per-device `IC`,
 `ICMODE`, and optional `BRANCH`, plus ordered node `.IC` hints. The
 source-only device and node IC fields are removed from the emitted
@@ -291,3 +291,33 @@ consumer explicitly running the native transient with UIC.
 Reference: SIMPLIS simulator manual, sections "Device Models Used in
 Simplis", "SIMPLIS Device Types", and "Control Statements for Setting
 Initial Conditions".
+
+
+### Prepared independent-source waveforms
+
+Manifest v5 carries `PreparedBundle::waveforms`, keyed by emitted artifact,
+lexical subcircuit scope and independent source identity. Bind each declaration
+in its actual occurrence's parameter environment using `PreparedWaveform::resolve`.
+The result includes the time-zero DC value, the time-domain forcing, and the
+periodic-operating-point idle flag. Native positional sources are unchanged.
+
+Named PUL (rectangular or trapezoidal), PWLS PUL, SAW, SIN and PWL share this
+contract. Periodic linear forcing stores one sorted cycle of unique knots with
+separate left and right values, an origin, a positive period and an optional
+pre-delay hold. Ungated cycles extend both ways; the origin is the nearest
+signed cycle boundary to zero, avoiding loss of a small positive delay to
+period subtraction. The first knot is at zero, the endpoint is implicit and
+interpolation approaches its left value. Coincident edges collapse to their
+exterior limits, not artificial finite-duration ramps. DC startup uses the
+right-sided value except while the source is held. PWL may have signed times
+and duplicate times; SIN keeps signed delay and damping. Symbolic timing is
+validated when bound.
+
+The typed payload is authoritative, including when a native-looking source
+card has only its DC placeholder. Consumers must bind the payload before
+analysis; do not silently simulate a placeholder as a constant source.
+The standalone expanded translator can emit native reference cards for
+constant parameters, including ngspice's duplicate-knot PWL syntax; this
+is a reference representation, not the prepared solver contract. The
+native solver binding and exact event scheduling are tracked in
+ngspice-rs-fast issue 223.

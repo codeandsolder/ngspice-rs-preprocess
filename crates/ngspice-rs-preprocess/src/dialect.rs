@@ -16,8 +16,9 @@ use model_preprocess_simplis::{
     source_include_target,
 };
 use model_translate_simplis::{
-    capture_artifact_initial_conditions, capture_passive_initial_conditions,
-    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_expanded_library,
+    capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
+    translate_simplis_expanded_library,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -67,6 +68,7 @@ fn bundle(
         normalization: Vec::new(),
         device_identities: Vec::new(),
         initial_conditions: None,
+        waveforms: Vec::new(),
     }
 }
 
@@ -398,10 +400,17 @@ fn check_closed_includes(bytes: &[u8], known: &BTreeSet<&str>) -> Result<()> {
 
 fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle> {
     let include = format == InputFormat::ExpandedLibrary;
+    let mut bytes = root.bytes.to_vec();
+    let mut waveforms = Vec::new();
+    capture_artifact_waveforms(
+        &mut bytes,
+        if include { "model.lib" } else { "deck.cir" },
+        &mut waveforms,
+    )?;
     let translated = if include {
-        translate_simplis_expanded_library(&root.bytes)?
+        translate_simplis_expanded_library(&bytes)?
     } else {
-        translate_simplis_deck(&root.bytes)?
+        translate_simplis_deck(&bytes)?
     };
     check_closed_includes(&translated.bytes, &BTreeSet::new())?;
     let artifact = generated(
@@ -412,7 +421,9 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
         Vec::new(),
         translated.required_code_models,
     );
-    Ok(bundle(root, format, artifact, Vec::new()))
+    let mut result = bundle(root, format, artifact, Vec::new());
+    result.waveforms = waveforms;
+    Ok(result)
 }
 
 fn linked(
@@ -448,6 +459,7 @@ fn linked(
     } else {
         None
     };
+    let waveforms = capture_linked_waveforms(&mut linked)?;
     let known = linked
         .libraries
         .iter()
@@ -516,6 +528,7 @@ fn linked(
             || !policy.devices.is_empty()
             || !policy.nodes.is_empty()
     });
+    bundle.waveforms = waveforms;
     Ok(bundle)
 }
 
