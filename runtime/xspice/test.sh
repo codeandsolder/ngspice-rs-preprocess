@@ -37,7 +37,8 @@ three_arg=(
     smoke-stateful-directional-drive smoke-stateful-output-load
     smoke-stateful-timing-defaults smoke-stateful-unknown-history
 )
-suites=("${two_arg[@]}" "${three_arg[@]}" smoke-generated smoke-family-materialized)
+suites=("${two_arg[@]}" "${three_arg[@]}" smoke-generated smoke-family-materialized
+        smoke-producer-identity-drivers smoke-promoted-x-formal-drivers)
 if (( $# > 0 )); then suites=("$@"); fi
 
 declare -A kind=()
@@ -45,6 +46,8 @@ for suite in "${two_arg[@]}"; do kind["$suite"]=two; done
 for suite in "${three_arg[@]}"; do kind["$suite"]=three; done
 kind[smoke-generated]=generated
 kind[smoke-family-materialized]=materialized
+kind[smoke-producer-identity-drivers]=multi_driver
+kind[smoke-promoted-x-formal-drivers]=multi_driver
 for suite in "${suites[@]}"; do
     if [[ ! -v 'kind[$suite]' ]]; then
         printf 'Unknown suite: %s\n' "$suite" >&2
@@ -65,6 +68,7 @@ run_suite() {
     case "${kind[$1]}" in
         two) "$here/$1.sh" "$cm" "$work" ;;
         three) "$here/$1.sh" "$cm" "$bins" "$work" ;;
+        multi_driver) "$here/smoke-family-multi-driver.sh" "$cm" "$bins" "$work" "${1#smoke-}" ;;
         generated)
             compile timed-enable timed-enable timed-enable ALB_TIMED &&
                 compile constant constant constant ALB_CONSTANT &&
