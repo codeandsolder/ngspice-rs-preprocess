@@ -1,4 +1,6 @@
+mod level17;
 mod passive_ic;
+use level17::{RawLevel17Mos, emit_level17_core_model, raw_level17_model, translate_level17_mos};
 mod pwls;
 mod waveforms;
 pub use passive_ic::{capture_artifact_initial_conditions, capture_passive_initial_conditions};
@@ -422,324 +424,6 @@ fn translate_raw_reactive_device(
         translate_charge_capacitor(instance, &tokens[1], &tokens[2], &model.points, initial)
             .map(Some)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MosPolarity {
-    Nmos,
-    Pmos,
-}
-
-#[derive(Clone, Debug)]
-struct RawLevel17Mos {
-    polarity: MosPolarity,
-    vto: f64,
-    kp: f64,
-    rs: f64,
-    rd: f64,
-    tc1rd: f64,
-    tc2rd: f64,
-    rg: f64,
-    isat: f64,
-    cbd: f64,
-    cgdmax: f64,
-    cgdmin: f64,
-    xg1cgd: f64,
-    xg2cgd: f64,
-    vtcgd: f64,
-    gamma: f64,
-    phi: f64,
-    lambda: f64,
-    vds_limit: Option<String>,
-}
-
-fn strip_level17_vds_limit(body: &str) -> Result<(String, Option<String>)> {
-    let upper = body.to_ascii_uppercase();
-    let Some(start) = upper.find("LIMIT(VDS)=") else {
-        return Ok((body.to_owned(), None));
-    };
-    let value_start = start + "LIMIT(VDS)=".len();
-    let open = body[value_start..]
-        .find('(')
-        .map(|offset| value_start + offset)
-        .context("SIMetrix LEVEL=17 LIMIT(VDS) has no opening parenthesis")?;
-    let close = body[open + 1..]
-        .find(')')
-        .map(|offset| open + 1 + offset)
-        .context("SIMetrix LEVEL=17 LIMIT(VDS) has no closing parenthesis")?;
-    let mut output = String::with_capacity(body.len());
-    output.push_str(&body[..start]);
-    output.push_str(&body[close + 1..]);
-    Ok((
-        output,
-        Some(
-            body[start..=close]
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-    ))
-}
-
-fn optional_numeric(
-    parameters: &std::collections::BTreeMap<String, String>,
-    name: &str,
-    default: f64,
-) -> Result<f64> {
-    parameters
-        .contains_key(name)
-        .then(|| numeric_parameter(parameters, name))
-        .transpose()
-        .map(|value| value.unwrap_or(default))
-}
-
-fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>> {
-    let normalized = normalized_statement(statement);
-    let upper = normalized.to_ascii_uppercase();
-    if !upper.starts_with(".MODEL ") || !upper.contains("LEVEL=17") {
-        return Ok(None);
-    }
-    let open = normalized
-        .find('(')
-        .context("SIMetrix LEVEL=17 .MODEL has no parameter list")?;
-    let close = normalized
-        .rfind(')')
-        .context("SIMetrix LEVEL=17 .MODEL has no closing parenthesis")?;
-    if close <= open {
-        bail!("malformed SIMetrix LEVEL=17 .MODEL parameter list");
-    }
-    let header = normalized[..open].split_whitespace().collect::<Vec<_>>();
-    if header.len() != 3 || !header[0].eq_ignore_ascii_case(".MODEL") {
-        bail!("malformed SIMetrix LEVEL=17 .MODEL header");
-    }
-    let polarity = if header[2].eq_ignore_ascii_case("NMOS") {
-        MosPolarity::Nmos
-    } else if header[2].eq_ignore_ascii_case("PMOS") {
-        MosPolarity::Pmos
-    } else {
-        return Ok(None);
-    };
-    let (body, vds_limit) = strip_level17_vds_limit(&normalized[open + 1..close])?;
-    let tokens = statement_tokens(&body)?;
-    let parameters = parse_assignments(&tokens)?;
-    let allowed = [
-        "LEVEL", "VTO", "VT0", "KP", "GAMMA", "PHI", "LAMBDA", "RD", "RS", "CBD", "IS", "RG",
-        "CGDMAX", "CGDMIN", "XG1CGD", "XG2CGD", "VTCGD", "TC1RD", "TC2RD",
-    ];
-    if let Some(unknown) = parameters.keys().find(|name| {
-        !allowed
-            .iter()
-            .any(|allowed| name.eq_ignore_ascii_case(allowed))
-    }) {
-        bail!("unsupported SIMetrix LEVEL=17 MOS parameter {unknown}");
-    }
-    if integer_parameter(&parameters, "LEVEL")? != 17 {
-        return Ok(None);
-    }
-    let vto = if parameters.contains_key("VTO") {
-        numeric_parameter(&parameters, "VTO")?
-    } else {
-        numeric_parameter(&parameters, "VT0")?
-    };
-    let model = RawLevel17Mos {
-        polarity,
-        vto,
-        kp: numeric_parameter(&parameters, "KP")?,
-        rs: numeric_parameter(&parameters, "RS")?,
-        rd: numeric_parameter(&parameters, "RD")?,
-        tc1rd: optional_numeric(&parameters, "TC1RD", 0.0)?,
-        tc2rd: optional_numeric(&parameters, "TC2RD", 0.0)?,
-        rg: numeric_parameter(&parameters, "RG")?,
-        isat: numeric_parameter(&parameters, "IS")?,
-        cbd: numeric_parameter(&parameters, "CBD")?,
-        cgdmax: numeric_parameter(&parameters, "CGDMAX")?,
-        cgdmin: numeric_parameter(&parameters, "CGDMIN")?,
-        xg1cgd: numeric_parameter(&parameters, "XG1CGD")?,
-        xg2cgd: numeric_parameter(&parameters, "XG2CGD")?,
-        vtcgd: numeric_parameter(&parameters, "VTCGD")?,
-        gamma: optional_numeric(&parameters, "GAMMA", 0.0)?,
-        phi: optional_numeric(&parameters, "PHI", 0.6)?,
-        lambda: optional_numeric(&parameters, "LAMBDA", 0.0)?,
-        vds_limit,
-    };
-    if !model.vto.is_finite()
-        || !model.kp.is_finite()
-        || model.kp <= 0.0
-        || !model.rs.is_finite()
-        || !model.rd.is_finite()
-        || !model.tc1rd.is_finite()
-        || !model.tc2rd.is_finite()
-        || !model.rg.is_finite()
-        || model.rg < 0.0
-        || !model.isat.is_finite()
-        || model.isat < 0.0
-        || !model.cbd.is_finite()
-        || model.cbd < 0.0
-        || !model.cgdmax.is_finite()
-        || model.cgdmax < 0.0
-        || !model.cgdmin.is_finite()
-        || model.cgdmin < 0.0
-        || !model.xg1cgd.is_finite()
-        || !model.xg2cgd.is_finite()
-        || !model.vtcgd.is_finite()
-        || !model.gamma.is_finite()
-        || !model.phi.is_finite()
-        || model.phi <= 0.0
-        || !model.lambda.is_finite()
-    {
-        bail!("invalid SIMetrix LEVEL=17 MOS parameters for {}", header[1]);
-    }
-    Ok(Some((header[1].to_ascii_uppercase(), model)))
-}
-
-fn level17_core_name(name: &str) -> String {
-    format!("__L17_{}", sanitized_name(name))
-}
-
-fn emit_level17_core_model(name: &str, model: &RawLevel17Mos) -> Result<String> {
-    let mut output = String::new();
-    if let Some(limit) = &model.vds_limit {
-        writeln!(
-            output,
-            "* ngspice-rs-preprocess: omitted SIMetrix LEVEL=17 {limit} SOA annotation for {name}"
-        )?;
-    }
-    write!(
-        output,
-        ".model {} {}(level=1 VTO=",
-        level17_core_name(name),
-        match model.polarity {
-            MosPolarity::Nmos => "NMOS",
-            MosPolarity::Pmos => "PMOS",
-        }
-    )?;
-    write_number(&mut output, model.vto)?;
-    output.push_str(" KP=");
-    write_number(&mut output, model.kp)?;
-    output.push_str(" RS=");
-    write_number(&mut output, model.rs)?;
-    output.push_str(" RD=0 IS=");
-    write_number(&mut output, model.isat)?;
-    output.push_str(" CBD=");
-    write_number(&mut output, model.cbd)?;
-    output.push_str(" GAMMA=");
-    write_number(&mut output, model.gamma)?;
-    output.push_str(" PHI=");
-    write_number(&mut output, model.phi)?;
-    output.push_str(" LAMBDA=");
-    write_number(&mut output, model.lambda)?;
-    output.push_str(")\n");
-    Ok(output)
-}
-
-fn write_level17_charge_term(
-    output: &mut String,
-    capacitance: f64,
-    gradient: f64,
-    threshold: f64,
-    voltage: &str,
-) -> Result<()> {
-    if capacitance == 0.0 {
-        output.push('0');
-        return Ok(());
-    }
-    write_number(output, capacitance)?;
-    if gradient == 0.0 {
-        write!(output, "*(0.5*{voltage})")?;
-        return Ok(());
-    }
-    let mut gradient_text = String::new();
-    write_number(&mut gradient_text, gradient)?;
-    let mut threshold_text = String::new();
-    write_number(&mut threshold_text, threshold)?;
-    let u = format!("(({threshold_text}-{voltage})*{gradient_text})");
-    write!(
-        output,
-        "*(0.5*{voltage}+(({u})*atan({u})-0.5*log(1+({u})^2))/(pi*{gradient_text}))"
-    )?;
-    Ok(())
-}
-
-fn translate_level17_mos(
-    statement: &str,
-    models: &std::collections::BTreeMap<String, RawLevel17Mos>,
-) -> Result<Option<Translation>> {
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    let Some(name) = tokens.first() else {
-        return Ok(None);
-    };
-    if !name
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| matches!(byte.to_ascii_uppercase(), b'M'))
-        || tokens.len() < 6
-    {
-        return Ok(None);
-    }
-    let Some(model) = models.get(&tokens[5].to_ascii_uppercase()) else {
-        return Ok(None);
-    };
-    if tokens.len() != 6 {
-        bail!("unsupported SIMetrix LEVEL=17 MOS instance parameters: {statement}");
-    }
-    for node in &tokens[1..5] {
-        validate_node(node)?;
-    }
-    let stem = sanitized_name(name);
-    let drain = if model.rd == 0.0 {
-        tokens[1].clone()
-    } else {
-        format!("__{stem}_DINT")
-    };
-    let gate = if model.rg == 0.0 {
-        tokens[2].clone()
-    } else {
-        format!("__{stem}_GINT")
-    };
-    let mut output = String::new();
-    if model.rd != 0.0 {
-        write!(output, "R__{stem}_RD {} {drain} ", tokens[1])?;
-        write_number(&mut output, model.rd)?;
-        output.push_str(" tc1=");
-        write_number(&mut output, model.tc1rd)?;
-        output.push_str(" tc2=");
-        write_number(&mut output, model.tc2rd)?;
-        output.push('\n');
-    }
-    if model.rg != 0.0 {
-        write!(output, "R__{stem}_RG {} {gate} ", tokens[2])?;
-        write_number(&mut output, model.rg)?;
-        output.push('\n');
-    }
-    writeln!(
-        output,
-        "{name} {drain} {gate} {} {} {} L=1 W=1",
-        tokens[3],
-        tokens[4],
-        level17_core_name(&tokens[5])
-    )?;
-    let voltage = format!("v({gate},{drain})");
-    write!(output, "C__{stem}_CGD {gate} {drain} Q='")?;
-    write_level17_charge_term(
-        &mut output,
-        model.cgdmin,
-        model.xg1cgd,
-        model.vtcgd,
-        &voltage,
-    )?;
-    output.push('+');
-    write_level17_charge_term(
-        &mut output,
-        model.cgdmax,
-        model.xg2cgd,
-        model.vtcgd,
-        &voltage,
-    )?;
-    output.push_str("'\n");
-    Ok(Some(Translation {
-        bytes: output.into_bytes(),
-        kind: TranslationKind::SimetrixMosfetLevel17,
-    }))
 }
 
 #[derive(Clone, Debug)]
@@ -5111,8 +4795,12 @@ fn emit_deck_statement(
     let effective = statement_with_init_override(statement, &models.init)?;
     let instrumented = models.instrument_current_branch(&effective, output)?;
     let statement = instrumented.as_str();
-    if let Some((name, model)) = raw_level17_model(statement)? {
-        output.push_str(&emit_level17_core_model(&name, &model)?);
+    if let Some((name, _)) = raw_level17_model(statement)? {
+        let model = models
+            .level17
+            .get(&name)
+            .context("unbound level 17 model")?;
+        output.push_str(&emit_level17_core_model(&name, model)?);
         return Ok(());
     }
     if let Some(rewritten) = rewrite_native_bridge_model(statement, &models.native_bridges)? {
@@ -7223,11 +6911,13 @@ M1 D G S S mosfet
         );
         assert!(text.contains(".model __L17_MOSFET NMOS(level=1"));
         assert!(text.contains("R__M1_RD D __M1_DINT"));
-        assert!(text.contains("tc1=1.56250000000000000e-2"));
+        assert!(text.contains("TC1=1.56250000000000000e-2"));
         assert!(text.contains("R__M1_RG G __M1_GINT"));
-        assert!(text.contains("M1 __M1_DINT __M1_GINT S S __L17_mosfet L=1 W=1"));
+        assert!(
+            text.contains("M1 __M1_DINT __M1_GINT S S __L17_MOSFET L=1 W=1 AD=0 AS=0 PD=1 PS=1")
+        );
         assert!(text.contains("C__M1_CGD __M1_GINT __M1_DINT Q='"));
-        assert!(text.contains("omitted SIMetrix LEVEL=17 LIMIT(VDS)=(*, 400) SOA annotation"));
+        assert!(text.contains("SIMetrix LEVEL=17 LIMIT(VDS)=(*, 400) SOA metadata"));
         assert!(!text.contains(".model mosfet NMOS( LEVEL=17"));
         assert!(!text.contains("CGDMAX="));
         Ok(())

@@ -136,7 +136,11 @@ pub(crate) fn positional_prefix(input: &str) -> (Vec<(&str, usize)>, &str) {
 }
 
 /// Named scalar/flag parameters of an already identified MOS instance.
-pub(crate) fn instance_fields(input: &str) -> Result<Vec<ModelParameter>> {
+/// The caller provides the maximum arity of an unparenthesized IC vector.
+///
+/// # Errors
+/// Malformed assignments or unbalanced expressions.
+pub fn instance_fields(input: &str, ic_arity: usize) -> Result<Vec<ModelParameter>> {
     let mut source = Source {
         text: input,
         offset: 0,
@@ -155,24 +159,25 @@ pub(crate) fn instance_fields(input: &str) -> Result<Vec<ModelParameter>> {
             source.skip_space();
             let start = source.offset;
             source.value()?;
-            // Native IC supports one or two scalars, parenthesized or
-            // comma-separated; keep the entire vector for typed binding.
-            if name.eq_ignore_ascii_case("ic") {
-                let end = source.offset;
-                source.skip_space();
-                let first = input.as_bytes().get(source.offset).copied();
-                if first == Some(b',') {
-                    source.offset += 1;
+            // A parenthesized vector is one balanced token. Otherwise
+            // consume up to the family-specific number of numeric entries.
+            if name.eq_ignore_ascii_case("ic") && !input[start..source.offset].starts_with('(') {
+                for _ in 1..ic_arity {
+                    let end = source.offset;
                     source.skip_space();
-                    source.value()?;
-                } else if input[start..end].starts_with('(') {
-                    source.offset = end;
-                } else if first.is_some_and(|b| {
-                    b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'{' | b'\'' | b'(')
-                }) {
-                    source.value()?;
-                } else {
-                    source.offset = end;
+                    let first = input.as_bytes().get(source.offset).copied();
+                    if first == Some(b',') {
+                        source.offset += 1;
+                        source.skip_space();
+                        source.value()?;
+                    } else if first.is_some_and(|b| {
+                        b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'{' | b'\'' | b'(')
+                    }) {
+                        source.value()?;
+                    } else {
+                        source.offset = end;
+                        break;
+                    }
                 }
             }
             Some(input[start..source.offset].to_owned())
