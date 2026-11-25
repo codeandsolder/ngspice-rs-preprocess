@@ -12,36 +12,23 @@ use std::{
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/xspice/fixtures/family")
 }
-fn expand(source: &Path, config: &Path, dir: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_alb-logical-expand"))
-        .arg(source)
-        .arg(config)
-        .arg(dir.join("lowered.cir"))
-        .arg(dir.join("generated.inc"))
-        .output()?)
-}
-fn wire(config: &Path, dir: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_alb-family-autowire"))
-        .arg(dir.join("lowered.cir"))
-        .arg(dir.join("generated.inc"))
-        .arg(config)
+fn compile(src: &Path, cfg: &Path, dir: &Path) -> Result<Output> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_alb-family-compile"))
+        .arg(src)
+        .arg(cfg)
         .arg(fixtures().join("auto-models.json"))
         .arg(dir.join("final.cir"))
+        .arg(dir.join("generated.inc"))
         .output()?)
 }
+
 #[test]
 fn recursive_occurrence_variants_preserve_actual_model_hierarchy() -> Result<()> {
     for variant in ["root", "lexical", "fanout"] {
         let dir = tempfile::tempdir()?;
         let source = fixtures().join(format!("occurrence-nested-{variant}.cir"));
         let config = fixtures().join(format!("occurrence-nested-{variant}.json"));
-        let result = expand(&source, &config, dir.path())?;
-        assert!(
-            result.status.success(),
-            "{variant}: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let output = wire(&config, dir.path())?;
+        let output = compile(&source, &config, dir.path())?;
         assert!(
             output.status.success(),
             "{variant}: {}",
@@ -104,8 +91,7 @@ fn nested_variant_assignment_is_independent_of_source_call_order() -> Result<()>
         };
         let source = dir.path().join("source.cir");
         fs::write(&source, content)?;
-        assert!(expand(&source, &cfg, dir.path())?.status.success());
-        let output = wire(&cfg, dir.path())?;
+        let output = compile(&source, &cfg, dir.path())?;
         assert!(
             output.status.success(),
             "{}",
@@ -119,12 +105,45 @@ fn nested_variant_assignment_is_independent_of_source_call_order() -> Result<()>
     Ok(())
 }
 #[test]
-fn nested_unknown_or_omitted_occurrences_reject_without_partial_output() -> Result<()> {
+fn partially_annotated_nested_occurrences_preserve_original_wrappers() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let source = fixtures().join("occurrence-nested-root.cir");
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixtures().join("occurrence-nested-root.json"))?)?;
+    config["connections"]
+        .as_array_mut()
+        .context("missing nested mapping entries")?
+        .retain(|entry| entry["occurrence"] != json!(["XTWO", "XINNER"]));
+    let config_file = temp.path().join("partial-nested.json");
+    fs::write(&config_file, serde_json::to_vec(&config)?)?;
+    let wired = compile(&source, &config_file, temp.path())?;
+    assert!(
+        wired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wired.stderr)
+    );
+    let deck = fs::read_to_string(temp.path().join("final.cir"))?;
+    assert!(deck.contains("Xone IN_A OUT_A OUTER_SRV0"), "{deck}");
+    assert!(deck.contains("Xtwo IN_B OUT_B OUTER"), "{deck}");
+    assert!(deck.contains("Xthree IN_C OUT_C OUTER_SRV0"), "{deck}");
+    assert!(
+        deck.contains(".subckt OUTER ANALOG_IN ANALOG_OUT"),
+        "{deck}"
+    );
+    assert!(deck.contains(".subckt INNER PIN_IN PIN_OUT"), "{deck}");
+    assert_eq!(deck.matches(".subckt OUTER_SRV").count(), 1);
+    assert_eq!(deck.matches(".subckt INNER_SRV").count(), 1);
+    assert_eq!(deck.matches("sr_family_adc(").count(), 1);
+    assert_eq!(deck.matches("sr_family_dac(").count(), 1);
+    Ok(())
+}
+
+#[test]
+fn nested_unknown_occurrences_reject_without_partial_output() -> Result<()> {
     let source = fixtures().join("occurrence-nested-root.cir");
     for kind in [
         "unknown-inner",
         "wrong-lexical-scope",
-        "omitted-instance",
         "duplicate-boundary",
         "zero-supply",
         "bad-path",
@@ -135,10 +154,6 @@ fn nested_unknown_or_omitted_occurrences_reject_without_partial_output() -> Resu
         match kind {
             "unknown-inner" => cfg["connections"][0]["occurrence"] = json!(["XONE", "XNOTHERE"]),
             "wrong-lexical-scope" => cfg["connections"][0]["scope"] = json!(["OUTER", "INNER"]),
-            "omitted-instance" => cfg["connections"]
-                .as_array_mut()
-                .context("missing mappings")?
-                .retain(|value| value["occurrence"] != json!(["XTWO", "XINNER"])),
             "duplicate-boundary" => {
                 let entry = cfg["connections"][0].clone();
                 cfg["connections"]
@@ -152,14 +167,10 @@ fn nested_unknown_or_omitted_occurrences_reject_without_partial_output() -> Resu
         }
         let config = dir.path().join("config.json");
         fs::write(&config, serde_json::to_vec(&cfg)?)?;
-        let result = expand(&source, &config, dir.path())?;
-        if result.status.success() {
-            let result = wire(&config, dir.path())?;
-            assert!(!result.status.success(), "{kind} unexpectedly accepted");
-            assert!(!dir.path().join("final.cir").exists());
-        } else {
-            assert!(!dir.path().join("lowered.cir").exists());
-        }
+        let result = compile(&source, &config, dir.path())?;
+        assert!(!result.status.success(), "{kind} unexpectedly accepted");
+        assert!(!dir.path().join("final.cir").exists());
+        assert!(!dir.path().join("generated.inc").exists());
     }
     Ok(())
 }
@@ -167,20 +178,14 @@ fn nested_unknown_or_omitted_occurrences_reject_without_partial_output() -> Resu
 fn reachable_recursive_model_calls_fail_before_native_output() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let cfg = fixtures().join("occurrence-nested-root.json");
-    let result = expand(
-        &fixtures().join("occurrence-nested-root.cir"),
-        &cfg,
-        dir.path(),
-    )?;
-    assert!(result.status.success());
-    let source = dir.path().join("lowered.cir");
-    let deck = fs::read_to_string(&source)?;
+    let source = dir.path().join("source.cir");
+    let deck = fs::read_to_string(fixtures().join("occurrence-nested-root.cir"))?;
     let modified = deck.replace(
         ".tran 20p 15n",
         "Xcycle 0 0 LOOP\n.subckt LOOP p q\nXself p q LOOP\n.ends LOOP\n.tran 20p 15n",
     );
     fs::write(&source, modified)?;
-    let result = wire(&cfg, dir.path())?;
+    let result = compile(&source, &cfg, dir.path())?;
     assert!(
         !result.status.success(),
         "reachable recursive X model silently accepted"

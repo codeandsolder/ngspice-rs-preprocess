@@ -1,0 +1,15 @@
+* Source authored digital input: zero, one, strong-unknown, high-z unknown
+0n 0s
+15n 1s
+30n Us
+45n Uz
+60n 0s
+75n 1s
+90n Us
+105n Uz
+120n 0s
+135n 1s
+150n Us
+165n Uz
+180n 0s
+195n 1s

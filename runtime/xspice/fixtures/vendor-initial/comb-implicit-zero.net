@@ -1,0 +1,15 @@
+* Original-source SIMetrix Elements 9.40d COMB differential probe
+.model MCOMB_PULSE d_logic_block file=FCOMB_PULSE family="UNIV"
+.file FCOMB_PULSE
+PORT Data in[0] ;
+PORT Q out[0] ;
+COMB (WIDTH=1, DELAY=1n, BITWISE=1) Stage ;
+Stage=Data ;
+Q=Stage ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 5.4n 5 5.5n 0 10n 0 10.1n 5 14n 5 14.1n 0 42n 0)
+Acomb [d] [q] MCOMB_PULSE
+Rout q 0 100k
+.tran 20p 42n 0 20p
+.PRINT TRAN V(d) V(q)
+.end

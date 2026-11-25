@@ -1,0 +1,18 @@
+* Original d_genlut (2016) multi-output fanout to two original 1991 code models.
+.subckt SR_GENLUT_FANOUT I0 I0_SINK I0_SOURCE I1 I1_SINK I1_SOURCE Q0 Q1 Q2 F0 F1
+ALOAD0 I0 I0_SINK I0_SOURCE RECEIVER
+ALOAD1 I1 I1_SINK I1_SOURCE RECEIVER
+.model RECEIVER sr_bundle_load(capacitance=2p sink_current=0 source_current=0)
+AGEN [I0 I1] [Q0_EVT Q1_EVT Q2_EVT] ORIG_GEN
+.model ORIG_GEN d_genlut(table_values="01100001z01z" rise_delay=[550p 750p 900p] fall_delay=[650p 850p 1100p] input_load=[0 0] input_delay=[150p 250p])
+AAND [Q0_EVT Q2_EVT] F0_EVT ORIG_AND
+.model ORIG_AND d_and(rise_delay=450p fall_delay=500p input_load=0 inertial_delay=false)
+AXOR [Q0_EVT Q1_EVT Q2_EVT] F1_EVT ORIG_XOR
+.model ORIG_XOR d_xor(rise_delay=700p fall_delay=600p input_load=0 inertial_delay=false)
+Aout0 Q0_EVT Q0_SINK Q0_SOURCE %gd(Q0 0) PHYSICAL_DAC
+Aout1 Q1_EVT Q1_SINK Q1_SOURCE %gd(Q1 0) PHYSICAL_DAC
+Aout2 Q2_EVT Q2_SINK Q2_SOURCE %gd(Q2 0) PHYSICAL_DAC
+Aout3 F0_EVT F0_SINK F0_SOURCE %gd(F0 0) PHYSICAL_DAC
+Aout4 F1_EVT F1_SINK F1_SOURCE %gd(F1 0) PHYSICAL_DAC
+.model PHYSICAL_DAC sr_family_dac(out_low=0 out_high=3.3 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-8 knee_low=2 knee_high=2.75 v_smooth=.5 input_load=0 t_rise=50p t_fall=50p)
+.ends SR_GENLUT_FANOUT

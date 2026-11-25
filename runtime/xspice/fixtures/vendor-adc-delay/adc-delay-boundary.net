@@ -1,0 +1,27 @@
+* ADC asymmetric delay and interrupted threshold-band crossings
+Vstim stim 0 PWL(0 0 10n 0 110n 5 120n 5 220n 0 230n 0)
+.model ADC0 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1.99n fall_delay=1.99n time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+.model ADC1 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=2n fall_delay=2n time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+.model ADC2 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=2.01n fall_delay=2.01n time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+.model DAC dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0 t_rise=10p t_fall=10p knee_low=2 knee_high=2.75 v_smooth=.5)
+Aadc0 stim din0 ADC0
+Adac0 din0 q0 DAC
+Vforce0 q0 0 0
+Aadc1 stim din1 ADC0
+Adac1 din1 q1 DAC
+Vforce1 q1 0 5
+Aadc2 stim din2 ADC1
+Adac2 din2 q2 DAC
+Vforce2 q2 0 0
+Aadc3 stim din3 ADC1
+Adac3 din3 q3 DAC
+Vforce3 q3 0 5
+Aadc4 stim din4 ADC2
+Adac4 din4 q4 DAC
+Vforce4 q4 0 0
+Aadc5 stim din5 ADC2
+Adac5 din5 q5 DAC
+Vforce5 q5 0 5
+.tran 5p 230n 0 5p
+.PRINT TRAN I(Vforce0) I(Vforce1) I(Vforce2) I(Vforce3) I(Vforce4) I(Vforce5)
+.end

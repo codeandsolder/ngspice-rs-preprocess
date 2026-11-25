@@ -1,16 +1,28 @@
 //! Explicit original logical ALB port expansion into native three-node
 //! physical bundles. No production translation path uses this module.
 
+mod code_model_ifspec;
+mod discovery;
+mod global_nodes;
 mod occurrence;
+mod opaque_library;
+mod receiver_groups;
 use super::{
     CompiledSourceAlbModel, Item, Result, bail, compile_explicit_alb_source_models,
     normalized_statement, parse_items, statement_tokens,
 };
 use crate::alb::DigitalPinDirection;
 use anyhow::{Context, ensure};
-pub use occurrence::{
-    FamilySpecialization, OccurrenceFamilyBoundary, specialize_family_occurrences,
+pub use code_model_ifspec::{CodeModelContract, LookupTableShape, verify_external_code_models};
+pub use discovery::{
+    DiscoveredAlbBoundary, OpaqueXInterface, OpaqueXPinKind, discover_original_alb_boundaries,
+    discover_original_alb_boundaries_with_opaque_x_interfaces,
 };
+pub use occurrence::{
+    DefinitionFamilyBoundary, FamilySpecialization, OccurrenceFamilyBoundary,
+    specialize_family_occurrences,
+};
+pub use opaque_library::verify_external_native_libraries;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -27,6 +39,8 @@ pub struct LogicalAlbBoundary {
     /// Exact ALB producer occurrence, for separating output pins that
     /// previously shared one logical state. Absent for existing boundaries.
     pub producer: Option<AlbOutputProducer>,
+    /// Exact input occurrences belonging to a heterogeneous physical receiver group.
+    pub receivers: Vec<AlbInputReceiver>,
 }
 
 /// Exact source occurrence path relative to the annotated lexical scope.
@@ -40,6 +54,31 @@ pub struct AlbOutputProducer {
     pub output_pin: usize,
 }
 
+/// Exact original ALB input occurrence relative to the boundary scope.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlbInputReceiver {
+    pub path: Vec<String>,
+    pub input_pin: usize,
+    /// X-hop indices and scalar analog formals traversed by this ADC route.
+    /// The analog wire remains a scalar; a separate event bundle is promoted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub analog_hops: BTreeMap<usize, String>,
+}
+
+impl AlbInputReceiver {
+    fn prepend(&mut self, instance: String, analog_formal: Option<String>) {
+        self.path.insert(0, instance);
+        self.analog_hops = std::mem::take(&mut self.analog_hops)
+            .into_iter()
+            .map(|(index, formal)| (index + 1, formal))
+            .collect();
+        if let Some(formal) = analog_formal {
+            self.analog_hops.insert(0, formal);
+        }
+    }
+}
+
 /// Lowered original source and the compiled code-model subcircuit library.
 #[derive(Clone, Debug)]
 pub struct LogicalAlbExpansion {
@@ -50,6 +89,8 @@ pub struct LogicalAlbExpansion {
 #[derive(Clone, Debug)]
 struct Scope {
     ports: Vec<String>,
+    /// Original implicit globals made explicit at the end of the input ABI.
+    global_formals: BTreeMap<String, String>,
     suffix: Vec<String>,
     items: Vec<Item>,
     digital: BTreeSet<String>,
@@ -60,6 +101,8 @@ struct Scope {
     /// Formal ports whose exported side remains analog while an internal
     /// compiled ALB uses a distinct physical digital bundle.
     analog_cut_formals: BTreeSet<String>,
+    /// Scalar interfaces whose receiver bundles originate in a caller.
+    lifted_adc_formals: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -81,25 +124,41 @@ struct Call {
 #[derive(Clone)]
 struct ResolvedAlbProducer {
     identity: AlbOutputProducer,
+    model: usize,
     /// Immediate source instance, its output formal (or direct ALB net),
     /// and direct ALB output bit. The first divergent interface is split.
     slot: (String, String, usize),
+}
+
+/// Resolved pin reached through original lexical X interfaces. Electrical
+/// identity and immediate routing slot come from the same source traversal.
+struct ResolvedAlbPin {
+    path: Vec<String>,
+    bit: usize,
+    model: usize,
+    slot: (String, String, usize),
+    analog_hops: BTreeMap<usize, String>,
 }
 
 #[derive(Default)]
 struct Graph {
     scopes: BTreeMap<Vec<String>, Scope>,
     models: Vec<CompiledSourceAlbModel>,
+    globals: BTreeSet<String>,
 }
 
 fn key(text: &str) -> String {
     text.to_ascii_uppercase()
 }
 
-fn valid_node(text: &str) -> Result<String> {
+fn valid_analog_node(text: &str) -> Result<String> {
     crate::validate_node(text)?;
-    ensure!(text != "0", "digital ALB node cannot be analog ground 0");
     Ok(key(text))
+}
+
+fn valid_node(text: &str) -> Result<String> {
+    ensure!(text != "0", "digital ALB node cannot be analog ground 0");
+    valid_analog_node(text)
 }
 
 fn header(header: &str) -> Result<(Vec<String>, Vec<String>)> {
@@ -141,11 +200,13 @@ impl Graph {
                     scope.to_vec(),
                     Scope {
                         ports,
+                        global_formals: BTreeMap::new(),
                         suffix,
                         items: items.to_vec(),
                         digital: BTreeSet::new(),
                         alb_roles: BTreeMap::new(),
                         analog_cut_formals: BTreeSet::new(),
+                        lifted_adc_formals: BTreeSet::new(),
                     }
                 )
                 .is_none(),
@@ -161,17 +222,33 @@ impl Graph {
         Ok(())
     }
 
-    fn lookup_model(&self, scope: &[String], name: &str) -> Option<usize> {
+    fn lookup_model(
+        &self,
+        scope: &[String],
+        name: &str,
+        device: Option<&[f64]>,
+    ) -> Result<Option<usize>> {
         let mut context = scope.to_vec();
         loop {
-            if let Some(index) = self
+            if self
                 .models
                 .iter()
-                .position(|m| m.scope == context && m.model_name.eq_ignore_ascii_case(name))
+                .any(|m| m.scope == context && m.model_name.eq_ignore_ascii_case(name))
             {
-                return Some(index);
+                let selected = self.models.iter().position(|m| {
+                    m.scope == context
+                        && m.model_name.eq_ignore_ascii_case(name)
+                        && super::same_device_values(m.device_values.as_deref(), device)
+                });
+                return selected
+                    .with_context(|| {
+                        format!("ALB {name} in scope {context:?} has no compiled DEVICE={device:?} specialization")
+                    })
+                    .map(Some);
             }
-            context.pop()?;
+            if context.pop().is_none() {
+                return Ok(None);
+            }
         }
     }
 
@@ -201,7 +278,7 @@ impl Graph {
                 continue;
             };
             let model = self.scopes.get(&target).context("missing lexical subckt")?;
-            if idx != model.ports.len() + 1 {
+            if idx != model.ports.len() - model.global_formals.len() + 1 {
                 continue;
             }
             let suffix = &fields[idx + 1..];
@@ -212,9 +289,18 @@ impl Graph {
             }) {
                 continue;
             }
+            let owner = self
+                .scopes
+                .get(scope)
+                .context("missing original call scope")?;
+            let actual = fields[1..idx]
+                .iter()
+                .chain(model.global_formals.keys())
+                .map(|node| owner.mapped_node(node))
+                .collect();
             found.push(Call {
                 target,
-                actual: fields[1..idx].iter().map(|v| key(v)).collect(),
+                actual,
                 suffix: suffix.to_vec(),
                 name: instance.clone(),
             });
@@ -235,14 +321,11 @@ impl Graph {
         if !inst.starts_with(['A', 'a']) || inst.len() <= 1 {
             return Ok(None);
         }
-        let Some(last) = fields.last() else {
+        let Some((model_name, device_values)) = super::original_alb_instance_signature(statement)?
+        else {
             return Ok(None);
         };
-        let model_name = last
-            .strip_prefix("MODEL=")
-            .or_else(|| last.strip_prefix("model="))
-            .unwrap_or(last);
-        let Some(target) = self.lookup_model(scope, model_name) else {
+        let Some(target) = self.lookup_model(scope, &model_name, device_values.as_deref())? else {
             return Ok(None);
         };
         let model = &self.models[target];
@@ -256,7 +339,7 @@ impl Graph {
                     .context("unterminated original XSPICE ALB node vector")?;
                 let content = stripped[..close]
                     .split_ascii_whitespace()
-                    .map(valid_node)
+                    .map(valid_analog_node)
                     .collect::<Result<Vec<_>>>()?;
                 groups.push(content);
                 remaining = &stripped[close + 1..];
@@ -265,39 +348,51 @@ impl Graph {
                 groups.len() == 2,
                 "ALB {inst} must have input and output port vectors"
             );
-            let tail = remaining.trim();
+            let tail = remaining
+                .trim()
+                .split_once(':')
+                .map_or_else(|| remaining.trim(), |(model, _)| model.trim());
             ensure!(
-                tail.eq_ignore_ascii_case(model_name)
-                    || tail.to_ascii_uppercase() == format!("MODEL={}", key(model_name)),
-                "unsupported ALB {inst} instance parameters {tail}"
+                tail.eq_ignore_ascii_case(&model_name)
+                    || tail.to_ascii_uppercase() == format!("MODEL={model_name}"),
+                "unsupported ALB {inst} instance model reference {tail}"
             );
             groups
         } else {
-            let tokens = raw.split_ascii_whitespace().collect::<Vec<_>>();
+            let node_and_model = raw.split_once(':').map_or(raw, |(head, _)| head.trim());
+            let tokens = node_and_model.split_ascii_whitespace().collect::<Vec<_>>();
             ensure!(
-                tokens.len() == model.input_width + model.output_width + 1,
+                tokens.len() == model.kernel.input_width + model.kernel.output_width + 1,
                 "ALB {inst} logical port count does not match model"
             );
             vec![
-                tokens[..model.input_width]
+                tokens[..model.kernel.input_width]
                     .iter()
-                    .map(|s| valid_node(s))
+                    .map(|s| valid_analog_node(s))
                     .collect::<Result<Vec<_>>>()?,
-                tokens[model.input_width..tokens.len() - 1]
+                tokens[model.kernel.input_width..tokens.len() - 1]
                     .iter()
-                    .map(|s| valid_node(s))
+                    .map(|s| valid_analog_node(s))
                     .collect::<Result<Vec<_>>>()?,
             ]
         };
         ensure!(
-            ports[0].len() == model.input_width && ports[1].len() == model.output_width,
+            ports[0].len() == model.kernel.input_width
+                && ports[1].len() == model.kernel.output_width,
             "ALB {inst} pin arity differs from compiled model {}",
             model.model_name
         );
+        let owner = self.scopes.get(scope).context("missing ALB source scope")?;
         Ok(Some(LogicalInstance {
             name: inst.clone(),
-            inputs: ports[0].clone(),
-            outputs: ports[1].clone(),
+            inputs: ports[0]
+                .iter()
+                .map(|node| owner.mapped_node(node))
+                .collect(),
+            outputs: ports[1]
+                .iter()
+                .map(|node| owner.mapped_node(node))
+                .collect(),
             target,
         }))
     }
@@ -312,7 +407,7 @@ impl Graph {
                 .iter()
                 .map(|name| key(name))
                 .collect::<Vec<_>>();
-            let analog = valid_node(&boundary.analog_net)?;
+            let analog = valid_analog_node(&boundary.analog_net)?;
             let digital = valid_node(&boundary.digital_net)?;
             let owner = self
                 .scopes
@@ -328,6 +423,170 @@ impl Graph {
                     "exported analog boundary {analog} cannot map to exported digital formal {digital}"
                 );
                 owner.analog_cut_formals.insert(analog);
+            }
+        }
+        Ok(())
+    }
+
+    /// A known physical terminal without any ALB pin role must not be
+    /// rewritten as a digital triple simply because its caller also owns
+    /// a compiled ALB on the same physical wire. ALB-bearing interfaces
+    /// still require an explicit ADC/DAC boundary annotation.
+    fn mark_passive_scalar_ports(
+        &mut self,
+        contacts: &BTreeMap<Vec<String>, BTreeSet<String>>,
+    ) -> Result<()> {
+        for (path, owner) in &mut self.scopes {
+            let witnessed = contacts.get(path).context("missing physical contacts")?;
+            owner.analog_cut_formals.extend(
+                owner
+                    .ports
+                    .iter()
+                    .filter(|formal| {
+                        witnessed.contains(*formal) && !owner.alb_roles.contains_key(*formal)
+                    })
+                    .cloned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// A scalar analog formal also makes a forwarding parent formal
+    /// scalar, even when that intermediate definition has no ALB of its own.
+    /// Never infer this port property from a caller's net name.
+    fn propagate_scalar_ports(&mut self) -> Result<()> {
+        loop {
+            let mut scalar_parents = BTreeSet::new();
+            for (path, owner) in &self.scopes {
+                for item in &owner.items {
+                    if let Item::Statement(statement) = item
+                        && let Some(call) = self.call(statement, path)?
+                    {
+                        let child = self
+                            .scopes
+                            .get(&call.target)
+                            .context("missing scalar child")?;
+                        for (formal, actual) in child.ports.iter().zip(&call.actual) {
+                            if child.analog_cut_formals.contains(formal)
+                                && owner.ports.contains(actual)
+                            {
+                                scalar_parents.insert((path.clone(), actual.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            let mut changed = false;
+            for (path, formal) in scalar_parents {
+                changed |= self
+                    .scopes
+                    .get_mut(&path)
+                    .context("missing scalar parent")?
+                    .analog_cut_formals
+                    .insert(formal);
+            }
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+
+    /// External native X implementations opt into the same three-node
+    /// digital event ABI as compiled ALBs. Their original logical pins
+    /// are digital even when no local ALB happens to touch that net.
+    fn mark_native_external_digital(
+        &mut self,
+        external: &BTreeMap<String, &OpaqueXInterface>,
+    ) -> Result<()> {
+        let scopes = self.scopes.keys().cloned().collect::<Vec<_>>();
+        for scope in scopes {
+            let items = self
+                .scopes
+                .get(&scope)
+                .context("missing scope")?
+                .items
+                .clone();
+            for item in items {
+                let Item::Statement(statement) = item else {
+                    continue;
+                };
+                if self.call(&statement, &scope)?.is_some() {
+                    continue;
+                }
+                let pins = discovery::external_x_pins(&statement, external)?;
+                if pins.is_empty() {
+                    continue;
+                }
+                let tokens = statement_tokens(&normalized_statement(&statement))?;
+                let native = tokens
+                    .iter()
+                    .filter_map(|name| external.get(&key(name)))
+                    .any(|entry| entry.native_model.is_some());
+                if native {
+                    let owner = self
+                        .scopes
+                        .get_mut(&scope)
+                        .context("missing mutable scope")?;
+                    owner.digital.extend(
+                        pins.into_iter()
+                            .filter(|(_, kind)| *kind == OpaqueXPinKind::Digital)
+                            .map(|(name, _)| name),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A verified native digital event node cannot simultaneously be a raw
+    /// SPICE analog voltage/current contact unless an independently proven
+    /// ADC/DAC cut actually replaces that original logical wire.
+    fn validate_native_external_contacts(
+        &self,
+        external: &BTreeMap<String, &OpaqueXInterface>,
+        renames: &BTreeMap<Vec<String>, ScopeRenames>,
+        contacts: &BTreeMap<Vec<String>, BTreeSet<String>>,
+    ) -> Result<()> {
+        for (path, scope) in &self.scopes {
+            let analog = contacts
+                .get(path)
+                .context("missing native X physical contacts")?;
+            let empty = ScopeRenames::default();
+            let cut = renames.get(path).unwrap_or(&empty);
+            for item in &scope.items {
+                let Item::Statement(statement) = item else {
+                    continue;
+                };
+                if self.call(statement, path)?.is_some() {
+                    continue;
+                }
+                let pins = discovery::external_x_pins(statement, external)?;
+                if pins.is_empty() {
+                    continue;
+                }
+                let tokens = statement_tokens(&normalized_statement(statement))?;
+                let native = tokens
+                    .iter()
+                    .filter_map(|name| external.get(&key(name)))
+                    .any(|model| model.native_model.is_some());
+                if !native {
+                    continue;
+                }
+                for (node, kind) in pins {
+                    ensure!(
+                        kind != OpaqueXPinKind::Digital
+                            || (!cut.receivers.cuts.contains(&node)
+                                && !cut.receivers.formals.contains_key(&node)),
+                        "external native digital X pin {node} in {path:?} has ambiguous heterogeneous receiver state"
+                    );
+                    ensure!(
+                        kind != OpaqueXPinKind::Digital
+                            || !analog.contains(&node)
+                            || cut.contains_key(&node)
+                            || cut.producer_analog_nodes.contains(&node),
+                        "external native digital X pin {node} in {path:?} has an unsplit physical analog contact; requires an explicit ADC/DAC cut"
+                    );
+                }
             }
         }
         Ok(())
@@ -399,39 +658,40 @@ impl Graph {
         }
         Ok(())
     }
-    /// Resolve every physical ALB output occurrence attached to an original
-    /// source node, preserving X instance identity (not merely the reusable
-    /// child definition identity). No implied driver ordering or selection.
-    fn producer_paths(
+    /// Resolve physical ALB pin occurrences, preserving actual X instance
+    /// identity and model binding rather than merely a reusable definition.
+    fn pin_paths(
         &self,
         scope: &[String],
         node: &str,
+        direction: DigitalPinDirection,
         stack: &mut Vec<Vec<String>>,
-    ) -> Result<Vec<ResolvedAlbProducer>> {
+    ) -> Result<Vec<ResolvedAlbPin>> {
         ensure!(stack.len() < 256, "ALB X hierarchy exceeds 256 levels");
         ensure!(
             !stack.iter().any(|active| active == scope),
-            "recursive ALB producer hierarchy at {scope:?}"
+            "recursive ALB pin hierarchy at {scope:?}"
         );
         stack.push(scope.to_vec());
-        let info = self
-            .scopes
-            .get(scope)
-            .context("missing ALB producer scope")?;
+        let info = self.scopes.get(scope).context("missing ALB pin scope")?;
         let mut result = Vec::new();
         for item in &info.items {
             let Item::Statement(statement) = item else {
                 continue;
             };
             if let Some(alb) = self.alb_instance(statement, scope)? {
-                for (bit, output) in alb.outputs.iter().enumerate() {
-                    if output == node {
-                        result.push(ResolvedAlbProducer {
-                            identity: AlbOutputProducer {
-                                path: vec![key(&alb.name)],
-                                output_pin: bit,
-                            },
+                let pins = match direction {
+                    DigitalPinDirection::Input => &alb.inputs,
+                    DigitalPinDirection::Output => &alb.outputs,
+                };
+                for (bit, pin) in pins.iter().enumerate() {
+                    if pin == node {
+                        result.push(ResolvedAlbPin {
+                            path: vec![key(&alb.name)],
+                            bit,
+                            model: alb.target,
                             slot: (key(&alb.name), node.to_owned(), bit),
+                            analog_hops: BTreeMap::new(),
                         });
                     }
                 }
@@ -439,13 +699,23 @@ impl Graph {
                 let child = self
                     .scopes
                     .get(&call.target)
-                    .context("missing producer child")?;
+                    .context("missing ALB pin child")?;
                 for (formal, actual) in child.ports.iter().zip(&call.actual) {
-                    if actual != node || child.analog_cut_formals.contains(formal) {
+                    let lifted = direction == DigitalPinDirection::Input
+                        && child.lifted_adc_formals.contains(formal);
+                    if actual != node || (child.analog_cut_formals.contains(formal) && !lifted) {
                         continue;
                     }
-                    for mut resolved in self.producer_paths(&call.target, formal, stack)? {
-                        resolved.identity.path.insert(0, key(&call.name));
+                    for mut resolved in self.pin_paths(&call.target, formal, direction, stack)? {
+                        resolved.path.insert(0, key(&call.name));
+                        resolved.analog_hops = resolved
+                            .analog_hops
+                            .into_iter()
+                            .map(|(index, formal)| (index + 1, formal))
+                            .collect();
+                        if lifted {
+                            resolved.analog_hops.insert(0, formal.clone());
+                        }
                         resolved.slot = (key(&call.name), formal.clone(), 0);
                         result.push(resolved);
                     }
@@ -456,50 +726,19 @@ impl Graph {
         Ok(result)
     }
 
-    /// Count distinct ALB output producers at a logical net, across actual
-    /// X call sites. One DAC bridge per analog output boundary cannot safely
-    /// collapse two drivers into one digital triple: that would resolve
-    /// contention digitally rather than through the physical analog pin.
-    fn output_producers(
-        &self,
-        scope: &[String],
-        node: &str,
-        stack: &mut Vec<Vec<String>>,
-    ) -> Result<usize> {
-        ensure!(stack.len() < 256, "ALB X hierarchy exceeds 256 levels");
-        ensure!(
-            !stack.iter().any(|active| active == scope),
-            "recursive ALB output producer graph at {scope:?}"
-        );
-        stack.push(scope.to_vec());
-        let info = self.scopes.get(scope).context("missing output scope")?;
-        let mut producers = 0usize;
-        for item in &info.items {
-            let Item::Statement(statement) = item else {
-                continue;
-            };
-            if let Some(alb) = self.alb_instance(statement, scope)? {
-                producers += alb.outputs.iter().filter(|output| *output == node).count();
-            } else if let Some(call) = self.call(statement, scope)? {
-                let child = self
-                    .scopes
-                    .get(&call.target)
-                    .context("missing output child")?;
-                for (formal, actual) in child.ports.iter().zip(&call.actual) {
-                    if actual == node && !child.analog_cut_formals.contains(formal) {
-                        producers += self.output_producers(&call.target, formal, stack)?;
-                        if producers > 1 {
-                            break;
-                        }
-                    }
-                }
-            }
-            if producers > 1 {
-                break;
-            }
-        }
-        stack.pop();
-        Ok(producers.min(2))
+    fn producer_paths(&self, scope: &[String], node: &str) -> Result<Vec<ResolvedAlbProducer>> {
+        Ok(self
+            .pin_paths(scope, node, DigitalPinDirection::Output, &mut Vec::new())?
+            .into_iter()
+            .map(|pin| ResolvedAlbProducer {
+                identity: AlbOutputProducer {
+                    path: pin.path,
+                    output_pin: pin.bit,
+                },
+                slot: pin.slot,
+                model: pin.model,
+            })
+            .collect())
     }
 
     /// Propagate the actual ALB input/output roles *up* through lexical X
@@ -605,13 +844,17 @@ struct ScopeRenames {
     /// (immediate instance, its formal/ALB node, output bit) specifies
     /// a separately wired physical producer; definitions remain reusable.
     producer_states: BTreeMap<ProducerSlot, String>,
+    /// Original analog nodes with every independent output producer bound
+    /// to a separate physical DAC; these do not have one digital driver.
+    producer_analog_nodes: BTreeSet<String>,
     /// Additional exported physical output bundles per original X formal.
     /// Every lexical call site must supply these in the same stable order.
     promoted_formals: BTreeMap<String, Vec<PromotedOutput>>,
+    receivers: receiver_groups::ReceiverPlan,
 }
 impl ScopeRenames {
     fn contains_key(&self, original: &str) -> bool {
-        self.states.contains_key(original)
+        self.states.contains_key(original) || self.receivers.cuts.contains(original)
     }
 }
 
@@ -621,6 +864,7 @@ struct ScopeBundles {
     alb_outputs: BTreeMap<String, [String; 3]>,
     producers: BTreeMap<ProducerSlot, [String; 3]>,
     promoted_formals: BTreeMap<String, Vec<PromotedOutput>>,
+    receivers: receiver_groups::ReceiverBundles,
 }
 impl ScopeBundles {
     fn triple(&self, name: &str) -> Result<&[String; 3]> {
@@ -639,6 +883,12 @@ impl ScopeBundles {
             .or_else(|| self.ports.get(&name))
             .with_context(|| format!("ALB output {name} lacks physical metadata"))?
             .to_vec())
+    }
+    fn receiver(&self, name: &str, node: &str, input_bit: usize) -> Option<Vec<String>> {
+        self.receivers
+            .routes
+            .get(&(key(name), key(node), input_bit))
+            .map(|b| b.to_vec())
     }
     fn producer(&self, name: &str, node: &str, output_bit: usize) -> Option<Vec<String>> {
         self.producers
@@ -662,12 +912,32 @@ fn reserved(scope: &Scope) -> BTreeSet<String> {
     }
     names
 }
+fn needs_primary_bundle(scope: &Scope, renames: &ScopeRenames, node: &str) -> bool {
+    if renames.states.contains_key(node) {
+        return true;
+    }
+    let routed_input = renames.receivers.cuts.contains(node);
+    let routed_output = renames.producer_analog_nodes.contains(node);
+    if !routed_input && !routed_output {
+        return true;
+    }
+    scope.alb_roles.get(node).is_some_and(|roles| {
+        roles.iter().any(|direction| match direction {
+            DigitalPinDirection::Input => !routed_input,
+            DigitalPinDirection::Output => !routed_output,
+        })
+    })
+}
+
 fn build_bundles(scope: &Scope, renames: &ScopeRenames) -> Result<ScopeBundles> {
     let mut reserved = reserved(scope);
     // Protect every chosen state name *before* allocating any metadata.
     // Otherwise a generated _SR_SINK name may collide with a later
     // separately selected input/output state.
     for original in &scope.digital {
+        if !needs_primary_bundle(scope, renames, original) {
+            continue;
+        }
         let state = renames.states.get(original).unwrap_or(original);
         reserved.insert(state.clone());
         if let Some(output) = renames.output_states.get(original) {
@@ -677,11 +947,15 @@ fn build_bundles(scope: &Scope, renames: &ScopeRenames) -> Result<ScopeBundles> 
     for state in renames.producer_states.values() {
         reserved.insert(state.clone());
     }
+    reserved.extend(renames.receivers.states.iter().cloned());
     let mut used_states = BTreeSet::new();
     let mut physical = BTreeMap::new();
     let mut alb_outputs = BTreeMap::new();
     let mut ordinal = 0usize;
     for original in &scope.digital {
+        if !needs_primary_bundle(scope, renames, original) {
+            continue;
+        }
         let state = renames
             .states
             .get(original)
@@ -717,11 +991,16 @@ fn build_bundles(scope: &Scope, renames: &ScopeRenames) -> Result<ScopeBundles> 
         ordinal += 1;
         producers.insert(identity.clone(), bundle);
     }
+    let receivers =
+        renames
+            .receivers
+            .build_bundles(&physical, &mut reserved, &mut used_states, ordinal)?;
     Ok(ScopeBundles {
         ports: physical,
         alb_outputs,
         producers,
         promoted_formals: renames.promoted_formals.clone(),
+        receivers,
     })
 }
 
@@ -755,7 +1034,15 @@ fn expanded_header(scope: &[String], info: &Scope, nodes: &ScopeBundles) -> Resu
     let mut output = format!(".subckt {name}");
     for formal in &info.ports {
         if info.digital.contains(formal) && !info.analog_cut_formals.contains(formal) {
-            for part in nodes.rendered(formal)? {
+            let parts = if let Some(groups) = nodes.receivers.formals.get(formal) {
+                groups
+                    .first()
+                    .context("empty promoted input groups")?
+                    .to_vec()
+            } else {
+                nodes.rendered(formal)?
+            };
+            for part in parts {
                 write!(output, " {part}")?;
             }
         } else {
@@ -769,6 +1056,14 @@ fn expanded_header(scope: &[String], info: &Scope, nodes: &ScopeBundles) -> Resu
             .context("promoted output formal lacks a physical bundle")?;
         for part in parts {
             write!(output, " {part}")?;
+        }
+    }
+    for (formal, groups) in &nodes.receivers.formals {
+        let skip = usize::from(!info.lifted_adc_formals.contains(formal));
+        for parts in groups.iter().skip(skip) {
+            for part in parts {
+                write!(output, " {part}")?;
+            }
         }
     }
     for tail in &info.suffix {
@@ -798,7 +1093,7 @@ fn guard_unknown_device(
                     "unverified original A-device {inst} touches mixed digital/analog node {name}"
                 );
             }
-            if !renames.contains_key(&name) {
+            if !renames.contains_key(&name) && !renames.producer_analog_nodes.contains(&name) {
                 bail!(
                     "untranslated device {inst} connects digital net {name}; physical interface unknown"
                 );
@@ -807,11 +1102,95 @@ fn guard_unknown_device(
     }
     Ok(())
 }
+struct RenderEnvironment<'a> {
+    maps: &'a BTreeMap<Vec<String>, ScopeBundles>,
+    scoped_renames: &'a BTreeMap<Vec<String>, ScopeRenames>,
+    compiled_file: &'a str,
+    external: &'a BTreeMap<String, &'a OpaqueXInterface>,
+}
+
 struct RenderContext<'a> {
     scope: &'a [String],
     maps: &'a BTreeMap<Vec<String>, ScopeBundles>,
     renames: &'a ScopeRenames,
     compiled_file: &'a str,
+    external: &'a BTreeMap<String, &'a OpaqueXInterface>,
+}
+
+/// Rewrite only externally verified native X replacements, preserving their
+/// analog terminals and expanding digital terminals into event triples.
+/// Opaque models without a replacement retain their original SPICE X call.
+fn render_external_x(
+    statement: &str,
+    ctx: &RenderContext<'_>,
+    info: &Scope,
+    physical: &ScopeBundles,
+    output: &mut String,
+) -> Result<bool> {
+    let fields = statement_tokens(&normalized_statement(statement))?;
+    let Some(first) = fields.first() else {
+        return Ok(false);
+    };
+    if !first.starts_with(['X', 'x']) || first.len() < 2 {
+        return Ok(false);
+    }
+    let pins = discovery::external_x_pins(statement, ctx.external)?;
+    if pins.is_empty() {
+        ensure!(
+            !fields
+                .iter()
+                .skip(1)
+                .any(|node| info.digital.contains(&key(node))),
+            "unresolved external X instance {first} touches digital state"
+        );
+        return Ok(false);
+    }
+    let model = fields
+        .iter()
+        .find_map(|name| ctx.external.get(&key(name)))
+        .context("verified external model missing")?;
+    if let Some(native) = &model.native_model {
+        write!(output, "{first}")?;
+        for (node, kind) in &pins {
+            match kind {
+                OpaqueXPinKind::Digital => {
+                    for part in physical.rendered(node)? {
+                        write!(output, " {part}")?;
+                    }
+                }
+                OpaqueXPinKind::Analog => {
+                    ensure!(
+                        !info.digital.contains(node)
+                            || ctx.renames.contains_key(node)
+                            || ctx.renames.producer_analog_nodes.contains(node),
+                        "external X {first} analog pin {node} touches unsplit ALB state"
+                    );
+                    write!(output, " {node}")?;
+                }
+            }
+        }
+        write!(output, " {native}")?;
+        for suffix in fields.iter().skip(pins.len() + 2) {
+            write!(output, " {suffix}")?;
+        }
+    } else {
+        for (node, kind) in &pins {
+            if info.digital.contains(node) {
+                ensure!(
+                    *kind == OpaqueXPinKind::Analog,
+                    "external X {first} digital pin {node} touches ALB state without a compatible native digital bundle"
+                );
+                ensure!(
+                    ctx.renames.contains_key(node)
+                        || ctx.renames.producer_analog_nodes.contains(node),
+                    "external X {first} analog pin {node} touches unsplit ALB digital state"
+                );
+            }
+        }
+        output.push_str(statement);
+    }
+    output.push('\n');
+    Ok(true)
 }
 
 /// Select the physical state for the original X formal. Any additional
@@ -825,6 +1204,9 @@ fn call_original_bundle(
     physical: &ScopeBundles,
     renames: &ScopeRenames,
 ) -> Result<Vec<String>> {
+    if let Some(bundle) = physical.receiver(&call.name, formal, 0) {
+        return Ok(bundle);
+    }
     if child_bundles.promoted_formals.contains_key(formal) {
         // The original formal remains the sensing input when this exported
         // node was bidirectional. When it is output-only, no internal ALB
@@ -898,6 +1280,41 @@ fn render_promoted_call_outputs(
     Ok(())
 }
 
+fn render_promoted_call_inputs(
+    call: &Call,
+    child: &Scope,
+    child_bundles: &ScopeBundles,
+    physical: &ScopeBundles,
+    output: &mut String,
+) -> Result<()> {
+    for (formal, groups) in &child_bundles.receivers.formals {
+        let index = child
+            .ports
+            .iter()
+            .position(|port| port == formal)
+            .context("missing promoted receiver formal")?;
+        let actual = &call.actual[index];
+        let lifted = child.lifted_adc_formals.contains(formal);
+        let start = usize::from(!lifted);
+        for group in start..groups.len() {
+            let parts = if lifted {
+                physical
+                    .receiver(&call.name, formal, group)
+                    .context("missing caller binding for lifted ADC receiver")?
+            } else {
+                physical
+                    .receiver(&call.name, formal, group)
+                    .or_else(|| physical.receiver(&call.name, formal, 0))
+                    .map_or_else(|| physical.rendered(actual), Ok)?
+            };
+            for part in parts {
+                write!(output, " {part}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Graph {
     fn render_call(&self, call: &Call, ctx: &RenderContext<'_>, output: &mut String) -> Result<()> {
         let child = self
@@ -923,7 +1340,9 @@ impl Graph {
                             .renames
                             .states
                             .get(original)
-                            .is_some_and(|digital| digital != original),
+                            .is_some_and(|digital| digital != original)
+                        || ctx.renames.receivers.cuts.contains(original)
+                        || ctx.renames.producer_analog_nodes.contains(original),
                     "analog-facing formal {formal} of {} connects to unsplit digital node {original} in {:?}",
                     call.name,
                     ctx.scope
@@ -947,6 +1366,7 @@ impl Graph {
             }
         }
         render_promoted_call_outputs(call, child, child_bundles, physical, ctx.renames, output)?;
+        render_promoted_call_inputs(call, child, child_bundles, physical, output)?;
         write!(
             output,
             " {}",
@@ -1008,8 +1428,11 @@ impl Graph {
                 "duplicate ALB instance name {device}"
             );
             write!(output, "{device}")?;
-            for state in &alb.inputs {
-                for part in physical.rendered(state)? {
+            for (bit, state) in alb.inputs.iter().enumerate() {
+                let parts = physical
+                    .receiver(&alb.name, state, bit)
+                    .map_or_else(|| physical.rendered(state), Ok)?;
+                for part in parts {
                     write!(output, " {part}")?;
                 }
             }
@@ -1021,22 +1444,15 @@ impl Graph {
                     write!(output, " {part}")?;
                 }
             }
-            writeln!(output, " {}", self.models[alb.target].subcircuit_name)?;
+            writeln!(output, " {}", self.models[alb.target].kernel.name)?;
             return Ok(());
         }
         if let Some(call) = self.call(statement, scope)? {
             self.render_call(&call, ctx, output)?;
             return Ok(());
         }
-        if first.starts_with(['X', 'x']) && first.len() > 1 {
-            let fields = statement_tokens(&normalized)?;
-            if fields
-                .iter()
-                .skip(1)
-                .any(|n| info.digital.contains(&key(n)))
-            {
-                bail!("unresolved external X instance {first} touches digital state");
-            }
+        if render_external_x(statement, ctx, info, physical, output)? {
+            return Ok(());
         }
         guard_unknown_device(statement, &info.digital, renames)?;
         if scope.is_empty() && first.eq_ignore_ascii_case(".end") {
@@ -1051,13 +1467,11 @@ impl Graph {
         &self,
         items: &[Item],
         scope: &[String],
-        maps: &BTreeMap<Vec<String>, ScopeBundles>,
-        scoped_renames: &BTreeMap<Vec<String>, ScopeRenames>,
-        compiled_file: &str,
+        env: &RenderEnvironment<'_>,
         output: &mut String,
     ) -> Result<()> {
         let empty = ScopeRenames::default();
-        let renames = scoped_renames.get(scope).unwrap_or(&empty);
+        let renames = env.scoped_renames.get(scope).unwrap_or(&empty);
         let mut in_file = false;
         let mut names = items
             .iter()
@@ -1077,20 +1491,13 @@ impl Graph {
                     let mut path = scope.to_vec();
                     path.push(key(&child.name));
                     let child_info = self.scopes.get(&path).context("missing child scope")?;
-                    let child_nodes = maps.get(&path).context("missing child node mapping")?;
+                    let child_nodes = env.maps.get(&path).context("missing child node mapping")?;
                     writeln!(
                         output,
                         "{}",
                         expanded_header(&path, child_info, child_nodes)?
                     )?;
-                    self.render(
-                        &child.body,
-                        &path,
-                        maps,
-                        scoped_renames,
-                        compiled_file,
-                        output,
-                    )?;
+                    self.render(&child.body, &path, env, output)?;
                     writeln!(output, ".ends {}", key(&child.name))?;
                 }
                 Item::Statement(statement) => {
@@ -1098,9 +1505,10 @@ impl Graph {
                         statement,
                         &RenderContext {
                             scope,
-                            maps,
+                            maps: env.maps,
                             renames,
-                            compiled_file,
+                            compiled_file: env.compiled_file,
+                            external: env.external,
                         },
                         &mut in_file,
                         &mut names,
@@ -1124,11 +1532,15 @@ fn plan_original_node_roles(
     path: &[String],
     analog: &str,
     roles: &BTreeMap<DigitalPinDirection, String>,
+    lifted_input: bool,
 ) -> Result<(String, Option<String>)> {
-    let used = scope.alb_roles.get(analog).cloned().unwrap_or_default();
+    let mut used = scope.alb_roles.get(analog).cloned().unwrap_or_default();
+    if lifted_input {
+        used.remove(&DigitalPinDirection::Input);
+    }
     if used.contains(&DigitalPinDirection::Output) {
         ensure!(
-            graph.output_producers(path, analog, &mut Vec::new())? == 1,
+            graph.producer_paths(path, analog)?.len() == 1,
             "analog boundary {analog} in {path:?} has multiple ALB output drivers; each needs a separate physical DAC"
         );
     }
@@ -1271,7 +1683,7 @@ fn producer_slot(
         .flatten()
         .find(|call| key(&call.name) == *instance_name)
         .with_context(|| format!("missing selected X instance {instance_name} in {scope:?}"))?;
-    let child_outputs = graph.producer_paths(&child.target, formal, &mut Vec::new())?;
+    let child_outputs = graph.producer_paths(&child.target, formal)?;
     if child_outputs.len() == 1 {
         return Ok((instance_name.clone(), formal.clone(), 0));
     }
@@ -1292,17 +1704,23 @@ fn producer_slot(
     Ok((instance_name.clone(), formal.clone(), position))
 }
 
-fn new_promoted_name(info: &Scope, plan: &ScopeRenames, ordinal: usize) -> Result<String> {
+fn new_promoted_name(
+    info: &Scope,
+    plan: &ScopeRenames,
+    prefix: &str,
+    ordinal: usize,
+) -> Result<String> {
     let mut occupied = reserved(info);
     occupied.extend(info.digital.iter().cloned());
     occupied.extend(plan.states.values().cloned());
     occupied.extend(plan.output_states.values().cloned());
     occupied.extend(plan.producer_states.values().cloned());
+    occupied.extend(plan.receivers.states.iter().cloned());
     for suffix in 0..u32::MAX {
         let name = if suffix == 0 {
-            format!("SR_PROMOTED_OUT_{ordinal}")
+            format!("{prefix}_{ordinal}")
         } else {
-            format!("SR_PROMOTED_OUT_{ordinal}_{suffix}")
+            format!("{prefix}_{ordinal}_{suffix}")
         };
         if !occupied.contains(&name) {
             return valid_node(&name);
@@ -1332,7 +1750,7 @@ fn promote_formal(
         "recursive ALB promoted output interface at {scope:?}/{formal}"
     );
     active.push(here);
-    let found = graph.producer_paths(scope, formal, &mut Vec::new())?;
+    let found = graph.producer_paths(scope, formal)?;
     ensure!(
         found.len() > 1,
         "promoted output formal {formal} in {scope:?} has fewer than two actual ALB drivers"
@@ -1361,7 +1779,7 @@ fn promote_formal(
     );
     let plan = plans.entry(scope.to_vec()).or_default();
     for promoted_output in &promoted {
-        let state = new_promoted_name(info, plan, plan.producer_states.len())?;
+        let state = new_promoted_name(info, plan, "SR_PROMOTED_OUT", plan.producer_states.len())?;
         ensure!(
             plan.producer_states
                 .insert(promoted_output.slot.clone(), state)
@@ -1390,7 +1808,7 @@ fn plan_selected_producers(
 ) -> Result<()> {
     for ((scope, analog), selected) in requests {
         let owner = graph.scopes.get(&scope).context("lost producer scope")?;
-        let discovered = graph.producer_paths(&scope, &analog, &mut Vec::new())?;
+        let discovered = graph.producer_paths(&scope, &analog)?;
         ensure!(
             !discovered.is_empty(),
             "no original ALB output producer on {analog} in {scope:?}"
@@ -1403,7 +1821,8 @@ fn plan_selected_producers(
             ensure!(
                 plans
                     .get(&scope)
-                    .is_some_and(|plan| plan.states.contains_key(&analog)),
+                    .is_some_and(|plan| plan.contains_key(&analog))
+                    || owner.lifted_adc_formals.contains(&analog),
                 "original ALB node {analog} in {scope:?} is also sensed; provide a separate ADC boundary"
             );
         }
@@ -1434,6 +1853,7 @@ fn plan_selected_producers(
             "unmatched physical ALB producer annotation on {analog} in {scope:?}"
         );
         let plan = plans.entry(scope.clone()).or_default();
+        plan.producer_analog_nodes.insert(analog.clone());
         for (slot, state) in bindings {
             ensure!(
                 plan.producer_states.insert(slot, state).is_none(),
@@ -1449,6 +1869,27 @@ type RequestedNodeRoles =
 type RequestedOutputProducers =
     BTreeMap<(Vec<String>, String), BTreeMap<AlbOutputProducer, String>>;
 
+fn validate_boundary_formals(
+    scope: &Scope,
+    path: &[String],
+    analog: &str,
+    digital: &str,
+) -> Result<()> {
+    if !path.is_empty() {
+        ensure!(
+            !scope.ports.iter().any(|formal| formal == digital),
+            "mixed boundary {path:?} cannot use an exported digital formal {digital}"
+        );
+        if scope.ports.iter().any(|formal| formal == analog) {
+            ensure!(
+                scope.analog_cut_formals.contains(analog),
+                "exported analog formal {analog} in {path:?} lacks a verified interface cut"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Collect and validate annotations before allocating any physical state.
 fn collect_boundary_requests(
     graph: &Graph,
@@ -1459,6 +1900,8 @@ fn collect_boundary_requests(
     let mut producers =
         BTreeMap::<(Vec<String>, String), BTreeMap<AlbOutputProducer, String>>::new();
     let mut seen = BTreeSet::new();
+    let mut receiver_cuts = BTreeSet::new();
+    let lifted_nodes = receiver_groups::lifted_nodes(boundaries);
     for boundary in boundaries {
         let path = boundary
             .scope
@@ -1469,7 +1912,7 @@ fn collect_boundary_requests(
             .scopes
             .get(&path)
             .with_context(|| format!("unknown lexical boundary subcircuit scope {path:?}"))?;
-        let analog = valid_node(&boundary.analog_net)?;
+        let analog = valid_analog_node(&boundary.analog_net)?;
         let digital = valid_node(&boundary.digital_net)?;
         ensure!(
             seen.insert((
@@ -1481,18 +1924,7 @@ fn collect_boundary_requests(
             "duplicate {:?} mixed boundary in {path:?}/{analog}/{digital}",
             boundary.direction
         );
-        if !path.is_empty() {
-            ensure!(
-                !scope.ports.contains(&digital),
-                "mixed boundary {path:?} cannot use an exported digital formal {digital}"
-            );
-            if scope.ports.contains(&analog) {
-                ensure!(
-                    scope.analog_cut_formals.contains(&analog),
-                    "exported analog formal {analog} in {path:?} lacks a verified interface cut"
-                );
-            }
-        }
+        validate_boundary_formals(scope, &path, &analog, &digital)?;
         if let Some(producer) = &boundary.producer {
             ensure!(
                 boundary.direction == DigitalPinDirection::Output,
@@ -1525,6 +1957,24 @@ fn collect_boundary_requests(
             );
             continue;
         }
+        if boundary.direction == DigitalPinDirection::Input
+            && lifted_nodes.contains(&(path.clone(), analog.clone()))
+        {
+            ensure!(
+                !boundary.receivers.is_empty(),
+                "lifted ADC needs explicit receiver identities in {path:?}/{analog}"
+            );
+            continue;
+        }
+        if !boundary.receivers.is_empty() {
+            ensure!(
+                boundary.direction == DigitalPinDirection::Input,
+                "receiver group must be an input"
+            );
+            if !receiver_cuts.insert((path.clone(), analog.clone())) {
+                continue;
+            }
+        }
         if !needs_original_node_rename(scope, &path, &analog, &digital, boundary.direction)? {
             continue;
         }
@@ -1553,6 +2003,7 @@ fn plan_scope_renames(
     // ALB spells the input and output pins identically.
     let (requested, producers) = collect_boundary_requests(graph, boundaries)?;
     let mut result = BTreeMap::new();
+    let lifted_nodes = receiver_groups::lifted_nodes(boundaries);
     for (path, per_analog) in requested {
         let scope = graph.scopes.get(&path).context("lost lexical scope")?;
         let mut planned = ScopeRenames::default();
@@ -1577,8 +2028,15 @@ fn plan_scope_renames(
                     .context("missing producer-split ADC state")?;
                 planned.states.insert(analog, input.clone());
             } else {
-                let (primary, secondary) =
-                    plan_original_node_roles(graph, scope, &path, &analog, &roles)?;
+                let (primary, secondary) = plan_original_node_roles(
+                    graph,
+                    scope,
+                    &path,
+                    &analog,
+                    &roles,
+                    lifted_nodes.contains(&(path.clone(), analog.clone()))
+                        || scope.lifted_adc_formals.contains(&analog),
+                )?;
                 planned.states.insert(analog.clone(), primary);
                 if let Some(output) = secondary {
                     planned.output_states.insert(analog, output);
@@ -1587,7 +2045,18 @@ fn plan_scope_renames(
         }
         result.insert(path, planned);
     }
+    // Allocate requested producer names first so promoted receiver states
+    // cannot collide, and tell the producer validator which inputs are owned.
+    for (path, analog) in lifted_nodes {
+        result
+            .entry(path)
+            .or_default()
+            .receivers
+            .cuts
+            .insert(analog);
+    }
     plan_selected_producers(graph, producers, &mut result)?;
+    receiver_groups::plan(graph, boundaries, &mut result)?;
     Ok(result)
 }
 
@@ -1601,6 +2070,25 @@ pub fn expand_logical_alb_source(
     boundaries: &[LogicalAlbBoundary],
     compiled_file: &str,
 ) -> Result<LogicalAlbExpansion> {
+    expand_logical_alb_source_with_opaque_x_interfaces(source, boundaries, compiled_file, &[])
+}
+
+/// Expand ALB nodes alongside explicitly verified external X-pin interfaces.
+///
+/// Neither model names nor node names imply analog ownership. An external X
+/// digital port touching native ALB state is rejected unless a compatible
+/// digital bundle can be provided by a future independent implementation.
+///
+/// # Errors
+/// Invalid signatures, incompatible original X terminals, or any source
+/// translation error.
+pub fn expand_logical_alb_source_with_opaque_x_interfaces(
+    source: &str,
+    boundaries: &[LogicalAlbBoundary],
+    compiled_file: &str,
+    external_interfaces: &[OpaqueXInterface],
+) -> Result<LogicalAlbExpansion> {
+    let external = discovery::opaque_x_interfaces(external_interfaces)?;
     ensure!(
         !compiled_file.is_empty()
             && compiled_file
@@ -1634,12 +2122,21 @@ pub fn expand_logical_alb_source(
     let mut graph = Graph {
         models,
         scopes: BTreeMap::new(),
+        globals: BTreeSet::new(),
     };
     graph.collect(&items, &[], None)?;
+    let scopes = discovery::dependency_order(&graph)?;
+    global_nodes::prepare(&mut graph, &scopes)?;
+    graph.mark_native_external_digital(&external)?;
     graph.mark_exported_cuts(boundaries)?;
-    graph.discover_roles()?;
+    receiver_groups::mark_lifted_formals(&mut graph, boundaries)?;
+    graph.propagate_scalar_ports()?;
     graph.discover_alb_roles()?;
+    let contacts = discovery::witnessed_analog_contacts(&graph, &external, &scopes)?;
+    graph.mark_passive_scalar_ports(&contacts)?;
+    graph.discover_roles()?;
     let scoped_renames = plan_scope_renames(&graph, boundaries)?;
+    graph.validate_native_external_contacts(&external, &scoped_renames, &contacts)?;
     let maps = graph
         .scopes
         .iter()
@@ -1653,15 +2150,25 @@ pub fn expand_logical_alb_source(
     graph.render(
         &items,
         &[],
-        &maps,
-        &scoped_renames,
-        compiled_file,
+        &RenderEnvironment {
+            maps: &maps,
+            scoped_renames: &scoped_renames,
+            compiled_file,
+            external: &external,
+        },
         &mut output,
     )?;
     let mut library = String::new();
-    for m in &graph.models {
-        library.push_str(&m.source);
-        library.push('\n');
+    let mut emitted = BTreeSet::new();
+    for model in &graph.models {
+        let kernel = &model.kernel;
+        if emitted.insert(&kernel.name) {
+            writeln!(
+                library,
+                ".subckt {}{}.ends {}\n",
+                kernel.name, kernel.contents, kernel.name
+            )?;
+        }
     }
     Ok(LogicalAlbExpansion {
         deck: output,

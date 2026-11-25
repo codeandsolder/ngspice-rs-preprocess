@@ -1,0 +1,54 @@
+* Stateful EDGE signed current floors, ceilings and load delay
+Vinput d 0 PWL(0 0 1.9n 0 2n 5 11.9n 5 12n 0 25n 0)
+Vclk ck 0 PWL(0 0 3.9n 0 4n 5 6n 5 6.1n 0 13.9n 0 14n 5 16n 5 16.1n 0 25n 0)
+.file CLOCKED
+PORT D in[0];
+PORT CK in[1];
+PORT Q out[0];
+EDGE (WIDTH=1, DELAY=1n, CLOCK=in[1]) REG=0;
+REG=D;
+Q=REG;
+.endf
+.model DRV1 d_logic_block file=CLOCKED family="HC" input_load=0 out_res=1000 out_delay=1n min_sink=.5m
+.model RCV1 d_logic_block family="HC" out_res=40 out_delay=1n input_load=2p sink_current=0 source_current=0 def="out[0]=in[0];"
+Aprod1 [d ck] [p1] DRV1
+Acons1 [p1] [q1] RCV1
+Rload1 q1 0 100k
+.model DRV2 d_logic_block file=CLOCKED family="HC" input_load=0 out_res=1000 out_delay=1n min_sink=.5m
+.model RCV2 d_logic_block family="HC" out_res=40 out_delay=1n input_load=2p sink_current=.5m source_current=0 def="out[0]=in[0];"
+Aprod2 [d ck] [p2] DRV2
+Acons2 [p2] [q2] RCV2
+Rload2 q2 0 100k
+.model DRV3 d_logic_block file=CLOCKED family="HC" input_load=0 out_res=1000 out_delay=1n max_source=-.5m
+.model RCV3 d_logic_block family="HC" out_res=40 out_delay=1n input_load=2p sink_current=0 source_current=0 def="out[0]=in[0];"
+Aprod3 [d ck] [p3] DRV3
+Acons3 [p3] [q3] RCV3
+Rload3 q3 0 100k
+.model DRV4 d_logic_block file=CLOCKED family="HC" input_load=0 out_res=1000 out_delay=1n max_source=-.5m
+.model RCV4 d_logic_block family="HC" out_res=40 out_delay=1n input_load=2p sink_current=0 source_current=-.5m def="out[0]=in[0];"
+Aprod4 [d ck] [p4] DRV4
+Acons4 [p4] [q4] RCV4
+Rload4 q4 0 100k
+.model DRV5 d_logic_block file=CLOCKED family="HC" input_load=0 out_res=1000 out_delay=1n 
+.model RCV5 d_logic_block family="HC" out_res=40 out_delay=1n input_load=0 sink_current=0 source_current=0 def="out[0]=in[0];"
+Aprod5 [d ck] [p5] DRV5
+Acons5 [p5] [q5] RCV5
+Rload5 q5 0 100k
+.model DRV6 d_logic_block file=CLOCKED family="HC" input_load=0 out_res=1000 out_delay=1n 
+.model RCV6 d_logic_block family="HC" out_res=40 out_delay=1n input_load=-.5p sink_current=0 source_current=0 def="out[0]=in[0];"
+Aprod6 [d ck] [p6] DRV6
+Acons6 [p6] [q6] RCV6
+Rload6 q6 0 100k
+.model DRV7 d_logic_block file=CLOCKED family="HC" input_load=0 out_res=1000 out_delay=1n 
+.model RCV7 d_logic_block family="HC" out_res=40 out_delay=1n input_load=-1p sink_current=0 source_current=0 def="out[0]=in[0];"
+Aprod7 [d ck] [p7] DRV7
+Acons7 [p7] [q7] RCV7
+Rload7 q7 0 100k
+.model DRV8 d_logic_block file=CLOCKED family="HC" input_load=0 out_res=1000 out_delay=1n 
+.model RCV8 d_logic_block family="HC" out_res=40 out_delay=1n input_load=-2p sink_current=0 source_current=0 def="out[0]=in[0];"
+Aprod8 [d ck] [p8] DRV8
+Acons8 [p8] [q8] RCV8
+Rload8 q8 0 100k
+.PRINT TRAN V(q1) V(q2) V(q3) V(q4) V(q5) V(q6) V(q7) V(q8)
+.tran 5p 25n 0 5p
+.end

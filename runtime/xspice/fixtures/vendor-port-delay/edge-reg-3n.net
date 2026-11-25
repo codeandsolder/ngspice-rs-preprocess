@@ -1,0 +1,18 @@
+* Vendor-only SIMetrix 9.40d ALB: positive-edge D register, output delay.
+* Source fixture, not yet run on proprietary vendor simulator.
+.model MEDGE3N d_logic_block file=PORT_EDGE3N family="UNIV"
+.file PORT_EDGE3N
+PORT Data in[0] ;
+PORT Clock in[1] ;
+PORT (DELAY=0) Q out[0] ;
+EDGE (WIDTH=1, DELAY=3n, CLOCK=in[1]) Flip=0 ;
+Flip = Data ;
+Q = Flip ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 15n 5 15.1n 0 25n 0 25.1n 5 35n 5 35.1n 0 52n 0)
+Vclock ck 0 PWL(0 0 9.9n 0 10n 5 13n 5 13.1n 0 19.9n 0 20n 5 23n 5 23.1n 0 29.9n 0 30n 5 33n 5 33.1n 0 39.9n 0 40n 5 43n 5 43.1n 0 52n 0)
+Aseq [d ck] [q] MEDGE3N
+Rout q 0 100k
+.tran 20p 52n 0 20p
+.PRINT TRAN V(d) V(ck) V(q)
+.end

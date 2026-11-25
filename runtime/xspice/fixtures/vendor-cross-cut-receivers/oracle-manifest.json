@@ -1,0 +1,99 @@
+{
+  "cases": [
+    {
+      "name": "same-domain",
+      "source_sha256": "E2D18718311B60502851212E5739C30B2D02C2857BE29E18E92F4FCCBE2AA4D2",
+      "listing_sha256": "1D969EAAF1F70E8C2E7B8FD51724C3C3BA0214E0BD5A274E8B81E072B28FB944",
+      "bridges": [
+        "A$BRIDGE_1 q3_#in_1 q3 HC_dac : interface_model=M5",
+        "A$BRIDGE_2 q2_#in_1 q2 HC_dac : interface_model=M5",
+        "A$BRIDGE_3 p p_#out_1 HC_adc : interface_model=M5",
+        "A$BRIDGE_4 q1_#in_1 q1 HC_dac : interface_model=M5"
+      ],
+      "headers": [
+        "Time        \tI(Vinput#p) \tV(q3)       \tV(q2)       \tV(q1)       "
+      ],
+      "startup": [
+        "0            \t0.0573884186 \t0            \t0            \t0            "
+      ],
+      "normalized_source_sha256": "43cc8dd8af2f0a95cab7ef0e28cdf02dacf4db61a38a18da638ded4ddb08c66e",
+      "pins": [
+        "i(vinput)",
+        "v(q3)",
+        "v(q2)",
+        "v(q1)"
+      ],
+      "csv_sha256": "0D7029DC7CFBBFB36EFFB3B149408673C96C961B8EE6BBB4401DDE73FEA8DCF8",
+      "original_rows": 22001,
+      "adc_count": 1,
+      "dac_count": 3,
+      "sample_rows": 221,
+      "crossings": 6
+    },
+    {
+      "name": "mixed-domain",
+      "source_sha256": "A540A1B7D8418FF13AE0D580D95967B860BFD8B8A004295409E6448188B74490",
+      "listing_sha256": "6977280A49974D7CA78E137F7C0EAE52C49E9F58A71E9A990954BB34E6B66736",
+      "bridges": [
+        "A$BRIDGE_1 q3_#in_1 q3 HC_dac : interface_model=M5",
+        "A$BRIDGE_2 p p_#out_1 HC_adc : interface_model=M5",
+        "A$BRIDGE_3 p p_#out_2 HC_adc : interface_model=Xtwo.M33",
+        "A$BRIDGE_4 q2_#in_1 q2 HC_dac : interface_model=Xtwo.M33",
+        "A$BRIDGE_5 q1_#in_1 q1 HC_dac : interface_model=Xone.M33"
+      ],
+      "headers": [
+        "Time        \tI(Vinput#p) \tV(q3)       \tV(q2)       \tV(q1)       "
+      ],
+      "startup": [
+        "0            \t0.1086839282 \t0            \t0            \t0            "
+      ],
+      "normalized_source_sha256": "e934a2f210ee482cef75d758404a8af49cfe4814cd9c176aad6fbd5515a09289",
+      "pins": [
+        "i(vinput)",
+        "v(q3)",
+        "v(q2)",
+        "v(q1)"
+      ],
+      "csv_sha256": "472318F319799FF542E6C58400CDB6912E4CAF580AE1590E1D5C0E18CA63D8A2",
+      "original_rows": 22001,
+      "adc_count": 2,
+      "dac_count": 3,
+      "sample_rows": 221,
+      "crossings": 6
+    },
+    {
+      "name": "independent-nets",
+      "source_sha256": "7BA121BC4F4C29DF591C52BD5AC512F3A5F75EE9CFC421B7FBB8DDB33CAE92E2",
+      "listing_sha256": "956BED49F4C8F3FB0F0F0F939C27D4B6B9DDF1FCE20A813251C2DC44EE884222",
+      "bridges": [
+        "A$BRIDGE_1 q3_#in_1 q3 HC_dac : interface_model=M5",
+        "A$BRIDGE_2 q2_#in_1 q2 HC_dac : interface_model=M5",
+        "A$BRIDGE_3 p p_#out_1 HC_adc : interface_model=M5",
+        "A$BRIDGE_4 r r_#out_1 HC_adc : interface_model=M5",
+        "A$BRIDGE_5 q1_#in_1 q1 HC_dac : interface_model=M5"
+      ],
+      "headers": [
+        "Time        \tI(Vother#p) \tI(Vinput#p) \tV(q3)       \tV(q2)       ",
+        "Time        \tV(q1)       "
+      ],
+      "startup": [
+        "0            \t0.001        \t0.0557874186 \t0            \t0            ",
+        "0            \t0            "
+      ],
+      "normalized_source_sha256": "287726f7b58f3fbff459b78edd47ec7af57f0be5e845961a6c4096f68f7cc5d9",
+      "pins": [
+        "i(vother)",
+        "i(vinput)",
+        "v(q3)",
+        "v(q2)",
+        "v(q1)"
+      ],
+      "csv_sha256": "43AA371F7AB428AC688CC2E88AA4D0E21BB1B639747B6C5B39F36F0B0D247D02",
+      "original_rows": 22001,
+      "adc_count": 2,
+      "dac_count": 3,
+      "sample_rows": 221,
+      "crossings": 6
+    }
+  ]
+}

@@ -3,10 +3,10 @@
 use super::super::super::Subcircuit;
 use super::super::{Call, normalized_statement, statement_tokens};
 use super::{
-    FamilySpecialization, Graph, Item, OccurrenceFamilyBoundary, Result, Signature, VariantKey,
-    key, signature,
+    DefinitionFamilyBoundary, FamilySpecialization, Graph, Item, LogicalCut,
+    OccurrenceFamilyBoundary, Result, Signature, VariantKey, key, signature,
 };
-use crate::alb::ScopedAnalogDigitalConnection;
+use crate::{LogicalAlbBoundary, alb::ScopedAnalogDigitalConnection};
 use anyhow::{Context, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -170,36 +170,30 @@ fn collect_occurrences(
     Ok(roots)
 }
 
-fn inspect_occurrence(
-    node: &Occurrence,
-    targeted: &BTreeSet<Vec<String>>,
-    shapes: &mut BTreeMap<Vec<String>, Vec<(String, String, u8)>>,
-) -> Result<()> {
-    if targeted.contains(&node.definition) {
-        let local = node.local.as_ref().with_context(|| {
-            format!(
-                "unannotated occurrence {:?} of specialized definition {:?}",
-                node.path, node.definition,
-            )
-        })?;
-        let shape = local
+/// A wholly unannotated occurrence retains the common logical cut layout
+/// only when every explicitly annotated occurrence agrees on it. It gets
+/// no electrical bridges. Heterogeneous cuts have no implicit default:
+/// an unchanged occurrence must be valid with its actual digital ports.
+type CommonCuts = BTreeMap<Vec<String>, Option<Vec<LogicalCut>>>;
+
+fn collect_common_cuts(node: &Occurrence, common: &mut CommonCuts) {
+    if let Some(local) = &node.local {
+        let cuts = local
             .iter()
-            .map(|v| (v.0.clone(), v.1.clone(), v.2))
+            .map(|entry| entry.cut.clone())
             .collect::<Vec<_>>();
-        if let Some(existing) = shapes.get(&node.definition) {
-            ensure!(
-                existing == &shape,
-                "inconsistent structural mixed-signal boundaries for {:?}",
-                node.definition
-            );
-        } else {
-            shapes.insert(node.definition.clone(), shape);
-        }
+        common
+            .entry(node.definition.clone())
+            .and_modify(|previous| {
+                if previous.as_ref() != Some(&cuts) {
+                    *previous = None;
+                }
+            })
+            .or_insert(Some(cuts));
     }
     for child in node.children.values() {
-        inspect_occurrence(child, targeted, shapes)?;
+        collect_common_cuts(child, common);
     }
-    Ok(())
 }
 
 fn gather_variants(node: &Occurrence, groups: &mut BTreeMap<Vec<String>, BTreeSet<VariantKey>>) {
@@ -290,10 +284,12 @@ struct Renderer<'a> {
     graph: &'a Graph,
     variants: &'a Variants,
     annotations: &'a Annotations,
-    lexical: &'a [ScopedAnalogDigitalConnection],
+    lexical: &'a [DefinitionFamilyBoundary],
+    common: &'a CommonCuts,
     emitted: BTreeSet<Vec<String>>,
     output: String,
     connections: Vec<ScopedAnalogDigitalConnection>,
+    logical_boundaries: Vec<LogicalAlbBoundary>,
 }
 
 impl Renderer<'_> {
@@ -305,9 +301,14 @@ impl Renderer<'_> {
     ) {
         for entry in self.lexical {
             if entry.scope.iter().map(|s| key(s)).collect::<Vec<_>>() == original {
-                let mut local = entry.clone();
-                local.scope = physical.to_vec();
-                self.connections.push(local);
+                self.connections.push(ScopedAnalogDigitalConnection {
+                    scope: physical.to_vec(),
+                    boundary: entry.boundary.clone(),
+                });
+                self.logical_boundaries.push(
+                    LogicalCut::new(&entry.boundary, entry.producer.as_ref(), &entry.receivers)
+                        .at(physical),
+                );
             }
         }
         if let Some(node) = representative
@@ -318,7 +319,14 @@ impl Renderer<'_> {
                     scope: physical.to_vec(),
                     boundary: entry.boundary.clone(),
                 });
+                self.logical_boundaries.push(
+                    LogicalCut::new(&entry.boundary, entry.producer.as_ref(), &entry.receivers)
+                        .at(physical),
+                );
             }
+        } else if let Some(Some(cuts)) = self.common.get(original) {
+            self.logical_boundaries
+                .extend(cuts.iter().map(|cut| cut.at(physical)));
         }
     }
 
@@ -398,17 +406,21 @@ impl Renderer<'_> {
                 requested.entry(variant.clone()).or_insert(occurrence);
             }
         }
-        if requested.is_empty() {
+        let original_occurrence = matches.iter().find(|node| node.variant.is_none()).copied();
+        if requested.is_empty() || original_occurrence.is_some() {
             let mut path = parent_physical.to_vec();
             path.push(key(&block.name));
-            return self.definition(
+            self.definition(
                 block,
                 original,
                 &path,
                 &block.name,
-                matches.first().copied(),
-            );
+                original_occurrence.or_else(|| matches.first().copied()),
+            )?;
         }
+        // A specialized child and an unchanged child can coexist under the
+        // same lexical parent. Keep the original definition for unchanged X
+        // calls rather than leaving them pointing to a removed subcircuit.
         for (variant, occurrence) in requested {
             let generated = self
                 .variants
@@ -430,16 +442,19 @@ fn render_specialized(
     roots: &BTreeMap<String, Occurrence>,
     variants: &Variants,
     annotations: &Annotations,
-    lexical: &[ScopedAnalogDigitalConnection],
+    lexical: &[DefinitionFamilyBoundary],
+    common: &CommonCuts,
 ) -> Result<FamilySpecialization> {
     let mut renderer = Renderer {
         graph,
         variants,
         annotations,
         lexical,
+        common,
         emitted: BTreeSet::new(),
         output: String::new(),
         connections: Vec::new(),
+        logical_boundaries: Vec::new(),
     };
     for item in items {
         match item {
@@ -470,40 +485,38 @@ fn render_specialized(
                         requested.entry(variant.clone()).or_insert(occurrence);
                     }
                 }
-                if requested.is_empty() {
+                let original_occurrence =
+                    matches.iter().find(|node| node.variant.is_none()).copied();
+                if requested.is_empty() || original_occurrence.is_some() {
                     renderer.definition(
                         def,
                         &scope,
                         &scope,
                         &def.name,
-                        matches.first().copied(),
+                        original_occurrence.or_else(|| matches.first().copied()),
                     )?;
-                } else {
-                    for (variant, occurrence) in requested {
-                        let name = variants
-                            .get(&scope)
-                            .and_then(|variants| variants.get(&variant))
-                            .context("missing root electrical variant")?;
-                        renderer.definition(
-                            def,
-                            &scope,
-                            std::slice::from_ref(name),
-                            name,
-                            Some(occurrence),
-                        )?;
-                    }
+                }
+                for (variant, occurrence) in requested {
+                    let name = variants
+                        .get(&scope)
+                        .and_then(|variants| variants.get(&variant))
+                        .context("missing root electrical variant")?;
+                    renderer.definition(
+                        def,
+                        &scope,
+                        std::slice::from_ref(name),
+                        name,
+                        Some(occurrence),
+                    )?;
                 }
             }
         }
     }
-    for entry in lexical {
-        if entry.scope.is_empty() {
-            renderer.connections.push(entry.clone());
-        }
-    }
+    renderer.copy_connections(&[], &[], None);
     Ok(FamilySpecialization {
         deck: renderer.output,
         connections: renderer.connections,
+        logical_boundaries: renderer.logical_boundaries,
     })
 }
 
@@ -511,7 +524,7 @@ pub(super) fn run(
     graph: &Graph,
     items: &[Item],
     occurrence_connections: &[OccurrenceFamilyBoundary],
-    lexical_connections: &[ScopedAnalogDigitalConnection],
+    lexical_connections: &[DefinitionFamilyBoundary],
 ) -> Result<FamilySpecialization> {
     let annotations = collect_annotations(occurrence_connections)?;
     let roots = collect_occurrences(graph, items, &annotations)?;
@@ -520,12 +533,16 @@ pub(super) fn run(
         let first = entries.first().context("empty occurrence annotation")?;
         targeted.insert(first.scope.iter().map(|s| key(s)).collect::<Vec<_>>());
     }
-    let mut shapes = BTreeMap::new();
+    let mut common = CommonCuts::new();
     for node in roots.values() {
-        inspect_occurrence(node, &targeted, &mut shapes)?;
+        collect_common_cuts(node, &mut common);
     }
     for entry in lexical_connections {
         let scope = entry.scope.iter().map(|s| key(s)).collect::<Vec<_>>();
+        ensure!(
+            graph.scopes.contains_key(&scope),
+            "unknown lexical family boundary scope {scope:?}"
+        );
         ensure!(
             !targeted.contains(&scope),
             "per-definition family boundary conflicts with per-occurrence assignment in {scope:?}"
@@ -539,5 +556,6 @@ pub(super) fn run(
         &variants,
         &annotations,
         lexical_connections,
+        &common,
     )
 }

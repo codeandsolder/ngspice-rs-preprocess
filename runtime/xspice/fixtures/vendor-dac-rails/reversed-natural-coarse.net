@@ -1,0 +1,9 @@
+* DAC rail order reversed-natural
+.model SRC d_source(input_file="source.txt" input_load=0)
+Asrc [dig] SRC
+.model DAC dac_bridge(in_family="HC" out_low=5 out_high=0 g_pullup=.024 g_pulldown=.034 g_hiz=.001 g_resistive=.002 input_load=0 t_rise=1n t_fall=1n knee_low=3 knee_high=2 v_smooth=.5)
+Adac dig q DAC
+Vforce q 0 PWL(0 -2 80n 7 180n -2)
+.PRINT TRAN I(Vforce)
+.tran 10p 180n 0 10p
+.end

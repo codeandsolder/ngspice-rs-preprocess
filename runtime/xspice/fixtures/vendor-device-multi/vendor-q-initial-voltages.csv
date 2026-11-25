@@ -1,0 +1,4 @@
+scenario,pin,initial_v
+device-multi-q1,q,0
+device-multi-q2,q,0
+device-multi-q3,q,0

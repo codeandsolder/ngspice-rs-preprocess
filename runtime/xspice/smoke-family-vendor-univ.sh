@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
-if (( $# != 4 )); then
-    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT EXTERNAL_MODEL_JSON\n' "$0" >&2
+if (( $# != 3 )); then
+    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT\n' "$0" >&2
     exit 2
 fi
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 cm="$(realpath -- "$1")"
 bins="$(realpath -- "$2")"
 scratch="$(realpath -- "$3")"
-models="$(realpath -- "$4")"
-test -f "$models"
 for tool in ngspice rg awk sed; do command -v "$tool" >/dev/null; done
 for tool in alb-logical-expand alb-family-autowire; do
     test -x "$bins/$tool" || { echo "Missing $tool" >&2; exit 1; }
@@ -20,7 +18,7 @@ fixture="$here/fixtures/family"
 "$bins/alb-logical-expand" "$fixture/dynamic-sensed-contention.cir" \
     "$fixture/dynamic-vendor-univ.json" "$work/lowered.cir" "$work/generated.inc"
 "$bins/alb-family-autowire" "$work/lowered.cir" "$work/generated.inc" \
-    "$fixture/dynamic-vendor-univ.json" "$models" "$work/base.cir"
+    "$fixture/dynamic-vendor-univ.json" "$fixture/vendor-univ-models.json" "$work/base.cir"
 [[ $(rg -c 'sr_family_adc\(' "$work/base.cir") == 3 ]] ||
     { echo 'Expected three UNIV input bridges' >&2; exit 1; }
 [[ $(rg -c 'sr_family_dac\(' "$work/base.cir") == 3 ]] ||

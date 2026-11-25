@@ -2,8 +2,9 @@
 //! Does not enable the production `D_LOGIC_BLOCK` translator.
 
 use super::{
-    AlbLogicLevel, BTreeMap, BTreeSet, Context, EvalContext, KnownLutSourceBit, Result,
-    TimedCombinationalGraph, bail,
+    AlbLogicLevel, BTreeMap, BTreeSet, Context, EvalContext, KnownLutSourceBit,
+    MIN_PROPAGATION_DELAY_S, OutputResistance, PhysicalOutputDrive, PhysicalOutputLoad, Result,
+    TimedCombinationalGraph, TimingEnvironment, bail, resolve_output_delay,
 };
 use std::fmt::Write as _;
 
@@ -27,17 +28,18 @@ pub struct XspiceTimedBit {
 /// Explicit experimental electrical parameters; not a claim of ALB family equivalence.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct XspiceElectrical {
+    /// Signed input capacitance contribution in farads.
     pub input_load_f: f64,
-    /// Signed current drained by one physical input at logic low (negative A).
+    /// Signed current demand of one physical input at logic low (A; typically negative).
     pub input_sink_current_a: f64,
-    /// Signed current demanded by one physical input at logic high (positive A).
+    /// Signed current demand of one physical input at logic high (A; typically positive).
     pub input_source_current_a: f64,
-    /// Lower bound of downstream aggregate current for a low output (negative A).
+    /// Signed lower bound of downstream aggregate current for a low output (A).
     pub min_sink_a: f64,
-    /// Upper bound of downstream aggregate current for a high output (positive A).
+    /// Signed upper bound of downstream aggregate current for a high output (A).
     pub max_source_a: f64,
     pub stage_out_res_ohm: f64,
-    pub output_out_res_ohm: f64,
+    pub output_out_res_ohm: OutputResistance,
 }
 
 /// Compiler artifact, independent of simulator-specific net names.
@@ -53,11 +55,16 @@ impl XspiceTimedPlan {
     /// physical timed native ABI as the register/COMB compiler.
     ///
     /// # Errors
-    /// Requires a positive finite delay and supported LUT fan-in.
-    pub fn from_known_truth_table(table: &super::KnownTruthTable, delay_s: f64) -> Result<Self> {
-        if !delay_s.is_finite() || delay_s < 1.0e-12 {
-            bail!("ALB combinational truth table requires finite delay >= 1ps");
-        }
+    /// Requires valid port delay qualifiers and supported LUT fan-in.
+    pub fn from_known_truth_table(
+        table: &super::KnownTruthTable,
+        environment: TimingEnvironment<'_>,
+    ) -> Result<Self> {
+        let delays = table
+            .output_delays
+            .iter()
+            .map(|port_delay| resolve_output_delay(port_delay.as_ref(), environment))
+            .collect::<Result<Vec<_>>>()?;
         let input_width = table.input_width();
         let output_width = table.output_width();
         if input_width > 16 {
@@ -73,7 +80,7 @@ impl XspiceTimedPlan {
                 },
                 sources: (0..input_width).map(KnownLutSourceBit::Input).collect(),
                 table_values: values[pin * combinations..(pin + 1) * combinations].to_owned(),
-                delay_s,
+                delay_s: delays[pin],
                 initial: AlbLogicLevel::Unknown,
             })
             .collect();
@@ -115,57 +122,15 @@ impl XspiceTimedPlan {
         {
             bail!("invalid XSPICE subcircuit name {name:?}");
         }
-        for (label, number) in [
-            ("input_load", electrical.input_load_f),
-            ("input_sink_current", electrical.input_sink_current_a),
-            ("input_source_current", electrical.input_source_current_a),
-            ("min_sink", electrical.min_sink_a),
-            ("max_source", electrical.max_source_a),
-            ("stage_out_res", electrical.stage_out_res_ohm),
-            ("output_out_res", electrical.output_out_res_ohm),
-        ] {
-            let signed = matches!(
-                label,
-                "input_sink_current" | "input_source_current" | "min_sink" | "max_source"
-            );
-            if !number.is_finite() || (!signed && number < 0.0) {
-                bail!("XSPICE {label} must be finite with valid sign: {number}");
-            }
-        }
+        let contents = self.render_contents(electrical)?;
+        Ok(format!(".subckt {name}{contents}.ends {name}\n"))
+    }
 
-        if electrical.input_sink_current_a > 0.0
-            || electrical.input_source_current_a < 0.0
-            || electrical.min_sink_a > 0.0
-            || electrical.max_source_a < 0.0
-        {
-            bail!("XSPICE current polarity must satisfy sink<=0 and source>=0");
-        }
-        let mut result = format!(".subckt {name}");
-        for pin in 0..self.input_width {
-            write!(result, " sr_in{pin} sr_in{pin}_sink sr_in{pin}_source")?;
-        }
-        for pin in 0..self.output_width {
-            write!(result, " sr_out{pin} sr_out{pin}_sink sr_out{pin}_source")?;
-        }
-        result.push('\n');
-        // Each *physical* ALB input contributes one load even if the input is
-        // absent from the Boolean graph. Internal LUT edges are not devices.
-        for pin in 0..self.input_width {
-            writeln!(
-                result,
-                "Asr_load{pin} sr_in{pin} sr_in{pin}_sink sr_in{pin}_source Msr_input_load"
-            )?;
-        }
-        writeln!(
-            result,
-            ".model Msr_input_load sr_bundle_load(capacitance={:e} sink_current={:e} source_current={:e})",
-            electrical.input_load_f,
-            electrical.input_sink_current_a,
-            electrical.input_source_current_a
-        )?;
-
+    /// Render the formal port list and complete body without a model name.
+    /// The canonical bytes are also the native implementation identity.
+    pub(crate) fn render_contents(&self, electrical: XspiceElectrical) -> Result<String> {
+        let mut result = render_bundle_prefix(self.input_width, self.output_width, electrical)?;
         self.render_bits(electrical, &mut result)?;
-        writeln!(result, ".ends {name}")?;
         Ok(result)
     }
     fn render_bits(&self, electrical: XspiceElectrical, result: &mut String) -> Result<()> {
@@ -182,7 +147,11 @@ impl XspiceTimedPlan {
                     {
                         bail!("duplicate XSPICE stage {name}[{bit}]");
                     }
-                    (format!("s{index}"), net, electrical.stage_out_res_ohm)
+                    (
+                        format!("s{index}"),
+                        net,
+                        OutputResistance::symmetric(electrical.stage_out_res_ohm),
+                    )
                 }
                 XspiceLutTarget::Output { name, pin } => {
                     if *pin >= self.output_width || !used_outputs.insert(*pin) {
@@ -195,23 +164,12 @@ impl XspiceTimedPlan {
                     )
                 }
             };
-            if !bit.delay_s.is_finite() || bit.delay_s < 1.0e-12 {
-                bail!(
-                    "XSPICE sr_alb_lut_bit requires delay >= 1ps for {suffix}: {}",
-                    bit.delay_s
-                );
-            }
-            if bit.sources.len() > 16 {
-                bail!("XSPICE LUT {suffix} exceeds current native 16-source limit");
-            }
-            if bit.table_values.len() != 1usize << bit.sources.len()
-                || !bit
-                    .table_values
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0' | b'1' | b'Z'))
-            {
-                bail!("malformed XSPICE table for {suffix}");
-            }
+            validate_lut_bit(bit, &suffix)?;
+            let minimum_delay = if matches!(bit.target, XspiceLutTarget::Output { .. }) {
+                MIN_PROPAGATION_DELAY_S
+            } else {
+                0.0
+            };
 
             let mut nets = Vec::new();
             for source in &bit.sources {
@@ -254,8 +212,12 @@ impl XspiceTimedPlan {
             )?;
             writeln!(
                 result,
-                ".model Msr_{suffix} sr_alb_lut_bit(table_values=\"{table}\" delay={:e} input_load=0 out_res={resistance:e} min_sink={:e} max_source={:e} ic={ic} inertial_delay=true unknown_as_zero=true)",
-                bit.delay_s, electrical.min_sink_a, electrical.max_source_a
+                ".model Msr_{suffix} sr_alb_lut_bit(table_values=\"{table}\" delay={:e} input_load=0 out_res_pos={:e} out_res_neg={:e} min_sink={:e} max_source={:e} ic={ic} inertial_delay=true unknown_as_zero=true unknown_as_last=true retain_disabled_polarity=true minimum_delay={minimum_delay:e})",
+                bit.delay_s,
+                resistance.positive,
+                resistance.negative,
+                electrical.min_sink_a,
+                electrical.max_source_a
             )?;
         }
         if needs_tie0 {
@@ -273,6 +235,162 @@ impl XspiceTimedPlan {
     }
 }
 
+fn validate_lut_bit(bit: &XspiceTimedBit, suffix: &str) -> Result<()> {
+    if !bit.delay_s.is_finite()
+        || matches!(bit.target, XspiceLutTarget::Stage { .. }) && bit.delay_s < 0.0
+    {
+        bail!("invalid XSPICE LUT delay for {suffix}: {}", bit.delay_s);
+    }
+    if bit.sources.len() > 16 {
+        bail!("XSPICE LUT {suffix} exceeds current native 16-source limit");
+    }
+    if bit.table_values.len() != 1usize << bit.sources.len()
+        || !bit
+            .table_values
+            .bytes()
+            .all(|byte| matches!(byte, b'0' | b'1' | b'Z'))
+    {
+        bail!("malformed XSPICE table for {suffix}");
+    }
+
+    Ok(())
+}
+
+fn render_bundle_prefix(
+    input_width: usize,
+    output_width: usize,
+    electrical: XspiceElectrical,
+) -> Result<String> {
+    // Receiver loads, current bounds and output timing resistance are
+    // finite signed quantities.
+    for (label, number) in [
+        ("input_load", electrical.input_load_f),
+        ("input_sink_current", electrical.input_sink_current_a),
+        ("input_source_current", electrical.input_source_current_a),
+        ("min_sink", electrical.min_sink_a),
+        ("max_source", electrical.max_source_a),
+        ("stage_out_res", electrical.stage_out_res_ohm),
+        ("output_out_res_pos", electrical.output_out_res_ohm.positive),
+        ("output_out_res_neg", electrical.output_out_res_ohm.negative),
+    ] {
+        if !number.is_finite() {
+            bail!("XSPICE {label} must be finite: {number}");
+        }
+    }
+    let mut result = String::new();
+    for pin in 0..input_width {
+        write!(result, " sr_in{pin} sr_in{pin}_sink sr_in{pin}_source")?;
+    }
+    for pin in 0..output_width {
+        write!(result, " sr_out{pin} sr_out{pin}_sink sr_out{pin}_source")?;
+    }
+    result.push('\n');
+    // Each *physical* ALB input contributes one load even if the input is
+    // absent from the Boolean graph. Internal LUT edges are not devices.
+    for pin in 0..input_width {
+        writeln!(
+            result,
+            "Asr_load{pin} sr_in{pin} sr_in{pin}_sink sr_in{pin}_source Msr_input_load"
+        )?;
+    }
+    writeln!(
+        result,
+        ".model Msr_input_load sr_bundle_load(capacitance={:e} sink_current={:e} source_current={:e})",
+        electrical.input_load_f, electrical.input_sink_current_a, electrical.input_source_current_a
+    )?;
+
+    Ok(result)
+}
+
+/// The canonical ordered vector pins of the direct stateful native ABI.
+pub fn stateful_device_statement(inputs: usize, outputs: usize) -> String {
+    let vector = |prefix: &str, count: usize, suffix: &str| {
+        (0..count)
+            .map(|pin| format!("{prefix}{pin}{suffix}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!(
+        "Asr_stateful [{}] [{}] 0 [{}] [{}] Msr_stateful",
+        vector("sr_in", inputs, ""),
+        vector("sr_out", outputs, ""),
+        vector("sr_out", outputs, "_sink"),
+        vector("sr_out", outputs, "_source")
+    )
+}
+
+/// Emit a direct Rust-backed scheduler with its own inertial physical
+/// output timing stage, using the actual XSPICE bundle loads.
+pub fn render_stateful_contents(
+    program: &super::StatefulProgram,
+    body: &str,
+    timing: TimingEnvironment<'_>,
+    electrical: XspiceElectrical,
+) -> Result<String> {
+    let (inputs, outputs) = (program.input_width(), program.output_width());
+    anyhow::ensure!(
+        (1..=32).contains(&inputs) && (1..=32).contains(&outputs),
+        "stateful native ALB needs 1..32 input/output pins"
+    );
+    let mut engine = program.physical_event_engine(
+        timing,
+        PhysicalOutputDrive {
+            resistance: electrical.output_out_res_ohm,
+            min_sink_a: electrical.min_sink_a,
+            max_source_a: electrical.max_source_a,
+        },
+    )?;
+    engine
+        .advance(
+            0.0,
+            &vec![AlbLogicLevel::Unknown; inputs],
+            &vec![PhysicalOutputLoad::default(); outputs],
+            false,
+        )
+        .context("validating initial stateful ALB evaluation")?;
+    let mut result = render_bundle_prefix(inputs, outputs, electrical)?;
+    writeln!(result, "{}", stateful_device_statement(inputs, outputs))?;
+    result.push_str(".model Msr_stateful sr_alb_stateful(source_hex=\"");
+    for byte in body.bytes() {
+        write!(result, "{byte:02x}")?;
+    }
+    write!(
+        result,
+        "\" reg_delay={:e} port_delay={:e} setup_time={:e} hold_time={:e} min_clock={:e} user_scale={:e} out_res_pos={:e} out_res_neg={:e} min_sink={:e} max_source={:e} input_load=0",
+        timing.default_register_delay,
+        timing.default_output_delay,
+        timing.register_timing_defaults.setup,
+        timing.register_timing_defaults.hold,
+        timing.register_timing_defaults.min_clock,
+        timing.user_scale,
+        electrical.output_out_res_ohm.positive,
+        electrical.output_out_res_ohm.negative,
+        electrical.min_sink_a,
+        electrical.max_source_a
+    )?;
+    for (name, values) in [
+        ("user_values", Some(timing.user)),
+        ("device_values", timing.device),
+    ] {
+        if let Some(values) = values.filter(|values| !values.is_empty()) {
+            write!(result, " {name}=[")?;
+            for (index, value) in values.iter().enumerate() {
+                anyhow::ensure!(
+                    value.is_finite(),
+                    "stateful native ALB {name} contains a nonfinite value"
+                );
+                if index > 0 {
+                    result.push(' ');
+                }
+                write!(result, "{value:e}")?;
+            }
+            result.push(']');
+        }
+    }
+    result.push_str(")\n");
+    Ok(result)
+}
+
 impl TimedCombinationalGraph {
     /// Produce a topologically ordered native bit-LUT compiler artifact.
     ///
@@ -288,6 +406,7 @@ impl TimedCombinationalGraph {
                     values: &BTreeMap::new(),
                     readonly: &self.readonly,
                     input_bits: &[],
+                    parameters: Some(&self.parameters),
                 })
                 .with_context(|| format!("initial state of XSPICE stage {}", stage.name))?;
             for index in 0..stage.width {
@@ -341,15 +460,50 @@ impl TimedCombinationalGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{TimingEnvironment, analyze_body};
+    use super::super::{TimingEnvironment, analyze_body, analyze_body_in_environment};
     use super::{
         AlbLogicLevel, Context, KnownLutSourceBit, Result, XspiceElectrical, XspiceTimedPlan,
     };
 
+    #[test]
+    fn stateless_port_delays_resolve_independently_per_output_pin() -> Result<()> {
+        let source = "PORT A in[0]; \
+            PORT (DELAY=USER[1]) Q out[0]; \
+            PORT (DELAY=DEVICE[1]) R out[1]; \
+            Q=A; R=A^DEVICE[0];";
+        let env = TimingEnvironment {
+            user: &[0.0, 2e-9],
+            device: Some(&[1.0, 5e-9]),
+            user_scale: 2.0,
+            default_register_delay: 1e-9,
+            default_output_delay: 3e-9,
+            register_timing_defaults: crate::alb::RegisterTimingDefaults::default(),
+        };
+        let (table, stateful) = analyze_body_in_environment(source, env)?.into_parts();
+        assert!(stateful.is_none());
+        let table = table.context("stateless body was not compiled")?;
+        assert_eq!(table.d_genlut_values(), "0110");
+        let plan = XspiceTimedPlan::from_known_truth_table(&table, env)?;
+        assert_eq!(plan.bits().len(), 2);
+        assert!((plan.bits()[0].delay_s - 4e-9).abs() < 1e-18);
+        assert!((plan.bits()[1].delay_s - 5e-9).abs() < 1e-18);
+        assert_eq!(plan.bits()[0].table_values, "01");
+        assert_eq!(plan.bits()[1].table_values, "10");
+        let no_device = TimingEnvironment {
+            device: None,
+            ..env
+        };
+        let error = XspiceTimedPlan::from_known_truth_table(&table, no_device)
+            .err()
+            .context("missing DEVICE port delay must be rejected")?;
+        assert!(format!("{error:#}").contains("DEVICE[1]"));
+        Ok(())
+    }
+
     const ELECTRICAL: XspiceElectrical = XspiceElectrical {
         input_load_f: 0.0,
         stage_out_res_ohm: 0.0,
-        output_out_res_ohm: 0.0,
+        output_out_res_ohm: crate::alb::OutputResistance::symmetric(0.0),
         input_sink_current_a: 0.0,
         input_source_current_a: 0.0,
         min_sink_a: -1e99,
@@ -366,6 +520,7 @@ mod tests {
                 user_scale: 1.0,
                 default_register_delay: 1e-9,
                 default_output_delay: 1e-9,
+                register_timing_defaults: crate::alb::RegisterTimingDefaults::default(),
             })?
             .context("unsupported timed graph")?;
         graph.xspice_timed_plan()
@@ -418,7 +573,7 @@ Y.En = OE ;
         );
         assert!(rendered.contains("table_values=\"Z0Z1\""));
         assert!(rendered.contains("ic=1 inertial_delay=true"));
-        assert!(rendered.contains("inertial_delay=true unknown_as_zero=true"));
+        assert!(rendered.contains("inertial_delay=true unknown_as_zero=true unknown_as_last=true retain_disabled_polarity=true"));
         Ok(())
     }
 
@@ -474,7 +629,57 @@ Y = D0 | D1 ;
         assert_eq!(rendered.matches("Asr_s0 [sr_in0] ").count(), 1);
         assert_eq!(rendered.matches("Asr_s1 [sr_in0] ").count(), 1);
         assert!(rendered.contains("capacitance=2e-12 sink_current=-1e-2 source_current=1e-2"));
-        assert_eq!(rendered.matches("input_load=0 out_res=").count(), 3);
+        assert_eq!(rendered.matches("input_load=0 out_res_pos=").count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn reverse_polarity_receiver_currents_are_signed_load_contributions() -> Result<()> {
+        let plan = compile(
+            r"
+PORT A in[0] ;
+PORT Y out[0] ;
+COMB (WIDTH=1, DELAY=2n) D ;
+D = A ;
+Y = D ;
+",
+        )?;
+        let electrical = XspiceElectrical {
+            input_load_f: -2e-12,
+            input_sink_current_a: 5e-4,
+            input_source_current_a: -5e-4,
+            min_sink_a: 5e-4,
+            max_source_a: -5e-4,
+            output_out_res_ohm: crate::alb::OutputResistance {
+                positive: -1000.0,
+                negative: 1000.0,
+            },
+            ..ELECTRICAL
+        };
+        let rendered = plan.render_subcircuit("ALB_SIGNED_LOAD", electrical)?;
+        assert!(rendered.contains("capacitance=-2e-12 sink_current=5e-4 source_current=-5e-4"));
+        assert!(rendered.contains("min_sink=5e-4 max_source=-5e-4"));
+        assert!(rendered.contains("out_res_pos=-1e3 out_res_neg=1e3"));
+        for invalid in [
+            XspiceElectrical {
+                min_sink_a: f64::NAN,
+                ..electrical
+            },
+            XspiceElectrical {
+                max_source_a: f64::NEG_INFINITY,
+                ..electrical
+            },
+            XspiceElectrical {
+                input_sink_current_a: f64::INFINITY,
+                ..electrical
+            },
+            XspiceElectrical {
+                stage_out_res_ohm: f64::NEG_INFINITY,
+                ..electrical
+            },
+        ] {
+            assert!(plan.render_subcircuit("ALB_SIGNED_LOAD", invalid).is_err());
+        }
         Ok(())
     }
 

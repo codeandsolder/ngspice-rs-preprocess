@@ -1,0 +1,17 @@
+* Original-source SIMetrix Elements 9.40d COMB differential probe
+.model MDEFCOMB2N d_logic_block file=FDEFCOMB2N family="UNIV" out_delay=2n
+.file FDEFCOMB2N
+PORT Data in[0:1] ;
+PORT Q out[0:1] ;
+COMB (WIDTH=2, DELAY=1n, BITWISE=0) Stage=0 ;
+Stage=Data ;
+Q=Stage ;
+.endf
+Vd0 d0 0 PWL(0 0 5n 0 5.1n 5 5.2n 5 5.3n 0 28n 0 28.1n 5 42n 5)
+Vd1 d1 0 PWL(0 0 5n 0 5.1n 5 13n 5 13.1n 0 28n 0 28.1n 5 42n 5)
+Acomb [d0 d1] [q0 q1] MDEFCOMB2N
+Rout0 q0 0 100k
+Rout1 q1 0 100k
+.tran 20p 42n 0 20p
+.PRINT TRAN V(d0) V(d1) V(q0) V(q1)
+.end

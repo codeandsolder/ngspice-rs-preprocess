@@ -77,3 +77,21 @@ to redistribute them. The catalog tools accept explicit input paths.
 
 Review the tracked release tree and its history before publication. Removing
 a fixture from the current tree does not remove its historical versions.
+
+## Experimental XSPICE interface specifications
+
+The reference interfaces in `runtime/xspice/fixtures/family/georgiatech-*-original.ifs`
+are public-domain XSPICE files by Georgia Tech Research Corporation; the
+file headers retain their individual authors and dates. The
+`tim-edwards-d_genlut-original.ifs` interface is public-domain work by
+Tim Edwards (2016). The four `original-xtraevt-*.ifs` files are unmodified
+ngspice 47 interface specifications from `src/xspice/icm/xtraevt`
+(`d_to_real`, `real_delay`, `real_gain`, `real_to_v`); the modified BSD
+notice above applies to these files. Only these interface specifications
+are redistributed, not the simulator's C implementations. The native
+test wrappers are independently authored circuits.
+
+The ALB regression decks are independently constructed test stimuli;
+the accompanying numerical CSV/DAT records and hash manifests record
+observations from reference simulators. The original simulator and vendor
+model-library distributions are not part of this repository.

@@ -1,0 +1,17 @@
+* Physically shared HC receiver across independently witnessed lexical analog cuts
+Vinput p 0 PWL(0 -1 10n -1 50n 7 60n 7 100n -1 110n -1)
+Xone p q1 INNER
+Xtwo p q2 INNER
+Aroot [p] [q3] M5
+.model M5 d_logic_block family="HC" vsupply=5 input_load=2p sink_current=-1m source_current=2m out_res=40 out_delay=1n def="out[0]=in[0];"
+.subckt INNER p q
+Rlocal p 0 1meg
+Ainner [p] [q] M33
+.model M33 d_logic_block family="HC" vsupply=3.3 input_load=1p sink_current=-.5m source_current=1m out_res=40 out_delay=1n def="out[0]=in[0];"
+.ends INNER
+R1 q1 0 100k
+R2 q2 0 100k
+R3 q3 0 100k
+.tran 5p 110n 0 5p
+.PRINT TRAN V(q1) V(q2) V(q3) I(Vinput)
+.end

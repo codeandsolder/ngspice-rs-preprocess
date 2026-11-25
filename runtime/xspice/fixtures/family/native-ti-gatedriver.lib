@@ -1,0 +1,33 @@
+* Independent ngspice reproduction of original TI gate_driver_basic power stage,
+* adapted to XSPICE event control by a stock ngspice dac_bridge. The original
+* TI "inp" was analog voltage-coded, and never had native event pins.
+.subckt SR_TI_GATE_DRIVER_EVENT OUT CONTROL CONTROL_SINK CONTROL_SOURCE VDD VSS PARAMS: tdr=5n ttr=2n tdf=5n ttf=2n rsrc=1 isrc=1 rsnk=1 isnk=1 gmin=1e-10
+Acontrol_load CONTROL CONTROL_SINK CONTROL_SOURCE EVENT_LOAD
+.model EVENT_LOAD sr_bundle_load(capacitance=2p sink_current=0 source_current=0)
+Acontrol_dac [CONTROL] [analog_control 0] D_TO_A
+.model D_TO_A dac_bridge(out_low=0 out_high=1 out_undef=.5 input_load=0 t_rise=.5n t_fall=.5n)
+Xphysical OUT analog_control VDD VSS SR_TI_GATE_DRIVER_PHYS
++ PARAMS: tdr=tdr tdf=tdf ttr=ttr ttf=ttf rsrc=rsrc isrc=isrc rsnk=rsnk isnk=isnk gmin=gmin
+.ends SR_TI_GATE_DRIVER_EVENT
+* The complete native analog power stage has two internal timing integrators,
+* a hysteretic logic decision and separately current-limited source/sink B devices.
+.subckt SR_TI_GATE_DRIVER_PHYS OUT INP VDD VSS PARAMS: tdr=5n ttr=2n tdf=5n ttf=2n rsrc=1 isrc=1 rsnk=1 isnk=1 gmin=1e-10
+Vone internal_one 0 1
+Cmemory memory midpoint 1n
+Rleak_memory memory 0 100G
+Bcharge internal_one memory I=(v(INP)/max(0.1,1.44e9*tdr))*min(1,max(0,1-v(memory)))
+Bdischarge memory 0 I=((1-v(INP))/max(0.1,1.44e9*tdf))*min(1,max(0,v(memory)))
+Blogic logical 0 V=u(v(memory)-.51)
+Bmidpoint midpoint 0 V=.5*v(filter)
+Rfilter logical filter {max(0.1,7.22e8*(ttr+ttf))}
+Cfilter filter 0 .1n
+Bcharge_out internal_one smooth I=(v(filter)/max(0.1,7.22e8*ttr))*min(1,max(0,1-v(smooth)))
+Bdischarge_out smooth 0 I=((1-v(filter))/max(0.1,7.22e8*ttf))*min(1,max(0,v(smooth)))
+Csmooth smooth 0 1n
+Rleak_smooth smooth 0 100G
+Brequest request 0 V=v(VSS)+v(smooth)*(v(VDD)-v(VSS))
+Bsource VDD OUT I=max(0,min((v(request)-v(OUT))/rsrc,isrc))
+Bsink OUT VSS I=max(0,min((v(OUT)-v(request))/rsnk,isnk))
+Rleak_source VDD OUT {1/gmin}
+Rleak_sink OUT VSS {1/gmin}
+.ends SR_TI_GATE_DRIVER_PHYS

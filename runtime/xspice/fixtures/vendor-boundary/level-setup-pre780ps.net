@@ -1,0 +1,19 @@
+* 5 ps resolution Elements 9.40d level-setup-pre780ps; D0 midpoint=11.020000 ns
+.model MLEVEL_SETUP_BITWISE_0 d_logic_block file=FLEVEL_SETUP_BITWISE_0 family="UNIV"
+.file FLEVEL_SETUP_BITWISE_0
+PORT Data in[0:1] ;
+PORT Enable in[2] ;
+PORT Q out[0:1] ;
+LEVEL (WIDTH=2, DELAY=2n, SETUP=800p, BITWISE=0, CLOCK=in[2]) R=0 ;
+R=Data ;
+OUT[0:1]=R ;
+.endf
+Vd0 d0 0 PWL(0 0 5n 0 5.1n 5 10.970000n 5 11.070000n 0 38n 0)
+Vd1 d1 0 PWL(0 0 5n 0 5.1n 5 19.95n 5 20.05n 0 38n 0)
+Venable en 0 PWL(0 0 9.95n 0 10.05n 5 11.75n 5 11.85n 0 19.95n 0 20.05n 5 22.95n 5 23.05n 0 38n 0)
+Alatch [d0 d1 en] [q0 q1] MLEVEL_SETUP_BITWISE_0
+Rout0 q0 0 100k
+Rout1 q1 0 100k
+.tran 5p 38n 0 5p
+.PRINT TRAN V(d0) V(d1) V(en) V(q0) V(q1)
+.end

@@ -6,7 +6,7 @@
   "default_output_delay": 1e-09,
   "input_load_f": 0,
   "stage_out_res_ohm": 0,
-  "output_out_res_ohm": 0,
+  "output_out_res_ohm": {"positive": 0, "negative": 0},
   "input_sink_current_a": 0,
   "input_source_current_a": 0,
   "min_sink_a": -1e+99,

@@ -1,0 +1,7 @@
+{
+  "supply_v": 5.0,
+  "bridge_models": [
+    {"name": "UNIV_ADC", "kind": "adc", "family": "UNIV", "nominal_supply_v": 5},
+    {"name": "UNIV_DAC", "kind": "dac", "family": "UNIV", "nominal_supply_v": 5}
+  ]
+}

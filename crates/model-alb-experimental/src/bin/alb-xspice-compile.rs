@@ -2,7 +2,9 @@
 //! Not a mode of normal `SIMetrix` model translation.
 
 use anyhow::{Context, Result, bail};
-use model_alb_experimental::{TimingEnvironment, XspiceElectrical, compile_alb_xspice_subcircuit};
+use model_alb_experimental::{
+    OutputResistance, TimingEnvironment, XspiceElectrical, compile_alb_xspice_subcircuit,
+};
 use serde::Deserialize;
 use std::{env, fs, path::Path};
 
@@ -20,7 +22,7 @@ struct Config {
     min_sink_a: f64,
     max_source_a: f64,
     stage_out_res_ohm: f64,
-    output_out_res_ohm: f64,
+    output_out_res_ohm: OutputResistance,
 }
 
 fn main() -> Result<()> {
@@ -52,6 +54,7 @@ fn main() -> Result<()> {
             user_scale: config.user_scale,
             default_register_delay: config.default_register_delay,
             default_output_delay: config.default_output_delay,
+            register_timing_defaults: model_alb_experimental::RegisterTimingDefaults::default(),
         },
         XspiceElectrical {
             input_load_f: config.input_load_f,

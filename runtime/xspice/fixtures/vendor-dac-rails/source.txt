@@ -1,0 +1,13 @@
+* Original 12-state strength schedule
+0n 0s
+15n 1s
+30n Us
+45n 0r
+60n 1r
+75n Ur
+90n 0z
+105n 1z
+120n Uz
+135n 0u
+150n 1u
+165n Uu

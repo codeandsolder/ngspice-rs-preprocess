@@ -1,0 +1,19 @@
+* Original SIMetrix multi-instance ALB DEVICE vector specialization oracle
+.model MDEV d_logic_block file=FDEV family="UNIV" user=[0.75] user_scale=3
+.file FDEV
+PORT Data in[0] ;
+PORT Q out[0] ;
+COMB (WIDTH=1, DELAY=DEVICE[1]) Stage=0 ;
+Stage=(USER[0]>1 && DEVICE[0]>0) ? Data : 0 ;
+Q=Stage ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 5.4n 5 5.5n 0 10n 0 10.1n 5 14n 5 14.1n 0 24n 0)
+A1 [d] [q1] MDEV : USER=[1 1n]
+A2 [d] [q2] MDEV : USER=[0 2n]
+A3 [d] [q3] MDEV : USER=[1 1n]
+R1 q1 0 100k
+R2 q2 0 100k
+R3 q3 0 100k
+.tran 20p 24n 0 20p
+.PRINT TRAN V(d) V(q1) V(q2) V(q3)
+.end

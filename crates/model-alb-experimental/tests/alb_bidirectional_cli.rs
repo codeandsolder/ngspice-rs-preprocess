@@ -161,7 +161,7 @@ fn bidirectional_pin_routes_sensing_only_child_to_adc_bundle() -> Result<()> {
     let source = fs::read_to_string(fixtures().join("bidirectional-port.cir"))?;
     let source=source.replace(
         ".ends TOP",
-        "Xother pin other CHILD\n.ends TOP\n.subckt CHILD port other\nA2 [port] [other] DCH\n.model DCH d_logic_block def=\"out[0] = in[0];\" out_delay=2n\n.ends CHILD"
+        "Xother pin other CHILD\n.ends TOP\n.subckt CHILD port other\nA2 [port] [other] DCH\n.model DCH d_logic_block out_delay=2n def=\"out[0] = in[0];\"\n.ends CHILD"
     );
     let file = temp.path().join("source.cir");
     fs::write(&file, source)?;
@@ -222,7 +222,15 @@ fn nested_one_way_children_of_an_analog_inout_port_keep_separate_bundles() -> Re
     assert_eq!(deck.matches("sr_family_adc(").count(), 2);
     assert_eq!(deck.matches("sr_family_dac(").count(), 2);
     let compiled = fs::read_to_string(temp.path().join("generated.inc"))?;
-    assert_eq!(compiled.matches("sr_bundle_load(").count(), 2);
+    assert_eq!(compiled.matches("sr_bundle_load(").count(), 1);
+    for instance in ["XSR_A1 ", "XSR_A2 "] {
+        assert!(
+            lowered
+                .lines()
+                .any(|line| line.starts_with(instance) && line.ends_with(" SRALB0")),
+            "{lowered}"
+        );
+    }
     Ok(())
 }
 
@@ -474,7 +482,7 @@ fn direct_original_alb_instances_can_split_their_shared_output_state() -> Result
     let source = fs::read_to_string(fixtures().join("producer-identity-drivers.cir"))?
         .replace(
             "Xleft a pin OUTER\nXright b pin OUTER",
-            "Aleft [a] [pin] DL\nAright [b] [pin] DL\n.model DL d_logic_block def=\"out[0] = in[0];\" input_load=2p out_res=40 out_delay=1n family=\"HC\"",
+            "Aleft [a] [pin] DL\nAright [b] [pin] DL\n.model DL d_logic_block input_load=2p out_res=40 out_delay=1n family=\"HC\" def=\"out[0] = in[0];\"",
         );
     let path = temp.path().join("direct.cir");
     fs::write(&path, source)?;
@@ -705,7 +713,7 @@ fn promoted_bidirectional_child_keeps_sensing_on_the_adc_bundle() -> Result<()> 
     let source = fs::read_to_string(fixtures().join("promoted-x-formal-drivers.cir"))?
         .replace(
             "Xright b pin OUTER\n.ends GROUP",
-            "Xright b pin OUTER\nAmonitor [pin] [sense_internal] DM\n.model DM d_logic_block def=\"out[0] = in[0];\" input_load=2p out_res=40 out_delay=1n family=\"HC\"\n.ends GROUP",
+            "Xright b pin OUTER\nAmonitor [pin] [sense_internal] DM\n.model DM d_logic_block input_load=2p out_res=40 out_delay=1n family=\"HC\" def=\"out[0] = in[0];\"\n.ends GROUP",
         );
     let source_path = temp.path().join("sensing.cir");
     fs::write(&source_path, source)?;
@@ -869,8 +877,16 @@ fn dynamically_loaded_bidirectional_shared_pin_has_independent_physical_ports() 
         fs::read_to_string(temp.path().join("generated.inc"))?
             .matches("sr_bundle_load(")
             .count(),
-        2,
-        "independent gate and monitor ALB definition input-load models"
+        1,
+        "identical gate and monitor kernels share a load-model declaration"
     );
+    for instance in ["XSR_A1 ", "XSR_AMONITOR "] {
+        assert!(
+            lowered
+                .lines()
+                .any(|line| line.starts_with(instance) && line.ends_with(" SRALB0")),
+            "{lowered}"
+        );
+    }
     Ok(())
 }

@@ -1,0 +1,103 @@
+{
+  "simulator": "SIMetrix Elements 9.40d",
+  "scope": "adc_schmitt ignores ic; initial in-band default LOW",
+  "sampling_note": "2ps max transient timestep; 0.126+0.25N ns off-knot samples for clamp and 0.126+0.5N ns for IC; independent 0.5/1.25/2.5/3.75/4.5V crossings. Original source/listing/CSV hashes, vendor unknown-parameter warnings per-case.",
+  "cases": [
+    {
+      "warnings": [
+        "clamp_low",
+        "clamp_high",
+        "ic"
+      ],
+      "pins": [
+        "v(q)",
+        "i(vd)"
+      ],
+      "csv_sha256": "6F84388456E07BE07CC7155D0D7CD3CADA7206AA6989A2A1660CAA6CBC01728B",
+      "listing_sha256": "DAC7CB3233A9EEFBDD1A8F749A3EA155A9F2D00F72D71BA7477F90314605721A",
+      "name": "equal-ic1",
+      "rows": 10001,
+      "crossings": 10,
+      "source_sha256": "95260D3F32151087783C990F0DE547BA7BE85B2C9BEBF7A372F1A4FCB7F5EEF1",
+      "retained_rows": 42,
+      "normalized_source_sha256": "5681d2c4325bb2d5efb957699abe17cf8930f2e0735bac1ff36779a42e000767",
+      "sample_tolerance": 0.045,
+      "current_tolerance": 1e-06,
+      "crossing_tolerance_ns": 0.015,
+      "voltage_time_tolerance_ns": 0.0,
+      "current_time_tolerance_ns": 0.0
+    },
+    {
+      "warnings": [
+        "clamp_low",
+        "clamp_high",
+        "ic"
+      ],
+      "pins": [
+        "v(q)",
+        "i(vd)"
+      ],
+      "csv_sha256": "1F7270F356A6DBF298E9ACE6FA71C137B18A20064488F326A2C7EBAAA5BC4D65",
+      "listing_sha256": "348E118D91546EE69D372DB33E1C55BECEF86D8D7EE2A29E0249A9A21A01DD8C",
+      "name": "ic0",
+      "rows": 10001,
+      "crossings": 10,
+      "source_sha256": "EECFA551AB5175762E63E1C261103B40C3A6044FACFD7C02AB788C7DF963F440",
+      "retained_rows": 42,
+      "normalized_source_sha256": "3c3db1502e9461754f20ac8fde6863cb6a8e52a0afbeec5303a806a8ea85632c",
+      "sample_tolerance": 0.045,
+      "current_tolerance": 1e-06,
+      "crossing_tolerance_ns": 0.015,
+      "voltage_time_tolerance_ns": 0.0,
+      "current_time_tolerance_ns": 0.0
+    },
+    {
+      "warnings": [
+        "clamp_low",
+        "clamp_high",
+        "ic"
+      ],
+      "pins": [
+        "v(q)",
+        "i(vd)"
+      ],
+      "csv_sha256": "1F7270F356A6DBF298E9ACE6FA71C137B18A20064488F326A2C7EBAAA5BC4D65",
+      "listing_sha256": "3DAE8C010F12052CA45D5017C76BFC8390E9E8A1F0FE4EDBBC6F6AFBD1D2C590",
+      "name": "ic1",
+      "rows": 10001,
+      "crossings": 10,
+      "source_sha256": "B7FFF2893C6528A39407EEA95299530BA84B06A784EA8A8C98A0EFB95E28CEEF",
+      "retained_rows": 42,
+      "normalized_source_sha256": "0e37f63af831e0c7c6cc5f850668089a9c2905d0b77d1369977c0a62d0991728",
+      "sample_tolerance": 0.045,
+      "current_tolerance": 1e-06,
+      "crossing_tolerance_ns": 0.015,
+      "voltage_time_tolerance_ns": 0.0,
+      "current_time_tolerance_ns": 0.0
+    },
+    {
+      "warnings": [
+        "clamp_low",
+        "clamp_high",
+        "ic"
+      ],
+      "pins": [
+        "v(q)",
+        "i(vd)"
+      ],
+      "csv_sha256": "EFD1592FC71EB4C28E0AEC68AD6059AFFCC2D92AC68A9437E86312F9F12441B8",
+      "listing_sha256": "89C1E8B8DBE45B5D11907A868E908FCAC041641EF3F43684001D7AF088E59FBC",
+      "name": "reversed-ic1",
+      "rows": 10001,
+      "crossings": 10,
+      "source_sha256": "80727608AD7425610DCF9460ECD8FEAA59EC47CEF1B2D57121C4219E267F5EE1",
+      "retained_rows": 42,
+      "normalized_source_sha256": "0acd3740a8279ceb5b3e80ad541d5276051eab3f0918ad6fe2023ed1df018973",
+      "sample_tolerance": 0.045,
+      "current_tolerance": 1e-06,
+      "crossing_tolerance_ns": 0.015,
+      "voltage_time_tolerance_ns": 0.0,
+      "current_time_tolerance_ns": 0.0
+    }
+  ]
+}

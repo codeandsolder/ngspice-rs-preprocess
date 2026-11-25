@@ -407,7 +407,9 @@ pub fn embedded_files(items: &[Item]) -> Result<BTreeMap<String, Vec<&str>>> {
     Ok(files)
 }
 
-pub(crate) fn logical_statements(input: &str) -> Vec<String> {
+/// Split physical deck lines into logical statements, preserving embedded payloads.
+#[must_use]
+pub fn logical_statements(input: &str) -> Vec<String> {
     let lines = input.lines().map(str::to_owned).collect::<Vec<_>>();
     let mut statements = Vec::<String>::new();
     let mut embedded = false;

@@ -1,0 +1,8 @@
+scenario,pin,initial_v
+comb-bitwise-0,q0,0
+comb-bitwise-0,q1,0
+comb-bitwise-1,q0,0
+comb-bitwise-1,q1,0
+comb-edge-level,q0,0
+comb-edge-level,q1,0
+comb-pulse,q,0

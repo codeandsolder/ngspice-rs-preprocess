@@ -187,7 +187,7 @@ fn sibling_digital_formal_propagation_survives_an_unrelated_analog_cut() -> Resu
         "Xtwo in_b out_b TOP\nXdigital source_n sink_n SIBLING",
     );
     src=src.replace(".tran 20p 15n",
-        ".subckt SIBLING digital_in digital_out\nA1 [digital_in] [digital_out] DL\n.model DL d_logic_block def=\"out[0] = in[0];\" input_load=2p out_res=40 out_delay=2n\n.ends SIBLING\n.tran 20p 15n");
+        ".subckt SIBLING digital_in digital_out\nA1 [digital_in] [digital_out] DL\n.model DL d_logic_block input_load=2p out_res=40 out_delay=2n def=\"out[0] = in[0];\"\n.ends SIBLING\n.tran 20p 15n");
     let deck = temp.path().join("sibling.cir");
     fs::write(&deck, src)?;
     let cfg = fixtures().join("exported-original-3v3.json");

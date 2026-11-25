@@ -14,7 +14,7 @@ Xinner analog_in analog_out INNER
 .param RMON=100meg
 A1 [pin_in] [pin_out] DL
 Rmonitor pin_out 0 {RMON}
-.model DL d_logic_block def="out[0] = in[0];" input_load=2p out_res=40 out_delay=2n family="HC"
+.model DL d_logic_block input_load=2p out_res=40 out_delay=2n family="HC" def="out[0] = in[0];"
 .ends INNER
 .ends OUTER
 .tran 20p 15n

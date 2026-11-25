@@ -1,0 +1,38 @@
+* Original public-domain Georgia Tech d_ram: 4-bit x 8-word RAM, select=5.
+Vd0 ad0 0 PWL(0 0 18n 0 18.1n 3.3 112n 3.3)
+Vd1 ad1 0 PWL(0 3.3 18n 3.3 18.1n 0 112n 0)
+Vd2 ad2 0 PWL(0 0 18n 0 18.1n 3.3 112n 3.3)
+Vd3 ad3 0 PWL(0 3.3 18n 3.3 18.1n 0 112n 0)
+Va0 aa0 0 PWL(0 0 20n 0 20.1n 3.3 52n 3.3 52.1n 0 62n 0 62.1n 3.3 86n 3.3 86.1n 0 112n 0)
+Va1 aa1 0 PWL(0 0 74n 0 74.1n 3.3 86n 3.3 86.1n 0 112n 0)
+Va2 aa2 0 PWL(0 0 20n 0 20.1n 3.3 52n 3.3 52.1n 0 62n 0 62.1n 3.3 86n 3.3 86.1n 0 112n 0)
+Vwe awe 0 PWL(0 0 9n 0 9.1n 3.3 13n 3.3 13.1n 0 25n 0 25.1n 3.3 30n 3.3 30.1n 0 112n 0)
+Vs0 as0 0 PWL(0 0 2n 0 2.1n 3.3 93n 3.3 93.1n 0 100n 0 100.1n 3.3 112n 3.3)
+Vs1 as1 0 PWL(0 0 40n 0 40.1n 3.3 50n 3.3 50.1n 0 112n 0)
+Vs2 as2 0 PWL(0 0 2n 0 2.1n 3.3 112n 3.3)
+Ainput_d0 [ad0] [d0] GT_LOGIC
+Ainput_d1 [ad1] [d1] GT_LOGIC
+Ainput_d2 [ad2] [d2] GT_LOGIC
+Ainput_d3 [ad3] [d3] GT_LOGIC
+Ainput_a0 [aa0] [a0] GT_LOGIC
+Ainput_a1 [aa1] [a1] GT_LOGIC
+Ainput_a2 [aa2] [a2] GT_LOGIC
+Ainput_we [awe] [we] GT_LOGIC
+Ainput_s0 [as0] [s0] GT_LOGIC
+Ainput_s1 [as1] [s1] GT_LOGIC
+Ainput_s2 [as2] [s2] GT_LOGIC
+.model GT_LOGIC d_logic_block family="HC" out_delay=1p def="out[0]=in[0];"
+Xexternal d0 d1 d2 d3 a0 a1 a2 we s0 s1 s2 analog_q0 analog_q1 analog_q2 analog_q3 GT_ORIGINAL_DIGITAL_RAM_WIDE
+.include "native-georgiatech-ram-wide.lib"
+Rpull0 vpull analog_q0 1k
+Rpull1 vpull analog_q1 1k
+Rpull2 vpull analog_q2 1k
+Rpull3 vpull analog_q3 1k
+Vpull vpull 0 1.2
+.tran 20p 112n 0 20p
+.control
+run
+wrdata result.dat i(Vpull) v(analog_q0) v(analog_q1) v(analog_q2) v(analog_q3)
+quit
+.endc
+.end

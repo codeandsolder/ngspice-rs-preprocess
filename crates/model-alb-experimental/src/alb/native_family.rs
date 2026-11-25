@@ -1,6 +1,7 @@
 //! Materialize fully explicit native XSPICE family bridges from a resolved
 //! physical grouping plan. Nothing here enables production ALB conversion.
 
+use super::OutputResistance;
 use super::family::{AnalogBridgeKind, LogicFamily, PlannedAnalogBridge};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -22,7 +23,7 @@ pub struct NativeDigitalBundle {
 pub struct NativePinWiring {
     pub id: String,
     pub bundle: NativeDigitalBundle,
-    pub out_res_ohm: Option<f64>,
+    pub out_res_ohm: Option<OutputResistance>,
 }
 
 /// Explicit family-model data for native emission.
@@ -39,10 +40,12 @@ pub struct NativeFamilyModel {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", content = "parameters", rename_all = "snake_case")]
 pub enum NativeFamilyParameters {
-    Adc(NativeAdcParameters),
+    AdcBridge(NativeAdcBridgeParameters),
+    AdcSchmitt(NativeAdcParameters),
     Dac(NativeDacParameters),
 }
 
+/// Parameters recognized by both original ADC and Schmitt models.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeAdcParameters {
@@ -53,12 +56,18 @@ pub struct NativeAdcParameters {
     pub time_tol: f64,
     pub out_low: f64,
     pub out_high: f64,
-    pub clamp_low: f64,
-    pub clamp_high: f64,
     pub clamp_res: f64,
     pub clamp_bias: f64,
-    pub schmitt: bool,
-    pub ic: u8,
+}
+
+/// An ordinary ADC bridge accepts explicit physical clamp bounds.
+/// A Schmitt model has no such parameters, and cannot represent them.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAdcBridgeParameters {
+    pub adc: NativeAdcParameters,
+    pub clamp_low: f64,
+    pub clamp_high: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -133,14 +142,6 @@ fn positive(label: &str, number: f64) -> Result<f64> {
     Ok(number)
 }
 
-fn nonnegative(label: &str, number: f64) -> Result<f64> {
-    let number = checked_real(label, number)?;
-    if number < 0.0 {
-        bail!("native family {label} must be nonnegative: {number}");
-    }
-    Ok(number)
-}
-
 impl NativeDigitalBundle {
     fn validated(&self) -> Result<Self> {
         let nodes = [
@@ -163,44 +164,42 @@ impl NativeDigitalBundle {
     }
 }
 
+fn check_adc_model(name: &str, params: &NativeAdcParameters) -> Result<()> {
+    for (label, value) in [
+        ("in_low", params.in_low),
+        ("in_high", params.in_high),
+        ("out_low", params.out_low),
+        ("out_high", params.out_high),
+        ("rise_delay", params.rise_delay),
+        ("fall_delay", params.fall_delay),
+        ("time_tol", params.time_tol),
+        ("clamp_bias", params.clamp_bias),
+    ] {
+        checked_real(label, value)?;
+    }
+    if matches!(
+        params.out_low.partial_cmp(&params.out_high),
+        Some(std::cmp::Ordering::Equal)
+    ) {
+        bail!("ADC {name} requires distinct output load levels");
+    }
+    if checked_real("clamp_res", params.clamp_res)? == 0.0 {
+        bail!("zero clamp resistance for ADC {name}");
+    }
+    Ok(())
+}
+
 fn check_model(model: &NativeFamilyModel) -> Result<(String, LogicFamily)> {
     let name = spice_identifier("native bridge model", &model.name)?;
     let family = LogicFamily::parse(&model.family)?;
     positive("VSUPPLY_NOMINAL", model.nominal_supply_v)?;
     match &model.native {
-        NativeFamilyParameters::Adc(params) => {
-            for (name, value) in [
-                ("in_low", params.in_low),
-                ("in_high", params.in_high),
-                ("out_low", params.out_low),
-                ("out_high", params.out_high),
-                ("clamp_low", params.clamp_low),
-                ("clamp_high", params.clamp_high),
-            ] {
-                checked_real(name, value)?;
-            }
-            if params.in_low >= params.in_high
-                || params.out_low >= params.out_high
-                || params.clamp_low >= params.clamp_high
-                || params.ic > 1
-            {
-                bail!("invalid family ADC voltage ordering or initial state in {name}");
-            }
-            for (label, delay) in [
-                ("rise_delay", params.rise_delay),
-                ("fall_delay", params.fall_delay),
-                ("time_tol", params.time_tol),
-            ] {
-                if positive(label, delay)? < 1e-12 {
-                    bail!("{label} must be at least 1ps for {name}");
-                }
-            }
-            if positive("clamp_res", params.clamp_res)? < 1e-6
-                || !(0.2..=2.0).contains(&params.clamp_bias)
-            {
-                bail!("invalid clamp resistor or bias for ADC {name}");
-            }
+        NativeFamilyParameters::AdcBridge(params) => {
+            check_adc_model(&name, &params.adc)?;
+            checked_real("clamp_low", params.clamp_low)?;
+            checked_real("clamp_high", params.clamp_high)?;
         }
+        NativeFamilyParameters::AdcSchmitt(params) => check_adc_model(&name, params)?,
         NativeFamilyParameters::Dac(params) => {
             for (label, value) in [
                 ("out_low", params.out_low),
@@ -213,22 +212,16 @@ fn check_model(model: &NativeFamilyModel) -> Result<(String, LogicFamily)> {
             ] {
                 checked_real(label, value)?;
             }
-            if params.out_low >= params.out_high {
-                bail!("DAC {name} requires out_low < out_high");
-            }
-            if params.sink_current > 0.0 || params.source_current < 0.0 {
-                bail!("DAC {name} sink/source metadata has invalid current polarity");
-            }
             for (label, number) in [
                 ("g_resistive", params.g_resistive),
                 ("g_hiz", params.g_hiz),
                 ("v_smooth", params.v_smooth),
             ] {
-                nonnegative(label, number)?;
+                checked_real(label, number)?;
             }
             for (label, number) in [("t_rise", params.t_rise), ("t_fall", params.t_fall)] {
-                if positive(label, number)? < 1e-12 {
-                    bail!("{label} must be at least 1ps for {name}");
+                if checked_real(label, number)? == 0.0 {
+                    bail!("zero {label} for DAC {name}");
                 }
             }
             for (label, optional) in [
@@ -236,7 +229,7 @@ fn check_model(model: &NativeFamilyModel) -> Result<(String, LogicFamily)> {
                 ("g_pulldown", params.g_pulldown),
             ] {
                 if let Some(number) = optional {
-                    nonnegative(label, number)?;
+                    checked_real(label, number)?;
                 }
             }
         }
@@ -250,7 +243,7 @@ fn effective_conductance(
     out_res_ohm: Option<f64>,
 ) -> Result<f64> {
     if let Some(explicit) = explicit {
-        return nonnegative(label, explicit);
+        return checked_real(label, explicit);
     }
     let out_res = positive(
         "OUT_RES",
@@ -263,30 +256,38 @@ fn emit_adc(
     text: &mut String,
     model: &str,
     params: &NativeAdcParameters,
+    clamps: Option<(f64, f64)>,
     scale: f64,
+    voltage_scale: f64,
 ) -> Result<()> {
     let in_low = checked_real("scaled in_low", params.in_low * scale)?;
     let in_high = checked_real("scaled in_high", params.in_high * scale)?;
-    if in_low >= in_high {
-        bail!("scaling collapses ADC input threshold band");
+    let out_low = checked_real("scaled ADC out_low", params.out_low * voltage_scale)?;
+    let out_high = checked_real("scaled ADC out_high", params.out_high * voltage_scale)?;
+    if matches!(
+        out_low.partial_cmp(&out_high),
+        Some(std::cmp::Ordering::Equal)
+    ) {
+        bail!("scaling collapses ADC output load levels");
     }
-    writeln!(
+    write!(
         text,
         ".model {model} sr_family_adc(in_low={in_low:e} in_high={in_high:e} \
          rise_delay={:e} fall_delay={:e} time_tol={:e} \
-         out_low={:e} out_high={:e} clamp_low={:e} clamp_high={:e} \
-         clamp_res={:e} clamp_bias={:e} schmitt={} ic={})",
-        params.rise_delay,
-        params.fall_delay,
-        params.time_tol,
-        params.out_low,
-        params.out_high,
-        params.clamp_low,
-        params.clamp_high,
+         out_low={out_low:e} out_high={out_high:e} ",
+        params.rise_delay, params.fall_delay, params.time_tol,
+    )?;
+    if let Some((low, high)) = clamps {
+        let clamp_low = checked_real("scaled clamp_low", low * voltage_scale)?;
+        let clamp_high = checked_real("scaled clamp_high", high * voltage_scale)?;
+        write!(text, "clamp_low={clamp_low:e} clamp_high={clamp_high:e} ")?;
+    }
+    writeln!(
+        text,
+        "clamp_res={:e} clamp_bias={:e} schmitt={})",
         params.clamp_res,
         params.clamp_bias,
-        if params.schmitt { "true" } else { "false" },
-        params.ic
+        if clamps.is_some() { "false" } else { "true" },
     )?;
     Ok(())
 }
@@ -296,27 +297,30 @@ fn emit_dac(
     model: &str,
     params: &NativeDacParameters,
     scale: f64,
-    out_res_ohm: Option<f64>,
+    voltage_scale: f64,
+    out_res_ohm: Option<OutputResistance>,
 ) -> Result<()> {
     let out_low = checked_real("scaled out_low", params.out_low * scale)?;
     let out_high = checked_real("scaled out_high", params.out_high * scale)?;
-    if out_low >= out_high {
-        bail!("scaling collapses DAC voltage levels");
-    }
-    let g_pullup = effective_conductance("g_pullup", params.g_pullup, out_res_ohm)?;
-    let g_pulldown = effective_conductance("g_pulldown", params.g_pulldown, out_res_ohm)?;
+    let knee_low = checked_real("scaled knee_low", params.knee_low * voltage_scale)?;
+    let knee_high = checked_real("scaled knee_high", params.knee_high * voltage_scale)?;
+    let v_smooth = checked_real("scaled v_smooth", params.v_smooth * voltage_scale)?;
+    let g_pullup =
+        effective_conductance("g_pullup", params.g_pullup, out_res_ohm.map(|r| r.positive))?;
+    let g_pulldown = effective_conductance(
+        "g_pulldown",
+        params.g_pulldown,
+        out_res_ohm.map(|r| r.negative),
+    )?;
     writeln!(
         text,
         ".model {model} sr_family_dac(out_low={out_low:e} out_high={out_high:e} \
          g_pullup={g_pullup:e} g_pulldown={g_pulldown:e} \
-         g_resistive={:e} g_hiz={:e} knee_low={:e} knee_high={:e} \
-         v_smooth={:e} input_load={:e} t_rise={:e} t_fall={:e} \
+         g_resistive={:e} g_hiz={:e} knee_low={knee_low:e} knee_high={knee_high:e} \
+         v_smooth={v_smooth:e} input_load={:e} t_rise={:e} t_fall={:e} \
          sink_current={:e} source_current={:e})",
         params.g_resistive,
         params.g_hiz,
-        params.knee_low,
-        params.knee_high,
-        params.v_smooth,
         params.input_load,
         params.t_rise,
         params.t_fall,
@@ -324,6 +328,32 @@ fn emit_dac(
         params.source_current
     )?;
     Ok(())
+}
+
+fn emit_native_model(
+    text: &mut String,
+    name: &str,
+    model: &NativeFamilyParameters,
+    scale: f64,
+    voltage_scale: f64,
+    out_res: Option<OutputResistance>,
+) -> Result<()> {
+    match model {
+        NativeFamilyParameters::AdcBridge(params) => emit_adc(
+            text,
+            name,
+            &params.adc,
+            Some((params.clamp_low, params.clamp_high)),
+            scale,
+            voltage_scale,
+        ),
+        NativeFamilyParameters::AdcSchmitt(params) => {
+            emit_adc(text, name, params, None, scale, voltage_scale)
+        }
+        NativeFamilyParameters::Dac(params) => {
+            emit_dac(text, name, params, scale, voltage_scale, out_res)
+        }
+    }
 }
 
 struct IndexedNativeSpec<'a> {
@@ -345,7 +375,7 @@ fn index_native_spec(spec: &NativeFamilySpecification) -> Result<IndexedNativeSp
             bail!("empty or duplicate physical digital pin ID {:?}", entry.id);
         }
         if let Some(out_res) = entry.out_res_ohm {
-            nonnegative("physical OUT_RES", out_res)?;
+            out_res.validate()?;
         }
         entry.bundle.validated()?;
     }
@@ -356,9 +386,10 @@ fn index_native_spec(spec: &NativeFamilySpecification) -> Result<IndexedNativeSp
 /// This never adds `sr_bundle_load`: each ALB physical input already
 /// contributes precisely one load on its connected digital triple.
 ///
-/// Only ADC thresholds and DAC `out_low/out_high` are scaled by
-/// `VSUPPLY / VSUPPLY_NOMINAL`. Clamp rails, knee positions, conductances,
-/// capacitances, and other parameters remain untouched.
+/// ADC thresholds and DAC output rails scale with supply. Original HC and UNIV
+/// measurements additionally establish scaling of ADC load/clamp rails,
+/// DAC knees and smoothing width; conductance, clamp bias/resistance,
+/// capacitance and signed current metadata remain invariant.
 ///
 /// # Errors
 /// Rejects invalid models, missing wiring, contradictory shared ADC
@@ -389,7 +420,9 @@ pub fn render_native_family_bridges(
             bail!("resolved plan and native model metadata disagree for {native_name}");
         }
         let kind = match &model.native {
-            NativeFamilyParameters::Adc(_) => AnalogBridgeKind::Adc,
+            NativeFamilyParameters::AdcBridge(_) | NativeFamilyParameters::AdcSchmitt(_) => {
+                AnalogBridgeKind::Adc
+            }
             NativeFamilyParameters::Dac(_) => AnalogBridgeKind::Dac,
         };
         if kind != plan.kind {
@@ -398,6 +431,11 @@ pub fn render_native_family_bridges(
         let scale = positive("VSUPPLY", plan.supply_v)?
             / positive("VSUPPLY_NOMINAL", model.nominal_supply_v)?;
         positive("VSUPPLY scale", scale)?;
+        let voltage_scale = if matches!(family.base_name(), "HC" | "UNIV") {
+            scale
+        } else {
+            1.0
+        };
         if plan.physical_pins.is_empty() {
             bail!("native bridge {index} has no connected physical pins");
         }
@@ -434,12 +472,14 @@ pub fn render_native_family_bridges(
             }
         }
         let generated = format!("MsrFamily{index}");
-        match &model.native {
-            NativeFamilyParameters::Adc(params) => emit_adc(&mut text, &generated, params, scale)?,
-            NativeFamilyParameters::Dac(params) => {
-                emit_dac(&mut text, &generated, params, scale, out_res)?;
-            }
-        }
+        emit_native_model(
+            &mut text,
+            &generated,
+            &model.native,
+            scale,
+            voltage_scale,
+            out_res,
+        )?;
         let analog = analog_node(&plan.analog_net)?;
         match kind {
             AnalogBridgeKind::Adc => writeln!(

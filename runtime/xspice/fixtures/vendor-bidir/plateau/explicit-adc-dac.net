@@ -1,0 +1,11 @@
+* Explicit ADC -> digital net -> explicit DAC, no ALB logic.
+Vext ext 0 PWL(0 5 8n 5 9n 2.15 29n 2.15 30n 0 40n 0 41n 5 50n 5)
+Rext ext pin 1k
+Aadc pin din AIN
+.model AIN adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1p fall_delay=1p time_tol=10p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Adac din q AOUT
+.model AOUT dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0 t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5)
+Rout q 0 100k
+.tran 20p 50n 0 20p
+.PRINT TRAN V(ext) V(pin) V(q)
+.end

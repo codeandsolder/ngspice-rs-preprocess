@@ -1,0 +1,20 @@
+[
+    {
+        "case":  "unknown-data-clock",
+        "source_sha256":  "6010DE9BAF6B7A3D8B39F6775A0F4E89D866875C528F6F901D56BC0723C1251B",
+        "waveform_sha256":  "801ADD7B6D137CCB8378A1D7BA0FD66069E89203F1B354CEBDCC29CEB912540F",
+        "listing_sha256":  "05049DDE25BCBEE661A1738EB2584F063958141A123534971C451CB7A1C55305",
+        "rows":  9001,
+        "warnings":  0,
+        "crossings":  18
+    },
+    {
+        "case":  "unknown-qualifiers",
+        "source_sha256":  "3DE06DA59F7DF5F2153236E5B42E42F9646996FE5236E6F0917790B37E9FE14B",
+        "waveform_sha256":  "77B626B5DB461B1EFD8B620D50E744177540935E24D48E09F247CF779A269F22",
+        "listing_sha256":  "AF280EFAA76CA0ED3FD650E7FAFD8BBA7C0081E4E47FCC1E1FB544BA33EEFFBC",
+        "rows":  5501,
+        "warnings":  0,
+        "crossings":  13
+    }
+]

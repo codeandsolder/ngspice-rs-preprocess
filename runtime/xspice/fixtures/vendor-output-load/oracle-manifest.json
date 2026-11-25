@@ -1,0 +1,47 @@
+[
+    {
+        "case":  "comb-load-matrix",
+        "source_sha256":  "B68C58782293C36359AE7221AD75AE750A3CC26534F9F8CE84F4BB78908060F8",
+        "waveform_sha256":  "8831631611FD8420478A8E0F34771441B8D38347B5131D4F36F1EAB98DD0D788",
+        "listing_sha256":  "1500866B8C5CA54DBB62EAC0D36C4759A336C55409A101C44F93FC55DDE13000",
+        "rows":  14001,
+        "warnings":  0,
+        "crossings":  32
+    },
+    {
+        "case":  "level-load-matrix",
+        "source_sha256":  "3B1395EAE77AC36A28A21C6F676271C0714A12A8F4AF08EEE4D1BD0841B75AB1",
+        "waveform_sha256":  "14015DBBF98A9ADEF72826F5E4685D52DF136F2329EA90DEB1EFE1E4667D029E",
+        "listing_sha256":  "93C3BD09121EA70C9C9C95D02A83DC722ADA35984A96C91FEF7B146EF67948A0",
+        "rows":  14001,
+        "warnings":  0,
+        "crossings":  32
+    },
+    {
+        "case":  "port-explicit-zero-load",
+        "source_sha256":  "8F3407803396994F89664C7DA3C9552EEEBBD4E0E3795BD36DA91489C17B7A2F",
+        "waveform_sha256":  "0D987953EBB6F30FF6ED6EC7FE48F88F9CD1E4C4545A8DE423F55B0E06F8E79A",
+        "listing_sha256":  "2ABDC2584E6827AB0209E732421B27741E8A3A82A5E0ED84413597D427708A7E",
+        "rows":  5001,
+        "warnings":  0,
+        "crossings":  18
+    },
+    {
+        "case":  "port-implicit-load",
+        "source_sha256":  "6DAC82E1C0C0F6B1C5BBF2BE113354E21AB8133838A48542E54A77DD836E59DA",
+        "waveform_sha256":  "9B2C67172F8A87B2E4A402420B09D8A900171CF6EE2F391F7C79BCF63651AD7E",
+        "listing_sha256":  "9EEE6F5BEFE3515EE9712A1906B1C2D31DC07BEFA5C5E5C0F76C09120D8B3C70",
+        "rows":  5001,
+        "warnings":  0,
+        "crossings":  18
+    },
+    {
+        "case":  "res-load-matrix",
+        "source_sha256":  "DFD7780AAFD3675138958523ADFA8082C1060EFA1AC4271123C4CA5A380304A6",
+        "waveform_sha256":  "14015DBBF98A9ADEF72826F5E4685D52DF136F2329EA90DEB1EFE1E4667D029E",
+        "listing_sha256":  "C60FCF25CDBD1CF2D681F4BE8E0D18DF28E6E3F9D1AEFEDF3235D272B6A44183",
+        "rows":  14001,
+        "warnings":  0,
+        "crossings":  32
+    }
+]

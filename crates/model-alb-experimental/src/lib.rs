@@ -1,27 +1,31 @@
-//! Explicit experimental ALB compiler and physical mixed-signal bridge planning.
-//!
-//! Not linked by the production dialect translator. Callers opt into its
-//! bounded models and separately provision a matching reference runtime.
+//! Explicit experimental ALB compilation and physical mixed-signal bridge planning.
+//! Not linked by production electrical translation.
 use anyhow::{Context, Result};
 use model_translate_simplis::syntax::{parse_numeric, validate_node};
-
 mod alb;
 pub use alb::{
-    AlbDigitalBit, AlbDriveStrength, AlbLogicLevel, AnalogBoundaryPin, AnalogBridgeKind,
-    AnalogDigitalConnection, BridgeCatalog, BridgeModel, DigitalFamilyResolution,
+    AlbDigitalBit, AlbDriveStrength, AlbLogicLevel, AlbTimedOutput, AnalogBoundaryPin,
+    AnalogBridgeKind, AnalogDigitalConnection, BridgeCatalog, BridgeModel, DigitalFamilyResolution,
     DigitalPinDirection, DiscoveredAlbPin, KnownLutSourceBit, KnownTimedLutSet, KnownTruthTable,
-    LegacyCompatibilityTable, LogicFamily, LogicFamilyAssignment, NativeAdcParameters,
-    NativeDacParameters, NativeDigitalBundle, NativeFamilyModel, NativeFamilyParameters,
-    NativeFamilySpecification, NativePinWiring, PlannedAnalogBridge, ScopedAnalogDigitalConnection,
+    LegacyCompatibilityTable, LogicFamily, LogicFamilyAssignment, NativeAdcBridgeParameters,
+    NativeAdcParameters, NativeDacParameters, NativeDigitalBundle, NativeFamilyModel,
+    NativeFamilyParameters, NativeFamilySpecification, NativePinWiring, OutputResistance,
+    PhysicalOutputDrive, PhysicalOutputLoad, PlannedAnalogBridge, RegisterTimingDefaults,
+    ScopedAnalogDigitalConnection, StatefulEventEngine, StatefulPhysicalEventEngine,
     TimingEnvironment, XspiceElectrical, XspiceLutTarget, XspiceTimedBit, XspiceTimedPlan,
-    derive_family_wiring, discover_alb_pins, materialize_scoped_family_bridges,
-    plan_analog_bridges, render_native_family_bridges,
+    compile_stateful_event_engine, compile_stateful_physical_engine, derive_family_wiring,
+    discover_alb_pins, materialize_scoped_family_bridges, plan_analog_bridges,
+    render_native_family_bridges,
 };
 mod whole;
 pub use whole::{
-    AlbOutputProducer, CompiledSourceAlbModel, FamilySpecialization, LogicalAlbBoundary,
-    LogicalAlbExpansion, OccurrenceFamilyBoundary, compile_explicit_alb_source_models,
-    expand_logical_alb_source, inspect_alb_source_models, specialize_family_occurrences,
+    AlbInputReceiver, AlbOutputProducer, CodeModelContract, DefinitionFamilyBoundary,
+    DiscoveredAlbBoundary, FamilySpecialization, LogicalAlbBoundary, LogicalAlbExpansion,
+    LookupTableShape, OccurrenceFamilyBoundary, OpaqueXInterface, OpaqueXPinKind,
+    discover_original_alb_boundaries, discover_original_alb_boundaries_with_opaque_x_interfaces,
+    expand_logical_alb_source, expand_logical_alb_source_with_opaque_x_interfaces,
+    inspect_alb_source_models, specialize_family_occurrences, verify_external_code_models,
+    verify_external_native_libraries,
 };
 
 /// Experimental isolated ALB-to-XSPICE subcircuit compiler.
@@ -38,12 +42,15 @@ pub fn compile_alb_xspice_subcircuit(
     timing: TimingEnvironment<'_>,
     electrical: XspiceElectrical,
 ) -> Result<String> {
-    let (_, program) = alb::analyze_body(body)?.into_parts();
-    let graph = program
-        .context("SIMetrix ALB body is not a timed COMB program")?
-        .timed_combinational_graph(timing)?
-        .context("SIMetrix ALB timed graph needs acyclic BITWISE COMB semantics")?;
-    graph
-        .xspice_timed_plan()?
-        .render_subcircuit(subcircuit, electrical)
+    let (stateless, stateful) = alb::analyze_body_in_environment(body, timing)?.into_parts();
+    let plan = if let Some(table) = stateless {
+        alb::XspiceTimedPlan::from_known_truth_table(&table, timing)?
+    } else {
+        let graph = stateful
+            .context("SIMetrix ALB body is neither stateless nor timed COMB")?
+            .timed_combinational_graph(timing)?
+            .context("SIMetrix ALB timed graph needs acyclic BITWISE COMB semantics")?;
+        graph.xspice_timed_plan()?
+    };
+    plan.render_subcircuit(subcircuit, electrical)
 }
