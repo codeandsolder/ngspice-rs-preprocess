@@ -137,6 +137,7 @@ struct SourceExpansion<'a> {
     session: &'a mut SourceSession,
     output: Vec<u8>,
     sources: BTreeSet<String>,
+    admitted_paths: BTreeMap<String, PathBuf>,
     stack: Vec<(PathBuf, Option<String>)>,
     limit: usize,
     simulator: LibrarySimulator,
@@ -154,6 +155,7 @@ impl<'a> SourceExpansion<'a> {
             session,
             output: Vec::new(),
             sources: BTreeSet::new(),
+            admitted_paths: BTreeMap::new(),
             stack: Vec::new(),
             limit: options.output_bytes,
             simulator: projection(request.format),
@@ -190,7 +192,18 @@ impl<'a> SourceExpansion<'a> {
             source.path.display()
         );
         self.stack.push(key);
-        self.sources.insert(display_path(&source.path));
+        let label = display_path(&source.path);
+        if self.standalone
+            && let Some(previous) = self
+                .admitted_paths
+                .insert(label.clone(), source.path.clone())
+        {
+            ensure!(
+                previous == source.path,
+                "ambiguous source display path {label}"
+            );
+        }
+        self.sources.insert(label);
         let result = self.expand_lines(source, inherited, kind, section);
         self.stack.pop();
         result.with_context(|| format!("expanding source {}", source.path.display()))

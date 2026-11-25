@@ -1,4 +1,4 @@
-//! Standalone HSPICE scalar semantics (as opposed to the SIMetrix
+//! Standalone HSPICE scalar semantics (as opposed to the `SIMetrix`
 //! compatibility profile). Keep original arithmetic domains explicit in
 //! native SPICE, including the signed logarithms and integer powers.
 use super::HspiceExpressionKind;

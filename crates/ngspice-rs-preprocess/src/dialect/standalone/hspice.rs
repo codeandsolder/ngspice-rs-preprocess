@@ -1,5 +1,5 @@
 //! Standalone HSPICE source normalization. Circuit semantics are distinct
-//! from SIMetrix's optional HSPICE model-selection preset.
+//! from `SIMetrix`'s optional HSPICE model-selection preset.
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
     model_card::{ModelParameter, parse_model_card, parse_parameter_fields, parse_spice_constant},
@@ -108,7 +108,7 @@ impl DeckOptions {
             let name = parameter.name.to_ascii_uppercase();
             let raw = parameter.expression.as_deref();
             match name.as_str() {
-                "PARHIER" => {
+                "PARHIER" | "PARHIE" => {
                     self.local_parameters = match raw.map(str::to_ascii_uppercase).as_deref() {
                         Some("LOCAL") => true,
                         Some("GLOBAL") => false,
@@ -247,7 +247,7 @@ fn device(text: &str, models: &BTreeSet<String>, limit: usize) -> Result<String>
 
     // HSPICE permits explicit controlled-source type keywords. Native
     // voltage/current-source VALUE syntax preserves the E/G identity.
-    if matches!(letter, b'E' | b'F' | b'G' | b'H') {
+    if matches!(letter, b'E'..=b'H') {
         let alias = match letter {
             b'E' => "VCVS",
             b'F' => "CCCS",
@@ -284,10 +284,10 @@ fn device(text: &str, models: &BTreeSet<String>, limit: usize) -> Result<String>
     }
 
     let (start, positional) = match letter {
-        b'R' | b'C' | b'L' | b'V' | b'I' => (3, true),
+        b'R' | b'C' | b'L' | b'V' | b'I' | b'K' => (3, true),
         b'M' => (6, false),
-        b'D' => (4, true),
-        b'J' | b'Z' => (5, true),
+        b'D' | b'F' | b'H' => (4, true),
+        b'J' | b'Z' | b'E' | b'G' => (5, true),
         b'Q' => {
             // The optional fourth terminal precedes the model. Resolve
             // by the declared model namespace, not the spelling of a node.
@@ -302,9 +302,6 @@ fn device(text: &str, models: &BTreeSet<String>, limit: usize) -> Result<String>
             };
             (position + 1, true)
         }
-        b'E' | b'G' => (5, true),
-        b'F' | b'H' => (4, true),
-        b'K' => (3, true),
         b'X' => (1, false),
         _ => bail!("unqualified HSPICE device {text}"),
     };
@@ -347,7 +344,7 @@ fn analysis(text: &str, name: &str, models: &BTreeSet<String>, limit: usize) -> 
 }
 
 pub(super) fn lower(
-    source: Vec<ScopedStatement>,
+    source: &[ScopedStatement],
     deck: bool,
     limit: usize,
 ) -> Result<Vec<ScopedStatement>> {
@@ -438,6 +435,15 @@ pub(super) fn lower(
         output.extend(result);
     }
     ensure!(scope_depth == 0, "unterminated source subcircuit");
+    finish(output, deck, &options, limit)
+}
+
+fn finish(
+    output: Vec<ScopedStatement>,
+    deck: bool,
+    options: &DeckOptions,
+    limit: usize,
+) -> Result<Vec<ScopedStatement>> {
     let output = scopes::normalize(output, deck, limit)?;
     let mut output = bindings::bind(&output, deck, options.local_parameters, limit)?;
     if deck {

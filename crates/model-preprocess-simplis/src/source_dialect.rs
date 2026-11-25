@@ -383,7 +383,7 @@ pub enum HspiceExpressionKind {
 }
 
 /// Convert an expression in the standalone HSPICE language, not the
-/// SIMetrix compatibility interpretation of HSPICE source.
+/// `SIMetrix` compatibility interpretation of HSPICE source.
 ///
 /// # Errors
 /// Invalid numeric literals, expression delimiters, function arity or

@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{linked_source::RootKind, normalize_mapped};
 use model_preprocess_simplis::source_dialect::{ScopedStatement, SourceKind};
-use std::{fmt::Write as _, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 
 mod hspice;
 
@@ -39,17 +39,24 @@ pub(super) fn prepare(
             title.first_line == 1 && title.last_line == 1,
             "invalid deck title span"
         );
-        title.text = std::str::from_utf8(
+        std::str::from_utf8(
             root.bytes
                 .split(|&byte| byte == b'\n')
                 .next()
                 .context("missing title")?,
         )?
         .trim_end_matches('\r')
-        .to_owned();
+        .clone_into(&mut title.text);
     }
-    let prepared = hspice::lower(source, deck, options.output_bytes)?;
-    finish(root, request.format, deck, &prepared, options.output_bytes)
+    let prepared = hspice::lower(&source, deck, options.output_bytes)?;
+    finish(
+        root,
+        request.format,
+        deck,
+        &prepared,
+        &expansion.admitted_paths,
+        options.output_bytes,
+    )
 }
 
 fn finish(
@@ -57,6 +64,7 @@ fn finish(
     format: InputFormat,
     deck: bool,
     source: &[ScopedStatement],
+    admitted_paths: &BTreeMap<String, PathBuf>,
     limit: usize,
 ) -> Result<PreparedBundle> {
     let mut rendered = String::new();
@@ -72,7 +80,10 @@ fn finish(
         );
         writeln!(rendered, "{}", statement.text)?;
         origins.push(OriginLine {
-            source: PathBuf::from(&statement.source),
+            source: admitted_paths
+                .get(&statement.source)
+                .context("unknown admitted source")?
+                .clone(),
             line: statement.first_line,
             last_line: statement.last_line,
         });

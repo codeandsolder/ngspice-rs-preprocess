@@ -984,8 +984,9 @@ pub fn project_resource(
     ))
 }
 
-/// Project one standalone SPICE-language resource without interpreting
-/// SIMetrix/SIMPLIS simulator-selection directives. Retain exact admitted
+/// Project a standalone SPICE-language resource.
+///
+/// Do not interpret simulator-selection directives. Retain exact admitted
 /// physical spans and inherit its language through ordinary includes.
 ///
 /// # Errors

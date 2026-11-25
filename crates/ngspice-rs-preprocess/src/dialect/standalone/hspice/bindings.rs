@@ -272,14 +272,14 @@ impl<'a> Compiler<'a> {
         bail!("unresolved HSPICE subcircuit {name}")
     }
 
-    fn instantiate(&mut self, key: Key, stack: &mut Vec<usize>) -> Result<usize> {
+    fn instantiate(&mut self, key: &Key, stack: &mut Vec<usize>) -> Result<usize> {
         ensure!(
             !stack.contains(&key.definition),
             "recursive HSPICE subcircuit {}",
             self.graph.definitions[key.definition].name
         );
         ensure!(stack.len() < 128, "HSPICE call depth exceeded");
-        if let Some(&id) = self.registry.get(&key) {
+        if let Some(&id) = self.registry.get(key) {
             return Ok(id);
         }
         let definition = self.graph.definitions[key.definition].clone();
@@ -388,7 +388,7 @@ impl<'a> Compiler<'a> {
             inherited,
             implicit,
         };
-        let target = self.instantiate(key, stack)?;
+        let target = self.instantiate(&key, stack)?;
         let last = signature
             .prefix
             .last_mut()
@@ -454,7 +454,7 @@ impl<'a> Compiler<'a> {
         if !self.graph.deck {
             for definition in root.children.values() {
                 self.instantiate(
-                    Key {
+                    &Key {
                         definition: *definition,
                         owner: 0,
                         inherited: self.variants[0].visible.clone(),
@@ -517,11 +517,10 @@ fn bind_bare_values(text: &str, names: &Names, models: &Names) -> Result<String>
         }
         let assigned = index >= 2 && &text[fields[index - 1].clone()] == "=";
         let positional = match name.as_bytes()[0] {
-            b'R' | b'C' | b'L' => index == 3,
+            b'R' | b'C' | b'L' | b'K' => index == 3,
             b'V' | b'I' => index >= 3,
             b'E' | b'G' => index == 5,
             b'F' | b'H' | b'D' => index == 4,
-            b'K' => index == 3,
             _ => false,
         };
         if assigned || positional {
