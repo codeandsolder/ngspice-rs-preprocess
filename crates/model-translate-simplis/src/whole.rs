@@ -1,6 +1,8 @@
 mod passive_ic;
 mod pwls;
+mod waveforms;
 pub use passive_ic::capture_passive_initial_conditions;
+pub use waveforms::{capture_artifact_waveforms, capture_linked_waveforms};
 mod simetrix_runtime;
 use super::{
     CodeModelRuntime, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateMode,
@@ -3332,389 +3334,6 @@ fn source_kind(name: &str) -> Result<char> {
     }
 }
 
-fn no_parameter(parameters: &std::collections::BTreeMap<String, String>, name: &str) -> Result<()> {
-    let value = parameters
-        .get(name)
-        .with_context(|| format!("missing SIMPLIS waveform parameter {name}"))?;
-    if !value.eq_ignore_ascii_case("NO") {
-        bail!("SIMPLIS waveform {name}={value} is not yet supported");
-    }
-    Ok(())
-}
-
-fn optional_no_parameter(
-    parameters: &std::collections::BTreeMap<String, String>,
-    name: &str,
-) -> Result<()> {
-    if let Some(value) = parameters.get(name)
-        && !value.eq_ignore_ascii_case("NO")
-    {
-        bail!("SIMPLIS waveform {name}={value} is not yet supported");
-    }
-    Ok(())
-}
-
-fn phase_expression(delay: f64, period: f64) -> Result<String> {
-    let mut delay_text = String::new();
-    write_number(&mut delay_text, delay)?;
-    let mut period_text = String::new();
-    write_number(&mut period_text, period)?;
-    Ok(format!(
-        "((time-{delay_text})-floor((time-{delay_text})/{period_text})*{period_text})"
-    ))
-}
-
-struct WaveformHeader<'a> {
-    name: &'a str,
-    kind: char,
-    node_p: &'a str,
-    node_n: &'a str,
-    waveform: String,
-}
-
-fn waveform_header(tokens: &[String]) -> Result<Option<WaveformHeader<'_>>> {
-    if tokens.len() < 4 {
-        return Ok(None);
-    }
-    let waveform = tokens[3].to_ascii_uppercase();
-    if !matches!(waveform.as_str(), "PUL" | "SAW" | "PWL" | "SIN") {
-        return Ok(None);
-    }
-    let name = tokens[0].as_str();
-    let kind = source_kind(name)?;
-    let node_p = tokens[1].as_str();
-    let node_n = tokens[2].as_str();
-    validate_node(node_p)?;
-    validate_node(node_n)?;
-    Ok(Some(WaveformHeader {
-        name,
-        kind,
-        node_p,
-        node_n,
-        waveform,
-    }))
-}
-
-fn write_time_pwl_behavioral(
-    output: &mut String,
-    kind: char,
-    stem: &str,
-    node_p: &str,
-    node_n: &str,
-    points: &[Point],
-) -> Result<()> {
-    write!(output, "B__{stem} {node_p} {node_n} {kind}='")?;
-    write_time_pwl_expr(output, points, 0)?;
-    output.push_str("'\n");
-    Ok(())
-}
-
-fn write_time_pwl_expr(output: &mut String, points: &[Point], index: usize) -> Result<()> {
-    let left = points[index];
-    let Some(right) = points.get(index.saturating_add(1)).copied() else {
-        write_number(output, left.value)?;
-        return Ok(());
-    };
-    if right.voltage.to_bits() == left.voltage.to_bits() {
-        return write_time_pwl_expr(output, points, index.saturating_add(1));
-    }
-    output.push_str("(time<");
-    write_number(output, right.voltage)?;
-    output.push_str(" ? ");
-    if index == 0 {
-        output.push_str("(time<");
-        write_number(output, left.voltage)?;
-        output.push_str(" ? ");
-        write_number(output, left.value)?;
-        output.push_str(" : ");
-    }
-    write_number(output, left.value)?;
-    output.push_str("+(");
-    write_number(output, right.value - left.value)?;
-    output.push_str(")*(time-");
-    write_number(output, left.voltage)?;
-    output.push_str(")/(");
-    write_number(output, right.voltage - left.voltage)?;
-    output.push(')');
-    if index == 0 {
-        output.push(')');
-    }
-    output.push_str(" : ");
-    write_time_pwl_expr(output, points, index.saturating_add(1))?;
-    output.push(')');
-    Ok(())
-}
-
-fn translate_time_pwl(
-    name: &str,
-    node_p: &str,
-    node_n: &str,
-    parameters: &std::collections::BTreeMap<String, String>,
-) -> Result<Translation> {
-    let segments = integer_parameter(parameters, "NSEG")?;
-    if segments == 0 {
-        bail!("SIMPLIS PWL source requires at least one segment");
-    }
-    let mut points = Vec::with_capacity(segments.saturating_add(1));
-    for index in 0..=segments {
-        points.push(Point {
-            voltage: numeric_parameter(parameters, &format!("X{index}"))?,
-            value: numeric_parameter(parameters, &format!("Y{index}"))?,
-        });
-    }
-    if points
-        .iter()
-        .any(|point| !point.voltage.is_finite() || !point.value.is_finite() || point.voltage < 0.0)
-        || points
-            .windows(2)
-            .any(|window| window[0].voltage > window[1].voltage)
-    {
-        bail!(
-            "SIMPLIS PWL source time coordinates must be finite, non-negative, and nondecreasing"
-        );
-    }
-    let mut output = String::new();
-    if points
-        .windows(2)
-        .any(|window| window[0].voltage.to_bits() == window[1].voltage.to_bits())
-    {
-        let kind = source_kind(name)?;
-        let stem = sanitized_name(name);
-        write_time_pwl_behavioral(&mut output, kind, &stem, node_p, node_n, &points)?;
-    } else {
-        write!(output, "{name} {node_p} {node_n} PWL(")?;
-        for (index, point) in points.iter().enumerate() {
-            if index != 0 {
-                output.push(' ');
-            }
-            write_number(&mut output, point.voltage)?;
-            output.push(' ');
-            write_number(&mut output, point.value)?;
-        }
-        output.push_str(")\n");
-    }
-    Ok(Translation {
-        bytes: output.into_bytes(),
-        kind: TranslationKind::PiecewiseLinearSource,
-    })
-}
-
-fn translate_saw_waveform(
-    name: &str,
-    kind: char,
-    node_p: &str,
-    node_n: &str,
-    parameters: &std::collections::BTreeMap<String, String>,
-) -> Result<Translation> {
-    no_parameter(parameters, "OFF_UNTIL_DELAY")?;
-    optional_no_parameter(parameters, "IDLE_IN_POP")?;
-    let v1 = numeric_parameter(parameters, "V1")?;
-    let v2 = numeric_parameter(parameters, "V2")?;
-    let frequency = numeric_parameter(parameters, "FREQ")?;
-    let delay = numeric_parameter(parameters, "DELAY")?;
-    if !(frequency > 0.0 && delay >= 0.0) {
-        bail!("invalid SIMPLIS SAW timing parameters");
-    }
-    let period = 1.0 / frequency;
-    let phase = phase_expression(delay, period)?;
-    let stem = sanitized_name(name);
-    let mut output = String::new();
-    write!(output, "B__{stem} {node_p} {node_n} {kind}='")?;
-    write_number(&mut output, v1)?;
-    output.push_str("+(");
-    write_number(&mut output, v2 - v1)?;
-    output.push_str(")*(");
-    output.push_str(&phase);
-    output.push_str("/(");
-    write_number(&mut output, period)?;
-    output.push_str("))'\n");
-    Ok(Translation {
-        bytes: output.into_bytes(),
-        kind: TranslationKind::SawSource,
-    })
-}
-
-fn write_native_pulse(name: &str, node_p: &str, node_n: &str, values: [f64; 7]) -> Result<Vec<u8>> {
-    let mut output = String::new();
-    write!(output, "{name} {node_p} {node_n} PULSE(")?;
-    for (index, value) in values.into_iter().enumerate() {
-        if index != 0 {
-            output.push(' ');
-        }
-        write_number(&mut output, value)?;
-    }
-    output.push_str(")\n");
-    Ok(output.into_bytes())
-}
-
-fn translate_pulse_waveform(
-    name: &str,
-    kind: char,
-    node_p: &str,
-    node_n: &str,
-    parameters: &std::collections::BTreeMap<String, String>,
-) -> Result<Translation> {
-    no_parameter(parameters, "OFF_UNTIL_DELAY")?;
-    optional_no_parameter(parameters, "IDLE_IN_POP")?;
-    let v1 = numeric_parameter(parameters, "V1")?;
-    let v2 = numeric_parameter(parameters, "V2")?;
-    let frequency = numeric_parameter(parameters, "FREQ")?;
-    let rise = numeric_parameter(parameters, "T_RISE")?;
-    let fall = numeric_parameter(parameters, "T_FALL")?;
-    let width = numeric_parameter(parameters, "PWIDTH")?;
-    let delay = numeric_parameter(parameters, "DELAY")?;
-    if !(frequency > 0.0 && rise >= 0.0 && fall >= 0.0 && width >= 0.0 && delay >= 0.0) {
-        bail!("invalid SIMPLIS PUL timing parameters");
-    }
-    let period = 1.0 / frequency;
-    if rise + width + fall > period {
-        bail!("SIMPLIS PUL high/rise/fall interval exceeds its period");
-    }
-    let bytes = if delay == 0.0 {
-        write_native_pulse(
-            name,
-            node_p,
-            node_n,
-            [v1, v2, 0.0, rise, fall, width, period],
-        )?
-    } else {
-        if rise == 0.0 || fall == 0.0 {
-            bail!("phase-shifted SIMPLIS PUL with zero rise/fall is not yet supported");
-        }
-        let phase = phase_expression(delay, period)?;
-        let stem = sanitized_name(name);
-        let mut output = String::new();
-        write!(output, "B__{stem} {node_p} {node_n} {kind}=pwl({phase}")?;
-        for (x, y) in [
-            (0.0, v1),
-            (rise, v2),
-            (rise + width, v2),
-            (rise + width + fall, v1),
-            (period, v1),
-        ] {
-            output.push_str(", ");
-            write_number(&mut output, x)?;
-            output.push_str(", ");
-            write_number(&mut output, y)?;
-        }
-        output.push_str(")\n");
-        output.into_bytes()
-    };
-    Ok(Translation {
-        bytes,
-        kind: TranslationKind::PulseSource,
-    })
-}
-
-fn translate_sine_waveform(
-    name: &str,
-    kind: char,
-    node_p: &str,
-    node_n: &str,
-    parameters: &std::collections::BTreeMap<String, String>,
-) -> Result<Translation> {
-    optional_no_parameter(parameters, "IDLE_IN_POP")?;
-    let offset = numeric_parameter(parameters, "VOFFSET")?;
-    let amplitude = numeric_parameter(parameters, "APEAK")?;
-    let frequency = numeric_parameter(parameters, "FREQ")?;
-    let damping = parameters
-        .get("DAMP_COEF")
-        .map_or(Ok(0.0), |value| crate::parse_numeric(value))?;
-    if !(amplitude >= 0.0 && frequency > 0.0 && damping >= 0.0) {
-        bail!("invalid SIMPLIS SIN amplitude/frequency/damping");
-    }
-    let time_delay = match (parameters.get("TDELAY"), parameters.get("PDELAY")) {
-        (Some(_), Some(_)) => bail!("SIMPLIS SIN TDELAY and PDELAY are mutually exclusive"),
-        (Some(value), None) => crate::parse_numeric(value)?,
-        (None, Some(value)) => crate::parse_numeric(value)? / (360.0 * frequency),
-        (None, None) => bail!("SIMPLIS SIN requires TDELAY or PDELAY"),
-    };
-    if !time_delay.is_finite() {
-        bail!("invalid SIMPLIS SIN delay");
-    }
-    let off_until_delay = match parameters
-        .get("OFF_UNTIL_DELAY")
-        .context("missing SIMPLIS waveform parameter OFF_UNTIL_DELAY")?
-        .to_ascii_uppercase()
-        .as_str()
-    {
-        "YES" => true,
-        "NO" => false,
-        value => bail!("SIMPLIS waveform OFF_UNTIL_DELAY={value} is not supported"),
-    };
-
-    let stem = sanitized_name(name);
-    let mut output = String::new();
-    write!(output, "B__{stem} {node_p} {node_n} {kind}='")?;
-    if off_until_delay {
-        output.push_str("(time<");
-        write_number(&mut output, time_delay)?;
-        output.push_str(" ? ");
-        write_number(&mut output, offset)?;
-        output.push_str(" : ");
-    }
-    write_number(&mut output, offset)?;
-    output.push_str("+(");
-    write_number(&mut output, amplitude)?;
-    output.push_str(")*exp(-(");
-    write_number(&mut output, damping)?;
-    output.push_str(")*(time-(");
-    write_number(&mut output, time_delay)?;
-    output.push_str(")))*sin(");
-    write_number(&mut output, 2.0 * std::f64::consts::PI * frequency)?;
-    output.push_str("*(time-(");
-    write_number(&mut output, time_delay)?;
-    output.push_str(")))");
-    if off_until_delay {
-        output.push(')');
-    }
-    output.push_str("'\n");
-    Ok(Translation {
-        bytes: output.into_bytes(),
-        kind: TranslationKind::SineSource,
-    })
-}
-
-fn translate_raw_waveform(statement: &str) -> Result<Option<Translation>> {
-    let normalized = normalized_statement(statement);
-    let tokens = statement_tokens(&normalized)?;
-    let Some(header) = waveform_header(&tokens)? else {
-        return Ok(None);
-    };
-    if matches!(header.waveform.as_str(), "PWL" | "SIN")
-        && tokens.get(4).is_some_and(|token| !token.contains('='))
-    {
-        return Ok(None);
-    }
-    let parameters = parse_assignments(&tokens[4..])?;
-    let translation = match header.waveform.as_str() {
-        "PWL" => translate_time_pwl(header.name, header.node_p, header.node_n, &parameters)?,
-        "SAW" => translate_saw_waveform(
-            header.name,
-            header.kind,
-            header.node_p,
-            header.node_n,
-            &parameters,
-        )?,
-        "PUL" => translate_pulse_waveform(
-            header.name,
-            header.kind,
-            header.node_p,
-            header.node_n,
-            &parameters,
-        )?,
-        "SIN" => translate_sine_waveform(
-            header.name,
-            header.kind,
-            header.node_p,
-            header.node_n,
-            &parameters,
-        )?,
-        _ => unreachable!(),
-    };
-    Ok(Some(translation))
-}
-
 fn raw_inductor_values(items: &[Item]) -> Result<std::collections::BTreeMap<String, f64>> {
     let mut values = std::collections::BTreeMap::new();
     for item in items {
@@ -4838,7 +4457,7 @@ fn translate_deck_primitive(
         translate_device_voltage_controlled_source(statement, &models.voltage_branches),
         translate_current_controlled_source(statement, &models.current_branches),
         pwls::translate(statement, &models.pwls_prefix),
-        translate_raw_waveform(statement),
+        waveforms::translate(statement),
         translate_raw_transformer(statement),
         translate_raw_mutual_inductance(statement, &models.inductors),
         translate_raw_pwl_device(statement, &models.pwl),
@@ -5691,7 +5310,7 @@ R1 a 0 1k
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("B__VSAW a 0 V='"));
+        assert!(text.contains("VSAW a 0 DC "));
         assert!(!text.contains("IDLE_IN_POP"));
         Ok(())
     }
@@ -5746,9 +5365,8 @@ R1 a 0 1k
         let translated = translate_simplis_deck(source)?;
         assert_eq!(translated.primitives, vec![TranslationKind::SineSource]);
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("B__VAC a 0 V='(time<"));
-        assert!(text.contains("exp(-("));
-        assert!(text.contains(")*sin("));
+        assert!(text.contains("VAC a 0 DC "));
+        assert!(text.contains(" SIN("));
         assert!(!text.contains(" OFF_UNTIL_DELAY="));
         Ok(())
     }
@@ -5763,9 +5381,9 @@ R2 b 0 1k
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("B__VSAW a 0 V='"));
-        assert!(text.contains("floor("));
-        assert!(text.contains("B__VPUL b 0 V=pwl("));
+        assert!(text.contains("VSAW a 0 DC "));
+        assert!(text.contains(") r=0 td="));
+        assert!(text.contains("VPUL b 0 DC "));
         assert_eq!(translated.primitives.len(), 2);
         Ok(())
     }
@@ -5796,8 +5414,8 @@ R1 a 0 1k
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("B__V1 a 0 V='"));
-        assert!(text.contains("time<"));
+        assert!(text.contains("V1 a 0 DC "));
+        assert!(text.contains(" PWL("));
         assert_eq!(
             translated.primitives,
             vec![TranslationKind::PiecewiseLinearSource]

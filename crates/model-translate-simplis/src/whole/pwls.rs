@@ -51,7 +51,7 @@ impl SpiceExpressionContext for Unbound {
     }
 }
 
-fn constant(expression: &str) -> Result<Option<f64>> {
+pub(super) fn constant(expression: &str) -> Result<Option<f64>> {
     let compiled = SpiceExpression::parse(expression)?;
     let mut resolver = Unbound::default();
     match compiled.evaluate_with(&mut resolver) {
@@ -61,7 +61,7 @@ fn constant(expression: &str) -> Result<Option<f64>> {
     }
 }
 
-fn expression_text(text: &str) -> Result<String> {
+pub(super) fn expression_text(text: &str) -> Result<String> {
     let text = text.trim();
     let inner = text
         .strip_prefix('{')

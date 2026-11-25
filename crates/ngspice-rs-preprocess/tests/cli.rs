@@ -42,7 +42,7 @@ fn cli_and_library_have_identical_artifacts_and_manifest() -> Result<()> {
     );
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
-    assert_eq!(manifest["version"], 4);
+    assert_eq!(manifest["version"], 5);
     assert_eq!(manifest["required_code_models"], serde_json::json!([]));
     assert_eq!(manifest["input_format"], "native-deck");
     assert_eq!(manifest["primary"], "deck.cir");

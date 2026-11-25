@@ -4,12 +4,12 @@
 mod dialect;
 
 use anyhow::{Context, Result, ensure};
-pub use model_normalize_ngspice::passive_ic;
 use model_normalize_ngspice::{
     NormalizationPass,
     linked_source::{LinkLimits, RootKind, SourceLinker},
     normalize_mapped,
 };
+pub use model_normalize_ngspice::{passive_ic, waveform};
 pub use model_preprocess_command::{
     AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, SourceSession,
 };
@@ -209,6 +209,8 @@ pub struct PreparedBundle {
     /// Source-specific initialization policy; absent for native decks.
     /// Consumers must bind it per instance and enclosing analysis.
     pub initial_conditions: Option<passive_ic::InitialConditions>,
+    /// Named independent-source forcing; bind per elaborated occurrence.
+    pub waveforms: Vec<waveform::PreparedWaveform>,
 }
 
 impl PreparedBundle {
@@ -298,6 +300,7 @@ fn native(
         normalization: normalized.model.passes,
         device_identities: Vec::new(),
         initial_conditions: None,
+        waveforms: Vec::new(),
     })
 }
 
