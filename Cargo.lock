@@ -160,8 +160,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-compact-intrinsic"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "model-kernel-api"
 version = "0.1.0"
+
+[[package]]
+name = "model-kernel-bipolar"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "model-kernel-diode"

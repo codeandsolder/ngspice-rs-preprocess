@@ -4,7 +4,7 @@ Standalone SPICE normalization, dialect lowering, source linking,
 parameter compilation and reusable prepared model kernels.
 
 The workspace contains the ngspice normalizer, SIMPLIS source preprocessor and
-translator, and VDMOS prepared numerical kernel. Experimental ALB/XSPICE
+translator, and prepared diode, VDMOS, bipolar and intrinsic compact-model kernels. Experimental ALB/XSPICE
 compilation lives in the separate `model-alb-experimental` crate and is
 excluded from default workspace builds. The production translator does not
 link it and rejects unsupported source semantics explicitly.
