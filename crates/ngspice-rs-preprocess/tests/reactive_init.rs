@@ -160,7 +160,7 @@ XC p n CELL
         let defaults = policy
             .resolve_defaults(|expr| evaluate_expression(expr, analysis, |s| bail!("{s}")))?;
         for device in &policy.devices {
-            let resolved = device.resolve(analysis, defaults, |expr| {
+            let startup = device.resolve(analysis, defaults, |expr| {
                 evaluate_expression(expr, analysis, |s| bail!("{s}"))
             })?;
             assert_eq!(
