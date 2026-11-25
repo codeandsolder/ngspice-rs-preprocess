@@ -4,6 +4,7 @@ members = [
     "crates/model-normalize-ngspice",
     "crates/model-preprocess-simplis",
     "crates/model-translate-simplis",
+    "crates/model-touchstone",
 ]
 resolver = "3"
 
