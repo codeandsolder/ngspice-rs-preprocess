@@ -2,8 +2,9 @@ name: Source quality
 
 on:
   pull_request:
+  merge_group:
   push:
-    branches: [main]
+    branches: [main, refactor/architecture-campaign]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
