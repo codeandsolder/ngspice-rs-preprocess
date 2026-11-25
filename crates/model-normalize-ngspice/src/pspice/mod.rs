@@ -804,6 +804,7 @@ pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<PspiceNormalizat
     Ok(PspiceNormalization {
         mapped: MappedNormalization {
             model: crate::NormalizedModel { bytes, passes },
+            waveforms: shared.waveforms,
             input_lines,
         },
         renamed,
