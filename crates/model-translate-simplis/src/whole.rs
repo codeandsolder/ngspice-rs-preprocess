@@ -2955,28 +2955,50 @@ fn spice_number(value: f64) -> Result<String> {
     Ok(output)
 }
 
+fn voltage_switch_control(
+    tokens: &[String],
+    model_index: usize,
+    branches: &std::collections::BTreeMap<String, (String, String)>,
+) -> Result<(String, String)> {
+    let pair = switch_control_and_model(tokens)
+        .filter(|(_, _, index)| *index == model_index)
+        .map(|(positive, negative, _)| (positive, negative));
+    let (positive, negative) = match pair {
+        Some(pair) => pair,
+        None if model_index == 4 => branches
+            .get(&tokens[3].to_ascii_uppercase())
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "SIMPLIS switch references unknown voltage branch {}",
+                    tokens[3]
+                )
+            })?,
+        None => bail!("invalid voltage-controlled switch terminal syntax"),
+    };
+    validate_node(&positive)?;
+    validate_node(&negative)?;
+    Ok((positive, negative))
+}
+
 fn q_control_expression(
     model: &RawVcqModel,
     tokens: &[String],
-    current_branches: &std::collections::BTreeMap<String, String>,
+    model_index: usize,
+    scope: &ScopeAnalysis,
 ) -> Result<String> {
     match model.control {
         RawQControl::Voltage => {
-            let control_p = tokens
-                .get(3)
-                .context("SIMPLIS voltage-controlled transistor switch has no positive control")?;
-            let control_n = tokens
-                .get(4)
-                .context("SIMPLIS voltage-controlled transistor switch has no negative control")?;
-            validate_node(control_p)?;
-            validate_node(control_n)?;
-            Ok(format!("v({control_p},{control_n})"))
+            let (positive, negative) =
+                voltage_switch_control(tokens, model_index, &scope.voltage_branches)?;
+            Ok(format!("v({positive},{negative})"))
         }
         RawQControl::Current => {
             let control_name = tokens
                 .get(3)
                 .context("SIMPLIS current-controlled transistor switch has no control branch")?;
-            let branch = current_branches
+            let branch = scope
+                .current_branches
                 .get(&control_name.to_ascii_uppercase())
                 .with_context(|| {
                     format!(
@@ -3106,11 +3128,7 @@ fn switch_closed_hint(value: Option<&str>) -> Result<bool> {
     }
 }
 
-fn translate_raw_vcq_device(
-    statement: &str,
-    models: &std::collections::BTreeMap<String, RawVcqModel>,
-    current_branches: &std::collections::BTreeMap<String, String>,
-) -> Result<Option<Translation>> {
+fn translate_raw_vcq_device(statement: &str, scope: &ScopeAnalysis) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     if !tokens
         .first()
@@ -3119,21 +3137,17 @@ fn translate_raw_vcq_device(
     {
         return Ok(None);
     }
-    let candidate = [4usize, 5].into_iter().find_map(|model_index| {
+    let candidate = [5usize, 4].into_iter().find_map(|model_index| {
         tokens
             .get(model_index)
-            .and_then(|name| models.get(&name.to_ascii_uppercase()))
+            .and_then(|name| scope.vcq.get(&name.to_ascii_uppercase()))
             .map(|model| (model_index, model))
     });
     let Some((model_index, model)) = candidate else {
         return Ok(None);
     };
-    let expected_model_index = match model.control {
-        RawQControl::Current => 4,
-        RawQControl::Voltage => 5,
-    };
-    if model_index != expected_model_index {
-        bail!("SIMPLIS transistor-switch control syntax does not match its model type");
+    if matches!(model.control, RawQControl::Current) && model_index != 4 {
+        bail!("SIMPLIS current-controlled transistor switch requires one control branch");
     }
     if model.iflow != "BIDIR" {
         bail!("SIMPLIS transistor-switch lowering requires IFLOW=BIDIR");
@@ -3149,7 +3163,7 @@ fn translate_raw_vcq_device(
         );
     }
     let closed = switch_closed_hint(parameters.get("IC").map(String::as_str))?;
-    let control = q_control_expression(model, &tokens, current_branches)?;
+    let control = q_control_expression(model, &tokens, model_index, scope)?;
     emit_qswitch(model, &tokens, &control, closed).map(Some)
 }
 
@@ -3328,7 +3342,7 @@ fn emit_simplis_vcsw(
 
 fn translate_raw_vcsw_device(
     statement: &str,
-    models: &std::collections::BTreeMap<String, RawVcswModel>,
+    scope: &ScopeAnalysis,
 ) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     if !tokens
@@ -3338,12 +3352,24 @@ fn translate_raw_vcsw_device(
     {
         return Ok(None);
     }
-    let Some((control_p, control_n, model_index)) = switch_control_and_model(&tokens) else {
+    let direct = switch_control_and_model(&tokens).and_then(|(_, _, index)| {
+        scope
+            .vcsw
+            .get(&tokens[index].to_ascii_uppercase())
+            .map(|model| (index, model))
+    });
+    let named = || {
+        tokens
+            .get(4)
+            .and_then(|name| scope.vcsw.get(&name.to_ascii_uppercase()))
+            .filter(|model| matches!(model.transfer, VcswTransfer::ShortTransition { .. }))
+            .map(|model| (4, model))
+    };
+    let Some((model_index, model)) = direct.or_else(named) else {
         return Ok(None);
     };
-    let Some(model) = models.get(&tokens[model_index].to_ascii_uppercase()) else {
-        return Ok(None);
-    };
+    let (control_p, control_n) =
+        voltage_switch_control(&tokens, model_index, &scope.voltage_branches)?;
     for node in [&tokens[1], &tokens[2], &control_p, &control_n] {
         validate_node(node)?;
     }
@@ -5464,11 +5490,10 @@ fn translate_deck_primitive(
     if let Some(value) = translate_raw_numbered_logic_device(statement, &models.numbered_logic)? {
         return Ok(Some(value));
     }
-    if let Some(value) = translate_raw_vcq_device(statement, &models.vcq, &models.current_branches)?
-    {
+    if let Some(value) = translate_raw_vcq_device(statement, models)? {
         return Ok(Some(value));
     }
-    if let Some(value) = translate_raw_vcsw_device(statement, &models.vcsw)? {
+    if let Some(value) = translate_raw_vcsw_device(statement, models)? {
         return Ok(Some(value));
     }
     Ok(None)
@@ -8047,6 +8072,35 @@ R1 a 0 1k
         assert!(text.contains("rx_ic=[ 0 ]"));
         assert!(!text.contains(" VCSW "));
         Ok(())
+    }
+
+    #[test]
+    fn switch_voltage_control_resolves_named_branch_and_node_pairs() -> Result<()> {
+        let source = br"Vctrl c r 5
+S1 p n Vctrl MS IC=OPEN
+S2 p n (c,r) MS IC=CLOSE
+Q1 p n Vctrl MQ IC=OPEN
+Q2 p n (c,r) MQ IC=CLOSE
+.MODEL MS VCSW RON=1 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC=POS
+.MODEL MQ VCQPOS VSAT=.1 RSAT=1 ROFF=1Meg GAIN=1 TH=2.5 HYSTWD=1 LOGIC=POS LEVEL=2
+.end
+";
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        for stem in ["S1", "S2", "Q1", "Q2"] {
+            assert!(text.contains(&format!("B__{stem}_CTRL __{stem}_CTRL 0 V='v(c,r)'")));
+        }
+        assert_eq!(translated.primitives.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn switch_unknown_named_voltage_branch_fails() {
+        let source = br"S1 p n missing MS IC=OPEN
+.MODEL MS VCSW RON=1 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC=POS
+.end
+";
+        assert!(translate_simplis_deck(source).is_err());
     }
 
     #[test]

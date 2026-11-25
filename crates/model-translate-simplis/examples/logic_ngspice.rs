@@ -603,6 +603,10 @@ fn timed_switch_vendor_waveforms(runtime: &Path) -> Result<()> {
         check_timed_switch(runtime, baseline, tolerance, &baseline_samples)?;
     }
 
+    timed_switch_pulse_boundaries(runtime)
+}
+
+fn timed_switch_pulse_boundaries(runtime: &Path) -> Result<()> {
     // Pulse width exactly equal to propagation delay has no excursion.
     // Width equal to delay + slew duration reverses at the endpoint;
     // a longer pulse reaches a stable rail and incurs the turn-off delay.
@@ -771,6 +775,40 @@ S1 b 0 a 0 M IC=0
     Ok(())
 }
 
+fn switch_named_voltage_branch(runtime: &Path) -> Result<()> {
+    let source = "Vref rtn 0 0.75
+Vctrl c rtn PWL(0 0 1u 0 1.01u 5 4u 5 4.01u 0 9u 0)
+Rctrl c rtn 1k
+Vbias p rtn 1
+S1 a rtn Rctrl MS IC=CLOSE
+S2 b rtn (c,rtn) MS IC=OPEN
+Q1 q rtn Vctrl MQ IC=CLOSE
+Q2 r rtn c rtn MQ IC=OPEN
+Ra p a 100
+Rb p b 100
+Rq p q 100
+Rr p r 100
+.MODEL MS VCSW RON=10 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC=POS
+.MODEL MQ VCQPOS VSAT=0.1 RSAT=10 ROFF=1Meg GAIN=1 TH=2.5 HYSTWD=1 LOGIC=POS LEVEL=1
+.end
+";
+    let off = 1e6 / (1e6 + 100.0);
+    let on = 10.0 / 110.0;
+    let q_on = 20.0 / 110.0;
+    let checks = ["a", "b", "q", "r"]
+        .into_iter()
+        .flat_map(|node| {
+            [
+                (0.0, off),
+                (2.0, if matches!(node, "a" | "b") { on } else { q_on }),
+                (8.0, off),
+            ]
+            .map(|(time, voltage)| (node.to_owned(), time, voltage))
+        })
+        .collect::<Vec<_>>();
+    verify(runtime, source, &checks)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -788,6 +826,7 @@ fn main() -> Result<()> {
     vendor_timing(&runtime)?;
     threshold_plateau_and_latch_cancellation(&runtime)?;
     switch_startup_and_load_lines(&runtime)?;
+    switch_named_voltage_branch(&runtime)?;
     timed_switch_vendor_waveforms(&runtime)?;
     timed_switch_runtime_parameters(&runtime)?;
     timed_switch_small_signal_and_stiff_load(&runtime)?;
