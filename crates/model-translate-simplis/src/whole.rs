@@ -1,4 +1,5 @@
 mod logical_ports;
+mod pwls;
 mod simetrix_runtime;
 use super::{
     CodeModelRuntime, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateMode,
@@ -330,7 +331,7 @@ fn residual_source_waveform(trimmed: &str) -> bool {
     {
         return false;
     }
-    source && matches!(kind.as_str(), "PUL" | "SAW" | "PWL" | "SIN")
+    source && matches!(kind.as_str(), "PUL" | "SAW" | "PWL" | "SIN" | "PWLS")
 }
 
 fn generated_simplis_identifier(token: &str) -> bool {
@@ -5041,6 +5042,7 @@ pub fn compile_explicit_alb_source_models(source: &str) -> Result<Vec<CompiledSo
 }
 
 struct ScopeAnalysis {
+    pwls_prefix: String,
     init: std::collections::BTreeMap<String, String>,
     pwl: std::collections::BTreeMap<String, RawPwlModel>,
     charge: std::collections::BTreeMap<String, RawChargeModel>,
@@ -5078,6 +5080,7 @@ fn insert_unique_model<T>(
 impl ScopeAnalysis {
     fn analyze(items: &[Item], header: Option<&str>) -> Result<Self> {
         let mut models = Self {
+            pwls_prefix: pwls::scope_prefix(items, header),
             init: init_overrides(items)?,
             pwl: std::collections::BTreeMap::new(),
             charge: std::collections::BTreeMap::new(),
@@ -5431,6 +5434,9 @@ fn translate_deck_primitive(
         return Ok(Some(value));
     }
     if let Some(value) = translate_current_controlled_source(statement, &models.current_branches)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = pwls::translate(statement, &models.pwls_prefix)? {
         return Ok(Some(value));
     }
     if let Some(value) = translate_raw_waveform(statement)? {
