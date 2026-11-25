@@ -37,7 +37,7 @@ with **zero warnings**, then the redundant control was deleted.
 
 The controls subdirectory contains separate, original-source causal
 variants. These are also real vendor-run inputs, each with its own .out
-and numeric .csv archived on the approved Windows shared drive.
+and numeric .csv retained as external research evidence.
 
 - edge-minclock-only.net removes HOLD but retains MINCLOCK=600 ps;
   Q transitions at 16.136674 and 35.896376 ns.
@@ -51,7 +51,7 @@ and numeric .csv archived on the approved Windows shared drive.
 The measured, machine-readable source of the full **25 Q crossings**
 is vendor-q-2p5v-events.csv. Its event rows are exactly the real vendor
 derived values; only Windows CRLF line endings were normalized to LF
-for source control. Original Windows oracle CSV SHA256:
+for source control. Original measured oracle CSV SHA256:
 F41EF8C4C5E07A3FBE93A79841FA2BA73FBAFA4D8ACBD65C62514A36AB4494FC.
 Normalized repository CSV SHA256:
 CF5CE515AE3041FAA2DF4F14D5FE4D873F04D7DD33720DE4B33A93B0CD321027.

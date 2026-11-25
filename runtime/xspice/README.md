@@ -1081,8 +1081,8 @@ conversion remains disabled pending broader language equivalence.
 
 The original source-only ALB physical sharing fixture now also has an
 **independent vendor-UNIV test configuration**,
-`fixtures/family/dynamic-vendor-univ.json` and
-`fixtures/family/vendor-univ-models.json`. SIMetrix Elements 9.40d
+`fixtures/family/dynamic-vendor-univ.json` plus an explicitly supplied
+external model configuration. SIMetrix Elements 9.40d
 automatically selects `UNIV_adc` and `UNIV_dac` at analog boundaries even
 when the original logical ALB declarations say `family="HC"`; the separate
 physical bridge annotations therefore select `UNIV`, nominal and actual
@@ -1093,7 +1093,7 @@ The tested vendor ADC thresholds are 2.1/2.2 V, with **retained prior LOW/HIGH
 state within that band**. The vendor DAC uses 5 V rails, 24/34 mS high/low
 conductances, 2.75/2.0 V knees, 0.5 V smoothing, 2 ns edges, and a **signed
 -31 pF digital input load** for rise/fall compensation. Those are represented
-explicitly in the test configuration; parameters not directly reported by
+explicitly in the external test configuration; parameters not directly reported by
 the vendor remain experimental assumptions. No production ALB conversion is
 enabled.
 
@@ -1105,11 +1105,13 @@ combinational truth table at DC if `IC=UNKNOWN` and its input levels are
 known, instead of producing a fictitious UNKNOWN analog equilibrium at t=0.
 Explicit known IC values continue to override DC combinational evaluation.
 
-The new source-only regression is:
+The optional differential regression requires the independently obtained
+external model JSON (not distributed with this repository):
 
 ```sh
 runtime/xspice/smoke-family-vendor-univ.sh \
-  /path/to/ngspice_preprocess_alb.cm /path/to/debug-bin /path/to/scratch
+  /path/to/ngspice_preprocess_alb.cm /path/to/debug-bin /path/to/scratch \
+  /path/to/external-models.json
 ```
 
 It simulates original ALB hierarchy with two independent DACs and a monitor
@@ -1123,8 +1125,8 @@ but (correctly) expects the source ALB to interpret that X as LOW; bare
 generic LUT consensus tests remain unchanged.
 
 The proprietary vendor `.PRINT TRAN` traces and original `.out` listings
-reside on the authorized Windows VMware shared volume, outside this source
-repository. The first 20 ohm loaded-from-startup comparison gave native
+are external research evidence and are not distributed. The first 20 ohm
+loaded-from-startup comparison gave native
 `V(pin)` **5.86 mV RMS difference across 7,251 samples** and exact sampled
 `V(observe)` equality.
 
@@ -1149,7 +1151,5 @@ measured vendor 2.5 V edge times, and `verify-vendor-univ-edges.awk` checks
 all four rising/falling PIN and monitor crossings for 20/52 ohm loads
 within 100 ps. This tests real dynamic readback timing in addition to
 previous steady-state/hysteresis cases, without shipping vendor libraries
-or using undocumented simulation constants. The separate Notion page
-“ALB transient parity — SIMetrix timestep and switch model defaults”
-records the experimental sources, vendor results and scope limits. Complete
+or using undocumented simulation constants. Complete
 proprietary ALB language parity is not yet claimed.
