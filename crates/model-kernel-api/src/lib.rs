@@ -371,7 +371,7 @@ impl<K: Kernel> Artifact<K> {
         Ok(Arc::new(Self { descriptor, kernel }))
     }
 
-    #[must_use]
+    #[must_use = "the descriptor defines the artifact binding contract"]
     pub const fn descriptor(&self) -> &Descriptor {
         &self.descriptor
     }
