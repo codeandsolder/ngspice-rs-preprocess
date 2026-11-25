@@ -1,4 +1,4 @@
-//! Discrete, absolute-geometry SIMetrix MOS level 17 preparation.
+//! Discrete, absolute-geometry `SIMetrix` MOS level 17 preparation.
 //! Channel and junction terms use the native level-1 MOS equations, with
 //! explicit effective geometry; the nonlinear gate-drain term is a
 //! two-terminal charge primitive. The two arctangent terms have opposite
@@ -56,6 +56,7 @@ pub(super) struct RawLevel17Mos {
     vds_limit: Option<String>,
     native_name: String,
     resistance_name: String,
+    lexical: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -185,7 +186,7 @@ fn candidate_level(statement: &str) -> Option<f64> {
         .and_then(|value| parse_spice_constant(&value).ok())
 }
 
-pub(super) fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>> {
+fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>> {
     let Some((name, family)) = model_header(statement) else {
         return Ok(None);
     };
@@ -199,7 +200,7 @@ pub(super) fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLe
         .iter()
         .any(|parameter| simple_assignment_value(&normalized, parameter).is_some());
     let candidate = candidate_level(&normalized);
-    if !matches!(candidate, Some(17.)) && !(matches!(candidate, Some(7.)) && legacy) {
+    if !(matches!(candidate, Some(17.)) || matches!(candidate, Some(7.)) && legacy) {
         return Ok(None);
     }
     let (text, vds_limit) = strip_level17_vds_limit(&normalized)?;
@@ -233,8 +234,7 @@ pub(super) fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLe
         "unsupported level 17 parameters: {:?}",
         fields.keys().collect::<Vec<_>>()
     );
-    let native_name = format!("__L17_{}", super::current_controlled_source_stem(&name));
-    let resistance_name = format!("{native_name}_RD");
+
     Ok(Some((
         name,
         RawLevel17Mos {
@@ -247,8 +247,9 @@ pub(super) fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLe
             tc2rd,
             cgd,
             vds_limit,
-            native_name,
-            resistance_name,
+            native_name: String::new(),
+            resistance_name: String::new(),
+            lexical: false,
         },
     )))
 }
@@ -416,7 +417,7 @@ fn instance_tail(mut text: &str) -> &str {
 
 pub(super) fn translate_level17_mos(
     statement: &str,
-    models: &BTreeMap<String, RawLevel17Mos>,
+    scope: &Scope<'_>,
 ) -> Result<Option<Translation>> {
     let normalized = normalized_statement(statement);
     let tokens = statement_tokens(&normalized)?;
@@ -426,29 +427,33 @@ pub(super) fn translate_level17_mos(
     if !name.starts_with(['M', 'm']) || tokens.len() < 6 {
         return Ok(None);
     }
-    let Some(model) = models.get(&tokens[5].to_ascii_uppercase()) else {
+    let Some(model) = scope.lookup(&tokens[5].to_ascii_uppercase()) else {
         return Ok(None);
     };
     let instance = Instance::parse(instance_tail(&normalized))?;
     for node in &tokens[1..5] {
         validate_node(node)?;
     }
-    let stem = super::current_controlled_source_stem(name);
+    let stem = format!(
+        "{}I_{}",
+        scope.prefix,
+        super::current_controlled_source_stem(&name.to_ascii_uppercase())
+    );
     let drain = if model.rd == 0. {
         tokens[1].clone()
     } else {
-        format!("__{stem}_DINT")
+        format!("{stem}_DINT")
     };
     let gate = if model.rg == 0. {
         tokens[2].clone()
     } else {
-        format!("__{stem}_GINT")
+        format!("{stem}_GINT")
     };
     let mut output = String::new();
     if model.rd != 0. {
         write!(
             output,
-            "R__{stem}_RD {} {drain} {} ",
+            "R{stem}_RD {} {drain} {} ",
             tokens[1], model.resistance_name
         )?;
         write_number(&mut output, model.rd)?;
@@ -456,7 +461,7 @@ pub(super) fn translate_level17_mos(
         output.push('\n');
     }
     if model.rg != 0. {
-        write!(output, "R__{stem}_RG {} {gate} ", tokens[2])?;
+        write!(output, "R{stem}_RG {} {gate} ", tokens[2])?;
         write_number(&mut output, model.rg)?;
         instance.emit_shared(&mut output)?;
         output.push('\n');
@@ -473,7 +478,7 @@ pub(super) fn translate_level17_mos(
     output.push('\n');
     if model.cgd.min != 0. || model.cgd.max != 0. {
         let voltage = format!("v({gate},{drain})");
-        write!(output, "C__{stem}_CGD {gate} {drain} Q='(")?;
+        write!(output, "C{stem}_CGD {gate} {drain} Q='(")?;
         let cgd = model.cgd;
         let sign = model.polarity.sign();
         charge_term(
@@ -503,4 +508,129 @@ pub(super) fn translate_level17_mos(
         bytes: output.into_bytes(),
         kind: TranslationKind::SimetrixMosfetLevel17,
     }))
+}
+
+/// Electrical model lookup in the source lexical scope. Non-level-17
+/// declarations are explicit shadow barriers. The generated namespace
+/// is selected once across the complete linked input.
+pub(super) struct Scope<'a> {
+    prefix: &'a str,
+    path: String,
+    parent: Option<&'a Scope<'a>>,
+    declarations: BTreeMap<String, Option<RawLevel17Mos>>,
+}
+
+impl<'a> Scope<'a> {
+    pub(super) fn global(prefix: &'a str, scopes: &[Vec<super::Item>]) -> Result<Self> {
+        let mut result = Self {
+            prefix,
+            path: String::new(),
+            parent: None,
+            declarations: BTreeMap::new(),
+        };
+        let mut texts = BTreeMap::new();
+        for items in scopes {
+            for statement in super::electrical_statements(items) {
+                let Some((name, _)) = model_header(statement) else {
+                    continue;
+                };
+                let model = result.bind(&name, statement)?;
+                if let Some(previous) = result.declarations.get(&name) {
+                    // Identical library declarations can occur in multiple
+                    // admitted resources. Never silently bind a conflicting
+                    // discrete model to the other source's native card.
+                    if previous.is_some() || model.is_some() {
+                        ensure!(
+                            texts.get(&name) == Some(&normalized_statement(statement)),
+                            "conflicting global model declaration for {name}"
+                        );
+                    }
+                } else {
+                    texts.insert(name.clone(), normalized_statement(statement));
+                    result.declarations.insert(name, model);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub(super) fn child<'b>(&'b self, block: &super::Subcircuit) -> Result<Scope<'b>> {
+        let path = format!(
+            "{}__{}",
+            self.path,
+            super::current_controlled_source_stem(&block.name.to_ascii_uppercase())
+        );
+        let mut result = Scope {
+            prefix: self.prefix,
+            path,
+            parent: Some(self),
+            declarations: BTreeMap::new(),
+        };
+        for statement in super::electrical_statements(&block.body) {
+            let Some((name, _)) = model_header(statement) else {
+                continue;
+            };
+            let model = result.bind(&name, statement)?;
+            let selected = model.is_some();
+            if let Some(previous) = result.declarations.insert(name.clone(), model) {
+                ensure!(
+                    previous.is_none() && !selected,
+                    "duplicate local model declaration for {name}"
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    fn bind(&self, name: &str, statement: &str) -> Result<Option<RawLevel17Mos>> {
+        let Some((_, mut model)) = raw_level17_model(statement)? else {
+            return Ok(None);
+        };
+        let stem = super::current_controlled_source_stem(name);
+        model.lexical = self.parent.is_some();
+        model.native_name = if model.lexical {
+            format!("{}L{}__{stem}", self.prefix, self.path)
+        } else {
+            format!("{}M_{stem}", self.prefix)
+        };
+        model.resistance_name = format!("{}_RD", model.native_name);
+        Ok(Some(model))
+    }
+
+    fn lookup(&self, name: &str) -> Option<&RawLevel17Mos> {
+        match self.declarations.get(name) {
+            Some(model) => model.as_ref(),
+            None => self.parent.and_then(|parent| parent.lookup(name)),
+        }
+    }
+
+    pub(super) fn declared(&self, name: &str) -> Option<&RawLevel17Mos> {
+        self.declarations.get(name).and_then(Option::as_ref)
+    }
+
+    /// Nested source subcircuits are emitted as flat definitions. Copy
+    /// only inherited lexical model definitions actually used here;
+    /// global models remain shared through the normal include graph.
+    pub(super) fn emit_inherited(&self, items: &[super::Item], output: &mut String) -> Result<()> {
+        let mut emitted = std::collections::BTreeSet::new();
+        for statement in super::electrical_statements(items) {
+            let tokens = statement_tokens(&normalized_statement(statement))?;
+            if !tokens
+                .first()
+                .is_some_and(|name| name.starts_with(['M', 'm']))
+            {
+                continue;
+            }
+            let Some(name) = tokens.get(5).map(|name| name.to_ascii_uppercase()) else {
+                continue;
+            };
+            if self.declarations.contains_key(&name) || !emitted.insert(name.clone()) {
+                continue;
+            }
+            if let Some(model) = self.lookup(&name).filter(|model| model.lexical) {
+                output.push_str(&emit_level17_core_model(&name, model)?);
+            }
+        }
+        Ok(())
+    }
 }

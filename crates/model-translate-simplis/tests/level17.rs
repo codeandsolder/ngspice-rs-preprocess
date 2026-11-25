@@ -1,13 +1,25 @@
-//! Independent authored source witnesses measured with SIMetrix Elements
+//! Independent authored source witnesses measured with `SIMetrix` Elements
 //! 9.40d and replayed through the prepared native circuit.
 use anyhow::{Context, Result, ensure};
-use model_translate_simplis::translate_simplis_deck;
+use model_translate_simplis::{translate_simplis_deck, translate_simplis_linked_netlist};
 use std::{fmt::Write as _, fs, process::Command};
 
 fn run(source: &str, analysis: &str, vectors: &str) -> Result<Vec<Vec<f64>>> {
     let translated = translate_simplis_deck(source.as_bytes())?;
+    run_native(&translated.bytes, &[], analysis, vectors)
+}
+
+fn run_native(
+    native: &[u8],
+    companions: &[(&str, &[u8])],
+    analysis: &str,
+    vectors: &str,
+) -> Result<Vec<Vec<f64>>> {
     let dir = tempfile::tempdir()?;
-    let native = String::from_utf8(translated.bytes)?;
+    for &(name, bytes) in companions {
+        fs::write(dir.path().join(name), bytes)?;
+    }
+    let native = std::str::from_utf8(native)?;
     let body = native
         .trim_end()
         .strip_suffix(".end")
@@ -216,4 +228,150 @@ fn level17_absolute_junction_capacitance_matches_independent_ramp() -> Result<()
         5e-4,
         2e-9,
     )
+}
+
+#[test]
+fn level17_ac_jacobian_and_terminal_charge_conservation() -> Result<()> {
+    let mut deck = String::from("* Level 17 AC witness\n");
+    let nonlinear = "CGDMIN=2n CGDMAX=3n XG1CGD=.3 XG2CGD=.8 VTCGD=1";
+    let overlap = "CGSO=2n CGBO=3n";
+    let gate_resistance = "CGSO=2n CGBO=3n RG=100";
+    let cases = [
+        ("NMOS", -5., nonlinear, ""),
+        ("NMOS", 0., nonlinear, ""),
+        ("NMOS", 5., nonlinear, ""),
+        ("PMOS", 5., nonlinear, "M=3"),
+        ("NMOS", 0., overlap, ""),
+        ("NMOS", 0., gate_resistance, ""),
+        ("NMOS", 0., gate_resistance, "M=3"),
+    ];
+    let mut analysis = String::from("ac dec 1 1k 1meg\n");
+    let mut vectors = Vec::new();
+    for (i, (family, bias, params, instance)) in cases.into_iter().enumerate() {
+        writeln!(
+            deck,
+            "Vg{i} g{i} 0 DC {bias} AC 1\nVd{i} d{i} 0 0\nVs{i} s{i} 0 0\nVb{i} b{i} 0 0\nM{i} d{i} g{i} s{i} b{i} Q{i} {instance}\n.model Q{i} {family} (LEVEL=17 {params})"
+        )?;
+        for terminal in ['g', 'd', 's', 'b'] {
+            for (suffix, function) in [('r', "real"), ('i', "imag")] {
+                let vector = format!("{terminal}{i}{suffix}");
+                writeln!(analysis, "let {vector}={function}(i(V{terminal}{i}))")?;
+                vectors.push(vector);
+            }
+        }
+    }
+    deck.push_str(".end\n");
+    let actual = run(&deck, &analysis, &vectors.join(" "))?;
+    let mut gate = Vec::new();
+    for row in &actual {
+        ensure!(
+            row.len() == 57,
+            "unexpected native AC terminal vector width {}",
+            row.len()
+        );
+        let mut gate_row = vec![row[0]];
+        for (case, ports) in row[1..].chunks_exact(8).enumerate() {
+            gate_row.extend_from_slice(&ports[..2]);
+            let scale = ports.iter().fold(0.0f64, |a, b| a.max(b.abs()));
+            for component in 0..2 {
+                let g = ports[component];
+                let d = ports[2 + component];
+                let s = ports[4 + component];
+                let b = ports[6 + component];
+                let tol = 1e-9f64.mul_add(scale, 1e-11);
+                ensure!(
+                    (g + d + s + b).abs() <= tol,
+                    "charge conservation failure case {case} frequency {}",
+                    row[0]
+                );
+                if case < 4 {
+                    ensure!(
+                        (g + d).abs() <= tol && s.abs() <= tol && b.abs() <= tol,
+                        "nonlinear charge terminal incidence"
+                    );
+                } else {
+                    ensure!(
+                        0.4f64.mul_add(g, s).abs() <= tol
+                            && 0.6f64.mul_add(g, b).abs() <= tol
+                            && d.abs() <= tol,
+                        "overlap charge terminal incidence"
+                    );
+                }
+            }
+        }
+        gate.push(gate_row);
+    }
+    compare(
+        &gate,
+        &rows(include_str!("fixtures/level17-ac.tsv"))?,
+        1e-5,
+        1e-10,
+    )
+}
+
+#[test]
+fn level17_nested_scope_shadowing_and_generated_names_are_electrical() -> Result<()> {
+    let deck = "* Local and inherited model declarations\nVg g 0 3\nVglobal d0 0 1\nVchild d1 0 1\nVnative d2 0 1\nVlocal d3 0 1\n.model Shared NMOS (LEVEL = 17 VTO=1 KP=.1 RD=.1)\nM1 d0 g 0 0 Shared\nX1 d1 g 0 child\nX2 d2 g 0 native\nX3 d3 g 0 parent\nR__l17_I_M1_RD __l17_I_M1_DINT 0 1\n.subckt child d g s\nMlocal d g s s Shared\n.ends child\n.subckt native d g s\n.model Shared NMOS (LEVEL=1 VTO=2 KP=.1)\nMlocal d g s s Shared L=1 W=1\n.ends native\n.subckt parent d g s\n.model Shared NMOS (LEVEL=17 VTO=0 KP=.1 RD=.1)\n.subckt grandchild d g s\nMlocal d g s s Shared\n.ends grandchild\nXnested d g s grandchild\n.ends parent\n.end\n";
+    let translated = translate_simplis_deck(deck.as_bytes())?;
+    let text = std::str::from_utf8(&translated.bytes)?;
+    ensure!(
+        text.contains("R__l17__I_M1_RD") && text.contains("R__l17_I_M1_RD"),
+        "generated prefix collides with source"
+    );
+    let rows = run_native(
+        &translated.bytes,
+        &[],
+        "op",
+        "i(Vglobal) i(Vchild) i(Vnative) i(Vlocal)",
+    )?;
+    // The simple native level-1 shadow has Vov=1, Vds=1, so Id=0.05.
+    // Global and inherited discrete instances are equal. The nested
+    // lexical model has lower threshold and therefore larger current.
+    let row = rows.last().context("missing operating point")?;
+    ensure!(row.len() == 5, "unexpected OP vector count");
+    ensure!(
+        (row[1] - row[2]).abs() < 1e-9
+            && (row[3] + 0.05).abs() < 1e-8
+            && row[4] < row[1]
+            && row[1] < row[3],
+        "lexical model binding: {row:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn level17_global_models_bind_across_linked_artifacts() -> Result<()> {
+    use model_preprocess_simplis::{
+        LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
+    };
+    let linked = LinkedPreprocessedNetlist {
+        root_bytes: b"* Linked global source model\nVg g 0 3\nVroot d 0 1\nVchild d2 0 1\n.model RootMos NMOS (LEVEL=17 VTO=2 KP=.1)\nM1 d g 0 0 LibraryMos\nX1 d2 g 0 cell\n.include \"models.lib\"\n.end\n".to_vec(),
+        libraries: vec![LinkedGeneratedLibrary {
+            source_id: "synthetic-models".into(), source_name: "models.lb".into(), filename: "models.lib".into(), dependencies: vec![],
+            bytes: b".model LibraryMos NMOS (LEVEL=17 VTO=1 KP=.1)\n.subckt cell d g s\nM1 d g s s RootMos\n.ends cell\n".to_vec(),
+        }],
+        stats: NetlistPreprocessStats { root_specializations: 0, generated_subcircuits: 1, local_parameterized_definitions_removed: 0 },
+    };
+    let (root, libraries) = translate_simplis_linked_netlist(&linked)?;
+    let lib = libraries.first().context("missing translated library")?;
+    let actual = run_native(
+        &root.bytes,
+        &[("models.lib", &lib.bytes)],
+        "op",
+        "i(Vroot) i(Vchild)",
+    )?;
+    let row = actual.last().context("missing linked OP")?;
+    ensure!(
+        row.len() == 3 && (row[1] + 0.15).abs() < 1e-8 && (row[2] + 0.05).abs() < 1e-8,
+        "global linked model binding: {row:?}"
+    );
+    let mut ambiguous = linked;
+    ambiguous.libraries[0]
+        .bytes
+        .extend_from_slice(b".model RootMos NMOS (LEVEL=1 VTO=0 KP=.1)\n");
+    ensure!(
+        translate_simplis_linked_netlist(&ambiguous).is_err(),
+        "conflicting global model accepted"
+    );
+    Ok(())
 }

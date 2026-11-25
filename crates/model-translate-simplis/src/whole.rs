@@ -1,6 +1,6 @@
 mod level17;
 mod passive_ic;
-use level17::{RawLevel17Mos, emit_level17_core_model, raw_level17_model, translate_level17_mos};
+use level17::{emit_level17_core_model, translate_level17_mos};
 mod pwls;
 mod waveforms;
 pub use passive_ic::{capture_artifact_initial_conditions, capture_passive_initial_conditions};
@@ -2597,7 +2597,7 @@ fn voltage_switch_control(
 fn switch_current_control(
     tokens: &[String],
     model_index: usize,
-    scope: &ScopeAnalysis,
+    scope: &ScopeAnalysis<'_>,
 ) -> Result<String> {
     if model_index != 4 {
         bail!("SIMPLIS current-controlled switch requires one control branch");
@@ -2618,7 +2618,7 @@ fn q_control_expression(
     model: &RawVcqModel,
     tokens: &[String],
     model_index: usize,
-    scope: &ScopeAnalysis,
+    scope: &ScopeAnalysis<'_>,
 ) -> Result<String> {
     match model.control {
         SwitchControl::Voltage => {
@@ -2751,7 +2751,10 @@ fn switch_closed_hint(value: Option<&str>) -> Result<bool> {
     }
 }
 
-fn translate_raw_vcq_device(statement: &str, scope: &ScopeAnalysis) -> Result<Option<Translation>> {
+fn translate_raw_vcq_device(
+    statement: &str,
+    scope: &ScopeAnalysis<'_>,
+) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     if !tokens
         .first()
@@ -2969,7 +2972,7 @@ fn emit_simplis_switch(
 
 fn translate_raw_vcsw_device(
     statement: &str,
-    scope: &ScopeAnalysis,
+    scope: &ScopeAnalysis<'_>,
 ) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     if !tokens
@@ -3902,7 +3905,7 @@ fn allocate_branch_identifier(
     Ok(candidate)
 }
 
-struct ScopeAnalysis {
+struct ScopeAnalysis<'a> {
     pwls_prefix: String,
     init: std::collections::BTreeMap<String, String>,
     pwl: std::collections::BTreeMap<String, RawPwlModel>,
@@ -3919,7 +3922,7 @@ struct ScopeAnalysis {
     digital: std::collections::BTreeMap<String, RawDigitalModel>,
     numbered_logic: std::collections::BTreeMap<String, RawNumberedLogicModel>,
     vcsw: std::collections::BTreeMap<String, RawVcswModel>,
-    level17: std::collections::BTreeMap<String, RawLevel17Mos>,
+    level17: &'a level17::Scope<'a>,
     pspice_mos_series_resistances: std::collections::BTreeMap<String, PspiceMosSeriesResistance>,
     simetrix_diode_temperatures: std::collections::BTreeMap<String, f64>,
     simetrix_resistor_temperatures: std::collections::BTreeMap<String, f64>,
@@ -3938,10 +3941,14 @@ fn insert_unique_model<T>(
     Ok(())
 }
 
-impl ScopeAnalysis {
-    fn analyze(items: &[Item], header: Option<&str>) -> Result<Self> {
+impl<'a> ScopeAnalysis<'a> {
+    fn analyze(
+        items: &[Item],
+        header: Option<&str>,
+        level17: &'a level17::Scope<'a>,
+    ) -> Result<Self> {
         let mut models = Self {
-            pwls_prefix: pwls::scope_prefix(items, header),
+            pwls_prefix: pwls::scope_prefix([items], header, "sr_pwls_"),
             init: init_overrides(items)?,
             pwl: std::collections::BTreeMap::new(),
             reactive: std::collections::BTreeMap::new(),
@@ -3957,7 +3964,7 @@ impl ScopeAnalysis {
             digital: std::collections::BTreeMap::new(),
             numbered_logic: std::collections::BTreeMap::new(),
             vcsw: std::collections::BTreeMap::new(),
-            level17: std::collections::BTreeMap::new(),
+            level17,
             pspice_mos_series_resistances: std::collections::BTreeMap::new(),
             simetrix_diode_temperatures: std::collections::BTreeMap::new(),
             simetrix_resistor_temperatures: std::collections::BTreeMap::new(),
@@ -4156,11 +4163,6 @@ impl ScopeAnalysis {
                     &mut self.digital,
                     raw_digital_model(statement)?,
                     "SIMPLIS DIGITAL1 model",
-                )?,
-                "NMOS" | "PMOS" => insert_unique_model(
-                    &mut self.level17,
-                    raw_level17_model(statement)?,
-                    "SIMetrix LEVEL=17 MOS model",
                 )?,
                 numbered if numbered_logic_kind(numbered).is_some() => insert_unique_model(
                     &mut self.numbered_logic,
@@ -4395,7 +4397,7 @@ fn translate_inline_schematic_x(statement: &str) -> Result<Option<Translation>> 
 
 fn translate_deck_primitive(
     statement: &str,
-    models: &ScopeAnalysis,
+    models: &ScopeAnalysis<'_>,
 ) -> Result<Option<Translation>> {
     // Evaluate in source-dispatch precedence order. Neither a successful
     // translation nor an error may fall through to a later translator.
@@ -4410,7 +4412,7 @@ fn translate_deck_primitive(
         }};
     }
     first_translation!(
-        translate_level17_mos(statement, &models.level17),
+        translate_level17_mos(statement, models.level17),
         translate_adc_schmitt_device(statement, &models.adc_schmitt),
         translate_pspice_mos_series_resistance(statement, &models.pspice_mos_series_resistances),
         translate_inline_schematic_x(statement),
@@ -4762,7 +4764,7 @@ fn sanitize_native_passive(statement: &str) -> Result<String> {
 
 fn emit_deck_statement(
     statement: &str,
-    models: &ScopeAnalysis,
+    models: &ScopeAnalysis<'_>,
     output: &mut String,
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
@@ -4795,11 +4797,9 @@ fn emit_deck_statement(
     let effective = statement_with_init_override(statement, &models.init)?;
     let instrumented = models.instrument_current_branch(&effective, output)?;
     let statement = instrumented.as_str();
-    if let Some((name, _)) = raw_level17_model(statement)? {
-        let model = models
-            .level17
-            .get(&name)
-            .context("unbound level 17 model")?;
+    if let Some((name, _)) = model_header(statement)
+        && let Some(model) = models.level17.declared(&name)
+    {
         output.push_str(&emit_level17_core_model(&name, model)?);
         return Ok(());
     }
@@ -4923,6 +4923,7 @@ fn dead_numeric_subcircuit_calls(block: &Subcircuit) -> Result<std::collections:
 
 fn emit_deck_subcircuit_children(
     block: &Subcircuit,
+    parent: &level17::Scope<'_>,
     output: &mut String,
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
@@ -4932,6 +4933,7 @@ fn emit_deck_subcircuit_children(
         if let Item::Subcircuit(child) = item {
             emit_deck_subcircuit(
                 child,
+                parent,
                 output,
                 primitives,
                 stripped_directives,
@@ -5028,13 +5030,16 @@ fn repaired_simetrix_subcircuit_header(block: &Subcircuit) -> Result<String> {
 
 fn emit_deck_subcircuit(
     block: &Subcircuit,
+    parent: &level17::Scope<'_>,
     output: &mut String,
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
     flattened_subcircuits: &mut usize,
 ) -> Result<()> {
+    let scope = parent.child(block)?;
     emit_deck_subcircuit_children(
         block,
+        &scope,
         output,
         primitives,
         stripped_directives,
@@ -5042,10 +5047,11 @@ fn emit_deck_subcircuit(
     )?;
     let dead_calls = dead_numeric_subcircuit_calls(block)?;
     let repair_one_model_typo = repair_unambiguous_pspice_one_model_typo(&block.body)?;
-    let models = ScopeAnalysis::analyze(&block.body, Some(&block.header))?;
+    let models = ScopeAnalysis::analyze(&block.body, Some(&block.header), &scope)?;
     *flattened_subcircuits = flattened_subcircuits.saturating_add(1);
     output.push_str(&repaired_simetrix_subcircuit_header(block)?);
     output.push('\n');
+    scope.emit_inherited(&block.body, output)?;
     let mut embedded_file = false;
     for item in &block.body {
         if let Item::Statement(statement) = item {
@@ -5124,12 +5130,55 @@ fn reject_experimental_models(items: &[Item]) -> Result<()> {
 /// Returns an error for malformed nesting, unsupported residual SIMPLIS syntax,
 /// protected content, or a primitive outside the implemented exact lowering set.
 pub fn translate_simplis_deck(input: &[u8]) -> Result<WholeModelTranslation> {
+    let items = vec![parse_deck_items(input)?];
+    let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
+    let scope = level17::Scope::global(&prefix, &items)?;
+    translate_deck_items(items.into_iter().next().context("missing deck")?, &scope)
+}
+
+fn parse_deck_items(input: &[u8]) -> Result<Vec<Item>> {
     let text =
         std::str::from_utf8(input).context("SIMPLIS deck translation requires UTF-8/ASCII")?;
-    let mut items = parse_items(text)?;
+    parse_items(text)
+}
+
+/// Translate a complete linked source graph with one model binding namespace.
+/// Companion results have the same order as the input companions.
+///
+/// # Errors
+/// Invalid source syntax, conflicting linked model declarations, or
+/// unsupported electrical semantics.
+pub fn translate_simplis_linked_netlist(
+    linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
+) -> Result<(WholeModelTranslation, Vec<WholeModelTranslation>)> {
+    let items = std::iter::once(linked.root_bytes.as_slice())
+        .chain(
+            linked
+                .libraries
+                .iter()
+                .map(|library| library.bytes.as_slice()),
+        )
+        .map(parse_deck_items)
+        .collect::<Result<Vec<_>>>()?;
+    let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
+    let scope = level17::Scope::global(&prefix, &items)?;
+    let mut translated = items
+        .into_iter()
+        .map(|items| translate_deck_items(items, &scope));
+    let root = translated.next().context("missing linked root")??;
+    let libraries = translated
+        .map(|result| include_safe(result?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((root, libraries))
+}
+
+fn translate_deck_items(
+    mut items: Vec<Item>,
+    scope: &level17::Scope<'_>,
+) -> Result<WholeModelTranslation> {
     reject_experimental_models(&items)?;
     distribute_root_init_overrides(&mut items)?;
-    let root_models = ScopeAnalysis::analyze(&items, None)?;
+    let root_models = ScopeAnalysis::analyze(&items, None, scope)?;
     let mut output = String::from(
         "* ngspice-rs-preprocess: translated expanded SIMPLIS deck to native ngspice\n",
     );
@@ -5140,6 +5189,7 @@ pub fn translate_simplis_deck(input: &[u8]) -> Result<WholeModelTranslation> {
         match item {
             Item::Subcircuit(block) => emit_deck_subcircuit(
                 block,
+                scope,
                 &mut output,
                 &mut primitives,
                 &mut stripped_directives,
@@ -5195,8 +5245,11 @@ pub fn translate_simplis_deck(input: &[u8]) -> Result<WholeModelTranslation> {
 ///
 /// Returns the same semantic errors as [`translate_simplis_deck`].
 pub fn translate_simplis_expanded_library(input: &[u8]) -> Result<WholeModelTranslation> {
+    include_safe(translate_simplis_deck(input)?)
+}
+
+fn include_safe(mut translated: WholeModelTranslation) -> Result<WholeModelTranslation> {
     const END: &[u8] = b".end\n";
-    let mut translated = translate_simplis_deck(input)?;
     if !translated.bytes.ends_with(END) {
         bail!("translated SIMPLIS library is missing synthetic .end terminator");
     }
@@ -6909,14 +6962,14 @@ M1 D G S S mosfet
             translated.primitives,
             vec![TranslationKind::SimetrixMosfetLevel17]
         );
-        assert!(text.contains(".model __L17_MOSFET NMOS(level=1"));
-        assert!(text.contains("R__M1_RD D __M1_DINT"));
+        assert!(text.contains(".model __l17_L__SYNTHETIC_5FLEVEL17__MOSFET NMOS(level=1"));
+        assert!(text.contains("R__l17_I_M1_RD D __l17_I_M1_DINT"));
         assert!(text.contains("TC1=1.56250000000000000e-2"));
-        assert!(text.contains("R__M1_RG G __M1_GINT"));
+        assert!(text.contains("R__l17_I_M1_RG G __l17_I_M1_GINT"));
         assert!(
-            text.contains("M1 __M1_DINT __M1_GINT S S __L17_MOSFET L=1 W=1 AD=0 AS=0 PD=1 PS=1")
+            text.contains("M1 __l17_I_M1_DINT __l17_I_M1_GINT S S __l17_L__SYNTHETIC_5FLEVEL17__MOSFET L=1 W=1 AD=0 AS=0 PD=1 PS=1")
         );
-        assert!(text.contains("C__M1_CGD __M1_GINT __M1_DINT Q='"));
+        assert!(text.contains("C__l17_I_M1_CGD __l17_I_M1_GINT __l17_I_M1_DINT Q='"));
         assert!(text.contains("SIMetrix LEVEL=17 LIMIT(VDS)=(*, 400) SOA metadata"));
         assert!(!text.contains(".model mosfet NMOS( LEVEL=17"));
         assert!(!text.contains("CGDMAX="));
