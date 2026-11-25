@@ -61,16 +61,12 @@ fn required_globals(graph: &Graph, scope: &[String]) -> Result<BTreeSet<String>>
         .filter(|node| graph.globals.contains(*node))
         .cloned()
         .collect::<BTreeSet<_>>();
-    for item in &owner.items {
-        if let Item::Statement(statement) = item
-            && let Some(call) = graph.call(statement, scope)?
-        {
-            let child = graph
-                .scopes
-                .get(&call.target)
-                .context("missing global alias child")?;
-            result.extend(child.global_formals.keys().cloned());
-        }
+    for call in graph.occurrences(scope)?.calls() {
+        let child = graph
+            .scopes
+            .get(&call.target)
+            .context("missing global alias child")?;
+        result.extend(child.global_formals.keys().cloned());
     }
     Ok(result)
 }
@@ -122,6 +118,7 @@ pub(super) fn prepare(graph: &mut Graph, scopes: &[Vec<String>]) -> Result<()> {
             .context("missing mutable global alias scope")?;
         allocate_formals(owner, &graph.globals, required)?;
     }
+    graph.rebind_global_occurrences()?;
     for owner in graph.scopes.values_mut() {
         owner.alb_roles.clear();
     }

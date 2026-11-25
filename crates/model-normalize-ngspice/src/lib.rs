@@ -1,6 +1,7 @@
 //! Deterministic compatibility normalization and validation for ngspice model includes.
 
 pub mod conditioning;
+pub mod controlled_transfer;
 mod lexical;
 
 /// Token spans of a logical SPICE statement, with balanced expression groups
@@ -15,6 +16,7 @@ pub mod model_card;
 pub mod param_expression;
 pub mod parameter_scope;
 pub mod passive_ic;
+pub mod pspice;
 pub mod vdmos_card;
 pub mod vdmos_ltspice;
 pub mod waveform;
@@ -51,10 +53,14 @@ pub enum NormalizationPass {
     NormalizeNbspWhitespace,
     /// Expand `LTspice`'s `L ... Rser=` extension to an ideal inductor plus resistor.
     LtspiceInductorRser,
+    /// Normalize controlled TABLE syntax and lower FREQ to native xfer models.
+    ControlledSourceTransfer,
     /// Map `PSpice` `arctan()` to ngspice `atan()`.
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.
     PspicePositionalParams,
+    /// Lower explicit `PSpice` source semantics to native SPICE.
+    PspiceSource,
     /// Comment a standalone `.END` so the model remains safe to include.
     StripStandaloneEnd,
     /// Scale proven private differentiator currents and compensate feedback.
@@ -314,7 +320,7 @@ fn expression_start(text: &[u8], first: &[u8]) -> Result<Option<usize>> {
         [b'e' | b'g', ..] => {
             if fields.get(3).is_some_and(|span| {
                 let field = &text[span.clone()];
-                [b"value".as_slice(), b"table", b"poly"]
+                [b"value".as_slice(), b"table", b"poly", b"vol", b"cur"]
                     .iter()
                     .any(|keyword| {
                         field
@@ -585,6 +591,27 @@ fn normalize_body(
     if strip_end && let Some(rewritten) = strip_standalone_end(&bytes)? {
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
+    }
+    if let Some(lowered) = controlled_transfer::lower_sources(&bytes)? {
+        let mut origins = Vec::new();
+        let mut previous = inserted_lines.iter().copied().peekable();
+        for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
+            while previous.peek() == Some(&line) {
+                origins.push(line);
+                previous.next();
+            }
+            origins.push(line);
+        }
+        for line in lowered.inserted_lines {
+            inserted_lines.push(
+                *origins
+                    .get(line - 1)
+                    .context("missing transfer source line")?,
+            );
+        }
+        inserted_lines.sort_unstable();
+        bytes = lowered.bytes;
+        passes.push(NormalizationPass::ControlledSourceTransfer);
     }
     Ok(NormalizedModel { bytes, passes })
 }

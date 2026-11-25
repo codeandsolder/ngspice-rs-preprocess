@@ -144,6 +144,7 @@ name = "model-alb-experimental"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-normalize-ngspice",
  "model-translate-simplis",
  "serde",
  "serde_json",
@@ -220,6 +221,7 @@ name = "model-preprocess-simplis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-kernel-diode",
  "model-normalize-ngspice",
  "model-preprocess-command",
  "serde",
@@ -249,6 +251,7 @@ name = "ngspice-rs-preprocess"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-kernel-diode",
  "model-normalize-ngspice",
  "model-preprocess-command",
  "model-preprocess-simplis",

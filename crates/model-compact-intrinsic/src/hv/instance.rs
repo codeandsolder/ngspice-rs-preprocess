@@ -56,44 +56,44 @@ impl PreparedHiSimHvInstance {
     }
 
     /// Original physical implementation for this instance.
-    #[must_use]
+    #[must_use = "the variant identifies the physical implementation"]
     pub const fn variant(&self) -> ModelVariant {
         self.parameters.variant()
     }
 
     /// C-setup instance parameter values; use canonical numeric slots.
-    #[must_use]
+    #[must_use = "the returned buffer supplies the prepared instance values"]
     pub const fn parameters(&self) -> &BoundParameters {
         &self.parameters
     }
 
     /// Source-bin geometry, independent of the model's later temperature laws.
-    #[must_use]
+    #[must_use = "the geometry is used to evaluate size-dependent model laws"]
     pub const fn geometry(&self) -> HiSimHvBinningGeometry {
         self.geometry
     }
 
     /// Metallurgical effective channel dimensions and other temperature-independent
     /// expressions from the beginning of the C `*temp.c` implementation.
-    #[must_use]
+    #[must_use = "the returned dimensions are inputs to the temperature and transport laws"]
     pub const fn effective_geometry(&self) -> HiSimHvEffectiveGeometry {
         self.effective_geometry
     }
 
     /// Temperature-independent mobility, velocity, and thermal layout factors.
-    #[must_use]
+    #[must_use = "the returned factors are inputs to mobility and thermal laws"]
     pub const fn transport_geometry(&self) -> HiSimHvTransportGeometry {
         self.transport_geometry
     }
 
     /// One of the source family's 92/95 size-dependent model parameters.
-    #[must_use]
+    #[must_use = "the lookup result distinguishes absent binning from a computed value"]
     pub fn binned_model_slot(&self, slot: u16) -> Option<f64> {
         self.binned.get(usize::from(slot)).copied().flatten()
     }
 
     /// SPICE IC vector in the upstream C order `VDS`, `VGS`, `VBS` (volts).
-    #[must_use]
+    #[must_use = "the returned vector establishes the initial device state"]
     pub const fn initial_conditions(&self) -> [f64; 3] {
         self.initial_conditions
     }

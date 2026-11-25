@@ -378,7 +378,7 @@ impl Prepared {
     }
 
     /// Source TMPHICJ coefficient slopes for coupled physical laws.
-    #[must_use]
+    #[must_use = "the returned slopes contribute to the coupled physical derivatives"]
     pub const fn temperature_slopes(&self) -> ParameterSlopes {
         self.temperature_slopes
     }

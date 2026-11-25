@@ -9,9 +9,7 @@ use serde::Serialize;
 use std::fmt::Write as _;
 
 pub mod syntax;
-use syntax::{
-    model_statement_tokens, normalized_statement, parse_numeric, statement_tokens, validate_node,
-};
+use syntax::{normalized_statement, parse_numeric, statement_tokens, validate_node};
 mod whole;
 pub use whole::{
     SplitDeckTranslation, WholeModelTranslation, capture_artifact_initial_conditions,
@@ -63,6 +61,10 @@ pub enum TranslationKind {
     SrLatch,
     /// SIMPLIS simple S-R flip flop.
     SrFlipFlop,
+    /// Classic edge-triggered SR, JK, D or T state element.
+    ClockedFlipFlop,
+    /// Classic level-sensitive transparent data latch.
+    DataLatch,
     /// SIMPLIS pulse source mapped to native/behavioral ngspice.
     PulseSource,
     /// SIMPLIS sawtooth source mapped to a periodic behavioral source.
@@ -113,6 +115,8 @@ impl TranslationKind {
             | Self::OrGate
             | Self::SrLatch
             | Self::SrFlipFlop
+            | Self::ClockedFlipFlop
+            | Self::DataLatch
             | Self::HystereticSwitch
             | Self::TimedVoltageControlledSwitch
             | Self::TransistorSwitchLevel1
@@ -853,13 +857,23 @@ struct LogicGateSpec {
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 enum LogicOperation {
-    And,
-    Or,
-    Nand,
-    Nor,
-    ResetDominant,
-    SetDominant,
-    HoldWhenEqual,
+    And = 0,
+    Or = 1,
+    Nand = 2,
+    Nor = 3,
+    ResetDominant = 4,
+    SetDominant = 5,
+    HoldWhenEqual = 6,
+    ClockedSrRising = 7,
+    ClockedSrFalling = 8,
+    ClockedJkRising = 9,
+    ClockedJkFalling = 10,
+    ClockedDRising = 11,
+    ClockedDFalling = 12,
+    ClockedTRising = 13,
+    ClockedTFalling = 14,
+    LatchHigh = 15,
+    LatchLow = 16,
 }
 
 impl From<LogicGateKind> for LogicOperation {

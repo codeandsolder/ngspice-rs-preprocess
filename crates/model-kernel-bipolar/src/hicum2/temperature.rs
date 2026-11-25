@@ -66,8 +66,8 @@ impl ThermalCoefficients {
     }
 }
 
-impl Default for ThermalCoefficients {
-    fn default() -> Self {
+impl ThermalCoefficients {
+    pub(super) const fn source_defaults() -> Self {
         Self {
             tnom_celsius: 27.0,
             dt: 0.0,
@@ -99,6 +99,12 @@ impl Default for ThermalCoefficients {
             zetarth: 0.0,
             alrth: 0.0,
         }
+    }
+}
+
+impl Default for ThermalCoefficients {
+    fn default() -> Self {
+        Self::source_defaults()
     }
 }
 
@@ -350,13 +356,13 @@ impl Prepared {
 
     /// The immutable thermal trial kernel, including power/KCL/energy laws
     /// at this same effective device temperature.
-    #[must_use]
+    #[must_use = "the returned kernel evaluates thermal residuals and derivatives"]
     pub const fn thermal_kernel(&self) -> thermal::Prepared {
         self.thermal
     }
 
     /// The immutable source nominal topology and external RC kernel.
-    #[must_use]
+    #[must_use = "the returned kernel evaluates external electrical branches"]
     pub const fn external_kernel(&self) -> external::Prepared {
         self.external
     }
