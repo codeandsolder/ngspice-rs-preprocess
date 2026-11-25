@@ -287,18 +287,6 @@ pub(super) fn rewrite(
         }
         return Ok(());
     }
-    if matches!(name.first().map(u8::to_ascii_lowercase), Some(b'v' | b'i'))
-        && fields
-            .iter()
-            .skip(3)
-            .any(|field| text[field.clone()].eq_ignore_ascii_case(b"file"))
-    {
-        return Err(reject(
-            origin,
-            Feature::Directive,
-            "file-backed waveform requires typed source resource linking",
-        ));
-    }
     if let Some(start) = expression_start(text, name)? {
         rewrite_span(statement, origin, start..text.len(), edits)?;
     }

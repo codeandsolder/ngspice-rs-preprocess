@@ -317,3 +317,72 @@ fn numeric_spelling_covers_continuations_and_analysis_values() -> Result<()> {
     assert_eq!(diagnostic.line, 2);
     Ok(())
 }
+
+#[test]
+fn relative_pwl_is_cumulative_and_preserves_value_signs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let source = "* PWL witness\nV1 a 0 PWL 0 0 1m 0 +1u +1 +2m 1 +1u 0\nI1 0 b PWL(0 0, 1m 0, +1u +1,\n+ +2m 1, +1u 0)\nR1 b 0 1\n.tran 0 4m 0 100n\n.end\n";
+    let root = dir.path().join("source.cir");
+    fs::write(&root, source)?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let output = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(output.contains("V1 a 0 PWL("));
+    assert!(output.contains("+1"));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        bail!("missing source map");
+    };
+    assert_eq!(lines.len(), source.lines().count());
+    let rows = reference(dir.path(), source, "run\nwrdata witness.dat v(a) v(b)")?;
+    let mut count = 0;
+    for row in rows {
+        let [time, voltage, current] = row.as_slice() else {
+            bail!("invalid waveform trace");
+        };
+        let expected = if *time <= 0.001 {
+            0.
+        } else if *time < 0.001001 {
+            (*time - 0.001) / 1e-6
+        } else if *time < 0.003001 {
+            1.
+        } else if *time < 0.003002 {
+            (0.003002 - *time) / 1e-6
+        } else {
+            0.
+        };
+        ensure!(
+            (voltage - expected).abs() < 1e-8 && (current - expected).abs() < 1e-8,
+            "{row:?}, expected {expected}"
+        );
+        count += 1;
+    }
+    ensure!(count > 100, "missing waveform observations");
+    Ok(())
+}
+
+#[test]
+fn unqualified_waveform_laws_are_source_located() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for card in [
+        "V1 a 0 PWL REPEAT FOR 2 0 0 1u 1 ENDREPEAT",
+        "V1 a 0 PWL(FILE 3k4.csv)",
+        "V1 a 0 PWL(0 0 1u 1 1u 2)",
+        "V1 a 0 PWL(0 0 1u 1 +{dt} 2)",
+        "V1 a 0 PWL(0 0 1u 1) TRIGGER=V(a)",
+        "V1 a 0 PULSE(0 1 -1u 1n 1n 1u 2u)",
+        "V1 a 0 PULSE(0 1 0 0 0 1u 2u)",
+        "V1 a 0 PULSE(0 1 0 1n 1n 1u 2u 3)",
+        "V1 a 0 1 Rser=1",
+    ] {
+        fs::write(&root, format!("Title\n{card}\n.end\n"))?;
+        let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+            .err()
+            .with_context(|| format!("unsupported waveform accepted: {card}"))?;
+        let diagnostic = error
+            .downcast_ref::<Unsupported>()
+            .with_context(|| format!("missing typed diagnostic for {card}: {error:#}"))?;
+        assert_eq!(diagnostic.feature, Feature::Waveform);
+        assert_eq!(diagnostic.line, 2);
+    }
+    Ok(())
+}

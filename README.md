@@ -47,6 +47,9 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 QSPICE source support is under qualification: whole-file and selected-section
 library references, source-relative paths, explicitly ideal passive branches
 and explicitly bounded transient windows are normalized with source provenance.
+Numeric suffix and embedded-decimal spellings, literal cumulative PWL times,
+and explicit positive-duration PULSE timing are normalized without changing
+node identifiers or branch identity.
 Known unsupported compiled/specialized devices, idealized diode laws, smooth
 switch laws and implicit inductor parasitics produce source-located diagnostics.
 A successful source preparation does not establish equivalence of unqualified

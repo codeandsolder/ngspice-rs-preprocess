@@ -1,5 +1,6 @@
 //! Source-scoped QSPICE plaintext normalization. No compiled device execution.
 mod numeric;
+mod sources;
 use crate::{
     lexical::{Edit, Statement, apply_edits, replace_span, statements, tokens},
     linked_source::{LinkedSource, RootKind, SourceOrigin},
@@ -30,6 +31,8 @@ pub enum Feature {
     PassiveParasitics,
     /// Analysis scheduling or output-time semantics.
     TransientTiming,
+    /// Independent-source timing or resource semantics requiring a typed binding.
+    Waveform,
     /// Nonlinear model laws or defaults without a qualified native binding.
     ModelLaw,
 }
@@ -44,6 +47,7 @@ impl fmt::Display for Feature {
             Self::Directive => "simulator-specific directive",
             Self::PassiveParasitics => "passive parasitics",
             Self::TransientTiming => "transient timing",
+            Self::Waveform => "waveform",
             Self::ModelLaw => "model law",
         })
     }
@@ -440,6 +444,7 @@ fn lower_statement(
             "analysis or output directive needs source-specific qualification",
         )),
         b".tran" => lower_tran(statement, origin, &fields, edits),
+        [b'v' | b'i', ..] => sources::rewrite(statement, origin, &fields, edits),
         [b'l' | b'c', ..] => lower_passive(statement, origin, &fields, edits, input),
         [b'a' | b'u' | b'y' | b'n' | b'o' | b'@', ..] => Err(reject(
             origin,
