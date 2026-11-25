@@ -5,19 +5,19 @@ use anyhow::Result;
 use std::{borrow::Cow, fmt::Write as _, iter::once};
 
 #[derive(Clone, Copy)]
-pub(super) struct OutputPins<'a> {
+pub struct OutputPins<'a> {
     pub primary: &'a str,
     pub complement: Option<&'a str>,
 }
 
 impl<'a> OutputPins<'a> {
-    pub(super) fn iter(self) -> impl Iterator<Item = (&'a str, bool)> {
+    pub fn iter(self) -> impl Iterator<Item = (&'a str, bool)> {
         once((self.primary, false)).chain(self.complement.map(|node| (node, true)))
     }
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct OutputDrive {
+pub struct OutputDrive {
     pub low: f64,
     pub high: f64,
     pub resistance: f64,
@@ -34,7 +34,7 @@ impl From<LogicIo> for OutputDrive {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum OutputSignal<'a> {
+pub enum OutputSignal<'a> {
     /// A scalar analog 0/1 state requiring its own transport delay.
     Analog { state: &'a str, delay: f64 },
     /// A native digital state with timing already applied in the event producer.
@@ -58,7 +58,7 @@ impl<'a> OutputSignal<'a> {
     }
 }
 
-pub(super) struct OutputStage<'a> {
+pub struct OutputStage<'a> {
     pub stem: &'a str,
     pub rtn: &'a str,
     pub pins: OutputPins<'a>,
@@ -68,7 +68,7 @@ pub(super) struct OutputStage<'a> {
 }
 
 impl OutputStage<'_> {
-    pub(super) fn emit(self, output: &mut String) -> Result<()> {
+    pub fn emit(self, output: &mut String) -> Result<()> {
         let state = self.signal.timed_state(output, self.stem)?;
         for (node, complement) in self.pins.iter() {
             let suffix = if complement { "B" } else { "" };
@@ -104,7 +104,7 @@ impl OutputStage<'_> {
     }
 }
 
-pub(super) fn emit_logic_voltage(
+pub fn emit_logic_voltage(
     output: &mut String,
     stem: &str,
     out: &str,
