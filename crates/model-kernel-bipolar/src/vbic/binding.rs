@@ -277,6 +277,53 @@ pub struct Instance {
 }
 
 impl Instance {
+    /// Construct resolved runtime controls without re-parsing model-card names.
+    /// # Errors
+    /// Invalid geometry or effective temperature.
+    pub fn new(
+        area: f64,
+        multiplicity: f64,
+        temperature_celsius: Option<f64>,
+        delta_kelvin: f64,
+    ) -> Result<Self, ModelError> {
+        Self {
+            area,
+            multiplicity,
+            temperature_celsius,
+            delta_kelvin,
+            initial: Initial::default(),
+        }
+        .validated()
+    }
+
+    #[must_use = "area is an independent physical instance parameter"]
+    pub const fn area(self) -> f64 {
+        self.area
+    }
+
+    #[must_use = "the optional override determines the instance temperature coordinate"]
+    pub const fn temperature_celsius(self) -> Option<f64> {
+        self.temperature_celsius
+    }
+
+    #[must_use = "the temperature offset is a separate runtime parameter"]
+    pub const fn delta_kelvin(self) -> f64 {
+        self.delta_kelvin
+    }
+
+    fn validated(self) -> Result<Self, ModelError> {
+        validate_positive("area", self.area)?;
+        validate_positive("m", self.multiplicity)?;
+        validate_positive("area*m", self.scale())?;
+        if !self.delta_kelvin.is_finite() {
+            return Err(ModelError::InvalidParameter("dtemp"));
+        }
+        if let Some(c) = self.temperature_celsius {
+            Temperature::new(c + 273.15 + self.delta_kelvin)?;
+        }
+        Ok(self)
+    }
+
     #[must_use = "area times multiplicity scales every electrical current and charge"]
     pub fn scale(self) -> f64 {
         self.area * self.multiplicity
@@ -346,11 +393,5 @@ pub fn instance(assignments: &[Assignment<'_>]) -> Result<Instance, Error> {
             _ => return Err(invalid(index, a.name, "unknown instance parameter")),
         }
     }
-    validate_positive("area", result.area)?;
-    validate_positive("m", result.multiplicity)?;
-    validate_positive("area*m", result.scale())?;
-    if let Some(c) = result.temperature_celsius {
-        Temperature::new(c + 273.15 + result.delta_kelvin)?;
-    }
-    Ok(result)
+    Ok(result.validated()?)
 }
