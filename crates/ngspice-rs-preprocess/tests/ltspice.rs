@@ -94,6 +94,11 @@ fn rejects_ambiguous_flags_and_shadowed_intrinsics() -> Result<()> {
         ".func limit(x,y,z) {x}",
         ".backanno unexpected",
         ".model ideal D(Ron=0.1 Roff=1Meg)",
+        ".model smooth SW(Ron=1 Roff=1Meg Vh=-1)",
+        ".model smooth SW(Vh={width})",
+        ".model smooth SW(level=2)",
+        ".model limited SW(Ilimit=1)",
+        ".model reactive C(Rser=1)",
         ".func min(x,y) {x}",
         "B1 y 0 V=table(v(x),0,0,1)",
         "B1 y 0 V=limit(random(time),0,1)",
@@ -424,5 +429,82 @@ fn vendor_duplicate_table_knots_preserve_both_macro_evaluation_phases() -> Resul
     for (&actual, expected) in row[1..].iter().zip([1e200, 0., 1e200, 0.]) {
         near(actual, expected)?;
     }
+    Ok(())
+}
+
+#[test]
+fn series_parasitics_preserve_terminal_admittance_and_coupling_scope() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root, b"title\n.options reltol=1e-10 abstol=1e-14 vntol=1e-12\nV0 s0 0 AC 1\nRsrc0 s0 a0 .1\nC0 a0 0 2u Rser=5\nV1 s1 0 AC 1\nRsrc1 s1 a1 .1\nC1 a1 0 2u Rser=5 m=3\nV2 s2 0 AC 1\nRsrc2 s2 a2 .1\nL2 a2 0 3m\nV3 s3 0 AC 1\nRsrc3 s3 a3 .1\nL3 a3 0 3m Rser=0 Rpar=0\nV4 s4 0 AC 1\nRsrc4 s4 a4 .1\nL4 a4 0 3m Rser=5 m=3\nV5 s5 0 AC 1\nRsrc5 s5 a5 .1\nV6 s6 0 AC 1\nRsrc6 s6 a6 .1\nX1 a5 a6 coupled\n.subckt coupled a b\nL2 a 0 3m\nL3 b 0 3m\nK1 L2 L3 .5\n.ends coupled\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains("R__L2_RSER a2"));
+    assert!(text.contains(" 1m\n"));
+    assert!(text.contains("L3 a3 0 3m\n"));
+    assert!(text.contains(".subckt coupled a b\nL2 a 0 3m\nL3 b 0 3m\nK1"));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing source mapping");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    for (line, origin) in text.lines().zip(lines) {
+        if line.starts_with("R__L2_RSER") {
+            assert_eq!(origin.line, 11);
+        }
+    }
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nac lin 3 100 10000\nwrdata ac.dat v(a0) i(v0) v(a1) i(v1) v(a2) i(v2) v(a3) i(v3) v(a4) i(v4) v(a5) i(v5) v(a6) i(v6)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    for row in data(&dir.path().join("ac.dat"))? {
+        let omega = std::f64::consts::TAU * row[0];
+        let c = -1. / (omega * 2e-6);
+        let l = omega * 3e-3;
+        for (values, (resistance, reactance, m)) in row[1..].chunks_exact(4).zip([
+            (5_f64, c, 1.),
+            (5., c, 3.),
+            (1e-3, l, 1.),
+            (0., l, 1.),
+            (5., l, 3.),
+            (0., 1.5 * l, 1.),
+            (0., 1.5 * l, 1.),
+        ]) {
+            let [vr, vi, ir, ii] = [values[0], values[1], values[2], values[3]];
+            let voltage_sq = vr.mul_add(vr, vi * vi);
+            let real = -ir.mul_add(vr, ii * vi) / voltage_sq;
+            let imag = -ii.mul_add(vr, -ir * vi) / voltage_sq;
+            let z_sq = resistance.mul_add(resistance, reactance * reactance);
+            near(real, m * resistance / z_sq)?;
+            near(imag, -m * reactance / z_sq)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unresolved_passive_topology_is_diagnostic_not_silent() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for card in [
+        "C1 a 0 1u Rpar=100",
+        "C1 a 0 1u Lser=1m",
+        "L1 a 0 1m Cpar=1p",
+        "C1 a 0 1u m=0",
+        "C1 a 0 1u IC=.75",
+        "L1 a 0 1m IC=.1",
+        "C1 a 0 Q={v(a)*v(a)}",
+    ] {
+        fs::write(&root, format!("title\n{card}\n.end\n"))?;
+        assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
+    }
+    fs::write(&root, "L1 a b 1m\n")?;
+    assert!(prepared(&root, InputFormat::LtspiceLibrary).is_err());
+    fs::write(&root, "L1 a b 1m Rser=0\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceLibrary)?;
+    assert_eq!(bundle.primary.bytes, b"L1 a b 1m\n");
     Ok(())
 }

@@ -126,29 +126,57 @@ fn reject_shadowed_helpers(statement: &lexical::Statement) -> Result<()> {
 
 /// Reject known model forms whose native counterpart has different physics.
 fn validate_model(statement: &lexical::Statement) -> Result<()> {
+    use crate::model_card::parse_spice_constant;
     for model in crate::model_card::parse_model_cards(&statement.text)? {
-        if !model.family.eq_ignore_ascii_case("d") {
-            continue;
-        }
+        let family = model.family.to_ascii_lowercase();
         for field in &model.parameters {
-            ensure!(
-                ![
-                    "ron",
-                    "roff",
-                    "rrev",
-                    "vfwd",
-                    "vrev",
-                    "epsilon",
-                    "revepsilon",
-                    "ilimit",
-                    "revilimit"
-                ]
-                .iter()
-                .any(|name| field.name.eq_ignore_ascii_case(name)),
-                "line {}: LTspice idealized diode parameter {} requires typed model lowering",
-                statement.line,
-                field.name
-            );
+            let name = field.name.to_ascii_lowercase();
+            match family.as_str() {
+                "d" => ensure!(
+                    !matches!(
+                        name.as_str(),
+                        "ron"
+                            | "roff"
+                            | "rrev"
+                            | "vfwd"
+                            | "vrev"
+                            | "epsilon"
+                            | "revepsilon"
+                            | "ilimit"
+                            | "revilimit"
+                    ),
+                    "line {}: LTspice idealized diode parameter {} requires typed model lowering",
+                    statement.line,
+                    field.name
+                ),
+                "sw" => {
+                    let value = field
+                        .expression
+                        .as_deref()
+                        .and_then(|value| parse_spice_constant(value).ok());
+                    ensure!(
+                        match name.as_str() {
+                            "vh" => value.is_some_and(|value| value >= 0.),
+                            "level" => value.is_some_and(|value| value == 1.),
+                            "lser" | "vser" | "ilimit" => false,
+                            _ => true,
+                        },
+                        "line {}: LTspice switch parameter {} requires typed switch lowering",
+                        statement.line,
+                        field.name
+                    );
+                }
+                "c" | "cap" | "l" | "ind" => ensure!(
+                    !matches!(
+                        name.as_str(),
+                        "rser" | "rpar" | "cpar" | "lser" | "rlshunt" | "ic"
+                    ),
+                    "line {}: LTspice passive model parameter {} requires typed lowering",
+                    statement.line,
+                    field.name
+                ),
+                _ => {}
+            }
         }
     }
     Ok(())

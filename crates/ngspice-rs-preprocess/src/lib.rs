@@ -289,10 +289,12 @@ fn native(
         },
         session,
     )?;
-    let mut normalized = normalize_mapped(&linked.bytes, kind)?;
-    if ltspice {
-        normalized = model_normalize_ngspice::ltspice::normalize(normalized, kind)?;
-    }
+    let dialect = if ltspice {
+        model_normalize_ngspice::NormalizationDialect::Ltspice
+    } else {
+        model_normalize_ngspice::NormalizationDialect::Native
+    };
+    let normalized = normalize_mapped(&linked.bytes, kind, dialect)?;
     let lines = normalized
         .input_lines
         .into_iter()

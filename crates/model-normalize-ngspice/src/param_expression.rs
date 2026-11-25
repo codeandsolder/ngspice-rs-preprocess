@@ -139,6 +139,52 @@ fn percent_literal(raw: &str, start: usize, percent: usize) -> Result<(String, u
     Ok((number, end))
 }
 
+fn single_token(
+    byte: u8,
+    dialect: Dialect,
+    runtime: bool,
+    brace_depth: &mut usize,
+) -> Result<Token> {
+    Ok(match byte {
+        b'(' => Token::Open,
+        b')' => Token::Close,
+        b'{' if dialect == Dialect::Ltspice => {
+            *brace_depth += 1;
+            Token::BraceOpen
+        }
+        b'}' if dialect == Dialect::Ltspice => {
+            *brace_depth = brace_depth
+                .checked_sub(1)
+                .context("unmatched parameter brace")?;
+            Token::BraceClose
+        }
+        b',' => Token::Comma,
+        b'?' => Token::Question,
+        b':' => Token::Colon,
+        b'+' => Token::Op("+"),
+        b'-' => Token::Op("-"),
+        b'*' => Token::Op("*"),
+        b'/' => Token::Op("/"),
+        b'%' if dialect == Dialect::Ltspice && runtime && *brace_depth == 0 => {
+            bail!("runtime LTspice percent suffix must follow a numeric literal")
+        }
+        b'%' => Token::Op("%"),
+        b'\\' => Token::Op("\\"),
+        b'^' if dialect == Dialect::Ltspice => Token::Op("^"),
+        b'&' if dialect == Dialect::Ltspice => Token::Op("&&"),
+        b'|' if dialect == Dialect::Ltspice => Token::Op("||"),
+        b'~' if dialect == Dialect::Ltspice => Token::Op("!"),
+        b'^' => Token::Op("**"),
+        b'!' => Token::Op("!"),
+        b'<' => Token::Op("<"),
+        b'>' => Token::Op(">"),
+        _ => bail!(
+            "unsupported ngspice expression character {:?}",
+            char::from(byte)
+        ),
+    })
+}
+
 fn tokenize(raw: &str, dialect: Dialect, runtime: bool) -> Result<Vec<Token>> {
     ensure!(raw.is_ascii(), "non-ASCII ngspice parameter expression");
     let bytes = raw.as_bytes();
@@ -200,44 +246,7 @@ fn tokenize(raw: &str, dialect: Dialect, runtime: bool) -> Result<Vec<Token>> {
             continue;
         }
         cursor += 1;
-        tokens.push(match byte {
-            b'(' => Token::Open,
-            b')' => Token::Close,
-            b'{' if dialect == Dialect::Ltspice => {
-                brace_depth += 1;
-                Token::BraceOpen
-            }
-            b'}' if dialect == Dialect::Ltspice => {
-                brace_depth = brace_depth
-                    .checked_sub(1)
-                    .context("unmatched parameter brace")?;
-                Token::BraceClose
-            }
-            b',' => Token::Comma,
-            b'?' => Token::Question,
-            b':' => Token::Colon,
-            b'+' => Token::Op("+"),
-            b'-' => Token::Op("-"),
-            b'*' => Token::Op("*"),
-            b'/' => Token::Op("/"),
-            b'%' if dialect == Dialect::Ltspice && runtime && brace_depth == 0 => {
-                bail!("runtime LTspice percent suffix must follow a numeric literal")
-            }
-            b'%' => Token::Op("%"),
-            b'\\' => Token::Op("\\"),
-            b'^' if dialect == Dialect::Ltspice => Token::Op("^"),
-            b'&' if dialect == Dialect::Ltspice => Token::Op("&&"),
-            b'|' if dialect == Dialect::Ltspice => Token::Op("||"),
-            b'~' if dialect == Dialect::Ltspice => Token::Op("!"),
-            b'^' => Token::Op("**"),
-            b'!' => Token::Op("!"),
-            b'<' => Token::Op("<"),
-            b'>' => Token::Op(">"),
-            _ => bail!(
-                "unsupported ngspice expression character {:?}",
-                char::from(byte)
-            ),
-        });
+        tokens.push(single_token(byte, dialect, runtime, &mut brace_depth)?);
     }
     ensure!(
         tokens.len() <= MAX_TREE_NODES,
