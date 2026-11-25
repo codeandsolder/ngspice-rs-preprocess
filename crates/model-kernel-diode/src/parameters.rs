@@ -86,7 +86,7 @@ macro_rules! source_parameters {
         #[derive(Clone, Copy)]
         enum SourceParameter { $($variant),+ }
 
-        /// Accepted case-insensitive SIMetrix model fields, including aliases.
+        /// Accepted case-insensitive `SIMetrix` model fields, including aliases.
         pub const SOURCE_PARAMETERS: &[&str] = &[$($($name),+),+];
 
         impl SourceParameter {
@@ -118,54 +118,53 @@ impl SourceParameter {
         grouped: &mut Grouped,
         value: f64,
     ) -> Result<(), ParameterError> {
-        use SourceParameter::*;
         let field = match self {
-            Level => {
+            Self::Level => {
                 if value.to_bits() != 1.0_f64.to_bits() {
                     return Err(ParameterError::Unsupported(format!("LEVEL={value}")));
                 }
                 return Ok(());
             }
-            Is => &mut model.transport.saturation_current,
-            N => &mut model.transport.emission,
-            Isr => &mut model.recombination.saturation_current,
-            Nr => &mut model.recombination.emission,
-            Cjo => &mut model.depletion.capacitance,
-            Vj => &mut model.depletion.potential,
-            M => &mut model.depletion.grading,
-            Fc => &mut model.depletion.forward_coefficient,
-            Tt => &mut model.transit_time,
-            Tnom => {
+            Self::Is => &mut model.transport.saturation_current,
+            Self::N => &mut model.transport.emission,
+            Self::Isr => &mut model.recombination.saturation_current,
+            Self::Nr => &mut model.recombination.emission,
+            Self::Cjo => &mut model.depletion.capacitance,
+            Self::Vj => &mut model.depletion.potential,
+            Self::M => &mut model.depletion.grading,
+            Self::Fc => &mut model.depletion.forward_coefficient,
+            Self::Tt => &mut model.transit_time,
+            Self::Tnom => {
                 model.temperature.nominal = value + 273.15;
                 return Ok(());
             }
-            Tabs => {
+            Self::Tabs => {
                 model.temperature.absolute = Some(value + 273.15);
                 return Ok(());
             }
-            Trel => &mut model.temperature.relative,
-            Eg => &mut model.temperature.energy_gap,
-            Xti => &mut model.temperature.exponent,
-            Rs => &mut model.series.resistance,
-            Trs1 => &mut model.series.linear_temperature,
-            Trs2 => &mut model.series.quadratic_temperature,
-            Kf => &mut model.noise.coefficient,
-            Af => &mut model.noise.exponent,
-            Ikf => {
+            Self::Trel => &mut model.temperature.relative,
+            Self::Eg => &mut model.temperature.energy_gap,
+            Self::Xti => &mut model.temperature.exponent,
+            Self::Rs => &mut model.series.resistance,
+            Self::Trs1 => &mut model.series.linear_temperature,
+            Self::Trs2 => &mut model.series.quadratic_temperature,
+            Self::Kf => &mut model.noise.coefficient,
+            Self::Af => &mut model.noise.exponent,
+            Self::Ikf => {
                 grouped.ikf = Some(value);
                 return Ok(());
             }
-            Tikf => &mut grouped.tikf,
-            Bv => {
+            Self::Tikf => &mut grouped.tikf,
+            Self::Bv => {
                 grouped.bv = Some(value);
                 return Ok(());
             }
-            Ibv => &mut grouped.primary.current,
-            Nbv => &mut grouped.primary.emission,
-            Ibvl => &mut grouped.low_current.current,
-            Nbvl => &mut grouped.low_current.emission,
-            Tbv1 => &mut grouped.tbv[0],
-            Tbv2 => &mut grouped.tbv[1],
+            Self::Ibv => &mut grouped.primary.current,
+            Self::Nbv => &mut grouped.primary.emission,
+            Self::Ibvl => &mut grouped.low_current.current,
+            Self::Nbvl => &mut grouped.low_current.emission,
+            Self::Tbv1 => &mut grouped.tbv[0],
+            Self::Tbv2 => &mut grouped.tbv[1],
         };
         *field = value;
         Ok(())
