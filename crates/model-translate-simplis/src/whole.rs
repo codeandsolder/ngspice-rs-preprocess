@@ -2373,6 +2373,25 @@ fn lower_simetrix_behavioral_expression(input: &str) -> Result<String> {
     lower_simetrix_expression_regions(input, true)
 }
 
+fn lower_simetrix_conditional(input: &str, name: &str, open: usize) -> Result<(String, usize)> {
+    let close = matching_behavioral_parenthesis(input, open)?;
+    let arguments = behavioral_function_arguments(&input[open + 1..close])?;
+    let [first, second, third] = arguments.as_slice() else {
+        bail!("{name} behavioral function requires exactly three arguments");
+    };
+    let first = lower_simetrix_behavioral_expression(first)?;
+    let second = lower_simetrix_behavioral_expression(second)?;
+    let third = lower_simetrix_behavioral_expression(third)?;
+    let lowered = if name.eq_ignore_ascii_case("IF") || name.eq_ignore_ascii_case("IFF") {
+        format!("(({first}) ? ({second}) : ({third}))")
+    } else {
+        format!(
+            "(({first}) > ({second}) ? ({second}) : (({first}) < ({third}) ? ({third}) : ({first})))"
+        )
+    };
+    Ok((lowered, close + 1))
+}
+
 fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<String> {
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
@@ -2432,23 +2451,9 @@ fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<St
                     || name.eq_ignore_ascii_case("IFF")
                     || name.eq_ignore_ascii_case("LIMIT"))
             {
-                let close = matching_behavioral_parenthesis(input, open)?;
-                let arguments = behavioral_function_arguments(&input[open + 1..close])?;
-                if arguments.len() != 3 {
-                    bail!("{name} behavioral function requires exactly three arguments");
-                }
-                let first = lower_simetrix_behavioral_expression(arguments[0])?;
-                let second = lower_simetrix_behavioral_expression(arguments[1])?;
-                let third = lower_simetrix_behavioral_expression(arguments[2])?;
-                if name.eq_ignore_ascii_case("IF") || name.eq_ignore_ascii_case("IFF") {
-                    write!(output, "(({first}) ? ({second}) : ({third}))")?;
-                } else {
-                    write!(
-                        output,
-                        "(({first}) > ({second}) ? ({second}) : (({first}) < ({third}) ? ({third}) : ({first})))"
-                    )?;
-                }
-                offset = close.saturating_add(1);
+                let (lowered, next) = lower_simetrix_conditional(input, name, open)?;
+                output.push_str(&lowered);
+                offset = next;
                 continue;
             }
         }

@@ -2361,7 +2361,7 @@ fn direct_device_models(
         } else if is_directive(statement, "ENDC") {
             control = false;
         } else if control {
-            continue;
+            // Control-language statements are not electrical devices.
         } else if is_directive(statement, "SUBCKT") {
             scopes.push(BTreeSet::new());
             scope = scopes.len() - 1;
