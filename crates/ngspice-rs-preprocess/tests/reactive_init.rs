@@ -217,6 +217,10 @@ V2 b 0 -1
 !L2 b 0 ML IC=0
 .MODEL ML PWLL NSEG=2 X0=-2 Y0=-1m X1=0 Y1=3m X2=2 Y2=11m
 .INIT I(!L1)=-1 I(!L2)=3
+H1 ha 0 !L1 1
+H2 hb 0 !L2 1
+Rha ha 0 1k
+Rhb hb 0 1k
 Icap 0 c 1m
 C1 c 0 1u IC=-5
 .INIT V(C1)=2
@@ -241,20 +245,32 @@ tran 1u 4m 0 0.5u uic
 let ia=-i(v1)
 let ib=-i(v2)
 let ilin=-i(vlin)
-wrdata wave.dat ia ib v(c) ilin
+wrdata wave.dat ia ib v(c) ilin v(ha) v(hb)
 quit
 .endc",
     )?;
     assert!(trace.len() > 8000);
     let flux = |current: f64| {
         if current < 0. {
-            2e-3 * current + 3e-3
+            2e-3_f64.mul_add(current, 3e-3)
         } else {
-            4e-3 * current + 3e-3
+            4e-3_f64.mul_add(current, 3e-3)
         }
     };
+    // The same two flux/current trajectories were measured independently
+    // in SIMPLIS 9.40 (201 samples per polarity). Verify branch-current
+    // observation and the energy integral in addition to flux.
+    let energy = |current: f64| {
+        if current < 0. {
+            1e-3 * current * current
+        } else {
+            2e-3 * current * current
+        }
+    };
+    let (mut previous_time, mut previous_a, mut previous_b) = (0.0, -1.0, 3.0);
+    let (mut work_a, mut work_b) = (0.0, 0.0);
     for row in trace {
-        let [time, a, b, c, i] = row.as_slice() else {
+        let [time, a, b, c, i, ha, hb] = row.as_slice() else {
             bail!("unexpected flux trace width")
         };
         ensure!(
@@ -265,8 +281,24 @@ quit
             (flux(*b) - flux(3.) + time).abs() < 1e-10,
             "t={time} i2={b}"
         );
-        assert!((c - (2. + time * 1000.)).abs() < 1e-7);
-        assert!((i - (-0.5 + time * 1000.)).abs() < 1e-7);
+        ensure!(
+            (ha - a).abs() < 1e-10 && (hb - b).abs() < 1e-10,
+            "controlled source observes wrong physical branch"
+        );
+        let step = time - previous_time;
+        work_a = (a + previous_a).mul_add(0.5 * step, work_a);
+        work_b = (b + previous_b).mul_add(-0.5 * step, work_b);
+        ensure!(
+            (energy(*a) - energy(-1.) - work_a).abs() < 1e-9,
+            "forward energy balance"
+        );
+        ensure!(
+            (energy(*b) - energy(3.) - work_b).abs() < 1e-9,
+            "reverse energy balance"
+        );
+        (previous_time, previous_a, previous_b) = (*time, *a, *b);
+        assert!((c - 1000.0_f64.mul_add(*time, 2.)).abs() < 1e-7);
+        assert!((i - 1000.0_f64.mul_add(*time, -0.5)).abs() < 1e-7);
     }
     Ok(())
 }

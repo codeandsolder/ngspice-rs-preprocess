@@ -4579,6 +4579,26 @@ fn rewrite_native_bridge_instance(
     )))
 }
 
+struct CurrentSensor {
+    source: String,
+    node: String,
+}
+
+fn allocate_branch_identifier(
+    requested: &str,
+    reserved: &mut std::collections::BTreeSet<String>,
+) -> Result<String> {
+    let mut candidate = requested.to_owned();
+    let mut suffix = 0usize;
+    while !reserved.insert(candidate.to_ascii_uppercase()) {
+        suffix = suffix
+            .checked_add(1)
+            .context("current sensor identifier suffix overflow")?;
+        candidate = format!("{requested}_{suffix}");
+    }
+    Ok(candidate)
+}
+
 struct ScopeAnalysis {
     pwls_prefix: String,
     init: std::collections::BTreeMap<String, String>,
@@ -4586,7 +4606,7 @@ struct ScopeAnalysis {
     reactive: std::collections::BTreeMap<String, RawReactiveModel>,
     inductors: std::collections::BTreeMap<String, f64>,
     current_branches: std::collections::BTreeMap<String, String>,
-    sensed_branches: std::collections::BTreeMap<String, String>,
+    sensed_branches: std::collections::BTreeMap<String, CurrentSensor>,
     voltage_branches: std::collections::BTreeMap<String, (String, String)>,
     vcq: std::collections::BTreeMap<String, RawVcqModel>,
     comp: std::collections::BTreeMap<String, RawCompModel>,
@@ -4642,35 +4662,101 @@ impl ScopeAnalysis {
         models.collect_raw_models(items)?;
         validate_native_bridge_outputs(items, header, &models.native_bridges)?;
         models.current_branches = translated_current_branches(items, &models.pwl)?;
-        models.prepare_switch_current_sensors(items)?;
+        models.prepare_current_sensors(items, header)?;
         Ok(models)
     }
 
-    fn prepare_switch_current_sensors(&mut self, items: &[Item]) -> Result<()> {
+    fn current_targets(&self, items: &[Item]) -> Result<std::collections::BTreeSet<String>> {
+        let mut targets = std::collections::BTreeSet::new();
         for statement in electrical_statements(items) {
-            let tokens = statement_tokens(&normalized_statement(statement))?;
-            let Some(name) = tokens.first() else {
+            let Some(kind) = statement
+                .trim_start()
+                .as_bytes()
+                .first()
+                .map(u8::to_ascii_uppercase)
+            else {
                 continue;
             };
+            if !matches!(kind, b'S' | b'Q' | b'F' | b'H') {
+                continue;
+            }
+            let tokens = statement_tokens(&normalized_statement(statement))?;
+            if matches!(kind, b'F' | b'H') {
+                // Traditional linear and POLY sources name physical device
+                // branches. VALUE expressions are resolved independently.
+                let poly = tokens
+                    .get(3)
+                    .and_then(|token| poly_dimension(token))
+                    .map(|dimension| (dimension, 4usize))
+                    .or_else(|| legacy_poly_dimension(&tokens, 3));
+                let controls = if let Some((dimension, start)) = poly {
+                    let end = start
+                        .checked_add(dimension)
+                        .context("current control count overflow")?;
+                    tokens.get(start..end).unwrap_or_default()
+                } else if tokens.len() == 5 {
+                    &tokens[3..4]
+                } else {
+                    &[]
+                };
+                for control in controls {
+                    let target = control.to_ascii_uppercase();
+                    if self.voltage_branches.contains_key(&target)
+                        || self.current_branches.contains_key(&target)
+                    {
+                        targets.insert(target);
+                    }
+                }
+                continue;
+            }
             let Some(model) = tokens.get(4) else {
                 continue;
             };
             let model = model.to_ascii_uppercase();
-            let current_controlled = match name.as_bytes().first().map(u8::to_ascii_uppercase) {
-                Some(b'S') => self
+            let current_controlled = match kind {
+                b'S' => self
                     .vcsw
                     .get(&model)
                     .is_some_and(|model| model.control == SwitchControl::Current),
-                Some(b'Q') => self
+                b'Q' => self
                     .vcq
                     .get(&model)
                     .is_some_and(|model| model.control == SwitchControl::Current),
                 _ => false,
             };
-            if !current_controlled {
-                continue;
+            if current_controlled {
+                targets.insert(tokens[3].to_ascii_uppercase());
             }
-            let target = tokens[3].to_ascii_uppercase();
+        }
+        Ok(targets)
+    }
+
+    fn prepare_current_sensors(&mut self, items: &[Item], header: Option<&str>) -> Result<()> {
+        let targets = self.current_targets(items)?;
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        // The generated node/source namespace is local to a source scope.
+        // Reserve original names even if they occur only in a subcircuit
+        // header or a controlling-node expression.
+        let mut reserved = electrical_statements(items)
+            .into_iter()
+            .chain(header)
+            .flat_map(|statement| {
+                statement.split(|character: char| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '_' | '$' | '.'))
+                })
+            })
+            .filter(|name| !name.is_empty())
+            .map(str::to_ascii_uppercase)
+            .chain(
+                self.current_branches
+                    .values()
+                    .map(|name| name.to_ascii_uppercase()),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        for target in targets {
             if self
                 .current_branches
                 .get(&target)
@@ -4681,15 +4767,15 @@ impl ScopeAnalysis {
             if !self.voltage_branches.contains_key(&target) {
                 bail!("SIMPLIS switch references unknown current branch {target}");
             }
-            let sensor = format!(
+            let stem = format!(
                 "V__{}_CONTROL_SENSE",
                 current_controlled_source_stem(&target)
             );
-            if self.voltage_branches.contains_key(&sensor) {
-                bail!("generated current sensor name conflicts with existing device {sensor}");
-            }
-            self.current_branches.insert(target.clone(), sensor.clone());
-            self.sensed_branches.insert(target, sensor);
+            let source = allocate_branch_identifier(&stem, &mut reserved)?;
+            let node = allocate_branch_identifier(&format!("__{source}_NODE"), &mut reserved)?;
+            self.current_branches.insert(target.clone(), source.clone());
+            self.sensed_branches
+                .insert(target, CurrentSensor { source, node });
         }
         Ok(())
     }
@@ -4708,16 +4794,8 @@ impl ScopeAnalysis {
         let terminal = tokens
             .get_mut(1)
             .context("missing current-sensed positive terminal")?;
-        let middle = format!("__{}_NODE", sensor);
-        if self
-            .voltage_branches
-            .values()
-            .any(|(p, n)| p.eq_ignore_ascii_case(&middle) || n.eq_ignore_ascii_case(&middle))
-        {
-            bail!("generated current sensor node conflicts with existing node {middle}");
-        }
-        writeln!(output, "{sensor} {terminal} {middle} 0")?;
-        *terminal = middle;
+        writeln!(output, "{} {terminal} {} 0", sensor.source, sensor.node)?;
+        terminal.clone_from(&sensor.node);
         Ok(tokens.join(" "))
     }
 
@@ -6624,8 +6702,8 @@ H1 d 0 !RX 3
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("B__F1 c 0 I='2.00000000000000000e0*i(R1)'"));
-        assert!(text.contains("B__H1 d 0 V='3.00000000000000000e0*i(BRX)'"));
+        assert!(text.contains("B__F1 c 0 I='2.00000000000000000e0*i(V__R1_CONTROL_SENSE)'"));
+        assert!(text.contains("B__H1 d 0 V='3.00000000000000000e0*i(V___21RX_CONTROL_SENSE)'"));
         assert!(!text.lines().any(|line| line.starts_with("F1 ")));
         assert!(!text.lines().any(|line| line.starts_with("H1 ")));
         Ok(())
@@ -7232,6 +7310,41 @@ Q1 d 0 R1 MQ IC=OPEN
         assert_eq!(text.matches("i(V__R1_CONTROL_SENSE)").count(), 4);
         assert!(text.contains("i(V__R1_IPWLR_SENSE)"));
         assert!(!text.contains(" ICSW "));
+        Ok(())
+    }
+
+    #[test]
+    fn current_sources_bind_polynomial_controls_to_same_physical_sensor() -> Result<()> {
+        let source = br"R1 a 0 1k
+!L1 a b ML IC=0
+H1 c 0 !L1 1
+F1 d 0 POLY(2) R1 !L1 0 1 2
+.MODEL ML PWLL NSEG=2 X0=-1 Y0=-1m X1=0 Y1=0 X2=1 Y2=1m
+.end
+";
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        assert_eq!(text.matches("V___21L1_CONTROL_SENSE a ").count(), 1);
+        assert_eq!(text.matches("i(V___21L1_CONTROL_SENSE)").count(), 2);
+        assert!(text.contains("i(V__R1_CONTROL_SENSE)"));
+        Ok(())
+    }
+
+    #[test]
+    fn current_sensor_avoids_source_and_subcircuit_pin_collisions() -> Result<()> {
+        let source = br".subckt T p n __V__R1_CONTROL_SENSE_1_NODE
+V__R1_CONTROL_SENSE p n 0
+R1 p n 1k
+S1 p n R1 MS IC=OPEN
+.MODEL MS ICSW RON=10 ROFF=1Meg TH=0 HYSTWD=1 LOGIC=POS
+.ends T
+.end
+";
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        assert!(text.contains("V__R1_CONTROL_SENSE_1 p __V__R1_CONTROL_SENSE_1_NODE_1 0"));
+        assert!(text.contains("R1 __V__R1_CONTROL_SENSE_1_NODE_1 n 1k"));
+        assert!(text.contains("i(V__R1_CONTROL_SENSE_1)"));
         Ok(())
     }
 

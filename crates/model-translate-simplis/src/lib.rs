@@ -184,10 +184,19 @@ fn write_pwl(output: &mut String, node_p: &str, node_n: &str, points: &[Point]) 
 
 fn validate_resistor_end_slopes(points: &[Point], current_defined: bool) -> Result<()> {
     validate_finite_points(points)?;
-    let (independent, dependent): (fn(&Point) -> f64, fn(&Point) -> f64) = if current_defined {
-        (|point| point.value, |point| point.voltage)
-    } else {
-        (|point| point.voltage, |point| point.value)
+    let independent = |point: &Point| {
+        if current_defined {
+            point.value
+        } else {
+            point.voltage
+        }
+    };
+    let dependent = |point: &Point| {
+        if current_defined {
+            point.voltage
+        } else {
+            point.value
+        }
     };
     anyhow::ensure!(
         points
@@ -232,8 +241,9 @@ pub fn translate_vpwlr(
 }
 
 /// Translate a SIMPLIS `IPWLR` two-terminal I-V primitive to an ngspice
-/// series current sensor plus behavioral voltage source. As with VPWLR,
-/// points are voltage/current pairs; only the independent coordinate
+/// series current sensor plus behavioral voltage source.
+///
+/// As with VPWLR, points are voltage/current pairs; only the independent coordinate
 /// changes. Interior voltage slopes may be negative or zero.
 ///
 /// # Errors

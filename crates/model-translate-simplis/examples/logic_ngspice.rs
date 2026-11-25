@@ -960,6 +960,38 @@ S4 o4 rtn I1 MS IC=CLOSE
     verify(runtime, source, &checks)
 }
 
+fn ipwlr_vendor_extrapolation(runtime: &Path) -> Result<()> {
+    let source = "Vref rtn 0 .75
+I1 rtn a PWL(0 -6 1u -6 4u 6 7u -6 9u -6)
+I2 rtn b PWL(0 -6 1u -6 4u 6 7u -6 9u -6)
+!R1 a rtn M1 IC=2
+!R2 b rtn M2 IC=3
+.MODEL M1 IPWLR NSEG=2 X0=-1 Y0=-2 X1=0 Y1=0 X2=1 Y2=4
+.MODEL M2 IPWLR NSEG=3 X0=-1 Y0=-2 X1=1 Y1=0 X2=.5 Y2=1 X3=2 Y3=3
+.end
+";
+    // Direct vendor values on both end extrapolations, the negative
+    // interior slope, and the return sweep.
+    let checks = [
+        (0.0, -3.0, -5.0),
+        (2.0, -1.0, -1.0),
+        (2.6, 0.1, 0.8),
+        (2.8, 0.3, 0.65),
+        (3.0, 0.5, 1.25),
+        (4.0, 1.5, 4.25),
+        (5.2, 0.3, 0.65),
+        (5.6, -0.2, 0.6),
+        (6.0, -1.0, -1.0),
+        (8.0, -3.0, -5.0),
+    ]
+    .into_iter()
+    .flat_map(|(time, a, b)| {
+        [("a", a), ("b", b)].map(|(node, value)| (node.to_owned(), time, value))
+    })
+    .collect::<Vec<_>>();
+    verify(runtime, source, &checks)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -984,6 +1016,7 @@ fn main() -> Result<()> {
     timed_switch_closed_loop(&runtime)?;
     current_controlled_switch_vendor_trace(&runtime)?;
     current_controlled_passive_branch_chain(&runtime)?;
+    ipwlr_vendor_extrapolation(&runtime)?;
     println!("All native ngspice logic regressions passed");
     Ok(())
 }
