@@ -6,7 +6,7 @@
 
 use crate::{
     lexical::{Statement, tokens},
-    model_card::parse_model_card,
+    model_card::{parse_model_card, parse_parameter_fields},
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,21 +38,10 @@ pub struct Declarations {
 }
 
 fn assignment_names(text: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let fields = tokens(text)?;
-    Ok(fields
-        .windows(3)
-        .filter(|fields| {
-            let key = &text[fields[0].clone()];
-            text[fields[1].clone()] == *b"="
-                && text[fields[2].clone()] != *b"="
-                && key
-                    .first()
-                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
-                && key
-                    .iter()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'#'))
-        })
-        .map(|fields| text[fields[0].clone()].to_ascii_lowercase())
+    Ok(parse_parameter_fields(std::str::from_utf8(text)?, &[])?
+        .into_iter()
+        .filter(|parameter| parameter.span.explicit_equals)
+        .map(|parameter| parameter.name.into_bytes().to_ascii_lowercase())
         .collect())
 }
 

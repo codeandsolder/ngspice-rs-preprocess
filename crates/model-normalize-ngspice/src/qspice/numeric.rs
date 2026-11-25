@@ -165,6 +165,15 @@ fn rewrite_span(
     let bytes = text.as_bytes();
     let mut at = 0;
     while let Some(&byte) = bytes.get(at) {
+        // QSPICE added boolean XOR in August 2025, distinct from single
+        // caret exponentiation. It needs the shared dialect expression AST.
+        if bytes[at..].starts_with(b"^^") {
+            return Err(reject(
+                origin,
+                Feature::ExpressionLaw,
+                "boolean XOR (^^) requires source-specific truth and precedence binding",
+            ));
+        }
         if byte == b'"' {
             // Double-quoted strings are paths or literals, not arithmetic.
             at += 1;
@@ -254,7 +263,9 @@ pub(super) fn rewrite(
     if name.eq_ignore_ascii_case(b".model") {
         let model = parse_model_card(std::str::from_utf8(text)?, origin.line, &[])?;
         for parameter in model.parameters {
-            if let Some(span) = parameter.span.value {
+            if !parameter.name.eq_ignore_ascii_case("mfg")
+                && let Some(span) = parameter.span.value
+            {
                 rewrite_span(statement, origin, span, edits)?;
             }
         }

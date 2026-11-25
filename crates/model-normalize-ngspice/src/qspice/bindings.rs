@@ -6,6 +6,8 @@ use super::{Feature, literal, reject};
 use crate::{
     lexical::{Edit, Statement, remove_spans, replace_span},
     linked_source::SourceOrigin,
+    model_card::{parse_model_card, parse_parameter_fields},
+    param_expression::SpiceExpression,
     parameter_scope::declarations::{Declarations, Visibility},
 };
 use anyhow::{Context, Result};
@@ -35,30 +37,82 @@ pub(super) fn passive_model(
     }
 }
 
+#[derive(Clone, Copy)]
+enum Position {
+    // A passive's positional identifier can also name a model.
+    KnownParameter,
+    // A formal, actual or linear gain slot denotes a scalar expression.
+    Scalar,
+    // A model value can also be a source-specific enumeration or annotation.
+    ModelValue,
+}
+
 fn brace_reference(
     statement: &Statement,
     origin: &SourceOrigin,
     declarations: &Declarations,
     field: &Range<usize>,
+    position: Position,
     edits: &mut Vec<Edit>,
 ) -> Result<()> {
     let raw = &statement.text[field.clone()];
-    match declarations.parameter(statement.line, raw) {
-        Visibility::Missing => Ok(()),
-        Visibility::Ambiguous => Err(reject(
-            origin,
-            Feature::Binding,
-            "conditionally declared parameter requires topology selection",
-        )),
-        Visibility::Unique(()) => {
-            let mut replacement = Vec::with_capacity(raw.len() + 2);
-            replacement.push(b'{');
-            replacement.extend_from_slice(raw);
-            replacement.push(b'}');
-            replace_span(statement, field.clone(), &replacement, edits);
-            Ok(())
-        }
+    if literal(raw).is_some()
+        || raw.starts_with(b"{")
+        || raw.starts_with(b"'")
+        || raw.starts_with(b"\"")
+    {
+        return Ok(());
     }
+    let known = match declarations.parameter(statement.line, raw) {
+        Visibility::Missing => false,
+        Visibility::Ambiguous => {
+            return Err(reject(
+                origin,
+                Feature::Binding,
+                "conditionally declared parameter requires topology selection",
+            ));
+        }
+        Visibility::Unique(()) => true,
+    };
+    let compound = raw.iter().any(|byte| {
+        matches!(
+            byte,
+            b'+' | b'-'
+                | b'*'
+                | b'/'
+                | b'('
+                | b'^'
+                | b'?'
+                | b'<'
+                | b'>'
+                | b'!'
+                | b'|'
+                | b'&'
+                | b'%'
+        )
+    });
+    let rewrite = known
+        || match position {
+            Position::KnownParameter => false,
+            Position::Scalar => true,
+            Position::ModelValue => compound,
+        };
+    if rewrite {
+        let text = std::str::from_utf8(raw)?;
+        SpiceExpression::parse(text).map_err(|error| {
+            reject(
+                origin,
+                Feature::Binding,
+                &format!("invalid static scalar expression: {error:#}"),
+            )
+        })?;
+        let mut replacement = Vec::with_capacity(raw.len() + 2);
+        replacement.push(b'{');
+        replacement.extend_from_slice(raw);
+        replacement.push(b'}');
+        replace_span(statement, field.clone(), &replacement, edits);
+    }
+    Ok(())
 }
 
 const fn is_bjt_family(family: &[u8]) -> bool {
@@ -148,9 +202,42 @@ fn assignment_references(
     edits: &mut Vec<Edit>,
 ) -> Result<()> {
     let text = &statement.text;
-    for pair in fields.windows(2) {
-        if text[pair[0].clone()] == *b"=" {
-            brace_reference(statement, origin, declarations, &pair[1], edits)?;
+    let start = fields.first().context("missing assignment card")?.end;
+    for parameter in parse_parameter_fields(std::str::from_utf8(&text[start..])?, &[])? {
+        if let Some(field) = parameter.span.value {
+            brace_reference(
+                statement,
+                origin,
+                declarations,
+                &(start + field.start..start + field.end),
+                Position::Scalar,
+                edits,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn model_references(
+    statement: &Statement,
+    origin: &SourceOrigin,
+    declarations: &Declarations,
+    edits: &mut Vec<Edit>,
+) -> Result<()> {
+    let model = parse_model_card(std::str::from_utf8(&statement.text)?, origin.line, &[])?;
+    for parameter in model.parameters {
+        // Manufacturer annotations are not scalar expressions.
+        if !parameter.name.eq_ignore_ascii_case("mfg")
+            && let Some(field) = parameter.span.value
+        {
+            brace_reference(
+                statement,
+                origin,
+                declarations,
+                &field,
+                Position::ModelValue,
+                edits,
+            )?;
         }
     }
     Ok(())
@@ -170,6 +257,9 @@ pub(super) fn rewrite(
         .context("empty source statement")?
         .to_ascii_lowercase();
     let name = fields.first().map_or(&[][..], |field| &text[field.clone()]);
+    if name.eq_ignore_ascii_case(b".model") {
+        return model_references(statement, origin, declarations, edits);
+    }
     if name.eq_ignore_ascii_case(b".subckt") || designator == b'x' {
         return assignment_references(statement, origin, declarations, fields, edits);
     }
@@ -179,7 +269,14 @@ pub(super) fn rewrite(
                 && fields.get(4).is_none_or(|next| text[next.clone()] != *b"=")
                 && !passive_model(statement, origin, declarations, &text[field.clone()])?
             {
-                brace_reference(statement, origin, declarations, field, edits)?;
+                brace_reference(
+                    statement,
+                    origin,
+                    declarations,
+                    field,
+                    Position::KnownParameter,
+                    edits,
+                )?;
             }
         }
         b'e' | b'g' => {
@@ -191,15 +288,32 @@ pub(super) fn rewrite(
                             text[span.clone()]
                                 .get(..keyword.len())
                                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+                                && text[span.clone()]
+                                    .get(keyword.len())
+                                    .is_none_or(|byte| *byte == b'(')
                         })
                 })
             {
-                brace_reference(statement, origin, declarations, field, edits)?;
+                brace_reference(
+                    statement,
+                    origin,
+                    declarations,
+                    field,
+                    Position::Scalar,
+                    edits,
+                )?;
             }
         }
         b'f' | b'h' => {
             if let Some(field) = fields.get(4) {
-                brace_reference(statement, origin, declarations, field, edits)?;
+                brace_reference(
+                    statement,
+                    origin,
+                    declarations,
+                    field,
+                    Position::Scalar,
+                    edits,
+                )?;
             }
         }
         b'q' => bjt_polarity(statement, origin, declarations, fields, edits, input)?,

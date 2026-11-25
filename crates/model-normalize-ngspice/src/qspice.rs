@@ -6,7 +6,7 @@ mod sources;
 use crate::{
     lexical::{Edit, Statement, apply_edits, remove_spans, statements, tokens},
     linked_source::{LinkedSource, RootKind, SourceOrigin},
-    model_card::{parse_model_card, parse_spice_constant},
+    model_card::{ModelCard, parse_model_card, parse_spice_constant},
     parameter_scope::declarations::Declarations,
     waveform::{PreparedWaveform, WaveformSpec},
 };
@@ -29,6 +29,8 @@ pub enum Feature {
     NumericLiteral,
     /// Conditional topology requires a source-specific binding phase.
     ConditionalTopology,
+    /// Source expression operators without a qualified native projection.
+    ExpressionLaw,
     /// Ambiguous or contradictory source declaration binding.
     Binding,
     /// Digital, specialized or compiled device class.
@@ -52,6 +54,7 @@ impl fmt::Display for Feature {
             Self::SourceEncoding => "source encoding",
             Self::NumericLiteral => "numeric literal",
             Self::Binding => "declaration binding",
+            Self::ExpressionLaw => "expression law",
             Self::ConditionalTopology => "conditional topology",
             Self::SpecialDevice => "specialized device class",
             Self::Directive => "simulator-specific directive",
@@ -276,6 +279,21 @@ fn lower_passive(
 ) -> Result<()> {
     let text = &statement.text;
     let designator = text[0].to_ascii_lowercase();
+    if fields.get(3..5).is_some_and(|pair| {
+        text[pair[1].clone()] == *b"="
+            && [b"r".as_slice(), b"c", b"l", b"q", b"flux"]
+                .iter()
+                .any(|key| text[pair[0].clone()].eq_ignore_ascii_case(key))
+    }) {
+        return Err(reject(
+            origin,
+            Feature::ModelLaw,
+            "behavioral resistance/reactance requires a qualified Norton, Thevenin, charge or flux law",
+        ));
+    }
+    if designator == b'r' {
+        return Ok(());
+    }
     let mut parallel = false;
     let mut series = false;
     let mut removed = Vec::new();
@@ -336,7 +354,89 @@ fn lower_passive(
     Ok(())
 }
 
-fn check_model(statement: &Statement, origin: &SourceOrigin) -> Result<()> {
+fn check_recovery(
+    model: &ModelCard,
+    statement: &Statement,
+    origin: &SourceOrigin,
+    edits: &mut Vec<Edit>,
+    input: &[u8],
+) -> Result<()> {
+    if !["d", "vdmos", "vdmosn", "vdmosp"]
+        .iter()
+        .any(|family| model.family.eq_ignore_ascii_case(family))
+    {
+        return Ok(());
+    }
+    let mut transit = None;
+    let mut soft = None;
+    let mut remove = Vec::new();
+    for parameter in &model.parameters {
+        let value = parameter
+            .expression
+            .as_deref()
+            .and_then(|value| literal(value.as_bytes()));
+        if parameter.name.eq_ignore_ascii_case("tt") {
+            if transit.replace(value).is_some() {
+                return Err(reject(
+                    origin,
+                    Feature::ModelLaw,
+                    "duplicate TT assignment has unqualified source precedence",
+                ));
+            }
+        }
+        if parameter.name.eq_ignore_ascii_case("vp") {
+            if soft.replace(value).is_some() {
+                return Err(reject(
+                    origin,
+                    Feature::ModelLaw,
+                    "duplicate VP assignment has unqualified source precedence",
+                ));
+            }
+            if let Some(span) = &parameter.span.value {
+                remove.push(parameter.span.name.start..span.end);
+            }
+        }
+    }
+    // QSPICE defaults VP to a nonzero diffusion-charge damping parameter.
+    // Explicit VP=0 selects the standard snap-recovery law; native's
+    // corresponding default is zero. Do not silently substitute it otherwise.
+    let explicit_snap = soft == Some(Some(0.));
+    let inactive_charge =
+        transit == Some(Some(0.)) && soft.flatten().is_some_and(|vp| (0.0..=1.0).contains(&vp));
+    if !explicit_snap
+        && !inactive_charge
+        && (soft.is_some() || transit.is_some_and(|value| value != Some(0.)))
+    {
+        return Err(reject(
+            origin,
+            Feature::ModelLaw,
+            "QSPICE soft reverse recovery (VP default or explicit value) requires a qualified charge-state law; VP=0 selects native snap recovery",
+        ));
+    }
+    // Model parameters can be comma-separated. Remove the separator after
+    // VP when present, otherwise remove the preceding separator if necessary.
+    for span in &mut remove {
+        let tail = &statement.text[span.end..];
+        let trimmed = tail.trim_ascii_start();
+        if trimmed.starts_with(b",") {
+            span.end += tail.len() - trimmed.len() + 1;
+        } else {
+            let before = statement.text[..span.start].trim_ascii_end();
+            if before.ends_with(b",") {
+                span.start = before.len() - 1;
+            }
+        }
+    }
+    remove_spans(statement, input, &remove, edits);
+    Ok(())
+}
+
+fn check_model(
+    statement: &Statement,
+    origin: &SourceOrigin,
+    edits: &mut Vec<Edit>,
+    input: &[u8],
+) -> Result<()> {
     let model = parse_model_card(std::str::from_utf8(&statement.text)?, origin.line, &[])?;
     if model.family.eq_ignore_ascii_case("d")
         && model.parameters.iter().any(|param| {
@@ -381,7 +481,7 @@ fn check_model(statement: &Statement, origin: &SourceOrigin) -> Result<()> {
             }
         }
     }
-    Ok(())
+    check_recovery(&model, statement, origin, edits, input)
 }
 
 fn lower_statement(
@@ -403,13 +503,24 @@ fn lower_statement(
             Feature::Directive,
             "external execution or source-defined resource search is not native; use explicit caller search directories for text resources",
         )),
-        b".model" => check_model(statement, origin),
+        b".model" => check_model(statement, origin, edits, input),
         b".step" | b".noise" | b".four" | b".display" => Err(reject(
             origin,
             Feature::Directive,
             "analysis or output directive needs source-specific qualification",
         )),
-        [b'l' | b'c', ..] => lower_passive(statement, origin, fields, edits, input),
+        [b'r' | b'l' | b'c', ..] => lower_passive(statement, origin, fields, edits, input),
+        [b'b', ..]
+            if fields.get(3..5).is_some_and(|pair| {
+                text[pair[0].clone()].eq_ignore_ascii_case(b"r") && text[pair[1].clone()] == *b"="
+            }) =>
+        {
+            Err(reject(
+                origin,
+                Feature::ModelLaw,
+                "behavioral resistor requires a qualified Norton or Thevenin law",
+            ))
+        }
         [b'a' | b'u' | b'y' | b'n' | b'o' | b'@', ..] => Err(reject(
             origin,
             Feature::SpecialDevice,

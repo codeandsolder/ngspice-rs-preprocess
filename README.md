@@ -44,19 +44,13 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
 | `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
 
-QSPICE source support is under qualification: whole-file and selected-section
-library references, source-relative paths, explicitly ideal passive branches
-and transient timing are normalized with source provenance. Short and symbolic
-transient forms preserve the candidate-bound time window; explicit MAXSTEP
-and ABSOLUTETIME options are projected into native analysis fields.
-Numeric suffix and embedded-decimal spellings, literal cumulative PWL times,
-and explicit positive-duration PULSE timing are normalized without changing
-node identifiers or branch identity.
-Known unsupported compiled/specialized devices, idealized diode laws, smooth
-switch laws and implicit inductor parasitics produce source-located diagnostics.
-A successful source preparation does not establish equivalence of unqualified
-model defaults or expression semantics. Schematic, symbol and raw-result files
-are not plaintext netlists.
+QSPICE preparation supports linked plaintext sources, scoped scalar
+declarations, numeric spellings, explicitly ideal passives, and native or
+occurrence-bound PWL/PULSE waveforms. The typed waveform metadata is mandatory
+when present; the source card may contain a placeholder DC bias. Known
+unsupported source laws and topology directives have physical-source
+diagnostics. See [the QSPICE adapter contract](docs/qspice.md) for the
+qualified behavior, boundaries and reference evidence.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:

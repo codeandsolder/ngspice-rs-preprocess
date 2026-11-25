@@ -640,3 +640,107 @@ fn symbolic_waveforms_bind_per_instance_and_preserve_bias() -> Result<()> {
     assert!(invalid.is_err(), "nonadvancing relative waveform accepted");
     Ok(())
 }
+
+#[test]
+fn model_and_subcircuit_scalar_expressions_keep_lexical_binding() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let source = "* scoped model values\n.param base=4k\n.subckt divider a b resistance=base/2\nR1 a b resistance\nR2 b 0 1k\n.ends divider\nV1 a 0 3\nX1 a b divider resistance=base/2\nX2 a c divider\nV2 d 0 1\nV3 e 0 1\n.subckt d1 p n\n.param leakage=2u\n.model dm D(IS=leakage/2)\nD1 p n dm\n.ends\n.subckt d2 p n\n.param leakage=1n\n.model dm D(IS=leakage)\nD1 p n dm\n.ends\nX3 0 d d1\nX4 0 e d2\n.op\n.end\n";
+    let root = dir.path().join("source.cir");
+    fs::write(&root, source)?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    for expected in ["resistance={base/2}", "IS={leakage/2}", "IS={leakage}"] {
+        ensure!(text.contains(expected), "{expected}: {text}");
+    }
+    let rows = reference(
+        dir.path(),
+        source,
+        "run\nwrdata witness.dat v(b) v(c) i(v2) i(v3)",
+    )?;
+    assert_eq!(rows.len(), 1);
+    let [_, b, c, first, second] = rows[0].as_slice() else {
+        bail!("unexpected operating point");
+    };
+    ensure!((b - 1.).abs() < 1e-12 && (c - 1.).abs() < 1e-12, "{rows:?}");
+    // Native ngspice uses a cubic continuation for reverse bias below
+    // -3*Vt, not a hard saturation approximation. Include default GMIN.
+    let thermal_voltage = 300.15 * 1.380_648_52e-23 / 1.602_176_620_8e-19;
+    let reverse_scale = 1. - (3. * thermal_voltage / std::f64::consts::E).powi(3);
+    for (current, saturation) in [(first, 1e-6_f64), (second, 1e-9_f64)] {
+        let expected = saturation.mul_add(reverse_scale, 1e-12);
+        ensure!((current.abs() - expected).abs() < 1e-15, "{rows:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn soft_recovery_and_behavioral_passive_laws_are_explicit() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for card in [
+        ".model dm D(TT=1n)",
+        ".model dm D(TT=1n VP=0.01)",
+        ".model dm D(TT={tau})",
+        ".model dm VDMOS(TT=1n)",
+        "R1 a b R=V(a)",
+        "B1 a b R=V(a)",
+        "C1 a b C=V(a)",
+        "C1 a b Q=V(a)*1n",
+        "L1 a b FLUX=I(L1)*1m",
+    ] {
+        fs::write(&root, format!("Title\n{card}\n.end\n"))?;
+        let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+            .err()
+            .with_context(|| format!("unqualified physical law accepted: {card}"))?;
+        let diagnostic = error
+            .downcast_ref::<Unsupported>()
+            .with_context(|| format!("{card}: {error:#}"))?;
+        assert_eq!(diagnostic.feature, Feature::ModelLaw);
+        assert_eq!(diagnostic.line, 2);
+    }
+    for (card, expected) in [
+        (".model dm D(VP=0, TT=1n)", "TT=1n"),
+        (".model dm D(TT=1n, VP=0)", "TT=1n"),
+        (".model dm D(TT=1n\n+ VP=0) ; snap", "snap"),
+        (".model dm D(TT=0)", "TT=0"),
+        (".model dm D(TT=0, VP=0.01)", "TT=0"),
+    ] {
+        fs::write(&root, format!("Title\n{card}\n.end\n"))?;
+        let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+        let text = std::str::from_utf8(&bundle.primary.bytes)?;
+        ensure!(!text.contains("VP=") && text.contains(expected), "{text}");
+        // The shared lexer must still recognize the model wrapper after removal.
+        model_normalize_ngspice::model_card::parse_model_cards(text.as_bytes())?;
+    }
+    Ok(())
+}
+
+#[test]
+fn boolean_xor_is_not_mistaken_for_exponentiation_or_node_identity() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(
+        &root,
+        b"Title\nV1 node^^name 0 1\nB1 out 0 V=V(node^^name)*2^3\n.end\n",
+    )?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains("node^^name"));
+    assert!(text.contains("2^3"));
+    for card in [
+        ".param state={1^^0}",
+        "B1 out 0 V=1^^0",
+        "V1 a 0 PWL(0 0 1u {1^^0})",
+    ] {
+        fs::write(&root, format!("Title\n{card}\n.end\n"))?;
+        let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+            .err()
+            .context("QSPICE XOR silently accepted")?;
+        let diagnostic = error
+            .downcast_ref::<Unsupported>()
+            .with_context(|| format!("{error:#}"))?;
+        assert_eq!(diagnostic.feature, Feature::ExpressionLaw);
+        assert_eq!(diagnostic.line, 2);
+    }
+    Ok(())
+}
