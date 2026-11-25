@@ -22,9 +22,9 @@ use model_preprocess_simplis::{
     preprocess_netlist_linked, project_resource, source_include_target,
 };
 use model_translate_simplis::{
-    capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
-    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
-    translate_simplis_expanded_library,
+    WholeModelTranslation, capture_artifact_initial_conditions, capture_artifact_waveforms,
+    capture_linked_waveforms, capture_passive_initial_conditions, lower_simetrix_linked_runtime,
+    translate_simplis_deck, translate_simplis_expanded_library, translate_simplis_linked_netlist,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -542,6 +542,7 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
 
 fn translate_companions(
     linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
+    translated_libraries: Vec<WholeModelTranslation>,
     known: &BTreeSet<&str>,
     sources: &BTreeMap<String, BTreeSet<String>>,
     root_sources: &BTreeSet<String>,
@@ -550,9 +551,11 @@ fn translate_companions(
 ) -> Result<(Vec<Artifact>, Vec<String>)> {
     let mut companions = Vec::new();
     let mut dependencies = Vec::new();
-    for library in &linked.libraries {
-        let mut translated = translate_simplis_expanded_library(&library.bytes)
-            .with_context(|| format!("translating linked library {}", library.source_id))?;
+    ensure!(
+        linked.libraries.len() == translated_libraries.len(),
+        "linked translation count mismatch"
+    );
+    for (library, mut translated) in linked.libraries.iter().zip(translated_libraries) {
         if let Some(policy) = &mut *initial_conditions {
             capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
         }
@@ -738,7 +741,7 @@ fn linked(
         .iter()
         .map(|library| library.filename.as_str())
         .collect::<BTreeSet<_>>();
-    let mut translated_root = translate_simplis_deck(&linked.root_bytes)?;
+    let (mut translated_root, translated_libraries) = translate_simplis_linked_netlist(&linked)?;
     if request.format == InputFormat::SimplisDeck {
         initial_conditions = Some(super::passive_ic::InitialConditions {
             mode: Some("1".to_owned()),
@@ -756,6 +759,7 @@ fn linked(
         .context("combined artifact output byte budget exceeded")?;
     let (companions, dependencies) = translate_companions(
         &linked,
+        translated_libraries,
         &known,
         &sources,
         &root_sources,

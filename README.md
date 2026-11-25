@@ -97,6 +97,19 @@ A different nominal temperature requires preparing the source again.
 Statistical analyses and conflicting or multiple analysis temperatures
 are rejected rather than approximated by the nominal translation.
 
+SIMetrix discrete MOS level 17 cards use explicit absolute geometry and a
+native MOS level-1 channel and junction core, with series-resistance
+multiplicity and temperature binding. The nonlinear gate-drain capacitance
+is lowered as conserved terminal charge (not capacitance times voltage).
+Model references resolve across linked artifacts and lexical scopes; local
+native model declarations shadow inherited discrete MOS models. Independent
+DC, transient and complex AC measurements qualify both polarities,
+resistance temperature coefficients, multiplicity, and junction and gate
+charge. Native semiconductor constants differ slightly from the historical
+source constants. Unsupported geometry and nonconstant instance fields
+are rejected; source SOA annotations are retained as metadata, not enforced
+by the native MOS core.
+
 ### Source model selection
 
 SIMetrix model selection is request-local. The typed mapping key is the

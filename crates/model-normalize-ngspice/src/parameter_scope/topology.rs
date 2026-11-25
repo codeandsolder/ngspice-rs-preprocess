@@ -577,7 +577,7 @@ impl<'a> Builder<'a> {
             .iter()
             .map(|&(node, _)| self.node(frame, node))
             .collect::<Vec<_>>();
-        let fields = instance_fields(&card.text[tokens[at].1..])?;
+        let fields = instance_fields(&card.text[tokens[at].1..], 3)?;
         let vdmos = if let Some((model, defaults)) = self.model(declaration, model_frame)? {
             Some(self.bind_vdmos(model, defaults, &nodes, &fields, resolver, scope)?)
         } else {

@@ -165,7 +165,11 @@ pub(crate) fn positional_prefix(input: &str) -> (Vec<(&str, usize)>, &str) {
 }
 
 /// Named scalar/flag parameters of an already identified MOS instance.
-pub(crate) fn instance_fields(input: &str) -> Result<Vec<ModelParameter>> {
+/// The caller provides the maximum arity of an unparenthesized IC vector.
+///
+/// # Errors
+/// Malformed assignments or unbalanced expressions.
+pub fn instance_fields(input: &str, ic_arity: usize) -> Result<Vec<ModelParameter>> {
     let mut source = Source {
         text: input,
         offset: 0,
@@ -177,26 +181,29 @@ pub(crate) fn instance_fields(input: &str) -> Result<Vec<ModelParameter>> {
             return Ok(parsed);
         }
         let mut field = source.field(&[])?;
-        // Native IC supports one or two scalars, parenthesized or
-        // comma-separated; keep the entire vector for typed binding.
+        // Keep a family-sized unparenthesized IC vector; a balanced
+        // parenthesized value already contains the whole vector.
         if input[field.name.clone()].eq_ignore_ascii_case("ic")
             && let Some(value) = &mut field.value
             && !input[value.clone()].starts_with('(')
         {
-            let end = value.end;
-            let first = input.as_bytes().get(source.offset).copied();
-            if first == Some(b',') {
-                source.offset += 1;
+            for _ in 1..ic_arity {
+                let end = value.end;
                 source.skip_space();
-                source.value()?;
+                let first = input.as_bytes().get(source.offset).copied();
+                if first == Some(b',') {
+                    source.offset += 1;
+                    source.skip_space();
+                    source.value()?;
+                } else if first.is_some_and(|b| {
+                    b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'{' | b'\'' | b'(')
+                }) {
+                    source.value()?;
+                } else {
+                    source.offset = end;
+                    break;
+                }
                 value.end = source.offset;
-            } else if first.is_some_and(|b| {
-                b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'{' | b'\'' | b'(')
-            }) {
-                source.value()?;
-                value.end = source.offset;
-            } else {
-                source.offset = end;
             }
         }
         parsed.push(ModelParameter::from_span(input, field));
