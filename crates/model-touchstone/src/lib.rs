@@ -270,6 +270,22 @@ fn numeric(path: &str, line: usize, word: &str) -> TouchstoneResult<f64> {
         .filter(|v| v.is_finite())
         .ok_or_else(|| error(path, line, format!("invalid numeric token {word}")))
 }
+fn encoded_frequency(hz: f64, unit: Unit, previous: &mut Option<f64>) -> TouchstoneResult<f64> {
+    let value = hz / unit.scale();
+    let recovered = value * unit.scale();
+    if !recovered.is_finite()
+        || (hz > 0. && recovered == 0.)
+        || previous.is_some_and(|last| recovered <= last)
+    {
+        return Err(error(
+            "output",
+            0,
+            "frequency grid cannot be represented in requested units",
+        ));
+    }
+    *previous = Some(recovered);
+    Ok(value)
+}
 fn positive(path: &str, line: usize, word: &str) -> TouchstoneResult<f64> {
     let value = numeric(path, line, word)?;
     if value <= 0. {
@@ -371,6 +387,7 @@ fn mixed_axes(
         let (letter, numbers) = word.split_at(1);
         let ids = numbers
             .split(',')
+            .take(3)
             .map(|x| count(path, line, x, n).map(|v| v - 1))
             .collect::<TouchstoneResult<Vec<_>>>()?;
         let descriptor = match (letter.to_ascii_uppercase().as_str(), ids.as_slice()) {
@@ -559,12 +576,6 @@ impl Touchstone {
                 .split_once('!')
                 .map_or(physical, |(part, _)| part)
                 .trim();
-            if without_comment.is_empty() {
-                continue;
-            }
-            if section == Section::End {
-                return Err(error(path, line, "data appears after [End]"));
-            }
             if section == Section::Information {
                 if without_comment.eq_ignore_ascii_case("[End Information]") {
                     section = Section::Header;
@@ -572,6 +583,12 @@ impl Touchstone {
                     result.information.push(physical.to_owned());
                 }
                 continue;
+            }
+            if without_comment.is_empty() {
+                continue;
+            }
+            if section == Section::End {
+                return Err(error(path, line, "data appears after [End]"));
             }
             if without_comment.starts_with('[') {
                 if continuation.is_some() {
@@ -880,19 +897,28 @@ impl Touchstone {
                 if section == Section::Network {
                     if !result.version.modern() {
                         let fields = words.clone().take(10).count();
-                        let expected = if n <= 2 {
-                            record
-                        } else if pending.is_empty() {
-                            1 + 2 * n.min(4)
+                        let frequency = usize::from(pending.is_empty());
+                        let col = (pending.len().saturating_sub(1) / 2) % n;
+                        let max_pairs = if n <= 2 {
+                            (record - pending.len() - frequency) / 2
                         } else {
-                            let col = ((pending.len() - 1) / 2) % n;
-                            2 * (n - col).min(4)
+                            (n - col).min(4)
                         };
-                        if fields != expected {
+                        let data_fields = fields.saturating_sub(frequency);
+                        let pairs = data_fields / 2;
+                        if fields <= frequency
+                            || data_fields % 2 != 0
+                            || pairs > max_pairs
+                            || ((3..=4).contains(&n) && pairs != max_pairs)
+                        {
                             return Err(error(path, line, "invalid legacy network row width"));
                         }
                     }
+                    let mut complete = false;
                     for word in words {
+                        if complete {
+                            return Err(error(path, line, "frequency must start on a new line"));
+                        }
                         pending.push(numeric(path, line, word)?);
                         if pending.len() == record {
                             if result.points.len() >= limits.frequencies
@@ -936,6 +962,7 @@ impl Touchstone {
                             }
                             result.points.push(NetworkPoint { hz, matrix });
                             pending.clear();
+                            complete = true;
                             if expected_points.is_some_and(|limit| result.points.len() > limit) {
                                 return Err(error(path, line, "too many network frequencies"));
                             }
@@ -1281,9 +1308,10 @@ impl Touchstone {
                 TwoPortOrder::N21BeforeN12
             },
         );
+        let mut previous = None;
         for point in &self.points {
-            write!(output, "{:.17e}", point.hz / self.unit.scale())
-                .map_err(|_| error("output", 0, "format failure"))?;
+            let frequency = encoded_frequency(point.hz, self.unit, &mut previous)?;
+            write!(output, "{frequency:.17e}").map_err(|_| error("output", 0, "format failure"))?;
             for (index, (r, c)) in order.iter().copied().enumerate() {
                 let mut value = point.matrix[r * n + c];
                 if !version.modern() {
@@ -1403,7 +1431,9 @@ impl Touchstone {
             if version.modern() {
                 output.push_str("[Noise Data]\n");
             }
+            let mut previous = None;
             for point in &self.noise {
+                let frequency = encoded_frequency(point.hz, self.unit, &mut previous)?;
                 let resistance = if version.modern() {
                     point.resistance_ohms
                 } else {
@@ -1414,8 +1444,7 @@ impl Touchstone {
                 }
                 writeln!(
                     output,
-                    "{:.17e} {:.17e} {:.17e} {:.17e} {resistance:.17e}",
-                    point.hz / self.unit.scale(),
+                    "{frequency:.17e} {:.17e} {:.17e} {:.17e} {resistance:.17e}",
                     point.min_figure_db,
                     point.optimum_reflection.magnitude().min(1.),
                     point.optimum_reflection.phase().to_degrees(),

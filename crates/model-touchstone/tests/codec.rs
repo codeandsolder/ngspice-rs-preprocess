@@ -343,3 +343,37 @@ fn mutated_model_and_noise_budget_are_checked_before_export() -> TouchstoneResul
     assert!(model.write(Version::V2_1, Encoding::Ri).is_err());
     Ok(())
 }
+
+#[test]
+fn information_comments_and_irregular_legacy_continuations() -> TouchstoneResult<()> {
+    let text = "[Version] 2.1\n# Hz S RI\n[Number of Ports] 1\n[Number of Frequencies] 1\n[Begin Information]\n[Vendor Extension] x\n! retained comment\n\n[End Information]\n[Network Data]\n1 1 0\n[End]\n";
+    let model = Touchstone::parse(text, "input.ts", LIMITS)?;
+    let encoded = model.write(Version::V2_1, Encoding::Ri)?;
+    let decoded = Touchstone::parse(&encoded, "output.ts", LIMITS)?;
+    assert_eq!(model.information, decoded.information);
+    assert_eq!(
+        model.information,
+        ["[Vendor Extension] x", "! retained comment", ""]
+    );
+    let legacy = "# Hz S RI\n1 1 0 2 0\n3 0 4 0\n";
+    let decoded = Touchstone::parse(legacy, "input.s2p", LIMITS)?;
+    assert_eq!(
+        decoded.points[0].matrix,
+        [
+            Complex::real(1.),
+            Complex::real(3.),
+            Complex::real(2.),
+            Complex::real(4.)
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn unrepresentable_frequency_export_is_rejected() -> TouchstoneResult<()> {
+    let mut model = Touchstone::parse("# Hz S RI\n1 1 0\n", "input.s1p", LIMITS)?;
+    model.points[0].hz = f64::from_bits(1);
+    model.unit = model_touchstone::Unit::GHz;
+    assert!(model.write(Version::V1_0, Encoding::Ri).is_err());
+    Ok(())
+}
