@@ -265,3 +265,29 @@ This policy selects the measured SIMetrix Elements GUI defaults
 Do not simulate the electrical text alone if this policy contains
 initialization declarations. Native decks have no source-specific
 initialization policy and retain their normal IC semantics.
+
+### SIMPLIS reactive startup and snapshots
+
+For linked SIMPLIS decks, `.INIT` assignments are resolved per instance
+before translation. An ancestor snapshot wins over a local snapshot or
+device IC; repeated instances can therefore have different initial states.
+`V(C...)` / `V(!C...)` are voltages and `I(L...)` / `I(!L...)` are
+signed currents, not charge or flux. The source target kind is checked
+before canonicalizing the instance path.
+
+A PWLC IC is converted to the normalized charge coordinate on its Q(V)
+curve; a PWLL IC is converted to the normalized flux-linkage coordinate
+on its flux/current curve. The first and last segments extrapolate
+outside the tabulated range. SIMPLIS reactive curves must have strictly
+increasing independent and storage coordinates. The normalized state
+preserves charge/flux conservation and is invariant to an arbitrary
+constant storage offset. The unified bundle stores these initial states
+in the existing typed initialization manifest, bound to the actual
+emitted storage device and definition. Linked SIMPLIS defaults to hard
+bias initialization (or storage initialization when UIC is requested).
+The low-level native text translator emits ordinary IC slots for a
+consumer explicitly running the native transient with UIC.
+
+Reference: SIMPLIS simulator manual, sections "Device Models Used in
+Simplis", "SIMPLIS Device Types", and "Control Statements for Setting
+Initial Conditions".

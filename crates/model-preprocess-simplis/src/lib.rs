@@ -13,10 +13,10 @@ pub mod source_dialect;
 pub use hierarchy::{
     LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
     ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, active_statement_prefix,
-    linked_library_filename, lower_simetrix_source_view, parse_init_target_path, parse_library,
-    parse_library_file, parse_library_for_simulator, parse_scoped_library, preprocess_netlist,
-    preprocess_netlist_file, preprocess_netlist_linked, preprocess_netlist_linked_file,
-    project_simetrix_source, project_source, source_include_target,
+    linked_library_filename, lower_simetrix_source_view, parse_init_statement,
+    parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
+    parse_scoped_library, preprocess_netlist, preprocess_netlist_file, preprocess_netlist_linked,
+    preprocess_netlist_linked_file, project_simetrix_source, project_source, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
@@ -2075,6 +2075,10 @@ pub fn validate_simetrix_parameter_name(name: &str) -> Result<()> {
 /// # Errors
 /// Rejects malformed names, missing values and unbalanced expression delimiters.
 pub fn parameter_assignments(input: &str) -> Result<Vec<(&str, &str)>> {
+    named_assignments(input, false)
+}
+
+fn named_assignments(input: &str, init: bool) -> Result<Vec<(&str, &str)>> {
     let bytes = input.as_bytes();
     let mut offset = 0usize;
     let mut assignments = Vec::new();
@@ -2089,10 +2093,11 @@ pub fn parameter_assignments(input: &str) -> Result<Vec<(&str, &str)>> {
             break;
         }
         let name_start = offset;
-        while bytes
-            .get(offset)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$' | b'.'))
-        {
+        while bytes.get(offset).is_some_and(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(*byte, b'_' | b'$' | b'.')
+                || init && matches!(*byte, b'!' | b':' | b'(' | b')')
+        }) {
             offset += 1;
         }
         if offset == name_start {

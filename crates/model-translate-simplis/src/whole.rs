@@ -1,7 +1,7 @@
 mod passive_ic;
 mod pwls;
 mod waveforms;
-pub use passive_ic::capture_passive_initial_conditions;
+pub use passive_ic::{capture_artifact_initial_conditions, capture_passive_initial_conditions};
 pub use waveforms::{capture_artifact_waveforms, capture_linked_waveforms};
 mod simetrix_runtime;
 use super::{
@@ -11,7 +11,8 @@ use super::{
     emit_logic_event, emit_logic_gate, emit_logic_input_loads, emit_logic_output,
     emit_logic_voltage, indexed_points, integer_parameter, model_statement_tokens,
     normalized_statement, numeric_parameter, parse_assignments, sanitized_name, statement_tokens,
-    translate_charge_capacitor, translate_ipwlr, translate_vpwlr, validate_node, write_number,
+    translate_charge_capacitor, translate_flux_inductor, translate_ipwlr, translate_vpwlr,
+    validate_node, write_number,
 };
 #[cfg(test)]
 use crate::syntax::logical_statements;
@@ -20,6 +21,7 @@ use crate::syntax::{
     model_header, parse_items, simple_assignment_span, simple_assignment_value,
 };
 use anyhow::{Context, Result, bail};
+use model_normalize_ngspice::passive_ic::PassiveKind;
 use serde::Serialize;
 pub use simetrix_runtime::lower_simetrix_linked_runtime;
 use std::fmt::Write as _;
@@ -337,11 +339,12 @@ struct RawPwlModel {
 }
 
 #[derive(Clone, Debug)]
-struct RawChargeModel {
+struct RawReactiveModel {
     points: Vec<Point>,
+    kind: PassiveKind,
 }
 
-fn raw_charge_model(statement: &str) -> Result<Option<(String, RawChargeModel)>> {
+fn raw_reactive_model(statement: &str) -> Result<Option<(String, RawReactiveModel)>> {
     let trimmed = statement.trim_start();
     if !trimmed
         .get(..6)
@@ -351,49 +354,74 @@ fn raw_charge_model(statement: &str) -> Result<Option<(String, RawChargeModel)>>
         return Ok(None);
     }
     let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 4 || !tokens[2].eq_ignore_ascii_case("PWLC") {
+    if tokens.len() < 4 {
         return Ok(None);
     }
+    let kind = match tokens[2].to_ascii_uppercase().as_str() {
+        "PWLC" => PassiveKind::Capacitor,
+        "PWLL" => PassiveKind::Inductor,
+        _ => return Ok(None),
+    };
     let parameters = parse_assignments(&tokens[3..])?;
     let segments = integer_parameter(&parameters, "NSEG")?;
     if segments == 0 {
-        bail!("SIMPLIS PWLC model {} has zero segments", tokens[1]);
+        bail!("SIMPLIS reactive model {} has zero segments", tokens[1]);
     }
     let points = indexed_points(&parameters, segments, "X", "Y")
-        .with_context(|| format!("parsing SIMPLIS PWLC model {}", tokens[1]))?;
+        .with_context(|| format!("parsing SIMPLIS reactive model {}", tokens[1]))?;
     Ok(Some((
         tokens[1].to_ascii_uppercase(),
-        RawChargeModel { points },
+        RawReactiveModel { points, kind },
     )))
 }
 
-fn translate_raw_charge_device(
+fn translate_raw_reactive_device(
     statement: &str,
-    models: &std::collections::BTreeMap<String, RawChargeModel>,
+    models: &std::collections::BTreeMap<String, RawReactiveModel>,
 ) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     let Some(name) = tokens.first() else {
         return Ok(None);
     };
-    if !name
-        .get(..2)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!C"))
-        || tokens.len() < 4
+    if !name.get(..2).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case("!C") || prefix.eq_ignore_ascii_case("!L")
+    }) || tokens.len() < 4
     {
         return Ok(None);
     }
     let Some(model) = models.get(&tokens[3].to_ascii_uppercase()) else {
         return Ok(None);
     };
+    let flux = name
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!L"));
+    anyhow::ensure!(
+        (model.kind == PassiveKind::Inductor) == flux,
+        "reactive device {name} has mismatched model type"
+    );
+    anyhow::ensure!(
+        model
+            .points
+            .windows(2)
+            .all(|pair| pair[1].value > pair[0].value),
+        "SIMPLIS reactive model requires positive differential storage"
+    );
     let parameters = parse_assignments(&tokens[4..])?;
-    if let Some(initial) = parameters.get("IC") {
-        let value = crate::parse_numeric(initial)?;
-        if value != 0.0 {
-            bail!("raw SIMPLIS PWLC IC={initial} is not yet supported");
-        }
-    }
+    anyhow::ensure!(
+        parameters.keys().all(|key| key == "IC"),
+        "unsupported reactive instance parameter on {name}"
+    );
+    let initial = parameters
+        .get("IC")
+        .map(|value| crate::parse_numeric(value))
+        .transpose()?;
     let instance = name.trim_start_matches('!');
-    translate_charge_capacitor(instance, &tokens[1], &tokens[2], &model.points).map(Some)
+    if model.kind == PassiveKind::Inductor {
+        translate_flux_inductor(instance, &tokens[1], &tokens[2], &model.points, initial).map(Some)
+    } else {
+        translate_charge_capacitor(instance, &tokens[1], &tokens[2], &model.points, initial)
+            .map(Some)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3670,21 +3698,55 @@ fn resolve_init_route(
     }))
 }
 
+fn merge_routed_initializations(items: &mut Vec<Item>, ancestor: Vec<String>) -> Result<()> {
+    let mut merged = std::collections::BTreeMap::new();
+    let mut retained = Vec::with_capacity(items.len());
+    for item in std::mem::take(items) {
+        if let Item::Statement(statement) = &item
+            && let Some(assignments) =
+                model_preprocess_simplis::parse_init_statement(&normalized_statement(statement))?
+        {
+            for (path, value) in assignments {
+                let name = path.join(".").to_ascii_uppercase();
+                anyhow::ensure!(
+                    merged.insert(name.clone(), value).is_none(),
+                    "duplicate SIMPLIS .INIT override for {name}"
+                );
+            }
+        } else {
+            retained.push(item);
+        }
+    }
+    for statement in ancestor {
+        for (path, value) in model_preprocess_simplis::parse_init_statement(&statement)?
+            .context("missing routed initialization")?
+        {
+            merged.insert(path.join(".").to_ascii_uppercase(), value);
+        }
+    }
+    retained.extend(
+        merged
+            .into_iter()
+            .map(|(name, value)| Item::Statement(format!(".INIT {name}={value}"))),
+    );
+    *items = retained;
+    Ok(())
+}
+
 fn apply_scoped_init_overrides(
     items: &mut [Item],
     scoped: &mut std::collections::BTreeMap<String, Vec<String>>,
-) {
+) -> Result<()> {
     for item in items {
         let Item::Subcircuit(block) = item else {
             continue;
         };
         if let Some(statements) = scoped.remove(&block.name.to_ascii_uppercase()) {
-            for statement in statements {
-                block.body.insert(0, Item::Statement(statement));
-            }
+            merge_routed_initializations(&mut block.body, statements)?;
         }
-        apply_scoped_init_overrides(&mut block.body, scoped);
+        apply_scoped_init_overrides(&mut block.body, scoped)?;
     }
+    Ok(())
 }
 
 fn apply_routed_init_overrides(items: &mut Vec<Item>, routed: Vec<RoutedInit>) -> Result<()> {
@@ -3702,7 +3764,7 @@ fn apply_routed_init_overrides(items: &mut Vec<Item>, routed: Vec<RoutedInit>) -
     for statement in root {
         items.insert(0, Item::Statement(statement));
     }
-    apply_scoped_init_overrides(items, &mut scoped);
+    apply_scoped_init_overrides(items, &mut scoped)?;
     if let Some(scope) = scoped.keys().next() {
         bail!("missing mutable SIMPLIS init scope {scope}");
     }
@@ -3732,9 +3794,11 @@ fn distribute_root_init_overrides(items: &mut Vec<Item>) -> Result<()> {
     let mut routed = Vec::new();
     let mut stale = Vec::new();
     for statement in init_statements {
-        let tokens = statement_tokens(&normalized_statement(&statement))?;
-        let assignments = parse_assignments(&tokens[1..])?;
-        for (name, value) in assignments {
+        let assignments =
+            model_preprocess_simplis::parse_init_statement(&normalized_statement(&statement))?
+                .context("missing .INIT assignments")?;
+        for (path, value) in assignments {
+            let name = path.join(".");
             if let Some(route) = resolve_init_route(&routing, &name, &value)? {
                 routed.push(route);
             } else {
@@ -3764,12 +3828,17 @@ fn init_overrides(items: &[Item]) -> Result<std::collections::BTreeMap<String, S
         if directive_name(statement).as_deref() != Some(".INIT") {
             continue;
         }
-        let tokens = statement_tokens(&normalized_statement(statement))?;
-        let assignments = parse_assignments(&tokens[1..])?;
-        for (name, value) in assignments {
-            if name.starts_with("V(") || name.starts_with("I(") || name.contains('.') {
-                bail!("hierarchical/reactive SIMPLIS .INIT override is not yet supported: {name}");
-            }
+        let assignments =
+            model_preprocess_simplis::parse_init_statement(&normalized_statement(statement))?
+                .context("missing .INIT assignments")?;
+        for (path, value) in assignments {
+            let [name] = path.as_slice() else {
+                bail!(
+                    "unrouted hierarchical SIMPLIS .INIT override: {}",
+                    path.join(".")
+                );
+            };
+            let name = name.to_ascii_uppercase();
             if overrides.insert(name.clone(), value).is_some() {
                 bail!("duplicate SIMPLIS .INIT override for {name}");
             }
@@ -4081,7 +4150,7 @@ struct ScopeAnalysis {
     pwls_prefix: String,
     init: std::collections::BTreeMap<String, String>,
     pwl: std::collections::BTreeMap<String, RawPwlModel>,
-    charge: std::collections::BTreeMap<String, RawChargeModel>,
+    reactive: std::collections::BTreeMap<String, RawReactiveModel>,
     inductors: std::collections::BTreeMap<String, f64>,
     current_branches: std::collections::BTreeMap<String, String>,
     voltage_branches: std::collections::BTreeMap<String, (String, String)>,
@@ -4118,7 +4187,7 @@ impl ScopeAnalysis {
             pwls_prefix: pwls::scope_prefix(items, header),
             init: init_overrides(items)?,
             pwl: std::collections::BTreeMap::new(),
-            charge: std::collections::BTreeMap::new(),
+            reactive: std::collections::BTreeMap::new(),
             inductors: raw_inductor_values(items)?,
             current_branches: std::collections::BTreeMap::new(),
             voltage_branches: branch_voltage_nodes(items)?,
@@ -4151,10 +4220,10 @@ impl ScopeAnalysis {
             };
             self.collect_model_compatibility(statement, &name, &kind)?;
             match kind.as_str() {
-                "PWLC" => insert_unique_model(
-                    &mut self.charge,
-                    raw_charge_model(statement)?,
-                    "SIMPLIS PWLC model",
+                "PWLC" | "PWLL" => insert_unique_model(
+                    &mut self.reactive,
+                    raw_reactive_model(statement)?,
+                    "SIMPLIS reactive model",
                 )?,
                 "VPWLR" | "IPWLR" => insert_unique_model(
                     &mut self.pwl,
@@ -4461,7 +4530,7 @@ fn translate_deck_primitive(
         translate_raw_transformer(statement),
         translate_raw_mutual_inductance(statement, &models.inductors),
         translate_raw_pwl_device(statement, &models.pwl),
-        translate_raw_charge_device(statement, &models.charge),
+        translate_raw_reactive_device(statement, &models.reactive),
         translate_raw_srff_device(statement, &models.srff),
         translate_raw_comp_device(statement, &models.comp),
         translate_raw_digital_device(statement, &models.digital),
@@ -4849,7 +4918,7 @@ fn emit_deck_statement(
         return Ok(());
     }
     if raw_pwl_model(statement)?.is_some()
-        || raw_charge_model(statement)?.is_some()
+        || raw_reactive_model(statement)?.is_some()
         || raw_comp_model(statement)?.is_some()
         || raw_adc_schmitt_model(statement)?.is_some()
         || raw_srff_model(statement)?.is_some()
@@ -6340,15 +6409,24 @@ R1 out 0 1k
     }
 
     #[test]
-    fn raw_pwlc_nonzero_initial_voltage_fails_closed() {
+    fn raw_pwlc_nonzero_initial_voltage_sets_normalized_charge() -> Result<()> {
         let source = br"!CNON a 0 MC IC=1
-.MODEL MC PWLC NSEG=1 X0=0 Y0=0 X1=1 Y1=10p
+.MODEL MC PWLC NSEG=2 X0=-1 Y0=2p X1=0 Y1=4p X2=2 Y2=12p
 .end
 ";
-        let error = translate_simplis_deck(source)
-            .err()
-            .map(|value| value.to_string());
-        assert!(error.is_some_and(|value| value.contains("PWLC IC=1")));
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        let state = text
+            .lines()
+            .find(|line| line.starts_with("C__CNON_PWLC_Q "))
+            .context("missing explicit charge state")?;
+        let value = state
+            .split("IC=")
+            .nth(1)
+            .context("missing state initial charge")?
+            .parse::<f64>()?;
+        assert!((value - 0.6).abs() < 1e-15);
+        Ok(())
     }
 
     #[test]

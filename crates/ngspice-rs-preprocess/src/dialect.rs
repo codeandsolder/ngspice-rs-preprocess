@@ -16,7 +16,7 @@ use model_preprocess_simplis::{
     source_include_target,
 };
 use model_translate_simplis::{
-    capture_artifact_waveforms, capture_linked_waveforms, capture_passive_initial_conditions,
+    capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms, capture_passive_initial_conditions,
     lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_expanded_library,
 };
 use std::{
@@ -452,7 +452,7 @@ fn linked(
     } = catalog(request, options, cancellation, session, context)?;
     device_identities.extend(catalog_identities);
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
-    let initial_conditions = if request.format == InputFormat::SimetrixDeck {
+    let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
         lower_simetrix_linked_runtime(&mut linked)?;
         Some(capture_passive_initial_conditions(&mut linked)?)
     } else {
@@ -464,7 +464,16 @@ fn linked(
         .iter()
         .map(|library| library.filename.as_str())
         .collect::<BTreeSet<_>>();
-    let translated_root = translate_simplis_deck(&linked.root_bytes)?;
+    let mut translated_root = translate_simplis_deck(&linked.root_bytes)?;
+    if request.format == InputFormat::SimplisDeck {
+        initial_conditions = Some(super::passive_ic::InitialConditions {
+            mode: Some("1".to_owned()),
+            ..Default::default()
+        });
+    }
+    if let Some(policy) = &mut initial_conditions {
+        capture_artifact_initial_conditions(&mut translated_root.bytes, "deck.cir", policy)?;
+    }
     check_closed_includes(&translated_root.bytes, &known)?;
     let mut remaining = options
         .output_bytes
@@ -473,8 +482,11 @@ fn linked(
     let mut companions = Vec::new();
     let mut dependencies = Vec::new();
     for library in &linked.libraries {
-        let translated = translate_simplis_expanded_library(&library.bytes)
+        let mut translated = translate_simplis_expanded_library(&library.bytes)
             .with_context(|| format!("translating linked library {}", library.source_id))?;
+        if let Some(policy) = &mut initial_conditions {
+            capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
+        }
         check_closed_includes(&translated.bytes, &known)?;
         remaining = remaining
             .checked_sub(translated.bytes.len())
@@ -510,7 +522,11 @@ fn linked(
             initialization.validate_artifact(&artifact.filename, &artifact.bytes)?;
         }
     }
-    bundle.initial_conditions = initial_conditions;
+    bundle.initial_conditions = initial_conditions.filter(|policy| {
+        request.format == InputFormat::SimetrixDeck
+            || !policy.devices.is_empty()
+            || !policy.nodes.is_empty()
+    });
     bundle.waveforms = waveforms;
     Ok(bundle)
 }
