@@ -326,6 +326,53 @@ pub fn replace_span(
     }
 }
 
+pub fn remove_spans(
+    statement: &Statement,
+    input: &[u8],
+    spans: &[Range<usize>],
+    edits: &mut Vec<Edit>,
+) {
+    let replacements = spans
+        .iter()
+        .map(|span| {
+            let start = statement.text[..span.start].trim_ascii_end().len();
+            (start..span.end, Vec::new())
+        })
+        .collect::<Vec<_>>();
+    replace_spans(statement, input, &replacements, edits);
+}
+
+/// Replace logical fields and comment wholly consumed continuations.
+pub fn replace_spans(
+    statement: &Statement,
+    input: &[u8],
+    replacements: &[Edit],
+    edits: &mut Vec<Edit>,
+) {
+    let mut removed = Vec::new();
+    for (span, replacement) in replacements {
+        let ranges = statement.source_ranges(span.clone());
+        for (index, range) in ranges.into_iter().enumerate() {
+            if index == 0 && !replacement.is_empty() {
+                edits.push((range, replacement.clone()));
+            } else {
+                removed.push(range.clone());
+                edits.push((range, Vec::new()));
+            }
+        }
+    }
+    for (plus, code) in &statement.continuations {
+        if input[code.clone()].iter().enumerate().all(|(i, byte)| {
+            byte.is_ascii_whitespace()
+                || removed
+                    .iter()
+                    .any(|range| range.contains(&(code.start + i)))
+        }) {
+            edits.push((*plus..*plus + 1, vec![b'*']));
+        }
+    }
+}
+
 const fn identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.') || !byte.is_ascii()
 }

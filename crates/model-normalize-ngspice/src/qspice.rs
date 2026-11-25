@@ -1,9 +1,10 @@
 //! Source-scoped QSPICE plaintext normalization. No compiled device execution.
+mod analysis;
 mod bindings;
 mod numeric;
 mod sources;
 use crate::{
-    lexical::{Edit, Statement, apply_edits, replace_span, statements, tokens},
+    lexical::{Edit, Statement, apply_edits, remove_spans, statements, tokens},
     linked_source::{LinkedSource, RootKind, SourceOrigin},
     model_card::{parse_model_card, parse_spice_constant},
     parameter_scope::declarations::Declarations,
@@ -280,8 +281,7 @@ fn lower_passive(
                         "nonzero or symbolic Rpar/Rser requires a qualified physical device representation",
                     ));
                 }
-                removed.extend(statement.source_ranges(span.clone()));
-                replace_span(statement, span, b"", edits);
+                removed.push(span);
             }
             index += 3;
         } else {
@@ -295,83 +295,7 @@ fn lower_passive(
             "implicit inductor Rpar depends on analysis; specify Rpar=0 for an ideal inductor",
         ));
     }
-    for (plus, code) in &statement.continuations {
-        if input[code.clone()]
-            .iter()
-            .enumerate()
-            .all(|(offset, byte)| {
-                byte.is_ascii_whitespace()
-                    || removed
-                        .iter()
-                        .any(|range| range.contains(&(code.start + offset)))
-            })
-        {
-            edits.push((*plus..*plus + 1, vec![b'*']));
-        }
-    }
-    Ok(())
-}
-
-fn lower_tran(
-    statement: &Statement,
-    origin: &SourceOrigin,
-    fields: &[Range<usize>],
-    edits: &mut Vec<Edit>,
-) -> Result<()> {
-    let text = &statement.text;
-    let mut args = &fields[1..];
-    if args
-        .last()
-        .is_some_and(|span| text[span.clone()].eq_ignore_ascii_case(b"uic"))
-    {
-        args = &args[..args.len() - 1];
-    }
-    let [interval, duration, start, maximum] = args else {
-        return Err(reject(
-            origin,
-            Feature::TransientTiming,
-            "explicit step, stop, zero start and positive maxstep required until simulator defaults are qualified",
-        ));
-    };
-    let values = [interval, duration, start, maximum].map(|span| literal(&text[span.clone()]));
-    let [
-        Some(interval_value),
-        Some(duration_value),
-        Some(start_value),
-        Some(maximum_value),
-    ] = values
-    else {
-        return Err(reject(
-            origin,
-            Feature::TransientTiming,
-            "symbolic time fields need analysis-specific parameter binding",
-        ));
-    };
-    let end = interval_value.max(duration_value);
-    if interval_value < 0.0
-        || duration_value < 0.0
-        || end <= 0.0
-        || start_value != 0.0
-        || maximum_value <= 0.0
-    {
-        return Err(reject(
-            origin,
-            Feature::TransientTiming,
-            "time window or timestep is not a qualified native equivalent",
-        ));
-    }
-    // QSPICE ignores the first interval except that it can extend the stop
-    // time. Native SPICE requires a positive output interval.
-    if interval_value > duration_value {
-        replace_span(statement, duration.clone(), &text[interval.clone()], edits);
-    }
-    let native_interval = end.min(maximum_value);
-    replace_span(
-        statement,
-        interval.clone(),
-        native_interval.to_string().as_bytes(),
-        edits,
-    );
+    remove_spans(statement, input, &removed, edits);
     Ok(())
 }
 
@@ -448,7 +372,6 @@ fn lower_statement(
             Feature::Directive,
             "analysis or output directive needs source-specific qualification",
         )),
-        b".tran" => lower_tran(statement, origin, fields, edits),
         [b'v' | b'i', ..] => sources::rewrite(statement, origin, fields, edits),
         [b'l' | b'c', ..] => lower_passive(statement, origin, fields, edits, input),
         [b'a' | b'u' | b'y' | b'n' | b'o' | b'@', ..] => Err(reject(
@@ -495,12 +418,17 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Option<Vec<
     let lowered = apply_edits(body, numeric_edits);
     let body = lowered.as_deref().unwrap_or(body);
     let mut edits = Vec::new();
-    for statement in statements(body)? {
+    let source_statements = statements(body)?;
+    let settings = analysis::collect(&source_statements, linked, title_len != 0, &declarations)?;
+    for statement in source_statements {
         let line = statement.line + usize::from(title_len != 0);
         let origin = linked
             .origin(line)
             .context("missing QSPICE source location")?;
         let fields = tokens(&statement.text)?;
+        if settings.rewrite(&statement, origin, &fields, &mut edits, body)? {
+            continue;
+        }
         bindings::rewrite(&statement, origin, &declarations, &fields, &mut edits, body)?;
         lower_statement(&statement, origin, &fields, &mut edits, body)
             .with_context(|| format!("QSPICE source {}:{}", origin.path.display(), origin.line))?;

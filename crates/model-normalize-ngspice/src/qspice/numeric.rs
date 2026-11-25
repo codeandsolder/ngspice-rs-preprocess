@@ -260,6 +260,16 @@ pub(super) fn rewrite(
         }
         return Ok(());
     }
+    if super::analysis::is_options(name) {
+        for parameter in super::analysis::option_fields(text, first.end)? {
+            if parameter.name.eq_ignore_ascii_case("maxstep")
+                && let Some(span) = parameter.span.value
+            {
+                rewrite_span(statement, origin, span, edits)?;
+            }
+        }
+        return Ok(());
+    }
     if name.eq_ignore_ascii_case(b".dc") {
         // Each sweep has an opaque source name followed by start/stop/step.
         for (index, field) in fields.iter().enumerate().skip(1) {

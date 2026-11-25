@@ -46,7 +46,9 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 
 QSPICE source support is under qualification: whole-file and selected-section
 library references, source-relative paths, explicitly ideal passive branches
-and explicitly bounded transient windows are normalized with source provenance.
+and transient timing are normalized with source provenance. Short and symbolic
+transient forms preserve the candidate-bound time window; explicit MAXSTEP
+and ABSOLUTETIME options are projected into native analysis fields.
 Numeric suffix and embedded-decimal spellings, literal cumulative PWL times,
 and explicit positive-duration PULSE timing are normalized without changing
 node identifiers or branch identity.

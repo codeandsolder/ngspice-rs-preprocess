@@ -34,7 +34,7 @@ pub enum Visibility<T> {
 
 pub struct Declarations {
     scopes: Vec<Scope>,
-    boundaries: Vec<(usize, usize)>,
+    boundaries: Vec<(usize, usize, bool)>,
 }
 
 fn assignment_names(text: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -65,7 +65,7 @@ impl Declarations {
     pub(crate) fn new(statements: &[Statement]) -> std::result::Result<Self, DeclarationError> {
         let mut result = Self {
             scopes: vec![Scope::default()],
-            boundaries: vec![(0, 0)],
+            boundaries: vec![(0, 0, false)],
         };
         let mut scope = 0;
         let mut conditional_depth = 0usize;
@@ -89,44 +89,22 @@ impl Declarations {
                 }
                 match name.as_slice() {
                     b".subckt" => {
-                        let fields = tokens(text)?;
-                        let next = result.scopes.len();
-                        let identifier = fields.get(1).context("missing subcircuit name")?;
-                        result.scopes.push(Scope {
-                            parent: Some(scope),
-                            name: Some(text[identifier.clone()].to_ascii_lowercase()),
-                            ..Scope::default()
-                        });
-                        scope = next;
-                        result.boundaries.push((statement.line, scope));
-                        result.record_parameters(
-                            scope,
-                            &text[identifier.end..],
-                            conditional_depth != 0,
-                        )?;
+                        scope = result.open_scope(scope, statement, conditional_depth != 0)?;
                     }
                     b".ends" => {
-                        let fields = tokens(text)?;
-                        let current = &result.scopes[scope];
-                        if let Some(identifier) = fields.get(1) {
-                            ensure!(
-                                current.name.as_ref().is_some_and(
-                                    |name| name.eq_ignore_ascii_case(&text[identifier.clone()])
-                                ),
-                                "line {}: mismatched subcircuit end",
-                                statement.line
-                            );
-                        }
-                        scope = current
-                            .parent
-                            .with_context(|| format!("line {}: unmatched .ends", statement.line))?;
-                        result.boundaries.push((statement.line, scope));
+                        scope = result.close_scope(scope, statement, conditional_depth != 0)?;
                     }
-                    b".if" => conditional_depth += 1,
+                    b".if" => {
+                        conditional_depth += 1;
+                        result.boundaries.push((statement.line, scope, true));
+                    }
                     b".endif" => {
                         conditional_depth = conditional_depth
                             .checked_sub(1)
                             .context("unmatched .endif")?;
+                        result
+                            .boundaries
+                            .push((statement.line, scope, conditional_depth != 0));
                     }
                     b".param" => {
                         result.record_parameters(
@@ -165,6 +143,52 @@ impl Declarations {
         Ok(result)
     }
 
+    fn open_scope(
+        &mut self,
+        parent: usize,
+        statement: &Statement,
+        conditional: bool,
+    ) -> Result<usize> {
+        let text = &statement.text;
+        let fields = tokens(text)?;
+        let identifier = fields.get(1).context("missing subcircuit name")?;
+        let scope = self.scopes.len();
+        self.scopes.push(Scope {
+            parent: Some(parent),
+            name: Some(text[identifier.clone()].to_ascii_lowercase()),
+            ..Scope::default()
+        });
+        self.boundaries.push((statement.line, scope, conditional));
+        self.record_parameters(scope, &text[identifier.end..], conditional)?;
+        Ok(scope)
+    }
+
+    fn close_scope(
+        &mut self,
+        scope: usize,
+        statement: &Statement,
+        conditional: bool,
+    ) -> Result<usize> {
+        let text = &statement.text;
+        let fields = tokens(text)?;
+        let current = &self.scopes[scope];
+        if let Some(identifier) = fields.get(1) {
+            ensure!(
+                current
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&text[identifier.clone()])),
+                "line {}: mismatched subcircuit end",
+                statement.line
+            );
+        }
+        let parent = current
+            .parent
+            .with_context(|| format!("line {}: unmatched .ends", statement.line))?;
+        self.boundaries.push((statement.line, parent, conditional));
+        Ok(parent)
+    }
+
     fn record_parameters(&mut self, scope: usize, text: &[u8], conditional: bool) -> Result<()> {
         let names = assignment_names(text)?;
         if conditional {
@@ -175,8 +199,19 @@ impl Declarations {
         Ok(())
     }
 
+    pub(crate) fn unconditional_root(&self, line: usize) -> bool {
+        let boundary = self
+            .boundaries
+            .partition_point(|(start, _, _)| *start <= line);
+        self.boundaries
+            .get(boundary.saturating_sub(1))
+            .is_some_and(|(_, scope, conditional)| *scope == 0 && !conditional)
+    }
+
     fn ancestry(&self, line: usize) -> impl Iterator<Item = &Scope> {
-        let boundary = self.boundaries.partition_point(|(start, _)| *start <= line);
+        let boundary = self
+            .boundaries
+            .partition_point(|(start, _, _)| *start <= line);
         let scope = boundary
             .checked_sub(1)
             .map(|index| self.boundaries[index].1);

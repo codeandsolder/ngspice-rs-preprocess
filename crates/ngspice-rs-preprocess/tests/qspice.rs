@@ -95,7 +95,7 @@ fn diagnostics_preserve_original_resource_and_line() -> Result<()> {
             &b"* comment\n* undefined \x81\n"[..],
             Feature::SourceEncoding,
         ),
-        (&b"* comment\n.tran 1m\n"[..], Feature::TransientTiming),
+        (&b"* comment\n.tran -1m\n"[..], Feature::TransientTiming),
     ] {
         fs::write(&part, content)?;
         let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
@@ -454,6 +454,82 @@ fn bjt_assertions_use_visible_model_and_preserve_terminals() -> Result<()> {
             .downcast_ref::<Unsupported>()
             .with_context(|| format!("{error:#}"))?;
         assert_eq!(diagnostic.feature, Feature::Binding);
+    }
+    Ok(())
+}
+
+#[test]
+fn transient_window_defaults_and_symbolic_options() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("deck.cir");
+    let source = "* timing\nV1 a 0 1\nR1 a b 1k\nC1 b 0 1u\n.tran 2m UIC\n.end\n";
+    fs::write(&root, source)?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let output = std::str::from_utf8(&bundle.primary.bytes)?;
+    let tran = output
+        .lines()
+        .find(|line| line.starts_with(".tran"))
+        .context("missing transient")?;
+    let fields = tran.split_ascii_whitespace().collect::<Vec<_>>();
+    assert_eq!(&fields[2..], ["2m", "0", fields[1], "UIC"]);
+    ensure!(
+        (fields[1].parse::<f64>()? - 0.002 / 1024.0).abs() < 1e-15,
+        "{tran}"
+    );
+
+    let source = "* timing\n.param duration=2m window=1m frequency=1000\nV1 a 0 1\nR1 a b 1k\nC1 b 0 1u\n.tran 0 duration window UIC\n.option reltol=1e-5\n+ maxstep=1/frequency/1000\n.option ABSOLUTETIME\n.end\n";
+    fs::write(&root, source)?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let output = std::str::from_utf8(&bundle.primary.bytes)?;
+    ensure!(output.contains("{window}"), "{output}");
+    ensure!(output.contains("{1/frequency/1000}"), "{output}");
+    ensure!(output.contains(".option reltol=1e-5"), "{output}");
+    ensure!(
+        !output.to_ascii_lowercase().contains("maxstep="),
+        "{output}"
+    );
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        bail!("missing source map");
+    };
+    assert_eq!(lines.len(), source.lines().count());
+
+    let rows = reference(dir.path(), source, "run\nwrdata witness.dat v(b)")?;
+    let first = rows.first().context("no transient samples")?;
+    let last = rows.last().context("no transient samples")?;
+    ensure!(first[0] >= 0.001 && first[0] <= 0.001_001_1, "{first:?}");
+    ensure!((last[0] - 0.002).abs() < 1e-12, "{last:?}");
+    for row in rows {
+        let [time, voltage] = row.as_slice() else {
+            bail!("invalid transient trace");
+        };
+        ensure!((voltage + (-time / 0.001).exp_m1()).abs() < 2e-4, "{row:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn transient_rejects_unqualified_output_time_and_option_precedence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("deck.cir");
+    for (source, line) in [
+        ("Title\n.tran 0 2m 1m\n.end\n", 2),
+        ("Title\n.tran 0 2m 0 2u\n.option maxstep=1u\n.end\n", 2),
+        ("Title\n.option maxstep=0\n.tran 2m\n.end\n", 2),
+        ("Title\n.option maxstep=1u\n.end\n", 2),
+        (
+            "Title\n.if (1)\n.option maxstep=1u\n.endif\n.tran 2m\n.end\n",
+            3,
+        ),
+    ] {
+        fs::write(&root, source)?;
+        let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+            .err()
+            .context("unqualified timing accepted")?;
+        let diagnostic = error
+            .downcast_ref::<Unsupported>()
+            .with_context(|| format!("missing structured diagnostic: {error:#}"))?;
+        assert_eq!(diagnostic.feature, Feature::TransientTiming);
+        assert_eq!(diagnostic.line, line);
     }
     Ok(())
 }

@@ -4,7 +4,7 @@
 
 use super::{Feature, literal, reject};
 use crate::{
-    lexical::{Edit, Statement, replace_span},
+    lexical::{Edit, Statement, remove_spans, replace_span},
     linked_source::SourceOrigin,
     parameter_scope::declarations::{Declarations, Visibility},
 };
@@ -134,23 +134,9 @@ fn bjt_polarity(
                 "BJT polarity assertion contradicts the visible model declaration",
             ));
         }
-        removals.extend(statement.source_ranges(field.clone()));
-        replace_span(statement, field.clone(), b"", edits);
+        removals.push(field.clone());
     }
-    for (plus, code) in &statement.continuations {
-        if input[code.clone()]
-            .iter()
-            .enumerate()
-            .all(|(offset, byte)| {
-                byte.is_ascii_whitespace()
-                    || removals
-                        .iter()
-                        .any(|range| range.contains(&(code.start + offset)))
-            })
-        {
-            edits.push((*plus..*plus + 1, vec![b'*']));
-        }
-    }
+    remove_spans(statement, input, &removals, edits);
     Ok(())
 }
 
