@@ -9,7 +9,8 @@ use super::{
     emit_logic_event, emit_logic_gate, emit_logic_input_loads, emit_logic_output,
     emit_logic_voltage, indexed_points, integer_parameter, model_statement_tokens,
     normalized_statement, numeric_parameter, parse_assignments, sanitized_name, statement_tokens,
-    translate_charge_capacitor, translate_flux_inductor, translate_ipwlr, translate_vpwlr, validate_node, write_number,
+    translate_charge_capacitor, translate_flux_inductor, translate_ipwlr, translate_vpwlr,
+    validate_node, write_number,
 };
 #[cfg(test)]
 use crate::syntax::logical_statements;
@@ -18,6 +19,7 @@ use crate::syntax::{
     model_header, parse_items, simple_assignment_span, simple_assignment_value,
 };
 use anyhow::{Context, Result, bail};
+use model_normalize_ngspice::passive_ic::PassiveKind;
 use serde::Serialize;
 pub use simetrix_runtime::lower_simetrix_linked_runtime;
 use std::fmt::Write as _;
@@ -337,7 +339,7 @@ struct RawPwlModel {
 #[derive(Clone, Debug)]
 struct RawReactiveModel {
     points: Vec<Point>,
-    kind: model_normalize_ngspice::passive_ic::PassiveKind,
+    kind: PassiveKind,
 }
 
 fn raw_reactive_model(statement: &str) -> Result<Option<(String, RawReactiveModel)>> {
@@ -353,7 +355,6 @@ fn raw_reactive_model(statement: &str) -> Result<Option<(String, RawReactiveMode
     if tokens.len() < 4 {
         return Ok(None);
     }
-    use model_normalize_ngspice::passive_ic::PassiveKind;
     let kind = match tokens[2].to_ascii_uppercase().as_str() {
         "PWLC" => PassiveKind::Capacitor,
         "PWLL" => PassiveKind::Inductor,
@@ -362,10 +363,10 @@ fn raw_reactive_model(statement: &str) -> Result<Option<(String, RawReactiveMode
     let parameters = parse_assignments(&tokens[3..])?;
     let segments = integer_parameter(&parameters, "NSEG")?;
     if segments == 0 {
-        bail!("SIMPLIS PWLC model {} has zero segments", tokens[1]);
+        bail!("SIMPLIS reactive model {} has zero segments", tokens[1]);
     }
     let points = indexed_points(&parameters, segments, "X", "Y")
-        .with_context(|| format!("parsing SIMPLIS PWLC model {}", tokens[1]))?;
+        .with_context(|| format!("parsing SIMPLIS reactive model {}", tokens[1]))?;
     Ok(Some((
         tokens[1].to_ascii_uppercase(),
         RawReactiveModel { points, kind },
@@ -389,7 +390,6 @@ fn translate_raw_reactive_device(
     let Some(model) = models.get(&tokens[3].to_ascii_uppercase()) else {
         return Ok(None);
     };
-    use model_normalize_ngspice::passive_ic::PassiveKind;
     let flux = name
         .get(..2)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!L"));
