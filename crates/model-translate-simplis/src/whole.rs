@@ -20,7 +20,7 @@ use crate::syntax::{
     Item, Subcircuit, electrical_statements, file_boundary, matching_behavioral_delimiter,
     model_header, parse_items, simple_assignment_span, simple_assignment_value,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::passive_ic::PassiveKind;
 use serde::Serialize;
 pub use simetrix_runtime::lower_simetrix_linked_runtime;
@@ -352,6 +352,7 @@ fn model_value<'a>(
 ) -> Option<&'a str> {
     card.parameters
         .iter()
+        .rev()
         .find(|field| field.name.eq_ignore_ascii_case(name) && field.expression.is_some())
         .and_then(|field| field.expression.as_deref())
 }
@@ -4459,7 +4460,7 @@ impl ScopeAnalysis {
                     _ => Some(String::new()),
                 }
             } else {
-                rewrite_simetrix_model_compat(&normalized, &card)?.map(|mut text| {
+                rewrite_simetrix_model_compat(&normalized, &card).map(|mut text| {
                     text.push('\n');
                     text
                 })
@@ -4842,7 +4843,7 @@ fn translate_pspice_mos_series_resistance(
 fn rewrite_simetrix_model_compat(
     statement: &str,
     card: &model_normalize_ngspice::model_card::ModelCard,
-) -> Result<Option<String>> {
+) -> Option<String> {
     let kind = card.family.to_ascii_uppercase();
     let temperature_model = matches!(kind.as_str(), "D" | "R" | "RES");
     let mos = matches!(kind.as_str(), "NMOS" | "PMOS");
@@ -4870,10 +4871,15 @@ fn rewrite_simetrix_model_compat(
             continue;
         }
         let replacement = match name.as_str() {
-            "VLEVEL" if level_alias => {
-                Some(("LEVEL", if promote_level { "8" } else { value.as_str() }))
-            }
-            "LEVEL" if promote_level => Some(("LEVEL", "8")),
+            "VLEVEL" if level_alias => Some((
+                "LEVEL",
+                if promote_level && value == "7" {
+                    "8"
+                } else {
+                    value.as_str()
+                },
+            )),
+            "LEVEL" if promote_level && value == "7" => Some(("LEVEL", "8")),
             "TO" if vto_alias => Some(("VTO", value.as_str())),
             _ => None,
         };
@@ -4884,7 +4890,7 @@ fn rewrite_simetrix_model_compat(
             );
         }
     }
-    Ok((output != statement).then_some(output))
+    (output != statement).then_some(output)
 }
 
 fn apply_simetrix_temperature(
@@ -6055,7 +6061,7 @@ X1 c b e T
     fn model_compat_handles_comma_assignments_and_legacy_mos_typos() -> Result<()> {
         let source = ".model pox pmos(vlevel=3,to=-0.75,kp=195u,rd=.5,rs=.5,rg=1,rb=1,cgso=66p)";
         let card = model_normalize_ngspice::model_card::parse_model_card(source, 1, &[])?;
-        let rewritten = rewrite_simetrix_model_compat(source, &card)?
+        let rewritten = rewrite_simetrix_model_compat(source, &card)
             .context("expected MOS compatibility rewrite")?;
         let upper = rewritten.to_ascii_uppercase();
         assert!(upper.contains("LEVEL=3"));
@@ -6066,6 +6072,24 @@ X1 c b e T
         assert!(!upper.contains(" RB="));
         assert!(!upper.contains(",RB="));
         assert!(upper.contains("CGSO=66P"));
+        Ok(())
+    }
+
+    #[test]
+    fn model_compat_rewrites_only_ordered_top_level_fields() -> Result<()> {
+        let source = r#".model mos NMOS(VLEVEL=3, VLEVEL = 7, VERSION=3.1, MOBMOD=3, RG=2, RG=4, RB=5, RGO=6, quoted="RG=9 VLEVEL=17", nested={max(x, f(RG=8))})"#;
+        let card = model_normalize_ngspice::model_card::parse_model_card(source, 1, &[])?;
+        assert_eq!(model_value(&card, "RG"), Some("4"));
+        let rewritten =
+            rewrite_simetrix_model_compat(source, &card).context("expected MOS rewrite")?;
+        let result = model_normalize_ngspice::model_card::parse_model_card(&rewritten, 1, &[])?;
+        assert_eq!(model_value(&result, "LEVEL"), Some("8"));
+        assert_eq!(result.parameters[0].expression.as_deref(), Some("3"));
+        assert!(model_value(&result, "RG").is_none());
+        assert!(model_value(&result, "RB").is_none());
+        assert_eq!(model_value(&result, "RGO"), Some("6"));
+        assert_eq!(model_value(&result, "quoted"), Some(r#""RG=9 VLEVEL=17""#));
+        assert_eq!(model_value(&result, "nested"), Some("{max(x, f(RG=8))}"));
         Ok(())
     }
 
@@ -7251,7 +7275,7 @@ M1 d g s s Bsim3 W=2 L=0.5u
     fn level7_with_discrete_cgd_signature_is_not_rewritten_as_bsim3() -> Result<()> {
         let source = ".MODEL OLD NMOS (LEVEL=7 VTO=3 KP=2 CGDMAX=1n CGDMIN=10p XG1CGD=0.1 XG2CGD=0.5 VTCGD=0)";
         let card = model_normalize_ngspice::model_card::parse_model_card(source, 1, &[])?;
-        assert!(rewrite_simetrix_model_compat(source, &card)?.is_none());
+        assert!(rewrite_simetrix_model_compat(source, &card).is_none());
         Ok(())
     }
 
