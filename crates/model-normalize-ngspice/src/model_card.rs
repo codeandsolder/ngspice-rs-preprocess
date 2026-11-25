@@ -648,6 +648,26 @@ mod tests {
     }
 
     #[test]
+    fn standalone_mapping_fields_use_the_model_grammar() -> Result<()> {
+        let source = r#"   (DEVICE="mos 1", LIMIT(VDS, VGS) = (*, 400), FLAG, USER [1, {x + y}])"#;
+        let fields = parse_parameter_fields(source, &["USER"])?;
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[1].name, "LIMIT(VDS, VGS)");
+        assert_eq!(fields[1].expression.as_deref(), Some("(*, 400)"));
+        assert_eq!(fields[2].expression, None);
+        assert_eq!(fields[3].expression.as_deref(), Some("[1, {x + y}]"));
+        for field in fields {
+            assert_eq!(&source[field.span.name], field.name);
+            assert_eq!(
+                field.span.value.map(|span| &source[span]),
+                field.expression.as_deref()
+            );
+        }
+        assert!(parse_parameter_fields("DEVICE= LEVEL=2", &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn malformed_fields_are_not_missing_fields() {
         for source in [
             ".model m D (IS= RS=2)",
