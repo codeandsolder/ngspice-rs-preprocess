@@ -872,6 +872,94 @@ S1 c 0 c 0 swmod IC=0
     Ok(())
 }
 
+// Direct SIMPLIS 9.40 transient, with deliberately wrong initial switch
+// hints, asymmetric IPWLR conductance and a bidirectional ICQPOS load.
+fn current_controlled_switch_vendor_trace(runtime: &Path) -> Result<()> {
+    let source = "Vref rtn 0 .75
+I1 rtn a PWL(0 -2 1u -2 4u 2 7u -2 8u -2 9u -2)
+!R1 a rtn MR IC=1
+Vbias p rtn 1
+R1 p neg 100
+R2 p pos 100
+R3 p qpos 100
+S1 pos rtn !R1 MS IC=CLOSE
+S2 neg rtn !R1 MN IC=OPEN
+Q1 qpos rtn !R1 MQ IC=CLOSE
+.MODEL MR IPWLR NSEG=2 X0=-1 Y0=-2 X1=0 Y1=0 X2=1 Y2=4
+.MODEL MS ICSW RON=10 ROFF=1Meg TH=0 HYSTWD=1 LOGIC=POS
+.MODEL MN ICSW RON=10 ROFF=1Meg TH=0 HYSTWD=1 LOGIC=NEG
+.MODEL MQ ICQPOS VSAT=0 RSAT=10 ROFF=1Meg GAIN=.002 TH=0 HYSTWD=1 LOGIC=POS LEVEL=2 IFLOW=BIDIR
+.end
+";
+    let off = 0.999_900_009_999;
+    let on = 0.090_909_090_909_1;
+    let rows = [
+        (0.0, -1.0, on, off, off),
+        (2.0, -0.333_333_333_333, on, off, off),
+        (2.4, -0.066_666_666_667, on, off, off),
+        (2.8, 0.1, on, off, off),
+        (3.0, 0.166_666_666_667, off, on, 0.766_590_007_666),
+        (3.2, 0.233_333_333_333, off, on, 0.713_262_007_133),
+        (4.0, 0.5, off, on, 0.499_950_004_999),
+        (4.8, 0.233_333_333_333, off, on, 0.713_262_007_133),
+        (5.2, 0.1, off, on, 0.819_918_008_199),
+        (5.6, -0.066_666_666_667, off, on, 0.926_574_009_266),
+        (6.0, -0.333_333_333_333, on, off, off),
+        (7.0, -1.0, on, off, off),
+        (8.0, -1.0, on, off, off),
+    ];
+    let checks = rows
+        .into_iter()
+        .flat_map(|(time, a, neg, pos, qpos)| {
+            [("a", a), ("neg", neg), ("pos", pos), ("qpos", qpos)]
+                .map(|(node, value)| (node.to_owned(), time, value))
+        })
+        .collect::<Vec<_>>();
+    verify(runtime, source, &checks)
+}
+
+// The same signed current flows through three series passives and the
+// independent source. Each branch must produce the same switch trajectory,
+// regardless of whether the implementation already has a current vector.
+fn current_controlled_passive_branch_chain(runtime: &Path) -> Result<()> {
+    let source = "Vref rtn 0 .75
+I1 rtn a PWL(0 -2 1u -2 4u 2 7u -2 9u -2)
+Rctrl a b 1
+!Rctrl b c MR IC=1
+!Lctrl c rtn ML IC=-2
+Vbias p rtn 1
+R1 p o1 100
+R2 p o2 100
+R3 p o3 100
+R4 p o4 100
+S1 o1 rtn Rctrl MS IC=CLOSE
+S2 o2 rtn !Rctrl MS IC=CLOSE
+S3 o3 rtn !Lctrl MS IC=CLOSE
+S4 o4 rtn I1 MS IC=CLOSE
+.MODEL MR VPWLR NSEG=2 X0=-1 Y0=-2 X1=0 Y1=0 X2=1 Y2=4
+.MODEL ML PWLL NSEG=2 X0=-1 Y0=-1m X1=0 Y1=0 X2=1 Y2=2m
+.MODEL MS ICSW RON=10 ROFF=1Meg TH=0 HYSTWD=1 LOGIC=POS
+.end
+";
+    let off = 1e6 / (1e6 + 100.0);
+    let on = 10.0 / 110.0;
+    let checks = ["o1", "o2", "o3", "o4"]
+        .into_iter()
+        .flat_map(|node| {
+            [
+                (0.0, off),
+                (2.8, off),
+                (3.2, on),
+                (5.6, on),
+                (6.0, off),
+                (8.0, off),
+            ]
+            .map(|(time, value)| (node.to_owned(), time, value))
+        })
+        .collect::<Vec<_>>();
+    verify(runtime, source, &checks)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -894,6 +982,8 @@ fn main() -> Result<()> {
     timed_switch_runtime_parameters(&runtime)?;
     timed_switch_small_signal_and_stiff_load(&runtime)?;
     timed_switch_closed_loop(&runtime)?;
+    current_controlled_switch_vendor_trace(&runtime)?;
+    current_controlled_passive_branch_chain(&runtime)?;
     println!("All native ngspice logic regressions passed");
     Ok(())
 }

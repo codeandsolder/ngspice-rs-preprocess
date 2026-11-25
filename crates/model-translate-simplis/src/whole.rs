@@ -8,9 +8,9 @@ use super::{
     LogicThresholds, LogicTiming, Point, Translation, TranslationKind, emit_digital_buffer,
     emit_logic_event, emit_logic_gate, emit_logic_input_loads, emit_logic_output,
     emit_logic_voltage, indexed_points, integer_parameter, model_statement_tokens,
-    normalized_statement, numeric_parameter, parse_assignments, sanitized_name, statement_tokens,
-    translate_charge_capacitor, translate_flux_inductor, translate_ipwlr, translate_vpwlr,
-    validate_node, write_number,
+    normalized_statement, numeric_parameter, parse_assignments, read_indexed_points,
+    sanitized_name, statement_tokens, translate_charge_capacitor, translate_flux_inductor,
+    translate_ipwlr, translate_vpwlr, validate_node, validate_resistor_end_slopes, write_number,
 };
 #[cfg(test)]
 use crate::syntax::logical_statements;
@@ -362,9 +362,7 @@ fn raw_reactive_model(statement: &str) -> Result<Option<(String, RawReactiveMode
     };
     let parameters = parse_assignments(&tokens[3..])?;
     let segments = integer_parameter(&parameters, "NSEG")?;
-    if segments == 0 {
-        bail!("SIMPLIS reactive model {} has zero segments", tokens[1]);
-    }
+    validate_pwl_segment_count(segments)?;
     let points = indexed_points(&parameters, segments, "X", "Y")
         .with_context(|| format!("parsing SIMPLIS reactive model {}", tokens[1]))?;
     Ok(Some((
@@ -872,6 +870,14 @@ struct RawCompModel {
     delay: f64,
 }
 
+fn validate_pwl_segment_count(segments: usize) -> Result<()> {
+    anyhow::ensure!(
+        (2..=255).contains(&segments),
+        "SIMPLIS PWL model NSEG must be in 2..=255"
+    );
+    Ok(())
+}
+
 fn raw_pwl_model(statement: &str) -> Result<Option<(String, RawPwlModel)>> {
     let trimmed = statement.trim_start();
     if !trimmed
@@ -895,11 +901,10 @@ fn raw_pwl_model(statement: &str) -> Result<Option<(String, RawPwlModel)>> {
     };
     let parameters = parse_assignments(&tokens[3..])?;
     let segments = integer_parameter(&parameters, "NSEG")?;
-    if segments == 0 {
-        bail!("SIMPLIS PWL model {} has zero segments", tokens[1]);
-    }
-    let points = indexed_points(&parameters, segments, "X", "Y")
+    validate_pwl_segment_count(segments)?;
+    let points = read_indexed_points(&parameters, segments, "X", "Y")
         .with_context(|| format!("parsing SIMPLIS PWL model {}", tokens[1]))?;
+    validate_resistor_end_slopes(&points, kind == RawPwlKind::Ipwlr)?;
     Ok(Some((
         tokens[1].to_ascii_uppercase(),
         RawPwlModel { kind, points },
@@ -948,7 +953,7 @@ fn raw_comp_model(statement: &str) -> Result<Option<(String, RawCompModel)>> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RawQControl {
+enum SwitchControl {
     Voltage,
     Current,
 }
@@ -967,7 +972,7 @@ enum RawQFlow {
 
 #[derive(Clone, Debug)]
 struct RawVcqModel {
-    control: RawQControl,
+    control: SwitchControl,
     polarity: RawQPolarity,
     vsat: f64,
     rsat: f64,
@@ -995,10 +1000,10 @@ fn raw_vcq_model(statement: &str) -> Result<Option<(String, RawVcqModel)>> {
         return Ok(None);
     }
     let (control, polarity) = match tokens[2].to_ascii_uppercase().as_str() {
-        "VCQPOS" => (RawQControl::Voltage, RawQPolarity::Positive),
-        "VCQNEG" => (RawQControl::Voltage, RawQPolarity::Negative),
-        "ICQPOS" => (RawQControl::Current, RawQPolarity::Positive),
-        "ICQNEG" => (RawQControl::Current, RawQPolarity::Negative),
+        "VCQPOS" => (SwitchControl::Voltage, RawQPolarity::Positive),
+        "VCQNEG" => (SwitchControl::Voltage, RawQPolarity::Negative),
+        "ICQPOS" => (SwitchControl::Current, RawQPolarity::Positive),
+        "ICQNEG" => (SwitchControl::Current, RawQPolarity::Negative),
         _ => return Ok(None),
     };
     let parameters = parse_assignments(&tokens[3..])?;
@@ -1169,6 +1174,7 @@ enum VcswTransfer {
 
 #[derive(Clone, Debug)]
 struct RawVcswModel {
+    control: SwitchControl,
     transfer: VcswTransfer,
 }
 
@@ -1288,11 +1294,11 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
         return Ok(None);
     }
     let kind = tokens[2].to_ascii_uppercase();
-    if !matches!(kind.as_str(), "VCSW" | "VSWITCH") {
+    if !matches!(kind.as_str(), "VCSW" | "ICSW" | "VSWITCH") {
         return Ok(None);
     }
     let parameters = parse_assignments(&tokens[3..])?;
-    let transfer = if kind == "VCSW" {
+    let transfer = if matches!(kind.as_str(), "VCSW" | "ICSW") {
         let ron = numeric_parameter(&parameters, "RON")?;
         let roff = numeric_parameter(&parameters, "ROFF")?;
         if !(ron > 0.0 && roff > ron) {
@@ -1328,7 +1334,14 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
     };
     Ok(Some((
         tokens[1].to_ascii_uppercase(),
-        RawVcswModel { transfer },
+        RawVcswModel {
+            control: if kind == "ICSW" {
+                SwitchControl::Current
+            } else {
+                SwitchControl::Voltage
+            },
+            transfer,
+        },
     )))
 }
 
@@ -2716,6 +2729,22 @@ fn translate_current_controlled_source(
     }))
 }
 
+fn validate_pwl_segment_hint(
+    parameters: &std::collections::BTreeMap<String, String>,
+    segments: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        parameters.keys().all(|name| name == "IC"),
+        "unsupported SIMPLIS PWL resistor instance parameter"
+    );
+    let initial = integer_parameter(parameters, "IC")?;
+    anyhow::ensure!(
+        (1..=segments).contains(&initial),
+        "SIMPLIS PWL resistor IC must select a defined segment"
+    );
+    Ok(())
+}
+
 fn translate_raw_pwl_device(
     statement: &str,
     models: &std::collections::BTreeMap<String, RawPwlModel>,
@@ -2734,6 +2763,8 @@ fn translate_raw_pwl_device(
 
     let instance = name.trim_start_matches('!');
     let (kind, points) = if let Some(model) = models.get(&tokens[3].to_ascii_uppercase()) {
+        let parameters = parse_assignments(&tokens[4..])?;
+        validate_pwl_segment_hint(&parameters, model.points.len() - 1)?;
         (model.kind, model.points.as_slice())
     } else if name
         .as_bytes()
@@ -2743,9 +2774,7 @@ fn translate_raw_pwl_device(
     {
         let parameters = parse_assignments(&tokens[3..])?;
         let segments = integer_parameter(&parameters, "NSEG")?;
-        if segments == 0 {
-            bail!("inline SIMPLIS PWL resistor {instance} has zero segments");
-        }
+        validate_pwl_segment_count(segments)?;
         let points = indexed_points(&parameters, segments, "X", "Y")
             .with_context(|| format!("parsing inline SIMPLIS PWL resistor {instance}"))?;
         let translation = translate_vpwlr(instance, &tokens[1], &tokens[2], &points)?;
@@ -2879,6 +2908,26 @@ fn voltage_switch_control(
     Ok((positive, negative))
 }
 
+fn switch_current_control(
+    tokens: &[String],
+    model_index: usize,
+    scope: &ScopeAnalysis,
+) -> Result<String> {
+    if model_index != 4 {
+        bail!("SIMPLIS current-controlled switch requires one control branch");
+    }
+    let control_name = tokens
+        .get(3)
+        .context("SIMPLIS switch has no control branch")?;
+    let branch = scope
+        .current_branches
+        .get(&control_name.to_ascii_uppercase())
+        .with_context(|| {
+            format!("SIMPLIS switch references unknown current branch {control_name}")
+        })?;
+    Ok(format!("i({branch})"))
+}
+
 fn q_control_expression(
     model: &RawVcqModel,
     tokens: &[String],
@@ -2886,25 +2935,12 @@ fn q_control_expression(
     scope: &ScopeAnalysis,
 ) -> Result<String> {
     match model.control {
-        RawQControl::Voltage => {
+        SwitchControl::Voltage => {
             let (positive, negative) =
                 voltage_switch_control(tokens, model_index, &scope.voltage_branches)?;
             Ok(format!("v({positive},{negative})"))
         }
-        RawQControl::Current => {
-            let control_name = tokens
-                .get(3)
-                .context("SIMPLIS current-controlled transistor switch has no control branch")?;
-            let branch = scope
-                .current_branches
-                .get(&control_name.to_ascii_uppercase())
-                .with_context(|| {
-                    format!(
-                        "SIMPLIS transistor switch references unknown current branch {control_name}"
-                    )
-                })?;
-            Ok(format!("i({branch})"))
-        }
+        SwitchControl::Current => switch_current_control(tokens, model_index, scope),
     }
 }
 
@@ -3047,7 +3083,7 @@ fn translate_raw_vcq_device(statement: &str, scope: &ScopeAnalysis) -> Result<Op
     let Some((model_index, model)) = candidate else {
         return Ok(None);
     };
-    if matches!(model.control, RawQControl::Current) && model_index != 4 {
+    if matches!(model.control, SwitchControl::Current) && model_index != 4 {
         bail!("SIMPLIS current-controlled transistor switch requires one control branch");
     }
     for node in &tokens[1..3] {
@@ -3194,43 +3230,50 @@ fn emit_simetrix_timed_vswitch(
     })
 }
 
-fn emit_simplis_vcsw(
-    instance: &ParsedVcswInstance<'_>,
-    ron: f64,
-    roff: f64,
-    threshold: f64,
-    hystwd: f64,
-    logic: &str,
+fn emit_simplis_switch(
+    tokens: &[String],
+    parameters: &std::collections::BTreeMap<String, String>,
+    control: &str,
+    transfer: &VcswTransfer,
 ) -> Result<Translation> {
-    if instance.parameters.keys().any(|name| name != "IC") {
+    let VcswTransfer::ShortTransition {
+        ron,
+        roff,
+        threshold,
+        hystwd,
+        logic,
+    } = transfer
+    else {
+        bail!("expected SIMPLIS hysteretic switch model");
+    };
+    if parameters.keys().any(|name| name != "IC") {
         bail!(
             "unsupported SIMPLIS VCSW instance parameter on {}",
-            instance.tokens[0]
+            tokens[0]
         );
     }
-    let closed = switch_closed_hint(instance.parameters.get("IC").map(String::as_str))?;
-    let stem = sanitized_name(&instance.tokens[0]);
-    let control = format!("v({},{})", instance.control_p, instance.control_n);
+    let closed = switch_closed_hint(parameters.get("IC").map(String::as_str))?;
+    let stem = sanitized_name(&tokens[0]);
     let mut output = String::new();
     let state = emit_switch_state(
         &mut output,
         &stem,
-        &control,
+        control,
         LogicThresholds {
-            center: threshold,
-            width: hystwd,
+            center: *threshold,
+            width: *hystwd,
         },
         LogicPolarity::parse(logic)?,
         closed,
     )?;
-    let voltage = format!("v({},{})", instance.tokens[1], instance.tokens[2]);
+    let voltage = format!("v({},{})", tokens[1], tokens[2]);
     writeln!(
         output,
         "B__{stem}_BRANCH {} {} I='{voltage}*((1-v({state}))/{}+v({state})/{})'",
-        instance.tokens[1],
-        instance.tokens[2],
-        spice_number(roff)?,
-        spice_number(ron)?
+        tokens[1],
+        tokens[2],
+        spice_number(*roff)?,
+        spice_number(*ron)?
     )?;
     Ok(Translation {
         bytes: output.into_bytes(),
@@ -3266,6 +3309,19 @@ fn translate_raw_vcsw_device(
     let Some((model_index, model)) = direct.or_else(named) else {
         return Ok(None);
     };
+    if matches!(model.transfer, VcswTransfer::ShortTransition { .. }) {
+        let control = match model.control {
+            SwitchControl::Current => switch_current_control(&tokens, model_index, scope)?,
+            SwitchControl::Voltage => {
+                let (p, n) = voltage_switch_control(&tokens, model_index, &scope.voltage_branches)?;
+                format!("v({p},{n})")
+            }
+        };
+        validate_node(&tokens[1])?;
+        validate_node(&tokens[2])?;
+        let parameters = parse_assignments(&tokens[model_index + 1..])?;
+        return emit_simplis_switch(&tokens, &parameters, &control, &model.transfer).map(Some);
+    }
     let (control_p, control_n) =
         voltage_switch_control(&tokens, model_index, &scope.voltage_branches)?;
     for node in [&tokens[1], &tokens[2], &control_p, &control_n] {
@@ -3285,13 +3341,9 @@ fn translate_raw_vcsw_device(
             von,
             voff,
         } => emit_pspice_vswitch(&instance, ron, roff, von, voff)?,
-        VcswTransfer::ShortTransition {
-            ron,
-            roff,
-            threshold,
-            hystwd,
-            logic,
-        } => emit_simplis_vcsw(&instance, *ron, *roff, *threshold, *hystwd, logic)?,
+        VcswTransfer::ShortTransition { .. } => {
+            bail!("unexpected short-transition switch dispatch")
+        }
         VcswTransfer::SimetrixTimedHysteresis(model) => {
             emit_simetrix_timed_vswitch(&instance, model)?
         }
@@ -4534,6 +4586,7 @@ struct ScopeAnalysis {
     reactive: std::collections::BTreeMap<String, RawReactiveModel>,
     inductors: std::collections::BTreeMap<String, f64>,
     current_branches: std::collections::BTreeMap<String, String>,
+    sensed_branches: std::collections::BTreeMap<String, String>,
     voltage_branches: std::collections::BTreeMap<String, (String, String)>,
     vcq: std::collections::BTreeMap<String, RawVcqModel>,
     comp: std::collections::BTreeMap<String, RawCompModel>,
@@ -4571,6 +4624,7 @@ impl ScopeAnalysis {
             reactive: std::collections::BTreeMap::new(),
             inductors: raw_inductor_values(items)?,
             current_branches: std::collections::BTreeMap::new(),
+            sensed_branches: std::collections::BTreeMap::new(),
             voltage_branches: branch_voltage_nodes(items)?,
             vcq: std::collections::BTreeMap::new(),
             comp: std::collections::BTreeMap::new(),
@@ -4588,7 +4642,83 @@ impl ScopeAnalysis {
         models.collect_raw_models(items)?;
         validate_native_bridge_outputs(items, header, &models.native_bridges)?;
         models.current_branches = translated_current_branches(items, &models.pwl)?;
+        models.prepare_switch_current_sensors(items)?;
         Ok(models)
+    }
+
+    fn prepare_switch_current_sensors(&mut self, items: &[Item]) -> Result<()> {
+        for statement in electrical_statements(items) {
+            let tokens = statement_tokens(&normalized_statement(statement))?;
+            let Some(name) = tokens.first() else {
+                continue;
+            };
+            let Some(model) = tokens.get(4) else {
+                continue;
+            };
+            let model = model.to_ascii_uppercase();
+            let current_controlled = match name.as_bytes().first().map(u8::to_ascii_uppercase) {
+                Some(b'S') => self
+                    .vcsw
+                    .get(&model)
+                    .is_some_and(|model| model.control == SwitchControl::Current),
+                Some(b'Q') => self
+                    .vcq
+                    .get(&model)
+                    .is_some_and(|model| model.control == SwitchControl::Current),
+                _ => false,
+            };
+            if !current_controlled {
+                continue;
+            }
+            let target = tokens[3].to_ascii_uppercase();
+            if self
+                .current_branches
+                .get(&target)
+                .is_some_and(|branch| branch.starts_with(['V', 'v']))
+            {
+                continue;
+            }
+            if !self.voltage_branches.contains_key(&target) {
+                bail!("SIMPLIS switch references unknown current branch {target}");
+            }
+            let sensor = format!(
+                "V__{}_CONTROL_SENSE",
+                current_controlled_source_stem(&target)
+            );
+            if self.voltage_branches.contains_key(&sensor) {
+                bail!("generated current sensor name conflicts with existing device {sensor}");
+            }
+            self.current_branches.insert(target.clone(), sensor.clone());
+            self.sensed_branches.insert(target, sensor);
+        }
+        Ok(())
+    }
+
+    fn instrument_current_branch(&self, statement: &str, output: &mut String) -> Result<String> {
+        if self.sensed_branches.is_empty() {
+            return Ok(statement.to_owned());
+        }
+        let mut tokens = statement_tokens(&normalized_statement(statement))?;
+        let Some(sensor) = tokens
+            .first()
+            .and_then(|name| self.sensed_branches.get(&name.to_ascii_uppercase()))
+        else {
+            return Ok(statement.to_owned());
+        };
+        let terminal = tokens
+            .get_mut(1)
+            .context("missing current-sensed positive terminal")?;
+        let middle = format!("__{}_NODE", sensor);
+        if self
+            .voltage_branches
+            .values()
+            .any(|(p, n)| p.eq_ignore_ascii_case(&middle) || n.eq_ignore_ascii_case(&middle))
+        {
+            bail!("generated current sensor node conflicts with existing node {middle}");
+        }
+        writeln!(output, "{sensor} {terminal} {middle} 0")?;
+        *terminal = middle;
+        Ok(tokens.join(" "))
     }
 
     fn collect_raw_models(&mut self, items: &[Item]) -> Result<()> {
@@ -4631,7 +4761,7 @@ impl ScopeAnalysis {
                     raw_vcq_model(statement)?,
                     "SIMPLIS transistor-switch model",
                 )?,
-                "VCSW" | "VSWITCH" => insert_unique_model(
+                "VCSW" | "ICSW" | "VSWITCH" => insert_unique_model(
                     &mut self.vcsw,
                     raw_vcsw_model(statement)?,
                     "SIMPLIS VCSW model",
@@ -5283,7 +5413,8 @@ fn emit_deck_statement(
         bail!("unsupported SIMPLIS directive remains in expanded deck: {trimmed}");
     }
     let effective = statement_with_init_override(statement, &models.init)?;
-    let statement = effective.as_str();
+    let instrumented = models.instrument_current_branch(&effective, output)?;
+    let statement = instrumented.as_str();
     if let Some((name, model)) = raw_level17_model(statement)? {
         output.push_str(&emit_level17_core_model(&name, &model)?);
         return Ok(());
@@ -6008,7 +6139,7 @@ Q1 drain 0 !RGAIN MQ IC=OPEN
         );
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("B__Q1_CTRL"));
-        assert!(text.contains("i(BRGAIN)"));
+        assert!(text.contains("i(V___21RGAIN_CONTROL_SENSE)"));
         assert!(text.contains("max("));
         assert!(text.contains("min("));
         assert!(!text.contains(" ICQPOS "));
@@ -6485,7 +6616,7 @@ A1 a b DL
         let source = br".subckt T a b c d
 R1 a b 1k
 !RX c d MX IC=1
-.MODEL MX VPWLR NSEG=1 X0=0 Y0=0 X1=1 Y1=1
+.MODEL MX VPWLR NSEG=2 X0=0 Y0=0 X1=1 Y1=1 X2=2 Y2=2
 F1 c 0 R1 2
 H1 d 0 !RX 3
 .ends T
@@ -7078,6 +7209,43 @@ R1 a 0 1k
     }
 
     #[test]
+    fn current_switch_uses_exact_branch_sensor_for_native_and_piecewise_passives() -> Result<()> {
+        let source = br"V1 p 0 1
+R1 p r 10
+!L1 r 0 ML IC=0
+!R1 p 0 MR IC=1
+S1 a 0 R1 MS IC=OPEN
+S2 b 0 !L1 MS IC=CLOSE
+S3 c 0 !R1 MS IC=OPEN
+Q1 d 0 R1 MQ IC=OPEN
+.MODEL ML PWLL NSEG=2 X0=-1 Y0=-1m X1=0 Y1=0 X2=1 Y2=1m
+.MODEL MR IPWLR NSEG=2 X0=-1 Y0=-10 X1=0 Y1=0 X2=1 Y2=10
+.MODEL MS ICSW RON=10 ROFF=1Meg TH=.1 HYSTWD=.02 LOGIC=POS
+.MODEL MQ ICQPOS VSAT=0 RSAT=10 ROFF=1Meg GAIN=1 TH=.1 HYSTWD=.02 LOGIC=POS LEVEL=2 IFLOW=BIDIR
+.end
+";
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        assert!(text.contains("V__R1_CONTROL_SENSE p __V__R1_CONTROL_SENSE_NODE 0"));
+        assert!(text.contains("R1 __V__R1_CONTROL_SENSE_NODE r 10"));
+        assert!(text.contains("V___21L1_CONTROL_SENSE r"));
+        assert_eq!(text.matches("i(V__R1_CONTROL_SENSE)").count(), 4);
+        assert!(text.contains("i(V__R1_IPWLR_SENSE)"));
+        assert!(!text.contains(" ICSW "));
+        Ok(())
+    }
+
+    #[test]
+    fn current_switch_rejects_missing_or_invalid_control_branch() {
+        for device in ["S1 p 0 unknown MS IC=OPEN", "S1 p 0 a b MS IC=OPEN"] {
+            let source = format!(
+                "{device}\n.MODEL MS ICSW RON=1 ROFF=1Meg TH=.1 HYSTWD=.02 LOGIC=POS\n.end\n"
+            );
+            assert!(translate_simplis_deck(source.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
     fn switch_voltage_control_resolves_named_branch_and_node_pairs() -> Result<()> {
         let source = br"Vctrl c r 5
 S1 p n Vctrl MS IC=OPEN
@@ -7138,6 +7306,47 @@ R1 out 0 1k
         assert!(!text.contains(".model MC COMP"));
         assert_eq!(translated.primitives, vec![TranslationKind::Comparator]);
         Ok(())
+    }
+
+    #[test]
+    fn raw_resistor_requires_valid_segment_hint_and_count() {
+        for (hint, model) in [
+            ("", "NSEG=2 X0=-1 Y0=-2 X1=0 Y1=0 X2=1 Y2=4"),
+            (" IC=0", "NSEG=2 X0=-1 Y0=-2 X1=0 Y1=0 X2=1 Y2=4"),
+            (" IC=3", "NSEG=2 X0=-1 Y0=-2 X1=0 Y1=0 X2=1 Y2=4"),
+            (" IC=1", "NSEG=1 X0=-1 Y0=-2 X1=1 Y1=4"),
+            (" IC=1", "NSEG=256"),
+            (" IC=1", "NSEG=2 X0=-1 Y0=0 X1=0 Y1=0 X2=1 Y2=4"),
+        ] {
+            for kind in ["IPWLR", "VPWLR"] {
+                let source = format!("!R1 a 0 M{hint}\n.MODEL M {kind} {model}\n.end\n");
+                assert!(translate_simplis_deck(source.as_bytes()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn ipwlr_preserves_voltage_current_axis_and_negative_interior_slope() -> Result<()> {
+        let source = br"!R1 a 0 M IC=2
+.MODEL M IPWLR NSEG=3 X0=-1 Y0=-2 X1=1 Y1=0 X2=.5 Y2=1 X3=2 Y3=3
+.end
+";
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        assert!(text.contains("pwl(i(V__R1_IPWLR_SENSE), -2.00000000000000000e0, -1.00000000000000000e0, 0.00000000000000000e0, 1.00000000000000000e0, 1.00000000000000000e0, 5.00000000000000000e-1, 3.00000000000000000e0, 2.00000000000000000e0)"));
+        Ok(())
+    }
+
+    #[test]
+    fn ipwlr_rejects_nonmonotonic_current_or_nonpositive_end_slope() {
+        for points in [
+            "X0=-1 Y0=-1 X1=0 Y1=-2 X2=1 Y2=3",
+            "X0=1 Y0=-1 X1=0 Y1=0 X2=1 Y2=3",
+            "X0=-1 Y0=-1 X1=0 Y1=0 X2=0 Y2=3",
+        ] {
+            let source = format!("!R1 a 0 M IC=1\n.MODEL M IPWLR NSEG=2 {points}\n.end\n");
+            assert!(translate_simplis_deck(source.as_bytes()).is_err());
+        }
     }
 
     #[test]
