@@ -272,7 +272,7 @@ fn repeat(period: f64, delay: f64, hold: bool, first: f64) -> Repeat {
     } else {
         let remainder = delay % period;
         let origin = if remainder.abs() > period * 0.5 {
-            remainder - remainder.signum() * period
+            remainder.signum().mul_add(-period, remainder)
         } else {
             remainder
         };
@@ -492,7 +492,7 @@ impl Forcing {
                 if *amplitude == 0. || (*hold_before_delay && *delay > 0.) {
                     *offset
                 } else {
-                    let phase = (-(delay * frequency)).rem_euclid(1.) * std::f64::consts::TAU;
+                    let phase = (-(delay * frequency) % 1.) * std::f64::consts::TAU;
                     (amplitude * (damping * delay).exp()).mul_add(phase.sin(), *offset)
                 }
             }

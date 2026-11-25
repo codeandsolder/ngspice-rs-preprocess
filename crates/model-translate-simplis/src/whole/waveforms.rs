@@ -437,7 +437,7 @@ impl Parsed {
                 } else {
                     amplitude * (-damping * elapsed).exp()
                 };
-                let phase = (elapsed * frequency).rem_euclid(1.) * 360.;
+                let phase = (elapsed * frequency % 1.) * 360.;
                 ensure!(
                     peak.is_finite() && phase.is_finite(),
                     "nonfinite native sine coefficients"
@@ -527,7 +527,9 @@ fn capture_items(
     Ok(changed)
 }
 
-/// Capture source waveforms after hierarchy linkage. Retain independent
+/// Capture source waveforms after hierarchy linkage.
+///
+/// Retain independent
 /// source names and terminals in the native electrical artifact. Static
 /// raw declarations with strictly increasing native knots also have a
 /// reference representation. Exact discontinuities and symbolic raw

@@ -151,14 +151,15 @@ impl Pulse {
         else {
             bail!("PWLS requires trapezoidal pulse edges")
         };
-        let rise = params.define("rise", rise.as_deref().unwrap_or(&format!("{period}/1000")))?;
+        let rise = match rise {
+            Some(expression) => params.define("rise", expression)?,
+            None => params.define("rise", &format!("{period}/1000"))?,
+        };
         let fall = params.define("fall", fall.as_deref().unwrap_or(&rise.text))?;
-        let width = params.define(
-            "width",
-            width
-                .as_deref()
-                .unwrap_or(&format!("({period}-{rise}-{fall})/2")),
-        )?;
+        let width = match width {
+            Some(expression) => params.define("width", expression)?,
+            None => params.define("width", &format!("({period}-{rise}-{fall})/2"))?,
+        };
         let delay = params.define("delay", &spec.delay)?;
         let off = params.define("off", &spec.hold_before_delay)?;
         ensure!(

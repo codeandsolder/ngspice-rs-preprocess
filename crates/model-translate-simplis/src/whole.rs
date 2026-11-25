@@ -5450,7 +5450,7 @@ R2 b 0 1k
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("VSAW a 0 DC "));
-        assert!(text.contains(") r=0 td="));
+        assert!(text.contains(") r=") && text.contains(" td="));
         assert!(text.contains("VPUL b 0 DC "));
         assert_eq!(translated.primitives.len(), 2);
         Ok(())

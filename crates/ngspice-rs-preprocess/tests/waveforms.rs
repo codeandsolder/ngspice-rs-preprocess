@@ -465,3 +465,58 @@ Vregular d 0 SAW V1=0 V2=1 PERIOD=1 DELAY=0.125 OFF_UNTIL_DELAY=NO
     assert!(text.contains("r=1.25000000000000000e-1 td=0."));
     Ok(())
 }
+
+#[test]
+fn positive_ungated_reference_repeats_after_initial_partial_cycle() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let source = br"* positive signed delay
+V1 a 0 PUL V1=0 V2=1 PERIOD=1 DRATIO=0.5 DELAY=0.125 OFF_UNTIL_DELAY=NO
+V2 b 0 SAW V1=0 V2=1 PERIOD=1 DELAY=0.125 OFF_UNTIL_DELAY=NO
+V3 c 0 SIN VOFFSET=0 APEAK=1 FREQ=1 TDELAY=1e-18 OFF_UNTIL_DELAY=NO
+R1 a 0 1k
+R2 b 0 1k
+R3 c 0 1k
+.end
+";
+    let bundle = prepared(
+        dir.path(),
+        std::str::from_utf8(source)?,
+        InputFormat::ExpandedDeck,
+    )?;
+    close(
+        resolve(&bundle.waveforms[2])?.dc,
+        -(std::f64::consts::TAU * 1e-18),
+        1e-32,
+    )?;
+    let translated = model_translate_simplis::translate_simplis_deck(source)?;
+    let mut input = std::str::from_utf8(&translated.bytes)?
+        .strip_suffix(".end\n")
+        .context("missing end")?
+        .to_owned();
+    input.push_str(".control\nset numdgt=17\nset wr_singlescale\ntran 0.001 2.5 0 0.0001\nwrdata wave.dat v(a) v(b)\nquit\n.endc\n.end\n");
+    fs::write(dir.path().join("reference.cir"), input)?;
+    let run = Command::new("ngspice")
+        .current_dir(dir.path())
+        .args(["-b", "-n", "reference.cir"])
+        .output()?;
+    ensure!(run.status.success(), "native reference execution failed");
+    let trace = fs::read_to_string(dir.path().join("wave.dat"))?;
+    let mut rows = 0;
+    for line in trace.lines() {
+        let row = line
+            .split_ascii_whitespace()
+            .map(str::parse::<f64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let [time, pulse, saw] = row.as_slice() else {
+            bail!("invalid trace width")
+        };
+        let phase = (*time - 0.125).rem_euclid(1.);
+        if phase.min((phase - 0.5).abs()).min(1. - phase) > 1e-9 {
+            close(*pulse, if phase < 0.5 { 1. } else { 0. }, 1e-12)?;
+            close(*saw, phase, 1e-12)?;
+        }
+        rows += 1;
+    }
+    ensure!(rows > 25_000, "incomplete reference execution");
+    Ok(())
+}
