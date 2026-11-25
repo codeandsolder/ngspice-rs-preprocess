@@ -519,7 +519,7 @@ digital state across two physical inputs maps both ALB input loads to
 one ADC, provided their source triples are actually identical.
 Independent outputs are not merged.
 
-Run from the source repository (use the standard Rust 1.99 and
+Run from the source repository (use the repository-pinned nightly and
 configured sccache wrapper for actual builds):
 
     cargo run --locked -p model-translate-simplis \

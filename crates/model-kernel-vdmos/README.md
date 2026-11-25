@@ -21,16 +21,16 @@ The caller owns instantiated X-line call-site scopes, topology binding, current 
 ## Reproducible checks
 
 ```sh
-cargo +stable test -p model-kernel-vdmos
-cargo +stable clippy -p model-kernel-vdmos --all-targets -- -D warnings
-cargo +stable test -p model-kernel-vdmos --test ngspice47 -- --ignored
-cargo +stable test -p model-kernel-vdmos --release --lib throughput_prepared_batch -- --ignored --nocapture
+cargo test --locked -p model-kernel-vdmos
+cargo clippy --locked -p model-kernel-vdmos --all-targets -- -D warnings
+cargo test --locked -p model-kernel-vdmos --test ngspice47 -- --ignored
+cargo test --locked -p model-kernel-vdmos --release --lib throughput_prepared_batch -- --ignored --nocapture
 ```
 
 Focused unit tests exercise polarity, independent instances/batching, numerical channel/diode/gate/recovery/thermal Jacobians, avalanche matching and its implicit temperature derivative, charge asymptotes, source parameter preparation and noise laws. The **thirty-nine opt-in ngspice-47 C oracles** cover NMOS/PMOS DC Id/gm/gds, NMOS/PMOS avalanche, elevated-temperature avalanche, NMOS/PMOS gate/diode capacitances, hot capacitance, VP soft-recovery depletion and independently solved NMOS/PMOS electrothermal DC equilibria (channel current, case temperature and junction temperature), weak-inversion-to-triode sweeps including hot channel and gm/gds, voltage/temperature quasi-saturation drain-resistance sweeps, and the catalog-derived IRF7220 PMOS with reversed `Cgdmin`/`Cgdmax` endpoints. Full transient cases add NMOS/PMOS reverse recovery, ordinary diode diffusion without VP, NMOS/PMOS electrothermal on/off cycling, and NMOS/PMOS nonlinear gate switching/charge history. Transient oracles read ngspice 47 adaptive-step waveforms and independently integrate scalar state equations using test-only RK4 between known PWL forcing breakpoints; no integration/stamping is added to the runtime kernel. Charge/current comparisons distinguish physical constitutive laws from ngspice's integrator-dependent displacement during sharp ramp transitions. C reference fixtures disable solver gmin regularization where the bare nonlinear model is compared. Eleven additional source-compiler C oracle fixtures exercise function nesting, local function definitions, global functions reading *caller* parameters, global `.param` values retaining *declaration* scope, forward and cyclic source parameters, as well as independent subcircuit instance overrides and real linked `.include`/`.lib` multi-file operating points with ID, gm and gds comparison, including a named library section importing another section from its own file.
 
 
-**Full-catalog compatibility:** An independently downloaded copy of the publicly indexed LTspice `standard.mos` device library was checked with `cargo +stable run --locked -p model-kernel-vdmos --example vdmos_corpus -- /path/to/standard.mos`. All **773/773 VDMOS model cards** parse, resolve PCHAN/NCHAN polarity and manufacturer/rating annotations (`mfg`, `Vds`, `Ron`, `Qg`), prepare, bind and evaluate. Manufacturer data stays in a separate local reference directory and is **not copied into this repository**. The one catalog exception uncovered in the first run was IRF7220's `Cgdmin=4.25n`, `Cgdmax=1.5n`: both values are positive, and the mathematical capacitance law supports this inverse ordering. Validation now rejects negative endpoints but does not invent an ordering restriction. The small attributed IRF7220 ngspice 47 fixture checks `Cgd` across eleven *intrinsic*, rather than external-series, bias points.
+**Full-catalog compatibility:** An independently downloaded copy of the publicly indexed LTspice `standard.mos` device library was checked (reproduce with `cargo run --locked -p model-kernel-vdmos --example vdmos_corpus -- /path/to/standard.mos`). All **773/773 VDMOS model cards** parse, resolve PCHAN/NCHAN polarity and manufacturer/rating annotations (`mfg`, `Vds`, `Ron`, `Qg`), prepare, bind and evaluate. Manufacturer data stays in a separate local reference directory and is **not copied into this repository**. The one catalog exception uncovered in the first run was IRF7220's `Cgdmin=4.25n`, `Cgdmax=1.5n`: both values are positive, and the mathematical capacitance law supports this inverse ordering. Validation now rejects negative endpoints but does not invent an ordering restriction. The small attributed IRF7220 ngspice 47 fixture checks `Cgd` across eleven *intrinsic*, rather than external-series, bias points.
 
 **Independent catalog hardening (2026-11-24):** A separate publicly indexed LTspice `standard.mos` catalog from `mpkopec/ltspice-lib` contains **905 distinct VDMOS cards**. Before any dialect-specific normalization, **841/905** are supported by the unchanged ngspice-47 parameter grammar; remaining rejects are 41 `Cgso` (LTspice-specific gate overlap semantics), 21 legacy `subthres` (not a native ngspice-47 VDMOS field), one incomplete numeric expression and one malformed bare `*`. The six additional NXP models with declared `Is=0` are correctly prepared after observing that **ngspice47 `vdmosset.c` floors source `Is` to `CKTepsmin=1e−28 A`** (`cktinit.c`), before instance preparation. This input-source normalization is explicit in `compile_ngspice`; the physical kernel still requires positive `Is`. Neither unsupported dialect fields nor corrupted source declarations are silently interpreted as other physics. The external 171,482-byte catalog and C differential report are retained outside this repository in the solver's dedicated quality corpus workspace.
 
@@ -51,9 +51,9 @@ Use the opt-in `catalog_oracle` example with an external plaintext VDMOS
 catalog and ngspice 47 on PATH:
 
 ```sh
-cargo +stable run --locked -p model-kernel-vdmos --example catalog_oracle -- /path/to/standard.mos 185
-cargo +stable run --locked -p model-kernel-vdmos --example catalog_oracle -- /path/to/flat-catalog.mos 185 --isolated
-cargo +stable run --locked -p model-kernel-vdmos --example catalog_oracle -- /path/to/flat-catalog.mos 185 --isolated --diode
+cargo run --locked -p model-kernel-vdmos --example catalog_oracle -- /path/to/standard.mos 185
+cargo run --locked -p model-kernel-vdmos --example catalog_oracle -- /path/to/flat-catalog.mos 185 --isolated
+cargo run --locked -p model-kernel-vdmos --example catalog_oracle -- /path/to/flat-catalog.mos 185 --isolated --diode
 ```
 
 Each model gets two independently selected bias/temperature points (−25 to
