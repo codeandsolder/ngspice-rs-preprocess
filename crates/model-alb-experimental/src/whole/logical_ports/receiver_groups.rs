@@ -93,14 +93,14 @@ pub(super) fn mark_lifted_formals(
                     .occurrences(&scope)?
                     .calls()
                     .filter(|call| call.name.eq_ignore_ascii_case(instance));
-                let matched = matches.next().with_context(|| {
+                let call = matches.next().with_context(|| {
                     format!("missing lifted ADC X instance {instance} in {scope:?}")
                 })?;
                 ensure!(
                     matches.next().is_none(),
                     "ambiguous lifted ADC X instance {instance} in {scope:?}"
                 );
-                scope = matched.target.clone();
+                scope = call.target.clone();
                 if let Some(formal) = receiver.analog_hops.get(&index) {
                     let formal = valid_node(formal)?;
                     let child = graph
