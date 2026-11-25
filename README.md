@@ -209,7 +209,8 @@ This check does not publish packages or release artifacts.
 SIMetrix deck preparation can rescale a private current coordinate after the
 complete electrical artifact graph has been linked and translated. An eligible
 loop contains a linear capacitor and ideal voltage-defined branches, including
-a driven voltage and current sensor. All but at most one loop node must be
+a driven voltage. Its current can be measured directly or through ideal
+zero-volt sensing branches. All but at most one loop node must be
 electrically private. An exposed port, global net, extra current path or
 unresolved current observation disqualifies the transformation.
 

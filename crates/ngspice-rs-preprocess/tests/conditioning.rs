@@ -230,3 +230,26 @@ fn facade_conditions_closed_translated_bundle_and_retains_input() -> Result<()> 
     assert_eq!(fs::read(lib)?, CELL.as_bytes());
     Ok(())
 }
+
+#[test]
+fn grounded_loops_ignore_numeric_literals_outside_their_scope() -> Result<()> {
+    let model = CELL
+        .replace("Edrive n1 b a b 1", "Edrive n1 0 a b 1")
+        .replace("Cstorage n3 b 2", "Cstorage n3 0 2");
+    let root = "* grounded\nV1 a 0 0.25\nX1 a 0 cell\n.end\n";
+    let result = condition(&model, root)?;
+    assert_eq!(result.scalings.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn driver_current_can_be_used_without_a_separate_sensor() -> Result<()> {
+    let source = ".subckt cell a b\nEdriver aux b a b 1\nCstate aux b 1 IC=0\nBcap a b I={-1u*I(Edriver)}\n.ends cell\n";
+    let output = condition(source, "* caller\nX1 a 0 cell\n.end\n")?;
+    assert_eq!(output.scalings.len(), 1);
+    assert!((output.scalings[0].factor - 1e-6).abs() < 1e-18);
+    let text = std::str::from_utf8(&output.bytes)?;
+    assert!(text.contains("IC=0"));
+    assert!(text.contains("I(Edriver)/"));
+    Ok(())
+}

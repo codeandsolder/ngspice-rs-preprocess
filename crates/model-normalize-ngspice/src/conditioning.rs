@@ -271,7 +271,17 @@ fn edge(card: &Card, index: usize) -> Option<Edge> {
 }
 
 fn capacitor(card: &Card) -> Option<[String; 2]> {
-    if card.kind()? != b'C' || card.fields.len() != 4 || !simple_name(card.first()) {
+    if card.kind()? != b'C' || card.fields.len() < 4 || !simple_name(card.first()) {
+        return None;
+    }
+    let mut options = card.fields.get(4..)?.chunks_exact(3);
+    if !options.remainder().is_empty()
+        || !options.all(|assignment| {
+            let key = &card.text()[assignment[0].clone()];
+            let equals = &card.text()[assignment[1].clone()];
+            key.eq_ignore_ascii_case("IC") && equals == "="
+        })
+    {
         return None;
     }
     let p = card.field(1)?;
@@ -343,11 +353,17 @@ impl VoltageGraph {
         // Walk from capacitor N to P. A shortest simple path is sufficient:
         // the exposure proof rejects any additional electrical connection at
         // more than one cycle node, including a competing parallel path.
-        let mut queue = VecDeque::from([nodes[1].clone()]);
+        let degree = |node: &String| self.adjacency.get(node).map_or(0, Vec::len);
+        let (start, target, orientation) = if degree(&nodes[1]) <= degree(&nodes[0]) {
+            (&nodes[1], &nodes[0], 1.)
+        } else {
+            (&nodes[0], &nodes[1], -1.)
+        };
+        let mut queue = VecDeque::from([start.clone()]);
         let mut previous =
-            BTreeMap::<String, Option<(usize, String)>>::from([(nodes[1].clone(), None)]);
+            BTreeMap::<String, Option<(usize, String)>>::from([(start.clone(), None)]);
         while let Some(node) = queue.pop_front() {
-            if node == nodes[0] {
+            if node == *target {
                 break;
             }
             for &index in self.adjacency.get(&node).into_iter().flatten() {
@@ -363,21 +379,19 @@ impl VoltageGraph {
                 }
             }
         }
-        let mut node = nodes[0].clone();
+        let mut node = target.clone();
         let mut vertices = BTreeSet::from([node.clone()]);
         let mut branches = Vec::new();
         let mut driven = false;
-        let mut sensed = false;
         while let Some((index, from)) = previous.get(&node)? {
             let edge = &self.edges[*index];
             driven |= edge.driven;
-            sensed |= !edge.driven;
             let sign = if edge.nodes[0] == *from { 1. } else { -1. };
-            branches.push((edge.card, sign));
+            branches.push((edge.card, sign * orientation));
             node.clone_from(from);
             vertices.insert(node.clone());
         }
-        if !driven || !sensed {
+        if !driven {
             return None;
         }
         Some(Loop {
@@ -506,15 +520,20 @@ impl<'a> Proof<'a> {
         false
     }
 
-    fn isolated(&self) -> bool {
+    fn private_nodes(&self) -> Option<Vec<&str>> {
         let scope = self.source.cards[self.circuit.capacitor].scope;
-        self.circuit
-            .nodes
-            .iter()
-            .filter(|node| self.exposed(node, scope))
-            .take(2)
-            .count()
-            <= 1
+        let mut private = Vec::new();
+        let mut anchor = None;
+        for node in &self.circuit.nodes {
+            if self.exposed(node, scope) {
+                if anchor.replace(node).is_some() {
+                    return None;
+                }
+            } else {
+                private.push(node.as_str());
+            }
+        }
+        Some(private)
     }
 
     fn uses(&self, index: usize, card: &Card) -> Option<Vec<Probe>> {
@@ -542,12 +561,13 @@ impl<'a> Proof<'a> {
         Some(uses)
     }
 
-    fn outside_reference(&self, card: &Card) -> bool {
+    fn outside_reference(&self, card: &Card, private_nodes: &[&str]) -> bool {
         // A hierarchical branch reference is not resolved by the local
         // name map. Reject rather than changing a caller's observable.
         self.currents
             .keys()
-            .chain(self.circuit.nodes.iter())
+            .map(String::as_str)
+            .chain(private_nodes.iter().copied())
             .any(|name| {
                 card.mentions(name).iter().any(|span| {
                     card.text().as_bytes().get(span.start.wrapping_sub(1)) == Some(&b'.')
@@ -603,9 +623,7 @@ struct Plan {
 
 fn plan(source: &Source, circuit: &Loop) -> Option<Plan> {
     let proof = Proof::new(source, circuit)?;
-    if !proof.isolated() {
-        return None;
-    }
+    let private_nodes = proof.private_nodes()?;
     let cap = &source.cards[circuit.capacitor];
     let original = source
         .parameters
@@ -619,13 +637,14 @@ fn plan(source: &Source, circuit: &Loop) -> Option<Plan> {
     let referenced = proof
         .currents
         .keys()
-        .chain(circuit.nodes.iter())
+        .map(String::as_str)
+        .chain(private_nodes.iter().copied())
         .flat_map(|name| source.references.get(name).into_iter().flatten().copied())
         .collect::<BTreeSet<_>>();
     for index in referenced {
         let card = &source.cards[index];
         if card.scope != cap.scope {
-            if proof.outside_reference(card) {
+            if proof.outside_reference(card, &private_nodes) {
                 return None;
             }
             continue;
