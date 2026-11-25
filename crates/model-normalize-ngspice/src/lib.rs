@@ -58,6 +58,8 @@ pub enum NormalizationPass {
     LtspiceNoiselessResistor,
     /// Translate source-specific scalar intrinsic functions.
     LtspiceIntrinsics,
+    /// Lower `LTspice`-specific operator precedence and Boolean coercion.
+    LtspiceOperators,
     /// Map `PSpice` `arctan()` to ngspice `atan()`.
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.

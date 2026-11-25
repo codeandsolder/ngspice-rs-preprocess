@@ -95,7 +95,7 @@ fn rejects_ambiguous_flags_and_shadowed_intrinsics() -> Result<()> {
         ".backanno unexpected",
         ".model ideal D(Ron=0.1 Roff=1Meg)",
         ".func min(x,y) {x}",
-        "B1 y 0 V=table(v(x),0,0,1,1)",
+        "B1 y 0 V=table(v(x),0,0,1)",
         "B1 y 0 V=limit(random(time),0,1)",
     ] {
         fs::write(&root, format!("title\n{body}\n.end\n"))?;
@@ -139,15 +139,18 @@ fn native(dir: &Path, deck: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn data(path: &Path) -> Result<Vec<Vec<f64>>> {
-    fs::read_to_string(path)?
-        .lines()
+fn parse_data(text: &str) -> Result<Vec<Vec<f64>>> {
+    text.lines()
         .map(|line| {
             line.split_whitespace()
                 .map(|value| value.parse::<f64>().map_err(Into::into))
                 .collect()
         })
         .collect()
+}
+
+fn data(path: &Path) -> Result<Vec<Vec<f64>>> {
+    parse_data(&fs::read_to_string(path)?)
 }
 
 fn near(actual: f64, expected: f64) -> Result<()> {
@@ -198,6 +201,162 @@ fn scalar_intrinsics_match_documented_laws_in_native_dc_and_transient() -> Resul
             near(*s, x.signum() * x * x)?;
             near(*q, x * x)?;
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_operator_precedence_and_table_limiter_dc_sweep() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    // Independently run with LTspice 24.0.12 on 2026-11-25.
+    // The vendor DC sweep uses exact quarter-volt steps and tight tolerances.
+    fs::write(&root, b"title\n.options reltol=1e-10 abstol=1e-14 vntol=1e-12\nVx x 0 0\nB1 a 0 V=table(V(x),-1,2,0,5,2,1)\nB2 b 0 V=uplim(V(x),1,.5)\nB3 c 0 V=dnlim(V(x),-1,.5)\nB4 d 0 V=V(x)^0.4\nB5 e 0 V=V(x)&0.6\nB6 f 0 V=V(x)|0.4\nB7 g 0 V=!V(x)\nB8 h 0 V=~V(x)\nB9 j 0 V=1|1&0\nB10 k 0 V=1^1|1\nB11 l 0 V=1|1^1\nB12 m 0 V=-2**2\nB13 n 0 V=2**3**2\nB14 p 0 V=pow(-2,0.5)\nB15 q 0 V=pow(-2,1.5)\nB16 r 0 V=pow(-2,2.5)\nB17 s 0 V=pow(-2,1.25)\nB18 t 0 V=pow(-2,3)\nB19 u 0 V=0**0\nB20 w 0 V=table(V(x),0,10)\nB21 zz 0 V=table(V(x),-1,2,0,5,0,8,2,1)\nB22 z0 0 V=pow(0,-2)\nB23 z1 0 V=pwr(0,0)\nB24 z2 0 V=pwrs(0,0)\nB25 z3 0 V=uplim(V(x),1,0)\nB26 z4 0 V=dnlim(V(x),-1,0)\nB27 z5 0 V=uplim(V(x),1,-.5)\nB28 z6 0 V=dnlim(V(x),-1,-.5)\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\ndc Vx -3 3 .25\nwrdata dc.dat v(x) v(a) v(b) v(c) v(d) v(e) v(f) v(g) v(h) v(j) v(k) v(l) v(m) v(n) v(p) v(q) v(r) v(s) v(t) v(u) v(w) v(zz) v(z0) v(z1) v(z2) v(z3) v(z4) v(z5) v(z6)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let rows = data(&dir.path().join("dc.dat"))?;
+    assert_eq!(rows.len(), 25);
+    let vendor = parse_data(include_str!("fixtures/ltspice/scalar-dc.tsv"))?;
+    assert_eq!(vendor.len(), rows.len());
+    for (row, reference) in rows.iter().zip(vendor) {
+        assert_eq!(reference.len(), 22);
+        for (index, (&actual, expected)) in row.iter().zip(reference).enumerate() {
+            if (row[1] - 0.5).abs() <= 8. * f64::EPSILON && (5..10).contains(&index) {
+                continue;
+            }
+            near(actual, expected)
+                .with_context(|| format!("vendor sweep {}, column={index}", row[0]))?;
+        }
+    }
+    for row in rows {
+        let x = row[1];
+        let value = if x <= -1. {
+            2.
+        } else if x <= 0. {
+            3.0_f64.mul_add(x, 5.)
+        } else {
+            2.0_f64.mul_add(-x.min(2.), 5.)
+        };
+        let upper = |input: f64, width: f64| {
+            if width == 0. {
+                return input.min(1.);
+            }
+            if input <= 1. - width {
+                input
+            } else {
+                (-width).mul_add(((1. - width - input) / width).exp(), 1.)
+            }
+        };
+        let duplicate = if x <= 0. {
+            value
+        } else {
+            (-3.5_f64).mul_add(x.min(2.), 8.)
+        };
+        let boolean = f64::from(x > 0.5);
+        let expected = [
+            value,
+            upper(x, 0.5),
+            -upper(-x, 0.5),
+            boolean,
+            boolean,
+            boolean,
+            1. - boolean,
+            1. - boolean,
+            0.,
+            1.,
+            0.,
+            4.,
+            512.,
+            0.,
+            0.,
+            0.,
+            0.,
+            -8.,
+            1.,
+            10.,
+            duplicate,
+            0.,
+            1.,
+            1.,
+            upper(x, 0.),
+            -upper(-x, 0.),
+            upper(x, -0.5),
+            -upper(-x, -0.5),
+        ];
+        assert_eq!(row.len(), expected.len() + 2);
+        for (index, (&actual, expected)) in row[2..].iter().zip(expected).enumerate() {
+            // Native Newton trial values can land one ULP across a jump.
+            if (x - 0.5).abs() <= 8. * f64::EPSILON && (3..8).contains(&index) {
+                assert!((0. ..=1.).contains(&actual));
+            } else if x.abs() <= 8. * f64::EPSILON && index == 20 {
+                assert!(actual == 5. || actual == 8.);
+            } else {
+                near(actual, expected).with_context(|| format!("x={x}, column={index}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn symbolic_table_knots_and_operators_in_parameter_scope() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root, b"title\n.param knot=2\n.param a=table(1,0,3,knot,5) b=table(2,0,3)\n.param e=1|1&0 f=2**3**2 g=-2**2 h=0**0\n.func nested(x) {table(x,0,table(0,0,3),knot,5)}\n.param k={nested(1)}\nVa a 0 {a}\nVb b 0 {b}\nVe e 0 {e}\nVf f 0 {f}\nVg g 0 {g}\nVh h 0 {h}\nVk k 0 {k}\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nop\nwrdata op.dat v(a) v(b) v(e) v(f) v(g) v(h) v(k)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let rows = data(&dir.path().join("op.dat"))?;
+    let row = rows.first().context("missing OP")?;
+    assert_eq!(row.len(), 8);
+    for (&actual, expected) in row[1..].iter().zip([4., 3., 0., 512., 4., 1., 4.]) {
+        near(actual, expected)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_ac_slopes_preserve_interpolation_and_exponential_limiting() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root, b"title\n.options reltol=1e-10 abstol=1e-14 vntol=1e-12\nVx x 0 DC 0.75 AC 1\nB1 a 0 V=table(V(x),-1,2,0,5,2,1)\nB2 b 0 V=uplim(V(x),1,.5)\nB3 c 0 V=dnlim(-V(x),-1,.5)\nB4 d 0 V=table(V(x),-2,0,-1,1)\nB5 e 0 V=table(V(x),0,10)\nB6 f 0 V=table(V(x),0,0,1,2,2,4)\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nac lin 1 1000 1000\nwrdata ac.dat v(x) v(a) v(b) v(c) v(d) v(e) v(f)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let rows = data(&dir.path().join("ac.dat"))?;
+    let row = rows.first().context("missing AC row")?;
+    assert_eq!(row.len(), 15);
+    near(row[0], 1000.)?;
+    for (actual, expected) in row[1..].chunks_exact(2).zip([
+        1.,
+        -2.,
+        0.606_530_659_712_633_4,
+        -0.606_530_659_712_633_4,
+        0.,
+        0.,
+        2.,
+    ]) {
+        near(actual[0], expected)?;
+        near(actual[1], 0.)?;
     }
     Ok(())
 }

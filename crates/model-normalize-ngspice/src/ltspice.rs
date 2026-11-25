@@ -3,6 +3,9 @@
 //! Preserve physical source mapping; generated helper definitions inherit the
 //! line of their first use. Native decks do not receive these dialect rewrites.
 
+mod operators;
+mod table;
+
 use crate::{
     MappedNormalization, NormalizationPass, expression_start, fresh_identifier,
     lexical::{self, Edit},
@@ -14,10 +17,34 @@ use std::collections::BTreeMap;
 const HELPERS: &[(&[u8], &str)] = &[
     (b"if", "(c,a,b) {ternary_fcn(c>0.5,a,b)}"),
     (b"limit", "(x,a,b) {min(max(x,min(a,b)),max(a,b))}"),
-    (b"pwr", "(x,y) {pow(abs(x),y)}"),
-    (b"pwrs", "(x,y) {sgn(x)*pow(abs(x),y)}"),
+    (
+        b"pwr",
+        "(x,y) {ternary_fcn(x==0,ternary_fcn(y==0,1,0),pow(abs(x),y))}",
+    ),
+    (
+        b"pwrs",
+        "(x,y) {ternary_fcn(x==0,ternary_fcn(y==0,1,0),ternary_fcn(x<0,-1,1)*pow(abs(x),y))}",
+    ),
     (b"inv", "(x) {ternary_fcn(x>0.5,0,1)}"),
     (b"square", "(x) {x*x}"),
+    (
+        b"mod",
+        "(x,y) {x-y*ternary_fcn(x/y>=0,floor(x/y),ceil(x/y))}",
+    ),
+    (b"buf", "(x) {ternary_fcn(x>0.5,1,0)}"),
+    (b"xor", "(x,y) {ternary_fcn((x>0.5)!=(y>0.5),1,0)}"),
+    (
+        b"pow",
+        "(x,y) {ternary_fcn(x==0,ternary_fcn(y==0,1,0),ternary_fcn(x<0,ternary_fcn(y==floor(y),pow(-1,y)*pow(abs(x),y),0),pow(x,y)))}",
+    ),
+    (
+        b"uplim",
+        "(x,y,z) {ternary_fcn(z==0,min(x,y),ternary_fcn(x<=y-z,x,y-z*exp((y-z-x)/z)))}",
+    ),
+    (
+        b"dnlim",
+        "(x,y,z) {ternary_fcn(z==0,max(x,y),ternary_fcn(x>=y+z,x,y+z*exp((x-y-z)/z)))}",
+    ),
 ];
 
 fn resistor_flags(statement: &lexical::Statement, edits: &mut Vec<Edit>) -> Result<()> {
@@ -72,7 +99,10 @@ fn reject_shadowed_helpers(statement: &lexical::Statement) -> Result<()> {
             .any(|(helper, _)| name.eq_ignore_ascii_case(helper))
             && ![
                 b"abs".as_slice(),
-                b"pow",
+                b"table",
+                b"floor",
+                b"ceil",
+                b"exp",
                 b"min",
                 b"max",
                 b"sgn",
@@ -118,10 +148,7 @@ fn validate_model(statement: &lexical::Statement) -> Result<()> {
 
 fn validate_expression(statement: &lexical::Statement, start: usize) -> Result<()> {
     for name in [
-        b"table".as_slice(),
-        b"uplim",
-        b"dnlim",
-        b"idt",
+        b"idt".as_slice(),
         b"idtmod",
         b"ddt",
         b"delay",
@@ -142,9 +169,37 @@ fn validate_expression(statement: &lexical::Statement, start: usize) -> Result<(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Helper {
+    Fixed(usize),
+    Table(usize),
+}
+
+impl Helper {
+    fn base(self) -> Vec<u8> {
+        match self {
+            Self::Fixed(index) => {
+                let mut base = b"__lt_intrinsic_".to_vec();
+                base.extend_from_slice(HELPERS[index].0);
+                base
+            }
+            Self::Table(points) => format!("__lt_table_{points}").into_bytes(),
+        }
+    }
+
+    fn definition(self) -> Result<String> {
+        match self {
+            Self::Fixed(index) => Ok(HELPERS[index].1.to_owned()),
+            Self::Table(points) => table::definition(points),
+        }
+    }
+}
+
+type HelperMap = BTreeMap<Helper, (Vec<u8>, usize)>;
+
 struct RewritePlan {
     edits: Vec<Edit>,
-    helpers: BTreeMap<usize, (Vec<u8>, usize)>,
+    helpers: HelperMap,
     flags_changed: bool,
     annotation_changed: bool,
 }
@@ -154,7 +209,7 @@ fn rewrite_intrinsics(
     start: usize,
     title_lines: usize,
     used: &mut std::collections::BTreeSet<Vec<u8>>,
-    helpers: &mut BTreeMap<usize, (Vec<u8>, usize)>,
+    helpers: &mut HelperMap,
     edits: &mut Vec<Edit>,
 ) -> Result<()> {
     let text = &statement.text;
@@ -163,28 +218,47 @@ fn rewrite_intrinsics(
         if spans.is_empty() {
             continue;
         }
-        let (identifier, _) = if let Some(helper) = helpers.get(&index) {
-            helper
-        } else {
-            let mut base = b"__lt_intrinsic_".to_vec();
-            base.extend_from_slice(name);
-            let identifier =
-                fresh_identifier(used, &base).context("LTspice intrinsic identifier overflow")?;
-            helpers
-                .entry(index)
-                .or_insert((identifier, statement.line + title_lines))
-        };
+        let helper = Helper::Fixed(index);
+        let identifier = helper_identifier(helper, statement.line + title_lines, used, helpers)?;
         for span in spans {
             lexical::replace_span(statement, span, identifier, edits);
         }
     }
+    for span in lexical::function_names(text, b"table", start) {
+        let points = table::point_count(text, span.clone())?;
+        let identifier = helper_identifier(
+            Helper::Table(points),
+            statement.line + title_lines,
+            used,
+            helpers,
+        )?;
+        lexical::replace_span(statement, span, identifier, edits);
+    }
     Ok(())
+}
+
+fn helper_identifier<'a>(
+    helper: Helper,
+    origin: usize,
+    used: &mut std::collections::BTreeSet<Vec<u8>>,
+    helpers: &'a mut HelperMap,
+) -> Result<&'a [u8]> {
+    use std::collections::btree_map::Entry;
+    let (identifier, _) = match helpers.entry(helper) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let identifier = fresh_identifier(used, &helper.base())
+                .context("LTspice intrinsic identifier overflow")?;
+            entry.insert((identifier, origin))
+        }
+    };
+    Ok(identifier)
 }
 
 fn plan_rewrites(bytes: &[u8], body: &[u8], title_lines: usize) -> Result<RewritePlan> {
     let mut used = source_identifiers(bytes);
     let mut edits = Vec::new();
-    let mut helpers = BTreeMap::<usize, (Vec<u8>, usize)>::new();
+    let mut helpers = HelperMap::new();
     let mut flags_changed = false;
     let mut annotation_changed = false;
     let mut control = false;
@@ -257,9 +331,10 @@ pub fn normalize(
     mut input: MappedNormalization,
     kind: crate::linked_source::RootKind,
 ) -> Result<MappedNormalization> {
-    let bytes = &input.model.bytes;
     let title = if kind == crate::linked_source::RootKind::Deck {
-        bytes
+        input
+            .model
+            .bytes
             .split_inclusive(|byte| *byte == b'\n')
             .next()
             .context("missing LTspice title")?
@@ -267,6 +342,12 @@ pub fn normalize(
     } else {
         0
     };
+    if let Some(lowered) = operators::rewrite(&input.model.bytes[title..])? {
+        input.model.bytes.truncate(title);
+        input.model.bytes.extend_from_slice(&lowered);
+        input.model.passes.push(NormalizationPass::LtspiceOperators);
+    }
+    let bytes = &input.model.bytes;
     let body = &bytes[title..];
     let title_lines = usize::from(title != 0);
     let plan = plan_rewrites(bytes, body, title_lines)?;
@@ -281,10 +362,10 @@ pub fn normalize(
     };
     let mut output = bytes[..title].to_vec();
     let mut origins = input.input_lines[..title_lines].to_vec();
-    for (index, (identifier, origin)) in &helpers {
+    for (helper, (identifier, origin)) in &helpers {
         output.extend_from_slice(b".func ");
         output.extend_from_slice(identifier);
-        output.extend_from_slice(HELPERS[*index].1.as_bytes());
+        output.extend_from_slice(helper.definition()?.as_bytes());
         output.push(b'\n');
         origins.push(
             *input

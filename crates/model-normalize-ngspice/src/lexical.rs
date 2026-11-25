@@ -234,47 +234,61 @@ pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
     (out != input).then_some(out)
 }
 
+/// Shared quote-aware delimiter tracking for logical source fields.
+#[derive(Default)]
+pub(crate) struct Balanced {
+    context: Context,
+    stack: Vec<u8>,
+}
+
+impl Balanced {
+    pub(crate) fn top_level(&self) -> bool {
+        self.context.quote.is_none() && self.stack.is_empty()
+    }
+
+    pub(crate) fn advance(&mut self, byte: u8) -> Result<()> {
+        if self.context.quote.is_none() {
+            match byte {
+                b'(' => self.stack.push(b')'),
+                b'{' => self.stack.push(b'}'),
+                b'[' => self.stack.push(b']'),
+                b')' | b'}' | b']' => ensure!(
+                    self.stack.pop() == Some(byte),
+                    "mismatched expression delimiters"
+                ),
+                _ => {}
+            }
+        }
+        self.context.advance(byte);
+        Ok(())
+    }
+
+    pub(crate) fn finish(&self) -> Result<()> {
+        ensure!(self.top_level(), "unterminated expression or quote");
+        Ok(())
+    }
+}
+
 /// Top-level whitespace and assignment separators, with balanced expression
 /// delimiters and quotes kept intact as a single token.
 pub fn tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
     let mut ranges = Vec::new();
     let mut start = None;
-    let mut context = Context::default();
-    let mut stack = Vec::new();
+    let mut balanced = Balanced::default();
     for (i, &b) in text.iter().enumerate() {
-        if context.quote.is_none() {
-            if stack.is_empty() && (b.is_ascii_whitespace() || b == b'=') {
-                if let Some(begin) = start.take() {
-                    ranges.push(begin..i);
-                }
-                if b == b'=' {
-                    ranges.push(i..i + 1);
-                }
-                continue;
+        if balanced.top_level() && (b.is_ascii_whitespace() || b == b'=') {
+            if let Some(begin) = start.take() {
+                ranges.push(begin..i);
             }
-            match b {
-                b'(' | b'{' | b'[' => stack.push(b),
-                b')' | b'}' | b']' => {
-                    let expected = match b {
-                        b')' => b'(',
-                        b'}' => b'{',
-                        _ => b'[',
-                    };
-                    ensure!(
-                        stack.pop() == Some(expected),
-                        "mismatched expression delimiters"
-                    );
-                }
-                _ => {}
+            if b == b'=' {
+                ranges.push(i..i + 1);
             }
+            continue;
         }
         start.get_or_insert(i);
-        context.advance(b);
+        balanced.advance(b)?;
     }
-    ensure!(
-        context.quote.is_none() && stack.is_empty(),
-        "unterminated expression or quote"
-    );
+    balanced.finish()?;
     if let Some(begin) = start {
         ranges.push(begin..text.len());
     }

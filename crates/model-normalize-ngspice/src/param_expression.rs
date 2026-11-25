@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Value(f64),
+    SourceAtom(String),
     Name(String),
     Op(&'static str),
     Open,
@@ -21,12 +22,106 @@ enum Token {
     End,
 }
 
-fn tokenize(raw: &str) -> Result<Vec<Token>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dialect {
+    Native,
+    Ltspice,
+}
+
+impl Dialect {
+    fn precedence(self, op: &str) -> Option<u8> {
+        match op {
+            "||" | "&&" | "^" if matches!(self, Self::Ltspice) => Some(2),
+            "||" => Some(2),
+            "&&" => Some(3),
+            "==" | "!=" | "<=" | ">=" | "<" | ">" => Some(4),
+            "+" | "-" => Some(5),
+            "*" | "/" | "%" | "\\" => Some(6),
+            "**" => Some(8),
+            _ => None,
+        }
+    }
+}
+
+fn source_probe(raw: &str, name_end: usize) -> Result<Option<usize>> {
+    let tail = raw[name_end..].trim_start();
+    if !tail.starts_with('(') {
+        return Ok(None);
+    }
+    let end = tail
+        .find(')')
+        .context("unterminated LTspice circuit probe")?;
+    let body = &tail[1..end];
+    ensure!(!body.contains('('), "nested circuit probe identifier");
+    Ok(Some(raw.len() - tail.len() + end + 1))
+}
+
+fn number_end(bytes: &[u8], mut cursor: usize) -> usize {
+    if bytes[cursor] == b'.' {
+        cursor += 1;
+    }
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+    }
+    if matches!(bytes.get(cursor), Some(b'e' | b'E' | b'd' | b'D')) {
+        let exponent = cursor + 1;
+        let offset = exponent + usize::from(matches!(bytes.get(exponent), Some(b'+' | b'-')));
+        if bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+            cursor = offset + 1;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor += 1;
+            }
+        }
+    }
+    while bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic) {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn name_token(raw: &str, start: usize, dialect: Dialect) -> Result<(Token, usize)> {
+    let mut cursor = start + 1;
+    while raw.as_bytes().get(cursor).is_some_and(|b| {
+        b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'#' | b'$' | b'[' | b']')
+    }) {
+        cursor += 1;
+    }
+    let name = &raw[start..cursor];
+    if dialect == Dialect::Ltspice {
+        if (name.eq_ignore_ascii_case("v") || name.eq_ignore_ascii_case("i"))
+            && let Some(end) = source_probe(raw, cursor)?
+        {
+            return Ok((Token::SourceAtom(raw[start..end].to_owned()), end));
+        }
+        return Ok((Token::Name(name.to_ascii_lowercase()), cursor));
+    }
+    let token = match name.to_ascii_lowercase().as_str() {
+        "not" => Token::Op("!"),
+        "and" => Token::Op("&&"),
+        "or" => Token::Op("||"),
+        "mod" => Token::Op("%"),
+        "div" => Token::Op("\\"),
+        _ => Token::Name(name.to_ascii_lowercase()),
+    };
+    Ok((token, cursor))
+}
+
+fn tokenize(raw: &str, dialect: Dialect) -> Result<Vec<Token>> {
     ensure!(raw.is_ascii(), "non-ASCII ngspice parameter expression");
     let bytes = raw.as_bytes();
     let mut cursor = 0;
     let mut tokens = Vec::new();
     while let Some(&byte) = bytes.get(cursor) {
+        ensure!(
+            tokens.len() < MAX_TREE_NODES,
+            "parameter expression token budget ({MAX_TREE_NODES}) exceeded"
+        );
         if byte.is_ascii_whitespace() {
             cursor += 1;
             continue;
@@ -35,51 +130,20 @@ fn tokenize(raw: &str) -> Result<Vec<Token>> {
         if byte.is_ascii_digit()
             || (byte == b'.' && bytes.get(cursor + 1).is_some_and(u8::is_ascii_digit))
         {
-            if byte == b'.' {
-                cursor += 1;
-            }
-            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                cursor += 1;
-            }
-            if bytes.get(cursor) == Some(&b'.') {
-                cursor += 1;
-                while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                    cursor += 1;
-                }
-            }
-            if matches!(bytes.get(cursor), Some(b'e' | b'E' | b'd' | b'D')) {
-                let exponent = cursor + 1;
-                let offset =
-                    exponent + usize::from(matches!(bytes.get(exponent), Some(b'+' | b'-')));
-                if bytes.get(offset).is_some_and(u8::is_ascii_digit) {
-                    cursor = offset + 1;
-                    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                        cursor += 1;
-                    }
-                }
-            }
-            while bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic) {
-                cursor += 1;
-            }
-            tokens.push(Token::Value(parse_spice_constant(&raw[start..cursor])?));
+            cursor = number_end(bytes, cursor);
+            let literal = &raw[start..cursor];
+            let value = parse_spice_constant(literal)?;
+            tokens.push(if dialect == Dialect::Ltspice {
+                Token::SourceAtom(literal.to_owned())
+            } else {
+                Token::Value(value)
+            });
             continue;
         }
         if byte.is_ascii_alphabetic() || byte == b'_' {
-            cursor += 1;
-            while bytes.get(cursor).is_some_and(|b| {
-                b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'#' | b'$' | b'[' | b']')
-            }) {
-                cursor += 1;
-            }
-            let name = &raw[start..cursor];
-            match name.to_ascii_lowercase().as_str() {
-                "not" => tokens.push(Token::Op("!")),
-                "and" => tokens.push(Token::Op("&&")),
-                "or" => tokens.push(Token::Op("||")),
-                "mod" => tokens.push(Token::Op("%")),
-                "div" => tokens.push(Token::Op("\\")),
-                _ => tokens.push(Token::Name(name.to_ascii_lowercase())),
-            }
+            let (token, end) = name_token(raw, cursor, dialect)?;
+            cursor = end;
+            tokens.push(token);
             continue;
         }
         let op = match bytes.get(cursor..cursor.saturating_add(2)) {
@@ -101,6 +165,8 @@ fn tokenize(raw: &str) -> Result<Vec<Token>> {
         tokens.push(match byte {
             b'(' => Token::Open,
             b')' => Token::Close,
+            b'{' if dialect == Dialect::Ltspice => Token::Open,
+            b'}' if dialect == Dialect::Ltspice => Token::Close,
             b',' => Token::Comma,
             b'?' => Token::Question,
             b':' => Token::Colon,
@@ -110,6 +176,10 @@ fn tokenize(raw: &str) -> Result<Vec<Token>> {
             b'/' => Token::Op("/"),
             b'%' => Token::Op("%"),
             b'\\' => Token::Op("\\"),
+            b'^' if dialect == Dialect::Ltspice => Token::Op("^"),
+            b'&' if dialect == Dialect::Ltspice => Token::Op("&&"),
+            b'|' if dialect == Dialect::Ltspice => Token::Op("||"),
+            b'~' if dialect == Dialect::Ltspice => Token::Op("!"),
             b'^' => Token::Op("**"),
             b'!' => Token::Op("!"),
             b'<' => Token::Op("<"),
@@ -120,6 +190,10 @@ fn tokenize(raw: &str) -> Result<Vec<Token>> {
             ),
         });
     }
+    ensure!(
+        tokens.len() <= MAX_TREE_NODES,
+        "parameter expression token budget ({MAX_TREE_NODES}) exceeded"
+    );
     tokens.push(Token::End);
     Ok(tokens)
 }
@@ -159,6 +233,7 @@ pub struct SpiceExpression(Expr);
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
     Number(f64),
+    SourceAtom(String),
     Symbol(String),
     Unary(&'static str, Box<Self>),
     Binary(&'static str, Box<Self>, Box<Self>),
@@ -166,14 +241,43 @@ enum Expr {
     Call(String, Vec<Self>),
 }
 
+// Align the source syntax envelope with the native solver. Bound both
+// nesting (including right-associative powers) and flat left-deep trees.
+const MAX_NESTING: usize = 64;
+const MAX_TREE_DEPTH: usize = 4 * MAX_NESTING;
+const MAX_TREE_NODES: usize = 100_000;
+
+struct Parsed {
+    expr: Expr,
+    height: usize,
+}
+
+impl Parsed {
+    const fn atom(expr: Expr) -> Self {
+        Self { expr, height: 1 }
+    }
+
+    fn parent(expr: Expr, child_height: usize) -> Result<Self> {
+        let height = child_height + 1;
+        ensure!(
+            height <= MAX_TREE_DEPTH,
+            "parameter expression structural depth limit ({MAX_TREE_DEPTH}) exceeded"
+        );
+        Ok(Self { expr, height })
+    }
+}
+
 struct Parser {
     tokens: Vec<Token>,
     offset: usize,
+    dialect: Dialect,
 }
 impl Parser {
     fn take(&mut self) -> Token {
         let token = self.tokens[self.offset].clone();
-        self.offset += 1;
+        if token != Token::End {
+            self.offset += 1;
+        }
         token
     }
     fn peek(&self) -> &Token {
@@ -187,65 +291,83 @@ impl Parser {
         );
         Ok(())
     }
-    fn prefix(&mut self) -> Result<Expr> {
-        match self.take() {
-            Token::Value(value) => Ok(Expr::Number(value)),
-            Token::Name(name) => {
-                if self.peek() != &Token::Open {
-                    return Ok(Expr::Symbol(name));
+    fn call(&mut self, name: String, depth: usize) -> Result<Parsed> {
+        self.take();
+        let mut args = Vec::new();
+        let mut height = 0;
+        if self.peek() != &Token::Close {
+            loop {
+                let parsed = self.expression(0, depth + 1)?;
+                height = height.max(parsed.height);
+                args.push(parsed.expr);
+                if self.peek() != &Token::Comma {
+                    break;
                 }
                 self.take();
-                let mut args = Vec::new();
-                if self.peek() != &Token::Close {
-                    loop {
-                        args.push(self.expression(0)?);
-                        if self.peek() != &Token::Comma {
-                            break;
-                        }
-                        self.take();
-                    }
-                }
-                self.expect(&Token::Close)?;
-                Ok(Expr::Call(name, args))
             }
-            Token::Op("+" | "-" | "!") => {
-                let Token::Op(op) = self.tokens[self.offset - 1] else {
-                    unreachable!()
+        }
+        self.expect(&Token::Close)?;
+        Parsed::parent(Expr::Call(name, args), height)
+    }
+
+    fn prefix(&mut self, depth: usize) -> Result<Parsed> {
+        match self.take() {
+            Token::Value(value) => Ok(Parsed::atom(Expr::Number(value))),
+            Token::SourceAtom(value) => Ok(Parsed::atom(Expr::SourceAtom(value))),
+            Token::Name(name) => {
+                if self.peek() == &Token::Open {
+                    self.call(name, depth)
+                } else {
+                    Ok(Parsed::atom(Expr::Symbol(name)))
+                }
+            }
+            Token::Op(op @ ("+" | "-" | "!")) => {
+                let binding = if self.dialect == Dialect::Ltspice {
+                    9
+                } else {
+                    8
                 };
-                Ok(Expr::Unary(op, Box::new(self.expression(8)?)))
+                let child = self.expression(binding, depth + 1)?;
+                Parsed::parent(Expr::Unary(op, Box::new(child.expr)), child.height)
             }
             Token::Open => {
-                let value = self.expression(0)?;
+                let value = self.expression(0, depth + 1)?;
                 self.expect(&Token::Close)?;
                 Ok(value)
             }
-            other => bail!("expected ngspice expression atom, got {other:?}"),
+            other => bail!("expected SPICE expression atom, got {other:?}"),
         }
     }
-    fn expression(&mut self, minimum: u8) -> Result<Expr> {
-        let mut left = self.prefix()?;
+
+    fn expression(&mut self, minimum: u8, depth: usize) -> Result<Parsed> {
+        ensure!(
+            depth <= MAX_NESTING,
+            "parameter expression nesting limit ({MAX_NESTING}) exceeded"
+        );
+        let mut left = self.prefix(depth)?;
         loop {
             if *self.peek() == Token::Question {
                 if minimum > 1 {
                     break;
                 }
                 self.take();
-                let then_branch = self.expression(0)?;
+                let then_branch = self.expression(0, depth + 1)?;
                 self.expect(&Token::Colon)?;
-                let else_branch = self.expression(1)?;
-                left =
-                    Expr::Conditional(Box::new(left), Box::new(then_branch), Box::new(else_branch));
+                let else_branch = self.expression(1, depth + 1)?;
+                let height = left.height.max(then_branch.height).max(else_branch.height);
+                left = Parsed::parent(
+                    Expr::Conditional(
+                        Box::new(left.expr),
+                        Box::new(then_branch.expr),
+                        Box::new(else_branch.expr),
+                    ),
+                    height,
+                )?;
                 continue;
             }
             let Token::Op(op) = self.peek() else { break };
-            let precedence = match *op {
-                "||" => 2,
-                "&&" => 3,
-                "==" | "!=" | "<=" | ">=" | "<" | ">" => 4,
-                "+" | "-" => 5,
-                "*" | "/" | "%" | "\\" => 6,
-                "**" => 8,
-                _ => break,
+            let Some(precedence) = self.dialect.precedence(op) else {
+                break;
             };
             if precedence < minimum {
                 break;
@@ -253,8 +375,17 @@ impl Parser {
             let Token::Op(op) = self.take() else {
                 unreachable!()
             };
-            let right = self.expression(precedence + 1)?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            let right_binding = if self.dialect == Dialect::Ltspice && op == "**" {
+                precedence
+            } else {
+                precedence + 1
+            };
+            let right = self.expression(right_binding, depth + 1)?;
+            let height = left.height.max(right.height);
+            left = Parsed::parent(
+                Expr::Binary(op, Box::new(left.expr), Box::new(right.expr)),
+                height,
+            )?;
         }
         Ok(left)
     }
@@ -278,10 +409,11 @@ impl SpiceExpression {
             raw
         };
         let mut parser = Parser {
-            tokens: tokenize(inner)?,
+            tokens: tokenize(inner, Dialect::Native)?,
             offset: 0,
+            dialect: Dialect::Native,
         };
-        let expr = parser.expression(0)?;
+        let expr = parser.expression(0, 0)?.expr;
         ensure!(
             parser.peek() == &Token::End,
             "trailing ngspice expression tokens: {:?}",
@@ -312,6 +444,94 @@ impl SpiceExpression {
     }
 }
 
+/// Lower `LTspice` operator precedence and Boolean coercion before native
+/// function-name lowering. Numeric spellings and circuit probe names remain
+/// untouched. The ordinary native evaluator never receives source atoms.
+pub(crate) fn lower_ltspice(raw: &str) -> Result<String> {
+    let mut parser = Parser {
+        tokens: tokenize(raw, Dialect::Ltspice)?,
+        offset: 0,
+        dialect: Dialect::Ltspice,
+    };
+    let expression = parser.expression(0, 0)?.expr;
+    ensure!(
+        parser.peek() == &Token::End,
+        "trailing LTspice expression tokens: {:?}",
+        parser.peek()
+    );
+    let mut output = String::new();
+    expression.render_ltspice(&mut output)?;
+    Ok(output)
+}
+
+impl Expr {
+    fn render_ltspice(&self, out: &mut String) -> Result<()> {
+        use std::fmt::Write as _;
+        match self {
+            Self::Number(value) => write!(out, "{value}")?,
+            Self::SourceAtom(value) | Self::Symbol(value) => out.push_str(value),
+            Self::Unary(op, child) => {
+                if *op == "!" {
+                    out.push_str("inv(");
+                } else {
+                    write!(out, "({op}")?;
+                }
+                child.render_ltspice(out)?;
+                out.push(')');
+            }
+            Self::Binary(op, lhs, rhs) => {
+                match *op {
+                    "**" | "^" | "%" => {
+                        let function = match *op {
+                            "**" => "pow",
+                            "^" => "xor",
+                            _ => "mod",
+                        };
+                        write!(out, "{function}(")?;
+                        lhs.render_ltspice(out)?;
+                        out.push(',');
+                        rhs.render_ltspice(out)?;
+                    }
+                    "&&" | "||" => {
+                        out.push_str("((");
+                        lhs.render_ltspice(out)?;
+                        write!(out, ">0.5){op}(")?;
+                        rhs.render_ltspice(out)?;
+                        out.push_str(">0.5)");
+                    }
+                    _ => {
+                        out.push('(');
+                        lhs.render_ltspice(out)?;
+                        out.push_str(op);
+                        rhs.render_ltspice(out)?;
+                    }
+                }
+                out.push(')');
+            }
+            Self::Conditional(condition, yes, no) => {
+                out.push_str("if(");
+                condition.render_ltspice(out)?;
+                out.push(',');
+                yes.render_ltspice(out)?;
+                out.push(',');
+                no.render_ltspice(out)?;
+                out.push(')');
+            }
+            Self::Call(name, arguments) => {
+                write!(out, "{name}(")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index != 0 {
+                        out.push(',');
+                    }
+                    argument.render_ltspice(out)?;
+                }
+                out.push(')');
+            }
+        }
+        Ok(())
+    }
+}
+
 fn truthy(value: f64) -> bool {
     value != 0.0
 }
@@ -327,6 +547,9 @@ impl Expr {
     fn evaluate(&self, resolve: &mut impl SpiceExpressionContext) -> Result<f64> {
         let value = match self {
             Self::Number(value) => *value,
+            Self::SourceAtom(_) => {
+                bail!("source-only expression cannot be evaluated as native numparam")
+            }
             Self::Symbol(name) => resolve
                 .symbol(name)
                 .with_context(|| format!("resolving parameter {name}"))?,
