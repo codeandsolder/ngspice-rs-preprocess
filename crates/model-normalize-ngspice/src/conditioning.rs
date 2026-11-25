@@ -102,6 +102,18 @@ struct Source {
     waveform_sources: BTreeSet<usize>,
 }
 
+fn charge_conditioning_input(
+    bytes: &[u8],
+    budget: &model_preprocess_command::WorkBudget,
+) -> Result<()> {
+    use model_preprocess_command::Resource;
+    budget.charge(Resource::ScannedBytes, bytes.len())?;
+    budget.charge(
+        Resource::Statements,
+        bytes.split_inclusive(|byte| *byte == b'\n').count(),
+    )
+}
+
 impl Source {
     fn parse(
         inputs: &[ConditioningInput<'_>],
@@ -119,10 +131,7 @@ impl Source {
         // an additional admission gate for already translated artifacts.
         let mut parameters = String::new();
         for (artifact, input) in inputs.iter().enumerate() {
-            budget.charge(
-                model_preprocess_command::Resource::ScannedBytes,
-                input.bytes.len(),
-            )?;
+            charge_conditioning_input(input.bytes, budget)?;
             let mut stack = vec![0];
             for statement in lexical::statements(input.bytes)? {
                 let text = std::str::from_utf8(&statement.text)?.to_owned();

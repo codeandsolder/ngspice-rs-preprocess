@@ -5,6 +5,7 @@
 //! parameter expressions use the containing source's declared language.
 
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 
 /// Default bound for the standalone source projection.
@@ -352,8 +353,8 @@ fn lower_call(
     name: &str,
     body: &str,
     language: SourceLanguage,
-    depth: usize,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<String> {
     if name.eq_ignore_ascii_case("LOG") {
         let args = split_arguments(body)?;
@@ -368,7 +369,7 @@ fn lower_call(
         };
         return Ok(format!(
             "{target}({})",
-            rewrite_expression(body, language, depth + 1, true, limit)?
+            rewrite_expression(body, language, true, limit, budget)?
         ));
     }
     let args = split_arguments(body)?;
@@ -379,8 +380,8 @@ fn lower_call(
         !base.is_empty() && !exponent.is_empty(),
         "PWR requires two arguments"
     );
-    let base = rewrite_expression(base, language, depth + 1, true, limit)?;
-    let exponent = rewrite_expression(exponent, language, depth + 1, true, limit)?;
+    let base = rewrite_expression(base, language, true, limit, budget)?;
+    let exponent = rewrite_expression(exponent, language, true, limit, budget)?;
     if language == SourceLanguage::Simetrix {
         return power::guarded(&base, &exponent, limit);
     }
@@ -410,11 +411,12 @@ fn lower_call(
 fn rewrite_expression(
     input: &str,
     language: SourceLanguage,
-    depth: usize,
     grouped: bool,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<String> {
-    ensure!(depth < 128, "source expression nesting exceeds 128");
+    let _frame = budget.enter()?;
+    budget.charge(Resource::EvaluationSteps, input.len())?;
     ensure!(
         input.len() <= limit,
         "source expression byte budget exceeded"
@@ -451,9 +453,9 @@ fn rewrite_expression(
             output.push_str(&rewrite_expression(
                 &input[offset + 1..end],
                 language,
-                depth + 1,
                 true,
                 limit.saturating_sub(output.len()),
+                budget,
             )?);
             output.push(if grouped { ')' } else { '}' });
             offset = end + 1;
@@ -484,8 +486,8 @@ fn rewrite_expression(
                         name,
                         &input[open + 1..end],
                         language,
-                        depth,
                         limit.saturating_sub(output.len()),
+                        budget,
                     )?);
                 }
                 offset = end + 1;
@@ -502,7 +504,7 @@ fn rewrite_expression(
         );
     }
     if grouped && language == SourceLanguage::Simetrix {
-        power::lower(&output, limit)
+        power::lower_with_budget(&output, limit, budget)
     } else {
         Ok(output)
     }
@@ -523,10 +525,16 @@ fn token_end(input: &str, count: usize) -> usize {
 ///
 /// # Errors
 /// Invalid function arity or unbalanced expression delimiters.
-pub(super) fn lower_statement(
+#[cfg(test)]
+fn lower_statement(statement: &str, context: DialectContext, limit: usize) -> Result<String> {
+    lower_statement_with_budget(statement, context, limit, &WorkBudget::default())
+}
+
+pub(super) fn lower_statement_with_budget(
     statement: &str,
     context: DialectContext,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<String> {
     let trimmed = statement.trim_start();
     let Some(first) = trimmed.split_whitespace().next() else {
@@ -576,9 +584,9 @@ pub(super) fn lower_statement(
     output.push_str(&rewrite_expression(
         &trimmed[prefix_end..],
         language,
-        0,
         false,
         limit.saturating_sub(prefix_end),
+        budget,
     )?);
     if language == SourceLanguage::Simetrix && output.contains("**") {
         let start = match upper.as_str() {
@@ -588,7 +596,8 @@ pub(super) fn lower_statement(
             }
             _ => output.find('=').map_or(output.len(), |index| index + 1),
         };
-        let lowered = power::lower(&output[start..], limit.saturating_sub(start))?;
+        let lowered =
+            power::lower_with_budget(&output[start..], limit.saturating_sub(start), budget)?;
         output.truncate(start);
         output.push_str(&lowered);
     }

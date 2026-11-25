@@ -131,8 +131,33 @@ their display spellings.
 The combined artifact/intermediate-link byte limit defaults to 128 MiB and
 is configurable with `--max-output-bytes`. Per-source and command limits are
 available with `--max-input-bytes`, `--max-command-output-bytes`,
-`--max-diagnostic-bytes`, and `--timeout-ms`. These do not replace the
-separate cumulative evaluation and hierarchy work limits.
+`--max-diagnostic-bytes`, and `--timeout-ms`. These do not replace the cumulative request limits in `Options::work`
+(`WorkLimits`), shared by the admission sessions, source linker, control-flow
+expander, specialization, scalar evaluation, and translation. Configure the
+following independently using the corresponding CLI switches:
+
+| Work limit | Default | CLI option |
+| --- | ---: | --- |
+| Original source bytes | 256 MiB | `--max-work-input-bytes` |
+| Admitted snapshot bytes | 256 MiB | `--max-work-admitted-bytes` |
+| Source identities | 16,384 | `--max-work-sources` |
+| Source visits (including cached includes) | 65,536 | `--max-work-source-visits` |
+| Scanned bytes | 1 GiB | `--max-work-scanned-bytes` |
+| Statement visits | 8,000,000 | `--max-work-statements` |
+| Expression work | 32,000,000 | `--max-work-evaluation-steps` |
+| Generated definitions, nodes and vector elements | 2,000,000 | `--max-work-generated-nodes` |
+| Intermediate and final emitted bytes | 512 MiB | `--max-work-emitted-bytes` |
+| Recursive preprocessing depth | 64 | `--max-work-depth` |
+
+These are cumulative work allowances, not exact heap-memory or wall-clock
+measurements: processing the same bytes again can consume additional work.
+Canonical repeated source admissions reuse their snapshots, but every expansion
+visit consumes work. Nested loops share the request allowance without changing
+the source-language iteration limit. Depth has an implementation ceiling of 64
+to bound native stack use. Recursive includes and unchanged-actuals recursive
+specializations are diagnosed separately from work exhaustion. A budget failure
+is sticky and rejects the entire request, including when an optional analysis
+would otherwise skip an unsupported expression.
 
 
 The SIMetrix `PWLS PUL` independent voltage/current waveform is lowered to
@@ -182,7 +207,7 @@ Cancellation uses a shared `Cancellation` token. On Unix, failed invocations
 terminate the child process group; on Windows, the direct child is terminated.
 Cleanup is separately bounded to five seconds. Ordinary filesystem reads
 are synchronous and may block at the OS/filesystem level. Cumulative graph
-budgets are a separate preprocessing policy.
+budgets also bound admission and expansion work across all invocations.
 
 `SourceLinker::link_with_session` applies the same session to the root,
 relative includes and named library sections. SIMPLIS callers use

@@ -758,11 +758,12 @@ pub fn parse_library_with_budget(
             crate::source_dialect::DialectContext::default(),
             crate::source_dialect::SourceKind::Include,
         )?;
-        let view = lower_simetrix_source_view(
+        let view = lower_simetrix_source_view_with_budget(
             &view,
             context,
             crate::source_dialect::DEFAULT_PROJECTION_BYTES
                 .min(budget.remaining(Resource::EmittedBytes)?),
+            budget,
         )?;
         budget.charge(Resource::EmittedBytes, view.len())?;
         return parse_projected_library(source_name, &view, simulator, Some(context), budget);
@@ -986,15 +987,34 @@ pub fn lower_simetrix_source_view(
     context: crate::source_dialect::DialectContext,
     limit: usize,
 ) -> Result<String> {
-    use crate::source_dialect::{OpaqueSource, lower_statement};
+    lower_simetrix_source_view_with_budget(selected, context, limit, &WorkBudget::default())
+}
+
+/// Lower a selected source view using the shared preprocessing budget.
+/// # Errors
+/// Invalid expression syntax or exhausted work allowance.
+pub fn lower_simetrix_source_view_with_budget(
+    selected: &str,
+    context: crate::source_dialect::DialectContext,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<String> {
+    use crate::source_dialect::{OpaqueSource, lower_statement_with_budget};
     use std::fmt::Write as _;
     let mut output = String::new();
     let mut opaque = OpaqueSource::default();
     for statement in selected.lines() {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.len())?;
         let lowered = if opaque.consume(statement) {
             statement.to_owned()
         } else {
-            lower_statement(statement, context, limit.saturating_sub(output.len()))?
+            lower_statement_with_budget(
+                statement,
+                context,
+                limit.saturating_sub(output.len()),
+                budget,
+            )?
         };
         anyhow::ensure!(
             lowered.len().saturating_add(1) <= limit.saturating_sub(output.len()),
@@ -2696,46 +2716,48 @@ fn linked_source(unit: &LinkedUnit) -> Result<(&str, &str)> {
     Ok((source_id, source_name))
 }
 
-fn emit_linked_unit(
+fn append_linked_body(
+    builder: &mut LinkedLibraryBuilder,
+    header: &str,
+    body: &[String],
+    name: &str,
+    budget: &WorkBudget,
+) -> Result<()> {
+    use std::fmt::Write as _;
+    budget.charge(Resource::EmittedBytes, header.len().saturating_add(1))?;
+    builder.output.push_str(header);
+    builder.output.push('\n');
+    for statement in body {
+        budget.charge(Resource::EmittedBytes, statement.len().saturating_add(1))?;
+        builder.output.push_str(statement);
+        builder.output.push('\n');
+    }
+    budget.charge(Resource::EmittedBytes, name.len().saturating_add(8))?;
+    writeln!(builder.output, ".ends {name}\n")?;
+    Ok(())
+}
+
+struct RewrittenLinkedBody {
+    header: String,
+    statements: Vec<String>,
+    children: Vec<LinkedUnit>,
+    dependencies: BTreeSet<String>,
+}
+
+fn rewrite_linked_body(
     unit: &LinkedUnit,
+    bytes: &[u8],
+    source_id: &str,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
-    builders: &mut BTreeMap<String, LinkedLibraryBuilder>,
-    seen: &mut BTreeSet<(String, String)>,
-    generated_subcircuits: &mut usize,
-) -> Result<()> {
-    let _depth = external.budget.enter()?;
-    let (source_id, source_name) = linked_source(unit)?;
-    let source_id = source_id.to_owned();
-    let source_name = source_name.to_owned();
-    let seen_key = (source_id.clone(), unit.emitted_name.clone());
-    if !seen.insert(seen_key) {
-        return Ok(());
-    }
-
-    if let LinkedBody::Microchip(overrides) = &unit.body {
-        let pending = Pending {
-            definition: unit.definition.clone(),
-            generated_name: unit.emitted_name.clone(),
-            overrides: overrides.clone(),
-            local_key: None,
-        };
-        let builder = builders.entry(source_id.clone()).or_default();
-        initialize_linked_builder(builder, &source_id, &source_name, external)?;
-        emit_microchip_complementary_pwm(&pending, &mut builder.output)?;
-        *generated_subcircuits = generated_subcircuits.saturating_add(1);
-        return Ok(());
-    }
-
-    let LinkedBody::Netlist(bytes) = &unit.body else {
-        unreachable!("handled Microchip body above");
-    };
+) -> Result<RewrittenLinkedBody> {
     let (header, body_lines) = rename_specialized(bytes, &unit.emitted_name)?;
     let mut rewritten_body = Vec::new();
     let mut children = Vec::new();
     let mut dependencies = BTreeSet::new();
     let mut init_children = unit.init.children.clone();
     for statement in logical_statements(&body_lines) {
+        external.budget.charge(Resource::Statements, 1)?;
         let child_init = instance_name(&statement)
             .and_then(|name| init_children.remove(&name))
             .unwrap_or_default();
@@ -2780,26 +2802,77 @@ fn emit_linked_unit(
         }
     }
 
-    {
+    Ok(RewrittenLinkedBody {
+        header,
+        statements: rewritten_body,
+        children,
+        dependencies,
+    })
+}
+
+fn emit_linked_unit(
+    unit: &LinkedUnit,
+    local: &SubcircuitCatalog,
+    external: &SubcircuitCatalog,
+    builders: &mut BTreeMap<String, LinkedLibraryBuilder>,
+    seen: &mut BTreeSet<(String, String)>,
+    active: &mut BTreeSet<(String, String)>,
+    generated_subcircuits: &mut usize,
+) -> Result<()> {
+    let (source_id, source_name) = linked_source(unit)?;
+    let source_id = source_id.to_owned();
+    let source_name = source_name.to_owned();
+    let seen_key = (source_id.clone(), unit.emitted_name.clone());
+    anyhow::ensure!(
+        !active.contains(&seen_key),
+        "recursive SIMPLIS specialization of {} with unchanged actuals",
+        unit.definition.name
+    );
+    if seen.contains(&seen_key) {
+        return Ok(());
+    }
+    let _depth = external.budget.enter()?;
+    active.insert(seen_key.clone());
+
+    if let LinkedBody::Microchip(overrides) = &unit.body {
+        let pending = Pending {
+            definition: unit.definition.clone(),
+            generated_name: unit.emitted_name.clone(),
+            overrides: overrides.clone(),
+            local_key: None,
+        };
         let builder = builders.entry(source_id.clone()).or_default();
         initialize_linked_builder(builder, &source_id, &source_name, external)?;
-        builder.dependencies.extend(dependencies);
+        let before = builder.output.len();
+        emit_microchip_complementary_pwm(&pending, &mut builder.output)?;
         external
             .budget
-            .charge(Resource::EmittedBytes, header.len().saturating_add(1))?;
-        builder.output.push_str(&header);
-        builder.output.push('\n');
-        for statement in rewritten_body {
-            external
-                .budget
-                .charge(Resource::EmittedBytes, statement.len().saturating_add(1))?;
-            builder.output.push_str(&statement);
-            builder.output.push('\n');
-        }
-        builder.output.push_str(".ends ");
-        builder.output.push_str(&unit.emitted_name);
-        builder.output.push_str("\n\n");
+            .charge(Resource::EmittedBytes, builder.output.len() - before)?;
+        active.remove(&seen_key);
+        seen.insert(seen_key);
+        *generated_subcircuits = generated_subcircuits.saturating_add(1);
+        return Ok(());
     }
+
+    let LinkedBody::Netlist(bytes) = &unit.body else {
+        unreachable!("handled Microchip body above");
+    };
+    let RewrittenLinkedBody {
+        header,
+        statements: rewritten_body,
+        children,
+        dependencies,
+    } = rewrite_linked_body(unit, bytes, &source_id, local, external)?;
+    let builder = builders.entry(source_id.clone()).or_default();
+    initialize_linked_builder(builder, &source_id, &source_name, external)?;
+    builder.dependencies.extend(dependencies);
+    append_linked_body(
+        builder,
+        &header,
+        &rewritten_body,
+        &unit.emitted_name,
+        &external.budget,
+    )?;
     *generated_subcircuits = generated_subcircuits.saturating_add(1);
     for child in children {
         emit_linked_unit(
@@ -2808,9 +2881,12 @@ fn emit_linked_unit(
             external,
             builders,
             seen,
+            active,
             generated_subcircuits,
         )?;
     }
+    active.remove(&seen_key);
+    seen.insert(seen_key);
     Ok(())
 }
 
@@ -3151,6 +3227,7 @@ pub fn preprocess_netlist_linked(
         .count();
     let mut builders = BTreeMap::new();
     let mut seen = BTreeSet::new();
+    let mut active = BTreeSet::new();
     let mut generated_subcircuits = 0usize;
     for unit in root_units {
         emit_linked_unit(
@@ -3159,6 +3236,7 @@ pub fn preprocess_netlist_linked(
             external,
             &mut builders,
             &mut seen,
+            &mut active,
             &mut generated_subcircuits,
         )?;
     }
@@ -3443,10 +3521,15 @@ XT 1 2 TOP
 .ends HELPER
 .end
 ";
-        let error = preprocess_netlist(source, &SubcircuitCatalog::new())
-            .err()
-            .context("expected recursive specialization error")?;
-        assert!(format!("{error:#}").contains("recursive SIMPLIS specialization"));
+        for result in [
+            preprocess_netlist(source, &SubcircuitCatalog::new()).map(|_| ()),
+            preprocess_netlist_linked(source, &SubcircuitCatalog::new()).map(|_| ()),
+        ] {
+            let error = result
+                .err()
+                .context("expected recursive specialization error")?;
+            assert!(format!("{error:#}").contains("recursive SIMPLIS specialization"));
+        }
         Ok(())
     }
 

@@ -16,8 +16,9 @@ use model_preprocess_simplis::source_dialect::{
     DeviceIdentity, DialectContext, ScopedStatement, SourceKind, resolve_device_identities,
 };
 use model_preprocess_simplis::{
-    SubcircuitCatalog, lower_simetrix_source_view, parse_library_with_budget, parse_scoped_library,
-    preprocess_netlist_linked, project_resource, render_projection, source_include_target,
+    SubcircuitCatalog, lower_simetrix_source_view_with_budget, parse_library_with_budget,
+    parse_scoped_library, preprocess_netlist_linked, project_resource, render_projection,
+    source_include_target,
 };
 use model_translate_simplis::{
     capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
@@ -219,13 +220,16 @@ impl<'a> SourceExpansion<'a> {
         Ok(None)
     }
 
-    fn expand_lines(
-        &mut self,
+    fn project_lines(
+        &self,
         source: &AdmittedSource,
         inherited: DialectContext,
         kind: SourceKind,
         section: Option<&str>,
-    ) -> Result<DialectContext> {
+    ) -> Result<(
+        DialectContext,
+        Vec<model_preprocess_simplis::source_dialect::ProjectedStatement>,
+    )> {
         let (context, mut projected) =
             project_resource(&source.bytes, inherited, kind, self.simulator)?;
         if let Some(section) = section {
@@ -243,7 +247,7 @@ impl<'a> SourceExpansion<'a> {
                 .collect();
         }
         if self.simulator == LibrarySimulator::Simetrix {
-            let lowered = lower_simetrix_source_view(
+            let lowered = lower_simetrix_source_view_with_budget(
                 &render_projection(&projected),
                 context,
                 self.limit.saturating_sub(self.output.len()).min(
@@ -251,6 +255,7 @@ impl<'a> SourceExpansion<'a> {
                         .budget()
                         .remaining(super::Resource::EmittedBytes)?,
                 ),
+                self.session.budget(),
             )?;
             ensure!(
                 lowered.lines().count() == projected.len(),
@@ -260,6 +265,17 @@ impl<'a> SourceExpansion<'a> {
                 lowered.clone_into(&mut line.text);
             }
         }
+        Ok((context, projected))
+    }
+
+    fn expand_lines(
+        &mut self,
+        source: &AdmittedSource,
+        inherited: DialectContext,
+        kind: SourceKind,
+        section: Option<&str>,
+    ) -> Result<DialectContext> {
+        let (context, projected) = self.project_lines(source, inherited, kind, section)?;
         let mut embedded = false;
         let mut projected = projected.into_iter();
         while let Some(line) = projected.next() {

@@ -15,9 +15,9 @@ pub use hierarchy::{
     LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
     ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, active_statement_prefix,
     capacitor_charge_assignments, linked_library_filename, lower_simetrix_source_view,
-    parse_init_statement, parse_init_target_path, parse_library, parse_library_file,
-    parse_library_for_simulator, parse_library_with_budget, parse_scoped_library,
-    preprocess_netlist, preprocess_netlist_file, preprocess_netlist_linked,
+    lower_simetrix_source_view_with_budget, parse_init_statement, parse_init_target_path,
+    parse_library, parse_library_file, parse_library_for_simulator, parse_library_with_budget,
+    parse_scoped_library, preprocess_netlist, preprocess_netlist_file, preprocess_netlist_linked,
     preprocess_netlist_linked_file, project_resource, project_simetrix_source, project_source,
     render_projection, source_include_target,
 };

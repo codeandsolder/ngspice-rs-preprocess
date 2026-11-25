@@ -389,6 +389,7 @@ pub fn prepare(
     budget.check()?;
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
+        budget.charge(Resource::EmittedBytes, artifact.bytes.len())?;
         waveform::validate_artifact(&result.waveforms, &artifact.filename, &artifact.bytes)?;
         remaining = remaining
             .checked_sub(artifact.bytes.len())
