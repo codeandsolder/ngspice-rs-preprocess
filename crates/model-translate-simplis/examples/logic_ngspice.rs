@@ -992,6 +992,117 @@ I2 rtn b PWL(0 -6 1u -6 4u 6 7u -6 9u -6)
     verify(runtime, source, &checks)
 }
 
+fn classic_clocked_state_elements(runtime: &Path) -> Result<()> {
+    // All tuples are logical, independently of physical polarity. Start
+    // with clock high to catch a spurious edge during the DC solve.
+    let timeline = [
+        (0., false, false, true),
+        (0.4, false, false, false),
+        (0.6, true, false, false),
+        (1., true, false, true),
+        (1.5, false, false, true),
+        (2., false, false, false),
+        (2.5, true, true, false),
+        (3., true, true, true),
+        (3.5, false, true, true),
+        (4., false, true, false),
+        (4.5, true, false, false),
+        (5., true, false, true),
+        (5.5, true, true, true),
+        (6., true, true, false),
+        (6.5, false, false, false),
+        (7., false, false, true),
+        (7.5, true, true, true),
+        (8., false, false, false),
+    ];
+    let mut source = String::from("Vref rtn 0 0.75\n");
+    let mut checks = Vec::new();
+    for (logic, negative) in [("POS", false), ("NEG", true)] {
+        let rail = |value: bool| if value ^ negative { 5 } else { 0 };
+        for (column, name) in ["data", "reset", "clock"].into_iter().enumerate() {
+            write!(source, "V{name}{logic} {name}{logic} rtn PWL(")?;
+            let mut previous = 0;
+            for (index, &(time, data, reset, clock)) in timeline.iter().enumerate() {
+                let value = rail([data, reset, clock][column]);
+                if index == 0 {
+                    write!(source, "0 {value}")?;
+                } else if value != previous {
+                    write!(source, " {time}u {previous} {}u {value}", time + 0.04)?;
+                }
+                previous = value;
+            }
+            writeln!(source, " 9u {previous})")?;
+        }
+        for kind in ["CLK_SRFF", "CLK_JKFF", "CLK_DFF", "CLK_TFF", "LATCH"] {
+            for high in [false, true] {
+                for initial in [false, true] {
+                    let id = format!("{kind}{logic}{}{}", u8::from(high), u8::from(initial));
+                    let selector = if kind == "LATCH" {
+                        format!("ENABLE_LEVEL={}", u8::from(high))
+                    } else if high {
+                        "TRIG_COND=0_TO_1".to_owned()
+                    } else {
+                        "TRIG_COND=1_TO_0".to_owned()
+                    };
+                    writeln!(
+                        source,
+                        ".MODEL M{id} {kind} TH=2.5 HYSTWD=1 VOL=0.5 VOH=4.5 RIN=10Meg ROUT=10 LOGIC={logic} {selector}"
+                    )?;
+                    let complement = if kind == "LATCH" {
+                        String::new()
+                    } else {
+                        format!(" qb{id}")
+                    };
+                    let reset = if matches!(kind, "CLK_SRFF" | "CLK_JKFF") {
+                        format!(" reset{logic}")
+                    } else {
+                        String::new()
+                    };
+                    writeln!(
+                        source,
+                        "!D{id} q{id}{complement} rtn data{logic}{reset} clock{logic} M{id} IC={}",
+                        u8::from(initial)
+                    )?;
+                    writeln!(source, "R{id} q{id} rtn 100")?;
+                    if kind != "LATCH" {
+                        writeln!(source, "RB{id} qb{id} rtn 100")?;
+                    }
+                    let mut q = initial;
+                    let mut old_clock = timeline[0].3;
+                    for (index, &(time, data, reset, clock)) in timeline.iter().enumerate() {
+                        if kind == "LATCH" {
+                            if clock == high {
+                                q = data;
+                            }
+                        } else if index > 0 && old_clock != clock && clock == high {
+                            q = match kind {
+                                "CLK_DFF" => data,
+                                "CLK_TFF" => q ^ data,
+                                "CLK_JKFF" if data && reset => !q,
+                                "CLK_SRFF" | "CLK_JKFF" if data != reset => data,
+                                _ => q,
+                            };
+                        }
+                        old_clock = clock;
+                        let sample = time + 0.15;
+                        checks.push((format!("q{id}"), sample, loaded(q ^ negative)));
+                        if kind != "LATCH" {
+                            checks.push((format!("qb{id}"), sample, loaded(!q ^ negative)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    source.push_str(".end\n");
+    verify(runtime, &source, &checks)?;
+    println!(
+        "Classic sequential state matrix: {} independent level checks",
+        checks.len()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -1003,6 +1114,7 @@ fn main() -> Result<()> {
     );
     numbered_logic_all_arities_polarities_and_initial_states(&runtime)?;
     sr_latch_polarities_priorities_and_loaded_complements(&runtime)?;
+    classic_clocked_state_elements(&runtime)?;
     advanced_gate_receivers_ignore_output_initial_hint(&runtime)?;
     advanced_gate_vendor_boundaries_and_trailing_inversions(&runtime)?;
     advanced_latch_vendor_ambiguous_inputs(&runtime)?;

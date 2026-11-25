@@ -1,3 +1,5 @@
+mod classic_state;
+use classic_state::{ClassicStateModel, classic_state_model, translate_classic_state_device};
 mod passive_ic;
 mod pwls;
 mod waveforms;
@@ -1349,163 +1351,6 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
     )))
 }
 
-#[derive(Clone, Copy, Debug)]
-enum ClassicStateKind {
-    Sr,
-    ClockedSr,
-    ClockedJk,
-    ClockedD,
-    ClockedT,
-    Latch,
-}
-
-impl ClassicStateKind {
-    fn parse(kind: &str) -> Option<Self> {
-        match kind {
-            "SRFF" => Some(Self::Sr),
-            "CLK_SRFF" => Some(Self::ClockedSr),
-            "CLK_JKFF" => Some(Self::ClockedJk),
-            "CLK_DFF" => Some(Self::ClockedD),
-            "CLK_TFF" => Some(Self::ClockedT),
-            "LATCH" => Some(Self::Latch),
-            _ => None,
-        }
-    }
-
-    const fn inputs(self) -> usize {
-        match self {
-            Self::ClockedSr | Self::ClockedJk => 3,
-            _ => 2,
-        }
-    }
-
-    const fn outputs(self) -> usize {
-        match self {
-            Self::Latch => 1,
-            _ => 2,
-        }
-    }
-
-    const fn operation(self, rising: bool) -> LogicOperation {
-        match (self, rising) {
-            (Self::Sr, _) => LogicOperation::HoldWhenEqual,
-            (Self::ClockedSr, true) => LogicOperation::ClockedSrRising,
-            (Self::ClockedSr, false) => LogicOperation::ClockedSrFalling,
-            (Self::ClockedJk, true) => LogicOperation::ClockedJkRising,
-            (Self::ClockedJk, false) => LogicOperation::ClockedJkFalling,
-            (Self::ClockedD, true) => LogicOperation::ClockedDRising,
-            (Self::ClockedD, false) => LogicOperation::ClockedDFalling,
-            (Self::ClockedT, true) => LogicOperation::ClockedTRising,
-            (Self::ClockedT, false) => LogicOperation::ClockedTFalling,
-            (Self::Latch, true) => LogicOperation::LatchHigh,
-            (Self::Latch, false) => LogicOperation::LatchLow,
-        }
-    }
-
-    const fn translation(self) -> TranslationKind {
-        match self {
-            Self::Sr => TranslationKind::SrFlipFlop,
-            Self::Latch => TranslationKind::DataLatch,
-            _ => TranslationKind::ClockedFlipFlop,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct RawSrffModel {
-    kind: ClassicStateKind,
-    operation: LogicOperation,
-    rin: f64,
-    rout: f64,
-    threshold: f64,
-    hystwd: f64,
-    vol: f64,
-    voh: f64,
-    logic: String,
-    delay: f64,
-}
-
-fn raw_srff_model(statement: &str) -> Result<Option<(String, RawSrffModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
-        return Ok(None);
-    }
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    let Some(kind) = tokens
-        .get(2)
-        .and_then(|name| ClassicStateKind::parse(&name.to_ascii_uppercase()))
-    else {
-        return Ok(None);
-    };
-    let parameters = parse_assignments(&tokens[3..])?;
-    let rising = match kind {
-        ClassicStateKind::Sr => true,
-        ClassicStateKind::Latch => match parameters.get("ENABLE_LEVEL").map(String::as_str) {
-            Some("1") => true,
-            Some("0") => false,
-            _ => bail!("LATCH requires ENABLE_LEVEL=0 or 1"),
-        },
-        _ => match parameters
-            .get("TRIG_COND")
-            .map(|value| value.trim_matches('\'').to_ascii_uppercase())
-            .as_deref()
-        {
-            Some("0_TO_1") => true,
-            Some("1_TO_0") => false,
-            _ => bail!("clocked logic requires TRIG_COND=0_TO_1 or 1_TO_0"),
-        },
-    };
-    if !matches!(kind, ClassicStateKind::Sr) {
-        // Classic clocked primitives have no specified propagation delay or
-        // setup/hold timing parameters. Do not silently invent them.
-        let selector = if matches!(kind, ClassicStateKind::Latch) {
-            "ENABLE_LEVEL"
-        } else {
-            "TRIG_COND"
-        };
-        anyhow::ensure!(
-            parameters.len() == 8
-                && parameters.keys().all(|key| matches!(
-                    key.as_str(),
-                    "RIN" | "ROUT" | "TH" | "HYSTWD" | "VOL" | "VOH" | "LOGIC"
-                ) || key == selector),
-            "unexpected or missing classic state model parameter"
-        );
-    }
-    let model = RawSrffModel {
-        kind,
-        operation: kind.operation(rising),
-        rin: numeric_parameter(&parameters, "RIN")?,
-        rout: numeric_parameter(&parameters, "ROUT")?,
-        threshold: numeric_parameter(&parameters, "TH")?,
-        hystwd: numeric_parameter(&parameters, "HYSTWD")?,
-        vol: numeric_parameter(&parameters, "VOL")?,
-        voh: numeric_parameter(&parameters, "VOH")?,
-        delay: if parameters.contains_key("DELAY") {
-            numeric_parameter(&parameters, "DELAY")?
-        } else {
-            0.0
-        },
-        logic: parameters.get("LOGIC").map_or_else(
-            || "POS".to_owned(),
-            |value| value.trim_matches('\'').to_ascii_uppercase(),
-        ),
-    };
-    if !(model.rin > 0.0
-        && model.rout > 0.0
-        && model.hystwd >= 0.0
-        && model.delay >= 0.0
-        && model.voh > model.vol)
-    {
-        bail!("invalid SIMPLIS state model {}", tokens[1]);
-    }
-    Ok(Some((tokens[1].to_ascii_uppercase(), model)))
-}
-
 #[derive(Clone, Debug)]
 struct RawNumberedLogicModel {
     kind: LogicGateKind,
@@ -1782,99 +1627,61 @@ fn bracket_groups(tokens: &[String]) -> Result<Vec<Vec<String>>> {
 }
 
 #[derive(Clone, Copy)]
-struct SrStateSpec<'a> {
+struct StateElementSpec<'a> {
     stem: &'a str,
-    out: &'a str,
-    out_bar: &'a str,
+    outputs: &'a [&'a str],
     rtn: &'a str,
     inputs: &'a [String],
-    initial: usize,
-    operation: LogicOperation,
-    input_polarity: LogicPolarity,
+    receiver: LogicReceiver,
     output_polarity: LogicPolarity,
+    timing: LogicTiming,
     kind: TranslationKind,
 }
 
-fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Translation> {
-    let SrStateSpec {
+fn emit_state_element(io: LogicIo, spec: &StateElementSpec<'_>) -> Result<Translation> {
+    let StateElementSpec {
         stem,
-        out,
-        out_bar,
+        outputs,
         rtn,
         inputs,
-        initial,
-        operation,
-        input_polarity,
+        receiver,
         output_polarity,
+        timing,
         kind,
     } = *spec;
-    if inputs.len() != 2 || initial > 1 {
-        bail!("invalid SIMPLIS S-R state element");
-    }
-    let set = &inputs[0];
-    let reset = &inputs[1];
-    for node in [out, out_bar, rtn, set, reset] {
+    for node in outputs
+        .iter()
+        .copied()
+        .chain(std::iter::once(rtn))
+        .chain(inputs.iter().map(String::as_str))
+    {
         validate_node(node)?;
     }
-    let io = LogicIo {
-        rin: model.rin,
-        rout: model.rout,
-        hystwd: model.hystwd,
-        vol: model.vol,
-        voh: model.voh,
-        delay: model.delay,
-        threshold: model.threshold,
-    };
     let mut output = String::new();
-    let inertial = kind == TranslationKind::SrLatch;
-    let receiver = if inertial {
-        LogicReceiver::digital1(input_polarity)
-    } else {
-        LogicReceiver {
-            polarity: input_polarity,
-            initial: false,
-        }
-    };
     emit_logic_input_loads(&mut output, stem, rtn, inputs, io.rin)?;
     let state = emit_logic_event(
         &mut output,
         stem,
         rtn,
         inputs,
-        &[receiver; 2],
+        &vec![receiver; inputs.len()],
         io.thresholds(),
-        LogicTiming {
-            operation,
-            delay: model.delay,
-            inertial,
-            initial: initial == 1,
-        },
+        timing,
     )?;
-    let negative = output_polarity.negative();
-    emit_logic_output(
-        &mut output,
-        io,
-        stem,
-        out,
-        rtn,
-        &state,
-        LogicOutput {
-            negative,
-            complement: false,
-        },
-    )?;
-    emit_logic_output(
-        &mut output,
-        io,
-        stem,
-        out_bar,
-        rtn,
-        &state,
-        LogicOutput {
-            negative,
-            complement: true,
-        },
-    )?;
+    for (index, node) in outputs.iter().enumerate() {
+        emit_logic_output(
+            &mut output,
+            io,
+            stem,
+            node,
+            rtn,
+            &state,
+            LogicOutput {
+                negative: output_polarity.negative(),
+                complement: index == 1,
+            },
+        )?;
+    }
     Ok(Translation {
         bytes: output.into_bytes(),
         kind,
@@ -1901,18 +1708,34 @@ fn emit_raw_sr_latch(
         "NONE" => LogicOperation::HoldWhenEqual,
         other => bail!("invalid SIMPLIS DIGITAL1 D_SRLATCH DOM={other}"),
     };
-    emit_sr_state(
-        model,
-        &SrStateSpec {
+    anyhow::ensure!(
+        inputs.len() == 2 && initial <= 1,
+        "invalid SIMPLIS S-R state element"
+    );
+    let io = LogicIo {
+        rin: model.rin,
+        rout: model.rout,
+        hystwd: model.hystwd,
+        vol: model.vol,
+        voh: model.voh,
+        delay: model.delay,
+        threshold: model.threshold,
+    };
+    emit_state_element(
+        io,
+        &StateElementSpec {
             stem,
-            out,
-            out_bar,
+            outputs: &[out, out_bar],
             rtn,
             inputs,
-            initial,
-            operation,
-            input_polarity,
+            receiver: LogicReceiver::digital1(input_polarity),
             output_polarity: LogicPolarity::Positive,
+            timing: LogicTiming {
+                operation,
+                delay: io.delay,
+                inertial: true,
+                initial: initial == 1,
+            },
             kind: TranslationKind::SrLatch,
         },
     )
@@ -3456,106 +3279,6 @@ fn translate_raw_vcsw_device(
     Ok(Some(translation))
 }
 
-fn translate_raw_srff_device(
-    statement: &str,
-    models: &std::collections::BTreeMap<String, RawSrffModel>,
-) -> Result<Option<Translation>> {
-    if !statement
-        .trim_start()
-        .get(..2)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!D"))
-    {
-        return Ok(None);
-    }
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    // Model positions depend on the declared input/output arity.
-    let Some((index, model)) = tokens
-        .iter()
-        .enumerate()
-        .skip(4)
-        .find_map(|(index, token)| {
-            let model = models.get(&token.to_ascii_uppercase())?;
-            (index == 2 + model.kind.outputs() + model.kind.inputs()).then_some((index, model))
-        })
-    else {
-        return Ok(None);
-    };
-    let polarity = LogicPolarity::parse(&model.logic)?;
-    let parameters = parse_assignments(&tokens[index + 1..])?;
-    anyhow::ensure!(
-        parameters.keys().all(|key| key == "IC"),
-        "unsupported classic state instance parameter"
-    );
-    let initial = if parameters.contains_key("IC") {
-        integer_parameter(&parameters, "IC")?
-    } else {
-        anyhow::ensure!(
-            matches!(model.kind, ClassicStateKind::Sr),
-            "classic state instance requires IC"
-        );
-        0
-    };
-    anyhow::ensure!(initial <= 1, "invalid classic state IC");
-    let rtn_index = 1 + model.kind.outputs();
-    let rtn = &tokens[rtn_index];
-    let inputs = &tokens[rtn_index + 1..index];
-    let outputs = &tokens[1..rtn_index];
-    for node in outputs.iter().chain(std::iter::once(rtn)).chain(inputs) {
-        validate_node(node)?;
-    }
-    let stem = sanitized_name(tokens[0].trim_start_matches('!'));
-    let io = LogicIo {
-        rin: model.rin,
-        rout: model.rout,
-        hystwd: model.hystwd,
-        vol: model.vol,
-        voh: model.voh,
-        delay: model.delay,
-        threshold: model.threshold,
-    };
-    let mut output = String::new();
-    emit_logic_input_loads(&mut output, &stem, rtn, inputs, io.rin)?;
-    let receivers = vec![
-        LogicReceiver {
-            polarity,
-            initial: false
-        };
-        inputs.len()
-    ];
-    let state = emit_logic_event(
-        &mut output,
-        &stem,
-        rtn,
-        inputs,
-        &receivers,
-        io.thresholds(),
-        LogicTiming {
-            operation: model.operation,
-            delay: io.delay,
-            inertial: false,
-            initial: initial == 1,
-        },
-    )?;
-    for (index, node) in outputs.iter().enumerate() {
-        emit_logic_output(
-            &mut output,
-            io,
-            &stem,
-            node,
-            rtn,
-            &state,
-            LogicOutput {
-                negative: polarity.negative(),
-                complement: index == 1,
-            },
-        )?;
-    }
-    Ok(Some(Translation {
-        bytes: output.into_bytes(),
-        kind: model.kind.translation(),
-    }))
-}
-
 fn source_kind(name: &str) -> Result<char> {
     match name.as_bytes().first().map(u8::to_ascii_uppercase) {
         Some(b'V') => Ok('V'),
@@ -4381,7 +4104,7 @@ struct ScopeAnalysis {
     comp: std::collections::BTreeMap<String, RawCompModel>,
     adc_schmitt: std::collections::BTreeMap<String, RawAdcSchmittModel>,
     native_bridges: std::collections::BTreeMap<String, NativeBridgeModel>,
-    srff: std::collections::BTreeMap<String, RawSrffModel>,
+    srff: std::collections::BTreeMap<String, ClassicStateModel>,
     digital: std::collections::BTreeMap<String, RawDigitalModel>,
     numbered_logic: std::collections::BTreeMap<String, RawNumberedLogicModel>,
     vcsw: std::collections::BTreeMap<String, RawVcswModel>,
@@ -4616,7 +4339,7 @@ impl ScopeAnalysis {
                 "SRFF" | "CLK_SRFF" | "CLK_JKFF" | "CLK_DFF" | "CLK_TFF" | "LATCH" => {
                     insert_unique_model(
                         &mut self.srff,
-                        raw_srff_model(statement)?,
+                        classic_state_model(statement)?,
                         "SIMPLIS SRFF model",
                     )?
                 }
@@ -4890,7 +4613,7 @@ fn translate_deck_primitive(
         translate_raw_mutual_inductance(statement, &models.inductors),
         translate_raw_pwl_device(statement, &models.pwl),
         translate_raw_reactive_device(statement, &models.reactive),
-        translate_raw_srff_device(statement, &models.srff),
+        translate_classic_state_device(statement, &models.srff),
         translate_raw_comp_device(statement, &models.comp),
         translate_raw_digital_device(statement, &models.digital),
         translate_raw_numbered_logic_device(statement, &models.numbered_logic),
@@ -5281,7 +5004,7 @@ fn emit_deck_statement(
         || raw_reactive_model(statement)?.is_some()
         || raw_comp_model(statement)?.is_some()
         || raw_adc_schmitt_model(statement)?.is_some()
-        || raw_srff_model(statement)?.is_some()
+        || classic_state_model(statement)?.is_some()
         || raw_digital_model(statement)?.is_some()
         || raw_numbered_logic_model(statement)?.is_some()
         || raw_vcsw_model(statement)?.is_some()
