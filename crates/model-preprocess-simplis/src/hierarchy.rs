@@ -2068,6 +2068,7 @@ pub fn parse_init_statement(statement: &str) -> Result<Option<Vec<InitAssignment
 }
 
 fn merge_local_init(bytes: &[u8], inherited: InitTree) -> Result<(Vec<u8>, InitTree)> {
+    use std::fmt::Write as _;
     let text = std::str::from_utf8(bytes)?;
     let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
     let mut local = InitTree::default();
@@ -2089,7 +2090,6 @@ fn merge_local_init(bytes: &[u8], inherited: InitTree) -> Result<(Vec<u8>, InitT
         .first()
         .context("SIMPLIS subcircuit with .INIT state has no header")?;
     let mut output = String::new();
-    use std::fmt::Write as _;
     writeln!(output, "{header}")?;
     for (name, value) in &local.local {
         writeln!(output, ".INIT {name}={value}")?;
