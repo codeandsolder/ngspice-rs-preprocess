@@ -1,10 +1,11 @@
 mod logical_ports;
 use super::{
-    DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateSpec, LogicIo, LogicPolarity,
-    Point, Translation, TranslationKind, emit_digital_buffer, emit_logic_gate, emit_logic_memory,
-    emit_logic_output, emit_logic_receiver, indexed_points, integer_parameter,
-    normalized_statement, numeric_parameter, parse_assignments, sanitized_name, statement_tokens,
-    translate_charge_capacitor, translate_ipwlr, translate_vpwlr, validate_node, write_number,
+    DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateMode, LogicGateSpec, LogicIo,
+    LogicPolarity, LogicReceiver, Point, Translation, TranslationKind, emit_digital_buffer,
+    emit_logic_gate, emit_logic_memory, emit_logic_output, emit_logic_receiver, indexed_points,
+    integer_parameter, normalized_statement, numeric_parameter, parse_assignments, sanitized_name,
+    statement_tokens, translate_charge_capacitor, translate_ipwlr, translate_vpwlr, validate_node,
+    write_number,
 };
 use crate::alb::{
     KnownTruthTable, StatefulProgram, TimedCombinationalGraph, TimingEnvironment, analyze_body,
@@ -1546,8 +1547,10 @@ fn translate_raw_numbered_logic_device(
         out_bar: None,
         rtn,
         inputs,
-        polarity: model.polarity,
-        initial: initial == 1,
+        mode: LogicGateMode::Classic {
+            polarity: model.polarity,
+            initial: initial == 1,
+        },
         io: LogicIo {
             rin: model.rin,
             rout: model.rout,
@@ -1686,7 +1689,7 @@ fn emit_sr_hysteretic_input(
     rtn: &str,
     label: &str,
     input: &str,
-    polarity: LogicPolarity,
+    receiver: LogicReceiver,
 ) -> Result<String> {
     let diff = format!("__{stem}_{label}_DIFF");
     let state = format!("__{stem}_{label}_STATE");
@@ -1695,7 +1698,7 @@ fn emit_sr_hysteretic_input(
     write_number(output, io.rin)?;
     output.push('\n');
     writeln!(output, "E__{stem}_{label}_DIFF {diff} 0 {input} {rtn} 1")?;
-    emit_logic_receiver(output, io, &diff, &state, &hyst_model, polarity, false)?;
+    emit_logic_receiver(output, io, &diff, &state, &hyst_model, receiver)?;
     Ok(state)
 }
 
@@ -1764,9 +1767,17 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
         threshold: model.threshold,
     };
     let mut output = String::new();
-    let set_state = emit_sr_hysteretic_input(&mut output, io, stem, rtn, "S", set, input_polarity)?;
-    let reset_state =
-        emit_sr_hysteretic_input(&mut output, io, stem, rtn, "R", reset, input_polarity)?;
+    let receiver = if kind == TranslationKind::SrLatch {
+        LogicReceiver::digital1(input_polarity)
+    } else {
+        LogicReceiver {
+            polarity: input_polarity,
+            initial: false,
+            strict: false,
+        }
+    };
+    let set_state = emit_sr_hysteretic_input(&mut output, io, stem, rtn, "S", set, receiver)?;
+    let reset_state = emit_sr_hysteretic_input(&mut output, io, stem, rtn, "R", reset, receiver)?;
     let (set_weight, reset_weight) = behavior.weights();
     let command = format!("{set_weight}*v({set_state})-{reset_weight}*v({reset_state})");
     let command = if initial == 1 {
@@ -1884,7 +1895,7 @@ fn emit_raw_digital_model(
             })
         }
         RawDigitalKind::And | RawDigitalKind::Or => {
-            if inputs.len() < 2 || model.num_inverted_inputs != 0 {
+            if inputs.len() < 2 || model.num_inverted_inputs >= inputs.len() {
                 bail!("unsupported SIMPLIS DIGITAL1 logic input/inversion configuration");
             }
             emit_logic_gate(&LogicGateSpec {
@@ -1898,8 +1909,9 @@ fn emit_raw_digital_model(
                 out_bar: Some(out_bar),
                 rtn,
                 inputs,
-                polarity: LogicPolarity::Positive,
-                initial: initial == Some(1),
+                mode: LogicGateMode::Digital1 {
+                    inverted_inputs: model.num_inverted_inputs,
+                },
                 io: LogicIo {
                     rin: model.rin,
                     rout: model.rout,

@@ -858,6 +858,65 @@ struct LogicIo {
     threshold: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LogicReceiver {
+    polarity: LogicPolarity,
+    initial: bool,
+    strict: bool,
+}
+
+impl LogicReceiver {
+    const fn digital1(polarity: LogicPolarity) -> Self {
+        Self {
+            polarity,
+            initial: polarity.negative(),
+            strict: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LogicGateMode {
+    Classic {
+        polarity: LogicPolarity,
+        initial: bool,
+    },
+    Digital1 {
+        inverted_inputs: usize,
+    },
+}
+
+impl LogicGateMode {
+    fn receiver(self, kind: LogicGateKind, index: usize, arity: usize) -> LogicReceiver {
+        match self {
+            // Every undecided input takes the state satisfying the suggested
+            // classic output whenever possible.
+            Self::Classic { polarity, initial } => LogicReceiver {
+                polarity,
+                initial: initial ^ kind.inverted(),
+                strict: false,
+            },
+            // DIGITAL1 receivers start physically low, independent of IC.
+            Self::Digital1 { inverted_inputs } => {
+                let inverted = index >= arity - inverted_inputs;
+                let polarity = if inverted {
+                    LogicPolarity::Negative
+                } else {
+                    LogicPolarity::Positive
+                };
+                LogicReceiver::digital1(polarity)
+            }
+        }
+    }
+
+    const fn output_negative(self) -> bool {
+        match self {
+            Self::Classic { polarity, .. } => polarity.negative(),
+            Self::Digital1 { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LogicGateSpec {
     kind: LogicGateKind,
@@ -867,8 +926,7 @@ struct LogicGateSpec {
     rtn: String,
     inputs: Vec<String>,
     io: LogicIo,
-    polarity: LogicPolarity,
-    initial: bool,
+    mode: LogicGateMode,
 }
 
 /// Map the threshold band to a dimensionless set/reset/hold command.
@@ -880,9 +938,13 @@ fn emit_logic_receiver(
     diff: &str,
     state: &str,
     model: &str,
-    polarity: LogicPolarity,
-    initial: bool,
+    receiver: LogicReceiver,
 ) -> Result<()> {
+    let LogicReceiver {
+        polarity,
+        initial,
+        strict,
+    } = receiver;
     let upper = io.threshold + io.hystwd / 2.0;
     let lower = io.threshold - io.hystwd / 2.0;
     if !upper.is_finite() || !lower.is_finite() {
@@ -891,9 +953,10 @@ fn emit_logic_receiver(
     let command = format!("{state}_CMD");
     let reverse = polarity.negative() ^ initial;
     let (high, low) = if reverse { (-1, 1) } else { (1, -1) };
+    let (above, below) = if strict { (">", "<") } else { (">=", "<=") };
     writeln!(
         output,
-        "B{model}_CMD {command} 0 V='(v({diff})>={upper:.17e} ? {high} : (v({diff})<={lower:.17e} ? {low} : 0))'"
+        "B{model}_CMD {command} 0 V='(v({diff}){above}{upper:.17e} ? {high} : (v({diff}){below}{lower:.17e} ? {low} : 0))'"
     )?;
     emit_logic_memory(output, &command, state, model, initial)
 }
@@ -947,9 +1010,6 @@ fn emit_logic_output(
 fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
     let mut output = String::new();
     let mut states = Vec::with_capacity(spec.inputs.len());
-    // For a monotone gate, assigning every undecided input this value
-    // satisfies the requested output whenever any assignment can do so.
-    let input_initial = spec.initial ^ spec.kind.inverted();
     for (index, input) in spec.inputs.iter().enumerate() {
         let number = index + 1;
         let state = format!("__{}_S{number}", spec.stem);
@@ -963,15 +1023,8 @@ fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
             "E__{}_D{number} {diff} 0 {input} {} 1",
             spec.stem, spec.rtn
         )?;
-        emit_logic_receiver(
-            &mut output,
-            spec.io,
-            &diff,
-            &state,
-            &model,
-            spec.polarity,
-            input_initial,
-        )?;
+        let receiver = spec.mode.receiver(spec.kind, index, spec.inputs.len());
+        emit_logic_receiver(&mut output, spec.io, &diff, &state, &model, receiver)?;
         states.push(state);
     }
     let raw = format!("__{}_RAW", spec.stem);
@@ -986,7 +1039,7 @@ fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
         })
         .collect::<Vec<_>>()
         .join("*");
-    let invert = !spec.kind.conjunction() ^ spec.kind.inverted() ^ spec.polarity.negative();
+    let invert = !spec.kind.conjunction() ^ spec.kind.inverted() ^ spec.mode.output_negative();
     let expression = if invert {
         format!("1-({product})")
     } else {
