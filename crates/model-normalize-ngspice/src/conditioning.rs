@@ -153,6 +153,13 @@ impl Source {
                 }
                 scopes[scope].cards.push(cards.len());
                 let identifiers = identifiers(&text);
+                if matches!(upper.as_str(), ".OPTION" | ".OPTIONS")
+                    && ["rshunt", "gshunt", "cshunt"]
+                        .iter()
+                        .any(|name| identifiers.contains_key(*name))
+                {
+                    anyhow::bail!("global shunts invalidate private differentiator topology");
+                }
                 for name in identifiers.keys() {
                     references
                         .entry(name.clone())
@@ -274,9 +281,9 @@ fn capacitor(card: &Card) -> Option<[String; 2]> {
     if card.kind()? != b'C' || card.fields.len() < 4 || !simple_name(card.first()) {
         return None;
     }
-    let mut options = card.fields.get(4..)?.chunks_exact(3);
-    if !options.remainder().is_empty()
-        || !options.all(|assignment| {
+    let (options, remainder) = card.fields.get(4..)?.as_chunks::<3>();
+    if !remainder.is_empty()
+        || !options.iter().all(|assignment| {
             let key = &card.text()[assignment[0].clone()];
             let equals = &card.text()[assignment[1].clone()];
             key.eq_ignore_ascii_case("IC") && equals == "="
@@ -439,7 +446,7 @@ fn probes(card: &Card) -> Vec<Probe> {
     result
 }
 
-fn contains(outer: &Range<usize>, inner: &Range<usize>) -> bool {
+const fn contains(outer: &Range<usize>, inner: &Range<usize>) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
@@ -564,6 +571,17 @@ impl<'a> Proof<'a> {
     fn outside_reference(&self, card: &Card, private_nodes: &[&str]) -> bool {
         // A hierarchical branch reference is not resolved by the local
         // name map. Reject rather than changing a caller's observable.
+        // A source function can be expanded in a different lexical scope.
+        // Without resolving that expansion, its local current observation
+        // cannot be guaranteed to use the original coordinate.
+        if card.first().eq_ignore_ascii_case(".func")
+            && self
+                .currents
+                .keys()
+                .any(|name| !card.mentions(name).is_empty())
+        {
+            return true;
+        }
         self.currents
             .keys()
             .map(String::as_str)
@@ -669,16 +687,17 @@ fn plan(source: &Source, circuit: &Loop) -> Option<Plan> {
     }
     let mut edits = Vec::new();
     let old = cap.field(3)?;
-    let new = if let Ok(value) = parse_spice_constant(old) {
-        format!("{:.17e}", value * factor)
-    } else {
-        let old = old
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-            .or_else(|| old.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-            .unwrap_or(old);
-        format!("{{({old})*{factor:.17e}}}")
-    };
+    let new = parse_spice_constant(old).map_or_else(
+        |_| {
+            let old = old
+                .strip_prefix('{')
+                .and_then(|s| s.strip_suffix('}'))
+                .or_else(|| old.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(old);
+            format!("{{({old})*{factor:.17e}}}")
+        },
+        |value| format!("{:.17e}", value * factor),
+    );
     lexical::replace_span(
         &cap.statement,
         cap.fields[3].clone(),

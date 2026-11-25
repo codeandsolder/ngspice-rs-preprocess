@@ -229,3 +229,9 @@ capacitor, voltage branches and factor in `current_scalings`. A consumer that
 explicitly requests a scaled internal branch current from the prepared graph
 must divide that value by the recorded factor to recover the original physical
 current. The optimization does not mutate the admitted source.
+
+The coordinate proof assumes the emitted electrical topology is the topology
+that is simulated. When a downstream analysis adds global shunt conductances
+or capacitances, or requires unchanged internal current observations, select
+`Options::conditioning = ConditioningPolicy::Disabled` (CLI:
+`--conditioning disabled`). This leaves the original coordinates intact.

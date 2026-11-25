@@ -73,6 +73,9 @@ fn exposed_state_or_untracked_current_reference_is_not_changed() -> Result<()> {
         ".save i(v.x1.vmeasure)",
         ".save @c.x1.cstorage[i]",
         ".global n3",
+        ".func hidden_feedback(x) {x*I(Vmeasure)}",
+        ".options rshunt=1e12",
+        ".options cshunt=1p",
     ] {
         let root = format!("* caller\nX1 a 0 cell\n{directive}\n.end\n");
         let output = condition(CELL, &root)?;
@@ -223,6 +226,24 @@ fn facade_conditions_closed_translated_bundle_and_retains_input() -> Result<()> 
     assert_eq!(count, 1);
     assert!(
         bundle.normalization.contains(
+            &model_normalize_ngspice::NormalizationPass::PrivateDifferentiatorConditioning
+        )
+    );
+    let unconditioned = prepare(
+        &request,
+        &Options {
+            conditioning: ngspice_rs_preprocess::ConditioningPolicy::Disabled,
+            ..Options::default()
+        },
+        &Cancellation::default(),
+    )?;
+    assert!(
+        unconditioned
+            .artifacts()
+            .all(|artifact| artifact.current_scalings.is_empty())
+    );
+    assert!(
+        !unconditioned.normalization.contains(
             &model_normalize_ngspice::NormalizationPass::PrivateDifferentiatorConditioning
         )
     );

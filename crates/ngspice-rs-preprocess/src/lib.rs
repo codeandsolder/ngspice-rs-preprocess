@@ -109,13 +109,26 @@ pub struct Request {
     pub search_paths: Vec<PathBuf>,
 }
 
-/// Admission and artifact publication ceilings.
+/// Whether the consumer permits an equivalent internal-current coordinate change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConditioningPolicy {
+    /// Retain the original internal current coordinates.
+    Disabled,
+    /// Scale electrically isolated differentiator loops.
+    #[default]
+    PrivateDifferentiators,
+}
+
+/// Admission, conditioning and artifact publication options.
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Optional source command and independent per-source limits.
     pub admission: AdmissionConfig,
     /// Ceiling on linked intermediate bytes and combined final artifact bytes.
     pub output_bytes: usize,
+    /// Disable conditioning when the consumer adds artificial topology
+    /// (such as global shunts) or requires unchanged internal current names.
+    pub conditioning: ConditioningPolicy,
 }
 
 impl Default for Options {
@@ -123,6 +136,7 @@ impl Default for Options {
         Self {
             admission: AdmissionConfig::default(),
             output_bytes: 128 * 1024 * 1024,
+            conditioning: ConditioningPolicy::default(),
         }
     }
 }
@@ -321,7 +335,9 @@ pub fn prepare(
         }
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
-    if request.format == InputFormat::SimetrixDeck {
+    if request.format == InputFormat::SimetrixDeck
+        && options.conditioning == ConditioningPolicy::PrivateDifferentiators
+    {
         condition_generated_bundle(&mut result)?;
     }
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
