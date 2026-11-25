@@ -12,3 +12,7 @@ instance-precedence	pass	1e-12	0.001
 lncosh-range	pass	1e-12	5e-11
 options-temp	pass	1e-12	5e-11
 temp-expression	pass	1e-12	5e-11
+limit-order	pass	1e-9	0
+absolute-static	pass	1e-9	1e-9
+precedence	pass	1e-9	1e-9
+mixed	pass	1e-9	1e-9

@@ -1,0 +1,15 @@
+* absolute power in static parameter and function expressions
+.func f(x,p) {x**p}
+.param pa={-2**3} pb={PWR(-2,3)} pc={2**3**2} pd={0**0} pf={0**.5} pg={PWR(0,0)} ph={f(-4,.5)} pi1={f(2,-3)}
+V1 a 0 {pa}
+V2 b 0 {pb}
+V3 c 0 {pc}
+V4 d 0 {pd}
+V5 f 0 {pf}
+V6 g 0 {pg}
+V7 h 0 {ph}
+V8 i 0 {pi1}
+V9 x 0 -4
+B1 j 0 V={f(V(x),.5)}
+.op
+.end

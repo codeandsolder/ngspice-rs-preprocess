@@ -1,0 +1,7 @@
+* charge expression witness
+V1 in 0 PULSE(0 2 1u 1u 1u 8u 20u)
+R1 in out 1000
+C1 out 0 Q='1n*V(out)+2n*V(out)**3'
+.tran 100n 40u 0 1n
+.print tran V(out)
+.end

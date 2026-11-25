@@ -95,3 +95,28 @@ The ALB regression decks are independently constructed test stimuli;
 the accompanying numerical CSV/DAT records and hash manifests record
 observations from reference simulators. The original simulator and vendor
 model-library distributions are not part of this repository.
+
+## Bipolar compact model kernels
+
+The VBIC 1.1.5 equations in `crates/model-kernel-bipolar` follow the public
+VBIC pseudocode and the ngspice 47 VBIC implementation (copyright 1990 Regents
+of the University of California; Thomas L. Quarles, 1985; model author Colin
+McAndrew, Motorola, 1995; Spice3 implementation Dietmar Warning, 2003).
+HICUM/L2 2.4.0 follows the public Verilog-A reference and the ngspice HICUM2
+implementation (copyright 1993–2024 Michael Schroter; Spice3 implementation
+2019–2020 Dietmar Warning, Markus Müller, Mario Krattenmacher). The upstream
+ngspice implementations carry the modified BSD terms reproduced above.
+The crate's README records the specific equation references and independently
+generated ngspice numerical witnesses.
+
+## HiSIM-HV1/HV2 intrinsic compact-model preparations
+
+`crates/model-compact-intrinsic` derives HiSIM-HV1/HiSIM-HV2 source-order
+setup rules, binning, geometry, and physical subkernel equations from the
+Hiroshima University/STARC implementations in ngspice 47. Copyright 2012
+Hiroshima University & STARC (HV1) and 2014 Hiroshima University & STARC
+(HV2). The upstream HiSIM_HV Distribution Statement and Copyright Notice,
+including attribution, redistribution and charging conditions, and the
+original-code MIT license are reproduced in
+[`crates/model-compact-intrinsic/LICENSE`](crates/model-compact-intrinsic/LICENSE).
+The top-level MIT license does not supersede these terms.

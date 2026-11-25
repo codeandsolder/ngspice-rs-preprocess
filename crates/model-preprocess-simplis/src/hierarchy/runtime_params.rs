@@ -13,13 +13,40 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 type Names = BTreeMap<String, String>;
+
+#[derive(Clone, Debug, Default)]
+struct Symbols {
+    parameters: BTreeSet<String>,
+    models: BTreeSet<String>,
+}
+
+impl Symbols {
+    fn collect(statements: &[String]) -> Result<Self> {
+        let mut symbols = Self::default();
+        for statement in statements {
+            if let Some(tail) = param_tail(statement) {
+                for (name, _) in parameter_assignments(tail)? {
+                    symbols.parameters.insert(name.to_ascii_uppercase());
+                }
+            }
+            if let Some(name) = model_name(statement) {
+                symbols.models.insert(name.to_ascii_uppercase());
+            }
+        }
+        Ok(symbols)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RuntimeScope {
     identity: String,
     names: Names,
+    local_models: BTreeSet<String>,
+    root_symbols: Arc<Symbols>,
+    source_symbols: Symbols,
 }
 
 fn generated_name(prefix: &str, identity: &str, name: &str) -> String {
@@ -182,8 +209,60 @@ impl RuntimeScope {
     pub(super) fn root(identity: &str) -> Self {
         Self {
             identity: identity.to_owned(),
-            names: Names::new(),
+            ..Self::default()
         }
+    }
+
+    pub(super) fn root_with_symbols(identity: &str, statements: &[String]) -> Result<Self> {
+        Ok(Self {
+            root_symbols: Arc::new(Symbols::collect(statements)?),
+            ..Self::root(identity)
+        })
+    }
+
+    pub(super) fn set_source_scope(
+        &mut self,
+        parent: &Self,
+        source_statements: &[String],
+    ) -> Result<()> {
+        self.root_symbols = Arc::clone(&parent.root_symbols);
+        self.source_symbols = Symbols::collect(source_statements)?;
+        Ok(())
+    }
+
+    // A bare R/C/L value can be a parameter, but a visible model with the
+    // same name takes precedence. Never rewrite an electrical node or a
+    // reserved single-letter device-value keyword.
+    pub(super) fn rewrite_bare_passive(
+        &self,
+        statement: &str,
+        catalog_model: impl FnOnce(&str) -> Result<bool>,
+    ) -> Result<String> {
+        let Some(value) = bare_passive_value(statement) else {
+            return Ok(statement.to_owned());
+        };
+        let key = value.to_ascii_uppercase();
+        let bound = self.names.get(&key).map(String::as_str).or_else(|| {
+            (self.root_symbols.parameters.contains(&key)
+                || self.source_symbols.parameters.contains(&key))
+            .then_some(value)
+        });
+        let Some(bound) = bound else {
+            return Ok(statement.to_owned());
+        };
+        if self.local_models.contains(&key)
+            || self.root_symbols.models.contains(&key)
+            || self.source_symbols.models.contains(&key)
+            || catalog_model(value)?
+        {
+            return Ok(statement.to_owned());
+        }
+        let start = value.as_ptr().addr() - statement.as_ptr().addr();
+        Ok(format!(
+            "{}{{{bound}}}{}",
+            &statement[..start],
+            &statement[start + value.len()..]
+        ))
     }
 
     pub(super) fn has_bindings(&self) -> bool {
@@ -208,6 +287,11 @@ impl RuntimeScope {
         let (prefix, defaults) = header_parameters(header)?;
         let actuals = parameter_assignments(actual_text)?;
         let mut scope = Self::root(identity);
+        scope.local_models = body
+            .iter()
+            .filter_map(|statement| model_name(statement))
+            .map(str::to_ascii_uppercase)
+            .collect();
         let mut formal_names = BTreeSet::new();
         for (name, _) in &defaults {
             validate_simetrix_parameter_name(name)?;
@@ -345,10 +429,45 @@ impl RuntimeScope {
     }
 }
 
+fn model_name(statement: &str) -> Option<&str> {
+    let mut fields = active_statement_prefix(statement).split_whitespace();
+    fields
+        .next()?
+        .eq_ignore_ascii_case(".model")
+        .then(|| fields.next())
+        .flatten()
+}
+
+fn bare_passive_value(statement: &str) -> Option<&str> {
+    let mut fields = active_statement_prefix(statement).split_whitespace();
+    let device = fields.next()?.as_bytes().first()?.to_ascii_uppercase();
+    if !matches!(device, b'R' | b'C' | b'L') {
+        return None;
+    }
+    let value = fields.nth(2)?;
+    let bytes = value.as_bytes();
+    let first = *bytes.first()?;
+    if !(first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.iter().copied().all(identifier_byte)
+        || (bytes.len() == 1 && first.to_ascii_uppercase() == device)
+    {
+        return None;
+    }
+    Some(value)
+}
+
 /// Rewrite explicit expression regions of native device statements. The
 /// structural device/model/node fields are left intact. Unbraced behavioural
 /// RHS expressions are supported in addition to ordinary brace expressions.
 fn rewrite_device_expressions(statement: &str, names: &Names) -> Result<String> {
+    if let Some(tail) = super::capacitor_charge_assignments(statement) {
+        let start = tail.as_ptr().addr() - statement.as_ptr().addr();
+        let mut output = statement[..start].trim_end().to_owned();
+        for (key, value) in parameter_assignments(tail)? {
+            write!(output, " {key}={}", rewrite_expression(value, names)?)?;
+        }
+        return Ok(output);
+    }
     let trimmed = statement.trim_start();
     let device = trimmed
         .as_bytes()
@@ -437,6 +556,68 @@ mod tests {
             assert_eq!(
                 header_parameters(header)?,
                 (".subckt T a b", vec![("R", "2k")])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bare_passive_values_use_parameters_only_if_no_visible_model() -> Result<()> {
+        let root = RuntimeScope::root_with_symbols(
+            "root",
+            &[
+                ".param global_r=2k".into(),
+                ".model global_model R(R=3k)".into(),
+            ],
+        )?;
+        let (_, mut scope) = RuntimeScope::prepare(
+            b".subckt T p n params: local_r=2k global_model=7k external_model=8k\n.param local_model=5k\n.model local_model R(R=3k)\n.ends\n",
+            "scope",
+            "",
+        )?;
+        scope.set_source_scope(&root, &[".param source_c=10n".into()])?;
+        let local_r = scope.lookup("local_r")?;
+        assert_eq!(
+            scope.rewrite_bare_passive("R1 p n local_r", |_| Ok(false))?,
+            format!("R1 p n {{{local_r}}}")
+        );
+        assert_eq!(
+            scope.rewrite_bare_passive("R1 p n global_r TC=0", |_| Ok(false))?,
+            "R1 p n {global_r} TC=0"
+        );
+        assert_eq!(
+            scope.rewrite_bare_passive("C1 p n source_c", |_| Ok(false))?,
+            "C1 p n {source_c}"
+        );
+        for model in ["local_model", "global_model", "external_model"] {
+            let statement = format!("R1 p n {model}");
+            assert_eq!(
+                scope.rewrite_bare_passive(&statement, |name| Ok(name == "external_model"))?,
+                statement
+            );
+        }
+        assert_eq!(
+            scope.rewrite_bare_passive("R1 local_r n 10k", |_| Ok(false))?,
+            "R1 local_r n 10k"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn charge_expression_bindings_preserve_electrical_names() -> Result<()> {
+        let (_, scope) = RuntimeScope::prepare(
+            b".subckt T p n params: gain=3 p=9 m=2\nC1 p n Q=(gain*V(p,n)+p) M={m}\n.ends\n",
+            "charge-scope",
+            "",
+        )?;
+        let gain = scope.lookup("gain")?;
+        let p = scope.lookup("p")?;
+        let m = scope.lookup("m")?;
+        for (left, right) in [("(", ")"), ("{", "}"), ("'", "'")] {
+            let statement = format!("C1 p n Q={left}gain*V(p,n)+p{right} M={{m}}");
+            assert_eq!(
+                scope.rewrite_statement(&statement)?,
+                format!("C1 p n Q={left}{gain}*V(p,n)+{p}{right} M={{{m}}}")
             );
         }
         Ok(())
