@@ -316,7 +316,7 @@ fn level17_nested_scope_shadowing_and_generated_names_are_electrical() -> Result
     let translated = translate_simplis_deck(deck.as_bytes())?;
     let text = std::str::from_utf8(&translated.bytes)?;
     ensure!(
-        text.contains("R__l17__I_M1_RD") && text.contains("R__l17_I_M1_RD"),
+        text.contains("R__l17_0_I_M1_RD") && text.contains("R__l17_I_M1_RD"),
         "generated prefix collides with source"
     );
     let rows = run_native(

@@ -3816,9 +3816,10 @@ impl<'a> ScopeAnalysis<'a> {
         items: &[Item],
         header: Option<&str>,
         level17: &'a level17::Scope<'a>,
+        budget: &WorkBudget,
     ) -> Result<Self> {
         let mut models = Self {
-            pwls_prefix: pwls::scope_prefix([items], header, "sr_pwls_"),
+            pwls_prefix: pwls::scope_prefix([items], header, "sr_pwls_", budget)?,
             init: init_overrides(items)?,
             pwl: std::collections::BTreeMap::new(),
             reactive: std::collections::BTreeMap::new(),
@@ -4965,7 +4966,7 @@ fn emit_deck_subcircuit(
     )?;
     let dead_calls = dead_numeric_subcircuit_calls(block, budget)?;
     let repair_one_model_typo = repair_unambiguous_pspice_one_model_typo(&block.body)?;
-    let models = ScopeAnalysis::analyze(&block.body, Some(&block.header), &scope)?;
+    let models = ScopeAnalysis::analyze(&block.body, Some(&block.header), &scope, budget)?;
     *flattened_subcircuits = flattened_subcircuits.saturating_add(1);
     let header = repaired_simetrix_subcircuit_header(block)?;
     budget.charge(Resource::EmittedBytes, header.len().saturating_add(1))?;
@@ -5071,7 +5072,7 @@ pub fn translate_simplis_deck_with_budget(
     budget: &WorkBudget,
 ) -> Result<WholeModelTranslation> {
     let items = vec![parse_deck_items(input, budget)?];
-    let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
+    let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_", budget)?;
     let scope = level17::Scope::global(&prefix, &items, budget)?;
     translate_deck_items(
         items.into_iter().next().context("missing deck")?,
@@ -5110,7 +5111,7 @@ pub fn translate_simplis_linked_netlist(
         )
         .map(|bytes| parse_deck_items(bytes, budget))
         .collect::<Result<Vec<_>>>()?;
-    let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
+    let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_", budget)?;
     let scope = level17::Scope::global(&prefix, &items, budget)?;
     let mut translated = items
         .into_iter()
@@ -5129,7 +5130,7 @@ fn translate_deck_items(
 ) -> Result<WholeModelTranslation> {
     reject_experimental_models(&items)?;
     distribute_root_init_overrides(&mut items)?;
-    let root_models = ScopeAnalysis::analyze(&items, None, scope)?;
+    let root_models = ScopeAnalysis::analyze(&items, None, scope, budget)?;
     let mut output = String::from(
         "* ngspice-rs-preprocess: translated expanded SIMPLIS deck to native ngspice\n",
     );

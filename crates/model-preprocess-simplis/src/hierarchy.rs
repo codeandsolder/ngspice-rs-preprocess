@@ -4160,7 +4160,7 @@ R1 1 2 {ROOT+PARENT}
     }
 
     #[test]
-    fn inherited_global_names_are_reserved() -> Result<()> {
+    fn inherited_global_names_are_reserved() {
         let catalog = SubcircuitCatalog::new();
         for source in [
             ".GLOBALVAR G=3\n.GLOBALVAR G=7\n.END\n",
@@ -4179,7 +4179,6 @@ R1 1 2 {ROOT+PARENT}
                 "{source}"
             );
         }
-        Ok(())
     }
 
     #[test]

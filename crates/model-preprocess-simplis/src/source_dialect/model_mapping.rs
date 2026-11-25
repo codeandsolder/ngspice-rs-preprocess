@@ -539,6 +539,30 @@ impl MappingTable {
             .is_some_and(|mapping| mapping.device == Device::HspiceResistor)
     }
 
+    fn family_mappings<'a>(&'a self, family: &'a str) -> impl Iterator<Item = &'a Mapping> {
+        self.entries
+            .range(
+                ModelKey {
+                    model_type: family.to_owned(),
+                    level: 0,
+                }..,
+            )
+            .take_while(move |(key, _)| key.model_type == family)
+            .map(|(_, mapping)| mapping)
+    }
+
+    fn positional_fields(&self, family: &str) -> Vec<&'static str> {
+        let mut fields = vec!["LEVEL", "VERSION", "VLEVEL"];
+        if family == "D"
+            || self
+                .family_mappings(family)
+                .any(|mapping| mapping.device == Device::Diode1)
+        {
+            fields.extend_from_slice(model_kernel_diode::SOURCE_PARAMETERS);
+        }
+        fields
+    }
+
     /// Resolve an admitted card before source-family lowering. Other
     /// device classes retain their own dedicated frontend.
     ///
@@ -569,37 +593,11 @@ impl MappingTable {
             .next()
             .unwrap_or_default()
             .to_ascii_uppercase();
-        if !known_family(&family)
-            && self
-                .entries
-                .range(
-                    ModelKey {
-                        model_type: family.clone(),
-                        level: 0,
-                    }..,
-                )
-                .next()
-                .is_none_or(|(key, _)| key.model_type != family)
-        {
+        if !known_family(&family) && self.family_mappings(&family).next().is_none() {
             return Ok(None);
         }
-        let structural = ["LEVEL", "VERSION", "VLEVEL"];
-        let diode_fields;
-        let positional = if family == "D"
-            || self
-                .entries
-                .values()
-                .any(|mapping| mapping.key.model_type == family && mapping.device == Device::Diode1)
-        {
-            diode_fields = structural
-                .into_iter()
-                .chain(model_kernel_diode::SOURCE_PARAMETERS.iter().copied())
-                .collect::<Vec<_>>();
-            diode_fields.as_slice()
-        } else {
-            &structural
-        };
-        let card = parse_model_card(text, line.first_line, positional)?;
+        let positional = self.positional_fields(&family);
+        let card = parse_model_card(text, line.first_line, &positional)?;
         let level = one(&card.parameters, "LEVEL")?;
         let vlevel = if matches!(family.as_str(), "NMOS" | "PMOS") {
             one(&card.parameters, "VLEVEL")?

@@ -301,8 +301,13 @@ pub struct Subcircuit {
 }
 
 fn bare_model_header(statement: &str) -> bool {
-    let fields = statement.split_whitespace().collect::<Vec<_>>();
-    fields.len() == 3 && fields[0].eq_ignore_ascii_case(".model")
+    let mut fields = statement.split_whitespace();
+    fields
+        .next()
+        .is_some_and(|field| field.eq_ignore_ascii_case(".model"))
+        && fields.next().is_some()
+        && fields.next().is_some()
+        && fields.next().is_none()
 }
 
 fn assignment_only_continuation(line: &str) -> bool {
@@ -410,40 +415,37 @@ pub fn embedded_files(items: &[Item]) -> Result<BTreeMap<String, Vec<&str>>> {
 /// Split physical deck lines into logical statements, preserving embedded payloads.
 #[must_use = "the returned statements combine physical continuation lines"]
 pub fn logical_statements(input: &str) -> Vec<String> {
-    let lines = input.lines().map(str::to_owned).collect::<Vec<_>>();
     let mut statements = Vec::<String>::new();
     let mut embedded = false;
-    for line in &lines {
-        if let Some(start) = file_boundary(line) {
+    let mut last_active: Option<usize> = None;
+    for line in input.lines() {
+        let boundary = file_boundary(line);
+        if let Some(start) = boundary {
             embedded = start;
-            statements.push(line.clone());
-            continue;
-        }
-        if embedded {
-            statements.push(line.clone());
-            continue;
         }
         let trimmed = line.trim_start();
-        if trimmed.starts_with('+')
-            && let Some(statement) = statements.iter_mut().rev().find(|statement| {
-                let candidate = statement.trim_start();
-                !candidate.is_empty() && !candidate.starts_with('*')
-            })
-        {
-            statement.push('\n');
-            statement.push_str(line);
-            continue;
+        if boundary.is_none() && !embedded {
+            if trimmed.starts_with('+')
+                && let Some(statement) = last_active.and_then(|index| statements.get_mut(index))
+            {
+                statement.push('\n');
+                statement.push_str(line);
+                continue;
+            }
+            if assignment_only_continuation(trimmed)
+                && let Some(previous) = statements.last_mut()
+                && bare_model_header(previous)
+            {
+                previous.push('\n');
+                previous.push('+');
+                previous.push_str(trimmed);
+                continue;
+            }
         }
-        if assignment_only_continuation(trimmed)
-            && let Some(previous) = statements.last_mut()
-            && bare_model_header(previous)
-        {
-            previous.push('\n');
-            previous.push('+');
-            previous.push_str(trimmed);
-            continue;
+        if !trimmed.is_empty() && !trimmed.starts_with('*') {
+            last_active = Some(statements.len());
         }
-        statements.push(line.clone());
+        statements.push(line.to_owned());
     }
     statements
 }
@@ -596,6 +598,17 @@ pub fn simple_assignment_value(statement: &str, name: &str) -> Result<Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_comment_run_does_not_rescan_for_each_continuation() {
+        let comments = "* a comment\n".repeat(10_000);
+        let continuations = "+ VALUE=1\n".repeat(10_000);
+        let input = format!(".model m D\n{comments}{continuations}");
+        let statements = logical_statements(&input);
+        assert_eq!(statements.len(), 10_001);
+        assert_eq!(statements[0].matches("+ VALUE=1").count(), 10_000);
+        assert_eq!(statements[10_000], "* a comment");
+    }
 
     #[test]
     fn embedded_payload_is_opaque_and_retains_physical_lines() -> Result<()> {
