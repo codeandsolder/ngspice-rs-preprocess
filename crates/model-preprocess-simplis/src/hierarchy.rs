@@ -1336,10 +1336,10 @@ fn rename_specialized(bytes: &[u8], generated_name: &str) -> Result<(String, Vec
 }
 
 fn override_number(environment: &Environment, name: &str) -> Result<f64> {
-    environment
+    let value = environment
         .get(name)
-        .with_context(|| format!("missing Complementary PWM parameter {name}"))?
-        .number()
+        .with_context(|| format!("missing Complementary PWM parameter {name}"))?;
+    super::Evaluation::new(environment).number(value)
 }
 
 fn write_pwm_number(output: &mut String, value: f64) -> Result<()> {

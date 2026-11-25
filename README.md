@@ -122,6 +122,20 @@ available with `--max-input-bytes`, `--max-command-output-bytes`,
 `--max-diagnostic-bytes`, and `--timeout-ms`. These do not replace the
 separate cumulative evaluation and hierarchy work limits.
 
+
+The SIMetrix `PWLS PUL` independent voltage/current waveform is lowered to
+native repeating PWL with the original source name and an explicit DC value.
+The period is specified by exactly one of `FREQ` or `PERIOD`; omitted rise is
+period/1000, omitted fall equals rise, and omitted plateau width is
+(period - rise - fall)/2. Omitted levels are 1 and -1. Delay is signed;
+`OFF_UNTIL_DELAY` defaults to enabled, while disabling it makes the waveform
+periodic before the specified delay. Zero plateau width and zero idle time
+are supported without artificial edge delays. Parameter expressions stay
+bound to their source instance; malformed timing is rejected. Finite
+`CYCLES`, other PWLS waveform kinds and unrecognized fields (including
+`DAMP_COEF`, which did not change the PUL waveform in the reference probes)
+are rejected rather than silently approximated.
+
 ## Optional external source command
 
 Configure one `AdmissionConfig` and share a `SourceSession` across the whole
