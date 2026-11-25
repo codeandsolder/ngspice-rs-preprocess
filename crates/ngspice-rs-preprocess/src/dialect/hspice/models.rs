@@ -5,7 +5,11 @@
 //! when the instance has only dimensionless AREA/PJ. DCAP=2 is the
 //! zero-threshold special case of the native depletion-charge law.
 use anyhow::{Context, Result, bail, ensure};
-use model_normalize_ngspice::model_card::{ModelCard, ModelParameter, parse_model_card};
+use model_normalize_ngspice::{
+    linked_source::RootKind,
+    model_card::{ModelCard, ModelParameter, parse_model_card, parse_spice_constant},
+    parameter_scope::ModelLibrary,
+};
 use model_preprocess_simplis::{
     lower_spice_expression,
     source_dialect::{
@@ -99,11 +103,6 @@ pub fn lower(
             });
         }
     }
-    // BV=0 is the documented infinite breakdown sentinel, not a 0-V clamp.
-    selected
-        .card
-        .parameters
-        .retain(|field| !(field.name == "BV" && field.expression.as_deref() == Some("0")));
     let native = selected.lower()?;
     let card = parse_model_card(&native, statement.first_line, &[])?;
     let text = render(&card, &card.name, |value| {
@@ -121,4 +120,63 @@ pub fn lower(
         "HSPICE model expansion byte budget exceeded"
     );
     Ok((text, selection))
+}
+
+/// Resolve HSPICE's zero-breakdown sentinel after occurrence binding. A
+/// standalone include cannot assume values of parameters supplied by its caller.
+pub fn resolve_breakdown(bytes: &[u8], kind: RootKind, limit: usize) -> Result<Vec<u8>> {
+    let source = std::str::from_utf8(bytes)?;
+    let library = if kind == RootKind::Deck {
+        Some(ModelLibrary::parse_source(bytes, kind)?)
+    } else {
+        None
+    };
+    let mut output = String::with_capacity(bytes.len());
+    for (index, line) in source.lines().enumerate() {
+        if (index == 0 && kind == RootKind::Deck)
+            || !super::analysis_plan::command(line).eq_ignore_ascii_case(".MODEL")
+        {
+            writeln!(output, "{line}")?;
+            continue;
+        }
+        let mut card = parse_model_card(line, index + 1, &[])?;
+        if let Some(position) = card
+            .parameters
+            .iter()
+            .position(|field| field.name.eq_ignore_ascii_case("BV"))
+        {
+            let expression = card.parameters[position]
+                .expression
+                .as_deref()
+                .context("BV requires a value")?;
+            let value = if let Some(library) = &library {
+                library.evaluate_scalar(0, expression, &[])?
+            } else {
+                parse_spice_constant(expression).context("parameter-dependent BV in an independent HSPICE include requires consuming deck binding")?
+            };
+            ensure!(
+                value.is_finite() && value >= 0.,
+                "invalid HSPICE BV {value}"
+            );
+            if value == 0. {
+                card.parameters.remove(position);
+            }
+            writeln!(
+                output,
+                "{}",
+                render(&card, &card.name, |value| Ok(value.to_owned()))?
+            )?;
+        } else {
+            writeln!(output, "{line}")?;
+        }
+        ensure!(
+            output.len() <= limit,
+            "HSPICE breakdown normalization exceeds byte budget"
+        );
+    }
+    ensure!(
+        output.len() <= limit,
+        "HSPICE breakdown normalization exceeds byte budget"
+    );
+    Ok(output.into_bytes())
 }

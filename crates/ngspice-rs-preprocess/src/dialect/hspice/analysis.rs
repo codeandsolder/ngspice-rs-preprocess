@@ -58,7 +58,7 @@ pub fn lower(text: &str) -> Result<String> {
         "unqualified HSPICE analysis {text}"
     );
     if kind == AnalysisKind::DcSweep {
-        for sweep in args.chunks_exact(4) {
+        for sweep in args.as_chunks::<4>().0 {
             let source = sweep[0]
                 .as_bytes()
                 .first()

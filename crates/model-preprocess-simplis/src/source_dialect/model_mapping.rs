@@ -521,7 +521,7 @@ impl MappingTable {
             .is_some_and(|mapping| mapping.device == Device::HspiceResistor)
     }
 
-    /// Select a qualified standalone HSPICE model, not a SIMetrix deck preset.
+    /// Select a qualified standalone HSPICE model, not a `SIMetrix` deck preset.
     ///
     /// # Errors
     /// The family, level or version has no qualified native lowering.

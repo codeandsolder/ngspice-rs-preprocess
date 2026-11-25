@@ -388,3 +388,28 @@ fn transient_start_is_normalized_without_reinterpreting_schedules() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn zero_breakdown_sentinel_resolves_in_each_occurrence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let text = numeric_deck(
+        dir.path(),
+        r#"Instance-specific breakdown
+.option parhier=local
+V1 a 0 -5
+V2 b 0 -5
+X1 a 0 junction bv=0.0
+X2 b 0 junction bv=5
+.subckt junction p n bv=0
+.model dm D(IS=1p BV='bv' IBV=100u)
+D1 p n dm
+.ends junction
+.end
+"#,
+        "op\nwrdata op.dat i(v1) i(v2)",
+    )?;
+    let row = &values(dir.path(), "op.dat")?[0];
+    ensure!(row[1].abs() < 1e-9, "{row:?}\n{text}");
+    ensure!((row[2] - 100e-6).abs() < 2e-7, "{row:?}\n{text}");
+    Ok(())
+}

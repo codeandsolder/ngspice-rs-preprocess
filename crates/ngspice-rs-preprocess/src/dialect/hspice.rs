@@ -174,7 +174,6 @@ fn map_values(
         _ if command.starts_with('.') => return Ok(text.to_owned()),
         _ => match command.as_bytes().first() {
             Some(b'X') => assignment_start(),
-            Some(b'D') => start(4),
             Some(b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => start(3),
             Some(b'E'..=b'H')
                 if ["VALUE", "VOL", "CUR", "TABLE", "POLY", "LAPLACE"]
@@ -184,7 +183,7 @@ fn map_values(
                 start(3)
             }
             Some(b'E' | b'G') => start(5),
-            Some(b'F' | b'H') => start(4),
+            Some(b'D' | b'F' | b'H') => start(4),
             _ => text.len(),
         },
     };
@@ -318,6 +317,83 @@ fn depletion_mode(
     Ok(mode.unwrap_or(2))
 }
 
+type LoweredExpansion = (
+    Vec<u8>,
+    Vec<crate::OriginLine>,
+    Vec<model_preprocess_simplis::source_dialect::model_mapping::ModelSelection>,
+    DeckOptions,
+);
+
+fn lower_expansion(
+    statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
+    input_origins: Vec<crate::OriginLine>,
+    deck: bool,
+    limit: usize,
+) -> Result<LoweredExpansion> {
+    let dcap = depletion_mode(&statements[usize::from(deck)..])?;
+    let mut selections = Vec::new();
+    let mut scope = Vec::new();
+    let mut bytes = Vec::new();
+    let mut origins = Vec::new();
+    let mut state = DeckOptions {
+        deck,
+        ..DeckOptions::default()
+    };
+    for (index, (statement, origin)) in statements.iter().zip(input_origins).enumerate() {
+        let text = if deck && index == 0 {
+            // Native ngspice may expand resource directives before discarding
+            // the title. Protect the title without changing its source span.
+            if statement.text.trim_start().starts_with('.') {
+                format!("* {}", statement.text)
+            } else {
+                statement.text.clone()
+            }
+        } else if analysis_plan::command(&statement.text) == ".MODEL" {
+            let (text, selection) =
+                models::lower(statement, &scope, dcap, limit.saturating_sub(bytes.len()))
+                    .with_context(|| format!("{}:{}", statement.source, statement.first_line))?;
+            selections.push(selection);
+            text
+        } else {
+            match analysis_plan::command(&statement.text).as_str() {
+                ".SUBCKT" => scope.push(
+                    statement
+                        .text
+                        .split_whitespace()
+                        .nth(1)
+                        .context("missing subcircuit name")?
+                        .to_owned(),
+                ),
+                ".ENDS" => {
+                    scope.pop().context("unmatched .ends")?;
+                }
+                _ => (),
+            }
+            lower_card(
+                &statement.text,
+                statement.context,
+                &mut state,
+                limit.saturating_sub(bytes.len()),
+            )
+            .with_context(|| {
+                format!(
+                    "{}:{}-{}",
+                    statement.source, statement.first_line, statement.last_line
+                )
+            })?
+        };
+        ensure!(
+            text.len().saturating_add(1) <= limit.saturating_sub(bytes.len()),
+            "standalone SPICE output byte budget exceeded"
+        );
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.push(b'\n');
+        origins.push(origin);
+    }
+    ensure!(state.depth == 0, "unclosed HSPICE subcircuit");
+    Ok((bytes, origins, selections, state))
+}
+
 pub(super) fn prepare(
     root: &AdmittedSource,
     request: &Request,
@@ -341,76 +417,12 @@ pub(super) fn prepare(
         },
         None,
     )?;
-    let dcap = depletion_mode(&expansion.statements[usize::from(deck)..])?;
-    let mut selections = Vec::new();
-    let mut scope = Vec::new();
-    let mut bytes = Vec::new();
-    let mut origins = Vec::new();
-    let mut state = DeckOptions {
+    let (mut bytes, mut origins, selections, state) = lower_expansion(
+        &expansion.statements,
+        expansion.origins,
         deck,
-        ..DeckOptions::default()
-    };
-    for (index, (statement, origin)) in expansion
-        .statements
-        .iter()
-        .zip(expansion.origins)
-        .enumerate()
-    {
-        let text = if deck && index == 0 {
-            // Native ngspice may expand resource directives before discarding
-            // the title. Protect the title without changing its source span.
-            if statement.text.trim_start().starts_with('.') {
-                format!("* {}", statement.text)
-            } else {
-                statement.text.clone()
-            }
-        } else if analysis_plan::command(&statement.text) == ".MODEL" {
-            let (text, selection) = models::lower(
-                statement,
-                &scope,
-                dcap,
-                options.output_bytes.saturating_sub(bytes.len()),
-            )
-            .with_context(|| format!("{}:{}", statement.source, statement.first_line))?;
-            selections.push(selection);
-            text
-        } else {
-            match analysis_plan::command(&statement.text).as_str() {
-                ".SUBCKT" => scope.push(
-                    statement
-                        .text
-                        .split_whitespace()
-                        .nth(1)
-                        .context("missing subcircuit name")?
-                        .to_owned(),
-                ),
-                ".ENDS" => {
-                    scope.pop().context("unmatched .ends")?;
-                }
-                _ => (),
-            }
-            lower_card(
-                &statement.text,
-                statement.context,
-                &mut state,
-                options.output_bytes.saturating_sub(bytes.len()),
-            )
-            .with_context(|| {
-                format!(
-                    "{}:{}-{}",
-                    statement.source, statement.first_line, statement.last_line
-                )
-            })?
-        };
-        ensure!(
-            text.len().saturating_add(1) <= options.output_bytes.saturating_sub(bytes.len()),
-            "standalone SPICE output byte budget exceeded"
-        );
-        bytes.extend_from_slice(text.as_bytes());
-        bytes.push(b'\n');
-        origins.push(origin);
-    }
-    ensure!(state.depth == 0, "unclosed HSPICE subcircuit");
+        options.output_bytes,
+    )?;
     if deck {
         (bytes, origins) = hierarchy::bind(
             &bytes,
@@ -446,6 +458,7 @@ pub(super) fn prepare(
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
     }
+    bytes = models::resolve_breakdown(&bytes, kind, options.output_bytes)?;
     let mut bundle = native_bundle(root.path.clone(), request.format, kind, &bytes, &origins)?;
     bundle.model_selections = selections;
     Ok(bundle)
