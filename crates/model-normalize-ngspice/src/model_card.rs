@@ -58,33 +58,12 @@ pub fn parse_model_cards(input: &[u8]) -> Result<Vec<ModelCard>> {
 /// Combine `+` continuation lines and preserve physical source locations.
 /// Never interpret opaque non-model source statements while lexing.
 pub(crate) fn logical_statements(input: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
-    let mut complete = Vec::new();
-    for (index, physical_line) in input.split(|byte| *byte == b'\n').enumerate() {
-        let line = physical_line
-            .strip_suffix(b"\r")
-            .unwrap_or(physical_line)
-            .trim_ascii();
-        if line.is_empty() || line.first() == Some(&b'*') {
-            continue;
-        }
-        let line = strip_comment(line).trim_ascii();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(continuation) = line.strip_prefix(b"+") {
-            let Some((_, statement)): Option<&mut (usize, Vec<u8>)> = complete.last_mut() else {
-                bail!(
-                    "line {}: continuation without a preceding source line",
-                    index + 1
-                );
-            };
-            statement.push(b' ');
-            statement.extend_from_slice(continuation.trim_ascii());
-        } else {
-            complete.push((index + 1, line.to_vec()));
-        }
-    }
-    Ok(complete)
+    let normalized = crate::lexical::normalize_nbsp(input);
+    let bytes = normalized.as_deref().unwrap_or(input);
+    Ok(crate::lexical::statements(bytes)?
+        .into_iter()
+        .map(|statement| (statement.line, statement.text))
+        .collect())
 }
 
 /// Decode named source parameters shared by `.param` and `.subckt` syntax.
@@ -125,32 +104,6 @@ fn is_model_start(line: &[u8]) -> bool {
         return false;
     };
     prefix.eq_ignore_ascii_case(b".model") && line.get(6).is_some_and(u8::is_ascii_whitespace)
-}
-
-fn strip_comment(line: &[u8]) -> &[u8] {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut nested_braces = 0;
-    for (index, &byte) in line.iter().enumerate() {
-        if let Some(delimiter) = quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == delimiter {
-                quote = None;
-            }
-        } else {
-            match byte {
-                b'\'' | b'"' => quote = Some(byte),
-                b'{' => nested_braces += 1,
-                b'}' if nested_braces > 0 => nested_braces -= 1,
-                b'$' | b';' if nested_braces == 0 => return &line[..index],
-                _ => {}
-            }
-        }
-    }
-    line
 }
 
 struct Source<'a> {

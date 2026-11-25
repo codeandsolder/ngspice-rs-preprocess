@@ -1,5 +1,6 @@
 //! Deterministic compatibility normalization and validation for ngspice model includes.
 
+mod lexical;
 pub mod linked_source;
 pub mod model_card;
 pub mod param_expression;
@@ -21,26 +22,6 @@ use std::{
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
-static LTSPICE_L_RSER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^([ \t]*)(l[^\s]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+rser\s*=\s*(\S+)(.*)$")
-        .unwrap_or_else(|error| unreachable!("static regex must compile: {error}"))
-});
-static PSPICE_ARCTAN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\barctan\s*\(")
-        .unwrap_or_else(|error| unreachable!("static regex must compile: {error}"))
-});
-static PSPICE_PARAMS_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\s*\+\s*PARAMS\s*:\s*$")
-        .unwrap_or_else(|error| unreachable!("static regex must compile: {error}"))
-});
-static PSPICE_POSITIONAL_PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^([ \t]*\+[ \t]*)([A-Za-z_][A-Za-z0-9_]*)[ \t]+([^=\s].*)$")
-        .unwrap_or_else(|error| unreachable!("static regex must compile: {error}"))
-});
-static END_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?im)^[ \t]*\.end[ \t]*(?:\r?\n|$)")
-        .unwrap_or_else(|error| unreachable!("static regex must compile: {error}"))
-});
 static NGSPICE_ERROR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?im)^(?:fatal|error)[: ]")
         .unwrap_or_else(|error| unreachable!("static regex must compile: {error}"))
@@ -64,8 +45,6 @@ static SIMPLIS_PREPROCESSOR_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub enum NormalizationPass {
     /// Replace Latin-1 or UTF-8 non-breaking spaces with ordinary spaces.
     NormalizeNbspWhitespace,
-    /// Restore the comment marker on wrapped prose in a leading comment block.
-    HeaderCommentContinuation,
     /// Expand `LTspice`'s `L ... Rser=` extension to an ideal inductor plus resistor.
     LtspiceInductorRser,
     /// Map `PSpice` `arctan()` to ngspice `atan()`.
@@ -114,93 +93,7 @@ pub fn looks_like_simplis(input: &[u8]) -> bool {
         || SIMPLIS_PREPROCESSOR_RE.is_match(input)
 }
 
-fn ensure_textual(input: &[u8]) -> Result<()> {
-    let sample_len = input.len().min(131_072);
-    if input[..sample_len].contains(&0) {
-        bail!("ngspice normalization requires a textual model");
-    }
-    Ok(())
-}
-
-fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
-    line.strip_suffix(b"\r\n").map_or_else(
-        || {
-            line.strip_suffix(b"\n")
-                .map_or((line, b"".as_slice()), |body| (body, b"\n".as_slice()))
-        },
-        |body| (body, b"\r\n".as_slice()),
-    )
-}
-
-fn lines_with_endings(input: &[u8]) -> impl Iterator<Item = &[u8]> {
-    input.split_inclusive(|byte| *byte == b'\n')
-}
-
-fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
-    if !input.windows(2).any(|pair| pair == b"\xc2\xa0") && !input.contains(&0xa0) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(input.len());
-    let mut index = 0;
-    while index < input.len() {
-        if input.get(index..index.saturating_add(2)) == Some(b"\xc2\xa0") {
-            out.push(b' ');
-            index += 2;
-        } else if input[index] == 0xa0 {
-            out.push(b' ');
-            index += 1;
-        } else {
-            out.push(input[index]);
-            index += 1;
-        }
-    }
-    Some(out)
-}
-
-fn repair_header_comment_continuations(input: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut changed = false;
-    let mut seen_spice = false;
-    let mut prev_comment = false;
-    for line in lines_with_endings(input) {
-        let (body, ending) = split_line_ending(line);
-        let stripped = body
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .map_or_else(|| &body[body.len()..], |index| &body[index..]);
-        if stripped.is_empty() {
-            out.extend_from_slice(line);
-            continue;
-        }
-        if stripped.starts_with(b"*") {
-            prev_comment = true;
-            out.extend_from_slice(line);
-            continue;
-        }
-        if stripped.starts_with(b".") || stripped.starts_with(b"+") {
-            seen_spice = true;
-            prev_comment = false;
-            out.extend_from_slice(line);
-            continue;
-        }
-        if !seen_spice
-            && prev_comment
-            && body
-                .first()
-                .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-        {
-            out.extend_from_slice(b"* ");
-            out.extend_from_slice(stripped);
-            out.extend_from_slice(ending);
-            changed = true;
-            prev_comment = true;
-            continue;
-        }
-        prev_comment = false;
-        out.extend_from_slice(line);
-    }
-    changed.then_some(out)
-}
+use lexical::{ensure_textual, normalize_nbsp, split_line_ending};
 
 /// Reserve source identifiers before introducing synthetic elements or nets.
 ///
@@ -245,117 +138,317 @@ fn fresh_identifier(used: &mut BTreeSet<Vec<u8>>, base: &[u8]) -> Option<Vec<u8>
     }
 }
 
-fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Option<Vec<u8>> {
-    // Most sources have no Rser extension; avoid reserving every source
-    // identifier or cloning the entire model in that common case.
-    if !lines_with_endings(input).any(|line| LTSPICE_L_RSER_RE.is_match(split_line_ending(line).0))
-    {
-        return None;
-    }
-
-    let mut used = source_identifiers(input);
-    let mut out = Vec::with_capacity(input.len());
-    let mut serial = 0usize;
-    let mut changed = false;
-    for line in lines_with_endings(input) {
-        let (body, ending) = split_line_ending(line);
-        if let Some(captures) = LTSPICE_L_RSER_RE.captures(body) {
-            let indent = captures
-                .get(1)
-                .map_or(b"".as_slice(), |value| value.as_bytes());
-            let ind = captures.get(2)?.as_bytes();
-            let node1 = captures.get(3)?.as_bytes();
-            let node2 = captures.get(4)?.as_bytes();
-            let value = captures.get(5)?.as_bytes();
-            let rser = captures.get(6)?.as_bytes();
-            let tail = captures
-                .get(7)
-                .map_or(b"".as_slice(), |value| value.as_bytes());
-
-            let mut resistor_base = b"R__".to_vec();
-            resistor_base.extend_from_slice(ind);
-            resistor_base.extend_from_slice(b"_RSER");
-            let resistor = fresh_identifier(&mut used, &resistor_base)?;
-
-            let mut internal_base = b"__".to_vec();
-            internal_base.extend_from_slice(ind);
-            write!(&mut internal_base, "_rser_{serial}").ok()?;
-            let internal = fresh_identifier(&mut used, &internal_base)?;
-
-            out.extend_from_slice(indent);
-            out.extend_from_slice(&resistor);
-            out.push(b' ');
-            out.extend_from_slice(node1);
-            out.push(b' ');
-            out.extend_from_slice(&internal);
-            out.push(b' ');
-            out.extend_from_slice(rser);
-            // The original may end without LF; the synthesized resistor must
-            // still be a separate complete SPICE statement.
-            if ending.is_empty() {
-                out.push(b'\n');
-            } else {
-                out.extend_from_slice(ending);
-            }
-            out.extend_from_slice(indent);
-            out.extend_from_slice(ind);
-            out.push(b' ');
-            out.extend_from_slice(&internal);
-            out.push(b' ');
-            out.extend_from_slice(node2);
-            out.push(b' ');
-            out.extend_from_slice(value);
-            out.extend_from_slice(tail);
-            out.extend_from_slice(ending);
-            serial += 1;
-            changed = true;
-        } else {
-            out.extend_from_slice(line);
-        }
-    }
-    changed.then_some(out)
-}
-
-fn rewrite_pspice_arctan(input: &[u8]) -> Option<Vec<u8>> {
-    PSPICE_ARCTAN_RE.is_match(input).then(|| {
-        PSPICE_ARCTAN_RE
-            .replace_all(input, b"atan(".as_slice())
-            .into_owned()
-    })
-}
-
-fn rewrite_pspice_positional_params(input: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut in_params = false;
-    let mut changed = false;
-    for line in lines_with_endings(input) {
-        let (body, ending) = split_line_ending(line);
-        if PSPICE_PARAMS_HEADER_RE.is_match(body) {
-            in_params = true;
-            out.extend_from_slice(line);
+/// Find the unique top-level series-resistance assignment after the device
+/// name, two nodes and inductance. Names occurring within values are not keys.
+fn rser_assignment(
+    text: &[u8],
+    fields: &[std::ops::Range<usize>],
+    line: usize,
+) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    let mut rser = None;
+    for index in 4..fields.len() {
+        if !text[fields[index].clone()].eq_ignore_ascii_case(b"rser")
+            || text[fields[index - 1].clone()] == *b"="
+            || fields
+                .get(index + 1)
+                .is_none_or(|span| text[span.clone()] != *b"=")
+        {
             continue;
         }
-        if in_params
-            && body
-                .iter()
-                .position(|byte| !byte.is_ascii_whitespace())
-                .is_some_and(|index| body[index] == b'+')
+        let value = fields
+            .get(index + 2)
+            .filter(|span| text[(*span).clone()] != *b"=")
+            .filter(|_| {
+                fields
+                    .get(index + 3)
+                    .is_none_or(|span| text[span.clone()] != *b"=")
+            })
+            .with_context(|| format!("line {line}: Rser requires a value"))?;
+        anyhow::ensure!(rser.is_none(), "line {line}: duplicate Rser assignment");
+        rser = Some((fields[index].start..value.end, value.clone()));
+    }
+    Ok(rser)
+}
+
+fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
+    use lexical::{apply_edits, replace_span, statements, tokens};
+    if !input
+        .windows(4)
+        .any(|word| word.eq_ignore_ascii_case(b"rser"))
+    {
+        return Ok(None);
+    }
+    let mut used = source_identifiers(input);
+    let mut edits = Vec::new();
+    let mut serial = 0;
+    let mut in_control = false;
+    for statement in statements(input)? {
+        let text = &statement.text;
+        let first = text
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .unwrap_or_default();
+        if first.eq_ignore_ascii_case(b".control") {
+            in_control = true;
+        } else if first.eq_ignore_ascii_case(b".endc") {
+            in_control = false;
+        }
+        if in_control
+            || !matches!(first.first(), Some(b'l' | b'L'))
+            || !text
+                .windows(4)
+                .any(|word| word.eq_ignore_ascii_case(b"rser"))
         {
-            if let Some(captures) = PSPICE_POSITIONAL_PARAM_RE.captures(body) {
-                out.extend_from_slice(captures.get(1)?.as_bytes());
-                out.extend_from_slice(captures.get(2)?.as_bytes());
-                out.push(b'=');
-                out.extend_from_slice(captures.get(3)?.as_bytes());
-                out.extend_from_slice(ending);
-                changed = true;
+            continue;
+        }
+        let fields = tokens(text)?;
+        if fields.len() < 5 {
+            continue;
+        }
+        let Some((assignment, resistance)) = rser_assignment(text, &fields, statement.line)? else {
+            continue;
+        };
+        let ind = &text[fields[0].clone()];
+        let node = &text[fields[1].clone()];
+        let mut resistor_base = b"R__".to_vec();
+        resistor_base.extend_from_slice(ind);
+        resistor_base.extend_from_slice(b"_RSER");
+        let resistor =
+            fresh_identifier(&mut used, &resistor_base).context("element identifier overflow")?;
+        let mut internal_base = b"__".to_vec();
+        internal_base.extend_from_slice(ind);
+        write!(&mut internal_base, "_rser_{serial}")?;
+        let internal =
+            fresh_identifier(&mut used, &internal_base).context("node identifier overflow")?;
+        serial += 1;
+        let physical = input[statement.start..]
+            .split_inclusive(|b| *b == b'\n')
+            .next()
+            .unwrap_or_default();
+        let (body, ending) = split_line_ending(physical);
+        let mut line = body[..body.len() - body.trim_ascii_start().len()].to_vec();
+        for word in [&resistor[..], node, &internal, &text[resistance]] {
+            line.extend_from_slice(word);
+            line.push(b' ');
+        }
+        line.pop();
+        line.extend_from_slice(if ending.is_empty() { b"\n" } else { ending });
+        edits.push((statement.start..statement.start, line));
+        replace_span(&statement, fields[1].clone(), &internal, &mut edits);
+        // Remove preceding horizontal separation on the same logical line.
+        // If the separator is synthetic its source range is empty.
+        let start = text[..assignment.start].trim_ascii_end().len();
+        let remove = start..assignment.end;
+        let removed = statement.source_ranges(remove.clone());
+        replace_span(&statement, remove, b"", &mut edits);
+        for (plus, code) in &statement.continuations {
+            if input[code.clone()].iter().enumerate().all(|(i, byte)| {
+                byte.is_ascii_whitespace()
+                    || removed
+                        .iter()
+                        .any(|range| range.contains(&(code.start + i)))
+            }) {
+                // A wholly consumed continuation remains a comment, retaining
+                // its physical location and any existing inline comment.
+                edits.push((*plus..*plus + 1, vec![b'*']));
+            }
+        }
+    }
+    Ok(apply_edits(input, edits))
+}
+
+fn params_header_end(text: &[u8], fields: &[std::ops::Range<usize>]) -> Option<usize> {
+    for (index, span) in fields.iter().enumerate() {
+        let field = &text[span.clone()];
+        if field.eq_ignore_ascii_case(b"params:") {
+            return Some(index + 1);
+        }
+        if field.eq_ignore_ascii_case(b"params")
+            && fields
+                .get(index + 1)
+                .is_some_and(|next| text[next.clone()] == *b":")
+        {
+            return Some(index + 2);
+        }
+    }
+    None
+}
+
+/// Locate the expression-bearing part of cards without interpreting their
+/// positional node/model identifiers as arithmetic.
+fn expression_start(text: &[u8], first: &[u8]) -> Result<Option<usize>> {
+    let fields = lexical::tokens(text)?;
+    let assignment = || {
+        fields
+            .iter()
+            .position(|span| text[span.clone()] == *b"=")
+            .map(|index| index + 1)
+    };
+    let lower = first.to_ascii_lowercase();
+    let index = match lower.as_slice() {
+        b".param" | b".if" | b".elseif" => Some(1),
+        b".model" => Some(2),
+        b".func" => Some(
+            if fields
+                .get(1)
+                .is_some_and(|span| text[span.clone()].contains(&b'('))
+            {
+                2
+            } else {
+                3
+            },
+        ),
+        b".subckt" => params_header_end(text, &fields).or_else(assignment),
+        [b'b' | b'r' | b'l' | b'c' | b'v' | b'i', ..] => Some(3),
+        [b'f' | b'h', ..] => Some(4),
+        [b'e' | b'g', ..] => {
+            if fields.get(3).is_some_and(|span| {
+                let field = &text[span.clone()];
+                [b"value".as_slice(), b"table", b"poly"]
+                    .iter()
+                    .any(|keyword| {
+                        field
+                            .get(..keyword.len())
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+                            && field.get(keyword.len()).is_none_or(|b| *b == b'(')
+                    })
+            }) {
+                Some(3)
+            } else {
+                Some(5)
+            }
+        }
+        [
+            b'd' | b'j' | b'q' | b'm' | b'x' | b's' | b'w' | b't' | b'o' | b'u' | b'k' | b'a'
+            | b'z',
+            ..,
+        ] => assignment(),
+        _ => None,
+    };
+    Ok(index.and_then(|at| fields.get(at)).map(|span| span.start))
+}
+
+fn rewrite_pspice_arctan(input: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !input
+        .windows(6)
+        .any(|word| word.eq_ignore_ascii_case(b"arctan"))
+    {
+        return Ok(None);
+    }
+    let mut edits = Vec::new();
+    let mut in_control = false;
+    for statement in lexical::statements(input)? {
+        let text = &statement.text;
+        let first = text
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .unwrap_or_default();
+        if first.eq_ignore_ascii_case(b".control") {
+            in_control = true;
+        } else if first.eq_ignore_ascii_case(b".endc") {
+            in_control = false;
+        }
+        if in_control {
+            continue;
+        }
+        if !text
+            .windows(6)
+            .any(|word| word.eq_ignore_ascii_case(b"arctan"))
+        {
+            continue;
+        }
+        let Some(start) = expression_start(text, first)? else {
+            continue;
+        };
+        for span in lexical::function_names(text, b"arctan", start) {
+            lexical::replace_span(&statement, span, b"atan", &mut edits);
+        }
+    }
+    Ok(lexical::apply_edits(input, edits))
+}
+
+fn rewrite_pspice_positional_params(input: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !input
+        .windows(6)
+        .any(|word| word.eq_ignore_ascii_case(b"params"))
+    {
+        return Ok(None);
+    }
+    let mut edits = Vec::new();
+    for statement in lexical::statements(input)? {
+        let text = &statement.text;
+        let first = text
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .unwrap_or_default();
+        if !first.eq_ignore_ascii_case(b".subckt") {
+            continue;
+        }
+        // Restrict the vendor positional syntax to the explicit PARAMS:
+        // section of a subcircuit declaration and physical continuation
+        // boundaries. Existing assignments and split expressions stay intact.
+        let fields = lexical::tokens(text)?;
+        let Some(mut index) = params_header_end(text, &fields) else {
+            continue;
+        };
+        while index < fields.len() {
+            let name = &fields[index];
+            let Some(value) = fields.get(index + 1) else {
+                break;
+            };
+            if text[value.clone()] == *b"=" {
+                index += 3;
                 continue;
             }
-        } else if in_params {
-            in_params = false;
+            let ranges = statement.source_ranges(name.clone());
+            let Some(range) = ranges.first() else { break };
+            let is_continuation_start = statement.continuations.iter().any(|(_, code)| {
+                code.contains(&range.start)
+                    && input[code.start..range.start].trim_ascii().is_empty()
+            });
+            let identifier = &text[name.clone()];
+            if is_continuation_start
+                && identifier
+                    .first()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+                && identifier
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                && fields
+                    .get(index + 2)
+                    .is_none_or(|span| text[span.clone()] != *b"=")
+                && let Some(value_range) = statement.source_ranges(value.clone()).first()
+                && value_range.start >= range.end
+                && !input[range.end..value_range.start].contains(&b'\n')
+            {
+                edits.push((range.end..value_range.start, vec![b'=']));
+                index += 2;
+            } else {
+                index += 1;
+            }
         }
-        out.extend_from_slice(line);
     }
-    changed.then_some(out)
+    Ok(lexical::apply_edits(input, edits))
+}
+
+fn strip_standalone_end(input: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut edits = Vec::new();
+    let mut in_control = false;
+    for statement in lexical::statements(input)? {
+        if statement.text.eq_ignore_ascii_case(b".control") {
+            in_control = true;
+        } else if statement.text.eq_ignore_ascii_case(b".endc") {
+            in_control = false;
+        } else if !in_control && statement.text.eq_ignore_ascii_case(b".end") {
+            lexical::replace_span(
+                &statement,
+                0..statement.text.len(),
+                b"* .END stripped for ngspice include",
+                &mut edits,
+            );
+        }
+    }
+    Ok(lexical::apply_edits(input, edits))
 }
 
 fn apply_optional<F>(
@@ -397,34 +490,20 @@ pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
         NormalizationPass::NormalizeNbspWhitespace,
         normalize_nbsp,
     );
-    apply_optional(
-        &mut bytes,
-        &mut passes,
-        NormalizationPass::HeaderCommentContinuation,
-        repair_header_comment_continuations,
-    );
-    apply_optional(
-        &mut bytes,
-        &mut passes,
-        NormalizationPass::LtspiceInductorRser,
-        rewrite_ltspice_inductor_rser,
-    );
-    apply_optional(
-        &mut bytes,
-        &mut passes,
-        NormalizationPass::PspiceArctan,
-        rewrite_pspice_arctan,
-    );
-    apply_optional(
-        &mut bytes,
-        &mut passes,
-        NormalizationPass::PspicePositionalParams,
-        rewrite_pspice_positional_params,
-    );
-    let stripped =
-        END_LINE_RE.replace_all(&bytes, b"* .END stripped for ngspice include\n".as_slice());
-    if stripped.as_ref() != bytes.as_slice() {
-        bytes = stripped.into_owned();
+    if let Some(rewritten) = rewrite_ltspice_inductor_rser(&bytes)? {
+        bytes = rewritten;
+        passes.push(NormalizationPass::LtspiceInductorRser);
+    }
+    if let Some(rewritten) = rewrite_pspice_arctan(&bytes)? {
+        bytes = rewritten;
+        passes.push(NormalizationPass::PspiceArctan);
+    }
+    if let Some(rewritten) = rewrite_pspice_positional_params(&bytes)? {
+        bytes = rewritten;
+        passes.push(NormalizationPass::PspicePositionalParams);
+    }
+    if let Some(rewritten) = strip_standalone_end(&bytes)? {
+        bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
     Ok(NormalizedModel { bytes, passes })
@@ -543,13 +622,13 @@ mod tests {
 
     #[test]
     fn rewrites_only_targeted_syntax() -> Result<()> {
-        let input = b"* hdr\n  wrapped prose\n.subckt x a b\nL1 a b 2u Rser=30m\n+ PARAMS:\n+ gain 2\nB1 x 0 v=arctan(v(a))\n.ends x\n.END\n";
+        let input = b"* hdr\n  wrapped prose\n.subckt x a b\n+ PARAMS:\n+ gain 2\nL1 a b 2u Rser=30m\nB1 x 0 v=arctan(v(a))\n.ends x\n.END\n";
         let normalized = normalize_ngspice(input)?;
         assert!(
             normalized
                 .bytes
-                .windows(b"* wrapped prose".len())
-                .any(|w| w == b"* wrapped prose")
+                .windows(b"  wrapped prose".len())
+                .any(|w| w == b"  wrapped prose")
         );
         assert!(
             normalized
@@ -575,7 +654,7 @@ mod tests {
                 .windows(b"* .END stripped for ngspice include".len())
                 .any(|w| w == b"* .END stripped for ngspice include")
         );
-        assert_eq!(normalized.passes.len(), 5);
+        assert_eq!(normalized.passes.len(), 4);
         Ok(())
     }
 
@@ -610,6 +689,149 @@ mod tests {
         let normalized = normalize_ngspice(input)?;
         assert_eq!(normalized.bytes, input);
         assert_eq!(normalized.passes, Vec::<NormalizationPass>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn indented_device_after_comment_is_not_prose() -> Result<()> {
+        let input = b"* header\n  R1 a b 1k\n\tL1 a b 2u\n  C1 b 0 10p\n";
+        let normalized = normalize_ngspice(input)?;
+        assert_eq!(normalized.bytes, input);
+        assert!(normalized.passes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn nbsp_rewrite_preserves_utf8_characters_and_literal_bytes() -> Result<()> {
+        let input = b"* \xc2\xa0 \xc3\xa0 \x81\nR1\xc2\xa0a\xa0b 1k ; \xa0\n.include \"a\xc2\xa0b\xc3\xa0.lib\"\nR2 n\xe0\xa0\x80 b 2k\n";
+        let expected = b"* \xc2\xa0 \xc3\xa0 \x81\nR1 a b 1k ; \xa0\n.include \"a\xc2\xa0b\xc3\xa0.lib\"\nR2 n\xe0\xa0\x80 b 2k\n";
+        let normalized = normalize_ngspice(input)?;
+        assert_eq!(normalized.bytes, expected);
+        assert_eq!(
+            normalized.passes,
+            vec![NormalizationPass::NormalizeNbspWhitespace]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nbsp_indentation_does_not_rewrite_comment_payload() -> Result<()> {
+        let input = b"\xc2\xa0* keep\xc2\xa0this\nR1 a b 1k\xa0$ keep\xa0this\n";
+        let expected = b" * keep\xc2\xa0this\nR1 a b 1k $ keep\xa0this\n";
+        assert_eq!(normalize_ngspice(input)?.bytes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn end_statement_is_commented_without_discarding_trailing_text() -> Result<()> {
+        let input = b"* .end\r\n.subckt x a b\r\nR1 a b 1k\r\n.ends x\r\n .END ; marker";
+        let expected = b"* .end\r\n.subckt x a b\r\nR1 a b 1k\r\n.ends x\r\n * .END stripped for ngspice include ; marker";
+        assert_eq!(normalize_ngspice(input)?.bytes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn nul_after_original_sample_boundary_is_rejected_everywhere() {
+        let mut input = vec![b' '; 131_073];
+        input.push(0);
+        assert!(normalize_ngspice(&input).is_err());
+        assert!(model_card::parse_model_cards(&input).is_err());
+        assert!(validate_ngspice(&input, ".lib", Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn rser_balanced_expressions_and_continuations_preserve_comments() -> Result<()> {
+        let input = b".subckt x a b\r\n  Lfoo a b {2 * (1u + 1u)} IC=2m ; first\r\n* between\r\n  + Rser = {30m +\r\n  + (2 * 5m)} IC=3m ; second\r\n.ends x";
+        let normalized = normalize_ngspice(input)?;
+        let text = std::str::from_utf8(&normalized.bytes)?;
+        assert!(text.contains("  R__Lfoo_RSER a __Lfoo_rser_0 {30m + (2 * 5m)}\r\n"));
+        assert!(text.contains("  Lfoo __Lfoo_rser_0 b {2 * (1u + 1u)} IC=2m ; first\r\n"));
+        assert!(text.contains("* between\r\n"));
+        assert!(text.contains("IC=3m ; second\r\n"));
+        assert!(text.ends_with(".ends x"));
+        let statements = model_card::logical_statements(&normalized.bytes)?;
+        assert_eq!(statements.len(), 4);
+        assert_eq!(
+            statements[2].1,
+            b"Lfoo __Lfoo_rser_0 b {2 * (1u + 1u)} IC=2m IC=3m"
+        );
+        assert_eq!(
+            normalize_ngspice(&normalized.bytes)?.bytes,
+            normalized.bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn continued_rser_matches_analytic_dc_and_ac_in_native_ngspice() -> Result<()> {
+        let model = normalize_ngspice(
+            b".subckt coil a b\n  Lfoo a b {2 * (1u + 1u)}\n+ Rser = {30m +\n+ (2 * 5m)}\n.ends coil\n",
+        )?;
+        let directory = TempDir::new()?;
+        fs::write(directory.path().join("coil.lib"), model.bytes)?;
+        fs::write(
+            directory.path().join("deck.cir"),
+            b".title Series-RL reference\n.include coil.lib\nVsrc a 0 dc 1 ac 1\nXcoil a 0 coil\n.control\nset numdgt=17\nset wr_singlescale\nop\nwrdata op.dat i(Vsrc)\nac lin 3 1000 3000\nwrdata ac.dat i(Vsrc)\nquit\n.endc\n.end\n",
+        )?;
+        let output = Command::new("ngspice")
+            .args(["-b", "-n", "deck.cir"])
+            .current_dir(directory.path())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "ngspice: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let op = fs::read_to_string(directory.path().join("op.dat"))?;
+        let current = op
+            .split_ascii_whitespace()
+            .nth(1)
+            .context("missing DC current")?
+            .parse::<f64>()?;
+        let resistance = 0.04;
+        let inductance = 4e-6;
+        assert!((current + 1.0 / resistance).abs() < 1e-10);
+        let ac = fs::read_to_string(directory.path().join("ac.dat"))?;
+        assert_eq!(ac.lines().count(), 3);
+        for line in ac.lines() {
+            let values = line
+                .split_ascii_whitespace()
+                .map(str::parse::<f64>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let [frequency, real, imaginary] = values.as_slice() else {
+                bail!("unexpected AC result: {line}");
+            };
+            let reactance = std::f64::consts::TAU * frequency * inductance;
+            let denominator = resistance * resistance + reactance * reactance;
+            assert!((real + resistance / denominator).abs() < 1e-10);
+            assert!((imaginary - reactance / denominator).abs() < 1e-10);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rser_is_only_a_top_level_inductor_assignment() -> Result<()> {
+        let input = b"* L1 a b 2u Rser=5\nL1 a b {Rser + 1u} IC=0 ; Rser=5\nR1 a b 2k Rser=5\n.include \"L1 a b 2u Rser=5\"\n";
+        assert_eq!(normalize_ngspice(input)?.bytes, input);
+        assert!(normalize_ngspice(b"L1 a b 2u Rser={1 + (2}").is_err());
+        assert!(normalize_ngspice(b"L1 a b 2u Rser=1 Rser=2").is_err());
+        assert!(normalize_ngspice(b"L1 a b 2u Rser=").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn arctan_does_not_change_comments_titles_or_paths() -> Result<()> {
+        let input = b"* arctan(x)\n.title arctan(x)\n.include 'arctan(x).lib'\nB1 a 0 V=arctan (v(b)) ; arctan(x)\nR1 'arctan(x)' b 1k\n";
+        let expected = b"* arctan(x)\n.title arctan(x)\n.include 'arctan(x).lib'\nB1 a 0 V=atan (v(b)) ; arctan(x)\nR1 'arctan(x)' b 1k\n";
+        assert_eq!(normalize_ngspice(input)?.bytes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn positional_rewrite_is_scoped_to_subcircuit_params() -> Result<()> {
+        let input = b".subckt x a b\n+ PARAMS :\n+ gain {2 +\n+ 3}\n+ k = {4 + 5}\n+ off 1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
+        let expected = b".subckt x a b\n+ PARAMS :\n+ gain={2 +\n+ 3}\n+ k = {4 + 5}\n+ off=1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
+        assert_eq!(normalize_ngspice(input)?.bytes, expected);
         Ok(())
     }
 
