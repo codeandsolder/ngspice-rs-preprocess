@@ -16,6 +16,11 @@ trap 'rm -rf -- "$work"' EXIT
 printf 'codemodel %s\n' "$model" > "$work/.spiceinit"
 for example in timed-enable timed-enable-family timed-enable-both-family constant bundle-unloaded bundle-underlimit bundle-overload bundle-overload-low bundle-multidriver; do
     cp -- "$here/fixtures/$example.cir" "$work/"
+    if [[ $example == timed-enable ]]; then
+        # A stock DAC sees the retained logic level, not the drive strength.
+        # Check the actual event states without modifying the archived deck.
+        sed -i '/^wrdata /a eprint dout' "$work/$example.cir"
+    fi
     generated_name="$example"
     if [[ $example == timed-enable-family || $example == timed-enable-both-family ]]; then
         generated_name=timed-enable
@@ -42,10 +47,23 @@ for example in timed-enable timed-enable-family timed-enable-both-family constan
         mv -- generated.dat "$example.dat"
     )
 done
-awk '$1 > 4e-9 && $1 < 6e-9 && $2 > .75 {high=1}
-     $1 > 9e-9 && $1 < 10e-9 && $2 > .45 && $2 < .55 {z=1}
-     END {exit !(high && z)}' "$work/timed-enable.dat" ||
-    { echo "Generated stage output did not propagate or tri-state correctly" >&2; exit 1; }
+awk '$1 > 4.1e-9 && $1 < 6e-9 && $2 > .75 {high=1}
+     END {exit !high}' "$work/timed-enable.dat" ||
+    { echo "Generated stage output did not propagate" >&2; exit 1; }
+# The compiler retains the last logical polarity during release. Require
+# the complete startup/enable/delayed-AND/release event sequence, including
+# the strength character; a stuck strongly driven high must fail.
+awk '
+    $2 ~ /^[01Uu][szru]$/ && $1 ~ /^[0-9.+-]+[eE][+-][0-9]+$/ {
+        n++
+        if (n==1 && !($1==0 && $2=="0z")) bad=1
+        if (n==2 && !($1>1.49e-9 && $1<1.52e-9 && $2=="0s")) bad=1
+        if (n==3 && !($1>3.99e-9 && $1<4.02e-9 && $2=="1s")) bad=1
+        if (n==4 && !($1>7.99e-9 && $1<8.02e-9 && $2=="1z")) bad=1
+    }
+    END {exit !(n==4 && !bad)}
+' "$work/timed-enable.log" ||
+    { echo "Generated stage output event timing or drive strength is wrong" >&2; exit 1; }
 awk '$1 > 4e-9 && $1 < 5e-9 && $2 > .75 {high=1} END {exit !high}' "$work/constant.dat" ||
     { echo "Generated constant-fanin stage failed to start or drive" >&2; exit 1; }
 # The same Rust-generated ALB model is instantiated through a nested
