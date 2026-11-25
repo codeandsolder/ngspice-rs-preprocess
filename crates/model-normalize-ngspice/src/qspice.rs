@@ -1,10 +1,12 @@
 //! Source-scoped QSPICE plaintext normalization. No compiled device execution.
+mod bindings;
 mod numeric;
 mod sources;
 use crate::{
     lexical::{Edit, Statement, apply_edits, replace_span, statements, tokens},
     linked_source::{LinkedSource, RootKind, SourceOrigin},
     model_card::{parse_model_card, parse_spice_constant},
+    parameter_scope::declarations::Declarations,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -23,6 +25,8 @@ pub enum Feature {
     SourceEncoding,
     /// Numeric spelling not representable in the native grammar.
     NumericLiteral,
+    /// Ambiguous or contradictory source declaration binding.
+    Binding,
     /// Digital, specialized or compiled device class.
     SpecialDevice,
     /// Simulator-specific command, search path or execution directive.
@@ -43,6 +47,7 @@ impl fmt::Display for Feature {
             Self::NonTextResource => "non-netlist resource",
             Self::SourceEncoding => "source encoding",
             Self::NumericLiteral => "numeric literal",
+            Self::Binding => "declaration binding",
             Self::SpecialDevice => "specialized device class",
             Self::Directive => "simulator-specific directive",
             Self::PassiveParasitics => "passive parasitics",
@@ -421,11 +426,11 @@ fn check_model(statement: &Statement, origin: &SourceOrigin) -> Result<()> {
 fn lower_statement(
     statement: &Statement,
     origin: &SourceOrigin,
+    fields: &[Range<usize>],
     edits: &mut Vec<Edit>,
     input: &[u8],
 ) -> Result<()> {
     let text = &statement.text;
-    let fields = tokens(text)?;
     let Some(first) = fields.first() else {
         return Ok(());
     };
@@ -443,9 +448,9 @@ fn lower_statement(
             Feature::Directive,
             "analysis or output directive needs source-specific qualification",
         )),
-        b".tran" => lower_tran(statement, origin, &fields, edits),
-        [b'v' | b'i', ..] => sources::rewrite(statement, origin, &fields, edits),
-        [b'l' | b'c', ..] => lower_passive(statement, origin, &fields, edits, input),
+        b".tran" => lower_tran(statement, origin, fields, edits),
+        [b'v' | b'i', ..] => sources::rewrite(statement, origin, fields, edits),
+        [b'l' | b'c', ..] => lower_passive(statement, origin, fields, edits, input),
         [b'a' | b'u' | b'y' | b'n' | b'o' | b'@', ..] => Err(reject(
             origin,
             Feature::SpecialDevice,
@@ -471,12 +476,21 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Option<Vec<
         0
     };
     let body = &input[title_len..];
+    let source_statements = statements(body)?;
+    let declarations = Declarations::new(&source_statements).map_err(|failure| {
+        linked
+            .origin(failure.line + usize::from(title_len != 0))
+            .map_or_else(
+                || anyhow::anyhow!("QSPICE declaration index: {}", failure.error),
+                |origin| reject(origin, Feature::Binding, &format!("{:#}", failure.error)),
+            )
+    })?;
     let mut numeric_edits = Vec::new();
-    for statement in statements(body)? {
+    for statement in source_statements {
         let origin = linked
             .origin(statement.line + usize::from(title_len != 0))
             .context("missing QSPICE source location")?;
-        numeric::rewrite(&statement, origin, &mut numeric_edits)?;
+        numeric::rewrite(&statement, origin, &declarations, &mut numeric_edits)?;
     }
     let lowered = apply_edits(body, numeric_edits);
     let body = lowered.as_deref().unwrap_or(body);
@@ -486,7 +500,9 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Option<Vec<
         let origin = linked
             .origin(line)
             .context("missing QSPICE source location")?;
-        lower_statement(&statement, origin, &mut edits, body)
+        let fields = tokens(&statement.text)?;
+        bindings::rewrite(&statement, origin, &declarations, &fields, &mut edits, body)?;
+        lower_statement(&statement, origin, &fields, &mut edits, body)
             .with_context(|| format!("QSPICE source {}:{}", origin.path.display(), origin.line))?;
     }
     let final_body = apply_edits(body, edits).or(lowered);

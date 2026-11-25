@@ -386,3 +386,74 @@ fn unqualified_waveform_laws_are_source_located() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn bare_parameter_references_bind_per_occurrence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let source = "* Scoped bare parameters\n.subckt divider a b resistance=1k\nR1 a b resistance\nR2 b 0 base\n.ends divider\nV1 a 0 3\nX1 a b divider resistance=base\nX2 a c divider resistance=other\n.param base=2k other=4k\nE1 output 0 b c gain\n.param gain=3\n.op\n.end\n";
+    let root = dir.path().join("source.cir");
+    fs::write(&root, source)?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    for expected in [
+        "R1 a b {resistance}",
+        "R2 b 0 {base}",
+        "X1 a b divider resistance={base}",
+        "X2 a c divider resistance={other}",
+        "E1 output 0 b c {gain}",
+    ] {
+        ensure!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    let rows = reference(
+        dir.path(),
+        source,
+        "run\nwrdata witness.dat v(b) v(c) v(output)",
+    )?;
+    assert_eq!(rows.len(), 1);
+    let [_, first, second, difference] = rows[0].as_slice() else {
+        bail!("invalid OP trace");
+    };
+    ensure!((first - 1.5).abs() < 1e-10, "{rows:?}");
+    ensure!((second - 1.).abs() < 1e-10, "{rows:?}");
+    ensure!((difference - 1.5).abs() < 1e-10, "{rows:?}");
+    Ok(())
+}
+
+#[test]
+fn bjt_assertions_use_visible_model_and_preserve_terminals() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    let source = "* Scoped bipolar polarity\n.model polarity NPN(IS=1e-15 BF=100)\n.subckt highside c b e\nQinner c b e 0 polarity PNP\n.model polarity PNP(IS=1e-15 BF=100)\n.ends highside\nQouter c b 0 polarity\n+ NPN ; assert NPN\nQfour c b 0 0 polarity NPN\nV1 c 0 2\nV2 b 0 0.6\n.op\n.end\n";
+    fs::write(&root, source)?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains("Qinner c b e 0 polarity"));
+    assert!(text.contains("Qouter c b 0 polarity"));
+    assert!(text.contains("Qfour c b 0 0 polarity"));
+    assert!(!text.contains("polarity PNP\n.model"));
+    assert!(!text.contains("Qfour c b 0 0 polarity NPN"));
+    assert!(text.contains("assert NPN"));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        bail!("missing source map");
+    };
+    assert_eq!(lines.len(), source.lines().count());
+    for malformed in [
+        source.replace("0 polarity PNP", "0 polarity NPN"),
+        source.replace("+ NPN", "+ PNP"),
+        source.replace("Qfour c b 0 0 polarity NPN", "Qfour c b 0 0 absent NPN"),
+        source.replace(
+            ".model polarity NPN(IS=1e-15 BF=100)",
+            ".model polarity NPN\n.model polarity PNP",
+        ),
+    ] {
+        fs::write(&root, malformed)?;
+        let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+            .err()
+            .context("contradictory or unresolved polarity accepted")?;
+        let diagnostic = error
+            .downcast_ref::<Unsupported>()
+            .with_context(|| format!("{error:#}"))?;
+        assert_eq!(diagnostic.feature, Feature::Binding);
+    }
+    Ok(())
+}

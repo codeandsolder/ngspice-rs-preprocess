@@ -10,6 +10,7 @@ use crate::{
     lexical::{Edit, Statement, replace_span, tokens},
     linked_source::SourceOrigin,
     model_card::parse_model_card,
+    parameter_scope::declarations::Declarations,
 };
 use anyhow::{Result, ensure};
 use std::ops::Range;
@@ -241,6 +242,7 @@ fn rewrite_span(
 pub(super) fn rewrite(
     statement: &Statement,
     origin: &SourceOrigin,
+    declarations: &Declarations,
     edits: &mut Vec<Edit>,
 ) -> Result<()> {
     let text = &statement.text;
@@ -288,6 +290,20 @@ pub(super) fn rewrite(
         return Ok(());
     }
     if let Some(start) = expression_start(text, name)? {
+        let start = if matches!(
+            name.first().map(u8::to_ascii_lowercase),
+            Some(b'r' | b'c' | b'l')
+        ) && let Some(field) = fields.get(3)
+            && super::bindings::passive_model(
+                statement,
+                origin,
+                declarations,
+                &text[field.clone()],
+            )? {
+            field.end
+        } else {
+            start
+        };
         rewrite_span(statement, origin, start..text.len(), edits)?;
     }
     Ok(())
