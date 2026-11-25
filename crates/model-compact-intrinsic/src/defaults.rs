@@ -25,20 +25,20 @@ pub struct PreparedBsimSoiModel {
 
 impl PreparedBsimSoiModel {
     /// Polarity after resolving explicit model flags.
-    #[must_use]
+    #[must_use = "the resolved polarity determines the device equations"]
     pub const fn polarity(&self) -> MosPolarity {
         self.polarity
     }
 
     /// O(1) prepared slot access. None means this parameter has no applicable
     /// source-derived default, not that its implicit physical value is zero.
-    #[must_use]
+    #[must_use = "the lookup result distinguishes an absent default from a bound value"]
     pub fn get_slot(&self, slot: u16) -> Option<&ParameterValue> {
         self.parameters.get_slot(slot)
     }
 
     /// Borrow the complete prepared model parameter buffer.
-    #[must_use]
+    #[must_use = "the returned buffer supplies the prepared parameter values"]
     pub const fn parameters(&self) -> &BoundParameters {
         &self.parameters
     }

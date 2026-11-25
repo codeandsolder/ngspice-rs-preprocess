@@ -65,6 +65,25 @@ fn render_native_subcircuit(block: &Subcircuit, output: &mut String) -> Result<(
     Ok(())
 }
 
+fn capture_artifact_items(
+    bytes: &mut Vec<u8>,
+    capture: impl FnOnce(&mut [Item]) -> Result<bool>,
+) -> Result<()> {
+    let mut items = parse_items(std::str::from_utf8(bytes)?)?;
+    if !capture(&mut items)? {
+        return Ok(());
+    }
+    let mut text = String::new();
+    for item in items {
+        match item {
+            Item::Statement(statement) => writeln!(text, "{statement}")?,
+            Item::Subcircuit(block) => render_native_subcircuit(&block, &mut text)?,
+        }
+    }
+    *bytes = text.into_bytes();
+    Ok(())
+}
+
 fn split_native_deck(input: &[u8], include_path: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     if include_path.is_empty()
         || include_path

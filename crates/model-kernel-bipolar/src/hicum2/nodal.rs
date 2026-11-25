@@ -22,7 +22,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    #[must_use]
+    #[must_use = "the constructed layout must be retained to allocate and stamp unknowns"]
     pub const fn new(topology: topology::Prepared) -> Self {
         let nqs_start = topology.count();
         let after_nqs = nqs_start + topology.nqs_state_count();
@@ -44,22 +44,22 @@ impl Layout {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned count determines the required unknown or node allocation"]
     pub const fn count(self) -> usize {
         self.count
     }
 
-    #[must_use]
+    #[must_use = "the count locates the end of the electrical unknowns"]
     pub const fn electrical_count(self) -> usize {
         self.nqs_start
     }
 
-    #[must_use]
+    #[must_use = "the index maps a source node to its prepared unknown"]
     pub const fn node(self, name: Node) -> usize {
         self.topology.index(name) as usize
     }
 
-    #[must_use]
+    #[must_use = "the lookup distinguishes missing auxiliary states from allocated slots"]
     pub const fn nqs_slot(self, state: usize) -> Option<usize> {
         if state < self.topology.nqs_state_count() {
             Some(self.nqs_start + state)
@@ -69,12 +69,12 @@ impl Layout {
     }
 
     /// None means the thermal port is an exact source ground constraint.
-    #[must_use]
+    #[must_use = "the result distinguishes a constrained thermal node from an allocated unknown"]
     pub const fn thermal_slot(self) -> Option<usize> {
         self.thermal_slot
     }
 
-    #[must_use]
+    #[must_use = "the returned topology defines the collapsed electrical connectivity"]
     pub const fn topology(self) -> topology::Prepared {
         self.topology
     }
@@ -238,7 +238,7 @@ impl Partials {
     /// Exact normalized HICCR Tf voltage gradient -> physical named
     /// source-node gradient. The resistor-raw voltage axes are not
     /// polarity multiplied; only the intrinsic BE and BC contribute.
-    #[must_use]
+    #[must_use = "the gradient contributes to the source-node Jacobian"]
     pub fn transit_time_gradient(polarity: Polarity, intrinsic: [f64; 2]) -> [f64; Node::COUNT] {
         let sign = if matches!(polarity, Polarity::Npn) {
             1.0

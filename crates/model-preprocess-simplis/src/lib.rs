@@ -7,7 +7,10 @@
 use anyhow::{Context, Result, bail};
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 mod hierarchy;
 pub mod source_dialect;
@@ -128,16 +131,21 @@ impl Value {
     }
 }
 
+type GlobalBindings = Arc<BTreeMap<String, Value>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct Environment {
     values: BTreeMap<String, Value>,
+    globals: GlobalBindings,
     options: BTreeMap<String, Value>,
     budget: WorkBudget,
 }
 
 impl PartialEq for Environment {
     fn eq(&self, other: &Self) -> bool {
-        self.values == other.values && self.options == other.options
+        self.values == other.values
+            && self.globals == other.globals
+            && self.options == other.options
     }
 }
 
@@ -148,7 +156,7 @@ impl Environment {
     }
 
     /// Create bindings that participate in a caller's cumulative budget.
-    #[must_use]
+    #[must_use = "the returned environment shares the caller’s cumulative work budget"]
     pub fn with_budget(budget: WorkBudget) -> Self {
         Self {
             budget,
@@ -170,12 +178,42 @@ impl Environment {
 
     #[must_use = "the returned value is the requested parameter binding"]
     pub fn get(&self, name: &str) -> Option<&Value> {
-        self.values.get(&name.to_ascii_uppercase())
+        let name = name.to_ascii_uppercase();
+        self.values.get(&name).or_else(|| self.globals.get(&name))
     }
 
     #[must_use = "the result reports whether the parameter is bound"]
     pub fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
+    }
+
+    fn ensure_local_name(&self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.globals.contains_key(&name.to_ascii_uppercase()),
+            "SIMPLIS parameter {name} is reserved by a global binding"
+        );
+        Ok(())
+    }
+
+    fn set_global(&mut self, name: &str, value: Value) -> Result<()> {
+        self.ensure_local_name(name)?;
+        let name = name.to_ascii_uppercase();
+        self.values.remove(&name);
+        if Arc::strong_count(&self.globals) > 1 {
+            for existing in self.globals.values() {
+                existing.charge_copy(&self.budget)?;
+            }
+        }
+        Arc::make_mut(&mut self.globals).insert(name, value);
+        Ok(())
+    }
+
+    fn inherited(globals: GlobalBindings, budget: WorkBudget) -> Self {
+        Self {
+            globals,
+            budget,
+            ..Self::default()
+        }
     }
 
     pub fn set_option(&mut self, name: impl AsRef<str>, value: Value) {
@@ -190,7 +228,7 @@ impl Environment {
 
     #[must_use = "the result reports whether any bindings exist"]
     pub(crate) fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.options.is_empty()
+        self.values.is_empty() && self.globals.is_empty() && self.options.is_empty()
     }
 }
 
@@ -1384,7 +1422,12 @@ fn process_range(
         if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
             let (name, value) = parse_assignment(assignment, state.env)
                 .with_context(|| format!("SIMPLIS assignment at line {}", index + 1))?;
-            state.env.set(name, value);
+            if directive(line, "GLOBALVAR").is_some() {
+                state.env.set_global(&name, value)?;
+            } else {
+                state.env.ensure_local_name(&name)?;
+                state.env.set(name, value);
+            }
             *state.assigned_variables = state.assigned_variables.saturating_add(1);
             index = index.saturating_add(1);
             continue;
@@ -2282,8 +2325,19 @@ fn named_assignments(input: &str, init: bool) -> Result<Vec<(&str, &str)>> {
 }
 
 fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
+    env.budget.charge(Resource::ScannedBytes, input.len())?;
     let assignments = parameter_assignments(input)?;
     for (name, expression) in &assignments {
+        env.ensure_local_name(name)?;
+        // A VARS header is evaluated directly, not as a substitution line.
+        // In Elements 9.40d even a constant braced default is invalid.
+        anyhow::ensure!(
+            !expression
+                .split('\'')
+                .step_by(2)
+                .any(|part| part.contains(['{', '}'])),
+            "braced SIMPLIS default for {name} is not a direct expression"
+        );
         let value = eval_expression(expression, env)
             .with_context(|| format!("evaluating default for SIMPLIS parameter {name}"))?;
         env.set(name, value);
@@ -2343,17 +2397,7 @@ fn specialize_subcircuit_control_flow_with_base(
     specialize_subcircuit_with_base_mode(input, inherited, overrides, false)
 }
 
-fn specialize_subcircuit_with_base_mode(
-    input: &[u8],
-    inherited: &Environment,
-    overrides: &Environment,
-    substitute_active_lines: bool,
-) -> Result<SpecializedSubcircuit> {
-    inherited
-        .budget
-        .charge(Resource::ScannedBytes, input.len())?;
-    let text = decode_simplis_text(input)?;
-    let lines: Vec<&str> = text.lines().collect();
+fn read_subcircuit_header(lines: &[&str]) -> Result<(String, usize)> {
     let first = lines
         .iter()
         .position(|line| directive(line, "SUBCKT").is_some())
@@ -2374,6 +2418,38 @@ fn specialize_subcircuit_with_base_mode(
                 .trim(),
         );
     }
+    Ok((header, header_end))
+}
+
+fn subcircuit_parameters(header: &str) -> &str {
+    find_ascii_case_insensitive(header, "vars:")
+        .map_or("", |index| &header[index + "vars:".len()..])
+}
+
+fn call_defaults(input: &[u8], inherited: &Environment) -> Result<Environment> {
+    inherited
+        .budget
+        .charge(Resource::ScannedBytes, input.len())?;
+    let text = decode_simplis_text(input)?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let (header, _) = read_subcircuit_header(&lines)?;
+    let mut defaults = inherited.charged_clone()?;
+    parse_parameter_list(subcircuit_parameters(&header), &mut defaults)?;
+    Ok(defaults)
+}
+
+fn specialize_subcircuit_with_base_mode(
+    input: &[u8],
+    inherited: &Environment,
+    overrides: &Environment,
+    substitute_active_lines: bool,
+) -> Result<SpecializedSubcircuit> {
+    inherited
+        .budget
+        .charge(Resource::ScannedBytes, input.len())?;
+    let text = decode_simplis_text(input)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let (header, header_end) = read_subcircuit_header(&lines)?;
     let subckt_rest = directive(&header, "SUBCKT").context("invalid .SUBCKT header")?;
     let vars_offset = find_ascii_case_insensitive(subckt_rest, "vars:");
     let (identity, parameter_text) = vars_offset.map_or((subckt_rest, ""), |index| {
@@ -2390,10 +2466,15 @@ fn specialize_subcircuit_with_base_mode(
     }
 
     let mut env = inherited.charged_clone()?;
+    for value in overrides.options.values() {
+        value.charge_copy(&env.budget)?;
+    }
     env.options.extend(overrides.options.clone());
     let default_parameters = parse_parameter_list(parameter_text, &mut env)?;
     let mut overridden_parameters = 0usize;
     for (name, value) in &overrides.values {
+        env.ensure_local_name(name)?;
+        value.charge_copy(&env.budget)?;
         env.values.insert(name.clone(), value.clone());
         overridden_parameters = overridden_parameters.saturating_add(1);
     }

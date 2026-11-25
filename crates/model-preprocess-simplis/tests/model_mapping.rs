@@ -218,3 +218,25 @@ fn global_mapping_cannot_be_applied_from_inactive_or_local_scopes() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn diode_alias_uses_the_selected_kernel_parameter_grammar() -> Result<()> {
+    let source = statements(
+        ".map ModelName=DTEST Level=69 Device=DIODE1 Letter=D
+.model a DTEST (LEVEL 69 IS {local_is} RS 2 T_ABS {local_temp})
+",
+    );
+    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source)?.apply(&source)?;
+    assert_eq!(mapped.selections.len(), 1);
+    let card = &mapped
+        .statements
+        .last()
+        .context("missing mapped model")?
+        .text;
+    assert!(card.contains(model_kernel_diode::MODEL_FAMILY), "{card}");
+    assert!(card.contains("LEVEL=1 "), "{card}");
+    assert!(card.contains("IS={local_is}"), "{card}");
+    assert!(card.contains("RS=2"), "{card}");
+    assert!(card.contains("T_ABS={local_temp}"), "{card}");
+    Ok(())
+}
