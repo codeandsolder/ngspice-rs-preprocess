@@ -170,6 +170,9 @@ pub struct Artifact {
     /// Supplemental code-model schemas introduced by this translation.
     /// Native input is preserved without inferring arbitrary external models.
     pub required_code_models: Vec<CodeModelRuntime>,
+    /// Internal current-coordinate changes; original branch current is the
+    /// emitted current divided by the recorded factor.
+    pub current_scalings: Vec<model_normalize_ngspice::conditioning::CurrentScaling>,
 }
 
 /// Deterministic primary artifact and any generated companion libraries.
@@ -268,6 +271,7 @@ fn native(
             provenance: Provenance::Native { lines },
             dependencies: Vec::new(),
             required_code_models: Vec::new(),
+            current_scalings: Vec::new(),
         },
         companions: Vec::new(),
         normalization: normalized.model.passes,
@@ -311,12 +315,15 @@ pub fn prepare(
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
     let root = request.input.admit(&mut session)?;
-    let result = match request.format {
+    let mut result = match request.format {
         InputFormat::NativeDeck | InputFormat::NativeLibrary => {
             native(&root, request, options, &mut session)
         }
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
+    if request.format == InputFormat::SimetrixDeck {
+        condition_generated_bundle(&mut result)?;
+    }
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
@@ -325,4 +332,28 @@ pub fn prepare(
             .context("combined artifact output byte budget exceeded")?;
     }
     Ok(result)
+}
+
+fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
+    use model_normalize_ngspice::conditioning::condition_private_differentiators;
+    let inputs = bundle
+        .artifacts()
+        .map(|artifact| artifact.bytes.as_slice())
+        .collect::<Vec<_>>();
+    let outputs = condition_private_differentiators(&inputs)?;
+    let mut changed = false;
+    for (artifact, output) in std::iter::once(&mut bundle.primary)
+        .chain(&mut bundle.companions)
+        .zip(outputs)
+    {
+        changed |= !output.scalings.is_empty();
+        artifact.bytes = output.bytes;
+        artifact.current_scalings = output.scalings;
+    }
+    if changed {
+        bundle
+            .normalization
+            .push(NormalizationPass::PrivateDifferentiatorConditioning);
+    }
+    Ok(())
 }

@@ -149,11 +149,12 @@ struct ManifestArtifact<'a> {
     provenance: &'a ngspice_rs_preprocess::Provenance,
     dependencies: &'a [String],
     required_code_models: &'a [ngspice_rs_preprocess::CodeModelRuntime],
+    current_scalings: &'a [model_normalize_ngspice::conditioning::CurrentScaling],
 }
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 2,
+        version: 3,
         input_format: bundle.format,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,
@@ -165,6 +166,7 @@ fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
                 provenance: &artifact.provenance,
                 dependencies: &artifact.dependencies,
                 required_code_models: &artifact.required_code_models,
+                current_scalings: &artifact.current_scalings,
             })
             .collect(),
         normalization: &bundle.normalization,

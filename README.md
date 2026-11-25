@@ -203,3 +203,28 @@ ngspice 47 reference in temporary storage, checks XSPICE execution and runs
 the opt-in VDMOS differential tests. On Linux hosts unable to use the pinned
 Arch binary, it builds the checksum-verified upstream source release instead.
 This check does not publish packages or release artifacts.
+
+### Private differentiator conditioning
+
+SIMetrix deck preparation can rescale a private current coordinate after the
+complete electrical artifact graph has been linked and translated. An eligible
+loop contains a linear capacitor and ideal voltage-defined branches, including
+a driven voltage and current sensor. All but at most one loop node must be
+electrically private. An exposed port, global net, extra current path or
+unresolved current observation disqualifies the transformation.
+
+For a positive constant factor s, replacing C with s*C multiplies the
+circulating capacitor and voltage-source currents by s, without changing any
+loop voltage or net external injection. Every reference to a scaled current is
+replaced with its inverse-scaled value. Thus external terminal current, charge
+law and derivatives are unchanged; the internal residual and Jacobian undergo
+a constant diagonal coordinate transformation. The scale is chosen from the
+nominal current-feedback response using the existing scoped scalar evaluator;
+its value is not a model fit. An unresolved or unsuitable scale leaves the
+source unchanged.
+
+The prepared artifact and JSON manifest report the affected lexical scope,
+capacitor, voltage branches and factor in `current_scalings`. A consumer that
+explicitly requests a scaled internal branch current from the prepared graph
+must divide that value by the recorded factor to recover the original physical
+current. The optimization does not mutate the admitted source.
