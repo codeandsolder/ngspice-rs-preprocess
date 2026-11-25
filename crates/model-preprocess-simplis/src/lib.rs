@@ -2211,6 +2211,15 @@ fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
     let assignments = parameter_assignments(input)?;
     for (name, expression) in &assignments {
         env.ensure_local_name(name)?;
+        // A VARS header is evaluated directly, not as a substitution line.
+        // In Elements 9.40d even a constant braced default is invalid.
+        anyhow::ensure!(
+            !expression
+                .split('\'')
+                .step_by(2)
+                .any(|part| part.contains(['{', '}'])),
+            "braced SIMPLIS default for {name} is not a direct expression"
+        );
         let value = eval_expression(expression, env)
             .with_context(|| format!("evaluating default for SIMPLIS parameter {name}"))?;
         env.set(name, value);
@@ -2266,14 +2275,7 @@ fn specialize_subcircuit_control_flow_with_base(
     specialize_subcircuit_with_base_mode(input, inherited, overrides, false)
 }
 
-fn specialize_subcircuit_with_base_mode(
-    input: &[u8],
-    inherited: &Environment,
-    overrides: &Environment,
-    substitute_active_lines: bool,
-) -> Result<SpecializedSubcircuit> {
-    let text = decode_simplis_text(input)?;
-    let lines: Vec<&str> = text.lines().collect();
+fn read_subcircuit_header(lines: &[&str]) -> Result<(String, usize)> {
     let first = lines
         .iter()
         .position(|line| directive(line, "SUBCKT").is_some())
@@ -2294,6 +2296,32 @@ fn specialize_subcircuit_with_base_mode(
                 .trim(),
         );
     }
+    Ok((header, header_end))
+}
+
+fn subcircuit_parameters(header: &str) -> &str {
+    find_ascii_case_insensitive(header, "vars:")
+        .map_or("", |index| &header[index + "vars:".len()..])
+}
+
+fn call_defaults(input: &[u8], inherited: &Environment) -> Result<Environment> {
+    let text = decode_simplis_text(input)?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let (header, _) = read_subcircuit_header(&lines)?;
+    let mut defaults = inherited.clone();
+    parse_parameter_list(subcircuit_parameters(&header), &mut defaults)?;
+    Ok(defaults)
+}
+
+fn specialize_subcircuit_with_base_mode(
+    input: &[u8],
+    inherited: &Environment,
+    overrides: &Environment,
+    substitute_active_lines: bool,
+) -> Result<SpecializedSubcircuit> {
+    let text = decode_simplis_text(input)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let (header, header_end) = read_subcircuit_header(&lines)?;
     let subckt_rest = directive(&header, "SUBCKT").context("invalid .SUBCKT header")?;
     let vars_offset = find_ascii_case_insensitive(subckt_rest, "vars:");
     let (identity, parameter_text) = vars_offset.map_or((subckt_rest, ""), |index| {

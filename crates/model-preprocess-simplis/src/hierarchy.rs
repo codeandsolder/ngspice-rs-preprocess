@@ -1,7 +1,7 @@
 use super::{
-    Environment, GlobalBindings, decode_simplis_text, eval_expression, find_ascii_case_insensitive,
-    parameter_assignments, preprocess_control_flow, specialize_subcircuit_control_flow_with_base,
-    specialize_subcircuit_with_base,
+    Environment, GlobalBindings, Substitution, call_defaults, decode_simplis_text, eval_expression,
+    find_ascii_case_insensitive, parameter_assignments, preprocess_control_flow,
+    specialize_subcircuit_control_flow_with_base, specialize_subcircuit_with_base, substitute_line,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::SourceSession;
@@ -1462,21 +1462,36 @@ fn logical_statements(lines: &[String]) -> Vec<String> {
     statements
 }
 
-fn parse_overrides(input: &str) -> Result<Environment> {
+fn parse_overrides(input: &str, defaults: &Environment) -> Result<Environment> {
     let mut environment = Environment::new();
-    // The caller has already substituted braced expressions at the X line.
-    // Do not allow later actuals to read earlier actual bindings.
+    let mut bindings = defaults.clone();
+    // Braces are caller substitutions, so any remaining expressions may
+    // contain constants but must not resolve in the callee. The bare actual
+    // expressions, on the other hand, are applied in reverse source order
+    // over the callee defaults (the first duplicate actual wins).
     let empty = Environment::new();
-    for (name, expression) in parameter_assignments(input)? {
-        let value = eval_expression(expression, &empty)
+    for (name, expression) in parameter_assignments(input)?.into_iter().rev() {
+        bindings.ensure_local_name(name)?;
+        let (substituted, _) = substitute_line(expression, &empty, Substitution::All)
+            .with_context(|| format!("substituting SIMPLIS actual {name}"))?;
+        let value = eval_expression(&substituted, &bindings)
             .with_context(|| format!("evaluating SIMPLIS actual {name}"))?;
-        ensure!(
-            !environment.contains(name),
-            "duplicate SIMPLIS actual {name}"
-        );
+        bindings.set(name, value.clone());
         environment.set(name, value);
     }
     Ok(environment)
+}
+
+fn bind_call_overrides(
+    definition: &Definition,
+    input: &str,
+    inherited: &Environment,
+) -> Result<Environment> {
+    if input.is_empty() {
+        return Ok(Environment::new());
+    }
+    let defaults = call_defaults(&definition.bytes, inherited)?;
+    parse_overrides(input, &defaults)
 }
 
 #[derive(Clone, Debug)]
@@ -1757,16 +1772,21 @@ fn rewrite_call(
     let compile_time_vars = explicit_vars || definition.parameterized;
     let rewritten = replace_call_target(statement, model, &generated_name, compile_time_vars)?;
     let local_key = is_local.then(|| definition.scope_id.clone());
+    let overrides = if compile_time_vars {
+        bind_call_overrides(
+            &definition,
+            override_text,
+            &Environment::inherited(inherited.clone()),
+        )?
+    } else {
+        Environment::new()
+    };
     Ok(Some((
         rewritten,
         Pending {
             definition,
             generated_name,
-            overrides: if compile_time_vars {
-                parse_overrides(override_text)?
-            } else {
-                Environment::new()
-            },
+            overrides,
             inherited,
             local_key,
         },
@@ -2580,7 +2600,7 @@ fn make_linked_unit(
     external: &SubcircuitCatalog,
 ) -> Result<LinkedUnit> {
     let overrides = if explicit_vars {
-        parse_overrides(override_text)?
+        bind_call_overrides(&definition, override_text, inherited)?
     } else {
         Environment::new()
     };
@@ -3566,7 +3586,88 @@ R1 1 2 {B}
         let catalog = SubcircuitCatalog::new();
         assert!(preprocess_netlist(missing, &catalog).is_err());
         assert!(preprocess_netlist_linked(missing, &catalog).is_err());
-        assert!(parse_overrides("A=7 B=A").is_err());
+        assert!(parse_overrides("A=7 B=A", &Environment::new()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_actual_expressions_apply_in_reverse_over_callee_defaults() -> Result<()> {
+        let source = br".VAR A=99
+.GLOBALVAR G=4
+X1 1 0 CHILD vars: B=A+2 A=7 C=B+3 D={A} E=G F=3 F=7
+.SUBCKT CHILD 1 2 vars: A=5 B=8 C=11 D=0 E=0 F=1
+RA 1 2 {A}
+RB 1 2 {B}
+RC 1 2 {C}
+RD 1 2 {D}
+RE 1 2 {E}
+RF 1 2 {F}
+.ENDS CHILD
+.END
+";
+        for output in expand_scope_fixture(source)? {
+            for (name, value) in [
+                ("RA", 7),
+                ("RB", 9),
+                ("RC", 11),
+                ("RD", 99),
+                ("RE", 4),
+                ("RF", 3),
+            ] {
+                assert!(
+                    output.contains(&format!("{name} 1 2 {value}\n")),
+                    "{output}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn header_defaults_are_direct_sequential_expressions() -> Result<()> {
+        let source = br".GLOBALVAR G=4
+X1 1 0 CHILD
+.SUBCKT CHILD 1 2 vars: A=3 A=7 B=A+G
+RA 1 2 {A}
+RB 1 2 {B}
+.ENDS CHILD
+.END
+";
+        for output in expand_scope_fixture(source)? {
+            assert!(output.contains("RA 1 2 7"));
+            assert!(output.contains("RB 1 2 11"));
+        }
+        let catalog = SubcircuitCatalog::new();
+        for parameters in ["B=A A=7", "A=7 B={A}", "B={G}", "B={2+3}"] {
+            let source = format!(
+                ".GLOBALVAR G=4\nX1 1 0 CHILD\n.SUBCKT CHILD 1 2 vars: {parameters}\nR1 1 2 {{B}}\n.ENDS CHILD\n.END\n"
+            );
+            assert!(
+                preprocess_netlist(source.as_bytes(), &catalog).is_err(),
+                "{source}"
+            );
+            assert!(
+                preprocess_netlist_linked(source.as_bytes(), &catalog).is_err(),
+                "{source}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_braced_actuals_never_capture_later_global_or_callee_default() -> Result<()> {
+        let catalog = SubcircuitCatalog::new();
+        for source in [
+            "X1 1 0 CHILD vars: B={A}\n.SUBCKT CHILD 1 2 vars: A=7 B=9\nR1 1 2 {B}\n.ENDS CHILD\n.END\n",
+            "X1 1 0 CHILD vars: B={G}\n.GLOBALVAR G=3\n.SUBCKT CHILD 1 2 vars: B=9\nR1 1 2 {B}\n.ENDS CHILD\n.END\n",
+        ] {
+            assert!(preprocess_netlist(source.as_bytes(), &catalog).is_err());
+            assert!(preprocess_netlist_linked(source.as_bytes(), &catalog).is_err());
+        }
+        let source = b"X1 1 0 CHILD vars: B={2+3}\n.SUBCKT CHILD 1 2 vars: B=9\nR1 1 2 {B}\n.ENDS CHILD\n.END\n";
+        for output in expand_scope_fixture(source)? {
+            assert!(output.contains("R1 1 2 5"));
+        }
         Ok(())
     }
 
@@ -3629,6 +3730,34 @@ R1 1 2 {G}
         for output in expand_scope_fixture(isolated)? {
             assert!(output.contains("R1 1 2 7"), "{output}");
             assert!(output.contains("R1 1 2 {G}"), "{output}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn global_bindings_cross_catalog_sources_without_leaking_between_instances() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named(
+            "parent.lb",
+            b".SUBCKT WRAP 1 2 vars: N=1\n.GLOBALVAR G={N}\nXH 1 2 CHILD\n.ENDS WRAP\n",
+        )?;
+        catalog.add_library_named(
+            "child.lb",
+            b".SUBCKT CHILD 1 2\nR1 1 2 {ROOT+G}\n.ENDS CHILD\n",
+        )?;
+        let source = b".GLOBALVAR ROOT=10\nX1 1 0 WRAP vars: N=3\nX2 2 0 WRAP vars: N=7\n.END\n";
+        let flat = preprocess_netlist(source, &catalog)?;
+        let linked = preprocess_netlist_linked(source, &catalog)?;
+        assert_eq!(linked.libraries.len(), 2);
+        let combined = linked
+            .libraries
+            .iter()
+            .map(|lib| std::str::from_utf8(&lib.bytes))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n");
+        for output in [std::str::from_utf8(&flat.bytes)?, &combined] {
+            assert!(output.contains("R1 1 2 13\n"), "{output}");
+            assert!(output.contains("R1 1 2 17\n"), "{output}");
         }
         Ok(())
     }
@@ -4522,7 +4651,7 @@ RB 1 2 {V}
             assert_eq!(model, "MODEL");
             assert!(!vars);
             assert_eq!(
-                parse_overrides(actuals)?.get("R"),
+                parse_overrides(actuals, &Environment::new())?.get("R"),
                 Some(&crate::Value::Number(2000.0))
             );
             let rewritten = replace_call_target(call, model, "generated", false)?;
