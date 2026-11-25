@@ -27,6 +27,7 @@ use model_translate_simplis::{
     translate_simplis_deck_with_budget, translate_simplis_expanded_library_with_budget,
 };
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
@@ -281,6 +282,17 @@ impl<'a> SourceExpansion<'a> {
                         .context("unmatched .ENDS in source expansion")?;
                 }
                 if self.capture_plan && self.scope_depth == 0 && analysis_plan::tracked(&name) {
+                    self.session
+                        .budget()
+                        .charge(super::Resource::GeneratedNodes, 1)?;
+                    self.session.budget().charge(
+                        super::Resource::EmittedBytes,
+                        source
+                            .path
+                            .as_os_str()
+                            .len()
+                            .saturating_add(line.text.len()),
+                    )?;
                     let mut declaration = SourceDeclaration {
                         origin: DirectiveOrigin::Source {
                             path: source.path.clone(),
@@ -292,6 +304,10 @@ impl<'a> SourceExpansion<'a> {
                     if name == ".CONTROL" {
                         let mut end = None;
                         for body in projected.by_ref() {
+                            self.session.budget().charge(
+                                super::Resource::EmittedBytes,
+                                body.text.len().saturating_add(1),
+                            )?;
                             declaration.text.push('\n');
                             declaration.text.push_str(&body.text);
                             if analysis_plan::command(&body.text) == ".ENDC" {
@@ -341,8 +357,16 @@ impl<'a> SourceExpansion<'a> {
         line: &str,
     ) -> Result<()> {
         if self.simulator == LibrarySimulator::Simetrix {
+            let source = display_path(&source.path);
+            self.session
+                .budget()
+                .charge(super::Resource::GeneratedNodes, 1)?;
+            self.session.budget().charge(
+                super::Resource::EmittedBytes,
+                source.len().saturating_add(line.len()),
+            )?;
             self.statements.push(ScopedStatement {
-                source: display_path(&source.path),
+                source,
                 context,
                 first_line: original.first_line,
                 last_line: original.last_line,
@@ -429,13 +453,13 @@ struct ResolvedLibraries {
     model_selections: Vec<ModelSelection>,
 }
 
-fn catalog_members(
-    request: &Request,
+fn catalog_members<'a>(
+    request: &'a Request,
     options: &Options,
     cancellation: &Cancellation,
     session: &mut SourceSession,
     context: DialectContext,
-) -> Result<Vec<(ParsedLibrary, String)>> {
+) -> Result<Vec<(Cow<'a, ParsedLibrary>, String)>> {
     let simulator = projection(request.format);
     let mut parsed_session = SourceSession::with_budget(
         AdmissionConfig {
@@ -446,25 +470,45 @@ fn catalog_members(
         session.budget().clone(),
     );
     let mut members = Vec::new();
-
+    let mut in_memory_sources = BTreeSet::new();
     for library in &request.libraries {
+        session.budget().charge(super::Resource::SourceVisits, 1)?;
+        session
+            .budget()
+            .charge(super::Resource::GeneratedNodes, 1)?;
         let (parsed, origin) = match library {
             LibraryInput::Source(input) => {
                 let admitted = input.admit(session)?;
                 let origin = display_path(&admitted.path);
                 (
-                    parse_admitted_library(&admitted, request, options, session, context)?,
+                    Cow::Owned(parse_admitted_library(
+                        &admitted, request, options, session, context,
+                    )?),
                     origin,
                 )
             }
             LibraryInput::ParsedFile(path) => {
                 let admitted = parsed_session.load(path)?;
+                session
+                    .budget()
+                    .charge(super::Resource::ScannedBytes, admitted.bytes.len())?;
+                session
+                    .budget()
+                    .charge(super::Resource::EmittedBytes, admitted.bytes.len())?;
                 (
-                    ParsedLibrary::from_json(&admitted.bytes)?,
+                    Cow::Owned(ParsedLibrary::from_json(&admitted.bytes)?),
                     display_path(&admitted.path),
                 )
             }
-            LibraryInput::Parsed(parsed) => (parsed.clone(), parsed.source_name().to_owned()),
+            LibraryInput::Parsed(parsed) => {
+                if in_memory_sources.insert(parsed.source_id()) {
+                    session.budget().charge(super::Resource::Sources, 1)?;
+                }
+                session
+                    .budget()
+                    .charge(super::Resource::EmittedBytes, parsed.source_name().len())?;
+                (Cow::Borrowed(parsed), parsed.source_name().to_owned())
+            }
         };
         ensure!(
             parsed.simulator() == simulator,
@@ -479,7 +523,7 @@ fn catalog_members(
 
 fn catalog(
     simulator: LibrarySimulator,
-    members: Vec<(ParsedLibrary, String)>,
+    members: Vec<(Cow<'_, ParsedLibrary>, String)>,
     mapping: Option<&MappingTable>,
     limit: usize,
     budget: &super::WorkBudget,
@@ -492,14 +536,19 @@ fn catalog(
         let parsed = if let Some(mapping) = mapping {
             let (parsed, selections) = parsed.mapped(mapping, limit, budget)?;
             model_selections.extend(selections);
-            parsed
+            Cow::Owned(parsed)
         } else {
             parsed
         };
         catalog.add_parsed_library(&parsed)?;
-        device_identities.extend(parsed.device_identities().iter().cloned());
+        for identity in parsed.device_identities() {
+            device_identities.push(identity.clone_with_budget(budget)?);
+        }
         let origins = sources.entry(parsed.source_id().to_owned()).or_default();
-        origins.extend(parsed.source_names().iter().cloned());
+        for source in parsed.source_names() {
+            budget.charge(super::Resource::EmittedBytes, source.len())?;
+            origins.insert(source.clone());
+        }
         origins.insert(origin);
     }
     Ok(ResolvedLibraries {

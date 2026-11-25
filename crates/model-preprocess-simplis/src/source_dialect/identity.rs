@@ -22,6 +22,20 @@ pub struct ScopedStatement {
     pub text: String,
 }
 
+impl ScopedStatement {
+    /// Copy retained source text and provenance under the shared work limit.
+    /// # Errors
+    /// Cancellation or exhausted work budget.
+    pub fn clone_with_budget(&self, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            self.source.len().saturating_add(self.text.len()),
+        )?;
+        Ok(self.clone())
+    }
+}
+
 /// Source-level name mapping before subsequent primitive lowering and
 /// subcircuit specialization. Scope consists of source definition names.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,6 +45,20 @@ pub struct DeviceIdentity {
     pub declared: String,
     pub displayed: String,
     pub linked: String,
+}
+
+impl DeviceIdentity {
+    /// Copy retained device identity and scope metadata under the work limit.
+    /// # Errors
+    /// Cancellation or exhausted work budget.
+    pub fn clone_with_budget(&self, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        charge_scope_copy(&self.scope, budget)?;
+        for text in [&self.source, &self.declared, &self.displayed, &self.linked] {
+            budget.charge(Resource::EmittedBytes, text.len())?;
+        }
+        Ok(self.clone())
+    }
 }
 
 /// Rewritten source with source-level device identities.

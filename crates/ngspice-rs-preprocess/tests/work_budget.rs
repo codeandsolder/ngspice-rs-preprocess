@@ -408,3 +408,55 @@ fn device_identity_scope_copies_consume_shared_budget() -> Result<()> {
     assert_eq!(resolved.identities[31].scope, vec![name]);
     Ok(())
 }
+
+#[test]
+fn repeated_compiled_catalog_members_consume_work_before_catalog_construction() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = "X1 a 0 A\n.end\n";
+    let parsed =
+        model_preprocess_simplis::parse_library("A.lib", b".subckt A p n\nR1 p n 1k\n.ends A\n")?;
+    let file = dir.path().join("A.json");
+    fs::write(&file, parsed.to_json()?)?;
+    let mut req = request(dir.path(), InputFormat::SimplisDeck, root);
+    for _ in 0..8 {
+        req.libraries.push(LibraryInput::ParsedFile(file.clone()));
+    }
+    fails(
+        &req,
+        WorkLimits {
+            source_visits: 8,
+            ..WorkLimits::default()
+        },
+        "SourceVisits budget exceeded",
+    )?;
+    let prepared = run(
+        &req,
+        WorkLimits {
+            sources: 2,
+            ..WorkLimits::default()
+        },
+    )?;
+    assert_eq!(prepared.companions.len(), 1);
+    req.libraries = vec![LibraryInput::Parsed(parsed)];
+    fails(
+        &req,
+        WorkLimits {
+            sources: 1,
+            ..WorkLimits::default()
+        },
+        "Sources budget exceeded",
+    )?;
+    assert_eq!(
+        run(
+            &req,
+            WorkLimits {
+                sources: 2,
+                ..WorkLimits::default()
+            }
+        )?
+        .primary
+        .bytes,
+        prepared.primary.bytes
+    );
+    Ok(())
+}

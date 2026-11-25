@@ -109,16 +109,21 @@ impl ParsedLibrary {
         Self,
         Vec<crate::source_dialect::model_mapping::ModelSelection>,
     )> {
-        let Some(dialect) = self.dialect else {
-            return Ok((self.clone(), Vec::new()));
-        };
+        let dialect = self
+            .dialect
+            .context("model mapping requires a SIMetrix source context")?;
+        charge_catalog_scan(self, budget)?;
+        for source in &self.source_names {
+            budget.charge(Resource::EmittedBytes, source.len())?;
+        }
+        budget.charge(Resource::EmittedBytes, self.source_name.len())?;
         let mapped = table.apply(&self.scoped_statements, budget)?;
         let parsed = parse_scoped_parts(
             self.source_name.clone(),
             self.source_names.clone(),
             dialect,
             &mapped.statements,
-            self.scoped_statements.clone(),
+            clone_scoped_statements(&self.scoped_statements, budget)?,
             limit,
             budget,
         )?;
@@ -372,17 +377,7 @@ impl SubcircuitCatalog {
     ///
     /// Returns an error if the parsed artifact fails its integrity/version check.
     pub fn add_parsed_library(&mut self, parsed: &ParsedLibrary) -> Result<usize> {
-        self.budget.charge(Resource::SourceVisits, 1)?;
-        self.budget
-            .charge(Resource::GeneratedNodes, parsed.definitions.len())?;
-        for definition in &parsed.definitions {
-            self.budget
-                .charge(Resource::ScannedBytes, definition.bytes.len())?;
-        }
-        for line in &parsed.support_lines {
-            self.budget.charge(Resource::ScannedBytes, line.len())?;
-            self.budget.charge(Resource::Statements, 1)?;
-        }
+        charge_catalog_scan(parsed, &self.budget)?;
         parsed.validate()?;
         if let Some(existing) = self.simulator {
             if existing != parsed.simulator {
@@ -395,8 +390,30 @@ impl SubcircuitCatalog {
         } else {
             self.simulator = Some(parsed.simulator);
         }
+        self.budget.charge(
+            Resource::EmittedBytes,
+            parsed
+                .source_id
+                .len()
+                .saturating_add(parsed.source_name.len()),
+        )?;
         let source_id = parsed.source_id.clone();
         let source_name = parsed.source_name.clone();
+        if !self.sources.contains_key(&source_id) {
+            for line in &parsed.support_lines {
+                self.budget.charge(Resource::EmittedBytes, line.len())?;
+            }
+            for alias in &parsed.aliases {
+                self.budget.charge(
+                    Resource::EmittedBytes,
+                    alias
+                        .name
+                        .len()
+                        .saturating_add(alias.target.len())
+                        .saturating_add(alias.kind.len()),
+                )?;
+            }
+        }
         self.sources
             .entry(source_id.clone())
             .or_insert_with(|| SourceMetadata {
@@ -412,6 +429,8 @@ impl SubcircuitCatalog {
                 .aliases
                 .entry(alias.name.to_ascii_uppercase())
                 .or_default();
+            self.budget
+                .charge(Resource::EvaluationSteps, bindings.len())?;
             if !bindings.iter().any(|binding| {
                 binding.source_id == source_id
                     && binding.target.eq_ignore_ascii_case(&alias.target)
@@ -426,20 +445,33 @@ impl SubcircuitCatalog {
         }
         let mut added = 0usize;
         for definition in &parsed.definitions {
-            let mut definition = definition.clone();
-            definition.source_id = Some(source_id.clone());
-            definition.source_name = Some(source_name.clone());
             let key = definition.name.to_ascii_uppercase();
             let definitions = self.definitions.entry(key).or_default();
-            if definitions.iter().any(|existing| {
-                existing.source_id.as_deref() == Some(source_id.as_str())
-                    && existing.owner_scope_id == definition.owner_scope_id
-                    && normalize_definition_for_equivalence(&existing.bytes)
-                        == normalize_definition_for_equivalence(&definition.bytes)
-            }) {
+            if has_equivalent_definition(definitions, definition, &source_id, &self.budget)? {
                 continue;
             }
-            definitions.push(definition);
+            self.budget
+                .charge(Resource::EmittedBytes, definition.bytes.len())?;
+            for text in [
+                &definition.name,
+                &definition.scope_id,
+                &source_id,
+                &source_name,
+            ] {
+                self.budget.charge(Resource::EmittedBytes, text.len())?;
+            }
+            if let Some(owner) = &definition.owner_scope_id {
+                self.budget.charge(Resource::EmittedBytes, owner.len())?;
+            }
+            definitions.push(Definition {
+                name: definition.name.clone(),
+                bytes: definition.bytes.clone(),
+                parameterized: definition.parameterized,
+                scope_id: definition.scope_id.clone(),
+                owner_scope_id: definition.owner_scope_id.clone(),
+                source_id: Some(source_id.clone()),
+                source_name: Some(source_name.clone()),
+            });
             added = added.saturating_add(1);
         }
         Ok(added)
@@ -807,14 +839,18 @@ pub fn parse_library_with_budget(
         )?;
         let statements = view
             .into_iter()
-            .map(|line| ScopedStatement {
-                source: source_name.clone(),
-                context,
-                first_line: line.first_line,
-                last_line: line.last_line,
-                text: line.text,
+            .map(|line| {
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                budget.charge(Resource::EmittedBytes, source_name.len())?;
+                Ok(ScopedStatement {
+                    source: source_name.clone(),
+                    context,
+                    first_line: line.first_line,
+                    last_line: line.last_line,
+                    text: line.text,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         return parse_scoped_library(
             source_name,
             sources,
@@ -858,10 +894,20 @@ pub fn parse_scoped_library(
         source_names,
         dialect,
         statements,
-        statements.to_vec(),
+        clone_scoped_statements(statements, budget)?,
         limit,
         budget,
     )
+}
+
+fn clone_scoped_statements(
+    statements: &[crate::source_dialect::ScopedStatement],
+    budget: &WorkBudget,
+) -> Result<Vec<crate::source_dialect::ScopedStatement>> {
+    statements
+        .iter()
+        .map(|statement| statement.clone_with_budget(budget))
+        .collect()
 }
 
 /// Lower each source's lexical dialect without losing its neutral card text.
@@ -880,7 +926,7 @@ pub fn lower_scoped_statements(
         .map(|statement| {
             budget.charge(Resource::Statements, 1)?;
             budget.charge(Resource::ScannedBytes, statement.text.len())?;
-            let mut statement = statement.clone();
+            let mut statement = statement.clone_with_budget(budget)?;
             if !opaque.consume(&statement.text) {
                 statement.text = crate::source_dialect::lower_statement_with_budget(
                     &statement.text,
@@ -1343,6 +1389,84 @@ fn definition_scope_id(bytes: &[u8]) -> String {
     hasher.update(b"simplis-lexical-scope-v1\0");
     hasher.update(normalize_definition(bytes));
     lower_hex(&hasher.finalize())
+}
+
+fn charge_catalog_scan(parsed: &ParsedLibrary, budget: &WorkBudget) -> Result<()> {
+    budget.charge(Resource::SourceVisits, 1)?;
+    budget.charge(Resource::GeneratedNodes, parsed.definitions.len())?;
+    for definition in &parsed.definitions {
+        budget.charge(Resource::ScannedBytes, definition.bytes.len())?;
+        for text in [&definition.name, &definition.scope_id] {
+            budget.charge(Resource::ScannedBytes, text.len())?;
+        }
+        for text in [
+            &definition.owner_scope_id,
+            &definition.source_id,
+            &definition.source_name,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            budget.charge(Resource::ScannedBytes, text.len())?;
+        }
+    }
+    for alias in &parsed.aliases {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        for text in [&alias.name, &alias.target, &alias.kind] {
+            budget.charge(Resource::ScannedBytes, text.len())?;
+        }
+    }
+    for source in &parsed.source_names {
+        budget.charge(Resource::ScannedBytes, source.len())?;
+    }
+    for line in &parsed.support_lines {
+        budget.charge(Resource::ScannedBytes, line.len())?;
+        budget.charge(Resource::Statements, 1)?;
+    }
+    for line in &parsed.scoped_statements {
+        budget.charge(
+            Resource::ScannedBytes,
+            line.text.len().saturating_add(line.source.len()),
+        )?;
+        budget.charge(Resource::Statements, 1)?;
+    }
+    for identity in &parsed.device_identities {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        for text in identity.scope.iter().chain([
+            &identity.source,
+            &identity.declared,
+            &identity.displayed,
+            &identity.linked,
+        ]) {
+            budget.charge(Resource::ScannedBytes, text.len())?;
+        }
+    }
+    Ok(())
+}
+
+fn has_equivalent_definition(
+    definitions: &[Definition],
+    definition: &Definition,
+    source_id: &str,
+    budget: &WorkBudget,
+) -> Result<bool> {
+    for existing in definitions {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        if existing.source_id.as_deref() == Some(source_id)
+            && existing.owner_scope_id == definition.owner_scope_id
+        {
+            budget.charge(
+                Resource::ScannedBytes,
+                existing.bytes.len().saturating_add(definition.bytes.len()),
+            )?;
+            if normalize_definition_for_equivalence(&existing.bytes)
+                == normalize_definition_for_equivalence(&definition.bytes)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn normalize_definition_for_equivalence(bytes: &[u8]) -> Vec<u8> {

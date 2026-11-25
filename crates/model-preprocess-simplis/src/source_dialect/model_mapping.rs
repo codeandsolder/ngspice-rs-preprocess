@@ -872,8 +872,7 @@ impl MappingTable {
         let mut scope = Vec::new();
         let mut opaque = OpaqueSource::default();
         for line in statements {
-            budget.check()?;
-            let mut line = line.clone();
+            let mut line = line.clone_with_budget(budget)?;
             let mut tokens = line.text.split_whitespace();
             let directive = tokens.next().unwrap_or_default().to_ascii_uppercase();
             if !opaque.consume(&line.text) {
