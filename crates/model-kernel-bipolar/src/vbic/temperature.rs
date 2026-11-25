@@ -13,124 +13,170 @@ use crate::{ModelError, Temperature, validate_positive};
 ///
 /// Model-card defaults and source-aware parameter name resolution are
 /// responsibilities of the upstream reader; model evaluation is type safe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Coefficient {
-    Tnom,
-    Rcx,
-    Rci,
-    Vo,
-    Gamm,
-    Hrcf,
-    Rbx,
-    Rbi,
-    Re,
-    Rs,
-    Rbp,
-    Is,
-    Nf,
-    Nr,
-    Fc,
-    Cbeo,
-    Cje,
-    Pe,
-    Me,
-    Aje,
-    Cbco,
-    Cjc,
-    Qco,
-    Cjep,
-    Pc,
-    Mc,
-    Ajc,
-    Cjcp,
-    Ps,
-    Ms,
-    Ajs,
-    Ibei,
-    Wbe,
-    Nei,
-    Iben,
-    Nen,
-    Ibci,
-    Nci,
-    Ibcn,
-    Ncn,
-    Avc1,
-    Avc2,
-    Isp,
-    Wsp,
-    Nfp,
-    Ibeip,
-    Ibenp,
-    Ibcip,
-    Ncip,
-    Ibcnp,
-    Ncnp,
-    Vef,
-    Ver,
-    Ikf,
-    Ikr,
-    Ikp,
-    Tf,
-    Qtf,
-    Xtf,
-    Vtf,
-    Itf,
-    Tr,
-    Td,
-    Kfn,
-    Afn,
-    Bfn,
-    Xre,
-    Xrbi,
-    Xrci,
-    Xrs,
-    Xvo,
-    Ea,
-    Eaie,
-    Eaic,
-    Eais,
-    Eane,
-    Eanc,
-    Eans,
-    Xis,
-    Xii,
-    Xin,
-    Tnf,
-    Tavc,
-    Rth,
-    Cth,
-    Vrt,
-    Art,
-    Ccso,
-    Qbm,
-    Nkf,
-    Xikf,
-    Xrcx,
-    Xrbx,
-    Xrbp,
-    Isrr,
-    Xisr,
-    Dear,
-    Eap,
-    Vbbe,
-    Nbbe,
-    Ibbe,
-    Tvbbe1,
-    Tvbbe2,
-    Tnbbe,
-    Ebbe,
-    Dtemp,
-    Vers,
-    Vref,
+// Scalar names, native setup defaults and source slot order have one definition.
+macro_rules! coefficients {
+    ($($variant:ident => ($name:literal, $default:expr)),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[repr(u8)]
+        pub enum Coefficient { $($variant),+ }
+
+        impl Coefficient {
+            /// Ordered source coefficient slots.
+            pub const ALL: [Self; COUNT] = [$(Self::$variant),+];
+
+            /// Canonical model-card keyword.
+            #[must_use = "the keyword identifies a source model coefficient"]
+            pub const fn name(self) -> &'static str {
+                match self { $(Self::$variant => $name),+ }
+            }
+
+            /// Native ngspice default before explicit setters.
+            #[must_use = "the default initializes an omitted model coefficient"]
+            pub const fn source_default(self) -> f64 {
+                match self { $(Self::$variant => $default),+ }
+            }
+        }
+    };
 }
 
-const COUNT: usize = 108;
+coefficients! {
+    Tnom => ("tnom", 27.0),
+    Rcx => ("rcx", 0.0),
+    Rci => ("rci", 0.1),
+    Vo => ("vo", 0.0),
+    Gamm => ("gamm", 0.0),
+    Hrcf => ("hrcf", 1.0),
+    Rbx => ("rbx", 0.0),
+    Rbi => ("rbi", 0.1),
+    Re => ("re", 0.0),
+    Rs => ("rs", 0.0),
+    Rbp => ("rbp", 0.1),
+    Is => ("is", 1e-16),
+    Nf => ("nf", 1.0),
+    Nr => ("nr", 1.0),
+    Fc => ("fc", 0.9),
+    Cbeo => ("cbeo", 0.0),
+    Cje => ("cje", 0.0),
+    Pe => ("pe", 0.75),
+    Me => ("me", 0.33),
+    Aje => ("aje", -0.5),
+    Cbco => ("cbco", 0.0),
+    Cjc => ("cjc", 0.0),
+    Qco => ("qco", 0.0),
+    Cjep => ("cjep", 0.0),
+    Pc => ("pc", 0.75),
+    Mc => ("mc", 0.33),
+    Ajc => ("ajc", -0.5),
+    Cjcp => ("cjcp", 0.0),
+    Ps => ("ps", 0.75),
+    Ms => ("ms", 0.33),
+    Ajs => ("ajs", -0.5),
+    Ibei => ("ibei", 1e-18),
+    Wbe => ("wbe", 1.0),
+    Nei => ("nei", 1.0),
+    Iben => ("iben", 0.0),
+    Nen => ("nen", 2.0),
+    Ibci => ("ibci", 1e-16),
+    Nci => ("nci", 1.0),
+    Ibcn => ("ibcn", 0.0),
+    Ncn => ("ncn", 2.0),
+    Avc1 => ("avc1", 0.0),
+    Avc2 => ("avc2", 0.0),
+    Isp => ("isp", 0.0),
+    Wsp => ("wsp", 1.0),
+    Nfp => ("nfp", 1.0),
+    Ibeip => ("ibeip", 0.0),
+    Ibenp => ("ibenp", 0.0),
+    Ibcip => ("ibcip", 0.0),
+    Ncip => ("ncip", 1.0),
+    Ibcnp => ("ibcnp", 0.0),
+    Ncnp => ("ncnp", 2.0),
+    Vef => ("vef", 0.0),
+    Ver => ("ver", 0.0),
+    Ikf => ("ikf", 0.0),
+    Ikr => ("ikr", 0.0),
+    Ikp => ("ikp", 0.0),
+    Tf => ("tf", 0.0),
+    Qtf => ("qtf", 0.0),
+    Xtf => ("xtf", 0.0),
+    Vtf => ("vtf", 0.0),
+    Itf => ("itf", 0.0),
+    Tr => ("tr", 0.0),
+    Td => ("td", 0.0),
+    Kfn => ("kfn", 0.0),
+    Afn => ("afn", 1.0),
+    Bfn => ("bfn", 1.0),
+    Xre => ("xre", 0.0),
+    Xrbi => ("xrbi", 0.0),
+    Xrci => ("xrci", 0.0),
+    Xrs => ("xrs", 0.0),
+    Xvo => ("xvo", 0.0),
+    Ea => ("ea", 1.12),
+    Eaie => ("eaie", 1.12),
+    Eaic => ("eaic", 1.12),
+    Eais => ("eais", 1.12),
+    Eane => ("eane", 1.12),
+    Eanc => ("eanc", 1.12),
+    Eans => ("eans", 1.12),
+    Xis => ("xis", 3.0),
+    Xii => ("xii", 3.0),
+    Xin => ("xin", 3.0),
+    Tnf => ("tnf", 0.0),
+    Tavc => ("tavc", 0.0),
+    Rth => ("rth", 0.0),
+    Cth => ("cth", 0.0),
+    Vrt => ("vrt", 0.0),
+    Art => ("art", 0.1),
+    Ccso => ("ccso", 0.0),
+    Qbm => ("qbm", 0.0),
+    Nkf => ("nkf", 0.5),
+    Xikf => ("xikf", 0.0),
+    Xrcx => ("xrcx", 0.0),
+    Xrbx => ("xrbx", 0.0),
+    Xrbp => ("xrbp", 0.0),
+    Isrr => ("isrr", 1.0),
+    Xisr => ("xisr", 0.0),
+    Dear => ("dear", 0.0),
+    Eap => ("eap", 1.12),
+    Vbbe => ("vbbe", 0.0),
+    Nbbe => ("nbbe", 1.0),
+    Ibbe => ("ibbe", 1e-06),
+    Tvbbe1 => ("tvbbe1", 0.0),
+    Tvbbe2 => ("tvbbe2", 0.0),
+    Tnbbe => ("tnbbe", 0.0),
+    Ebbe => ("ebbe", 0.0),
+    Dtemp => ("dtemp", 0.0),
+    Vers => ("vers", 1.2),
+    Vref => ("vref", 0.0),
+}
+
+pub const COUNT: usize = 108;
 const ELECTRICAL_K_OVER_Q: f64 = 1.380_662e-23 / 1.602_189e-19;
 
 impl Coefficient {
-    const fn index(self) -> usize {
+    /// Resolve canonical names and documented aliases once at the source boundary.
+    #[must_use = "the optional slot distinguishes unknown source keywords"]
+    pub fn from_name(name: &str) -> Option<Self> {
+        let alias = match name.to_ascii_lowercase().as_str() {
+            "tref" => Some(Self::Tnom),
+            "v0" => Some(Self::Vo),
+            "cbe0" => Some(Self::Cbeo),
+            "cbc0" => Some(Self::Cbco),
+            "qc0" => Some(Self::Qco),
+            "xv0" => Some(Self::Xvo),
+            "xrc" => Some(Self::Xrcx),
+            "xrb" => Some(Self::Xrbx),
+            _ => None,
+        };
+        alias.or_else(|| {
+            Self::ALL
+                .into_iter()
+                .find(|slot| slot.name().eq_ignore_ascii_case(name))
+        })
+    }
+
+    #[must_use = "the index identifies the source coefficient slot"]
+    pub const fn index(self) -> usize {
         self as usize
     }
 }
@@ -152,6 +198,14 @@ pub struct Prepared {
 }
 
 impl Nominal {
+    /// Native default coefficients before explicit setters.
+    #[must_use = "the defaults form a nominal model"]
+    pub fn source_defaults() -> Self {
+        Self {
+            values: Coefficient::ALL.map(Coefficient::source_default),
+        }
+    }
+
     /// # Errors
     /// Rejects incomplete/nonphysical numeric model coefficients rather than
     /// constructing a partly valid temperature profile.

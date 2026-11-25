@@ -6,6 +6,7 @@
 //! expose a complete VBIC device kernel.
 
 pub mod avalanche;
+pub mod binding;
 pub mod charge;
 pub mod depletion;
 pub mod noise;
