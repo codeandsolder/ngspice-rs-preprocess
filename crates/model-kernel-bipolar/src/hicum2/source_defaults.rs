@@ -12,7 +12,7 @@ impl temperature::Nominal {
     /// Exact HICUM/L2 2.4.0 Verilog-A nominal defaults. Source FLcomp=0
     /// intentionally selects its historical 2.1-compatible equations.
     /// Polarity is initially NPN; callers may select PNP before binding.
-    #[must_use]
+    #[must_use = "the constructed nominal model is returned rather than modifying any state"]
     pub const fn source_defaults() -> Self {
         Self {
             polarity: Polarity::Npn,

@@ -64,7 +64,7 @@ pub struct ThermalStamp {
 }
 
 impl Output {
-    #[must_use]
+    #[must_use = "the returned physical contribution is required for branch stamping"]
     pub const fn branch(&self, branch: Branch) -> PhysicalBranch {
         self.branches[branch.index()]
     }
@@ -308,7 +308,7 @@ impl Output {
 }
 
 impl Quantity {
-    #[must_use]
+    #[must_use = "the updated quantity is returned rather than modifying the original"]
     fn with_states(mut self, state: nqs::State, scale: f64) -> Self {
         self.gradient.states = nqs::State {
             current_first: scale * state.current_first,

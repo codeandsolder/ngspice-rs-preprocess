@@ -30,7 +30,7 @@ pub struct Specification {
 }
 
 impl Specification {
-    #[must_use]
+    #[must_use = "the boolean determines whether the source parameter is valid"]
     pub fn accepts(self, value: f64) -> bool {
         value.is_finite()
             && (if self.include_minimum {
@@ -54,7 +54,7 @@ impl Specification {
 pub struct Id(u8);
 
 impl Id {
-    #[must_use]
+    #[must_use = "the lookup distinguishes unknown names from registered parameter identities"]
     pub fn from_name(name: &str) -> Option<Self> {
         SPECIFICATIONS
             .iter()
@@ -69,7 +69,7 @@ impl Id {
     }
 
     /// Stable dense source parameter identity for one-time artifact hashing.
-    #[must_use]
+    #[must_use = "the lookup distinguishes invalid indices from registered parameter identities"]
     pub fn at(index: usize) -> Option<Self> {
         u8::try_from(index)
             .ok()
@@ -77,7 +77,7 @@ impl Id {
             .map(Self)
     }
 
-    #[must_use]
+    #[must_use = "the returned specification defines parameter validation"]
     pub const fn specification(self) -> Specification {
         SPECIFICATIONS[self.0 as usize]
     }
@@ -1992,7 +1992,7 @@ impl temperature::Nominal {
 
     /// Read the nominal source model parameter, never its temperature-
     /// adjusted value, with the source's own binary/enum encoding.
-    #[must_use]
+    #[must_use = "the returned nominal coefficient is required for source model preparation"]
     pub fn parameter(&self, id: Id) -> f64 {
         match id.0 {
             0..=31 => self.read_group_0(id.0),

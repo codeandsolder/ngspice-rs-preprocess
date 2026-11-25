@@ -350,13 +350,13 @@ impl Prepared {
 
     /// The immutable thermal trial kernel, including power/KCL/energy laws
     /// at this same effective device temperature.
-    #[must_use]
+    #[must_use = "the returned kernel evaluates thermal residuals and derivatives"]
     pub const fn thermal_kernel(&self) -> thermal::Prepared {
         self.thermal
     }
 
     /// The immutable source nominal topology and external RC kernel.
-    #[must_use]
+    #[must_use = "the returned kernel evaluates external electrical branches"]
     pub const fn external_kernel(&self) -> external::Prepared {
         self.external
     }
