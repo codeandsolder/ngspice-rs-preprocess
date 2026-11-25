@@ -88,11 +88,22 @@ pub enum TranslationKind {
 }
 
 /// Code-model library needed by generated native-ngspice statements.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeModelRuntime {
     /// Event-timed gates, hysteretic receivers and committed latches.
     Logic,
+}
+
+impl CodeModelRuntime {
+    /// Matching C-reference module filename. Native execution may implement
+    /// the corresponding model schemas directly instead of loading a C module.
+    #[must_use]
+    pub const fn reference_module(self) -> &'static str {
+        match self {
+            Self::Logic => "ngspice_preprocess_logic.cm",
+        }
+    }
 }
 
 impl TranslationKind {

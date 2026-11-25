@@ -3,9 +3,13 @@
 The SIMPLIS translator emits three XSPICE models for numbered AND/OR/NAND/NOR
 gates, DIGITAL1 AND/OR and S-R latches, and classic SRFF. This runtime is
 independent of the experimental ALB runtime. Translation results advertise
-the required code-model library through `required_code_models`.
+the required code-model library through `required_code_models`. The unified
+preparation API and version-2 JSON manifest report the per-artifact requirements
+and their bundle-wide union. The native engine implements the model schemas;
+the C module is an independent reference backend, not a required native-engine
+binary plugin.
 
-Build against the configured **matching** ngspice source tree, including
+Build against the configured in-tree **matching** ngspice source tree, including
 its CIDER/KLU/XSPICE configuration and built cmpp. Code-model ABI mismatches
 can crash the simulator. Use the managed compiler wrapper:
 
@@ -16,9 +20,14 @@ put the following command in the simulation working directory's .spiceinit):
 
     codemodel /path/to/output/ngspice_preprocess_logic.cm
 
-The reference regression example accepts the module path explicitly:
+The source CI builds both the pinned simulator and this module together
+using the same managed compiler wrapper, including the cmpp scanner restart
+fix for consecutive interface specifications. The reference regression
+examples accept the module path (or its directory for a linked bundle)
+explicitly:
 
     cargo +nightly run --locked -p model-translate-simplis --example logic_ngspice -- /path/to/output/ngspice_preprocess_logic.cm
+    cargo +nightly run --locked -p ngspice-rs-preprocess --example logic_bundle_ngspice -- /path/to/output
 
 The receiver detects threshold crossings from accepted analog samples and
 requests a simulator breakpoint. Event scheduling and state storage use

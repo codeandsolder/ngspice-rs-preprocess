@@ -77,7 +77,17 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. On Linux publication uses a
+counts, dependencies and provenance. Manifest version 2 includes
+`required_code_models` for each artifact and the deduplicated union for
+the whole bundle. The Rust API exposes the same requirements through
+`Artifact::required_code_models` and `PreparedBundle::required_code_models()`.
+The `logic` requirement describes the generated event-timed logic model
+schemas; a C ngspice 47 reference must load the matching
+`ngspice_preprocess_logic.cm` before parsing the deck. A native solver may
+implement these schemas directly. Requirements do not infer or load
+arbitrary user-supplied native code models. See
+[runtime/logic-xspice](runtime/logic-xspice/README.md) for building and
+testing the reference module. On Linux publication uses a
 no-replacement rename. Native line maps are exact at the admitted-source
 boundary, including synthetic elements created during compatibility
 normalization. Generated dialect artifacts retain source identities and

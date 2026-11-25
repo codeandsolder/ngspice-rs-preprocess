@@ -17,7 +17,7 @@ mkdir "$temporary/source"
 git -C "$root" archive --format=tar HEAD | tar -xf - -C "$temporary/source"
 # Use the same configured simulator source to build supplemental code models.
 # A distro package with the same version number is not an ABI guarantee.
-bash "$temporary/source/.github/scripts/install-reference-ngspice-source.sh" "$temporary/reference" "$RUSTC_WRAPPER"
+bash "$temporary/source/.github/scripts/install-reference-ngspice.sh" "$temporary/reference" --source "$RUSTC_WRAPPER"
 export PATH="$temporary/reference/bin:$PATH"
 cd "$temporary/source"
 cargo metadata --locked --format-version 1 >/dev/null
@@ -29,5 +29,7 @@ cargo test --locked --workspace --all-targets
 cargo test --locked -p model-kernel-vdmos --test ngspice47 -- --ignored
 cargo run --locked -p model-translate-simplis --example logic_ngspice -- \
     "$temporary/reference/lib/ngspice/ngspice_preprocess_logic.cm"
+cargo run --locked -p ngspice-rs-preprocess --example logic_bundle_ngspice -- \
+    "$temporary/reference/lib/ngspice"
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
 cargo build --locked --workspace --release

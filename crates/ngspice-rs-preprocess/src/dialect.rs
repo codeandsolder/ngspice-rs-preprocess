@@ -1,7 +1,8 @@
 //! Shared dialect source preparation and artifact construction.
 use super::{
-    AdmittedSource, Artifact, Cancellation, InputFormat, LibraryInput, LibrarySimulator, Options,
-    ParsedLibrary, PreparedBundle, Provenance, Request, SourceSession, display_path,
+    AdmittedSource, Artifact, Cancellation, CodeModelRuntime, InputFormat, LibraryInput,
+    LibrarySimulator, Options, ParsedLibrary, PreparedBundle, Provenance, Request, SourceSession,
+    display_path,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::AdmissionConfig;
@@ -32,12 +33,14 @@ const fn generated(
     sources: Vec<String>,
     source_id: Option<String>,
     dependencies: Vec<String>,
+    required_code_models: Vec<CodeModelRuntime>,
 ) -> Artifact {
     Artifact {
         filename,
         bytes,
         provenance: Provenance::Generated { sources, source_id },
         dependencies,
+        required_code_models,
     }
 }
 
@@ -64,6 +67,7 @@ fn parse_root(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBund
         parsed.to_json()?,
         vec![name],
         Some(parsed.source_id().to_owned()),
+        Vec::new(),
         Vec::new(),
     );
     Ok(bundle(root, format, artifact, Vec::new()))
@@ -249,6 +253,7 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
         vec![display_path(&root.path)],
         None,
         Vec::new(),
+        translated.required_code_models,
     );
     Ok(bundle(root, format, artifact, Vec::new()))
 }
@@ -306,6 +311,7 @@ fn linked(
             origins,
             Some(library.source_id.clone()),
             library.dependencies.clone(),
+            translated.required_code_models,
         ));
     }
     let primary = generated(
@@ -314,6 +320,7 @@ fn linked(
         root_sources.into_iter().collect(),
         None,
         dependencies,
+        translated_root.required_code_models,
     );
     Ok(bundle(root, request.format, primary, companions))
 }
