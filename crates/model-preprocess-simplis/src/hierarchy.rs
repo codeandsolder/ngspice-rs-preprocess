@@ -12,6 +12,9 @@ use std::{
     path::Path,
 };
 
+mod runtime_params;
+use runtime_params::RuntimeScope;
+
 const PARSED_LIBRARY_FORMAT_VERSION: u32 = 4;
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -216,6 +219,15 @@ impl SubcircuitCatalog {
     #[must_use = "the returned catalog owns the library definitions"]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Select the source simulator even when no external libraries are supplied.
+    #[must_use = "the returned catalog selects the simulator"]
+    pub fn for_simulator(simulator: LibrarySimulator) -> Self {
+        Self {
+            simulator: Some(simulator),
+            ..Self::default()
+        }
     }
 
     /// Add standalone `.SUBCKT` definitions from one anonymous library source.
@@ -1171,7 +1183,9 @@ fn call_target(statement: &str) -> Result<Option<(&str, &str, bool)>> {
                 return Ok(Some((model, rest[..end].trim(), compile_time)));
             }
         }
-        return Ok(Some((model, "", false)));
+        let start = model.as_ptr().addr() - trimmed.as_ptr().addr() + model.len();
+        let end = tokens[pinnames_index].as_ptr().addr() - trimmed.as_ptr().addr();
+        return Ok(Some((model, trimmed[start..end].trim(), false)));
     }
     for (marker, compile_time) in [(" vars:", true), (" params:", false)] {
         if let Some(offset) = find_ascii_case_insensitive(trimmed, marker) {
@@ -1187,16 +1201,24 @@ fn call_target(statement: &str) -> Result<Option<(&str, &str, bool)>> {
     if let Some(call) = legacy_colon_call(trimmed)? {
         return Ok(Some(call));
     }
-    let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+    plain_call_target(trimmed, &tokens)
+}
+
+fn plain_call_target<'a>(
+    trimmed: &'a str,
+    fields: &[&'a str],
+) -> Result<Option<(&'a str, &'a str, bool)>> {
     if let Some(first_assignment) = fields.iter().position(|token| token.contains('=')) {
         if first_assignment <= 1 {
             return Ok(None);
         }
-        let model = fields[first_assignment - 1];
-        let model_offset = trimmed
-            .find(model)
-            .context("inline-parameterized SIMPLIS X instance has no model source span")?;
-        let overrides = trimmed[model_offset + model.len()..].trim_start();
+        let assignment = first_assignment - usize::from(fields[first_assignment].starts_with('='));
+        if assignment <= 1 {
+            return Ok(None);
+        }
+        let model = fields[assignment - 1];
+        let overrides =
+            trimmed[model.as_ptr().addr() - trimmed.as_ptr().addr() + model.len()..].trim_start();
         if overrides.is_empty() {
             bail!("inline-parameterized SIMPLIS X instance has no assignments");
         }
@@ -1270,19 +1292,7 @@ fn rewrite_call(
     }
     *next_id = next_id.saturating_add(1);
     let generated_name = format!("{}${}", definition.name, *next_id);
-    let trimmed = statement.trim_start();
-    let rewritten = if let Some(vars_offset) = find_ascii_case_insensitive(trimmed, " vars:") {
-        let before = trimmed[..vars_offset].trim_end();
-        let model_offset = before
-            .rfind(model)
-            .with_context(|| format!("cannot locate SIMPLIS model {model} in X instance"))?;
-        format!("{} {generated_name}", before[..model_offset].trim_end())
-    } else {
-        let model_offset = trimmed
-            .rfind(model)
-            .with_context(|| format!("cannot locate SIMPLIS model {model} in X instance"))?;
-        format!("{} {generated_name}", trimmed[..model_offset].trim_end())
-    };
+    let rewritten = replace_call_target(statement, model, &generated_name, true)?;
     let local_key = is_local.then(|| definition.name.to_ascii_uppercase());
     Ok(Some((
         rewritten,
@@ -1825,6 +1835,7 @@ struct LinkedUnit {
     emitted_name: String,
     body: LinkedBody,
     environment: Environment,
+    runtime: Option<RuntimeScope>,
     init: InitTree,
 }
 
@@ -1945,25 +1956,6 @@ fn linked_plain_name(definition: &Definition) -> Result<String> {
     ))
 }
 
-fn last_whole_token_span(input: &str, target: &str) -> Option<(usize, usize)> {
-    let bytes = input.as_bytes();
-    let mut offset = 0usize;
-    let mut found = None;
-    while offset < bytes.len() {
-        while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
-            offset = offset.saturating_add(1);
-        }
-        let start = offset;
-        while offset < bytes.len() && !bytes[offset].is_ascii_whitespace() {
-            offset = offset.saturating_add(1);
-        }
-        if start < offset && input[start..offset].eq_ignore_ascii_case(target) {
-            found = Some((start, offset));
-        }
-    }
-    found
-}
-
 fn replace_call_target(
     statement: &str,
     model: &str,
@@ -1971,27 +1963,17 @@ fn replace_call_target(
     compile_time_vars: bool,
 ) -> Result<String> {
     let trimmed = active_statement_prefix(statement).trim_start();
-    let (model_offset, model_end) = last_whole_token_span(trimmed, model)
-        .with_context(|| format!("cannot locate SIMPLIS model {model} in X instance"))?;
-    if compile_time_vars {
-        return Ok(format!(
-            "{} {emitted_name}",
-            trimmed[..model_offset].trim_end()
-        ));
+    let (parsed_model, actuals, _) = call_target(statement)?.context("missing subcircuit call")?;
+    if !parsed_model.eq_ignore_ascii_case(model) {
+        bail!("inconsistent SIMPLIS model {model} in X instance");
     }
+    let model_offset = parsed_model.as_ptr().addr() - trimmed.as_ptr().addr();
     let prefix = trimmed[..model_offset].trim_end();
-    let mut suffix = &trimmed[model_end..];
-    if let Some(pinnames_offset) = find_ascii_case_insensitive(suffix, " pinnames:") {
-        suffix = suffix[..pinnames_offset].trim_end();
+    if compile_time_vars || actuals.is_empty() {
+        Ok(format!("{prefix} {emitted_name}"))
+    } else {
+        Ok(format!("{prefix} {emitted_name} params: {actuals}"))
     }
-    if let Some(runtime) = suffix.trim_start().strip_prefix(':') {
-        let runtime = runtime.trim_start();
-        if runtime.is_empty() {
-            return Ok(format!("{prefix} {emitted_name}"));
-        }
-        return Ok(format!("{prefix} {emitted_name} params: {runtime}"));
-    }
-    Ok(format!("{prefix} {emitted_name}{suffix}"))
 }
 
 fn definition_uses_preprocessor(definition: &Definition) -> bool {
@@ -2028,6 +2010,7 @@ fn make_linked_unit(
     override_text: &str,
     inherited: &Environment,
     init: InitTree,
+    simetrix: bool,
 ) -> Result<LinkedUnit> {
     let overrides = if explicit_vars {
         parse_overrides(override_text)?
@@ -2047,6 +2030,7 @@ fn make_linked_unit(
             emitted_name,
             body: LinkedBody::Microchip(overrides),
             environment: inherited.clone(),
+            runtime: None,
             init,
         });
     }
@@ -2069,8 +2053,17 @@ fn make_linked_unit(
     } else {
         (definition.bytes.clone(), inherited.clone())
     };
-    let specialized = needs_preprocessing || scoped;
     let bytes = inject_local_init(&bytes, &init)?;
+    let (bytes, runtime) = if simetrix {
+        let actuals = if explicit_vars { "" } else { override_text };
+        let (prepared, runtime) = RuntimeScope::prepare(&bytes, &definition.scope_id, actuals)
+            .with_context(|| format!("binding SIMetrix parameters for {}", definition.name))?;
+        (prepared, Some(runtime))
+    } else {
+        (bytes, None)
+    };
+    let specialized =
+        needs_preprocessing || scoped || runtime.as_ref().is_some_and(RuntimeScope::has_bindings);
     let emitted_name = if specialized || !init.is_empty() {
         linked_specialization_name(&definition, Some(&bytes), &overrides, &init)
     } else {
@@ -2081,33 +2074,40 @@ fn make_linked_unit(
         emitted_name,
         body: LinkedBody::Netlist(bytes),
         environment,
+        runtime,
         init,
     })
+}
+
+#[derive(Clone, Copy)]
+struct LinkCaller<'a> {
+    source: Option<&'a str>,
+    scope: Option<&'a str>,
+    environment: &'a Environment,
+    runtime: Option<&'a RuntimeScope>,
 }
 
 fn link_call(
     statement: &str,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
-    preferred_source: Option<&str>,
-    preferred_scope: Option<&str>,
-    inherited: &Environment,
+    caller: LinkCaller<'_>,
     init: InitTree,
 ) -> Result<Option<(String, LinkedUnit)>> {
     let Some((model, override_text, explicit_vars)) = call_target(statement)? else {
         return Ok(None);
     };
     let Some((definition, _is_local)) =
-        resolve_definition(model, local, external, preferred_source, preferred_scope)?
+        resolve_definition(model, local, external, caller.source, caller.scope)?
     else {
         bail!("unresolved SIMPLIS subcircuit {model} in linkable preprocessing");
     };
-    let inherits_lexically = preferred_scope.is_some()
-        && definition.owner_scope_id.as_deref() == preferred_scope
-        && definition.source_id.as_deref() == preferred_source;
+    let inherits_lexically = caller.scope.is_some()
+        && definition.owner_scope_id.as_deref() == caller.scope
+        && definition.source_id.as_deref() == caller.source;
     let empty = Environment::new();
     let inherited = if inherits_lexically {
-        inherited
+        caller.environment
     } else {
         &empty
     };
@@ -2118,8 +2118,22 @@ fn link_call(
         override_text,
         inherited,
         init,
+        caller.runtime.is_some(),
     )?;
-    let rewritten = replace_call_target(statement, model, &unit.emitted_name, compile_time_vars)?;
+    let rewritten = if !compile_time_vars
+        && let (Some(caller), Some(callee)) = (caller.runtime, &unit.runtime)
+    {
+        let instance = instance_name(statement).context("missing runtime call instance")?;
+        let (declarations, arguments) = caller.bind_actuals(callee, &instance, override_text)?;
+        let prefix = replace_call_target(statement, model, &unit.emitted_name, true)?;
+        if arguments.is_empty() {
+            prefix
+        } else {
+            format!("{declarations}{prefix} params:{arguments}")
+        }
+    } else {
+        replace_call_target(statement, model, &unit.emitted_name, compile_time_vars)?
+    };
     Ok(Some((rewritten, unit)))
 }
 
@@ -2198,9 +2212,12 @@ fn emit_linked_unit(
             &statement,
             local,
             external,
-            unit.definition.source_id.as_deref(),
-            Some(&unit.definition.scope_id),
-            &unit.environment,
+            LinkCaller {
+                source: unit.definition.source_id.as_deref(),
+                scope: Some(&unit.definition.scope_id),
+                environment: &unit.environment,
+                runtime: unit.runtime.as_ref(),
+            },
             child_init.clone(),
         )? {
             let (child_source, _) = linked_source(&child)?;
@@ -2210,6 +2227,10 @@ fn emit_linked_unit(
             rewritten_body.push(rewritten);
             children.push(child);
         } else {
+            let statement = match &unit.runtime {
+                Some(runtime) => runtime.rewrite_statement(&statement)?,
+                None => statement,
+            };
             rewritten_body.push(annotate_unlinked_init(&statement, &child_init));
         }
     }
@@ -2302,6 +2323,7 @@ fn link_root_statements(
     root_lines: &[String],
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
+    runtime: Option<&RuntimeScope>,
 ) -> Result<(String, Vec<LinkedUnit>, Option<String>)> {
     use std::fmt::Write as _;
 
@@ -2339,9 +2361,12 @@ fn link_root_statements(
             &statement,
             local,
             external,
-            None,
-            None,
-            &Environment::new(),
+            LinkCaller {
+                source: None,
+                scope: None,
+                environment: &Environment::new(),
+                runtime,
+            },
             child_init.clone(),
         )? {
             root_output.push_str(&rewritten);
@@ -2412,8 +2437,10 @@ pub fn preprocess_netlist_linked(
         insert_local_definition(&mut local, definition.clone())?;
     }
 
+    let runtime = (external.simulator == Some(LibrarySimulator::Simetrix))
+        .then(|| RuntimeScope::root(&root_source_id));
     let (mut root_output, root_units, end_statement) =
-        link_root_statements(&extracted.root_lines, &local, external)?;
+        link_root_statements(&extracted.root_lines, &local, external, runtime.as_ref())?;
 
     let root_specializations = root_units
         .iter()
@@ -3327,6 +3354,27 @@ RB 1 2 {V}
             replace_call_target("X$Z1 VSN J3_D Z1", "Z1", "sr_Z1_sp_123", false)?,
             "X$Z1 VSN J3_D sr_Z1_sp_123"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn linked_call_preserves_actuals_after_pin_metadata_and_repeated_model_name() -> Result<()> {
+        for call in [
+            "X1 MODEL n MODEL R = 2k",
+            "X1 MODEL n MODEL R=2k pinnames: P N",
+            "X1 MODEL n MODEL pinnames: P N params: R = 2k",
+        ] {
+            let (model, actuals, vars) = call_target(call)?.context("expected call")?;
+            assert_eq!(model, "MODEL");
+            assert!(!vars);
+            assert_eq!(
+                parse_overrides(actuals)?.get("R"),
+                Some(&crate::Value::Number(2000.0))
+            );
+            let rewritten = replace_call_target(call, model, "generated", false)?;
+            assert!(rewritten.starts_with("X1 MODEL n generated params: R"));
+            assert!(!rewritten.contains("pinnames:"));
+        }
         Ok(())
     }
 

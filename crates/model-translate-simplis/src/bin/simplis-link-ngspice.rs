@@ -142,7 +142,7 @@ fn main() -> Result<()> {
 
     let input_bytes = fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
     let input_bytes = inline_init_includes(&input, &input_bytes)?;
-    let mut catalog = SubcircuitCatalog::new();
+    let mut catalog = SubcircuitCatalog::for_simulator(simulator);
     let mut definitions = 0usize;
     for library in &libraries {
         let bytes = fs::read(library).with_context(|| format!("reading {}", library.display()))?;

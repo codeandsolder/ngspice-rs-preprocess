@@ -1,0 +1,13 @@
+* child unpassed name must resolve global, not parent's local
+.param r=5k
+V1 a 0 10
+X1 a x outer params: r=2k
+R1 x 0 1k
+.subckt outer p n
+X1 p n inner
+.ends
+.subckt inner p n
+R1 p n {r}
+.ends
+.op
+.end

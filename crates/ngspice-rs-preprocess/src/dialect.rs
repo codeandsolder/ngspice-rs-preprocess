@@ -179,7 +179,7 @@ fn catalog(
         },
         cancellation.clone(),
     );
-    let mut catalog = SubcircuitCatalog::new();
+    let mut catalog = SubcircuitCatalog::for_simulator(simulator);
     let mut sources = BTreeMap::<String, BTreeSet<String>>::new();
     for library in &request.libraries {
         let (parsed, origin) = match library {

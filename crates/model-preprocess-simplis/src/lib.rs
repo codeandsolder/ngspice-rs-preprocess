@@ -1531,10 +1531,10 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
+fn parameter_assignments(input: &str) -> Result<Vec<(&str, &str)>> {
     let bytes = input.as_bytes();
     let mut offset = 0usize;
-    let mut count = 0usize;
+    let mut assignments = Vec::new();
     while offset < bytes.len() {
         while bytes
             .get(offset)
@@ -1617,12 +1617,19 @@ fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
         if expression.is_empty() {
             bail!("SIMPLIS parameter {name} has an empty value");
         }
+        assignments.push((name, expression));
+    }
+    Ok(assignments)
+}
+
+fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
+    let assignments = parameter_assignments(input)?;
+    for (name, expression) in &assignments {
         let value = eval_expression(expression, env)
             .with_context(|| format!("evaluating default for SIMPLIS parameter {name}"))?;
         env.set(name, value);
-        count = count.saturating_add(1);
     }
-    Ok(count)
+    Ok(assignments.len())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
