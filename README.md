@@ -4,7 +4,8 @@ Standalone SPICE normalization, dialect lowering, source linking,
 parameter compilation and reusable prepared model kernels.
 
 The workspace contains the ngspice normalizer, SIMPLIS source preprocessor and
-translator, and prepared diode, VDMOS, bipolar and intrinsic compact-model kernels. Experimental ALB/XSPICE
+translator, and prepared diode, VDMOS, bipolar and intrinsic compact-model
+packages. Experimental ALB/XSPICE
 compilation lives in the separate `model-alb-experimental` crate and is
 excluded from default workspace builds. The production translator does not
 link it and rejects unsupported source semantics explicitly.
@@ -72,7 +73,18 @@ SIMetrix decks preserve runtime argument binding, including implicit formals,
 source-order actuals, callee defaults and isolated local scopes. Direct and
 nested electrical model dependencies are resolved against declared catalog
 models, including optional substrate/bulk terminals and passive model/value
-forms; ambiguous model positions are rejected.
+forms; ambiguous model positions are rejected. Bare passive values resolve
+to visible parameters only when no visible model has that name. Charge
+expressions preserve dynamic probe and temperature semantics independently
+of instance parameter bindings; capacitor temperature coefficients lower
+to the native two-coefficient form.
+
+SIMetrix source absolute-base exponentiation (`**` and `PWR`) preserves
+source associativity, unary operands, the zero-base Jacobian and true
+negative-power singularities. Lowering is performed before cross-language
+source linking, within the existing expression expansion budget. Native
+signed power and HSPICE/PSpice expression contexts remain distinct.
+`LIMIT` clamps between either ordering of its two bounds.
 
 Nominal SIMetrix preparation lowers PI, E and the historical BOLTZ/ECHARGE
 constants, stable LNCOSH and lazy nominal GAUSS(x) (always 1). Predefined
