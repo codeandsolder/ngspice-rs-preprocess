@@ -56,19 +56,32 @@ pub enum Value {
     Vector(Vec<Self>),
 }
 
-impl Value {
-    fn number(&self) -> Result<f64> {
-        match self {
-            Self::Number(value) => Ok(*value),
-            Self::Text(_) | Self::Vector(_) => bail!("numeric value required"),
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarType {
+    Number,
+    Text,
+}
 
-    fn truthy(&self) -> Result<bool> {
+impl Value {
+    // In the reference expression language, scalar and vector are shapes,
+    // not distinct element types. Empty vectors have no inspectable type.
+    fn scalar_type(&self) -> Result<Option<ScalarType>> {
         match self {
-            Self::Number(value) => Ok(*value != 0.0),
-            Self::Text(value) => Ok(!value.is_empty()),
-            Self::Vector(_) => bail!("vector cannot be used as a boolean"),
+            Self::Number(_) => Ok(Some(ScalarType::Number)),
+            Self::Text(_) => Ok(Some(ScalarType::Text)),
+            Self::Vector(values) => {
+                let mut kind = None;
+                for value in values {
+                    if let Some(next) = value.scalar_type()? {
+                        anyhow::ensure!(
+                            kind.is_none_or(|prior| prior == next),
+                            "SIMPLIS vector elements must have the same type"
+                        );
+                        kind = Some(next);
+                    }
+                }
+                Ok(kind)
+            }
         }
     }
 
@@ -175,25 +188,31 @@ enum Token {
     End,
 }
 
-fn engineering_multiplier(suffix: &str) -> Option<f64> {
-    match suffix.to_ascii_uppercase().as_str() {
-        "" => Some(1.0),
-        "T" => Some(1e12),
-        "G" => Some(1e9),
-        "MEG" => Some(1e6),
-        "K" => Some(1e3),
-        "M" => Some(1e-3),
-        "U" => Some(1e-6),
-        "N" => Some(1e-9),
-        "P" => Some(1e-12),
-        "F" => Some(1e-15),
-        "A" => Some(1e-18),
-        _ => None,
+/// A numeric token may carry a unit label after its engineering multiplier.
+fn engineering_multiplier(suffix: &str) -> (f64, usize) {
+    let upper = suffix.to_ascii_uppercase();
+    if upper.starts_with("MEG") {
+        return (1e6, 3);
     }
+    if upper.starts_with("MIL") {
+        return (25.4e-6, 3);
+    }
+    let multiplier = match upper.as_bytes().first() {
+        Some(b'T') => 1e12,
+        Some(b'G') => 1e9,
+        Some(b'K') => 1e3,
+        Some(b'M') => 1e-3,
+        Some(b'U') => 1e-6,
+        Some(b'N') => 1e-9,
+        Some(b'P') => 1e-12,
+        Some(b'F') => 1e-15,
+        Some(b'A') => 1e-18,
+        _ => 1.0,
+    };
+    (multiplier, usize::from(!suffix.is_empty()))
 }
 
-fn parse_number_literal(input: &str) -> Result<f64> {
-    let bytes = input.as_bytes();
+fn decimal_end(bytes: &[u8]) -> usize {
     let mut offset = 0usize;
     while bytes
         .get(offset)
@@ -221,16 +240,39 @@ fn parse_number_literal(input: &str) -> Result<f64> {
             offset = exponent_marker;
         }
     }
-    let (number, suffix) = input.split_at(offset);
+    offset
+}
+
+fn parse_number_literal(input: &str) -> Result<f64> {
+    let (number, suffix) = input.split_at(decimal_end(input.as_bytes()));
     let base: f64 = number
         .parse()
         .with_context(|| format!("invalid SIMPLIS number {input:?}"))?;
-    let multiplier = engineering_multiplier(suffix)
-        .with_context(|| format!("unsupported SIMPLIS numeric suffix {suffix:?}"))?;
-    let value = base * multiplier;
-    if !value.is_finite() {
-        bail!("non-finite SIMPLIS number {input:?}");
-    }
+    anyhow::ensure!(
+        suffix.is_empty() || suffix.starts_with(|c: char| c.is_ascii_alphabetic()),
+        "invalid SIMPLIS numeric suffix {suffix:?}"
+    );
+    anyhow::ensure!(
+        suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "invalid SIMPLIS numeric suffix {suffix:?}"
+    );
+    let (multiplier, prefix) = engineering_multiplier(suffix);
+    // SIMetrix accepts engineering decimal notation (4k7, 2R2)
+    // and ignores trailing unit text (2kOhm, 3V, 1xx). Only digits
+    // immediately following the scale marker extend the mantissa.
+    let fractional = suffix[prefix..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    // The vendor's engineering-decimal expansion leaves an exactly zero
+    // leading value unchanged, including 0k2 and 0.0x2.
+    let value = if fractional == 0 || base == 0.0 {
+        base
+    } else {
+        let digits = &suffix[prefix..prefix + fractional];
+        base + format!("0.{digits}").parse::<f64>()?
+    } * multiplier;
+    anyhow::ensure!(value.is_finite(), "non-finite SIMPLIS number {input:?}");
     Ok(value)
 }
 
@@ -289,17 +331,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
             _ if b.is_ascii_digit() || b == b'.' => {
                 let start = i;
-                i += 1;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_digit()
-                        || bytes[i].is_ascii_alphabetic()
-                        || matches!(bytes[i], b'.' | b'+' | b'-'))
-                {
-                    if matches!(bytes[i], b'+' | b'-')
-                        && !matches!(bytes.get(i.wrapping_sub(1)), Some(b'e' | b'E'))
-                    {
-                        break;
-                    }
+                i += decimal_end(&bytes[i..]);
+                while bytes.get(i).is_some_and(u8::is_ascii_alphanumeric) {
                     i += 1;
                 }
                 let literal = &input[start..i];
@@ -325,18 +358,68 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
+struct Evaluation<'a> {
+    env: &'a Environment,
+    conversion_depth: usize,
+}
+
+impl<'a> Evaluation<'a> {
+    const fn new(env: &'a Environment) -> Self {
+        Self {
+            env,
+            conversion_depth: 0,
+        }
+    }
+
+    fn expression(self, input: &str) -> Result<Value> {
+        let trimmed = input.trim();
+        let inner = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            &trimmed[1..trimmed.len().saturating_sub(1)]
+        } else {
+            trimmed
+        };
+        Parser::new(inner, self)?.parse()
+    }
+
+    fn number(self, value: &Value) -> Result<f64> {
+        match value {
+            Value::Number(number) => Ok(*number),
+            Value::Text(text) => {
+                anyhow::ensure!(
+                    self.conversion_depth < 32,
+                    "SIMPLIS numeric string conversion depth exceeded"
+                );
+                let nested = Self {
+                    conversion_depth: self.conversion_depth + 1,
+                    ..self
+                };
+                let evaluated = nested
+                    .expression(text)
+                    .with_context(|| format!("SIMPLIS numeric conversion of {text:?}"))?;
+                nested.number(&evaluated)
+            }
+            Value::Vector(_) => bail!("numeric value required"),
+        }
+    }
+
+    fn truthy(self, value: &Value) -> Result<bool> {
+        Ok(self.number(value)? != 0.0)
+    }
+}
+
 struct Parser<'a> {
     tokens: Vec<Token>,
     offset: usize,
-    env: &'a Environment,
+    eval: Evaluation<'a>,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &str, env: &'a Environment) -> Result<Self> {
+    fn new(input: &str, eval: Evaluation<'a>) -> Result<Self> {
         Ok(Self {
             tokens: tokenize(input)?,
             offset: 0,
-            env,
+            eval,
         })
     }
 
@@ -363,7 +446,9 @@ impl<'a> Parser<'a> {
         while self.current() == &Token::OrOr {
             self.bump();
             let right = self.parse_and()?;
-            left = Value::Number(f64::from(left.truthy()? || right.truthy()?));
+            left = Value::Number(f64::from(
+                self.eval.truthy(&left)? | self.eval.truthy(&right)?,
+            ));
         }
         Ok(left)
     }
@@ -373,7 +458,9 @@ impl<'a> Parser<'a> {
         while self.current() == &Token::AndAnd {
             self.bump();
             let right = self.parse_compare()?;
-            left = Value::Number(f64::from(left.truthy()? && right.truthy()?));
+            left = Value::Number(f64::from(
+                self.eval.truthy(&left)? & self.eval.truthy(&right)?,
+            ));
         }
         Ok(left)
     }
@@ -434,7 +521,7 @@ impl<'a> Parser<'a> {
             }
             self.bump();
             let right = self.parse_mul()?;
-            left = vector_add_sub(left, right, add)?;
+            left = vector_add_sub(left, right, add, self.eval)?;
         }
     }
 
@@ -449,9 +536,9 @@ impl<'a> Parser<'a> {
             self.bump();
             let right = self.parse_unary()?;
             let value = if mul {
-                left.number()? * right.number()?
+                self.eval.number(&left)? * self.eval.number(&right)?
             } else {
-                left.number()? / right.number()?
+                self.eval.number(&left)? / self.eval.number(&right)?
             };
             if !value.is_finite() {
                 bail!("non-finite SIMPLIS arithmetic result");
@@ -464,15 +551,18 @@ impl<'a> Parser<'a> {
         match self.current() {
             Token::Plus => {
                 self.bump();
-                Ok(Value::Number(self.parse_unary()?.number()?))
+                let operand = self.parse_unary()?;
+                Ok(Value::Number(self.eval.number(&operand)?))
             }
             Token::Minus => {
                 self.bump();
-                Ok(Value::Number(-self.parse_unary()?.number()?))
+                let operand = self.parse_unary()?;
+                Ok(Value::Number(-self.eval.number(&operand)?))
             }
             Token::Bang => {
                 self.bump();
-                Ok(Value::Number(f64::from(!self.parse_unary()?.truthy()?)))
+                let operand = self.parse_unary()?;
+                Ok(Value::Number(f64::from(!self.eval.truthy(&operand)?)))
             }
             _ => self.parse_power(),
         }
@@ -484,8 +574,9 @@ impl<'a> Parser<'a> {
             return Ok(left);
         }
         self.bump();
-        let exponent = self.parse_unary()?.number()?;
-        let value = left.number()?.powf(exponent);
+        let operand = self.parse_unary()?;
+        let exponent = self.eval.number(&operand)?;
+        let value = self.eval.number(&left)?.powf(exponent);
         if !value.is_finite() {
             bail!("non-finite SIMPLIS exponentiation result");
         }
@@ -496,7 +587,8 @@ impl<'a> Parser<'a> {
         let mut value = self.parse_primary()?;
         while self.current() == &Token::LBracket {
             self.bump();
-            let index = self.parse_or()?.number()?;
+            let operand = self.parse_or()?;
+            let index = self.eval.number(&operand)?;
             if self.current() != &Token::RBracket {
                 bail!("missing ] after SIMPLIS vector index");
             }
@@ -529,7 +621,8 @@ impl<'a> Parser<'a> {
                 } else if name.eq_ignore_ascii_case("PI") {
                     Ok(Value::Number(std::f64::consts::PI))
                 } else {
-                    self.env
+                    self.eval
+                        .env
                         .get(&name)
                         .cloned()
                         .with_context(|| format!("undefined SIMPLIS variable {name}"))
@@ -558,7 +651,9 @@ impl<'a> Parser<'a> {
                     bail!("missing ] in SIMPLIS vector literal");
                 }
                 self.bump();
-                Ok(Value::Vector(values))
+                let vector = Value::Vector(values);
+                vector.scalar_type()?;
+                Ok(vector)
             }
             other => bail!("unexpected SIMPLIS expression token {other:?}"),
         }
@@ -592,7 +687,7 @@ impl<'a> Parser<'a> {
                 bail!("ExistVec accepts exactly one argument");
             }
             self.bump();
-            return Ok(Value::Number(f64::from(self.env.contains(&ident))));
+            return Ok(Value::Number(f64::from(self.eval.env.contains(&ident))));
         }
         let args = self.parse_arguments()?;
         match name.to_ascii_uppercase().as_str() {
@@ -600,23 +695,29 @@ impl<'a> Parser<'a> {
                 if args.len() != 3 {
                     bail!("IFF requires exactly three arguments");
                 }
-                if args[0].truthy()? {
+                let left_type = args[1].scalar_type()?;
+                let right_type = args[2].scalar_type()?;
+                anyhow::ensure!(
+                    left_type.is_none() || right_type.is_none() || left_type == right_type,
+                    "IFF arguments 2 and 3 must be of the same type"
+                );
+                if self.eval.truthy(&args[0])? {
                     Ok(args[1].clone())
                 } else {
                     Ok(args[2].clone())
                 }
             }
-            "ABS" => unary_numeric(name, &args, f64::abs),
-            "SQRT" => unary_numeric(name, &args, f64::sqrt),
-            "SIN" => unary_numeric(name, &args, f64::sin),
-            "LN" => unary_numeric(name, &args, f64::ln),
-            "LOG10" => unary_numeric(name, &args, f64::log10),
-            "FLOOR" => unary_numeric(name, &args, f64::floor),
-            "SIGN" => unary_numeric(name, &args, f64::signum),
-            "VECTOR" => vector_function(name, &args),
+            "ABS" => unary_numeric(name, &args, f64::abs, self.eval),
+            "SQRT" => unary_numeric(name, &args, f64::sqrt, self.eval),
+            "SIN" => unary_numeric(name, &args, f64::sin, self.eval),
+            "LN" => unary_numeric(name, &args, f64::ln, self.eval),
+            "LOG10" => unary_numeric(name, &args, f64::log10, self.eval),
+            "FLOOR" => unary_numeric(name, &args, f64::floor, self.eval),
+            "SIGN" => unary_numeric(name, &args, f64::signum, self.eval),
+            "VECTOR" => vector_function(name, &args, self.eval),
             "SEARCH" => search_function(name, &args),
-            "GETOPTION" => get_option_function(name, &args, self.env),
-            "FORMATNUMBER" => format_number_function(name, &args),
+            "GETOPTION" => get_option_function(name, &args, self.eval.env),
+            "FORMATNUMBER" => format_number_function(name, &args, self.eval),
             "SUBSTSTRING" => subst_string_function(name, &args),
             _ => bail!("unsupported SIMPLIS function {name}"),
         }
@@ -704,12 +805,12 @@ fn subst_string_function(name: &str, args: &[Value]) -> Result<Value> {
     Ok(Value::Text(input.replace(needle, replacement)))
 }
 
-fn format_number_function(name: &str, args: &[Value]) -> Result<Value> {
+fn format_number_function(name: &str, args: &[Value], eval: Evaluation<'_>) -> Result<Value> {
     if args.len() != 2 {
         bail!("{name} currently supports exactly two arguments");
     }
-    let value = args[0].number()?;
-    let significant_digits = args[1].number()?;
+    let value = eval.number(&args[0])?;
+    let significant_digits = eval.number(&args[1])?;
     if significant_digits < 1.0 || significant_digits > 17.0 || significant_digits.fract() != 0.0 {
         bail!("{name} significant digits must be an integer from 1 through 17");
     }
@@ -732,7 +833,7 @@ fn get_option_function(name: &str, args: &[Value], env: &Environment) -> Result<
         .unwrap_or_else(|| Value::Text("FALSE".to_owned())))
 }
 
-fn vector_add_sub(left: Value, right: Value, add: bool) -> Result<Value> {
+fn vector_add_sub(left: Value, right: Value, add: bool, eval: Evaluation<'_>) -> Result<Value> {
     fn apply(left: f64, right: f64, add: bool) -> Result<f64> {
         let value = if add { left + right } else { left - right };
         if !value.is_finite() {
@@ -742,17 +843,21 @@ fn vector_add_sub(left: Value, right: Value, add: bool) -> Result<Value> {
     }
 
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => Ok(Value::Number(apply(left, right, add)?)),
-        (Value::Vector(left), Value::Number(right)) => left
-            .into_iter()
-            .map(|value| Ok(Value::Number(apply(value.number()?, right, add)?)))
-            .collect::<Result<Vec<_>>>()
-            .map(Value::Vector),
-        (Value::Number(left), Value::Vector(right)) => right
-            .into_iter()
-            .map(|value| Ok(Value::Number(apply(left, value.number()?, add)?)))
-            .collect::<Result<Vec<_>>>()
-            .map(Value::Vector),
+        (Value::Vector(left), right @ (Value::Number(_) | Value::Text(_))) => {
+            let right = eval.number(&right)?;
+            left.into_iter()
+                .map(|value| Ok(Value::Number(apply(eval.number(&value)?, right, add)?)))
+                .collect::<Result<Vec<_>>>()
+                .map(Value::Vector)
+        }
+        (left @ (Value::Number(_) | Value::Text(_)), Value::Vector(right)) => {
+            let left = eval.number(&left)?;
+            right
+                .into_iter()
+                .map(|value| Ok(Value::Number(apply(left, eval.number(&value)?, add)?)))
+                .collect::<Result<Vec<_>>>()
+                .map(Value::Vector)
+        }
         (Value::Vector(left), Value::Vector(right)) => {
             if left.len() != right.len() {
                 bail!("SIMPLIS vector arithmetic requires equal lengths");
@@ -760,20 +865,28 @@ fn vector_add_sub(left: Value, right: Value, add: bool) -> Result<Value> {
             left.into_iter()
                 .zip(right)
                 .map(|(left, right)| {
-                    Ok(Value::Number(apply(left.number()?, right.number()?, add)?))
+                    Ok(Value::Number(apply(
+                        eval.number(&left)?,
+                        eval.number(&right)?,
+                        add,
+                    )?))
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(Value::Vector)
         }
-        _ => bail!("SIMPLIS addition/subtraction type mismatch"),
+        (left, right) => Ok(Value::Number(apply(
+            eval.number(&left)?,
+            eval.number(&right)?,
+            add,
+        )?)),
     }
 }
 
-fn vector_function(name: &str, args: &[Value]) -> Result<Value> {
+fn vector_function(name: &str, args: &[Value], eval: Evaluation<'_>) -> Result<Value> {
     if args.len() != 1 {
         bail!("{name} requires exactly one argument");
     }
-    let length = args[0].number()?;
+    let length = eval.number(&args[0])?;
     if length < 0.0 || length.fract() != 0.0 {
         bail!("{name} length must be a non-negative integer");
     }
@@ -808,11 +921,16 @@ fn search_function(name: &str, args: &[Value]) -> Result<Value> {
     Ok(Value::Number(index.map_or(-1.0, f64::from)))
 }
 
-fn unary_numeric(name: &str, args: &[Value], function: fn(f64) -> f64) -> Result<Value> {
+fn unary_numeric(
+    name: &str,
+    args: &[Value],
+    function: fn(f64) -> f64,
+    eval: Evaluation<'_>,
+) -> Result<Value> {
     if args.len() != 1 {
         bail!("{name} requires exactly one argument");
     }
-    let value = function(args[0].number()?);
+    let value = function(eval.number(&args[0])?);
     if !value.is_finite() {
         bail!("{name} produced a non-finite result");
     }
@@ -826,13 +944,7 @@ fn unary_numeric(name: &str, args: &[Value], function: fn(f64) -> f64) -> Result
 /// Returns an error for unsupported syntax/functions, undefined variables, type
 /// mismatches, non-finite arithmetic, or invalid vector access.
 pub fn eval_expression(input: &str, env: &Environment) -> Result<Value> {
-    let trimmed = input.trim();
-    let inner = if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        &trimmed[1..trimmed.len().saturating_sub(1)]
-    } else {
-        trimmed
-    };
-    Parser::new(inner, env)?.parse()
+    Evaluation::new(env).expression(input)
 }
 
 fn directive<'a>(line: &'a str, name: &str) -> Option<&'a str> {
@@ -1008,7 +1120,8 @@ fn process_range(
         let line = lines[index];
         if let Some(condition) = directive(line, "IF") {
             let (else_index, endif_index) = find_if_bounds(lines, index, end)?;
-            let active = eval_expression(unwrap_then(condition), state.env)?.truthy()?;
+            let active = Evaluation::new(state.env)
+                .truthy(&eval_expression(unwrap_then(condition), state.env)?)?;
             *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
             if active {
                 process_range(
@@ -1030,7 +1143,8 @@ fn process_range(
             let endwhile_index = find_while_end(lines, index, end)?;
             let mut iterations = 0usize;
             loop {
-                let active = eval_expression(condition, state.env)?.truthy()?;
+                let active =
+                    Evaluation::new(state.env).truthy(&eval_expression(condition, state.env)?)?;
                 *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
                 if !active {
                     break;
@@ -1185,6 +1299,164 @@ mod tests {
     }
 
     #[test]
+    fn numeric_choice_and_engineering_unit_notation_matches_reference() -> Result<()> {
+        let env = Environment::new();
+        for count in 1..=10 {
+            assert_eq!(
+                eval_expression(&format!("{count}x"), &env)?,
+                n(f64::from(count))
+            );
+        }
+        for (expression, expected) in [
+            ("3X", 3.0),
+            ("1xx", 1.0),
+            ("2.5x", 2.5),
+            ("1.5e2x", 150.0),
+            ("4foo", 4e-15),
+            ("2kOhm", 2000.0),
+            ("6megOhm", 6e6),
+            ("3V", 3.0),
+            ("4x2", 4.2),
+            ("4k7", 4700.0),
+            ("2R2", 2.2),
+            ("1meg5", 1.5e6),
+            ("1u25", 1.25e-6),
+            ("2k7Ohm", 2700.0),
+            ("2xyz", 2.0),
+            ("1foo2", 1e-15),
+            ("1.5k2", 1700.0),
+            ("1x2x3", 1.2),
+            ("1abc", 1e-18),
+            ("1abc2", 1e-18),
+            ("3mV", 0.003),
+            ("1mil", 25.4e-6),
+            ("2e", 2.0),
+            ("3efoo", 3.0),
+            ("1e3k", 1e6),
+            ("1e-3k", 1.0),
+            ("2e3x", 2000.0),
+            ("1e+3V", 1000.0),
+            ("3e-2V", 0.03),
+            ("4e2x3", 400.3),
+            ("1e2e3", 100.3),
+            ("1.2e2k3", 120_300.0),
+            ("0.5x1", 0.6),
+            ("0.01k2", 210.0),
+            ("0.0001k2", 200.1),
+            ("0.1e-2k3", 301.0),
+            ("0k2", 0.0),
+            ("0.0x2", 0.0),
+            ("0e2x3", 0.0),
+            ("4k7+1", 4701.0),
+            ("3e-2V-1", -0.97),
+        ] {
+            let actual = Evaluation::new(&env).number(&eval_expression(expression, &env)?)?;
+            assert!(
+                (actual - expected).abs() <= expected.abs() * 4.0 * f64::EPSILON,
+                "{expression}: {actual} != {expected}"
+            );
+        }
+        for invalid in [".", "1.2.3", "1e999", "1k.2", "1x+unknown"] {
+            assert!(eval_expression(invalid, &env).is_err(), "{invalid}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_string_conversion_uses_the_current_environment() -> Result<()> {
+        let mut env = Environment::new();
+        env.set("X", n(5.0));
+        for (expression, expected) in [
+            ("'2x'+1", 3.0),
+            ("'2+3'*4", 20.0),
+            ("'2k'+1", 2001.0),
+            ("'X+2'*3", 21.0),
+            ("'2+3'+1", 6.0),
+            ("'2'+'3'", 5.0),
+            ("ABS('-2')", 2.0),
+            ("IFF('0',2,3)", 3.0),
+            ("IFF('1',2,3)", 2.0),
+            ("!'0'", 1.0),
+        ] {
+            assert_eq!(
+                eval_expression(expression, &env)?,
+                n(expected),
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            eval_expression("'2' & 3", &env)?,
+            Value::Text("23".to_owned())
+        );
+        assert_eq!(eval_expression("'01' == '1'", &env)?, n(0.0));
+        for invalid in ["'2' == 2", "'2' < 3", "2 == '2'", "!'foo'"] {
+            assert!(eval_expression(invalid, &env).is_err(), "{invalid}");
+        }
+        env.set("A", Value::Text("2".to_owned()));
+        env.set("B", Value::Text("A".to_owned()));
+        env.set("C", Value::Text("B+1".to_owned()));
+        assert_eq!(eval_expression("'A'+1", &env)?, n(3.0));
+        assert_eq!(eval_expression("'B'+1", &env)?, n(3.0));
+        assert_eq!(eval_expression("'C'+1", &env)?, n(4.0));
+        env.set("LOOP", Value::Text("LOOP+1".to_owned()));
+        assert!(eval_expression("LOOP+1", &env).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn preprocessing_branches_are_lazy_but_operators_and_iff_are_eager() -> Result<()> {
+        let env = Environment::new();
+        for invalid in [
+            "IFF(1,2,UNDEFINED)",
+            "IFF(0,UNDEFINED,3)",
+            "IFF(0,1/0,3)",
+            "IFF(1,2,'abc')",
+            "0 && UNDEFINED",
+            "1 || UNDEFINED",
+            "0 && 'undefined'",
+            "1 || 'undefined'",
+        ] {
+            assert!(eval_expression(invalid, &env).is_err(), "{invalid}");
+        }
+        assert_eq!(eval_expression("IFF(1,2,[3,4])", &env)?, n(2.0));
+        assert_eq!(eval_expression("IFF(0,[2,3],4)", &env)?, n(4.0));
+        assert_eq!(
+            eval_expression("IFF(1,'hi',['a','b'])", &env)?,
+            Value::Text("hi".to_owned())
+        );
+        assert_eq!(
+            eval_expression("IFF(0,['a','b'],'hi')", &env)?,
+            Value::Text("hi".to_owned())
+        );
+        assert!(eval_expression("IFF(1,2,['a','b'])", &env).is_err());
+        assert!(eval_expression("IFF(1,[2,'a'],[3,4])", &env).is_err());
+        let source = b".IF {0}\nR1 1 0 {UNDEFINED}\n.ELSE\nR2 1 0 3\n.ENDIF\n";
+        assert_eq!(preprocess_body(source, &env)?.bytes, b"R2 1 0 3\n");
+        let source = b".IF {'0'}\nR1 1 0 {UNDEFINED}\n.ELSE\nR2 1 0 3\n.ENDIF\n";
+        assert_eq!(preprocess_body(source, &env)?.bytes, b"R2 1 0 3\n");
+        Ok(())
+    }
+
+    #[test]
+    fn quantity_defaults_overrides_and_inactive_branches_specialize() -> Result<()> {
+        let source = b".SUBCKT CTEST A B VARS: USE_QUANTITY=0 QUANTITY=1x\nC1 A B 1u\n.IF {USE_QUANTITY}\nF1 A B V1 {QUANTITY}\n.ELSE\nR1 A B 1k\n.ENDIF\n.ENDS\n";
+        let mut overrides = Environment::new();
+        assert_eq!(
+            specialize_subcircuit(source, &overrides)?
+                .environment
+                .get("QUANTITY"),
+            Some(&n(1.0))
+        );
+        overrides.set("USE_QUANTITY", n(1.0));
+        overrides.set("QUANTITY", eval_expression("3x", &Environment::new())?);
+        let specialized = specialize_subcircuit(source, &overrides)?;
+        let output = std::str::from_utf8(&specialized.bytes)?;
+        assert!(output.contains("F1 A B V1 3"));
+        assert!(!output.contains("R1 A B 1k"));
+        Ok(())
+    }
+
+    #[test]
     fn full_preprocessing_resolves_forward_active_params() -> Result<()> {
         let mut env = Environment::new();
         env.set("SELECT", n(1.0));
@@ -1242,7 +1514,7 @@ R1 1 0 {RUNTIME}
         assert_eq!(eval_expression("2^3^2", &env)?, n(512.0));
         assert_eq!(eval_expression("-2^2", &env)?, n(-4.0));
         assert_eq!(eval_expression("2^-2", &env)?, n(0.25));
-        let sine = eval_expression("SIN(PI/2)", &env)?.number()?;
+        let sine = Evaluation::new(&env).number(&eval_expression("SIN(PI/2)", &env)?)?;
         assert!((sine - 1.0).abs() < f64::EPSILON);
         Ok(())
     }
