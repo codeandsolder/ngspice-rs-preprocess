@@ -728,9 +728,12 @@ fn linked(
             },
     } = resolve_deck(root, request, options, cancellation, session)?;
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
-    let plan = capture_linked_plan(&mut linked, root, request.format, &declarations)?;
+    let mut plan = capture_linked_plan(&mut linked, root, request.format, &declarations)?;
+    if request.format == InputFormat::SimetrixDeck {
+        plan.select_statistical_sample(options.statistical_sample)?;
+    }
     let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
-        lower_simetrix_linked_runtime(&mut linked)?;
+        lower_simetrix_linked_runtime(&mut linked, options.statistical_sample)?;
         Some(capture_passive_initial_conditions(&mut linked)?)
     } else {
         None
