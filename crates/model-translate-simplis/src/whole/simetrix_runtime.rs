@@ -375,7 +375,7 @@ fn root_temperature(items: &[Item]) -> Result<f64> {
                 )
             }
             Some(".OPTIONS" | ".OPTION" | ".OPT") => {
-                super::simple_assignment_value(statement, "TEMP")
+                super::simple_assignment_value(statement, "TEMP")?
             }
             _ => None,
         };
@@ -422,7 +422,7 @@ fn collect_model_temperatures(items: &[Item], map: &mut Temperatures) -> Result<
             continue;
         };
         if let Some(device) = temperature_device(&kind)
-            && let Some(value) = super::simple_assignment_value(statement, "T_ABS")
+            && let Some(value) = super::simple_assignment_value(statement, "T_ABS")?
         {
             // Native diode and BJT instances cannot run below absolute zero.
             // Resistor models intentionally retain the existing SIMetrix
@@ -446,9 +446,9 @@ fn collect_model_temperatures(items: &[Item], map: &mut Temperatures) -> Result<
 fn lower_model_temperature(statement: &str, models: &Temperatures) -> Result<String> {
     if let Some((_, kind)) = model_header(statement)
         && temperature_device(&kind).is_some()
-        && super::simple_assignment_value(statement, "T_ABS").is_some()
+        && super::simple_assignment_value(statement, "T_ABS")?.is_some()
     {
-        return Ok(super::remove_simple_assignment(statement, "T_ABS"));
+        return super::remove_simple_assignment(statement, "T_ABS");
     }
     let trimmed = statement.trim_start();
     let Some(device) = trimmed.as_bytes().first().map(u8::to_ascii_uppercase) else {
@@ -460,7 +460,7 @@ fn lower_model_temperature(statement: &str, models: &Temperatures) -> Result<Str
         b'R' => &[3, 4],
         _ => return Ok(statement.to_owned()),
     };
-    if super::simple_assignment_value(statement, "TEMP").is_some() {
+    if super::simple_assignment_value(statement, "TEMP")?.is_some() {
         return Ok(statement.to_owned());
     }
     let normalized = normalized_statement(statement);
