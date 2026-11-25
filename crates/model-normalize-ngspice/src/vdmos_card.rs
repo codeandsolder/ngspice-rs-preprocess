@@ -1,7 +1,7 @@
 //! Typed separation of LTspice/ngspice VDMOS source declarations and metadata.
 //! Numerical VDMOS physics remains in `model-kernel-vdmos`.
 
-use crate::model_card::{ModelCard, parse_spice_constant};
+use crate::model_card::{ModelCard, ModelParameter, parse_spice_constant};
 use anyhow::{Result, bail, ensure};
 
 /// Source-level VDMOS polarity with flags resolved once at model compilation.
@@ -35,6 +35,8 @@ pub struct VdmosLiterals<'a> {
     pub parameters: Vec<(&'a str, f64)>,
     /// Metadata preserved verbatim, not silently dropped or sent to the kernel.
     pub annotations: Vec<ModelAnnotation<'a>>,
+    /// Instance-only defaults retain their source expressions, separate from physics.
+    pub instance_defaults: Vec<&'a ModelParameter>,
 }
 
 /// Extract a VDMOS literal-parameter card from an arbitrary parsed `.model`.
@@ -72,7 +74,15 @@ pub fn vdmos_resolved(
     let mut p_requested = false;
     let mut parameters = Vec::new();
     let mut annotations = Vec::new();
+    let mut instance_defaults = Vec::new();
     for param in &card.parameters {
+        if matches!(
+            param.name.to_ascii_lowercase().as_str(),
+            "temp" | "dtemp" | "thermal" | "off" | "ic" | "icvds" | "icvgs"
+        ) {
+            instance_defaults.push(param);
+            continue;
+        }
         if param.name.eq_ignore_ascii_case("pchan") || param.name.eq_ignore_ascii_case("nchan") {
             let enabled = match param.expression.as_deref() {
                 None => true,
@@ -131,6 +141,7 @@ pub fn vdmos_resolved(
         polarity,
         parameters,
         annotations,
+        instance_defaults,
     }))
 }
 
