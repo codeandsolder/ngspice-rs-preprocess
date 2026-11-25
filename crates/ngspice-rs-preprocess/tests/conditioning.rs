@@ -148,19 +148,19 @@ quit
         ensure!(a.len() == 4 && b.len() == 4);
         ensure!((a[0] - b[0]).abs() < 1e-15, "time grid mismatch");
         ensure!(
-            (a[1] - b[1]).abs() <= 1e-5 + 1e-4 * a[1].abs(),
+            (a[1] - b[1]).abs() <= 1e-4_f64.mul_add(a[1].abs(), 1e-5),
             "voltage {} {}",
             a[1],
             b[1]
         );
         ensure!(
-            (a[2] - b[2]).abs() <= 1e-7 + 1e-4 * a[2].abs(),
+            (a[2] - b[2]).abs() <= 1e-4_f64.mul_add(a[2].abs(), 1e-7),
             "terminal current {} {}",
             a[2],
             b[2]
         );
         ensure!(
-            (a[3] - b[3] / factor).abs() <= 0.1 + 1e-3 * a[3].abs(),
+            (a[3] - b[3] / factor).abs() <= 1e-3_f64.mul_add(a[3].abs(), 0.1),
             "internal coordinate {} {}",
             a[3],
             b[3] / factor
