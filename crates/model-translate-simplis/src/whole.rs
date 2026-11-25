@@ -1,4 +1,6 @@
+mod passive_ic;
 mod pwls;
+pub use passive_ic::capture_passive_initial_conditions;
 mod simetrix_runtime;
 use super::{
     CodeModelRuntime, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateMode,

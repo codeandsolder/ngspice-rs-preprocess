@@ -1,0 +1,10 @@
+* node IC mode witness
+.options initCondMode=2 icres=2
+Vs s 0 10
+Rp s p 10
+Rn n 0 20
+C1 p n 1m IC=3 BRANCH=1
+.ic V(p)=4 V(n)=2
+.tran 1u 5u 0 100n UIC
+.PRINT TRAN V(p) V(n)
+.end

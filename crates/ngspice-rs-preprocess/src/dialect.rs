@@ -16,7 +16,8 @@ use model_preprocess_simplis::{
     source_include_target,
 };
 use model_translate_simplis::{
-    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_expanded_library,
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
+    translate_simplis_expanded_library,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -65,6 +66,7 @@ fn bundle(
         companions,
         normalization: Vec::new(),
         device_identities: Vec::new(),
+        initial_conditions: None,
     }
 }
 
@@ -440,9 +442,12 @@ fn linked(
     } = catalog(request, options, cancellation, session, context)?;
     device_identities.extend(catalog_identities);
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
-    if request.format == InputFormat::SimetrixDeck {
+    let initial_conditions = if request.format == InputFormat::SimetrixDeck {
         lower_simetrix_linked_runtime(&mut linked)?;
-    }
+        Some(capture_passive_initial_conditions(&mut linked)?)
+    } else {
+        None
+    };
     let known = linked
         .libraries
         .iter()
@@ -489,6 +494,7 @@ fn linked(
     );
     let mut bundle = bundle(root, request.format, primary, companions);
     bundle.device_identities = device_identities;
+    bundle.initial_conditions = initial_conditions;
     Ok(bundle)
 }
 

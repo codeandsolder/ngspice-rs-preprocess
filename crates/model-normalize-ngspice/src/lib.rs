@@ -6,6 +6,7 @@ pub mod linked_source;
 pub mod model_card;
 pub mod param_expression;
 pub mod parameter_scope;
+pub mod passive_ic;
 pub mod vdmos_card;
 pub mod vdmos_ltspice;
 
