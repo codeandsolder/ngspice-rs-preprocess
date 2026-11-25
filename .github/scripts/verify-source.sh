@@ -21,6 +21,7 @@ bash "$temporary/source/.github/scripts/install-reference-ngspice.sh" "$temporar
 export PATH="$temporary/reference/bin:$PATH"
 cd "$temporary/source"
 cargo metadata --locked --format-version 1 >/dev/null
+bash .github/scripts/verify-workspace-membership.sh
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets

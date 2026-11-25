@@ -335,13 +335,13 @@ impl PreparedInstance {
     }
 
     /// Effective local device temperature, K.
-    #[must_use]
+    #[must_use = "use the resolved temperature in the device equations"]
     pub const fn temperature(&self) -> f64 {
         self.temperature
     }
 
     /// Temperature- and geometry-adjusted series resistance, ohm.
-    #[must_use]
+    #[must_use = "use the adjusted resistance in the series branch stamp"]
     pub const fn series_resistance(&self) -> f64 {
         self.series_resistance
     }

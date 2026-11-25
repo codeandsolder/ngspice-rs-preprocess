@@ -96,7 +96,7 @@ impl CurrentSensitivity {
     /// Multiply by the source dTdev/dRise, and subtract from thermal
     /// KCL d(Rise/Rth-P)/dRise. Other source power families remain
     /// independent contributions in the full electrothermal assembly.
-    #[must_use]
+    #[must_use = "use the derivative in the electrothermal Jacobian"]
     pub fn external_dissipation_slope(self, bias: Bias) -> f64 {
         self.external_base.mul_add(
             bias.vbbp,
@@ -311,7 +311,7 @@ impl Prepared {
         Ok(out)
     }
 
-    #[must_use]
+    #[must_use = "use the prepared resistance split in the external branch equations"]
     pub const fn split(&self) -> Split {
         self.split
     }

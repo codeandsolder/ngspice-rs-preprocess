@@ -288,19 +288,19 @@ impl BoundParameters {
     }
 
     /// Retrieve a prepared parameter by slot, without names or allocations.
-    #[must_use]
+    #[must_use = "use the resolved parameter or handle a missing slot"]
     pub fn get_slot(&self, slot: u16) -> Option<&ParameterValue> {
         self.values.get(usize::from(slot)).and_then(Option::as_ref)
     }
 
     /// The exact family implementation chosen at binding.
-    #[must_use]
+    #[must_use = "use the selected physical implementation when dispatching model equations"]
     pub const fn variant(&self) -> ModelVariant {
         self.variant
     }
 
     /// Model versus instance parameter storage.
-    #[must_use]
+    #[must_use = "use the parameter scope when resolving model and instance storage"]
     pub const fn scope(&self) -> ParameterScope {
         self.scope
     }
@@ -342,7 +342,7 @@ impl ModelVariant {
 
     /// ngspice registration-order terminal labels; optional positions are preserved,
     /// including BSIMSOI's intentionally empty fifth terminal slot.
-    #[must_use]
+    #[must_use = "use the terminal order when binding device nodes"]
     pub const fn terminals(self) -> &'static [&'static str] {
         const MOS: &[&str] = &["Drain", "Gate", "Source", "Bulk"];
         const HV: &[&str] = &["Drain", "Gate", "Source", "Bulk", "Substrate", "Temp"];
@@ -369,13 +369,13 @@ impl ModelVariant {
     pub const KERNEL_STATUS: KernelStatus = KernelStatus::NotImplemented;
 
     /// Entire name-sorted source-derived model or instance parameter table.
-    #[must_use]
+    #[must_use = "use the parameter table to bind and validate source values"]
     pub fn parameters(self, scope: ParameterScope) -> &'static [ParameterSpec] {
         catalog::table(self, scope)
     }
 
     /// Lookup only during model/instance preparation, never during numerical evaluation.
-    #[must_use]
+    #[must_use = "use the parameter specification or handle an unknown name"]
     pub fn parameter(self, scope: ParameterScope, name: &str) -> Option<&'static ParameterSpec> {
         let lower = name.to_ascii_lowercase();
         let table = self.parameters(scope);

@@ -74,7 +74,7 @@ impl Device {
 
     /// Canonical source level; this is deliberately *not* an assertion
     /// that the target simulator implements this source variant.
-    #[must_use]
+    #[must_use = "use the original source level when resolving the model variant"]
     pub const fn source_level(self) -> u16 {
         match self {
             Self::Diode1 | Self::Resistor | Self::Mos1 | Self::GummelPoon => 1,
@@ -507,7 +507,7 @@ impl MappingTable {
     }
 
     /// True if unmodeled resistors select the HSPICE implementation.
-    #[must_use]
+    #[must_use = "use the result when applying source-specific resistor defaults"]
     pub fn hspice_default_resistor(&self) -> bool {
         let key = ModelKey {
             model_type: "R".into(),

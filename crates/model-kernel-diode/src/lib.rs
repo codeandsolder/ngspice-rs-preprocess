@@ -298,7 +298,7 @@ impl Model {
 
 impl PreparedModel {
     /// Source parameters, available to the setup layer.
-    #[must_use]
+    #[must_use = "use the prepared parameter buffer when binding or evaluating the model"]
     pub const fn parameters(&self) -> &Model {
         &self.model
     }

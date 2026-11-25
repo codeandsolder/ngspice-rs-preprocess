@@ -94,7 +94,7 @@ impl TemperatureSensitivity {
     /// Exact source FLSH=2 nonlinear intrinsic-base resistor
     /// contribution to fixed-voltage thermal power slope, in W/K.
     /// Other source heat families remain independent contributors.
-    #[must_use]
+    #[must_use = "use the derivative in the electrothermal Jacobian"]
     pub fn base_dissipation_slope(self, vbpbi: f64) -> f64 {
         vbpbi * self.resistor_current
     }

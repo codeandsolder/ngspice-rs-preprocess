@@ -38,12 +38,12 @@ impl Temperature {
         })
     }
 
-    #[must_use]
+    #[must_use = "use the absolute temperature in the device equations"]
     pub const fn kelvin(self) -> f64 {
         self.kelvin
     }
 
-    #[must_use]
+    #[must_use = "use the thermal voltage in the device equations"]
     pub const fn thermal_voltage(self) -> f64 {
         self.thermal_voltage
     }

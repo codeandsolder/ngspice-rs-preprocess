@@ -350,13 +350,13 @@ impl Prepared {
 
     /// The immutable thermal trial kernel, including power/KCL/energy laws
     /// at this same effective device temperature.
-    #[must_use]
+    #[must_use = "use the prepared thermal kernel in the electrothermal evaluation"]
     pub const fn thermal_kernel(&self) -> thermal::Prepared {
         self.thermal
     }
 
     /// The immutable source nominal topology and external RC kernel.
-    #[must_use]
+    #[must_use = "use the prepared external kernel when evaluating branch dissipation"]
     pub const fn external_kernel(&self) -> external::Prepared {
         self.external
     }

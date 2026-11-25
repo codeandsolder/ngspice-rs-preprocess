@@ -56,44 +56,44 @@ impl PreparedHiSimHvInstance {
     }
 
     /// Original physical implementation for this instance.
-    #[must_use]
+    #[must_use = "use the selected physical implementation when dispatching model equations"]
     pub const fn variant(&self) -> ModelVariant {
         self.parameters.variant()
     }
 
     /// C-setup instance parameter values; use canonical numeric slots.
-    #[must_use]
+    #[must_use = "use the prepared parameter buffer when binding or evaluating the model"]
     pub const fn parameters(&self) -> &BoundParameters {
         &self.parameters
     }
 
     /// Source-bin geometry, independent of the model's later temperature laws.
-    #[must_use]
+    #[must_use = "use the prepared binning geometry when evaluating size-dependent parameters"]
     pub const fn geometry(&self) -> HiSimHvBinningGeometry {
         self.geometry
     }
 
     /// Metallurgical effective channel dimensions and other temperature-independent
     /// expressions from the beginning of the C `*temp.c` implementation.
-    #[must_use]
+    #[must_use = "use the adjusted channel dimensions in model evaluation"]
     pub const fn effective_geometry(&self) -> HiSimHvEffectiveGeometry {
         self.effective_geometry
     }
 
     /// Temperature-independent mobility, velocity, and thermal layout factors.
-    #[must_use]
+    #[must_use = "use the prepared transport geometry in mobility and velocity equations"]
     pub const fn transport_geometry(&self) -> HiSimHvTransportGeometry {
         self.transport_geometry
     }
 
     /// One of the source family's 92/95 size-dependent model parameters.
-    #[must_use]
+    #[must_use = "use the size-adjusted coefficient or handle an absent slot"]
     pub fn binned_model_slot(&self, slot: u16) -> Option<f64> {
         self.binned.get(usize::from(slot)).copied().flatten()
     }
 
     /// SPICE IC vector in the upstream C order `VDS`, `VGS`, `VBS` (volts).
-    #[must_use]
+    #[must_use = "use the prepared voltage vector when initializing device state"]
     pub const fn initial_conditions(&self) -> [f64; 3] {
         self.initial_conditions
     }

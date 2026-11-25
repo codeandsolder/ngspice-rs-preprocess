@@ -378,7 +378,7 @@ impl Prepared {
     }
 
     /// Source TMPHICJ coefficient slopes for coupled physical laws.
-    #[must_use]
+    #[must_use = "use the derivatives in the electrothermal Jacobian"]
     pub const fn temperature_slopes(&self) -> ParameterSlopes {
         self.temperature_slopes
     }

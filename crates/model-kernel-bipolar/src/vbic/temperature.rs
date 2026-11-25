@@ -182,7 +182,7 @@ impl Nominal {
         Ok(Self { values: *values })
     }
 
-    #[must_use]
+    #[must_use = "use the temperature-adjusted coefficient in the model equations"]
     pub const fn value(&self, parameter: Coefficient) -> f64 {
         self.values[parameter.index()]
     }
@@ -426,17 +426,17 @@ fn transformed_potential(
 }
 
 impl Prepared {
-    #[must_use]
+    #[must_use = "use the temperature-adjusted coefficient in the model equations"]
     pub const fn value(&self, parameter: Coefficient) -> f64 {
         self.values[parameter.index()]
     }
 
-    #[must_use]
+    #[must_use = "use the resolved temperature in the device equations"]
     pub const fn temperature(self) -> Temperature {
         self.effective
     }
 
-    #[must_use]
+    #[must_use = "use the extracted coefficients to evaluate transport"]
     pub const fn transport_parameters(&self) -> transport::Parameters {
         transport::Parameters {
             is: self.value(Coefficient::Is),
@@ -456,7 +456,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the extracted coefficients to evaluate depletion charge"]
     pub const fn depletion_parameters(&self) -> depletion::Parameters {
         depletion::Parameters {
             fc: self.value(Coefficient::Fc),
@@ -471,7 +471,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the extracted coefficients to evaluate substrate charge"]
     pub const fn substrate_parameters(&self) -> depletion::SubstrateParameters {
         depletion::SubstrateParameters {
             ps: self.value(Coefficient::Ps),
@@ -480,7 +480,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the extracted coefficients to evaluate parasitic branches"]
     pub const fn parasitic_parameters(&self) -> parasitic::Parameters {
         parasitic::Parameters {
             isp: self.value(Coefficient::Isp),
@@ -490,7 +490,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the prepared branch parameters when evaluating currents"]
     pub const fn branch_parameters(&self) -> super::Parameters {
         super::Parameters {
             ibei: self.value(Coefficient::Ibei),
@@ -514,7 +514,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the extracted coefficients to evaluate avalanche current"]
     pub const fn avalanche_parameters(&self) -> avalanche::Parameters {
         avalanche::Parameters {
             avc1: self.value(Coefficient::Avc1),
@@ -524,7 +524,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the extracted coefficients to evaluate series resistance"]
     pub const fn resistance_parameters(&self) -> resistance::Parameters {
         resistance::Parameters {
             rcx: self.value(Coefficient::Rcx),
@@ -540,7 +540,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the extracted coefficients when evaluating stored charge"]
     pub const fn charge_parameters(&self) -> charge::Parameters {
         charge::Parameters {
             transport: self.transport_parameters(),
@@ -566,7 +566,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the extracted coefficients when evaluating noise"]
     pub const fn noise_parameters(&self) -> noise::Parameters {
         noise::Parameters {
             kfn: self.value(Coefficient::Kfn),

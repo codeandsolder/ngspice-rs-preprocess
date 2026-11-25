@@ -68,7 +68,7 @@ pub struct Capabilities {
 pub struct StructureKey(pub u8);
 
 impl StructureKey {
-    #[must_use]
+    #[must_use = "use the derived semantic layout in the artifact"]
     pub const fn from_layout(layout: nodal::Layout) -> Self {
         let topology = layout.topology();
         let mut mask = 0u8;
@@ -176,12 +176,12 @@ impl Model {
             .map_err(ArtifactError::Model)
     }
 
-    #[must_use]
+    #[must_use = "use the semantic identity when matching prepared artifacts"]
     pub const fn identity(&self) -> SemanticDigest {
         self.digest
     }
 
-    #[must_use]
+    #[must_use = "use the returned provenance when checking artifact origin"]
     pub const fn provenance(&self) -> Option<Provenance> {
         self.provenance
     }
@@ -226,27 +226,27 @@ pub struct Instance {
 }
 
 impl Instance {
-    #[must_use]
+    #[must_use = "use the semantic identity when matching prepared artifacts"]
     pub const fn identity(&self) -> InstanceIdentity {
         self.identity
     }
 
-    #[must_use]
+    #[must_use = "use the prepared layout when assembling device unknowns"]
     pub const fn layout(&self) -> nodal::Layout {
         self.layout
     }
 
-    #[must_use]
+    #[must_use = "use the prepared initial voltages when initializing device state"]
     pub const fn initial_voltages(&self) -> instance::InitialVoltages {
         self.bound.initial
     }
 
-    #[must_use]
+    #[must_use = "use the flag when initializing device operating state"]
     pub const fn off(&self) -> bool {
         self.bound.off
     }
 
-    #[must_use]
+    #[must_use = "use the capability set to determine supported analysis operations"]
     pub const fn capabilities(&self) -> Capabilities {
         Capabilities {
             local: LocalPhysics::CurrentsChargesNoise,
@@ -299,7 +299,7 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    #[must_use]
+    #[must_use = "use the prepared layout when assembling device unknowns"]
     pub const fn layout(&self) -> nodal::Layout {
         self.layout
     }

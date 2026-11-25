@@ -88,7 +88,7 @@ impl CurrentSensitivity {
     /// The published source power includes IBEI, IBCI, IBEP, IJBCX,
     /// and IJSC, but *not* the IREI/IREP recombination currents.
     /// Other source heat contributors remain independent.
-    #[must_use]
+    #[must_use = "use the derivative in the electrothermal Jacobian"]
     pub fn flsh2_diode_power_slope(self, bias: Bias) -> f64 {
         self.ibei.mul_add(
             bias.vbiei,

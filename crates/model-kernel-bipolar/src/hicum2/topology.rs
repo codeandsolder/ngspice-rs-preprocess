@@ -45,7 +45,7 @@ impl Node {
     ];
     pub const TERMINALS: [Self; 4] = [Self::C, Self::B, Self::E, Self::S];
 
-    #[must_use]
+    #[must_use = "use the mapped index to access the corresponding storage slot"]
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -65,7 +65,7 @@ pub enum Resistor {
 impl Resistor {
     pub const ALL: [Self; 5] = [Self::Rbx, Self::Rbi, Self::Rcx, Self::Re, Self::Rsu];
 
-    #[must_use]
+    #[must_use = "use the terminal pair when assembling the branch"]
     pub const fn nodes(self) -> (Node, Node) {
         match self {
             Self::Rbx => (Node::B, Node::Bp),
@@ -76,7 +76,7 @@ impl Resistor {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the mapped index to access the corresponding storage slot"]
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -129,14 +129,14 @@ impl Branch {
         Self::SubstrateTransfer,
         Self::Avalanche,
     ];
-    #[must_use]
+    #[must_use = "use the mapped index to access the corresponding storage slot"]
     pub const fn index(self) -> usize {
         self as usize
     }
 
     /// Published Verilog-A branch declaration, from positive current
     /// terminal to negative terminal.
-    #[must_use]
+    #[must_use = "use the terminal pair when assembling the branch"]
     pub const fn nodes(self) -> (Node, Node) {
         match self {
             Self::Rbx => (Node::B, Node::Bp),
@@ -160,7 +160,7 @@ impl Branch {
         }
     }
 
-    #[must_use]
+    #[must_use = "use the branch resistance identifier or handle a nonresistive branch"]
     pub const fn resistor(self) -> Option<Resistor> {
         match self {
             Self::Rbx => Some(Resistor::Rbx),
@@ -261,22 +261,22 @@ impl Prepared {
         })
     }
 
-    #[must_use]
+    #[must_use = "use the mapped index to access the corresponding storage slot"]
     pub const fn index(self, node: Node) -> u8 {
         self.index[node.index()]
     }
 
-    #[must_use]
+    #[must_use = "use the count when allocating the corresponding state vector"]
     pub const fn count(self) -> usize {
         self.node_count as usize
     }
 
-    #[must_use]
+    #[must_use = "use the result to determine whether the branch is present"]
     pub const fn present(self, resistor: Resistor) -> bool {
         self.present[resistor.index()]
     }
 
-    #[must_use]
+    #[must_use = "use the result when constructing the thermal network"]
     pub const fn thermal_shorted(self) -> bool {
         self.thermal_shorted
     }
@@ -284,14 +284,14 @@ impl Prepared {
     /// The source has exactly three auxiliary NQS state nodes whenever
     /// FLNQS/FLcomp and ALIT/ALQF can enable them. Their trial values
     /// remain solver-owned and can be temporarily inactive at a bias.
-    #[must_use]
+    #[must_use = "use the count when allocating NQS unknowns"]
     pub const fn nqs_state_count(self) -> usize {
         if self.nqs_auxiliaries { 3 } else { 0 }
     }
 
     /// Source-prescribed branch endpoints after all ideal resistor shorts.
     /// The owner simulator can stamp directly into its allocated node map.
-    #[must_use]
+    #[must_use = "use the mapped endpoints when stamping the branch"]
     pub const fn ends(self, branch: Branch) -> (u8, u8) {
         let (a, b) = branch.nodes();
         (self.index(a), self.index(b))

@@ -63,4 +63,6 @@ missing_safety_doc = "deny"
 await_holding_lock = "deny"
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
+deprecated_attributes_without_note = "deny"
+must_use_without_reason = "deny"
 

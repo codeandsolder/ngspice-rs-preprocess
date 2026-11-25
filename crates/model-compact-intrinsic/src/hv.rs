@@ -63,25 +63,25 @@ pub struct PreparedHiSimHvModel {
 
 impl PreparedHiSimHvModel {
     /// Resolved source-level model implementation (HV1 or HV2).
-    #[must_use]
+    #[must_use = "use the selected physical implementation when dispatching model equations"]
     pub const fn variant(&self) -> ModelVariant {
         self.parameters.variant()
     }
 
     /// Resolved channel polarity.
-    #[must_use]
+    #[must_use = "use the resolved channel polarity in model evaluation"]
     pub const fn polarity(&self) -> MosPolarity {
         self.polarity
     }
 
     /// O(1) numerical slot access, with no runtime string lookup.
-    #[must_use]
+    #[must_use = "use the resolved parameter or handle a missing slot"]
     pub fn get_slot(&self, slot: u16) -> Option<&ParameterValue> {
         self.parameters.get_slot(slot)
     }
 
     /// Immutable prepared parameter buffer.
-    #[must_use]
+    #[must_use = "use the prepared parameter buffer when binding or evaluating the model"]
     pub const fn parameters(&self) -> &BoundParameters {
         &self.parameters
     }
