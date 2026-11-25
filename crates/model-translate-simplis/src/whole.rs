@@ -2047,6 +2047,25 @@ fn lower_simetrix_conditional(input: &str, name: &str, open: usize) -> Result<(S
     Ok((lowered, close + 1))
 }
 
+fn source_operator(bytes: &[u8], offset: usize, expression: bool) -> Option<(&'static str, usize)> {
+    let next = bytes.get(offset + 1);
+    match bytes[offset] {
+        b'&' => Some(("&&", 1 + usize::from(next == Some(&b'&')))),
+        b'|' => Some(("||", 1 + usize::from(next == Some(&b'|')))),
+        b'~' => Some(("!", 1)),
+        b'=' if expression
+            && !matches!(
+                offset.checked_sub(1).and_then(|index| bytes.get(index)),
+                Some(b'=' | b'!' | b'<' | b'>')
+            )
+            && next != Some(&b'=') =>
+        {
+            Some(("==", 1))
+        }
+        _ => None,
+    }
+}
+
 fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<String> {
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
@@ -2123,33 +2142,12 @@ fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<St
                 _ => {}
             }
         }
-        if !quote && matches!(character, '&' | '|') {
-            let byte = character as u8;
-            if bytes.get(offset.saturating_add(1)) == Some(&byte) {
-                output.push(character);
-                output.push(character);
-                offset = offset.saturating_add(2);
-                continue;
-            }
-            output.push(character);
-            output.push(character);
-            offset = offset.saturating_add(1);
-            continue;
-        }
         if !quote
-            && (expression || brace_depth > 0)
-            && character == '='
-            && !matches!(
-                offset.checked_sub(1).and_then(|index| bytes.get(index)),
-                Some(b'=' | b'!' | b'<' | b'>')
-            )
-            && bytes.get(offset + 1) != Some(&b'=')
+            && let Some((operator, width)) =
+                source_operator(bytes, offset, expression || brace_depth > 0)
         {
-            output.push('=');
-        }
-        if !quote && character == '~' {
-            output.push('!');
-            offset = offset.saturating_add(1);
+            output.push_str(operator);
+            offset += width;
             continue;
         }
         output.push(character);

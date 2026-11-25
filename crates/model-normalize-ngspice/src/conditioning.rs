@@ -86,16 +86,26 @@ struct Scope {
     ports: BTreeSet<String>,
 }
 
+/// A named emitted electrical artifact in the closed circuit graph.
+pub struct ConditioningInput<'a> {
+    pub filename: &'a str,
+    pub bytes: &'a [u8],
+}
+
 struct Source {
     cards: Vec<Card>,
     scopes: Vec<Scope>,
     globals: BTreeSet<String>,
     parameters: ModelLibrary,
     references: BTreeMap<String, Vec<usize>>,
+    constrained_capacitors: BTreeSet<usize>,
 }
 
 impl Source {
-    fn parse(inputs: &[&[u8]]) -> Result<Self> {
+    fn parse(
+        inputs: &[ConditioningInput<'_>],
+        initialization: Option<&crate::passive_ic::InitialConditions>,
+    ) -> Result<Self> {
         let mut cards = Vec::new();
         let mut scopes = vec![Scope::default()];
         // Ground aliases and conventional global nodes cannot be private.
@@ -105,9 +115,9 @@ impl Source {
         // shared scalar resolver. Unrelated device/model grammars are not
         // an additional admission gate for already translated artifacts.
         let mut parameters = String::new();
-        for (artifact, bytes) in inputs.iter().enumerate() {
+        for (artifact, input) in inputs.iter().enumerate() {
             let mut stack = vec![0];
-            for statement in lexical::statements(bytes)? {
+            for statement in lexical::statements(input.bytes)? {
                 let text = std::str::from_utf8(&statement.text)?.to_owned();
                 let fields = lexical::tokens(&statement.text)?;
                 let first = fields
@@ -185,13 +195,62 @@ impl Source {
             parameters.scopes.len() == scopes.len(),
             "conditioning scope mismatch"
         );
-        Ok(Self {
+        let mut source = Self {
             cards,
             scopes,
             globals,
             parameters,
             references,
-        })
+            constrained_capacitors: BTreeSet::new(),
+        };
+        if let Some(initialization) = initialization {
+            source.add_initialization_paths(inputs, initialization);
+        }
+        Ok(source)
+    }
+
+    fn add_initialization_paths(
+        &mut self,
+        inputs: &[ConditioningInput<'_>],
+        initialization: &crate::passive_ic::InitialConditions,
+    ) {
+        for device in &initialization.devices {
+            if device.kind != crate::passive_ic::PassiveKind::Capacitor
+                || (device.target.is_none() && device.branch.is_none())
+            {
+                continue;
+            }
+            // A typed bias constraint can carry current in parallel with
+            // the capacitor even though the electrical card has no IC.
+            for &index in self
+                .references
+                .get(&device.device.to_ascii_lowercase())
+                .into_iter()
+                .flatten()
+            {
+                let card = &self.cards[index];
+                if inputs[card.artifact].filename == device.artifact
+                    && self.scopes[card.scope].path == device.scope
+                    && card.first().eq_ignore_ascii_case(&device.device)
+                {
+                    self.constrained_capacitors.insert(index);
+                }
+            }
+        }
+        for hint in &initialization.nodes {
+            let node = hint.node.to_ascii_lowercase();
+            // A local .IC adds a node-to-ground path during bias. Ports
+            // are already exposed; root hierarchical hints can reach a
+            // private node by its final path component.
+            for scope in &mut self.scopes {
+                if scope.path == hint.scope {
+                    scope.ports.insert(node.clone());
+                }
+            }
+            if let Some((_, tail)) = node.rsplit_once('.') {
+                self.globals.insert(tail.to_owned());
+            }
+        }
     }
 }
 
@@ -640,6 +699,9 @@ struct Plan {
 }
 
 fn plan(source: &Source, circuit: &Loop) -> Option<Plan> {
+    if source.constrained_capacitors.contains(&circuit.capacitor) {
+        return None;
+    }
     let proof = Proof::new(source, circuit)?;
     let private_nodes = proof.private_nodes()?;
     let cap = &source.cards[circuit.capacitor];
@@ -740,15 +802,18 @@ fn plan(source: &Source, circuit: &Loop) -> Option<Plan> {
 ///
 /// # Errors
 /// Internal source edit invariants fail.
-pub fn condition_private_differentiators(inputs: &[&[u8]]) -> Result<Vec<ConditionedArtifact>> {
+pub fn condition_private_differentiators(
+    inputs: &[ConditioningInput<'_>],
+    initialization: Option<&crate::passive_ic::InitialConditions>,
+) -> Result<Vec<ConditionedArtifact>> {
     let mut result = inputs
         .iter()
         .map(|bytes| ConditionedArtifact {
-            bytes: bytes.to_vec(),
+            bytes: bytes.bytes.to_vec(),
             scalings: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let Ok(source) = Source::parse(inputs) else {
+    let Ok(source) = Source::parse(inputs, initialization) else {
         return Ok(result);
     };
     let mut plans = Vec::new();
@@ -785,7 +850,7 @@ pub fn condition_private_differentiators(inputs: &[&[u8]]) -> Result<Vec<Conditi
                 .all(|pair| pair[0].0.end <= pair[1].0.start),
             "overlapping conditioning edits"
         );
-        if let Some(bytes) = lexical::apply_edits(inputs[artifact], edits) {
+        if let Some(bytes) = lexical::apply_edits(inputs[artifact].bytes, edits) {
             output.bytes = bytes;
         }
     }

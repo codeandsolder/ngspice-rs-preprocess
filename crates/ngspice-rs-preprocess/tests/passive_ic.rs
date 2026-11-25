@@ -317,3 +317,87 @@ fn source_policy_preserves_native_path_and_validates_modes() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn nested_actuals_bind_distinct_initial_conditions_in_emitted_scope() -> Result<()> {
+    use model_normalize_ngspice::parameter_scope::{ModelLibrary, topology::Limits};
+    let bundle = prepare_fixture("analysis-tran")?;
+    let policy = bundle
+        .initial_conditions
+        .as_ref()
+        .context("missing policy")?;
+    let inner = policy
+        .devices
+        .iter()
+        .find(|device| device.device.eq_ignore_ascii_case("Cinner"))
+        .context("missing nested capacitor")?;
+    // The hierarchy linker generates hygienic parameter identifiers and
+    // definition names. Resolve against the actual emitted declarations.
+    let directory = tempfile::tempdir()?;
+    for artifact in bundle.artifacts() {
+        fs::write(directory.path().join(&artifact.filename), &artifact.bytes)?;
+    }
+    let linked = model_normalize_ngspice::linked_source::SourceLinker::default()
+        .link(&directory.path().join(&bundle.primary.filename))?;
+    let library = ModelLibrary::parse(&linked.bytes)?;
+    let topology = library.instantiate(Limits::default())?;
+    let mut targets = Vec::new();
+    let analysis = Analysis::Transient { uic: false };
+    let defaults = policy.resolve_defaults(|value| isolated(value, analysis))?;
+    for frame in &topology.frames {
+        let scope = &library.scopes[frame.declaration];
+        if !scope.name.as_deref().is_some_and(|name| {
+            inner
+                .scope
+                .last()
+                .is_some_and(|emitted| name.eq_ignore_ascii_case(emitted))
+        }) {
+            continue;
+        }
+        let mut overrides = frame
+            .overrides
+            .iter()
+            .map(|(name, &value)| (frame.declaration, name.as_str(), value))
+            .collect::<Vec<_>>();
+        overrides.push((0, "analysis", analysis.source_code()));
+        let resolved = inner.resolve(analysis, defaults, |value| {
+            library.evaluate_scalar(frame.declaration, value, &overrides)
+        })?;
+        let BiasConstraint::CapacitorHard { voltage } = resolved.bias else {
+            bail!("expected hard constraint")
+        };
+        targets.push(voltage);
+    }
+    targets.sort_by(f64::total_cmp);
+    assert_eq!(targets, [-1., 2.]);
+    Ok(())
+}
+
+#[test]
+fn typed_bias_paths_disqualify_only_affected_private_loops() -> Result<()> {
+    use model_normalize_ngspice::conditioning::{
+        ConditioningInput, condition_private_differentiators,
+    };
+    use ngspice_rs_preprocess::passive_ic::capture_statement;
+    let deck = b"* source\nX1 a 0 cell1\nX2 b 0 cell2\n.end\n";
+    let models=b".subckt cell1 a b\nEdrive aux b a b 1\nCstate aux b 1\nBcap a b I={-1u*I(Edrive)}\n.ends cell1\n.subckt cell2 a b\nEdrive aux b a b 1\nCstate aux b 1\nBcap a b I={-1u*I(Edrive)}\n.ends cell2\n";
+    let inputs = [
+        ConditioningInput {
+            filename: "deck.cir",
+            bytes: deck,
+        },
+        ConditioningInput {
+            filename: "model.lib",
+            bytes: models,
+        },
+    ];
+    for declaration in ["Cstate aux b 1 IC=2 BRANCH=1", ".ic V(aux)=2"] {
+        let mut policy = InitialConditions::default();
+        let _ = capture_statement(&mut policy, "model.lib", &["cell1".to_owned()], declaration)?;
+        let result = condition_private_differentiators(&inputs, Some(&policy))?;
+        let scales = &result[1].scalings;
+        assert_eq!(scales.len(), 1, "{declaration}");
+        assert_eq!(scales[0].scope, ["cell2"]);
+    }
+    Ok(())
+}

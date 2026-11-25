@@ -2,7 +2,7 @@
 //! integration and an independent linear small-signal circuit law.
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::conditioning::{
-    ConditionedArtifact, condition_private_differentiators,
+    ConditionedArtifact, ConditioningInput, condition_private_differentiators,
 };
 use ngspice_rs_preprocess::{Cancellation, InputFormat, Options, Request, SourceInput, prepare};
 use std::{fs, path::Path, process::Command};
@@ -19,7 +19,19 @@ Bother a b I={cnom/8*(I(Vmeasure)+I(Vreverse))}
 ";
 
 fn condition(library: &str, root: &str) -> Result<ConditionedArtifact> {
-    let mut outputs = condition_private_differentiators(&[root.as_bytes(), library.as_bytes()])?;
+    let mut outputs = condition_private_differentiators(
+        &[
+            ConditioningInput {
+                filename: "deck.cir",
+                bytes: root.as_bytes(),
+            },
+            ConditioningInput {
+                filename: "model.lib",
+                bytes: library.as_bytes(),
+            },
+        ],
+        None,
+    )?;
     ensure!(outputs.len() == 2);
     Ok(outputs.remove(1))
 }

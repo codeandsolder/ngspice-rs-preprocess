@@ -363,12 +363,17 @@ pub fn prepare(
 }
 
 fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
-    use model_normalize_ngspice::conditioning::condition_private_differentiators;
+    use model_normalize_ngspice::conditioning::{
+        ConditioningInput, condition_private_differentiators,
+    };
     let inputs = bundle
         .artifacts()
-        .map(|artifact| artifact.bytes.as_slice())
+        .map(|artifact| ConditioningInput {
+            filename: &artifact.filename,
+            bytes: &artifact.bytes,
+        })
         .collect::<Vec<_>>();
-    let outputs = condition_private_differentiators(&inputs)?;
+    let outputs = condition_private_differentiators(&inputs, bundle.initial_conditions.as_ref())?;
     let mut changed = false;
     for (artifact, output) in std::iter::once(&mut bundle.primary)
         .chain(&mut bundle.companions)

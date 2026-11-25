@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 fn capture_items(
     items: &mut [Item],
     artifact: &str,
-    scope: &mut Vec<String>,
+    scope: &[String],
     conditions: &mut InitialConditions,
 ) -> Result<()> {
     let mut embedded = false;
@@ -31,8 +31,7 @@ fn capture_items(
                 }
             }
             Item::Subcircuit(block) => {
-                let mut emitted_scope = vec![block.name.clone()];
-                capture_items(&mut block.body, artifact, &mut emitted_scope, conditions)?;
+                capture_items(&mut block.body, artifact, &[block.name.clone()], conditions)?;
             }
         }
     }
@@ -45,7 +44,7 @@ fn capture_artifact(
     conditions: &mut InitialConditions,
 ) -> Result<()> {
     let mut items = parse_items(std::str::from_utf8(bytes)?)?;
-    capture_items(&mut items, filename, &mut Vec::new(), conditions)?;
+    capture_items(&mut items, filename, &[], conditions)?;
     let mut output = String::new();
     for item in items {
         match item {
@@ -59,6 +58,7 @@ fn capture_artifact(
 
 /// Remove source-only IC annotations from the linked electrical text and
 /// retain the complete typed, symbolic initialization policy for the solver.
+///
 /// Call after source expression normalization and before native translation.
 ///
 /// # Errors

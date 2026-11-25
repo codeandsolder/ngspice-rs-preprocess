@@ -270,7 +270,7 @@ pub fn statement_tokens(input: &str) -> Result<Vec<String>> {
 }
 
 /// Join continuation lines into a single logical statement.
-#[must_use]
+#[must_use = "the normalized logical statement must replace its physical-line form"]
 pub fn normalized_statement(input: &str) -> String {
     input
         .lines()
@@ -319,7 +319,7 @@ fn assignment_only_continuation(line: &str) -> bool {
 
 /// Identify embedded file delimiters without tokenizing file contents.
 /// True opens a file, false closes it.
-#[must_use]
+#[must_use = "the result identifies entry or exit from opaque embedded data"]
 pub fn file_boundary(statement: &str) -> Option<bool> {
     let trimmed = statement.trim_start();
     for (name, starts) in [(".file", true), (".endf", false)] {
@@ -338,7 +338,7 @@ pub fn file_boundary(statement: &str) -> Option<bool> {
 
 /// Borrow the electrical statements in one lexical scope, excluding
 /// embedded file payloads and subcircuit definitions.
-#[must_use]
+#[must_use = "the returned statements exclude embedded file content"]
 pub fn electrical_statements(items: &[Item]) -> Vec<&str> {
     let mut statements = Vec::new();
     let mut embedded = false;
@@ -408,7 +408,7 @@ pub fn embedded_files(items: &[Item]) -> Result<BTreeMap<String, Vec<&str>>> {
 }
 
 /// Split physical deck lines into logical statements, preserving embedded payloads.
-#[must_use]
+#[must_use = "the returned logical statements preserve source continuation semantics"]
 pub fn logical_statements(input: &str) -> Vec<String> {
     let lines = input.lines().map(str::to_owned).collect::<Vec<_>>();
     let mut statements = Vec::<String>::new();
@@ -553,7 +553,7 @@ pub(crate) fn matching_behavioral_delimiter(
 }
 
 /// Return the case-normalized model name and kind, if present.
-#[must_use]
+#[must_use = "the result identifies the declared model and family"]
 pub fn model_header(statement: &str) -> Option<(String, String)> {
     let normalized = normalized_statement(statement);
     let fields = normalized.split_whitespace().collect::<Vec<_>>();
@@ -634,7 +634,7 @@ pub(crate) fn simple_assignment_span(statement: &str, name: &str) -> Option<(usi
 }
 
 /// Return a named scalar assignment, including balanced braces.
-#[must_use]
+#[must_use = "the returned expression is the value of the named assignment"]
 pub fn simple_assignment_value(statement: &str, name: &str) -> Option<String> {
     let normalized = normalized_statement(statement);
     let (_, value_start, value_end) = simple_assignment_span(&normalized, name)?;

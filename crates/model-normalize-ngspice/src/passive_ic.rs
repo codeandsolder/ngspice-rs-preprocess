@@ -298,6 +298,7 @@ pub fn evaluate_expression(
 }
 
 /// Parse one logical source statement in its already linked lexical scope.
+///
 /// Returns a statement with all source-specific passive IC fields removed.
 /// The typed policy owns both storage IC and node hints; native IC semantics
 /// must not also be applied.
