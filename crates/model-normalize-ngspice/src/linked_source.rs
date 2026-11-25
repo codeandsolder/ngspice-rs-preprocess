@@ -53,6 +53,8 @@ pub enum LibrarySyntax {
     NamedSections,
     /// `LTspice` whole-file .lib reference; named sections remain supported.
     Ltspice,
+    /// `PSpice` whole-file import retains electrical cards.
+    Pspice,
 }
 
 /// Root source treatment. Included resources are always include-safe.
@@ -328,6 +330,37 @@ impl SourceLinker {
     }
 }
 
+fn validate_pspice_header(body: &[u8], kind: RootKind, path: &Path) -> Result<()> {
+    let mut lines = body.split_inclusive(|byte| *byte == b'\n');
+    let first = lines.next().unwrap_or_default().trim_ascii();
+    let second = lines.next().unwrap_or_default().trim_ascii();
+    let header = if kind == RootKind::Include && (first.is_empty() || first.starts_with(b"*")) {
+        [first, second]
+            .into_iter()
+            .find(|line| line.starts_with(b"*#"))
+            .unwrap_or_default()
+    } else {
+        first
+    };
+    let declaration = header
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or_default();
+    ensure!(
+        ![
+            b"*#SIMETRIX".as_slice(),
+            b"*#HSPICE",
+            b"*#LTSPICE",
+            b"*#NATIVE"
+        ]
+        .iter()
+        .any(|name| declaration.eq_ignore_ascii_case(name)),
+        "{}: explicit foreign source dialect in standalone PSpice graph",
+        path.display()
+    );
+    Ok(())
+}
+
 impl LinkState<'_> {
     fn resolve(&self, path: &Path, parent: &Path) -> Result<PathBuf> {
         let local = parent.parent().into_iter().map(|dir| dir.join(path));
@@ -380,10 +413,10 @@ impl LinkState<'_> {
         projection: &mut Projection,
     ) -> Result<()> {
         let portable;
-        let requested = if self.settings.library_syntax == LibrarySyntax::Ltspice {
+        let requested = if self.settings.library_syntax != LibrarySyntax::NamedSections {
             let text = requested
                 .to_str()
-                .context("non-UTF-8 LTspice resource path")?;
+                .context("non-UTF-8 source resource path")?;
             portable = PathBuf::from(text.replace('\\', "/"));
             portable.as_path()
         } else {
@@ -469,6 +502,9 @@ impl LinkState<'_> {
         } else {
             (&source.bytes[..], 1)
         };
+        if self.settings.library_syntax == LibrarySyntax::Pspice {
+            validate_pspice_header(body, kind, path)?;
+        }
         let mut selection = SectionSelection::new(section);
         let mut in_control = false;
         let physical = body
@@ -486,7 +522,7 @@ impl LinkState<'_> {
             let control_end = directive(text, ".endc").is_some();
             let whole_file_reference = !in_control
                 && !control_start
-                && self.settings.library_syntax == LibrarySyntax::Ltspice
+                && self.settings.library_syntax != LibrarySyntax::NamedSections
                 && (section.is_none() || selection.active.is_some())
                 && library_marker(text)?.is_some_and(|args| args.len() == 1);
             if !in_control
@@ -546,7 +582,7 @@ impl LinkState<'_> {
             return self.expand(Path::new(&args[0]), path, None, projection);
         }
         if let Some(args) = library_marker(text)? {
-            if self.settings.library_syntax == LibrarySyntax::Ltspice && args.len() == 1 {
+            if self.settings.library_syntax != LibrarySyntax::NamedSections && args.len() == 1 {
                 return self.expand_library(Path::new(&args[0]), path, None, projection);
             }
             ensure!(

@@ -272,15 +272,23 @@ impl Balanced {
 /// Top-level whitespace and assignment separators, with balanced expression
 /// delimiters and quotes kept intact as a single token.
 pub fn tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
+    tokens_with_separator(text, false)
+}
+
+pub fn comma_tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
+    tokens_with_separator(text, true)
+}
+
+fn tokens_with_separator(text: &[u8], comma: bool) -> Result<Vec<Range<usize>>> {
     let mut ranges = Vec::new();
     let mut start = None;
     let mut balanced = Balanced::default();
     for (i, &b) in text.iter().enumerate() {
-        if balanced.top_level() && (b.is_ascii_whitespace() || b == b'=') {
+        if balanced.top_level() && (b.is_ascii_whitespace() || b == b'=' || comma && b == b',') {
             if let Some(begin) = start.take() {
                 ranges.push(begin..i);
             }
-            if b == b'=' {
+            if b == b'=' || comma && b == b',' {
                 ranges.push(i..i + 1);
             }
             continue;

@@ -34,6 +34,10 @@ pub enum InputFormat {
     LtspiceDeck,
     /// `LTspice` source library, emitted as include-safe native syntax.
     LtspiceLibrary,
+    /// Standalone `PSpice` deck lowered to native SPICE.
+    PspiceDeck,
+    /// Standalone `PSpice` library lowered to include-safe native SPICE.
+    PspiceLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,
     /// `SIMetrix` source deck with optional library catalog.
@@ -59,6 +63,8 @@ impl InputFormat {
             "native-library" => Ok(Self::NativeLibrary),
             "ltspice-deck" => Ok(Self::LtspiceDeck),
             "ltspice-library" => Ok(Self::LtspiceLibrary),
+            "pspice-deck" => Ok(Self::PspiceDeck),
+            "pspice-library" => Ok(Self::PspiceLibrary),
             "simplis-deck" => Ok(Self::SimplisDeck),
             "simetrix-deck" => Ok(Self::SimetrixDeck),
             "expanded-deck" => Ok(Self::ExpandedDeck),
@@ -270,24 +276,21 @@ fn native(
 ) -> Result<PreparedBundle> {
     let kind = if matches!(
         request.format,
-        InputFormat::NativeDeck | InputFormat::LtspiceDeck
+        InputFormat::NativeDeck | InputFormat::LtspiceDeck | InputFormat::PspiceDeck
     ) {
         RootKind::Deck
     } else {
         RootKind::Include
     };
     let origin = root.path.clone();
-    let ltspice = matches!(
-        request.format,
-        InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary
-    );
+    let syntax = match request.format {
+        InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary => LibrarySyntax::Ltspice,
+        InputFormat::PspiceDeck | InputFormat::PspiceLibrary => LibrarySyntax::Pspice,
+        _ => LibrarySyntax::NamedSections,
+    };
     let linked = SourceLinker {
         search_paths: request.search_paths.clone(),
-        library_syntax: if ltspice {
-            LibrarySyntax::Ltspice
-        } else {
-            LibrarySyntax::NamedSections
-        },
+        library_syntax: syntax,
     }
     .link_admitted(
         root,
@@ -297,12 +300,33 @@ fn native(
         },
         session,
     )?;
-    let dialect = if ltspice {
-        model_normalize_ngspice::NormalizationDialect::Ltspice
+    let (normalized, device_identities) = if syntax == LibrarySyntax::Pspice {
+        let normalized = model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?;
+        let identities = normalized
+            .renamed
+            .into_iter()
+            .map(|device| {
+                let origin = linked
+                    .origin(device.input_line)
+                    .context("missing renamed device origin")?;
+                Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
+                    source: display_path(&origin.path),
+                    scope: device.scope,
+                    displayed: device.declared.clone(),
+                    declared: device.declared,
+                    linked: device.linked,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (normalized.mapped, identities)
     } else {
-        model_normalize_ngspice::NormalizationDialect::Native
+        let dialect = if syntax == LibrarySyntax::Ltspice {
+            model_normalize_ngspice::NormalizationDialect::Ltspice
+        } else {
+            model_normalize_ngspice::NormalizationDialect::Native
+        };
+        (normalize_mapped(&linked.bytes, kind, dialect)?, Vec::new())
     };
-    let normalized = normalize_mapped(&linked.bytes, kind, dialect)?;
     let lines = normalized
         .input_lines
         .into_iter()
@@ -334,7 +358,7 @@ fn native(
         },
         companions: Vec::new(),
         normalization: normalized.model.passes,
-        device_identities: Vec::new(),
+        device_identities,
         model_selections: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,
@@ -359,6 +383,8 @@ fn validate_request(request: &Request) -> Result<()> {
                     | InputFormat::NativeLibrary
                     | InputFormat::LtspiceDeck
                     | InputFormat::LtspiceLibrary
+                    | InputFormat::PspiceDeck
+                    | InputFormat::PspiceLibrary
                     | InputFormat::SimetrixDeck
                     | InputFormat::SimetrixLibrary
             ),
@@ -392,7 +418,9 @@ pub fn prepare(
         InputFormat::NativeDeck
         | InputFormat::NativeLibrary
         | InputFormat::LtspiceDeck
-        | InputFormat::LtspiceLibrary => native(&root, request, options, &mut session),
+        | InputFormat::LtspiceLibrary
+        | InputFormat::PspiceDeck
+        | InputFormat::PspiceLibrary => native(&root, request, options, &mut session),
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
     if request.format == InputFormat::SimetrixDeck
