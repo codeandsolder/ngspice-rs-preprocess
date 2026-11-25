@@ -31,6 +31,11 @@ void cm_preprocess_logic_event(ARGS)
     int i, size = PORT_SIZE(in);
     double delay = PARAM(delay), low = PARAM(low), high = PARAM(high);
     double earliest = TIME;
+    if (op >= 4 && size != 2) {
+        cm_message_send("preprocess_logic_event: latch requires exactly two inputs");
+        OUTPUT_CHANGED(out) = FALSE;
+        return;
+    }
     if (INIT) {
         cm_event_alloc(0, (int)(sizeof(struct logic_event_state) +
             (size_t)size * sizeof(struct receiver_sample)));

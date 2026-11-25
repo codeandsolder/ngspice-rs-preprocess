@@ -2,11 +2,12 @@ mod pwls;
 mod simetrix_runtime;
 use super::{
     CodeModelRuntime, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateMode,
-    LogicGateSpec, LogicIo, LogicOperation, LogicOutput, LogicPolarity, LogicReceiver, LogicTiming,
-    Point, Translation, TranslationKind, emit_digital_buffer, emit_logic_event, emit_logic_gate,
-    emit_logic_output, indexed_points, integer_parameter, normalized_statement, numeric_parameter,
-    parse_assignments, sanitized_name, statement_tokens, translate_charge_capacitor,
-    translate_ipwlr, translate_vpwlr, validate_node, write_number,
+    LogicGateSpec, LogicIo, LogicOperation, LogicOutput, LogicPolarity, LogicReceiver,
+    LogicThresholds, LogicTiming, Point, Translation, TranslationKind, emit_digital_buffer,
+    emit_logic_event, emit_logic_gate, emit_logic_input_loads, emit_logic_output,
+    emit_logic_voltage, indexed_points, integer_parameter, model_statement_tokens,
+    normalized_statement, numeric_parameter, parse_assignments, sanitized_name, statement_tokens,
+    translate_charge_capacitor, translate_ipwlr, translate_vpwlr, validate_node, write_number,
 };
 #[cfg(test)]
 use crate::syntax::logical_statements;
@@ -1007,12 +1008,6 @@ fn raw_vcq_model(statement: &str) -> Result<Option<(String, RawVcqModel)>> {
     )))
 }
 
-// ngspice's native SW model is transient-step fragile at the 1 nΩ ideal-switch
-// value used by some SIMPLIS helpers. 2 nΩ is still electrically negligible for
-// those helpers and is the lowest broad stable basin in the LMG regression.
-// Apply the floor only when Roff remains above it.
-const NGSPICE_MIN_VCSW_RON_OHMS: f64 = 2.0e-9;
-
 #[derive(Clone, Debug)]
 enum RuntimeNumeric {
     Constant(f64),
@@ -1090,6 +1085,7 @@ struct SimetrixTimedVswitch {
     toff: RuntimeNumeric,
     td_on: RuntimeNumeric,
     td_off: RuntimeNumeric,
+    timetol: RuntimeNumeric,
     gin: RuntimeNumeric,
 }
 
@@ -1162,6 +1158,7 @@ fn parse_vswitch_transfer(
         td
     };
     let gin = runtime_numeric_or(parameters, "GIN", 0.0)?;
+    let timetol = runtime_numeric_or(parameters, "TIMETOL", 10.0e-12)?;
     for (name, value, allow_zero) in [
         ("VH", &vh, true),
         ("TON", &ton, false),
@@ -1169,6 +1166,7 @@ fn parse_vswitch_transfer(
         ("TD_ON", &td_on, true),
         ("TD_OFF", &td_off, true),
         ("GIN", &gin, true),
+        ("TIMETOL", &timetol, true),
     ] {
         if let RuntimeNumeric::Constant(value) = value
             && (*value < 0.0 || (!allow_zero && *value == 0.0))
@@ -1176,11 +1174,27 @@ fn parse_vswitch_transfer(
             bail!("invalid timed VSWITCH {name} on model {model_name}");
         }
     }
-    if let Some(value) = parameters.get("TIMETOL") {
-        let timetol = runtime_numeric_value("TIMETOL", value)?;
-        if !matches!(timetol, RuntimeNumeric::Constant(value) if (value - 10.0e-12).abs() <= 1.0e-24)
-        {
-            bail!("non-default timed VSWITCH TIMETOL is not yet supported");
+    if let RuntimeNumeric::Constant(value) = timetol
+        && value < 1.0e-15
+    {
+        bail!("timed VSWITCH TIMETOL below 1 fs on {model_name}");
+    }
+    for name in parameters.keys() {
+        if !matches!(
+            name.as_str(),
+            "RON"
+                | "ROFF"
+                | "VT"
+                | "VH"
+                | "TON"
+                | "TOFF"
+                | "TD"
+                | "TD_ON"
+                | "TD_OFF"
+                | "TIMETOL"
+                | "GIN"
+        ) {
+            bail!("unsupported timed VSWITCH model parameter {name} on {model_name}");
         }
     }
     Ok(VcswTransfer::SimetrixTimedHysteresis(
@@ -1193,6 +1207,7 @@ fn parse_vswitch_transfer(
             toff,
             td_on,
             td_off,
+            timetol,
             gin,
         },
     ))
@@ -1208,8 +1223,7 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
         return Ok(None);
     }
     let normalized = normalized_statement(statement);
-    let separated = normalized.replace(['(', ')', ','], " ");
-    let tokens = statement_tokens(&separated)?;
+    let tokens = model_statement_tokens(&normalized)?;
     if tokens.len() < 3 {
         return Ok(None);
     }
@@ -1635,13 +1649,14 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
             initial: false,
         }
     };
+    emit_logic_input_loads(&mut output, stem, rtn, inputs, io.rin)?;
     let state = emit_logic_event(
         &mut output,
         stem,
         rtn,
         inputs,
         &[receiver; 2],
-        io,
+        io.thresholds(),
         LogicTiming {
             operation,
             delay: model.delay,
@@ -2763,28 +2778,50 @@ fn spice_number(value: f64) -> Result<String> {
     Ok(output)
 }
 
+fn voltage_switch_control(
+    tokens: &[String],
+    model_index: usize,
+    branches: &std::collections::BTreeMap<String, (String, String)>,
+) -> Result<(String, String)> {
+    let pair = switch_control_and_model(tokens)
+        .filter(|(_, _, index)| *index == model_index)
+        .map(|(positive, negative, _)| (positive, negative));
+    let (positive, negative) = match pair {
+        Some(pair) => pair,
+        None if model_index == 4 => branches
+            .get(&tokens[3].to_ascii_uppercase())
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "SIMPLIS switch references unknown voltage branch {}",
+                    tokens[3]
+                )
+            })?,
+        None => bail!("invalid voltage-controlled switch terminal syntax"),
+    };
+    validate_node(&positive)?;
+    validate_node(&negative)?;
+    Ok((positive, negative))
+}
+
 fn q_control_expression(
     model: &RawVcqModel,
     tokens: &[String],
-    current_branches: &std::collections::BTreeMap<String, String>,
+    model_index: usize,
+    scope: &ScopeAnalysis,
 ) -> Result<String> {
     match model.control {
         RawQControl::Voltage => {
-            let control_p = tokens
-                .get(3)
-                .context("SIMPLIS voltage-controlled transistor switch has no positive control")?;
-            let control_n = tokens
-                .get(4)
-                .context("SIMPLIS voltage-controlled transistor switch has no negative control")?;
-            validate_node(control_p)?;
-            validate_node(control_n)?;
-            Ok(format!("v({control_p},{control_n})"))
+            let (positive, negative) =
+                voltage_switch_control(tokens, model_index, &scope.voltage_branches)?;
+            Ok(format!("v({positive},{negative})"))
         }
         RawQControl::Current => {
             let control_name = tokens
                 .get(3)
                 .context("SIMPLIS current-controlled transistor switch has no control branch")?;
-            let branch = current_branches
+            let branch = scope
+                .current_branches
                 .get(&control_name.to_ascii_uppercase())
                 .with_context(|| {
                     format!(
@@ -2825,44 +2862,65 @@ fn q_closed_current_expression(
     Ok((leak, closed))
 }
 
+/// Strict Schmitt state shared by simple and transistor switches.
+fn emit_switch_state(
+    output: &mut String,
+    stem: &str,
+    control: &str,
+    thresholds: LogicThresholds,
+    polarity: LogicPolarity,
+    closed: bool,
+) -> Result<String> {
+    let control_node = format!("__{stem}_CTRL");
+    writeln!(output, "B__{stem}_CTRL {control_node} 0 V='{control}'")?;
+    let state = emit_logic_event(
+        output,
+        stem,
+        "0",
+        &[control_node],
+        &[LogicReceiver {
+            polarity,
+            initial: closed,
+        }],
+        thresholds,
+        LogicTiming {
+            operation: LogicOperation::And,
+            delay: 0.0,
+            inertial: true,
+            initial: closed,
+        },
+    )?;
+    let voltage = format!("__{stem}_STATE");
+    emit_logic_voltage(
+        output,
+        &format!("{stem}_STATE"),
+        &voltage,
+        "0",
+        &state,
+        [0.0, 1.0],
+    )?;
+    Ok(voltage)
+}
+
 fn emit_qswitch(
     model: &RawVcqModel,
     tokens: &[String],
     control: &str,
     closed: bool,
 ) -> Result<Translation> {
-    let logic_sign = if model.logic == "POS" { 1.0 } else { -1.0 };
-    let effective_threshold = logic_sign * model.threshold;
     let stem = sanitized_name(&tokens[0]);
-    let control_node = format!("__{stem}_CTRL");
-    let state_input = format!("__{stem}_STATE_INPUT");
-    let state = format!("__{stem}_STATE");
-    let hyst_model = format!("__{stem}_HYST_M");
-    let force = if closed {
-        effective_threshold + model.hystwd / 2.0 + 1.0
-    } else {
-        effective_threshold - model.hystwd / 2.0 - 1.0
-    };
     let mut output = String::new();
-    writeln!(
-        output,
-        "B__{stem}_CTRL {control_node} 0 V='{}*({control})'",
-        spice_number(logic_sign)?
+    let state = emit_switch_state(
+        &mut output,
+        &stem,
+        control,
+        LogicThresholds {
+            center: model.threshold,
+            width: model.hystwd,
+        },
+        LogicPolarity::parse(&model.logic)?,
+        closed,
     )?;
-    writeln!(
-        output,
-        "B__{stem}_STATE_INPUT {state_input} 0 V='(time<=0 ? {} : v({control_node}))'",
-        spice_number(force)?
-    )?;
-    writeln!(output, "A__{stem}_HYST {state_input} {state} {hyst_model}")?;
-    writeln!(
-        output,
-        ".model {hyst_model} hyst(in_low={} in_high={} hyst={} out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)",
-        spice_number(effective_threshold)?,
-        spice_number(effective_threshold)?,
-        spice_number(model.hystwd / 2.0)?
-    )?;
-
     let branch_voltage = format!("v({},{})", tokens[1], tokens[2]);
     let (leak, closed_current) = q_closed_current_expression(model, control, &branch_voltage)?;
     writeln!(
@@ -2880,11 +2938,20 @@ fn emit_qswitch(
     })
 }
 
-fn translate_raw_vcq_device(
-    statement: &str,
-    models: &std::collections::BTreeMap<String, RawVcqModel>,
-    current_branches: &std::collections::BTreeMap<String, String>,
-) -> Result<Option<Translation>> {
+fn switch_closed_hint(value: Option<&str>) -> Result<bool> {
+    match value
+        .unwrap_or("OPEN")
+        .trim_matches('\'')
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "OPEN" => Ok(false),
+        "CLOSE" | "CLOSED" => Ok(true),
+        other => bail!("unsupported SIMPLIS switch IC={other}"),
+    }
+}
+
+fn translate_raw_vcq_device(statement: &str, scope: &ScopeAnalysis) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     if !tokens
         .first()
@@ -2893,21 +2960,17 @@ fn translate_raw_vcq_device(
     {
         return Ok(None);
     }
-    let candidate = [4usize, 5].into_iter().find_map(|model_index| {
+    let candidate = [5usize, 4].into_iter().find_map(|model_index| {
         tokens
             .get(model_index)
-            .and_then(|name| models.get(&name.to_ascii_uppercase()))
+            .and_then(|name| scope.vcq.get(&name.to_ascii_uppercase()))
             .map(|model| (model_index, model))
     });
     let Some((model_index, model)) = candidate else {
         return Ok(None);
     };
-    let expected_model_index = match model.control {
-        RawQControl::Current => 4,
-        RawQControl::Voltage => 5,
-    };
-    if model_index != expected_model_index {
-        bail!("SIMPLIS transistor-switch control syntax does not match its model type");
+    if matches!(model.control, RawQControl::Current) && model_index != 4 {
+        bail!("SIMPLIS current-controlled transistor switch requires one control branch");
     }
     if model.iflow != "BIDIR" {
         bail!("SIMPLIS transistor-switch lowering requires IFLOW=BIDIR");
@@ -2916,13 +2979,14 @@ fn translate_raw_vcq_device(
         validate_node(node)?;
     }
     let parameters = parse_assignments(&tokens[model_index + 1..])?;
-    let initial = parameters.get("IC").map_or("OPEN", String::as_str);
-    let closed = match initial.trim_matches('\'').to_ascii_uppercase().as_str() {
-        "OPEN" => false,
-        "CLOSE" | "CLOSED" => true,
-        other => bail!("unsupported SIMPLIS transistor-switch IC={other}"),
-    };
-    let control = q_control_expression(model, &tokens, current_branches)?;
+    if parameters.keys().any(|name| name != "IC") {
+        bail!(
+            "unsupported SIMPLIS transistor-switch instance parameter on {}",
+            tokens[0]
+        );
+    }
+    let closed = switch_closed_hint(parameters.get("IC").map(String::as_str))?;
+    let control = q_control_expression(model, &tokens, model_index, scope)?;
     emit_qswitch(model, &tokens, &control, closed).map(Some)
 }
 
@@ -3012,89 +3076,46 @@ fn emit_simetrix_timed_vswitch(
         bail!("timed VSWITCH IC must be 0 or 1");
     }
     let stem = sanitized_name(&instance.tokens[0]);
-    let vt = runtime_numeric_expression(&model.vt)?;
-    let vh = runtime_numeric_expression(&model.vh)?;
-    let ton = runtime_numeric_expression(&model.ton)?;
-    let toff = runtime_numeric_expression(&model.toff)?;
-    let td_on = runtime_numeric_expression(&model.td_on)?;
-    let td_off = runtime_numeric_expression(&model.td_off)?;
-    let ron = runtime_numeric_expression(&model.ron)?;
-    let roff = runtime_numeric_expression(&model.roff)?;
-    let gin = runtime_numeric_expression(&model.gin)?;
-    let ic = runtime_numeric_expression(&ic)?;
-    let control = format!("__{stem}_TIMED_CTRL");
-    let raw = format!("__{stem}_TIMED_RAW");
-    let delayed_on = format!("__{stem}_TIMED_ON");
-    let delayed_off = format!("__{stem}_TIMED_OFF");
-    let event = format!("__{stem}_TIMED_EVENT");
-    let latched = format!("__{stem}_TIMED_LATCHED");
-    let phase = format!("__{stem}_TIMED_PHASE");
+    let model_name = format!("__{stem}_TIMED_M");
     let mut output = String::new();
-    let sensed_control = format!("v({},{})", instance.control_p, instance.control_n);
     writeln!(
         output,
-        "B__{stem}_TIMED_CTRL {control} 0 V='(time<=0 ? (({sensed_control})>(({vt})+({vh})) ? ({sensed_control}) : (({sensed_control})<(({vt})-({vh})) ? ({sensed_control}) : (({ic})>=0.5 ? (({vt})+({vh}))+1 : (({vt})-({vh}))-1))) : ({sensed_control}))'"
+        "A__{stem}_TIMED %vd({} {}) %gd({} {}) {model_name}",
+        instance.control_p, instance.control_n, instance.tokens[1], instance.tokens[2]
     )?;
-    writeln!(
+    write!(output, ".model {model_name} preprocess_timed_switch(")?;
+    for (index, (name, value)) in [
+        ("ron", &model.ron),
+        ("roff", &model.roff),
+        ("vt", &model.vt),
+        ("vh", &model.vh),
+        ("ton", &model.ton),
+        ("toff", &model.toff),
+        ("td_on", &model.td_on),
+        ("td_off", &model.td_off),
+        ("timetol", &model.timetol),
+        ("ic", &ic),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index != 0 {
+            output.push(' ');
+        }
+        write!(output, "{name}=")?;
+        write_runtime_numeric(&mut output, value)?;
+    }
+    output.push_str(")\n");
+    write!(
         output,
-        "A__{stem}_TIMED_RAW {control} {raw} __{stem}_TIMED_RAW_HYST"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_RAW_HYST hyst(in_low={{{vt}}} in_high={{{vt}}} hyst={{{vh}}} out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)"
-    )?;
-    writeln!(
-        output,
-        "A__{stem}_TIMED_ON {raw} {delayed_on} 0 __{stem}_TIMED_ON_DELAY"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_ON_DELAY delay(delay={{{td_on}}})"
-    )?;
-    writeln!(
-        output,
-        "A__{stem}_TIMED_OFF {raw} {delayed_off} 0 __{stem}_TIMED_OFF_DELAY"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_OFF_DELAY delay(delay={{{td_off}}})"
-    )?;
-    // Select the directional delayed state with the current Schmitt state. This keeps
-    // TD_ON and TD_OFF independent and cancels a pending edge if the control reverses
-    // before that edge's delay expires.
-    writeln!(
-        output,
-        "B__{stem}_TIMED_EVENT {event} 0 V='v({raw})*v({delayed_on})-(1-v({raw}))*(1-v({delayed_off}))'"
-    )?;
-    writeln!(
-        output,
-        "A__{stem}_TIMED_LATCH {event} {latched} __{stem}_TIMED_LATCH_HYST"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_LATCH_HYST hyst(in_low=0 in_high=0 hyst=0.5 out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)"
-    )?;
-    writeln!(
-        output,
-        "A__{stem}_TIMED_SLEW {latched} {phase} __{stem}_TIMED_SLEW"
-    )?;
-    writeln!(
-        output,
-        ".model __{stem}_TIMED_SLEW slew(rise_slope={{1/({ton})}} fall_slope={{1/({toff})}})"
-    )?;
-    writeln!(
-        output,
-        "B__{stem}_TIMED_BRANCH {} {} I='v({},{})*exp(-0.5*ln(({ron})*({roff}))-ln(({ron})/({roff}))*(v({phase})-0.5)*(1.5-2*(v({phase})-0.5)^2))'",
-        instance.tokens[1], instance.tokens[2], instance.tokens[1], instance.tokens[2]
-    )?;
-    writeln!(
-        output,
-        "G__{stem}_TIMED_GIN {} {} {} {} {{{gin}}}",
+        "G__{stem}_TIMED_GIN {} {} {} {} ",
         instance.control_p, instance.control_n, instance.control_p, instance.control_n
     )?;
+    write_runtime_numeric(&mut output, &model.gin)?;
+    output.push('\n');
     Ok(Translation {
         bytes: output.into_bytes(),
-        kind: TranslationKind::VoltageControlledSwitch,
+        kind: TranslationKind::TimedVoltageControlledSwitch,
     })
 }
 
@@ -3106,48 +3127,45 @@ fn emit_simplis_vcsw(
     hystwd: f64,
     logic: &str,
 ) -> Result<Translation> {
-    let initial = instance.parameters.get("IC").map_or("OPEN", String::as_str);
-    let initial = initial.trim_matches('\'').to_ascii_uppercase();
-    if !matches!(initial.as_str(), "OPEN" | "CLOSE" | "CLOSED") {
-        bail!("unsupported SIMPLIS VCSW IC={initial}");
+    if instance.parameters.keys().any(|name| name != "IC") {
+        bail!(
+            "unsupported SIMPLIS VCSW instance parameter on {}",
+            instance.tokens[0]
+        );
     }
-    let (control_p, control_n, threshold) = if logic == "POS" {
-        (instance.control_p, instance.control_n, threshold)
-    } else {
-        (instance.control_n, instance.control_p, -threshold)
-    };
-    let initial = if initial == "OPEN" { "OFF" } else { "ON" };
+    let closed = switch_closed_hint(instance.parameters.get("IC").map(String::as_str))?;
     let stem = sanitized_name(&instance.tokens[0]);
-    let model_name = format!("__{stem}_SW");
+    let control = format!("v({},{})", instance.control_p, instance.control_n);
     let mut output = String::new();
+    let state = emit_switch_state(
+        &mut output,
+        &stem,
+        &control,
+        LogicThresholds {
+            center: threshold,
+            width: hystwd,
+        },
+        LogicPolarity::parse(logic)?,
+        closed,
+    )?;
+    let voltage = format!("v({},{})", instance.tokens[1], instance.tokens[2]);
     writeln!(
         output,
-        "S__{stem} {} {} {control_p} {control_n} {model_name} {initial}",
-        instance.tokens[1], instance.tokens[2]
+        "B__{stem}_BRANCH {} {} I='{voltage}*((1-v({state}))/{}+v({state})/{})'",
+        instance.tokens[1],
+        instance.tokens[2],
+        spice_number(roff)?,
+        spice_number(ron)?
     )?;
-    write!(output, ".model {model_name} SW(Ron=")?;
-    let conditioned_ron = if ron < NGSPICE_MIN_VCSW_RON_OHMS && roff > NGSPICE_MIN_VCSW_RON_OHMS {
-        NGSPICE_MIN_VCSW_RON_OHMS
-    } else {
-        ron
-    };
-    write_number(&mut output, conditioned_ron)?;
-    output.push_str(" Roff=");
-    write_number(&mut output, roff)?;
-    output.push_str(" Vt=");
-    write_number(&mut output, threshold)?;
-    output.push_str(" Vh=");
-    write_number(&mut output, hystwd / 2.0)?;
-    output.push_str(")\n");
     Ok(Translation {
         bytes: output.into_bytes(),
-        kind: TranslationKind::VoltageControlledSwitch,
+        kind: TranslationKind::HystereticSwitch,
     })
 }
 
 fn translate_raw_vcsw_device(
     statement: &str,
-    models: &std::collections::BTreeMap<String, RawVcswModel>,
+    scope: &ScopeAnalysis,
 ) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     if !tokens
@@ -3157,12 +3175,24 @@ fn translate_raw_vcsw_device(
     {
         return Ok(None);
     }
-    let Some((control_p, control_n, model_index)) = switch_control_and_model(&tokens) else {
+    let direct = switch_control_and_model(&tokens).and_then(|(_, _, index)| {
+        scope
+            .vcsw
+            .get(&tokens[index].to_ascii_uppercase())
+            .map(|model| (index, model))
+    });
+    let named = || {
+        tokens
+            .get(4)
+            .and_then(|name| scope.vcsw.get(&name.to_ascii_uppercase()))
+            .filter(|model| matches!(model.transfer, VcswTransfer::ShortTransition { .. }))
+            .map(|model| (4, model))
+    };
+    let Some((model_index, model)) = direct.or_else(named) else {
         return Ok(None);
     };
-    let Some(model) = models.get(&tokens[model_index].to_ascii_uppercase()) else {
-        return Ok(None);
-    };
+    let (control_p, control_n) =
+        voltage_switch_control(&tokens, model_index, &scope.voltage_branches)?;
     for node in [&tokens[1], &tokens[2], &control_p, &control_n] {
         validate_node(node)?;
     }
@@ -4795,11 +4825,10 @@ fn translate_deck_primitive(
     if let Some(value) = translate_raw_numbered_logic_device(statement, &models.numbered_logic)? {
         return Ok(Some(value));
     }
-    if let Some(value) = translate_raw_vcq_device(statement, &models.vcq, &models.current_branches)?
-    {
+    if let Some(value) = translate_raw_vcq_device(statement, models)? {
         return Ok(Some(value));
     }
-    if let Some(value) = translate_raw_vcsw_device(statement, &models.vcsw)? {
+    if let Some(value) = translate_raw_vcsw_device(statement, models)? {
         return Ok(Some(value));
     }
     Ok(None)
@@ -5931,7 +5960,7 @@ R1 a 0 1k
             vec![TranslationKind::TransistorSwitchLevel1]
         );
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("A__Q1_HYST"));
+        assert!(text.contains("A__Q1_EVENT"));
         assert!(text.contains("B__Q1_BRANCH a 0 I='"));
         assert!(text.contains("-1.00000000000000006e-1"));
         assert!(!text.contains(" VCQPOS "));
@@ -6472,7 +6501,8 @@ A_BUF %gnd_ref 0 [ q qb ] [ inp ] MODEL=MB IC=0
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("S__S1 a b ctrl 0 __S1_SW ON"));
+        assert!(text.contains("B__S1_BRANCH a b"));
+        assert!(text.contains("rx_ic=[ 1 ]"));
         assert!(text.contains("C1 a b 1u IC=1.25"));
         assert!(text.contains("L1 a b 1u IC=2m"));
         assert!(text.contains("B__A_BUF_INIT __A_BUF_DIFF 0 V='(time<=0 ? "));
@@ -6513,7 +6543,8 @@ S1 p n ctrl 0 MS IC=OPEN
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("S__S1 a 0 ctrl 0 __S1_SW ON"));
+        assert!(text.contains("B__S1_BRANCH a 0"));
+        assert!(text.contains("rx_ic=[ 1 ]"));
         assert!(!text.contains(".INIT"));
         Ok(())
     }
@@ -6776,22 +6807,55 @@ S1 p n cp cn SW IC={IC}
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("TIMED_RAW_HYST hyst"));
-        assert!(text.contains("time<=0 ? ((v(cp,cn))>((TH)+(H))"));
-        assert!(text.contains("(v(cp,cn))<((TH)-(H))"));
-        assert!(text.contains("((IC)>=0.5 ? ((TH)+(H))+1 : ((TH)-(H))-1)"));
-        assert!(text.contains("delay(delay={TDON})"));
-        assert!(text.contains("A__S1_TIMED_OFF __S1_TIMED_RAW __S1_TIMED_OFF"));
-        assert!(text.contains("delay(delay={TDOFF})"));
-        assert!(text.contains(
-            "V='v(__S1_TIMED_RAW)*v(__S1_TIMED_ON)-(1-v(__S1_TIMED_RAW))*(1-v(__S1_TIMED_OFF))'"
-        ));
-        assert!(!text.contains("TIMED_INV"));
-        assert!(text.contains("slew(rise_slope={1/(TON)} fall_slope={1/(TOFF)})"));
-        assert!(text.contains("exp(-0.5*ln((RON)*(ROFF))"));
-        assert!(text.contains("G__S1_TIMED_GIN cp cn cp cn {0.00000000000000000e0}"));
+        assert_eq!(
+            translated.required_code_models,
+            vec![CodeModelRuntime::Logic]
+        );
+        assert_eq!(
+            translated.primitives,
+            vec![TranslationKind::TimedVoltageControlledSwitch]
+        );
+        assert!(text.contains("A__S1_TIMED %vd(cp cn) %gd(p n) __S1_TIMED_M"));
+        assert!(text.contains("preprocess_timed_switch(ron={RON} roff={ROFF} vt={TH} vh={H} ton={TON} toff={TOFF} td_on={TDON} td_off={TDOFF}"));
+        assert!(text.contains("ic={IC}"));
+        assert!(text.contains("G__S1_TIMED_GIN cp cn cp cn 0.00000000000000000e0"));
+        assert!(!text.contains("delay(delay="));
         assert!(!text.to_ascii_uppercase().contains(" VSWITCH"));
         Ok(())
+    }
+
+    #[test]
+    fn timed_switch_preserves_nested_runtime_expressions_and_tolerance() -> Result<()> {
+        let source = br".subckt T p n cp cn params: tol=1p R=10
+S1 p n cp cn SW IC=1
+.model SW VSWITCH(RON={max(R,1)}, ROFF=1Meg, VT=2.5, TIMETOL={max(tol,2p)}, TD=4n, TD_OFF=3n)
+.ends T
+.end
+";
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        assert!(text.contains("ron={max(R,1)}"));
+        assert!(text.contains("timetol={max(tol,2p)}"));
+        assert!(text.contains("td_on=4.00000000000000025e-9"));
+        assert!(
+            text.contains("td_off=3.00000000000000039e-9")
+                || text.contains("td_off=3.00000000000000000e-9")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timed_switch_rejects_negative_tolerance_and_unsupported_parameters() {
+        for extra in [
+            "TIMETOL=-1n",
+            "TIMETOL=0",
+            "TIMETOL=0.5f",
+            "TON=0",
+            "UNKNOWN=1",
+        ] {
+            let source = format!("S1 a 0 c 0 M IC=0\n.MODEL M VSWITCH VT=2.5 {extra}\n.end\n");
+            assert!(translate_simplis_deck(source.as_bytes()).is_err());
+        }
     }
 
     #[test]
@@ -6852,16 +6916,46 @@ R1 a 0 1k
         let translated = translate_simplis_deck(source)?;
         assert_eq!(
             translated.primitives,
-            vec![TranslationKind::VoltageControlledSwitch]
+            vec![TranslationKind::HystereticSwitch]
         );
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("S__S1 a 0 ctrl 0 __S1_SW OFF"));
+        assert!(text.contains("preprocess_logic_event(operation=0"));
+        assert!(text.contains("rx_ic=[ 0 ]"));
         assert!(!text.contains(" VCSW "));
         Ok(())
     }
 
     #[test]
-    fn conditions_near_ideal_raw_vcsw_ron() -> Result<()> {
+    fn switch_voltage_control_resolves_named_branch_and_node_pairs() -> Result<()> {
+        let source = br"Vctrl c r 5
+S1 p n Vctrl MS IC=OPEN
+S2 p n (c,r) MS IC=CLOSE
+Q1 p n Vctrl MQ IC=OPEN
+Q2 p n (c,r) MQ IC=CLOSE
+.MODEL MS VCSW RON=1 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC=POS
+.MODEL MQ VCQPOS VSAT=.1 RSAT=1 ROFF=1Meg GAIN=1 TH=2.5 HYSTWD=1 LOGIC=POS LEVEL=2
+.end
+";
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        for stem in ["S1", "S2", "Q1", "Q2"] {
+            assert!(text.contains(&format!("B__{stem}_CTRL __{stem}_CTRL 0 V='v(c,r)'")));
+        }
+        assert_eq!(translated.primitives.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn switch_unknown_named_voltage_branch_fails() {
+        let source = br"S1 p n missing MS IC=OPEN
+.MODEL MS VCSW RON=1 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC=POS
+.end
+";
+        assert!(translate_simplis_deck(source).is_err());
+    }
+
+    #[test]
+    fn preserves_near_ideal_raw_vcsw_ron() -> Result<()> {
         let source = br"VCTRL ctrl 0 3
 S1 a 0 ctrl 0 MS IC=OPEN
 .MODEL MS VCSW RON=1n ROFF=1Meg TH=2 HYSTWD=0.2 LOGIC=POS
@@ -6870,7 +6964,8 @@ R1 a 0 1k
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("SW(Ron=2.00000000000000012e-9"));
+        assert!(text.contains("1.00000000000000006e-9"));
+        assert!(text.contains("B__S1_BRANCH"));
         Ok(())
     }
 

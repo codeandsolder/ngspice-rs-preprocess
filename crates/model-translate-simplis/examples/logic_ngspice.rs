@@ -35,13 +35,8 @@ fn run_native(runtime: &Path, source: &str, control: &str) -> Result<String> {
     Ok(stdout)
 }
 
-fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result<()> {
-    let mut control = String::from("tran 10n 9u\n");
-    for (index, (node, time, _)) in checks.iter().enumerate() {
-        writeln!(control, "meas tran check{index} find v({node}) at={time}u")?;
-    }
-    let stdout = run_native(runtime, source, &control)?;
-    let actual = stdout
+fn measurements(stdout: &str) -> BTreeMap<usize, f64> {
+    stdout
         .lines()
         .filter_map(|line| {
             let (key, value) = line.split_once('=')?;
@@ -50,7 +45,16 @@ fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result
                 value.split_whitespace().next()?.parse::<f64>().ok()?,
             ))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect()
+}
+
+fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result<()> {
+    let mut control = String::from("tran 10n 9u\n");
+    for (index, (node, time, _)) in checks.iter().enumerate() {
+        writeln!(control, "meas tran check{index} find v({node}) at={time}u")?;
+    }
+    let stdout = run_native(runtime, source, &control)?;
+    let actual = measurements(&stdout);
     for (index, (node, time, expected)) in checks.iter().enumerate() {
         let value = *actual
             .get(&index)
@@ -459,6 +463,395 @@ Rsb sb rtn 100
     Ok(())
 }
 
+/// Vendor startup-state sweep at 0, 2, 2.5, 3, and 5 V with
+/// TH=2.5, HYSTWD=1. Independent load-line solutions test both transistor
+/// model levels, both device polarities, voltage/current control and
+/// reverse bias rather than just checking the reported switch state.
+fn switch_startup_and_load_lines(runtime: &Path) -> Result<()> {
+    let mut source = String::from("Vref rtn 0 0.75\nVpos pos rtn 1\nVneg neg rtn -1\n");
+    let mut checks = Vec::new();
+    for (index, control) in [0.0_f64, 2.0, 2.5, 3.0, 5.0].into_iter().enumerate() {
+        writeln!(source, "Vc{index} c{index} rtn {control}")?;
+        // Current sense has 1 ohm resistance, so its branch current is
+        // numerically identical to the differential voltage control.
+        writeln!(
+            source,
+            "Vi{index} c{index} ci{index} 0\nRc{index} ci{index} rtn 1"
+        )?;
+        for (logic, negative) in [("POS", false), ("NEG", true)] {
+            for (ic, suggested) in [("OPEN", false), ("CLOSE", true)] {
+                let closed = if control > 3.0 {
+                    !negative
+                } else if control < 2.0 {
+                    negative
+                } else {
+                    suggested
+                };
+                let id = format!("{index}{logic}{ic}");
+                for (bias, rail) in [(1.0_f64, "pos"), (-1.0, "neg")] {
+                    let suffix = format!("{id}{rail}");
+                    writeln!(
+                        source,
+                        "S{suffix} s{suffix} rtn c{index} rtn ms{suffix} IC={ic}"
+                    )?;
+                    writeln!(
+                        source,
+                        ".model ms{suffix} VCSW RON=10 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC={logic}"
+                    )?;
+                    writeln!(source, "Rs{suffix} {rail} s{suffix} 100")?;
+                    let resistance = if closed { 10.0 } else { 1e6 };
+                    let expected = bias * resistance / (resistance + 100.0);
+                    for time in [0.0, 8.0] {
+                        checks.push((format!("s{suffix}"), time, expected));
+                    }
+                    for (kind, sign) in [("POS", 1.0_f64), ("NEG", -1.0)] {
+                        for level in [1, 2] {
+                            for (control_kind, pins) in [
+                                ("VC", format!("c{index} rtn")),
+                                ("IC", format!("Vi{index}")),
+                            ] {
+                                let q = format!("{suffix}{kind}{level}{control_kind}");
+                                let vsat = 0.1 * sign;
+                                writeln!(source, "Q{q} q{q} rtn {pins} mq{q} IC={ic}")?;
+                                writeln!(
+                                    source,
+                                    ".model mq{q} {control_kind}Q{kind} VSAT={vsat} RSAT=10 ROFF=1Meg GAIN=0.002 TH=2.5 HYSTWD=1 LOGIC={logic} LEVEL={level}"
+                                )?;
+                                writeln!(source, "Rq{q} {rail} q{q} 100")?;
+                                let off = bias / (1.0 + 100.0 / 1e6);
+                                let sat = 100.0_f64.mul_add(vsat, bias * 10.0) / 110.0;
+                                let overdrive = if negative {
+                                    3.0 - control
+                                } else {
+                                    control - 2.0
+                                };
+                                let active = (100.0 * sign * 0.002).mul_add(-overdrive, bias)
+                                    / (1.0 + 100.0 / 1e6);
+                                let expected = if !closed {
+                                    off
+                                } else if level == 1 {
+                                    sat
+                                } else if sign.is_sign_positive() {
+                                    active.max(sat).min(off)
+                                } else {
+                                    active.min(sat).max(off)
+                                };
+                                for time in [0.0, 8.0] {
+                                    checks.push((format!("q{q}"), time, expected));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    source.push_str(".end\n");
+    verify(runtime, &source, &checks)
+}
+
+// Direct SIMetrix 9.40d printed waveform samples from a 1 V biased
+// switch. Reference maxstep 0.25 ns, print interval 1 ns, RELTOL=1e-6.
+fn check_timed_switch(
+    runtime: &Path,
+    drive: &str,
+    tolerance: &str,
+    samples: &[(f64, f64)],
+) -> Result<()> {
+    let source = format!(
+        "Vref rtn 0 0.75\nVdrive a rtn {drive}\nVbias p rtn 1\nS1 p rtn a rtn m IC=0\n.model m VSWITCH(RON=10 ROFF=1Meg VT=2.5 VH=0.5 TON=100n TOFF=200n TD_ON=500n TD_OFF=300n TIMETOL={tolerance} GIN=0.125)\n.options reltol=1e-6 abstol=1e-13\n.end\n"
+    );
+    let mut control = String::from("tran 1n 6u 0 0.25n\n");
+    for (index, (time, _)) in samples.iter().enumerate() {
+        writeln!(control, "meas tran check{index} find i(vbias) at={time}n")?;
+    }
+    let stdout = run_native(runtime, &source, &control)?;
+    let values = measurements(&stdout);
+    for (index, (time, expected)) in samples.iter().enumerate() {
+        let actual = -*values
+            .get(&index)
+            .with_context(|| format!("missing switch current at {time} ns: {stdout}"))?;
+        ensure!(
+            (actual - expected).abs() <= expected.abs().mul_add(0.002, 1e-12),
+            "TIMETOL={tolerance}, {time} ns: {actual} A != vendor {expected} A"
+        );
+    }
+    Ok(())
+}
+
+fn timed_switch_vendor_waveforms(runtime: &Path) -> Result<()> {
+    let baseline = "PWL(0 0 1u 0 1.01u 5 1.2u 5 1.21u 0 3u 0 3.01u 5 4u 5 4.01u 0 6u 0)";
+    let baseline_samples = [
+        (0.0, 1e-6),
+        (1550.0, 1e-6),
+        (3500.0, 1e-6),
+        (3510.0, 1.05512e-6),
+        (3540.0, 2.19091e-5),
+        (3560.0, 0.000_629_491),
+        (3580.0, 0.014_503_464),
+        (3600.0, 0.088_730_93),
+        (3610.0, 0.1),
+        (4300.0, 0.1),
+        (4310.0, 0.098_649_46),
+        (4350.0, 0.024_021_974),
+        (4400.0, 0.000_530_782),
+        (4450.0, 9.04963e-6),
+        (4500.0, 1.03098e-6),
+        (4520.0, 1e-6),
+    ];
+    for tolerance in ["1f", "1p", "10p", "100p", "1n", "10n", "100n"] {
+        check_timed_switch(runtime, baseline, tolerance, &baseline_samples)?;
+    }
+
+    timed_switch_pulse_boundaries(runtime)
+}
+
+fn timed_switch_pulse_boundaries(runtime: &Path) -> Result<()> {
+    // Pulse width exactly equal to propagation delay has no excursion.
+    // Width equal to delay + slew duration reverses at the endpoint;
+    // a longer pulse reaches a stable rail and incurs the turn-off delay.
+    for (width, samples) in [
+        (
+            499,
+            [
+                (1507.0, 1e-6),
+                (1606.0, 1e-6),
+                (1700.0, 1e-6),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            500,
+            [
+                (1507.0, 1e-6),
+                (1606.0, 1e-6),
+                (1700.0, 1e-6),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            501,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 1e-6),
+                (1700.0, 1e-6),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            550,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 6.04492e-6),
+                (1700.0, 1e-6),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            599,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 0.099_236_131),
+                (1700.0, 0.000_409_877),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            600,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 0.099_999_991),
+                (1700.0, 0.000_530_782),
+                (1900.0, 1e-6),
+            ],
+        ),
+        (
+            601,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 0.099_999_991),
+                (1700.0, 0.1),
+                (1900.0, 0.1),
+            ],
+        ),
+        (
+            650,
+            [
+                (1507.0, 1.0034e-6),
+                (1606.0, 0.099_999_991),
+                (1700.0, 0.1),
+                (1900.0, 0.1),
+            ],
+        ),
+    ] {
+        let end = 1000 + width;
+        let drive = format!("PWL(0 0 1u 0 1.01u 5 {end}n 5 {}n 0 6u 0)", end + 10);
+        check_timed_switch(runtime, &drive, "10p", &samples)?;
+    }
+    check_timed_switch(
+        runtime,
+        "PWL(0 5 1u 5 1.01u 0 1.35u 0 1.36u 5 6u 5)",
+        "10p",
+        &[
+            (0.0, 0.1),
+            (1300.0, 0.1),
+            (1356.0, 0.016_553_53),
+            (1380.0, 0.099_654_058),
+            (1400.0, 0.1),
+        ],
+    )
+}
+
+fn timed_switch_runtime_parameters(runtime: &Path) -> Result<()> {
+    let source = "Vref rtn 0 0.75
+Vdrive a rtn 2.5
+Vbias p rtn 1
+X1 p rtn a rtn T
+.subckt T p n cp cn params: R=10 OFF=1Meg TOL=100p INIT=1
+S1 p n cp cn M IC={INIT}
+.model M VSWITCH(RON={max(R,1)}, ROFF={OFF}, VT=2.5, VH=0.5, TIMETOL={max(TOL,1p)}, GIN=0.125)
+.ends T
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "tran 10n 1u\nmeas tran check0 find i(vbias) at=0\nmeas tran check1 find i(vdrive) at=0\n",
+    )?;
+    let actual = measurements(&stdout);
+    for (index, expected) in [-0.1, -0.3125].into_iter().enumerate() {
+        let value = *actual
+            .get(&index)
+            .with_context(|| format!("missing runtime measurement: {stdout}"))?;
+        ensure!(
+            (value - expected).abs() <= 1e-8,
+            "runtime measurement {index}: {value} != {expected}"
+        );
+    }
+    Ok(())
+}
+
+fn timed_switch_small_signal_and_stiff_load(runtime: &Path) -> Result<()> {
+    let source = "Vdrive a 0 DC 5 AC 1
+Vbias p 0 DC 1 AC 1
+S1 p 0 a 0 M IC=0
+.model M VSWITCH(RON=10 ROFF=1Meg VT=2.5 VH=0.5 GIN=0.125)
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "ac lin 3 1k 3k\nlet ib=real(i(vbias))\nlet ic=real(i(vdrive))\nmeas ac check0 find ib at=2k\nmeas ac check1 find ic at=2k\n",
+    )?;
+    let actual = measurements(&stdout);
+    for (index, expected) in [-0.1, -0.125].into_iter().enumerate() {
+        let value = *actual
+            .get(&index)
+            .with_context(|| format!("missing AC measurement: {stdout}"))?;
+        ensure!(
+            (value - expected).abs() <= 1e-8,
+            "AC measurement {index}: {value} != {expected}"
+        );
+    }
+    let source = "Vdrive a 0 5
+Vbias p 0 1
+Rload p b 1
+S1 b 0 a 0 M IC=0
+.model M VSWITCH(RON=1n ROFF=1T VT=2.5 VH=0.5)
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "tran 10n 1u\nmeas tran check0 find v(b) at=0.5u\n",
+    )?;
+    let value = *measurements(&stdout)
+        .get(&0)
+        .with_context(|| format!("missing stiff load measurement: {stdout}"))?;
+    ensure!(
+        (value - 1e-9 / (1.0 + 1e-9)).abs() < 1e-14,
+        "stiff load voltage {value}"
+    );
+    Ok(())
+}
+
+fn switch_named_voltage_branch(runtime: &Path) -> Result<()> {
+    let source = "Vref rtn 0 0.75
+Vctrl c rtn PWL(0 0 1u 0 1.01u 5 4u 5 4.01u 0 9u 0)
+Rctrl c rtn 1k
+Vbias p rtn 1
+S1 a rtn Rctrl MS IC=CLOSE
+S2 b rtn (c,rtn) MS IC=OPEN
+Q1 q rtn Vctrl MQ IC=CLOSE
+Q2 r rtn c rtn MQ IC=OPEN
+Ra p a 100
+Rb p b 100
+Rq p q 100
+Rr p r 100
+.MODEL MS VCSW RON=10 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC=POS
+.MODEL MQ VCQPOS VSAT=0.1 RSAT=10 ROFF=1Meg GAIN=1 TH=2.5 HYSTWD=1 LOGIC=POS LEVEL=1
+.end
+";
+    let off = 1e6 / (1e6 + 100.0);
+    let on = 10.0 / 110.0;
+    let q_on = 20.0 / 110.0;
+    let checks = ["a", "b", "q", "r"]
+        .into_iter()
+        .flat_map(|node| {
+            [
+                (0.0, off),
+                (2.0, if matches!(node, "a" | "b") { on } else { q_on }),
+                (8.0, off),
+            ]
+            .map(|(time, voltage)| (node.to_owned(), time, voltage))
+        })
+        .collect::<Vec<_>>();
+    verify(runtime, source, &checks)
+}
+
+// Vendor extrema from the 1 ns sampled SIMetrix 9.40d trace of a
+// self-controlled RC relaxation oscillator. The switch's branch current
+// determines its own future threshold crossings.
+fn timed_switch_closed_loop(runtime: &Path) -> Result<()> {
+    let source = "Vbias p 0 PWL(0 0 1n 5 10u 5)
+Rcharge p c 1k
+Cstore c 0 1n
+S1 c 0 c 0 swmod IC=0
+.model swmod VSWITCH(RON=100 ROFF=1Meg VT=2.5 VH=0.5 TON=100n TOFF=200n TD_ON=50n TD_OFF=30n TIMETOL=10p)
+.options reltol=1e-6 abstol=1e-13
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "tran 1n 10u 0 1n\nmeas tran check0 max v(c) from=1.8u to=2u\nmeas tran check1 max_at v(c) from=1.8u to=2u\nmeas tran check2 min v(c) from=2u to=2.2u\nmeas tran check3 min_at v(c) from=2u to=2.2u\nmeas tran check4 max v(c) from=9u to=9.2u\nmeas tran check5 max_at v(c) from=9u to=9.2u\nmeas tran check6 min v(c) from=9.2u to=9.4u\nmeas tran check7 min_at v(c) from=9.2u to=9.4u\n",
+    )?;
+    let values = measurements(&stdout);
+    for (index, expected) in [
+        3.199_790_93,
+        1.929e-6,
+        1.285_854_69,
+        2.078e-6,
+        3.199_789_77,
+        9.12e-6,
+        1.285_860_32,
+        9.269e-6,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let actual = *values
+            .get(&index)
+            .with_context(|| format!("missing oscillator measurement {index}: {stdout}"))?;
+        let tolerance = if index % 2 == 0 { 1e-4 } else { 2e-9 };
+        ensure!(
+            (actual - expected).abs() <= tolerance,
+            "oscillator {index}: {actual} != {expected}"
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -475,6 +868,12 @@ fn main() -> Result<()> {
     advanced_latch_vendor_ambiguous_inputs(&runtime)?;
     vendor_timing(&runtime)?;
     threshold_plateau_and_latch_cancellation(&runtime)?;
+    switch_startup_and_load_lines(&runtime)?;
+    switch_named_voltage_branch(&runtime)?;
+    timed_switch_vendor_waveforms(&runtime)?;
+    timed_switch_runtime_parameters(&runtime)?;
+    timed_switch_small_signal_and_stiff_load(&runtime)?;
+    timed_switch_closed_loop(&runtime)?;
     println!("All native ngspice logic regressions passed");
     Ok(())
 }
