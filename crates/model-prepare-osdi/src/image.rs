@@ -5,12 +5,36 @@ use anyhow::{Context, Result, bail, ensure};
 use object::{
     Architecture, Object, ObjectSegment, ObjectSymbol, ObjectSymbolTable, Relocation,
     RelocationFlags, RelocationTarget, SegmentFlags, elf,
+    read::elf::{ElfFile, FileHeader, SectionHeader},
 };
 use std::collections::BTreeMap;
 
+enum Fixup {
+    Dynamic(Relocation),
+    PackedRelative,
+}
+
+fn packed_relative<Elf: FileHeader>(
+    file: &ElfFile<'_, Elf>,
+    relocations: &mut BTreeMap<u64, Fixup>,
+) -> Result<()> {
+    for section in file.elf_section_table().iter() {
+        if let Some(offsets) = section.relr(file.endian(), file.data())? {
+            for address in offsets {
+                let address = address.into();
+                ensure!(
+                    relocations.insert(address, Fixup::PackedRelative).is_none(),
+                    "duplicate ELF relocation at {address:#x}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct Image<'a> {
     file: object::File<'a>,
-    relocations: BTreeMap<u64, Relocation>,
+    relocations: BTreeMap<u64, Fixup>,
     pub pointer: u64,
 }
 
@@ -24,15 +48,52 @@ impl<'a> Image<'a> {
             .context("missing dynamic relocations")?
         {
             ensure!(
-                relocations.insert(address, relocation).is_none(),
+                relocations
+                    .insert(address, Fixup::Dynamic(relocation))
+                    .is_none(),
                 "duplicate ELF relocation at {address:#x}"
             );
+        }
+        match &file {
+            object::File::Elf32(elf) => packed_relative(elf, &mut relocations)?,
+            object::File::Elf64(elf) => packed_relative(elf, &mut relocations)?,
+            _ => bail!("unsupported OSDI object format"),
         }
         Ok(Self {
             file,
             relocations,
             pointer,
         })
+    }
+
+    pub const fn file(&self) -> &object::File<'a> {
+        &self.file
+    }
+
+    fn validate_relocations(&self, address: u64, size: u64, pointer: bool) -> Result<()> {
+        let end = address
+            .checked_add(size)
+            .context("metadata range overflow")?;
+        // Unknown relocation widths are conservatively treated as pointer
+        // width. Known narrower relocations use their actual encoding width.
+        for (&at, fixup) in self
+            .relocations
+            .range(address.saturating_sub(self.pointer - 1)..end)
+        {
+            let width = match fixup {
+                Fixup::Dynamic(relocation) if relocation.size() != 0 => {
+                    u64::from(relocation.size()).div_ceil(8)
+                }
+                _ => self.pointer,
+            };
+            if at.saturating_add(width) > address {
+                ensure!(
+                    pointer && at == address && width == size,
+                    "unexpected relocation overlapping OSDI metadata at {address:#x}"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn bytes(&self, address: u64, size: u64) -> Result<&'a [u8]> {
@@ -69,6 +130,7 @@ impl<'a> Image<'a> {
     }
 
     pub fn u32(&self, address: u64) -> Result<u32> {
+        self.validate_relocations(address, 4, false)?;
         Ok(u32::try_from(self.integer(address, 4)?)?)
     }
 
@@ -103,6 +165,7 @@ impl<'a> Image<'a> {
     }
 
     pub fn pointer(&self, address: u64) -> Result<u64> {
+        self.validate_relocations(address, self.pointer, true)?;
         let raw = self.integer(address, self.pointer)?;
         let Some(relocation) = self.relocations.get(&address) else {
             ensure!(
@@ -110,6 +173,9 @@ impl<'a> Image<'a> {
                 "non-null metadata pointer without supported relocation at {address:#x}"
             );
             return Ok(0);
+        };
+        let Fixup::Dynamic(relocation) = relocation else {
+            return Ok(raw);
         };
         let addend = if relocation.has_implicit_addend() {
             if self.pointer == 4 {
@@ -145,6 +211,7 @@ impl<'a> Image<'a> {
                 .iter()
                 .position(|&byte| byte == 0)
                 .context("unterminated metadata string")?;
+            self.validate_relocations(address, u64::try_from(end)? + 1, false)?;
             return Ok(std::str::from_utf8(&tail[..end])?.to_owned());
         }
         bail!("metadata string outside file-backed load segment")
@@ -206,6 +273,7 @@ impl<'i, 'a> Cursor<'i, 'a> {
 
     pub fn byte(&mut self) -> Result<u8> {
         let address = self.field(1)?;
+        self.image.validate_relocations(address, 1, false)?;
         Ok(self.image.bytes(address, 1)?[0])
     }
 

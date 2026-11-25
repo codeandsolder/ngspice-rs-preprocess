@@ -26,12 +26,9 @@ fn main() -> Result<()> {
             .filter(|param| param.kind == ParameterKind::Model)
             .count();
         println!(
-            "{}: {} terminals, {} unknowns, {} model parameters, {} instance parameters, {} operating point variables, {} Jacobian entries, {} noise sources, charge={}",
+            "{}: {terminals} terminals, {} unknowns, {models} model parameters, {instances} instance parameters, {} operating point variables, {} Jacobian entries, {} noise sources, charge={}",
             device.name,
-            terminals,
             device.nodes.len(),
-            models,
-            instances,
             device.parameters.len() - models - instances,
             device.jacobian.len(),
             device.noise_sources.len(),

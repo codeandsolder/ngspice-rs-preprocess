@@ -72,18 +72,14 @@ fn data<'a>(file: &object::File<'a>, export: Export) -> Result<&'a [u8]> {
     bail!("OSDI export is not backed by module bytes")
 }
 
-fn read_scalar(file: &object::File<'_>, export: Export) -> Result<u32> {
+fn read_scalar(image: &image::Image<'_>, export: Export) -> Result<u32> {
     ensure!(export.size == 4, "OSDI scalar export must be a uint32");
-    let bytes: [u8; 4] = data(file, export)?.try_into()?;
-    Ok(if file.is_little_endian() {
-        u32::from_le_bytes(bytes)
-    } else {
-        u32::from_be_bytes(bytes)
-    })
+    image.u32(export.address)
 }
 
-fn scalar(file: &object::File<'_>, name: &str) -> Result<u32> {
-    read_scalar(file, required(file, name)?).with_context(|| format!("reading OSDI export {name}"))
+fn scalar(image: &image::Image<'_>, name: &str) -> Result<u32> {
+    read_scalar(image, required(image.file(), name)?)
+        .with_context(|| format!("reading OSDI export {name}"))
 }
 
 // ABI structure layouts are calculated using the target pointer width, not
@@ -121,14 +117,19 @@ fn descriptor_size(abi: Abi, pointer: u32) -> u32 {
 /// Invalid ELF, non-shared-object input, missing or malformed exports,
 /// unsupported ABI revision or an inconsistent descriptor array.
 pub fn inspect(bytes: &[u8]) -> Result<ModuleEnvelope> {
-    let file = object::File::parse(bytes).context("invalid OSDI ELF module")?;
+    let image = image::Image::new(bytes).context("invalid OSDI ELF module")?;
+    inspect_image(&image, bytes)
+}
+
+fn inspect_image(image: &image::Image<'_>, bytes: &[u8]) -> Result<ModuleEnvelope> {
+    let file = image.file();
     ensure!(
         file.kind() == ObjectKind::Dynamic && file.entry() == 0,
         "OSDI input must be a shared object"
     );
     let abi = match (
-        scalar(&file, "OSDI_VERSION_MAJOR")?,
-        scalar(&file, "OSDI_VERSION_MINOR")?,
+        scalar(image, "OSDI_VERSION_MAJOR")?,
+        scalar(image, "OSDI_VERSION_MINOR")?,
     ) {
         (0, 3) => Abi::V03,
         (0, 4) => Abi::V04,
@@ -136,10 +137,10 @@ pub fn inspect(bytes: &[u8]) -> Result<ModuleEnvelope> {
     };
     let pointer = if file.is_64() { 8_u8 } else { 4_u8 };
     let expected = descriptor_size(abi, u32::from(pointer));
-    let stride = match (abi, export(&file, "OSDI_DESCRIPTOR_SIZE")?) {
+    let stride = match (abi, export(file, "OSDI_DESCRIPTOR_SIZE")?) {
         (Abi::V03, None) => expected,
         (_, Some(size)) => {
-            let stride = read_scalar(&file, size)?;
+            let stride = read_scalar(image, size)?;
             ensure!(
                 stride == expected,
                 "invalid OSDI descriptor stride: {stride}, expected {expected}"
@@ -148,15 +149,15 @@ pub fn inspect(bytes: &[u8]) -> Result<ModuleEnvelope> {
         }
         (Abi::V04, None) => bail!("OSDI 0.4 requires OSDI_DESCRIPTOR_SIZE"),
     };
-    let count = scalar(&file, "OSDI_NUM_DESCRIPTORS")?;
-    let descriptors = required(&file, "OSDI_DESCRIPTORS")?;
+    let count = scalar(image, "OSDI_NUM_DESCRIPTORS")?;
+    let descriptors = required(file, "OSDI_DESCRIPTORS")?;
     ensure!(
         count != 0
             && descriptors.size == u64::from(count) * u64::from(stride)
             && descriptors.address.is_multiple_of(u64::from(pointer)),
         "OSDI descriptor array size or alignment mismatch"
     );
-    data(&file, descriptors)?;
+    data(file, descriptors)?;
     Ok(ModuleEnvelope {
         sha256: Sha256::digest(bytes).into(),
         architecture: file.architecture(),

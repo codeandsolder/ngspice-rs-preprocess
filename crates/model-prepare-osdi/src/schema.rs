@@ -3,7 +3,7 @@
 use super::{
     Abi, ModuleEnvelope,
     image::{Cursor, Image},
-    inspect, required,
+    inspect_image, required,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
@@ -544,10 +544,9 @@ fn device(image: &Image<'_>, address: u64, abi: Abi) -> Result<Device> {
 /// # Errors
 /// Invalid envelope, unsupported relocation, malformed device schema or missing callback.
 pub fn inspect_schema(bytes: &[u8]) -> Result<ModuleSchema> {
-    let envelope = inspect(bytes)?;
-    let file = object::File::parse(bytes)?;
-    let table = required(&file, "OSDI_DESCRIPTORS")?;
     let image = Image::new(bytes)?;
+    let envelope = inspect_image(&image, bytes)?;
+    let table = required(image.file(), "OSDI_DESCRIPTORS")?;
     let mut devices = Vec::new();
     for index in 0..envelope.descriptor_count {
         devices.push(
