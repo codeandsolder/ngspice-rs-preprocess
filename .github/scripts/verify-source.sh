@@ -7,6 +7,8 @@ root=$(git rev-parse --show-toplevel)
 # supplies its own isolated target directory and may use the same script.
 : "${CARGO_TARGET_DIR:?isolated Cargo target directory is required}"
 [[ "$CARGO_TARGET_DIR" == /* ]]
+# Preserve intermediates in the isolated target across the consecutive checks.
+export CARGO_BUILD_EPHEMERAL_INTERMEDIATES=false
 temporary=$(mktemp -d "${RUNNER_TEMP:-$(dirname "$CARGO_TARGET_DIR")}/preprocess-ci.XXXXXXXX")
 trap 'rm -rf -- "$temporary"' EXIT
 trap 'exit 130' INT
