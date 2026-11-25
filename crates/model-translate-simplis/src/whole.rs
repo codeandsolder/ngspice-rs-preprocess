@@ -2308,6 +2308,11 @@ fn translate_device_voltage_controlled_source(
     statement: &str,
     branches: &std::collections::BTreeMap<String, (String, String)>,
 ) -> Result<Option<Translation>> {
+    if model_normalize_ngspice::controlled_transfer::parse(&normalized_statement(statement))?
+        .is_some()
+    {
+        return Ok(None);
+    }
     let trimmed = statement.trim_start();
     let Some(kind) = trimmed.as_bytes().first().map(u8::to_ascii_uppercase) else {
         return Ok(None);
@@ -5489,8 +5494,13 @@ pub fn translate_simplis_deck(input: &[u8]) -> Result<WholeModelTranslation> {
     };
     output.push_str(".end\n");
     reject_residual_simplis(&output)?;
+    let bytes =
+        match model_normalize_ngspice::controlled_transfer::lower_sources(output.as_bytes())? {
+            Some(lowered) => lowered.bytes,
+            None => output.into_bytes(),
+        };
     Ok(WholeModelTranslation {
-        bytes: output.into_bytes(),
+        bytes,
         primitives,
         required_code_models,
         stripped_directives,
