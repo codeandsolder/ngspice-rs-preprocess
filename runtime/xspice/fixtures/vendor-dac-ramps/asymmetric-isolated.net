@@ -1,0 +1,47 @@
+* Directional resistance during output enable/disable transitions
+Vd d 0 PWL(0 0 39.9n 0 40n 5 119.9n 5 120n 0 199.9n 0 200n 5 279.9n 5 280n 0 330n 0)
+Ve en 0 PWL(0 5 19.9n 5 20n 0 59.9n 0 60n 5 79.9n 5 80n 0 99.9n 0 100n 5 139.9n 5 140n 0 159.9n 0 160n 5 179.9n 5 180n 0 219.9n 0 220n 5 239.9n 5 240n 0 259.9n 0 260n 5 299.9n 5 300n 0 319.9n 0 320n 5 330n 5)
+Vbias bias 0 2.5
+.file LOGIC
+PORT D in[0] ;
+PORT EN in[1] ;
+PORT (DELAY=4n) Q out[0] ;
+
+
+Q=D ;
+Q.En=EN ;
+.endf
+.model M d_logic_block file=LOGIC family="HC" input_load=0 out_res=0
+.model DAC0 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=2n t_fall=6n knee_low=2 knee_high=2.75 v_smooth=.5)
+.model DAC1 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=6n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5)
+.model DAC2 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=4n t_fall=4n knee_low=2 knee_high=2.75 v_smooth=.5)
+Aseq0 [d en] [dig0] M
+Adac0 dig0 q0 DAC0
+Vforce0 q0 0 0
+Aseq1 [d en] [dig1] M
+Adac1 dig1 q1 DAC0
+Vforce1 q1 0 2.5
+Aseq2 [d en] [dig2] M
+Adac2 dig2 q2 DAC0
+Vforce2 q2 0 5
+Aseq3 [d en] [dig3] M
+Adac3 dig3 q3 DAC1
+Vforce3 q3 0 0
+Aseq4 [d en] [dig4] M
+Adac4 dig4 q4 DAC1
+Vforce4 q4 0 2.5
+Aseq5 [d en] [dig5] M
+Adac5 dig5 q5 DAC1
+Vforce5 q5 0 5
+Aseq6 [d en] [dig6] M
+Adac6 dig6 q6 DAC2
+Vforce6 q6 0 0
+Aseq7 [d en] [dig7] M
+Adac7 dig7 q7 DAC2
+Vforce7 q7 0 2.5
+Aseq8 [d en] [dig8] M
+Adac8 dig8 q8 DAC2
+Vforce8 q8 0 5
+.tran 5p 330n 0 5p
+.PRINT TRAN I(Vforce0) I(Vforce1) I(Vforce2) I(Vforce3) I(Vforce4) I(Vforce5) I(Vforce6) I(Vforce7) I(Vforce8)
+.end

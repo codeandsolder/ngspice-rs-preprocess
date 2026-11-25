@@ -1,0 +1,13 @@
+* Three unchanged ngspice47 xtraevt code models with genuine 'real' event data.
+.subckt SR_ORIGINAL_REAL_EVENT DATA DATA_SINK DATA_SOURCE CLOCK CLOCK_SINK CLOCK_SOURCE ANALOG_RAW ANALOG_SAMPLED
+AloadData DATA DATA_SINK DATA_SOURCE INPUT_LOAD
+AloadClock CLOCK CLOCK_SINK CLOCK_SOURCE INPUT_LOAD
+.model INPUT_LOAD sr_bundle_load(capacitance=2p sink_current=0 source_current=0)
+Ad2r DATA NULL RDATA ORIGINAL_D2R
+.model ORIGINAL_D2R d_to_real(zero=-0.5 one=2 delay=350p)
+Adelay RDATA CLOCK RHELD ORIGINAL_DELAY
+.model ORIGINAL_DELAY real_delay(delay=800p)
+Aobserve RDATA ANALOG_RAW ORIGINAL_R2V
+Aheld RHELD ANALOG_SAMPLED ORIGINAL_R2V
+.model ORIGINAL_R2V real_to_v(gain=1 transition_time=400p)
+.ends SR_ORIGINAL_REAL_EVENT

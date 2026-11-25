@@ -1,0 +1,15 @@
+case,kind,offset_ps,d0_midpoint_ns,q0_at_16ns_v,q1_at_16ns_v,passes_clocked_bit
+edge-hold-d740ps,edge,740,10.740000,0,4.9979175344,0
+edge-hold-d765ps,edge,765,10.765000,0,4.9979175344,0
+edge-hold-d780ps,edge,780,10.780000,0,4.9979175344,0
+edge-hold-d790ps,edge,790,10.790000,4.9979175344,4.9979175344,1
+edge-hold-d800ps,edge,800,10.800000,4.9979175344,4.9979175344,1
+edge-hold-d820ps,edge,820,10.820000,4.9979175344,4.9979175344,1
+edge-hold-d850ps,edge,850,10.850000,4.9979175344,4.9979175344,1
+level-setup-pre860ps,level,860,10.940000,0,4.9979175344,1
+level-setup-pre830ps,level,830,10.970000,0,4.9979175344,1
+level-setup-pre815ps,level,815,10.985000,0,4.9979175344,1
+level-setup-pre805ps,level,805,10.995000,0,4.9979175344,1
+level-setup-pre795ps,level,795,11.005000,0,0,0
+level-setup-pre780ps,level,780,11.020000,0,0,0
+level-setup-pre750ps,level,750,11.050000,0,0,0

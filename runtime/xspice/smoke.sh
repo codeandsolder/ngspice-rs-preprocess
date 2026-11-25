@@ -104,4 +104,8 @@ awk '$1 > 11e-9 && $1 < 12e-9 &&
     { echo "UNKNOWN-input Boolean/drive consensus at a=1 is wrong" >&2; exit 1; }
 awk -f "$source_dir/check-inertial-contention.awk" lut-inertial-contention.dat ||
     { echo "Inertial contention/transport transitions failed" >&2; exit 1; }
-printf 'All 15 ngspice 47 ALB XSPICE smokes passed.\n'
+# The existing 15 native LUT/bridge tests remain independent of
+# dynamic *analog* capacitance. Validate an INIT-registered 2pF digital
+# event load against three physically switched SPICE capacitors.
+"$source_dir/smoke-switched-capacitance.sh" "$model" "$work_root"
+printf 'All 18 ngspice 47 ALB XSPICE smokes passed.\n'

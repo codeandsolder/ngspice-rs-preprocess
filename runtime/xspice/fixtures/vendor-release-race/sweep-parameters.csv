@@ -1,0 +1,10 @@
+case,offset_ps,reset_start_ns,reset_end_ns
+release-offset-m20ps,-20,9.880000,9.980000
+release-offset-m10ps,-10,9.890000,9.990000
+release-offset-m5ps,-5,9.895000,9.995000
+release-offset-m2ps,-2,9.898000,9.998000
+release-offset-z0ps,0,9.900000,10.000000
+release-offset-p2ps,2,9.902000,10.002000
+release-offset-p5ps,5,9.905000,10.005000
+release-offset-p10ps,10,9.910000,10.010000
+release-offset-p20ps,20,9.920000,10.020000

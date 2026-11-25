@@ -1,0 +1,117 @@
+* Initial disabled ALB drive memory across current limits
+Vd0 d0 0 0
+Vd1 d1 0 5
+Vdr dr 0 PWL(0 0 9.9n 0 10n 5 40n 5)
+Vdf df 0 PWL(0 5 9.9n 5 10n 0 40n 0)
+Ve en 0 PWL(0 0 19.9n 0 20n 5 40n 5)
+.file DIRECT
+PORT D in[0] ;
+PORT EN in[1] ;
+PORT (DELAY=4n) Q out[0] ;
+Q=D ;
+Q.En=EN ;
+.endf
+.model M d_logic_block file=DIRECT family="HC" input_load=0 out_res_pos=1000 out_res_neg=2000 min_sink=-10m max_source=10m
+.model DAC0 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-5m source_current=5m)
+.model DAC1 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-15m source_current=5m)
+.model DAC2 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-5m source_current=15m)
+.model DAC3 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-15m source_current=15m)
+Aseq0 [d0 en] [dig0] M
+Adac0 dig0 q0 DAC0
+Vforce0 q0 0 0
+Aseq1 [d0 en] [dig1] M
+Adac1 dig1 q1 DAC0
+Vforce1 q1 0 5
+Aseq2 [d0 en] [dig2] M
+Adac2 dig2 q2 DAC1
+Vforce2 q2 0 0
+Aseq3 [d0 en] [dig3] M
+Adac3 dig3 q3 DAC1
+Vforce3 q3 0 5
+Aseq4 [d0 en] [dig4] M
+Adac4 dig4 q4 DAC2
+Vforce4 q4 0 0
+Aseq5 [d0 en] [dig5] M
+Adac5 dig5 q5 DAC2
+Vforce5 q5 0 5
+Aseq6 [d0 en] [dig6] M
+Adac6 dig6 q6 DAC3
+Vforce6 q6 0 0
+Aseq7 [d0 en] [dig7] M
+Adac7 dig7 q7 DAC3
+Vforce7 q7 0 5
+Aseq8 [d1 en] [dig8] M
+Adac8 dig8 q8 DAC0
+Vforce8 q8 0 0
+Aseq9 [d1 en] [dig9] M
+Adac9 dig9 q9 DAC0
+Vforce9 q9 0 5
+Aseq10 [d1 en] [dig10] M
+Adac10 dig10 q10 DAC1
+Vforce10 q10 0 0
+Aseq11 [d1 en] [dig11] M
+Adac11 dig11 q11 DAC1
+Vforce11 q11 0 5
+Aseq12 [d1 en] [dig12] M
+Adac12 dig12 q12 DAC2
+Vforce12 q12 0 0
+Aseq13 [d1 en] [dig13] M
+Adac13 dig13 q13 DAC2
+Vforce13 q13 0 5
+Aseq14 [d1 en] [dig14] M
+Adac14 dig14 q14 DAC3
+Vforce14 q14 0 0
+Aseq15 [d1 en] [dig15] M
+Adac15 dig15 q15 DAC3
+Vforce15 q15 0 5
+Aseq16 [dr en] [dig16] M
+Adac16 dig16 q16 DAC0
+Vforce16 q16 0 0
+Aseq17 [dr en] [dig17] M
+Adac17 dig17 q17 DAC0
+Vforce17 q17 0 5
+Aseq18 [dr en] [dig18] M
+Adac18 dig18 q18 DAC1
+Vforce18 q18 0 0
+Aseq19 [dr en] [dig19] M
+Adac19 dig19 q19 DAC1
+Vforce19 q19 0 5
+Aseq20 [dr en] [dig20] M
+Adac20 dig20 q20 DAC2
+Vforce20 q20 0 0
+Aseq21 [dr en] [dig21] M
+Adac21 dig21 q21 DAC2
+Vforce21 q21 0 5
+Aseq22 [dr en] [dig22] M
+Adac22 dig22 q22 DAC3
+Vforce22 q22 0 0
+Aseq23 [dr en] [dig23] M
+Adac23 dig23 q23 DAC3
+Vforce23 q23 0 5
+Aseq24 [df en] [dig24] M
+Adac24 dig24 q24 DAC0
+Vforce24 q24 0 0
+Aseq25 [df en] [dig25] M
+Adac25 dig25 q25 DAC0
+Vforce25 q25 0 5
+Aseq26 [df en] [dig26] M
+Adac26 dig26 q26 DAC1
+Vforce26 q26 0 0
+Aseq27 [df en] [dig27] M
+Adac27 dig27 q27 DAC1
+Vforce27 q27 0 5
+Aseq28 [df en] [dig28] M
+Adac28 dig28 q28 DAC2
+Vforce28 q28 0 0
+Aseq29 [df en] [dig29] M
+Adac29 dig29 q29 DAC2
+Vforce29 q29 0 5
+Aseq30 [df en] [dig30] M
+Adac30 dig30 q30 DAC3
+Vforce30 q30 0 0
+Aseq31 [df en] [dig31] M
+Adac31 dig31 q31 DAC3
+Vforce31 q31 0 5
+.tran 5p 40n 0 5p
+.PRINT TRAN I(Vforce0) I(Vforce1) I(Vforce2) I(Vforce3) I(Vforce4) I(Vforce5) I(Vforce6) I(Vforce7) I(Vforce8) I(Vforce9) I(Vforce10) I(Vforce11) I(Vforce12) I(Vforce13) I(Vforce14) I(Vforce15) I(Vforce16) I(Vforce17) I(Vforce18) I(Vforce19) I(Vforce20) I(Vforce21) I(Vforce22) I(Vforce23) I(Vforce24) I(Vforce25) I(Vforce26) I(Vforce27) I(Vforce28) I(Vforce29) I(Vforce30) I(Vforce31)
+.end

@@ -1,0 +1,8 @@
+scenario,pin,initial_v
+release-clock-minus-10ps,q,0.0000000000
+release-clock-minus-2ps,q,0.0000000000
+release-clock-equal,q,0.0000000000
+release-clock-plus-2ps,q,0.0000000000
+release-clock-plus-10ps,q,0.0000000000
+release-clock-early-control,q,0.0000000000
+release-clock-late-control,q,0.0000000000

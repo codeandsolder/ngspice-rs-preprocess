@@ -1,0 +1,78 @@
+{
+  "simulator": "SIMetrix Elements 9.40d",
+  "cases": [
+    {
+      "pins": [
+        "i(vd10)",
+        "i(vd9)",
+        "i(vd8)",
+        "i(vd7)",
+        "i(vd6)",
+        "i(vd5)",
+        "i(vd4)",
+        "i(vd3)",
+        "i(vd2)",
+        "i(vd1)",
+        "i(vd0)"
+      ],
+      "csv_sha256": "13AE60A7E466E19FBAE771AFA588411B3639CE937245A09D5B543AAAC62E98CC",
+      "listing_sha256": "0AC26BECCADDBD7C5A5BA207ABEDB7F2C6C054E6C10FC2CE85131CC1AE45648B",
+      "name": "adc-clamp-domain-plateaus",
+      "rows": 4201,
+      "crossings": 0,
+      "source_sha256": "0998F5E301F5EB79D9CFDE97E575F2CC16A775F5FE5C8FA86175C8679C63577C",
+      "retained_rows": 23,
+      "normalized_source_sha256": "3cf568764b97bb8b108b17b69eb7602a1e75989860437891b9633a3098558059",
+      "sample_only": 1,
+      "sample_tolerance": 1e-05,
+      "sample_relative_tolerance": 3e-06,
+      "unit": "A",
+      "equal_pairs": [],
+      "relative_pairs": [],
+      "relative_tolerance_ns": 0
+    },
+    {
+      "pins": [
+        "v(q11)",
+        "v(q10)",
+        "v(q9)",
+        "v(q8)",
+        "v(q7)",
+        "v(q6)",
+        "v(q5)",
+        "v(q4)",
+        "v(q3)",
+        "v(q2)",
+        "v(q1)",
+        "v(q0)"
+      ],
+      "csv_sha256": "1FF722F28B9FEF4EE5C7A04C95B07ED2A2CA855C00095EECA61395FFF2FB873D",
+      "listing_sha256": "1C0CFF83845263B3A69B1F2AFEC939DAE4875962A9BC421239AB027B9417DB3F",
+      "name": "adc-delay-domain-matrix",
+      "rows": 25001,
+      "crossings": 120,
+      "source_sha256": "1C476ACCF5C35D62C29BF833030B3F9FB842F2E0875A8DF98BE438C2856F7FE5",
+      "retained_rows": 21,
+      "normalized_source_sha256": "282153bc055dc2971b8fe61eff4cd699c31fb5572c1bedad086d59f229d21a41",
+      "sample_only": 0,
+      "sample_tolerance": 0.045,
+      "sample_relative_tolerance": 0,
+      "unit": "V",
+      "equal_pairs": [
+        "v(q0):v(q1)",
+        "v(q0):v(q2)",
+        "v(q0):v(q3)",
+        "v(q0):v(q4)",
+        "v(q7):v(q8)",
+        "v(q7):v(q9)",
+        "v(q7):v(q10)",
+        "v(q7):v(q11)"
+      ],
+      "relative_pairs": [
+        "v(q4):v(q5)",
+        "v(q4):v(q6)"
+      ],
+      "relative_tolerance_ns": 0.0005
+    }
+  ]
+}

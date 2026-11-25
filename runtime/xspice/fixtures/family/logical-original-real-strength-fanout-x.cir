@@ -1,0 +1,26 @@
+* Original 1991 Georgia Tech d_source drives explicit strong UNKNOWN and high-Z;
+* unchanged xtraevt d_to_real maps digital event states into real-valued events.
+* ALB source independently exercises active physical digital enable.
+Venable aenable 0 PWL(0 3.3 65n 3.3 65.1n 0 125n 0 125.1n 3.3 208n 3.3)
+AINEN [aenable] [len] SOURCE_LOGIC
+.model SOURCE_LOGIC d_logic_block family="HC" out_delay=1p def="out[0]=in[0];"
+Xexternal len ANALOG_RAW ANALOG_GATED ANALOG_POS ANALOG_NEG ANALOG_PROBE ORIGINAL_REAL_STRENGTH
+.include "native-original-real-strength-fanout.lib"
+Rraw ANALOG_RAW 0 1k
+Rgated ANALOG_GATED 0 1k
+Rpos ANALOG_POS 0 1k
+Rneg ANALOG_NEG 0 1k
+Craw ANALOG_RAW 0 2p
+Cgated ANALOG_GATED 0 2p
+Cpos ANALOG_POS 0 2p
+Cneg ANALOG_NEG 0 2p
+Vpull vpull 0 1.2
+Rprobe vpull ANALOG_PROBE 1k
+Cprobe ANALOG_PROBE 0 2p
+.tran 20p 208n 0 20p
+.control
+run
+wrdata result.dat v(ANALOG_RAW) v(ANALOG_GATED) v(ANALOG_POS) v(ANALOG_NEG) v(ANALOG_PROBE) i(Vpull) v(aenable)
+quit
+.endc
+.end

@@ -1,0 +1,18 @@
+* Experimental Rust-backed XSPICE LEVEL ALB, original SIMetrix 9.40d source.
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 14n 5 14.1n 0 24n 0 24.1n 5 34n 5 34.1n 0 44n 0 44.1n 5 52n 5)
+Venable en 0 PWL(0 0 9.9n 0 10n 5 19.9n 5 20n 0 29.9n 0 30n 5 39.9n 5 40n 0 52n 0)
+AadcD %gd(d 0) dd d_sink d_source ADC
+AadcC %gd(en 0) dc c_sink c_source ADC
+.model ADC sr_family_adc(in_low=2.1 in_high=2.2 rise_delay=1p fall_delay=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 schmitt=true time_tol=20p)
+Alatch [dd dc] [dq] 0 [q_sink] [q_source] STATE
+.model STATE sr_alb_stateful(source_hex="504f5254204461746120696e5b305d3b20504f525420456e61626c6520696e5b315d3b20504f5254202844454c41593d32353070292051206f75745b305d3b204c4556454c202857494454483d312c2044454c41593d373530702c2053455455503d302c20434c4f434b3d696e5b315d29204c617463683d303b204c61746368203d20446174613b2051203d204c617463683b" reg_delay=1n port_delay=1n)
+Adac dq q_sink q_source %gd(q 0) DAC
+.model DAC sr_family_dac(out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 knee_low=2 knee_high=2.75 v_smooth=.5 input_load=-31p t_rise=2n t_fall=2n sink_current=0 source_current=0)
+Rout q 0 100k
+.tran 20p 52n 0 20p
+.control
+run
+wrdata stateful-level.dat v(q) v(d) v(en)
+quit
+.endc
+.end

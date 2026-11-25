@@ -1,0 +1,32 @@
+* Implicit ALB ADC and DAC supply scaling, forced physical currents
+Vstim stim 0 PWL(0 -3 140n 11)
+Vinput0 p0 0 PWL(0 -3 140n 11)
+Aalb0 [p0] [lo0 hi0 z0 q0] MD0
+.model MD0 d_logic_block file=logic family="HC" vsupply=3.3 input_load=0 out_res=40 out_delay=1n
+Vforcelo0 lo0 0 PWL(0 -3 140n 11)
+Vforcehi0 hi0 0 PWL(0 -3 140n 11)
+Vforcez0 z0 0 PWL(0 -3 140n 11)
+Rout0 q0 0 100k
+Vinput1 p1 0 PWL(0 -3 140n 11)
+Aalb1 [p1] [lo1 hi1 z1 q1] MD1
+.model MD1 d_logic_block file=logic family="HC" vsupply=5 input_load=0 out_res=40 out_delay=1n
+Vforcelo1 lo1 0 PWL(0 -3 140n 11)
+Vforcehi1 hi1 0 PWL(0 -3 140n 11)
+Vforcez1 z1 0 PWL(0 -3 140n 11)
+Rout1 q1 0 100k
+Vinput2 p2 0 PWL(0 -3 140n 11)
+Aalb2 [p2] [lo2 hi2 z2 q2] MD2
+.model MD2 d_logic_block file=logic family="HC" vsupply=10 input_load=0 out_res=40 out_delay=1n
+Vforcelo2 lo2 0 PWL(0 -3 140n 11)
+Vforcehi2 hi2 0 PWL(0 -3 140n 11)
+Vforcez2 z2 0 PWL(0 -3 140n 11)
+Rout2 q2 0 100k
+.file logic
+PORT D in[0];
+PORT Q out[0:3];
+Q = 2 | (D ? 8 : 0);
+Q.En = 11;
+.endf
+.tran 5p 140n 0 5p
+.PRINT TRAN I(Vforcelo0) I(Vforcehi0) I(Vforcez0) I(Vinput0) V(q0) I(Vforcelo1) I(Vforcehi1) I(Vforcez1) I(Vinput1) V(q1) I(Vforcelo2) I(Vforcehi2) I(Vforcez2) I(Vinput2) V(q2)
+.end

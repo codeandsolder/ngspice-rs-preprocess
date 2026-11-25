@@ -1,0 +1,11 @@
+PORT Data in[0:1] ;
+PORT Clock in[2] ;
+PORT Enable in[3] ;
+PORT Q out[0:1] ;
+COMB (WIDTH=2, DELAY=1n) Filter=0 ;
+EDGE (WIDTH=2, DELAY=1n, CLOCK=in[2]) Capture=0 ;
+LEVEL (WIDTH=2, DELAY=1n, CLOCK=in[3]) Output=0 ;
+Filter=Data ;
+Capture=Filter ;
+Output=Capture ;
+Q=Output ;

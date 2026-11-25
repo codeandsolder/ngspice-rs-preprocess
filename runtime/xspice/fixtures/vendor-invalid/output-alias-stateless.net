@@ -1,0 +1,16 @@
+* SIMetrix Elements 9.40d stateless ALB output pin read oracle
+.model MALIAS_STATELESS d_logic_block file=FALIAS_STATELESS family="UNIV"
+.file FALIAS_STATELESS
+PORT Data in[0] ;
+PORT Q out[0] ;
+PORT Z out[1] ;
+Q = Data ;
+Z = Q ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 15n 5 15.1n 0 20n 0)
+Aseq [d] [q z] MALIAS_STATELESS
+Routq q 0 100k
+Routz z 0 100k
+.tran 20p 20n 0 20p
+.PRINT TRAN V(d) V(q) V(z)
+.end

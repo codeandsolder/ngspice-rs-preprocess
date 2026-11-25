@@ -1,0 +1,16 @@
+* Global connectivity probes
+.model M d_logic_block family="HC" vsupply=3.3 input_load=2p sink_current=-1m source_current=2m out_res=40 out_delay=1n def="out[0]=in[0];"
+.global p
+Vinput d 0 PULSE(0 3.3 2n 1n 1n 5n 15n)
+Aroot [d] [p] M
+X1 q1 SUB
+X2 q2 SUB
+.subckt SUB q
+A1 [p] [q] M
+R0 p 0 200
+.ends SUB
+R1 q1 0 100k
+R2 q2 0 100k
+.PRINT TRAN V(q1) V(q2) I(Vinput)
+.tran 5p 20n 0 5p
+.end

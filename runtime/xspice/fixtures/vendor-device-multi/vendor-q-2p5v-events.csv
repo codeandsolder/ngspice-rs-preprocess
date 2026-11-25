@@ -1,0 +1,5 @@
+scenario,pin,direction,time_ns
+device-multi-q1,q,rise,12.193591936
+device-multi-q1,q,fall,15.967680421
+device-multi-q3,q,rise,12.193591936
+device-multi-q3,q,fall,15.967680421

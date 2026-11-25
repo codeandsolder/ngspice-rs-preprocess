@@ -1,0 +1,20 @@
+* SIMetrix Elements 9.40d source-order named output alias to EDGE input
+.model MALIAS_EDGE d_logic_block file=FALIAS_EDGE family="UNIV"
+.file FALIAS_EDGE
+PORT Data in[0] ;
+PORT Clock in[1] ;
+PORT Q out[0] ;
+PORT Z out[1] ;
+EDGE (WIDTH=1, DELAY=1n, CLOCK=in[1]) R=0 ;
+Q = Data ;
+R = Q ;
+Z = R ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 15n 5 15.1n 0 30n 0)
+Vclock ck 0 PWL(0 0 9.9n 0 10n 5 12n 5 12.1n 0 19.9n 0 20n 5 22n 5 22.1n 0 30n 0)
+Aseq [d ck] [q z] MALIAS_EDGE
+Routq q 0 100k
+Routz z 0 100k
+.tran 20p 30n 0 20p
+.PRINT TRAN V(d) V(ck) V(q) V(z)
+.end

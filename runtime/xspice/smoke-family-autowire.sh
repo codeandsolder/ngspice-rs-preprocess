@@ -55,7 +55,7 @@ for variant in direct-3v3 direct-5v nested-3v3 shared; do
     else
         rg -q 'sr_family_adc\(' "$dir/circuit.cir"
         rg -q 'sr_family_dac\(' "$dir/circuit.cir"
-        rg -q 'g_pullup=2\.5e-2 g_pulldown=2\.5e-2' "$dir/circuit.cir"
+        rg -q 'g_pullup=2\.4e-2 g_pulldown=3\.4e-2' "$dir/circuit.cir"
     fi
     (
         cd "$dir"

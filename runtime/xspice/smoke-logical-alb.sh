@@ -15,7 +15,7 @@ done
 work="$(mktemp -d "$scratch/ngspice_preprocess_logical_XXXXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 printf 'codemodel %s\n' "$cm" >"$work/.spiceinit"
-for variant in original-3v3 original-5v nested shared; do
+for variant in original-3v3 original-5v nested shared device-variants device-variants-comb stateless-user-on stateless-user-off; do
     dir="$work/$variant"
     mkdir -p "$dir"
     cp -- "$work/.spiceinit" "$dir/"
@@ -24,9 +24,17 @@ for variant in original-3v3 original-5v nested shared; do
         original-5v) source=logical-original.cir; binding=auto-bindings-5v.json ;;
         nested) source=logical-nested.cir; binding=auto-bindings-3v3.json ;;
         shared) source=logical-shared.cir; binding=auto-bindings-shared.json ;;
+        stateless-user-on|stateless-user-off) source=logical-stateless-user.cir; binding=auto-bindings-3v3.json ;;
+        device-variants) source=logical-device-variants.cir; binding=auto-bindings-device-variants.json ;;
+        device-variants-comb) source=logical-device-comb.cir; binding=auto-bindings-device-variants.json ;;
     esac
+    source_path="$here/fixtures/family/$source"
+    if [[ $variant == stateless-user-off ]]; then
+        sed 's/user_scale=3/user_scale=1/' "$source_path" >"$dir/off.cir"
+        source_path="$dir/off.cir"
+    fi
     "$bins/alb-logical-expand" \
-        "$here/fixtures/family/$source" \
+        "$source_path" \
         "$here/fixtures/family/$binding" \
         "$dir/lowered.cir" "$dir/generated.inc"
     "$bins/alb-family-autowire" \
@@ -41,7 +49,7 @@ for variant in original-3v3 original-5v nested shared; do
     else
         rg -q 'sr_family_adc\(' "$dir/circuit.cir"
         rg -q 'sr_family_dac\(' "$dir/circuit.cir"
-        rg -q 'g_pullup=2\.5e-2 g_pulldown=2\.5e-2' "$dir/circuit.cir"
+        rg -q 'g_pullup=2\.4e-2 g_pulldown=3\.4e-2' "$dir/circuit.cir"
     fi
     (
         cd "$dir"
@@ -68,3 +76,34 @@ awk '$1>4.99e-9 && $1<5.01e-9 && $2>3.04 && $2<3.29 {found=1}
      END {exit !found}' "$work/shared/result.dat" ||
     { echo 'Original ALB two-receiver 4pF analog input load failed' >&2; exit 1; }
 echo '4/4 original SIMetrix A + embedded D_LOGIC_BLOCK native ngspice circuits passed'
+# The same ALB body with different MODEL USER_SCALE must compile to distinct
+# truth tables and produce distinct physical outputs.
+awk '$1>10e-9 && $1<11e-9 && $2>3.1 && $2<3.31 {found=1}
+     END {exit !found}' "$work/stateless-user-on/result.dat" ||
+    { echo 'Stateless model USER_SCALE=3 failed to enable output' >&2; exit 1; }
+awk '$1>10e-9 && $1<11e-9 && $2>=-.01 && $2<.1 {found=1}
+     END {exit !found}' "$work/stateless-user-off/result.dat" ||
+    { echo 'Stateless model USER_SCALE=1 failed to disable output' >&2; exit 1; }
+echo '2/2 additional stateless model USER/USER_SCALE native physical circuits passed'
+# Three original ALB A devices share one original model, but DEVICE=[1]
+# and DEVICE=[0] must become two, not three independent native code models.
+awk '$1>10e-9 && $1<11e-9 && $2>3.1 && $2<3.31 && $4>=-.01 && $4<.1 && $6>3.1 && $6<3.31 {found=1}
+     END {exit !found}' "$work/device-variants/result.dat" ||
+    { echo 'Physical DEVICE per-instance variants lost independence' >&2; exit 1; }
+[[ $(rg -c '^.subckt SRALB' "$work/device-variants/generated.inc") == 2 ]] ||
+    { echo 'Identical DEVICE model environments were not deduplicated' >&2; exit 1; }
+rg -q '^XSR_A1 .* SRALB0$' "$work/device-variants/lowered.cir"
+rg -q '^XSR_A2 .* SRALB1$' "$work/device-variants/lowered.cir"
+rg -q '^XSR_A3 .* SRALB0$' "$work/device-variants/lowered.cir"
+echo '3/3 per-instance DEVICE vectors selected correctly (two deduplicated native model variants)'
+# Registered COMB uses both DEVICE[0] for logic and DEVICE[1] for
+# original per-instance timing. Identical vectors share one native model.
+awk '$1>10e-9 && $1<11e-9 && $2>3.1 && $2<3.31 && $4>=-.01 && $4<.1 && $6>3.1 && $6<3.31 {found=1}
+     END {exit !found}' "$work/device-variants-comb/result.dat" ||
+    { echo 'Registered COMB DEVICE logic/timing specialization failed' >&2; exit 1; }
+[[ $(rg -c '^\.subckt SRALB' "$work/device-variants-comb/generated.inc") == 2 ]] ||
+    { echo 'Registered COMB DEVICE model environments were not deduplicated' >&2; exit 1; }
+rg -q '^XSR_A1 .* SRALB0$' "$work/device-variants-comb/lowered.cir"
+rg -q '^XSR_A2 .* SRALB1$' "$work/device-variants-comb/lowered.cir"
+rg -q '^XSR_A3 .* SRALB0$' "$work/device-variants-comb/lowered.cir"
+echo '3/3 original registered COMB per-instance DEVICE environments correctly specialized'

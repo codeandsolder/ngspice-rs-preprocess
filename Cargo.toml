@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/model-alb-xspice-ffi",
     "crates/model-alb-experimental",
     "crates/model-kernel-api",
     "crates/model-kernel-vdmos",

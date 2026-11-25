@@ -1,0 +1,22 @@
+* Actual TI TPS22986 comp_hys_simple: analog output-feedback comparator.
+* Two parameter variants expose independent hysteresis and timed RC response.
+Vin analog_input 0 PWL(0 .30 8n .30 30n .56 50n .48 70n .43 90n .35 120n .55 145n .42 170n .36)
+Vref comparator_reference 0 .5
+Xvendor_base comparator_base analog_input comparator_reference TI_TPS22986_COMP_HYS PARAMS: vhys=.05 td=0 tt=2n
+Xvendor_wide comparator_wide analog_input comparator_reference TI_TPS22986_COMP_HYS PARAMS: vhys=.12 td=1n tt=4n
+Rload_base comparator_base 0 10k
+Rload_wide comparator_wide 0 10k
+* Isolated analog monitor makes the source-to-ALB physical boundary visible
+* without changing the original vendor's analog output/load.
+Elevel monitor_in 0 comparator_base 0 3.3
+Amonitor [monitor_in] [monitor_out] DL
+Rmonitor monitor_out 0 100k
+.model DL d_logic_block family="HC" out_delay=1n def="out[0]=in[0];"
+.include "native-ti-comparator.lib"
+.tran 30p 170n 0 30p
+.control
+run
+wrdata result.dat v(comparator_base) v(comparator_wide) v(analog_input) v(monitor_out)
+quit
+.endc
+.end

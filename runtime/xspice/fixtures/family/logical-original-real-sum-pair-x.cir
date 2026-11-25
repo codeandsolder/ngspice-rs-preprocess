@@ -1,0 +1,25 @@
+* Original multi-driven REAL UDN under original 1991 source C models.
+* Independent true real UDN resolution must SUM driver contributions.
+* Physical ALB enable transitions are offset from original 12ns source boundaries.
+Venable aenable 0 PWL(0 3.3 93n 3.3 93.1n 0 189n 0 189.1n 3.3 291n 3.3)
+AINEN [aenable] [len] SOURCE_LOGIC
+.model SOURCE_LOGIC d_logic_block family="HC" out_delay=1p def="out[0]=in[0];"
+Xexternal len ANALOG_SUM ANALOG_POST ANALOG_ENABLED ANALOG_PROBE ORIGINAL_REAL_SUM
+.include "native-original-real-sum-pair.lib"
+Rsum ANALOG_SUM 0 1k
+Rpost ANALOG_POST 0 1k
+Renabled ANALOG_ENABLED 0 1k
+Csum ANALOG_SUM 0 2p
+Cpost ANALOG_POST 0 2p
+Cenabled ANALOG_ENABLED 0 2p
+Vpull vpull 0 1.2
+Rprobe vpull ANALOG_PROBE 1k
+Cprobe ANALOG_PROBE 0 2p
+.tran 25p 287n 0 25p
+.control
+run
+eprint xexternal.real_sum xexternal.bpre xexternal.rpost xexternal.r_enabled xexternal.q0 xexternal.q1 > original-events.txt
+wrdata result.dat v(ANALOG_SUM) v(ANALOG_POST) v(ANALOG_ENABLED) v(ANALOG_PROBE) i(Vpull) v(aenable)
+quit
+.endc
+.end

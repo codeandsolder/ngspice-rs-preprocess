@@ -11,21 +11,13 @@ use std::{
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/xspice/fixtures/family")
 }
-fn expand(src: &Path, cfg: &Path, dir: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_alb-logical-expand"))
+fn compile(src: &Path, cfg: &Path, dir: &Path) -> Result<Output> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_alb-family-compile"))
         .arg(src)
-        .arg(cfg)
-        .arg(dir.join("lowered.cir"))
-        .arg(dir.join("generated.inc"))
-        .output()?)
-}
-fn wire(cfg: &Path, dir: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_alb-family-autowire"))
-        .arg(dir.join("lowered.cir"))
-        .arg(dir.join("generated.inc"))
         .arg(cfg)
         .arg(fixtures().join("auto-models.json"))
         .arg(dir.join("final.cir"))
+        .arg(dir.join("generated.inc"))
         .output()?)
 }
 
@@ -48,13 +40,7 @@ fn electrical_variants_are_shared_by_signature_and_independent_of_order() -> Res
         } else {
             src.clone()
         };
-        let first = expand(&source, &cfg, temp.path())?;
-        assert!(
-            first.status.success(),
-            "{}",
-            String::from_utf8_lossy(&first.stderr)
-        );
-        let result = wire(&cfg, temp.path())?;
+        let result = compile(&source, &cfg, temp.path())?;
         assert!(
             result.status.success(),
             "{}",
@@ -62,6 +48,14 @@ fn electrical_variants_are_shared_by_signature_and_independent_of_order() -> Res
         );
         let deck = fs::read_to_string(temp.path().join("final.cir"))?;
         assert_eq!(deck.matches(".subckt TOP_SRV").count(), 2);
+        let library = fs::read_to_string(temp.path().join("generated.inc"))?;
+        assert_eq!(library.matches(".subckt SRALB").count(), 1, "{library}");
+        assert_eq!(
+            deck.lines()
+                .filter(|line| line.starts_with("XSR_A1 ") && line.ends_with(" SRALB0"))
+                .count(),
+            2
+        );
         assert_eq!(deck.matches("sr_family_adc(").count(), 2);
         assert_eq!(deck.matches("sr_family_dac(").count(), 2);
         assert!(!deck.contains(".subckt TOP ANALOG_IN ANALOG_OUT"));
@@ -94,16 +88,99 @@ fn electrical_variants_are_shared_by_signature_and_independent_of_order() -> Res
 }
 
 #[test]
+fn partially_annotated_occurrences_keep_the_original_definition() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let original: Value =
+        serde_json::from_slice(&fs::read(fixtures().join("occurrence-3calls.json"))?)?;
+    let mut config = original;
+    config["connections"]
+        .as_array_mut()
+        .context("missing connections")?
+        .retain(|entry| entry["occurrence"] != json!(["XTHREE"]));
+    let config_path = temp.path().join("partial.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let result = compile(
+        &fixtures().join("occurrence-3calls.cir"),
+        &config_path,
+        temp.path(),
+    )?;
+    assert!(
+        result.status.success(),
+        "mixed annotated/unannotated X occurrences rejected: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let deck = fs::read_to_string(temp.path().join("final.cir"))?;
+    assert!(deck.contains(".subckt TOP ANALOG_IN ANALOG_OUT"), "{deck}");
+    assert!(deck.contains("Xone IN_A OUT_A TOP_SRV0"), "{deck}");
+    assert!(deck.contains("Xtwo IN_B OUT_B TOP_SRV1"), "{deck}");
+    assert!(deck.contains("Xthree IN_C OUT_C TOP"), "{deck}");
+    assert_eq!(deck.matches(".subckt TOP_SRV").count(), 2);
+    assert_eq!(deck.matches("sr_family_adc(").count(), 2);
+    assert_eq!(deck.matches("sr_family_dac(").count(), 2);
+    Ok(())
+}
+
+#[test]
+fn occurrence_specialization_rejects_unknown_definition_boundaries() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let cfg = fixtures().join("occurrence-3calls.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(cfg)?)?;
+    let mut unknown = config["connections"][0].clone();
+    unknown["scope"] = json!(["MISSING"]);
+    unknown
+        .as_object_mut()
+        .context("boundary is not an object")?
+        .remove("occurrence");
+    config["connections"]
+        .as_array_mut()
+        .context("missing connections")?
+        .push(unknown);
+    let invalid = temp.path().join("missing-scope.json");
+    fs::write(&invalid, serde_json::to_vec(&config)?)?;
+    let result = compile(
+        &fixtures().join("occurrence-3calls.cir"),
+        &invalid,
+        temp.path(),
+    )?;
+    assert!(
+        !result.status.success(),
+        "specialization silently discarded a definition boundary"
+    );
+    assert!(!temp.path().join("final.cir").exists());
+    Ok(())
+}
+
+#[test]
+fn each_occurrence_must_select_an_actual_physical_producer() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixtures().join("occurrence-3calls.json"))?)?;
+    // The first and second calls have the same lowered output state.
+    // The latter cannot secretly select a different source producer simply
+    // because the earlier occurrence's annotation was encountered first.
+    config["connections"][3]["producer"] = json!({"path": ["A_NONEXISTENT"], "output_pin": 0});
+    let cfg = temp.path().join("conflicting-producer.json");
+    fs::write(&cfg, serde_json::to_vec(&config)?)?;
+    let first = compile(&fixtures().join("occurrence-3calls.cir"), &cfg, temp.path())?;
+    assert!(
+        !first.status.success(),
+        "logical expansion silently discarded a conflicting producer assignment"
+    );
+    assert!(!temp.path().join("final.cir").exists());
+    assert!(!temp.path().join("generated.inc").exists());
+    Ok(())
+}
+
+#[test]
 fn invalid_occurrence_assignments_fail_without_native_deck() -> Result<()> {
     for case in [
         "unknown",
         "nested",
         "wrong-scope",
-        "unassigned",
         "duplicate",
         "invalid-supply",
         "lexical-collision",
-        "different-structure",
+        "exported-state",
         "conflicting-electrical",
     ] {
         let temp = tempfile::tempdir()?;
@@ -113,12 +190,6 @@ fn invalid_occurrence_assignments_fail_without_native_deck() -> Result<()> {
             "unknown" => value["connections"][0]["occurrence"] = json!(["XNOTTHERE"]),
             "nested" => value["connections"][0]["occurrence"] = json!(["XONE", "XINNER"]),
             "wrong-scope" => value["connections"][0]["scope"] = json!(["MISSING"]),
-            "unassigned" => {
-                value["connections"]
-                    .as_array_mut()
-                    .context("no connections")?
-                    .retain(|entry| entry["occurrence"] != json!(["XTHREE"]));
-            }
             "duplicate" => {
                 let entry = value["connections"][0].clone();
                 value["connections"]
@@ -141,23 +212,21 @@ fn invalid_occurrence_assignments_fail_without_native_deck() -> Result<()> {
                     .context("mapping not object")?
                     .remove("occurrence");
             }
-            "different-structure" => value["connections"][0]["digital_net"] = json!("DIFFERENT"),
+            "exported-state" => value["connections"][0]["digital_net"] = json!("ANALOG_OUT"),
             _ => unreachable!(),
         }
         let cfg = temp.path().join("config.json");
         fs::write(&cfg, serde_json::to_vec(&value)?)?;
-        let initial = expand(&fixtures().join("occurrence-3calls.cir"), &cfg, temp.path())?;
-        if initial.status.success() {
-            let result = wire(&cfg, temp.path())?;
-            assert!(!result.status.success(), "{case} was accepted");
-            assert!(
-                !temp.path().join("final.cir").exists(),
-                "{case} wrote invalid native circuit"
-            );
-        } else {
-            assert!(!temp.path().join("lowered.cir").exists());
-            assert!(!temp.path().join("generated.inc").exists());
-        }
+        let result = compile(&fixtures().join("occurrence-3calls.cir"), &cfg, temp.path())?;
+        assert!(!result.status.success(), "{case} was accepted");
+        assert!(
+            !temp.path().join("final.cir").exists(),
+            "{case} wrote invalid native circuit"
+        );
+        assert!(
+            !temp.path().join("generated.inc").exists(),
+            "{case} wrote invalid native library"
+        );
     }
     Ok(())
 }
@@ -167,26 +236,60 @@ fn electrical_specialization_preserves_unused_nested_lexical_definitions() -> Re
     let temp = tempfile::tempdir()?;
     let source = fixtures().join("occurrence-3calls.cir");
     let config = fixtures().join("occurrence-3calls.json");
-    let first = expand(&source, &config, temp.path())?;
-    assert!(first.status.success());
-    let lowered = temp.path().join("lowered.cir");
-    let original = fs::read_to_string(&lowered)?;
+    let original = fs::read_to_string(source)?;
+    let mutated = temp.path().join("source.cir");
     fs::write(
-        &lowered,
+        &mutated,
         original.replace(
             ".ends TOP\n",
             ".subckt INNER p q\nRin p q 1k\n.ends INNER\n.ends TOP\n",
         ),
     )?;
-    let result = wire(&config, temp.path())?;
+    let result = compile(&mutated, &config, temp.path())?;
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
     let deck = fs::read_to_string(temp.path().join("final.cir"))?;
-    assert_eq!(deck.matches(".subckt INNER p q").count(), 2);
+    assert_eq!(deck.matches(".subckt INNER P Q").count(), 2);
     assert!(deck.contains(".subckt TOP_SRV0"));
     assert!(deck.contains(".subckt TOP_SRV1"));
+    Ok(())
+}
+
+#[test]
+fn original_occurrence_variants_have_independent_port_topology() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let result = compile(
+        &fixtures().join("occurrence-heterogeneous.cir"),
+        &fixtures().join("occurrence-heterogeneous.json"),
+        temp.path(),
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let deck = fs::read_to_string(temp.path().join("final.cir"))?;
+    assert!(
+        deck.contains(".subckt TOP_SRV0 ANALOG_IN ANALOG_OUT"),
+        "{deck}"
+    );
+    assert!(
+        deck.contains(
+            ".subckt TOP_SRV1 ANALOG_IN ANALOG_IN_SR_SINK ANALOG_IN_SR_SOURCE ANALOG_OUT"
+        ),
+        "{deck}"
+    );
+    assert!(deck.contains("Xone IN_A OUT_A TOP_SRV0"), "{deck}");
+    assert!(
+        deck.contains("Xtwo BUS BUS_SR_SINK BUS_SR_SOURCE OUT_B TOP_SRV1"),
+        "{deck}"
+    );
+    // Root ADC and Xone ADC; neither the root digital state nor Xtwo
+    // receives a redundant ADC/DAC round trip.
+    assert_eq!(deck.matches("sr_family_adc(").count(), 2);
+    assert_eq!(deck.matches("sr_family_dac(").count(), 2);
     Ok(())
 }

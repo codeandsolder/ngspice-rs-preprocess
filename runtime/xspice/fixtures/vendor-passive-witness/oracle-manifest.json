@@ -1,0 +1,117 @@
+{
+  "simulator": "SIMetrix Elements 9.40d",
+  "cases": [
+    {
+      "name": "passive-direct",
+      "source_sha256": "648AB8922184B5CF117C28EA32FC28830870D392D93496B3C7514C35139188A2",
+      "listing_sha256": "E01490F9176A1122FA57A4BF8DA72B8F5CC7F7C71455440AFCBD2B011E3F3FF5",
+      "csv_sha256": "1D484FFFABC150A0D419EE1F967EBE0A63515AB4AA8A99A86E2047A4353BB9D5",
+      "pins": [
+        "i(vinput)",
+        "v(q)"
+      ],
+      "rows": 9001,
+      "bridges": [
+        "A$BRIDGE_1 q_#in_1 q HC_dac : interface_model=M",
+        "A$BRIDGE_2 p_#in_2 p HC_dac : interface_model=M",
+        "A$BRIDGE_3 p p_#out_1 HC_adc : interface_model=M",
+        "A$BRIDGE_4 d d_#out_1 HC_adc : interface_model=M"
+      ],
+      "normalized_source_sha256": "8ec18470ad22614245939717d98e5cca72a58142952f13ea927c86ef9af0517f",
+      "retained_rows": 181,
+      "crossings": 10,
+      "adc_count": 2,
+      "dac_count": 2
+    },
+    {
+      "name": "passive-nested",
+      "source_sha256": "0743DE045C7749CCC568E735A17AC215C4A730BD439A366E6F3D046F31DFE936",
+      "listing_sha256": "B23186FC74B58F4C9EBC68E49B547CBB04F327EFE9D6CCCEF047403A85672D7A",
+      "csv_sha256": "1D484FFFABC150A0D419EE1F967EBE0A63515AB4AA8A99A86E2047A4353BB9D5",
+      "pins": [
+        "i(vinput)",
+        "v(q)"
+      ],
+      "rows": 9001,
+      "bridges": [
+        "A$BRIDGE_1 q_#in_1 q HC_dac : interface_model=M",
+        "A$BRIDGE_2 p_#in_2 p HC_dac : interface_model=M",
+        "A$BRIDGE_3 p p_#out_1 HC_adc : interface_model=M",
+        "A$BRIDGE_4 d d_#out_1 HC_adc : interface_model=M"
+      ],
+      "normalized_source_sha256": "9c3a096661e3f3743defebe11333390b88b17aad7394b1e02b9ef6b79645d10b",
+      "retained_rows": 181,
+      "crossings": 10,
+      "adc_count": 2,
+      "dac_count": 2
+    },
+    {
+      "name": "passive-shared",
+      "source_sha256": "EC2956AD0CBA6C0820ED3597EEBC6945863942B9D24BF25180D8EBDB771B48F7",
+      "listing_sha256": "E335DA3CF3519FC9FECDF7D624206FCD20215242D54AEF3D0E5766A029B28CF9",
+      "csv_sha256": "1D484FFFABC150A0D419EE1F967EBE0A63515AB4AA8A99A86E2047A4353BB9D5",
+      "pins": [
+        "i(vinput)",
+        "v(q)"
+      ],
+      "rows": 9001,
+      "bridges": [
+        "A$BRIDGE_1 q_#in_1 q HC_dac : interface_model=M",
+        "A$BRIDGE_2 p_#in_2 p HC_dac : interface_model=M",
+        "A$BRIDGE_3 p p_#out_1 HC_adc : interface_model=M",
+        "A$BRIDGE_4 d d_#out_1 HC_adc : interface_model=M"
+      ],
+      "normalized_source_sha256": "9cb10fc63cee72d3db7c726728e3fb0716168ffbcc9b3263222365168ca90a18",
+      "retained_rows": 181,
+      "crossings": 10,
+      "adc_count": 2,
+      "dac_count": 2
+    },
+    {
+      "name": "passive-independent",
+      "source_sha256": "529F93DBC292420D52535C20F639818053FE6F8E8881938DB98FF9E18AECBD73",
+      "listing_sha256": "7380CF1A35FED64DF343C79D860F9468CE9FFF127C10A0CBA468B84CE5C3CAD3",
+      "csv_sha256": "B1B4AA756B7D76E9274061FB56FA3B3B673ECF2478DADD59AB7E093209737553",
+      "pins": [
+        "i(vother)",
+        "i(vinput)",
+        "v(q)"
+      ],
+      "rows": 9001,
+      "bridges": [
+        "A$BRIDGE_1 q_#in_1 q HC_dac : interface_model=M",
+        "A$BRIDGE_2 p_#in_2 p HC_dac : interface_model=M",
+        "A$BRIDGE_3 p p_#out_1 HC_adc : interface_model=M",
+        "A$BRIDGE_4 d d_#out_1 HC_adc : interface_model=M"
+      ],
+      "normalized_source_sha256": "3488243871c4c025a0e6366f096f44056b13fb0b8af2a11e7170e110e2d67c2b",
+      "retained_rows": 181,
+      "crossings": 10,
+      "adc_count": 2,
+      "dac_count": 2
+    },
+    {
+      "name": "passive-witness",
+      "source_sha256": "47B7E8C3E37BC76F82826AA0986F3C7D7115AECD88F18BFC95552EB51AC6BE98",
+      "listing_sha256": "4C55A7C25F4031C0700ED6ECDC7AB549403AD687DC9A8E6DB495BC34DC0EA139",
+      "csv_sha256": "10A980A104200B11E33B595FCC7D4B69ABF0B7584273E80A6F3FB70FFF6EEEA7",
+      "pins": [
+        "i(vinput)",
+        "v(q)",
+        "v(p)"
+      ],
+      "rows": 9001,
+      "bridges": [
+        "A$BRIDGE_1 q_#in_1 q HC_dac : interface_model=M",
+        "A$BRIDGE_2 p_#in_2 p HC_dac : interface_model=M",
+        "A$BRIDGE_3 p p_#out_1 HC_adc : interface_model=M",
+        "A$BRIDGE_4 d d_#out_1 HC_adc : interface_model=M"
+      ],
+      "normalized_source_sha256": "5d6989535e4b87a509f8c18c4df5b3e382cde359397a474f7608337212cdd7be",
+      "retained_rows": 181,
+      "crossings": 18,
+      "adc_count": 2,
+      "dac_count": 2
+    }
+  ]
+}

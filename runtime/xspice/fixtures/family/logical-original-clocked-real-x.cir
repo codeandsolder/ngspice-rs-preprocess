@@ -1,0 +1,25 @@
+* ORIGINAL ngspice47 source digital real_delay state-sensitive sampling proof
+Venable aenable 0 PWL(0 3.3 43n 3.3 43.1n 0 79n 0 79.1n 3.3 114n 3.3)
+AINEN [aenable] [len] SOURCE_LOGIC
+.model SOURCE_LOGIC d_logic_block family="HC" out_delay=1p def="out[0]=in[0];"
+Xexternal len ANALOG_RAW ANALOG_HELD ANALOG_POST ANALOG_ENABLED ANALOG_PROBE ORIGINAL_CLOCKED_REAL
+.include "native-original-clocked-real.lib"
+Rraw ANALOG_RAW 0 1k
+Rheld ANALOG_HELD 0 1k
+Rpost ANALOG_POST 0 1k
+Renabled ANALOG_ENABLED 0 1k
+Craw ANALOG_RAW 0 2p
+Cheld ANALOG_HELD 0 2p
+Cpost ANALOG_POST 0 2p
+Cenabled ANALOG_ENABLED 0 2p
+Vpull vpull 0 1.2
+Rprobe vpull ANALOG_PROBE 1k
+Cprobe ANALOG_PROBE 0 2p
+.tran 25p 112n 0 25p
+.control
+run
+eprint xexternal.rdata xexternal.rheld xexternal.rpost xexternal.renable xexternal.data xexternal.clk > original-events.txt
+wrdata result.dat v(ANALOG_RAW) v(ANALOG_HELD) v(ANALOG_POST) v(ANALOG_ENABLED) v(ANALOG_PROBE) i(Vpull) v(aenable)
+quit
+.endc
+.end

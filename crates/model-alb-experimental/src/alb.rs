@@ -1,5 +1,10 @@
 use anyhow::{Context, Result, bail};
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+mod electrical;
+pub use electrical::{OutputResistance, PhysicalOutputDrive, PhysicalOutputLoad};
 
 mod family;
 pub use family::{
@@ -7,10 +12,44 @@ pub use family::{
     DigitalPinDirection, LegacyCompatibilityTable, LogicFamily, LogicFamilyAssignment,
     PlannedAnalogBridge, plan_analog_bridges,
 };
+mod stateful;
+pub use stateful::{AlbTimedOutput, StatefulEventEngine, StatefulPhysicalEventEngine};
+
+/// Parse an original ALB body and construct a pure logical event scheduler.
+/// This does not enable production or XSPICE code-model lowering.
+///
+/// # Errors
+/// Rejects malformed ALBs, absent registered state, unresolved timing, and
+/// unsupported register initialization.
+pub fn compile_stateful_event_engine(
+    body: &str,
+    environment: TimingEnvironment<'_>,
+) -> Result<StatefulEventEngine> {
+    let (_, program) = analyze_body(body)?.into_parts();
+    program
+        .context("SIMetrix ALB source has no register program")?
+        .event_engine(environment)
+}
+/// Parse an original register program and construct the native physical
+/// output scheduler with a signed capacitive load law.
+///
+/// # Errors
+/// Rejects an unsupported program or invalid timing/electrical parameters.
+pub fn compile_stateful_physical_engine(
+    body: &str,
+    environment: TimingEnvironment<'_>,
+    drive: PhysicalOutputDrive,
+) -> Result<StatefulPhysicalEventEngine> {
+    let (_, program) = analyze_body(body)?.into_parts();
+    program
+        .context("SIMetrix ALB source has no register program")?
+        .physical_event_engine(environment, drive)
+}
+
 mod native_family;
 pub use native_family::{
-    NativeAdcParameters, NativeDacParameters, NativeDigitalBundle, NativeFamilyModel,
-    NativeFamilyParameters, NativeFamilySpecification, NativePinWiring,
+    NativeAdcBridgeParameters, NativeAdcParameters, NativeDacParameters, NativeDigitalBundle,
+    NativeFamilyModel, NativeFamilyParameters, NativeFamilySpecification, NativePinWiring,
     render_native_family_bridges,
 };
 mod topology;
@@ -19,8 +58,12 @@ pub use topology::{
     discover_alb_pins, materialize_scoped_family_bridges,
 };
 mod xspice;
+pub use xspice::render_stateful_contents;
 pub use xspice::{XspiceElectrical, XspiceLutTarget, XspiceTimedBit, XspiceTimedPlan};
 
+// SIMetrix floors physical propagation and nonzero register delays at 1 ps.
+// Exact zero register delays retain their synchronous-event semantics.
+const MIN_PROPAGATION_DELAY_S: f64 = 1e-12;
 const MAX_TRUTH_TABLE_INPUTS: usize = 16;
 const MAX_VALUE_BITS: usize = 32;
 const MAX_KNOWN_LUT_CELLS: usize = 4 * 1024 * 1024;
@@ -87,12 +130,13 @@ fn join_drive_strength(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KnownTruthTable {
     input_width: usize,
     output_width: usize,
     rows: Vec<u32>,
     delayed_output_bits: usize,
+    output_delays: Vec<Option<DynamicValue>>,
 }
 
 impl KnownTruthTable {
@@ -254,6 +298,15 @@ impl CombinationalTimingShape {
     }
 }
 
+/// Model-level register qualifiers in seconds, inherited only by the register kinds
+/// for which the corresponding source qualifier is legal.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RegisterTimingDefaults {
+    pub setup: f64,
+    pub hold: f64,
+    pub min_clock: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TimingEnvironment<'a> {
     pub user: &'a [f64],
@@ -261,6 +314,26 @@ pub struct TimingEnvironment<'a> {
     pub user_scale: f64,
     pub default_register_delay: f64,
     pub default_output_delay: f64,
+    pub register_timing_defaults: RegisterTimingDefaults,
+}
+
+impl TimingEnvironment<'_> {
+    fn validate(self) -> Result<()> {
+        let defaults = self.register_timing_defaults;
+        for (name, value) in [
+            ("REG_DELAY", self.default_register_delay),
+            ("OUT_DELAY", self.default_output_delay),
+            ("SETUP_TIME", defaults.setup),
+            ("HOLD_TIME", defaults.hold),
+            ("MIN_CLOCK", defaults.min_clock),
+            ("USER_SCALE", self.user_scale),
+        ] {
+            if !value.is_finite() {
+                bail!("invalid SIMetrix ALB {name}={value}");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -518,6 +591,7 @@ impl KnownTimedLutSet {
 pub struct TimedCombinationalGraph {
     inputs: Vec<Port>,
     readonly: BTreeMap<String, ReadOnly>,
+    parameters: ExpressionParameters,
     stages: Vec<TimedCombinationalStage>,
     outputs: Vec<TimedCombinationalOutput>,
     input_width: usize,
@@ -602,6 +676,7 @@ impl TimedCombinationalGraph {
                 values: &values,
                 readonly: &self.readonly,
                 input_bits: &input_bits,
+                parameters: Some(&self.parameters),
             };
             let value = (value.evaluate(context)? >> output_bit) & 1;
             let driven = enable.map_or(Ok(1), |enable| {
@@ -863,24 +938,12 @@ impl StatefulProgram {
         if self.combinational_timing_shape().is_none() {
             return Ok(None);
         }
-        validate_timing_default("REG_DELAY", environment.default_register_delay, 0.0)?;
-        validate_timing_default("OUT_DELAY", environment.default_output_delay, 0.0)?;
-        if !environment.user_scale.is_finite() || environment.user_scale < 0.0 {
-            bail!(
-                "SIMetrix ALB USER_SCALE={} is invalid",
-                environment.user_scale
-            );
-        }
+        environment.validate()?;
         let register_delays = self
             .registers
             .iter()
             .map(|register| {
-                let delay = resolve_timing_value(
-                    register.delay.as_ref(),
-                    environment.default_register_delay,
-                    environment,
-                )?;
-                validate_timing_default("COMB DELAY", delay, 0.0)?;
+                let delay = resolve_register_delay(register.delay.as_ref(), environment)?;
                 Ok((register.name.clone(), delay))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
@@ -888,12 +951,7 @@ impl StatefulProgram {
             .outputs
             .iter()
             .map(|port| {
-                let delay = resolve_timing_value(
-                    port.delay.as_ref(),
-                    environment.default_output_delay,
-                    environment,
-                )?;
-                validate_timing_default("PORT DELAY", delay, 0.0)?;
+                let delay = resolve_output_delay(port.delay.as_ref(), environment)?;
                 Ok((port.name.clone(), delay))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
@@ -949,6 +1007,7 @@ impl StatefulProgram {
         Ok(Some(TimedCombinationalGraph {
             inputs: self.inputs.clone(),
             readonly: self.readonly.clone(),
+            parameters: ExpressionParameters::from_environment(environment),
             stages,
             outputs,
             input_width: self.input_width,
@@ -1007,7 +1066,7 @@ fn collect_all_known_lut_sources(
                     bail!("SIMetrix ALB LUT direct IN[] reference requires a constant pin index");
                 };
                 output.insert(KnownLutSourceBit::Input(usize::try_from(*pin)?));
-            } else if !readonly.contains_key(name) {
+            } else if !readonly.contains_key(name) && name != "USER" && name != "DEVICE" {
                 bail!("SIMetrix ALB LUT expression indexes unsupported value {name}");
             }
         }
@@ -1131,7 +1190,7 @@ fn collect_known_lut_index_bit(
             };
             output.insert(KnownLutSourceBit::Input(usize::try_from(*pin)?));
         }
-    } else if readonly.contains_key(name) {
+    } else if readonly.contains_key(name) || name == "USER" || name == "DEVICE" {
         collect_all_known_lut_sources(index, inputs, readonly, stage_widths, output)?;
     } else {
         bail!("SIMetrix ALB LUT expression indexes unsupported value {name}");
@@ -1557,13 +1616,6 @@ fn resolve_register_width(
     Ok(usize::try_from(width)?)
 }
 
-fn validate_timing_default(name: &str, value: f64, minimum: f64) -> Result<()> {
-    if !value.is_finite() || value < minimum {
-        bail!("invalid SIMetrix ALB {name}={value}");
-    }
-    Ok(())
-}
-
 fn resolve_dynamic_value(value: &DynamicValue, environment: TimingEnvironment<'_>) -> Result<f64> {
     match value {
         DynamicValue::Literal(value) => Ok(*value),
@@ -1583,14 +1635,56 @@ fn resolve_dynamic_value(value: &DynamicValue, environment: TimingEnvironment<'_
     }
 }
 
+// Explicit source timing qualifiers must be nonnegative. Model-level
+// defaults may be signed; their effective treatment depends on the event.
 fn resolve_timing_value(
-    value: Option<&DynamicValue>,
+    name: &str,
+    explicit: Option<&DynamicValue>,
     default: f64,
     environment: TimingEnvironment<'_>,
 ) -> Result<f64> {
-    value.map_or(Ok(default), |value| {
+    let value = explicit.map_or(Ok(default), |value| {
         resolve_dynamic_value(value, environment)
-    })
+    })?;
+    if !value.is_finite() || explicit.is_some() && value < 0.0 {
+        bail!("invalid SIMetrix ALB {name}={value}");
+    }
+    Ok(value)
+}
+
+fn register_propagation_delay(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else {
+        value.max(MIN_PROPAGATION_DELAY_S)
+    }
+}
+
+fn resolve_register_delay(
+    explicit: Option<&DynamicValue>,
+    environment: TimingEnvironment<'_>,
+) -> Result<f64> {
+    resolve_timing_value(
+        "DELAY",
+        explicit,
+        environment.default_register_delay,
+        environment,
+    )
+    .map(register_propagation_delay)
+}
+
+// An explicit port qualifier is nonnegative, but a model default is a
+// signed offset to be combined with the actual electrical load at runtime.
+fn resolve_output_delay(
+    explicit: Option<&DynamicValue>,
+    environment: TimingEnvironment<'_>,
+) -> Result<f64> {
+    resolve_timing_value(
+        "PORT DELAY",
+        explicit,
+        environment.default_output_delay,
+        environment,
+    )
 }
 
 fn expression_register_dependencies(
@@ -1898,7 +1992,7 @@ impl Port {
 
 #[derive(Clone, Debug)]
 struct ReadOnly {
-    values: Vec<u32>,
+    values: Arc<[u32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -1924,7 +2018,14 @@ struct Program {
 }
 
 impl Program {
-    fn known_truth_table(&self) -> Result<KnownTruthTable> {
+    fn known_truth_table(
+        &self,
+        environment: Option<TimingEnvironment<'_>>,
+    ) -> Result<KnownTruthTable> {
+        if let Some(environment) = environment {
+            environment.validate()?;
+        }
+        let parameters = environment.map(ExpressionParameters::from_environment);
         if self.input_width > MAX_TRUTH_TABLE_INPUTS {
             bail!(
                 "stateless SIMetrix ALB has {} inputs; bounded truth-table lowering supports at most {MAX_TRUTH_TABLE_INPUTS}",
@@ -1936,7 +2037,7 @@ impl Program {
             .context("SIMetrix ALB truth-table size overflow")?;
         let mut rows = Vec::with_capacity(row_count);
         for input_state in 0..row_count {
-            rows.push(self.evaluate_known(u32::try_from(input_state)?)?);
+            rows.push(self.evaluate_known(u32::try_from(input_state)?, parameters.as_ref())?);
         }
         let delayed_output_bits = self
             .outputs
@@ -1944,15 +2045,30 @@ impl Program {
             .filter(|port| port.delay.is_some())
             .map(Port::width)
             .sum();
+        let mut output_delays = vec![None; self.output_width];
+        for port in &self.outputs {
+            for delay in output_delays
+                .iter_mut()
+                .take(port.last + 1)
+                .skip(port.first)
+            {
+                delay.clone_from(&port.delay);
+            }
+        }
         Ok(KnownTruthTable {
             input_width: self.input_width,
             output_width: self.output_width,
             rows,
             delayed_output_bits,
+            output_delays,
         })
     }
 
-    fn evaluate_known(&self, input_state: u32) -> Result<u32> {
+    fn evaluate_known(
+        &self,
+        input_state: u32,
+        parameters: Option<&ExpressionParameters>,
+    ) -> Result<u32> {
         let mut values = BTreeMap::<String, u32>::new();
         let input_bits = (0..self.input_width)
             .map(|bit| (input_state >> bit) & 1)
@@ -1972,6 +2088,7 @@ impl Program {
                 values: &values,
                 readonly: &self.readonly,
                 input_bits: &input_bits,
+                parameters,
             })?;
             match &assignment.target {
                 AssignmentTarget::Name(name) => {
@@ -2275,39 +2392,6 @@ fn parse_state_register(statement: &str) -> Result<Option<StateRegister>> {
     }))
 }
 
-fn validate_state_expression_names(
-    expression: &Expr,
-    defined_values: &BTreeSet<String>,
-    arrays: &BTreeSet<String>,
-) -> Result<()> {
-    match expression {
-        Expr::Constant(_) => Ok(()),
-        Expr::Name(name) => {
-            if defined_values.contains(name) {
-                Ok(())
-            } else {
-                bail!("SIMetrix ALB expression references undefined value {name}")
-            }
-        }
-        Expr::Index(name, index) => {
-            if name != "IN" && name != "USER" && name != "DEVICE" && !arrays.contains(name) {
-                bail!("SIMetrix ALB expression indexes undeclared array {name}");
-            }
-            validate_state_expression_names(index, defined_values, arrays)
-        }
-        Expr::Unary(_, value) => validate_state_expression_names(value, defined_values, arrays),
-        Expr::Binary(_, lhs, rhs) => {
-            validate_state_expression_names(lhs, defined_values, arrays)?;
-            validate_state_expression_names(rhs, defined_values, arrays)
-        }
-        Expr::Conditional(condition, yes, no) => {
-            validate_state_expression_names(condition, defined_values, arrays)?;
-            validate_state_expression_names(yes, defined_values, arrays)?;
-            validate_state_expression_names(no, defined_values, arrays)
-        }
-    }
-}
-
 fn split_async_action(value: &str) -> Result<(&str, &str)> {
     let mut parens = 0usize;
     let mut brackets = 0usize;
@@ -2515,7 +2599,12 @@ fn validate_state_initializers(
 ) -> Result<()> {
     for register in registers {
         for initial in &register.initial {
-            validate_state_expression_names(initial, &namespace.defined_values, &namespace.arrays)?;
+            validate_expression_names(
+                initial,
+                &namespace.defined_values,
+                &namespace.arrays,
+                &namespace.output_names,
+            )?;
         }
     }
     Ok(())
@@ -2547,8 +2636,18 @@ fn parse_async_state_assignment(
     let (condition, action) = split_async_action(rhs)?;
     let condition = ExprParser::new(condition).parse()?;
     let value = ExprParser::new(action).parse()?;
-    validate_state_expression_names(&condition, &namespace.defined_values, &namespace.arrays)?;
-    validate_state_expression_names(&value, &namespace.defined_values, &namespace.arrays)?;
+    validate_expression_names(
+        &condition,
+        &namespace.defined_values,
+        &namespace.arrays,
+        &namespace.output_names,
+    )?;
+    validate_expression_names(
+        &value,
+        &namespace.defined_values,
+        &namespace.arrays,
+        &namespace.output_names,
+    )?;
     let input_width = condition
         .direct_input_width()?
         .max(value.direct_input_width()?);
@@ -2594,7 +2693,12 @@ fn parse_sync_state_target(
         if array_size == 1 || kind == StateRegisterKind::Combinational {
             bail!("SIMetrix ALB indexed assignment target {name} is not an EDGE/LEVEL array");
         }
-        validate_state_expression_names(&index, &namespace.defined_values, &namespace.arrays)?;
+        validate_expression_names(
+            &index,
+            &namespace.defined_values,
+            &namespace.arrays,
+            &namespace.output_names,
+        )?;
         let input_width = index.direct_input_width()?;
         return Ok((
             StateAssignmentTarget::RegisterIndex { name, index },
@@ -2607,12 +2711,7 @@ fn parse_sync_state_target(
     if namespace.register_by_name.contains_key(&name) {
         Ok((StateAssignmentTarget::Register(name), 0, 0, None))
     } else if namespace.output_names.contains(&name) {
-        Ok((
-            StateAssignmentTarget::Output(name.clone()),
-            0,
-            0,
-            Some(name),
-        ))
+        Ok((StateAssignmentTarget::Output(name), 0, 0, None))
     } else if namespace.input_names.contains(&name) || namespace.readonly_names.contains(&name) {
         bail!("SIMetrix ALB assignment attempts to modify read-only/input value {name}");
     } else {
@@ -2628,7 +2727,12 @@ fn parse_sync_state_assignment(
         .split_once('=')
         .with_context(|| format!("malformed SIMetrix ALB assignment {statement:?}"))?;
     let value = ExprParser::new(rhs.trim()).parse()?;
-    validate_state_expression_names(&value, &namespace.defined_values, &namespace.arrays)?;
+    validate_expression_names(
+        &value,
+        &namespace.defined_values,
+        &namespace.arrays,
+        &namespace.output_names,
+    )?;
     let value_input_width = value.direct_input_width()?;
     let (target, target_input_width, output_width, defines) =
         parse_sync_state_target(lhs.trim(), namespace)?;
@@ -2691,6 +2795,11 @@ fn parse_stateful_program_statements(statements: Vec<String>) -> Result<Stateful
     if input_width == 0 || output_width == 0 {
         bail!("SIMetrix ALB structural analysis requires at least one input and one output");
     }
+    if input_width > MAX_VALUE_BITS || output_width > MAX_VALUE_BITS {
+        bail!(
+            "SIMetrix ALB pin signature exceeds {MAX_VALUE_BITS} bits: {input_width} inputs, {output_width} outputs"
+        );
+    }
     Ok(StatefulProgram {
         inputs: declarations.inputs,
         outputs: declarations.outputs,
@@ -2743,11 +2852,30 @@ fn body_has_alb_syntax(body: &str) -> bool {
 }
 
 pub fn analyze_body(body: &str) -> Result<BodyAnalysis> {
+    analyze_body_with_parameters(body, None)
+}
+
+/// Analyze an original ALB body with the model USER vector and optional
+/// per-instance DEVICE vector in scope. Unresolved expression parameter
+/// references remain errors; they must never become zero-valued LUT cells.
+///
+/// # Errors
+/// Malformed source, undefined parameter indexes, or unrepresentable LUTs.
+pub fn analyze_body_in_environment(
+    body: &str,
+    environment: TimingEnvironment<'_>,
+) -> Result<BodyAnalysis> {
+    analyze_body_with_parameters(body, Some(environment))
+}
+
+enum ParsedBody {
+    Stateless(Program),
+    Stateful(StatefulProgram),
+}
+
+fn parse_body(body: &str) -> Result<Option<ParsedBody>> {
     if !body_has_alb_syntax(body) {
-        return Ok(BodyAnalysis {
-            known_truth_table: None,
-            stateful: None,
-        });
+        return Ok(None);
     }
     let statements = alb_statements(body)?;
     let stateful = statements.iter().any(|statement| {
@@ -2758,10 +2886,9 @@ pub fn analyze_body(body: &str) -> Result<BodyAnalysis> {
                 .is_some_and(|(lhs, _)| lhs.trim().to_ascii_uppercase().ends_with(".EN"))
     });
     if stateful {
-        return Ok(BodyAnalysis {
-            known_truth_table: None,
-            stateful: Some(parse_stateful_program_statements(statements)?),
-        });
+        return parse_stateful_program_statements(statements)
+            .map(ParsedBody::Stateful)
+            .map(Some);
     }
     let has_interface = statements.iter().any(|statement| {
         let upper = statement.to_ascii_uppercase();
@@ -2775,15 +2902,38 @@ pub fn analyze_body(body: &str) -> Result<BodyAnalysis> {
             })
     });
     if !has_interface {
-        return Ok(BodyAnalysis {
+        return Ok(None);
+    }
+    parse_program_statements(statements)
+        .map(ParsedBody::Stateless)
+        .map(Some)
+}
+
+/// Validate an ALB definition that the vendor reads before replacing it
+/// with inline DEF, without evaluating an unused truth table or timing.
+pub fn validate_referenced_body(body: &str) -> Result<()> {
+    parse_body(body)?.context("invalid or empty referenced ALB definition")?;
+    Ok(())
+}
+
+fn analyze_body_with_parameters(
+    body: &str,
+    environment: Option<TimingEnvironment<'_>>,
+) -> Result<BodyAnalysis> {
+    match parse_body(body)? {
+        Some(ParsedBody::Stateful(program)) => Ok(BodyAnalysis {
+            known_truth_table: None,
+            stateful: Some(program),
+        }),
+        Some(ParsedBody::Stateless(program)) => Ok(BodyAnalysis {
+            known_truth_table: Some(program.known_truth_table(environment)?),
+            stateful: None,
+        }),
+        None => Ok(BodyAnalysis {
             known_truth_table: None,
             stateful: None,
-        });
+        }),
     }
-    Ok(BodyAnalysis {
-        known_truth_table: Some(parse_program_statements(statements)?.known_truth_table()?),
-        stateful: None,
-    })
 }
 
 #[cfg(test)]
@@ -2845,13 +2995,17 @@ fn parse_program_statements(statements: Vec<String>) -> Result<Program> {
 
     let declared_input_width = validate_ports(&inputs, PortKind::Input)?;
     let declared_output_width = validate_ports(&outputs, PortKind::Output)?;
+    let output_names = outputs
+        .iter()
+        .map(|port| port.name.as_str())
+        .collect::<BTreeSet<_>>();
     let input_names = inputs
         .iter()
         .map(|port| port.name.as_str())
         .collect::<BTreeSet<_>>();
     validate_distinct_declaration_names(&inputs, &outputs, &readonly)?;
     let (assignments, direct_input_width, direct_output_width) =
-        parse_assignment_sources(assignment_sources, &input_names, &readonly)?;
+        parse_assignment_sources(assignment_sources, &input_names, &output_names, &readonly)?;
     let input_width = declared_input_width.max(direct_input_width);
     let output_width = declared_output_width.max(direct_output_width);
     if input_width == 0 || output_width == 0 {
@@ -2871,6 +3025,7 @@ fn parse_program_statements(statements: Vec<String>) -> Result<Program> {
 fn parse_assignment_sources(
     assignment_sources: Vec<String>,
     input_names: &BTreeSet<&str>,
+    output_names: &BTreeSet<&str>,
     readonly: &BTreeMap<String, ReadOnly>,
 ) -> Result<(Vec<Assignment>, usize, usize)> {
     let mut assignments = Vec::with_capacity(assignment_sources.len());
@@ -2898,12 +3053,14 @@ fn parse_assignment_sources(
             bail!("SIMetrix ALB assignment attempts to modify read-only/input value {name}");
         }
         let value = ExprParser::new(rhs.trim()).parse()?;
-        validate_expression_names(&value, &defined_values, &readonly_names)?;
+        validate_expression_names(&value, &defined_values, &readonly_names, output_names)?;
         direct_input_width = direct_input_width.max(value.direct_input_width()?);
         if let AssignmentTarget::OutputRange { last, .. } = target {
             direct_output_width = direct_output_width.max(last + 1);
         }
-        if let AssignmentTarget::Name(name) = &target {
+        if let AssignmentTarget::Name(name) = &target
+            && !output_names.contains(name.as_str())
+        {
             defined_values.insert(name.clone());
         }
         assignments.push(Assignment { target, value });
@@ -3131,7 +3288,11 @@ fn parse_readonly(statement: &str) -> Result<(String, ReadOnly)> {
     Ok((
         name,
         ReadOnly {
-            values: values.into_iter().map(|value| value & mask).collect(),
+            values: values
+                .into_iter()
+                .map(|value| value & mask)
+                .collect::<Vec<_>>()
+                .into(),
         },
     ))
 }
@@ -3197,14 +3358,16 @@ fn canonical_name(name: &str) -> Result<String> {
 }
 
 #[derive(Clone, Debug)]
-enum Expr {
+enum Expression<N, I> {
     Constant(u32),
-    Name(String),
-    Index(String, Box<Self>),
+    Name(N),
+    Index(I, Box<Self>),
     Unary(UnaryOp, Box<Self>),
     Binary(BinaryOp, Box<Self>, Box<Self>),
     Conditional(Box<Self>, Box<Self>, Box<Self>),
 }
+
+type Expr = Expression<String, String>;
 
 impl Expr {
     fn direct_input_width(&self) -> Result<usize> {
@@ -3214,7 +3377,14 @@ impl Expr {
                 let Self::Constant(index) = index.as_ref() else {
                     bail!("SIMetrix ALB direct IN[] reference requires a constant pin index");
                 };
-                Ok(usize::try_from(*index)?.saturating_add(1))
+                let pin = usize::try_from(*index)?;
+                if pin >= MAX_VALUE_BITS {
+                    bail!(
+                        "SIMetrix ALB direct IN[{pin}] pin exceeds bounded input index {}",
+                        MAX_VALUE_BITS - 1
+                    );
+                }
+                Ok(pin + 1)
             }
             Self::Index(_, index) | Self::Unary(_, index) => index.direct_input_width(),
             Self::Binary(_, lhs, rhs) => {
@@ -3228,39 +3398,28 @@ impl Expr {
     }
 
     fn evaluate(&self, context: EvalContext<'_>) -> Result<u32> {
+        self.evaluate_with(&context)
+    }
+}
+
+/// Expression addressing, independent of unsigned arithmetic and lazy
+/// control flow. Stateful programs bind their symbols to numeric slots;
+/// the stateless parser/interpreter uses its existing named environment.
+trait ExpressionValues<N, I> {
+    fn scalar(&self, name: &N) -> Result<u32>;
+    fn indexed(&self, name: &I, index: usize) -> Result<u32>;
+}
+
+impl<N, I> Expression<N, I> {
+    fn evaluate_with(&self, context: &impl ExpressionValues<N, I>) -> Result<u32> {
         match self {
             Self::Constant(value) => Ok(*value),
-            Self::Name(name) => context
-                .values
-                .get(name)
-                .copied()
-                .or_else(|| {
-                    context
-                        .readonly
-                        .get(name)
-                        .filter(|register| register.values.len() == 1)
-                        .and_then(|register| register.values.first().copied())
-                })
-                .with_context(|| {
-                    format!("SIMetrix ALB expression references undefined value {name}")
-                }),
+            Self::Name(name) => context.scalar(name),
             Self::Index(name, index) => {
-                let index = usize::try_from(index.evaluate(context)?)?;
-                if name == "IN" {
-                    return context.input_bits.get(index).copied().with_context(|| {
-                        format!("SIMetrix ALB input index {index} is out of range")
-                    });
-                }
-                let register = context
-                    .readonly
-                    .get(name)
-                    .with_context(|| format!("SIMetrix ALB expression indexes non-array {name}"))?;
-                register.values.get(index).copied().with_context(|| {
-                    format!("SIMetrix ALB READONLY {name} index {index} is out of range")
-                })
+                context.indexed(name, usize::try_from(index.evaluate_with(context)?)?)
             }
             Self::Unary(operation, value) => {
-                let value = value.evaluate(context)?;
+                let value = value.evaluate_with(context)?;
                 Ok(match operation {
                     UnaryOp::Plus => value,
                     UnaryOp::Minus => value.wrapping_neg(),
@@ -3269,31 +3428,31 @@ impl Expr {
                 })
             }
             Self::Binary(BinaryOp::LogicalAnd, lhs, rhs) => {
-                let lhs = lhs.evaluate(context)?;
+                let lhs = lhs.evaluate_with(context)?;
                 if lhs == 0 {
                     Ok(0)
                 } else {
-                    Ok(u32::from(rhs.evaluate(context)? != 0))
+                    Ok(u32::from(rhs.evaluate_with(context)? != 0))
                 }
             }
             Self::Binary(BinaryOp::LogicalOr, lhs, rhs) => {
-                let lhs = lhs.evaluate(context)?;
+                let lhs = lhs.evaluate_with(context)?;
                 if lhs != 0 {
                     Ok(1)
                 } else {
-                    Ok(u32::from(rhs.evaluate(context)? != 0))
+                    Ok(u32::from(rhs.evaluate_with(context)? != 0))
                 }
             }
             Self::Binary(operation, lhs, rhs) => {
-                let lhs = lhs.evaluate(context)?;
-                let rhs = rhs.evaluate(context)?;
+                let lhs = lhs.evaluate_with(context)?;
+                let rhs = rhs.evaluate_with(context)?;
                 evaluate_binary(*operation, lhs, rhs)
             }
             Self::Conditional(condition, yes, no) => {
-                if condition.evaluate(context)? != 0 {
-                    yes.evaluate(context)
+                if condition.evaluate_with(context)? != 0 {
+                    yes.evaluate_with(context)
                 } else {
-                    no.evaluate(context)
+                    no.evaluate_with(context)
                 }
             }
         }
@@ -3305,6 +3464,106 @@ struct EvalContext<'a> {
     values: &'a BTreeMap<String, u32>,
     readonly: &'a BTreeMap<String, ReadOnly>,
     input_bits: &'a [u32],
+    parameters: Option<&'a ExpressionParameters>,
+}
+
+impl ExpressionValues<String, String> for EvalContext<'_> {
+    fn scalar(&self, name: &String) -> Result<u32> {
+        self.values
+            .get(name)
+            .copied()
+            .or_else(|| {
+                self.readonly
+                    .get(name)
+                    .filter(|register| register.values.len() == 1)
+                    .and_then(|register| register.values.first().copied())
+            })
+            .with_context(|| format!("SIMetrix ALB expression references undefined value {name}"))
+    }
+
+    fn indexed(&self, name: &String, index: usize) -> Result<u32> {
+        if name == "IN" {
+            return self
+                .input_bits
+                .get(index)
+                .copied()
+                .with_context(|| format!("SIMetrix ALB input index {index} is out of range"));
+        }
+        if name == "USER" || name == "DEVICE" {
+            return self
+                .parameters
+                .with_context(|| {
+                    format!("SIMetrix ALB {name}[{index}] has no parameter environment")
+                })?
+                .resolve_expression_value(name, index);
+        }
+        let register = self
+            .readonly
+            .get(name)
+            .with_context(|| format!("SIMetrix ALB expression indexes non-array {name}"))?;
+        register
+            .values
+            .get(index)
+            .copied()
+            .with_context(|| format!("SIMetrix ALB READONLY {name} index {index} is out of range"))
+    }
+}
+
+/// Numeric parameters are represented as reals in the model and on each
+/// device. They are converted to the 32-bit unsigned ALB expression domain
+/// only when actually referenced in a digital expression; the same value may
+/// also be used without integer conversion by a timing qualifier.
+#[derive(Clone, Debug)]
+struct ExpressionParameters {
+    user: Vec<f64>,
+    device: Option<Vec<f64>>,
+    user_scale: f64,
+}
+
+impl ExpressionParameters {
+    fn from_environment(environment: TimingEnvironment<'_>) -> Self {
+        Self {
+            user: environment.user.to_vec(),
+            device: environment.device.map(<[f64]>::to_vec),
+            user_scale: environment.user_scale,
+        }
+    }
+
+    fn resolve_expression_value(&self, name: &str, index: usize) -> Result<u32> {
+        let parameter = match name {
+            "USER" => DynamicValue::User(index),
+            "DEVICE" => DynamicValue::Device(index),
+            _ => bail!("not an ALB numeric parameter: {name}"),
+        };
+        let value = resolve_dynamic_value(
+            &parameter,
+            TimingEnvironment {
+                user: &self.user,
+                device: self.device.as_deref(),
+                user_scale: self.user_scale,
+                default_register_delay: 0.0,
+                default_output_delay: 0.0,
+                register_timing_defaults: RegisterTimingDefaults::default(),
+            },
+        )?;
+        if !value.is_finite() {
+            bail!("SIMetrix ALB {name}[{index}] is not finite after scaling");
+        }
+        // Elements 9.40d truncates toward zero, then applies 32-bit
+        // unsigned expression semantics. This also wraps negative values:
+        // USER=-1.5 compares equal to -1 and greater than unsigned zero.
+        // rem_euclid implements the 2^32 wrap without saturating casts.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "wrapped finite value is deliberately converted to a 32-bit ALB word"
+        )]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "rem_euclid produces a nonnegative number before the deliberate unsigned conversion"
+        )]
+        let bits = value.trunc().rem_euclid(4_294_967_296.0) as u32;
+        Ok(bits)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3379,14 +3638,25 @@ fn evaluate_binary(operation: BinaryOp, lhs: u32, rhs: u32) -> Result<u32> {
     })
 }
 
-fn validate_expression_names(
+// Stateless symbols are borrowed and stateful symbols are owned; the
+// Elements 9.40d expression grammar is identical in both contexts.
+// An output port is always write-only, even after a preceding assignment.
+fn validate_expression_names<A, O>(
     expression: &Expr,
     defined_values: &BTreeSet<String>,
-    readonly: &BTreeSet<&str>,
-) -> Result<()> {
+    readonly: &BTreeSet<A>,
+    output_names: &BTreeSet<O>,
+) -> Result<()>
+where
+    A: Borrow<str> + Ord,
+    O: Borrow<str> + Ord,
+{
     match expression {
         Expr::Constant(_) => Ok(()),
         Expr::Name(name) => {
+            if output_names.contains(name.as_str()) {
+                bail!("SIMetrix ALB attempts to read output pin {name}");
+            }
             if defined_values.contains(name) {
                 Ok(())
             } else {
@@ -3394,20 +3664,29 @@ fn validate_expression_names(
             }
         }
         Expr::Index(name, index) => {
-            if name != "IN" && !readonly.contains(name.as_str()) {
+            if output_names.contains(name.as_str()) {
+                bail!("SIMetrix ALB attempts to read output pin {name}");
+            }
+            if name != "IN"
+                && name != "USER"
+                && name != "DEVICE"
+                && !readonly.contains(name.as_str())
+            {
                 bail!("SIMetrix ALB expression indexes undeclared array {name}");
             }
-            validate_expression_names(index, defined_values, readonly)
+            validate_expression_names(index, defined_values, readonly, output_names)
         }
-        Expr::Unary(_, value) => validate_expression_names(value, defined_values, readonly),
+        Expr::Unary(_, value) => {
+            validate_expression_names(value, defined_values, readonly, output_names)
+        }
         Expr::Binary(_, lhs, rhs) => {
-            validate_expression_names(lhs, defined_values, readonly)?;
-            validate_expression_names(rhs, defined_values, readonly)
+            validate_expression_names(lhs, defined_values, readonly, output_names)?;
+            validate_expression_names(rhs, defined_values, readonly, output_names)
         }
         Expr::Conditional(condition, yes, no) => {
-            validate_expression_names(condition, defined_values, readonly)?;
-            validate_expression_names(yes, defined_values, readonly)?;
-            validate_expression_names(no, defined_values, readonly)
+            validate_expression_names(condition, defined_values, readonly, output_names)?;
+            validate_expression_names(yes, defined_values, readonly, output_names)?;
+            validate_expression_names(no, defined_values, readonly, output_names)
         }
     }
 }
@@ -3807,7 +4086,82 @@ fn parse_u32_constant(value: &str) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    fn unit_timing() -> TimingEnvironment<'static> {
+        TimingEnvironment {
+            user: &[],
+            device: None,
+            user_scale: 1.0,
+            default_register_delay: 1e-9,
+            default_output_delay: 1e-9,
+            register_timing_defaults: RegisterTimingDefaults::default(),
+        }
+    }
+
+    fn timed_graph(source: &str) -> Result<TimedCombinationalGraph> {
+        let (_, stateful) = analyze_body(source)?.into_parts();
+        stateful
+            .context("expected timed ALB")?
+            .timed_combinational_graph(unit_timing())?
+            .context("expected timed graph")
+    }
+
     use super::*;
+
+    #[test]
+    fn stateless_user_device_compile_with_full_numeric_environment() -> Result<()> {
+        let source = "PORT Data in[0]; PORT Q out[0]; \
+            Q=(USER[USER[0]]+DEVICE[0]==4) ? Data : 0;";
+        let env = TimingEnvironment {
+            user: &[1.5, 2.0],
+            device: Some(&[2.0]),
+            user_scale: 1.0,
+            default_register_delay: 1e-9,
+            default_output_delay: 1e-9,
+            register_timing_defaults: RegisterTimingDefaults::default(),
+        };
+        let (table, stateful) = analyze_body_in_environment(source, env)?.into_parts();
+        assert!(stateful.is_none());
+        let table = table.context("expected resolved stateless ALB")?;
+        assert_eq!(table.input_width(), 1);
+        assert_eq!(table.output_width(), 1);
+        assert_eq!(table.rows(), &[0, 1]);
+        assert_eq!(table.d_genlut_values(), "01");
+
+        let without_device = TimingEnvironment {
+            device: None,
+            ..env
+        };
+        let error = analyze_body_in_environment(source, without_device)
+            .err()
+            .context("missing DEVICE must fail rather than return an empty LUT")?;
+        assert!(format!("{error:#}").contains("DEVICE[0]"));
+        let error = analyze_body(source)
+            .err()
+            .context("unresolved USER must not compile as an unparameterized LUT")?;
+        assert!(format!("{error:#}").contains("USER[0]"));
+        Ok(())
+    }
+
+    #[test]
+    fn stateless_user_parameters_preserve_unsigned_wrap_and_real_scale() -> Result<()> {
+        let source = "PORT D in[0]; PORT Q out[0]; \
+            Q=((USER[0]>0) && (USER[1]>1)) ? D : 0;";
+        let params = TimingEnvironment {
+            user: &[-1.5, 0.75],
+            device: None,
+            user_scale: 3.0,
+            default_register_delay: 1e-9,
+            default_output_delay: 1e-9,
+            register_timing_defaults: RegisterTimingDefaults::default(),
+        };
+        let (table, stateful) = analyze_body_in_environment(source, params)?.into_parts();
+        assert!(stateful.is_none());
+        assert_eq!(table.context("missing stateless table")?.rows(), &[0, 1]);
+        // The same REAL values are not rounded for timing qualifiers.
+        let delay = resolve_dynamic_value(&DynamicValue::User(1), params)?;
+        assert!((delay - 2.25).abs() < 1e-12);
+        Ok(())
+    }
 
     #[test]
     fn compiles_hc138_known_input_truth_table() -> Result<()> {
@@ -3845,6 +4199,26 @@ Out = (!E_Inv) ? ~(1<<Address) : 7 ;
         assert_eq!(table.rows()[0], 0xe);
         assert_eq!(table.rows()[3], 0x7);
         assert_eq!(table.rows()[4], 0x7);
+        Ok(())
+    }
+
+    #[test]
+    fn vendor_rejects_stateless_output_pin_reads() -> Result<()> {
+        // Elements 9.40d outputs are write-only; the same name cannot
+        // subsequently be used as an expression value.
+        for body in [
+            "PORT D in[0]; PORT Q out[0]; PORT Z out[1]; Q=D; Z=Q;",
+            "PORT D in[0]; PORT Q out[0]; PORT Z out[1]; Q=D; Z=D && Q;",
+            "PORT D in[0]; PORT Q out[0]; PORT Z out[1]; Q=D; Z=D ? Q : 0;",
+        ] {
+            let error = compile_known_truth_table(body)
+                .err()
+                .context("stateless ALB output pin reads must be rejected")?;
+            assert!(
+                error.to_string().contains("read output pin Q"),
+                "unexpected stateless ALB error: {error:#}"
+            );
+        }
         Ok(())
     }
 
@@ -4007,15 +4381,7 @@ Y = delayed ;
             assert_eq!(program.register_count(expected_kind), 1);
             assert_eq!(program.registers[0].clock_pin, Some(5));
             assert!(
-                program
-                    .timed_combinational_graph(TimingEnvironment {
-                        user: &[],
-                        device: None,
-                        user_scale: 1.0,
-                        default_register_delay: 1e-9,
-                        default_output_delay: 1e-9,
-                    })?
-                    .is_none(),
+                program.timed_combinational_graph(unit_timing())?.is_none(),
                 "clocked ALBs must remain outside the COMB-only compiler"
             );
         }
@@ -4132,16 +4498,50 @@ CountOut = Count ;
             assert_eq!(program.asynchronous_assignment_count(), async_count);
             assert_eq!(program.registers[0].initial.len(), 1);
             assert!(
-                program
-                    .timed_combinational_graph(TimingEnvironment {
-                        user: &[],
-                        device: None,
-                        user_scale: 1.0,
-                        default_register_delay: 1e-9,
-                        default_output_delay: 1e-9,
-                    })?
-                    .is_none(),
+                program.timed_combinational_graph(unit_timing())?.is_none(),
                 "stateful oracle must never silently lower as COMB"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_input_expression_pin_indices_respect_the_32_bit_alb_boundary() -> Result<()> {
+        let accepted = analyze_body("PORT Q out[0]; COMB (WIDTH=1, DELAY=1n) R=0; R=IN[31]; Q=R;")?;
+        assert_eq!(
+            accepted
+                .into_parts()
+                .1
+                .context("expected stateful ALB for IN[31]")?
+                .input_width(),
+            MAX_VALUE_BITS,
+        );
+        let stateless = compile_known_truth_table("PORT Q out[0]; Q=IN[7];")?;
+        assert_eq!(stateless.input_width(), 8);
+        assert_eq!(stateless.rows()[0], 0);
+        assert_eq!(stateless.rows()[128], 1);
+        for source in [
+            "PORT Q out[0]; Q=IN[32];",
+            "PORT Q out[0]; Q=IN[4294967295];",
+            "PORT Q out[0]; Q=1 ? IN[32] : 0;",
+            "PORT Q out[0]; COMB (WIDTH=1, DELAY=1n) R=0; R=IN[32]; Q=R;",
+            "PORT Q out[0]; COMB (WIDTH=1, DELAY=1n) R=0; R=IN[4294967295]; Q=R;",
+            "PORT Q out[0]; COMB (WIDTH=1, DELAY=1n) R=0; R=0 ? IN[32] : 1; Q=R;",
+            concat!(
+                "PORT Q out[0]; EDGE (WIDTH=1, DELAY=1n, CLOCK=in[0]) R=0; ",
+                "R:=IN[32] ? 0; R=IN[0]; Q=R;"
+            ),
+            concat!(
+                "PORT Q out[0]; EDGE (WIDTH=1, DELAY=1n, CLOCK=in[0]) R[2]=0,0; ",
+                "R[IN[32]]=1; Q=R[0];"
+            ),
+        ] {
+            let error = analyze_body(source)
+                .err()
+                .context("out-of-range direct IN pin must fail before runtime allocation")?;
+            assert!(
+                error.to_string().contains("pin"),
+                "wrong error for {source}: {error}"
             );
         }
         Ok(())
@@ -4365,6 +4765,7 @@ Y = D2 ;
                 user_scale: 2.0,
                 default_register_delay: 11.0e-9,
                 default_output_delay: 13.0e-9,
+                register_timing_defaults: RegisterTimingDefaults::default(),
             })?
             .context("expected COMB-only timing resolution")?;
         assert_eq!(resolved.register_delays()["D0"], 11.0e-9);
@@ -4388,13 +4789,7 @@ Y = D ;
         let (_, stateful) = analysis.into_parts();
         let stateful = stateful.context("expected delayed combinational program")?;
         let error = stateful
-            .resolve_combinational_timing(TimingEnvironment {
-                user: &[],
-                device: None,
-                user_scale: 1.0,
-                default_register_delay: 1.0e-9,
-                default_output_delay: 1.0e-9,
-            })
+            .resolve_combinational_timing(unit_timing())
             .err()
             .map(|error| error.to_string());
         assert!(error.is_some_and(|error| {
@@ -4427,6 +4822,7 @@ Y = D2 ;
                 user_scale: 1.0,
                 default_register_delay: 1.0e-9,
                 default_output_delay: 1.0e-9,
+                register_timing_defaults: RegisterTimingDefaults::default(),
             })?
             .context("expected acyclic timed COMB graph")?;
         assert_eq!(graph.stage_names(), vec!["D1", "D2"]);
@@ -4469,6 +4865,7 @@ Y.En = E ;
                 user_scale: 2.0,
                 default_register_delay: 1.0e-9,
                 default_output_delay: 5.0e-9,
+                register_timing_defaults: RegisterTimingDefaults::default(),
             })?
             .context("expected acyclic timed COMB graph")?;
         assert_eq!(graph.stage("D").context("missing D")?.width, 2);
@@ -4493,20 +4890,14 @@ Y = State ;
         let (_, stateful) = analysis.into_parts();
         let graph = stateful
             .context("expected stateful ALB")?
-            .timed_combinational_graph(TimingEnvironment {
-                user: &[],
-                device: None,
-                user_scale: 1.0,
-                default_register_delay: 1.0e-9,
-                default_output_delay: 1.0e-9,
-            })?;
+            .timed_combinational_graph(unit_timing())?;
         assert!(graph.is_none());
         Ok(())
     }
 
     #[test]
     fn compiles_timed_stage_known_state_luts_with_minimal_sources() -> Result<()> {
-        let analysis = analyze_body(
+        let graph = timed_graph(
             r"
 PORT A in[0] ;
 PORT B in[1] ;
@@ -4516,17 +4907,6 @@ D = A ^ (B << 1) ;
 Y = D ;
 ",
         )?;
-        let (_, stateful) = analysis.into_parts();
-        let graph = stateful
-            .context("expected timed ALB")?
-            .timed_combinational_graph(TimingEnvironment {
-                user: &[],
-                device: None,
-                user_scale: 1.0,
-                default_register_delay: 1.0e-9,
-                default_output_delay: 1.0e-9,
-            })?
-            .context("expected timed graph")?;
         let luts = graph.known_state_luts()?;
         let stage0 = luts.stage_bit("D", 0).context("missing D[0] LUT")?;
         let stage1 = luts.stage_bit("D", 1).context("missing D[1] LUT")?;
@@ -4545,7 +4925,7 @@ Y = D ;
 
     #[test]
     fn compiles_timed_output_enable_as_high_impedance_lut_cells() -> Result<()> {
-        let analysis = analyze_body(
+        let graph = timed_graph(
             r"
 PORT A in[0:1] ;
 PORT OE in[2] ;
@@ -4558,17 +4938,6 @@ Y = D ;
 Y.En = E ? 3 : 0 ;
 ",
         )?;
-        let (_, stateful) = analysis.into_parts();
-        let graph = stateful
-            .context("expected timed ALB")?
-            .timed_combinational_graph(TimingEnvironment {
-                user: &[],
-                device: None,
-                user_scale: 1.0,
-                default_register_delay: 1.0e-9,
-                default_output_delay: 1.0e-9,
-            })?
-            .context("expected timed graph")?;
         let luts = graph.known_state_luts()?;
         let output0 = luts.output_bit("Y", 0).context("missing Y[0] LUT")?;
         let output1 = luts.output_bit("Y", 1).context("missing Y[1] LUT")?;
@@ -4616,7 +4985,7 @@ Y = A ^ A ;
 
     #[test]
     fn timed_lut_computes_possible_levels_and_enable_strengths() -> Result<()> {
-        let analysis = analyze_body(
+        let graph = timed_graph(
             r"
 PORT A in[0] ;
 PORT B in[1] ;
@@ -4628,17 +4997,6 @@ Y = D ;
 Y.En = OE ;
 ",
         )?;
-        let (_, stateful) = analysis.into_parts();
-        let graph = stateful
-            .context("expected timed ALB")?
-            .timed_combinational_graph(TimingEnvironment {
-                user: &[],
-                device: None,
-                user_scale: 1.0,
-                default_register_delay: 1.0e-9,
-                default_output_delay: 1.0e-9,
-            })?
-            .context("expected timed graph")?;
         let luts = graph.known_state_luts()?;
 
         assert_eq!(
@@ -4707,7 +5065,7 @@ Y.En = OE ;
 
     #[test]
     fn timed_known_state_lut_uses_cell_bound_not_global_input_bound() -> Result<()> {
-        let analysis = analyze_body(
+        let graph = timed_graph(
             r"
 PORT A in[0:22] ;
 PORT Y out[0] ;
@@ -4716,17 +5074,6 @@ D = A == 0 ;
 Y = D ;
 ",
         )?;
-        let (_, stateful) = analysis.into_parts();
-        let graph = stateful
-            .context("expected timed ALB")?
-            .timed_combinational_graph(TimingEnvironment {
-                user: &[],
-                device: None,
-                user_scale: 1.0,
-                default_register_delay: 1.0e-9,
-                default_output_delay: 1.0e-9,
-            })?
-            .context("expected timed graph")?;
         let error = graph
             .known_state_luts()
             .err()

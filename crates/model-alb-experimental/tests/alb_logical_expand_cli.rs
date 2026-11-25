@@ -65,7 +65,7 @@ fn file_and_inline_models_emit_source_tree_with_shared_physical_triples() -> Res
         assert!(native.to_ascii_uppercase().contains(
             ".SUBCKT SRALB0 SR_IN0 SR_IN0_SINK SR_IN0_SOURCE SR_OUT0 SR_OUT0_SINK SR_OUT0_SOURCE"
         ));
-        assert!(native.contains("out_res=4e1"));
+        assert!(native.contains("out_res_pos=4e1"));
         assert!(native.contains("capacitance=2e-12"));
         if fixture == "logical-shared.cir" {
             assert_eq!(
@@ -111,10 +111,6 @@ fn unsupported_model_forms_and_hierarchy_are_not_guessed() -> Result<()> {
         (
             "unmatched-output",
             input.replace("[din] [dout]", "[din] [dout other]"),
-        ),
-        (
-            "unequal-out-res",
-            input.replace("out_res=40", "out_res_pos=40 out_res_neg=20"),
         ),
         (
             "wrong-model",
@@ -165,6 +161,82 @@ fn compiled_model_parameters_are_extracted_from_inline_truth_table() -> Result<(
         "{text}"
     );
     assert!(text.contains("delay=2e-9"), "{text}");
-    assert!(text.contains("out_res=4e1"), "{text}");
+    assert!(text.contains("out_res_pos=4e1"), "{text}");
+    Ok(())
+}
+
+#[test]
+fn original_clocked_alb_discovery_and_native_bundle_wiring() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let input = source_dir().join("../vendor-stateful/edge-basic.net");
+    let original = fs::read_to_string(input)?;
+    let source = temp.path().join("clocked.cir");
+    fs::write(&source, original)?;
+    let config = temp.path().join("config.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_alb-boundary-discover"))
+        .arg(&source)
+        .arg(source_dir().join("auto-discovery-univ-5v.json"))
+        .arg(&config)
+        .output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = expand(&source, &config, temp.path())?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let library = temp.path().join("generated.inc");
+    let native = fs::read_to_string(&library)?;
+    assert!(
+        native.contains(
+            "Asr_stateful [sr_in0 sr_in1] [sr_out0] 0 [sr_out0_sink] [sr_out0_source] Msr_stateful"
+        ),
+        "{native}"
+    );
+    let wire = || {
+        Command::new(env!("CARGO_BIN_EXE_alb-family-autowire"))
+            .arg(temp.path().join("lowered.cir"))
+            .arg(&library)
+            .arg(&config)
+            .arg(source_dir().join("vendor-univ-models.json"))
+            .arg(temp.path().join("final.cir"))
+            .output()
+    };
+    let result = wire()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let deck = fs::read_to_string(temp.path().join("final.cir"))?;
+    assert_eq!(deck.matches("sr_family_adc(").count(), 2);
+    assert_eq!(deck.matches("sr_family_dac(").count(), 1);
+    fs::remove_file(temp.path().join("final.cir"))?;
+    for broken in [
+        native.replace("[sr_in0 sr_in1] [sr_out0]", "[sr_in1 sr_in0] [sr_out0]"),
+        native.replace(
+            "[sr_out0_sink] [sr_out0_source]",
+            "[sr_out0_source] [sr_out0_sink]",
+        ),
+        native.replace("[sr_out0_sink]", "[unbound]"),
+        native.replace("input_load=0)", "input_load=1e-12)"),
+        native.replace("out_res_pos=1e2 ", "wrong_out_res_pos=1e2 "),
+        native.replace("out_res_neg=1e2 ", "out_res_neg=NaN "),
+        native.replace("hold_time=0e0 ", "hold_time=NaN "),
+        native.replace("setup_time=0e0 ", "setup_time=0e0 setup_time=1e-9 "),
+        native.replace("sr_alb_stateful(", "sr_alb_probe("),
+    ] {
+        fs::write(&library, &broken)?;
+        let result = wire()?;
+        assert!(
+            !result.status.success(),
+            "invalid stateful ABI accepted: {broken}"
+        );
+        assert!(!temp.path().join("final.cir").exists());
+    }
     Ok(())
 }

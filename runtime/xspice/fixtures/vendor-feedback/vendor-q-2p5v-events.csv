@@ -1,0 +1,8 @@
+scenario,pin,direction,time_ns
+comb-two-stage,q,fall,8.951119295
+comb-two-stage,q,rise,19.204997545
+comb-two-stage,q,fall,28.927206454
+comb-feedback-input,q,fall,11.963524038
+comb-feedback-input,q,rise,12.209963569
+comb-feedback-input,q,fall,13.963905429
+comb-feedback-input,q,rise,14.189659093

@@ -155,6 +155,62 @@ fn existing_a_device_cannot_receive_a_second_private_adc() -> Result<()> {
 }
 
 #[test]
+fn preexisting_a_device_on_private_bundle_metadata_is_rejected() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = fixtures().join("scoped-private-3v3.json");
+    let expanded = run_expand(&fixtures().join("scoped-private.cir"), &config, temp.path())?;
+    assert!(expanded.status.success());
+    let path = temp.path().join("lowered.cir");
+    let original = fs::read_to_string(&path)?;
+    for metadata in ["D_IN_SR_SINK", "D_IN_SR_SOURCE"] {
+        fs::write(
+            &path,
+            original.replace(
+                ".ends TOP\n",
+                &format!("Arogue {metadata} UNKNOWN_MODEL\n.ends TOP\n"),
+            ),
+        )?;
+        let output = run_autowire(&config, temp.path())?;
+        assert!(
+            !output.status.success(),
+            "accepted existing A device on private metadata {metadata}"
+        );
+        assert!(!temp.path().join("circuit.cir").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn nested_a_device_on_private_bundle_metadata_is_rejected() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = fixtures().join("scoped-private-3v3.json");
+    let expanded = run_expand(&fixtures().join("scoped-private.cir"), &config, temp.path())?;
+    assert!(expanded.status.success());
+    let path = temp.path().join("lowered.cir");
+    let content = fs::read_to_string(&path)?;
+    let altered = content.replace(
+        ".ends TOP\n",
+        "Xrogue D_IN_SR_SOURCE PROBE\n\
+         .ends TOP\n\
+         .subckt PROBE tap\n\
+         Xdeep tap SENSE\n\
+         .ends PROBE\n\
+         .subckt SENSE sensed\n\
+         Arogue %gd(sensed 0) unrelated UNKNOWN_MODEL\n\
+         .ends SENSE\n",
+    );
+    assert_ne!(altered, content);
+    fs::write(&path, altered)?;
+    let output = run_autowire(&config, temp.path())?;
+    assert!(
+        !output.status.success(),
+        "accepted nested A device on private output source-current metadata"
+    );
+    assert!(!temp.path().join("circuit.cir").exists());
+    Ok(())
+}
+
+#[test]
 fn lexical_nested_model_scope_is_distinct_from_flat_model_name() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let input = fs::read_to_string(fixtures().join("scoped-nested.cir"))?;

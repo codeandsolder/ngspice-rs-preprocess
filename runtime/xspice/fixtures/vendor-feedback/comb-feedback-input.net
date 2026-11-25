@@ -1,0 +1,15 @@
+* Vendor-derived COMB cascade or positive-delay feedback experiment
+.model MCOMB_FEEDBACK_INPUT d_logic_block file=FCOMB_FEEDBACK_INPUT family="UNIV"
+.file FCOMB_FEEDBACK_INPUT
+PORT Data in[0] ;
+PORT Q out[0] ;
+COMB (WIDTH=1, DELAY=1n) Osc=0 ;
+Osc=(!Osc) ^ Data ;
+Q=Osc ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 10n 5 10.1n 0 15n 0 15.1n 5 20n 5)
+Acomb [d] [q] MCOMB_FEEDBACK_INPUT
+Rout q 0 100k
+.tran 20p 20n 0 20p
+.PRINT TRAN V(d) V(q)
+.end

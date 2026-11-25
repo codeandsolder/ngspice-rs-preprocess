@@ -1,0 +1,12 @@
+* Original physical negative capacitance and reverse current demands
+.model R d_logic_block family="HC" input_load=-2p sink_current=.5m source_current=-.5m out_res=40 out_delay=1n def="out[0]=in[0];"
+.model CONTROL d_logic_block family="HC" input_load=0 sink_current=.5m source_current=-.5m out_res=40 out_delay=1n def="out[0]=in[0];"
+Vinput d 0 PWL(0 0 10n 0 20n 5 30n 5 40n 0 50n 0)
+Vcontrol e 0 PWL(0 0 10n 0 20n 5 30n 5 40n 0 50n 0)
+A1 [d] [q] R
+A2 [e] [r] CONTROL
+R1 q 0 100k
+R2 r 0 100k
+.PRINT TRAN V(q) V(r) I(Vinput) I(Vcontrol)
+.tran 10p 50n 0 10p
+.end

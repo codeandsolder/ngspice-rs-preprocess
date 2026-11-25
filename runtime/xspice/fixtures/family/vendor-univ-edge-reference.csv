@@ -1,6 +1,7 @@
 # SIMetrix Elements 9.40d source-only ALB oracle: 20ps max internal step,
 # vendor Sload hysteretic TON=TOFF=1ps; ngspice SW is effectively instantaneous.
 # Threshold crossings linearly interpolated from vendor 20ps .PRINT voltage samples.
+# Full oracle and provenance: Notion ALB transient parity — timestep and switch defaults.
 shunt_ohm,pin_rise_ns,pin_fall_ns,observe_rise_ns,observe_fall_ns
 20,31.800586648,95.644260048,32.644393721,97.167206454
 52,31.800586648,95.644333397,32.644393721,97.427206454

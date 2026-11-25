@@ -1,0 +1,24 @@
+* Three original ALB A instances, two distinct DEVICE vectors, one source body.
+Vin analog_input 0 1.5
+Xtop analog_input analog_on analog_off analog_copy TOP
+Ron analog_on 0 100k
+Roff analog_off 0 100k
+Rcopy analog_copy 0 100k
+.subckt TOP din dout_on dout_off dout_copy
+A1 [din] [dout_on] DL : USER=[1]
+A2 [din] [dout_off] DL : USER=[0]
+A3 [din] [dout_copy] DL : USER=[1]
+.model DL d_logic_block file=logic input_load=2p out_res=40 out_delay=2n family="HC" user=[0.75] user_scale=3
+.file logic
+PORT A in[0] ;
+PORT Y out[0] ;
+Y = (USER[0]>1 && DEVICE[0]>0) ? A : 0 ;
+.endf
+.ends TOP
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(analog_on) v(analog_off) v(analog_copy)
+quit
+.endc
+.end

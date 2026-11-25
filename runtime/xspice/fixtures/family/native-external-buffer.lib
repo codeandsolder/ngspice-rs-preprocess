@@ -1,0 +1,5 @@
+* A verified external library that explicitly implements the native 3-node ABI.
+* The internal ALB uses the same D_LOGIC_BLOCK buffer compiled to SRALB0.
+.subckt SR_NATIVE_DIGITAL_BUFFER D D_SINK D_SOURCE Q Q_SINK Q_SOURCE
+Xcore D D_SINK D_SOURCE Q Q_SINK Q_SOURCE SRALB0
+.ends SR_NATIVE_DIGITAL_BUFFER

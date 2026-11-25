@@ -1,0 +1,20 @@
+* Original digital 12-state source drives a d_to_real sampleable event node
+0n 0s
+6n 1s
+12n 0r
+18n Ur
+24n 1z
+30n 0u
+36n 1u
+42n 1r
+48n 0z
+54n Us
+60n 1s
+66n 0s
+72n 1s
+78n 0r
+84n 1u
+90n 0s
+96n 1r
+102n Uu
+108n 0s

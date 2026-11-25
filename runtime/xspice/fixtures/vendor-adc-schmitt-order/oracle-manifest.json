@@ -1,0 +1,82 @@
+{
+  "simulator": "SIMetrix Elements 9.40d",
+  "sampling_note": "2ps maximum transient timestep; 0.126+1n ns samples avoid PWL corners; 5 thresholds per V(q) rise/fall; original source/listing/CSV hashes",
+  "cases": [
+    {
+      "pins": [
+        "v(q)",
+        "i(vd)"
+      ],
+      "csv_sha256": "04BC70D72EF83C0A331E89CB38FA1A9BF0E77A95290694E8785E59B90E92379B",
+      "listing_sha256": "6DC0FC807B539C89E1E6152C2CDA705F38A51230266B6AE5008A1B3A0B9F5DE9",
+      "name": "baseline",
+      "rows": 20001,
+      "crossings": 20,
+      "source_sha256": "7D8186B265007177549C5F9556A0942899EF0280D6B5C2C0AF52C2B7AAB1C5A8",
+      "retained_rows": 42,
+      "normalized_source_sha256": "e94e01168fe43ba8f9a844a95e0149ddad7e8339780ea8af62e492409b6f0096",
+      "sample_tolerance": 0.045,
+      "current_tolerance": 1e-06,
+      "crossing_tolerance_ns": 0.015,
+      "voltage_time_tolerance_ns": 0.0,
+      "current_time_tolerance_ns": 0.0
+    },
+    {
+      "pins": [
+        "v(q)",
+        "i(vd)"
+      ],
+      "csv_sha256": "D22736CE84CC45FE1547268E3166C512DD27C5F1034E47CECFCA2E89F144E097",
+      "listing_sha256": "18DA15CD0B1770801174AD6C7F0AB8ACD5AC4603FCD6F008EB029D7AE69DD678",
+      "name": "equal",
+      "rows": 20001,
+      "crossings": 20,
+      "source_sha256": "4D75A71ADD2B34CDC3CFC2CB52ECE719813F6ABB72FD3BD33A8019F3466A2206",
+      "retained_rows": 42,
+      "normalized_source_sha256": "5162164fc68056ce30af942c4afbde44962e1a934a9b25019c2a5a216d1a33e5",
+      "sample_tolerance": 0.045,
+      "current_tolerance": 1e-06,
+      "crossing_tolerance_ns": 0.015,
+      "voltage_time_tolerance_ns": 0.0,
+      "current_time_tolerance_ns": 0.0
+    },
+    {
+      "pins": [
+        "v(q)",
+        "i(vd)"
+      ],
+      "csv_sha256": "E947C46E93F3B973F0B36B44BA6EF2C3D0076579B212D786E913D86EB3111637",
+      "listing_sha256": "55283C58D89C6C2B9C9E34363B4990BDF9C174DEE8132BCCE369A74A9057CA12",
+      "name": "reversed",
+      "rows": 20001,
+      "crossings": 30,
+      "source_sha256": "273A07ECC3EB8F2FFEFAB3E5C43D038776494945F875F5197B0FD8853AE7962C",
+      "retained_rows": 42,
+      "normalized_source_sha256": "5c595c226701713e49ec090f3ddb504ef5a7fefadec638a6883fad9ae5f54ac3",
+      "sample_tolerance": 0.045,
+      "current_tolerance": 1e-06,
+      "crossing_tolerance_ns": 0.015,
+      "voltage_time_tolerance_ns": 0.0,
+      "current_time_tolerance_ns": 0.0
+    },
+    {
+      "pins": [
+        "v(q)",
+        "i(vd)"
+      ],
+      "csv_sha256": "039DFE10649E0F478BE091A8028849537068324B24214CA58596C7D3A50EEC66",
+      "listing_sha256": "5B8B9B0BEB8B9740A92263456CDF2335A861C7C49A4C75631327DFC41A58997A",
+      "name": "wide",
+      "rows": 20001,
+      "crossings": 20,
+      "source_sha256": "85803E2BACE93E34CF4713401CCF434FDC8614754955499418D919883630B884",
+      "retained_rows": 42,
+      "normalized_source_sha256": "85fc788620c50c6ce3e931ffe3d55f1d9ddf1e1e59360a6f07ef765ae268e2e4",
+      "sample_tolerance": 0.045,
+      "current_tolerance": 1e-06,
+      "crossing_tolerance_ns": 0.015,
+      "voltage_time_tolerance_ns": 0.0,
+      "current_time_tolerance_ns": 0.0
+    }
+  ]
+}

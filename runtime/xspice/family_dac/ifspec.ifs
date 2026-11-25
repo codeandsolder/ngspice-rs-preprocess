@@ -18,7 +18,7 @@ Parameter_Name:        out_low             out_high          g_pullup        g_p
 Description:           "analog zero V"     "analog one V"    "one S"         "zero S"
 Data_Type:             real                real              real            real
 Default_Value:         0                   5                 0.01            0.01
-Limits:                -                   -                 [0 -]           [0 -]
+Limits:                -                   -                 -               -
 Vector:                no                  no                no              no
 Vector_Bounds:         -                   -                 -               -
 Null_Allowed:          yes                 yes               yes             yes
@@ -28,7 +28,7 @@ Parameter_Name:        g_resistive         g_hiz             knee_low        kne
 Description:           "resistive S"       "hi-Z S"         "zero knee V"    "one knee V"
 Data_Type:             real                real              real            real
 Default_Value:         0.001               1e-9              2               3
-Limits:                [0 -]               [0 -]             -               -
+Limits:                -                   -                 -               -
 Vector:                no                  no                no              no
 Vector_Bounds:         -                   -                 -               -
 Null_Allowed:          yes                 yes               yes             yes
@@ -38,7 +38,7 @@ Parameter_Name:        v_smooth            input_load        t_rise          t_f
 Description:           "knee offset V"     "digital load F"  "rise sec"      "fall sec"
 Data_Type:             real                real              real            real
 Default_Value:         0                   1e-12             1e-9            1e-9
-Limits:                [0 -]               -                 [1e-12 -]       [1e-12 -]
+Limits:                -                   -                 -               -
 Vector:                no                  no                no              no
 Vector_Bounds:         -                   -                 -               -
 Null_Allowed:          yes                 yes               yes             yes

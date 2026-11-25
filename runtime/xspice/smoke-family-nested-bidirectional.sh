@@ -28,8 +28,10 @@ rg -q '^AsrFamily[[:digit:]]+ D_DRIVE D_DRIVE_SR_SINK D_DRIVE_SR_SOURCE %gd\(PIN
     { echo 'Expected PIN/OE ADC models' >&2; exit 1; }
 [[ $(rg -c 'sr_family_dac\(' "$work/circuit.cir") == 2 ]] ||
     { echo 'Expected PIN/MONITOR DAC models' >&2; exit 1; }
-[[ $(rg -c 'sr_bundle_load\(' "$work/generated.inc") == 2 ]] ||
-    { echo 'Each remote ALB input needs exactly one input-load model' >&2; exit 1; }
+[[ $(rg -c 'sr_bundle_load\(' "$work/generated.inc") == 1 ]] ||
+    { echo 'Identical ALB kernels must share one load-model declaration' >&2; exit 1; }
+rg -q '^XSR_A1 .* SRALB0$' "$work/circuit.cir"
+rg -q '^XSR_A2 .* SRALB0$' "$work/circuit.cir"
 
 printf 'codemodel %s\n' "$cm" > "$work/.spiceinit"
 (

@@ -1,0 +1,38 @@
+* Original ngspice47 1991 digital IDN resolution: triple all 48 table cases
+Venable aenable 0 PWL(0 3.3 130n 3.3 130.1n 0 261n 0 261.1n 3.3 392n 3.3)
+AenInput [aenable] [EN] ORIGINAL_ADC
+.model ORIGINAL_ADC adc_bridge(in_low=1.386 in_high=1.452 rise_delay=1p fall_delay=1p)
+Asource0 [QEV] ORIGINAL_SOURCE0
+Asource1 [QEV] ORIGINAL_SOURCE1
+Asource2 [QEV] ORIGINAL_SOURCE2
+Ad2real QEV NULL RRAW ORIGINAL_D2R
+Ad2enabled QEV EN RGATED ORIGINAL_D2R
+Again RRAW RGAIN ORIGINAL_GAIN
+Araw RRAW ANALOG_RAW ORIGINAL_R2V
+Aenabled RGATED ANALOG_ENABLED ORIGINAL_R2V
+AgainAnalog RGAIN ANALOG_GAIN ORIGINAL_R2V
+Aprobe QEV Q_SINK Q_SOURCE %gd(ANALOG_PROBE 0) ORIGINAL_PROBE
+.model ORIGINAL_SOURCE0 d_source(input_file="original-contention-triple-source-0.txt" input_load=0)
+.model ORIGINAL_SOURCE1 d_source(input_file="original-contention-triple-source-1.txt" input_load=0)
+.model ORIGINAL_SOURCE2 d_source(input_file="original-contention-triple-source-2.txt" input_load=0)
+.model ORIGINAL_D2R d_to_real(zero=-0.5 one=2 delay=350p)
+.model ORIGINAL_GAIN real_gain(in_offset=0.2 gain=1.6 out_offset=-0.3 delay=250p ic=-0.8)
+.model ORIGINAL_R2V real_to_v(gain=1 transition_time=400p)
+.model ORIGINAL_PROBE sr_family_dac(out_low=0 out_high=3.3 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-8 knee_low=2 knee_high=2.75 v_smooth=.5 input_load=0 t_rise=50p t_fall=50p)
+Rraw ANALOG_RAW 0 1k
+Renabled ANALOG_ENABLED 0 1k
+Rgain ANALOG_GAIN 0 1k
+Craw ANALOG_RAW 0 2p
+Cenabled ANALOG_ENABLED 0 2p
+Cgain ANALOG_GAIN 0 2p
+Vpull vpull 0 1.2
+Rprobe vpull ANALOG_PROBE 1k
+Cprobe ANALOG_PROBE 0 2p
+.tran 25p 391n 0 25p
+.control
+run
+eprint qev rraw rgated rgain > original-events.txt
+wrdata result.dat v(ANALOG_RAW) v(ANALOG_ENABLED) v(ANALOG_GAIN) v(ANALOG_PROBE) i(Vpull) v(aenable)
+quit
+.endc
+.end
