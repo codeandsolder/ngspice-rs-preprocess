@@ -270,6 +270,29 @@ fn write_inverse_charge_pwl(
     Ok(())
 }
 
+fn normalized_initial_charge(
+    points: &[Point],
+    voltage: f64,
+    offset: f64,
+    span: f64,
+) -> Result<f64> {
+    let upper = points
+        .partition_point(|point| point.voltage <= voltage)
+        .clamp(1, points.len() - 1);
+    let left = points[upper - 1];
+    let right = points[upper];
+    let fraction = (voltage - left.voltage) / (right.voltage - left.voltage);
+    let charge = fraction.mul_add(
+        (right.value - left.value) / span,
+        (left.value - offset) / span,
+    );
+    anyhow::ensure!(
+        charge.is_finite(),
+        "non-finite normalized PWLC initial charge"
+    );
+    Ok(charge)
+}
+
 /// Translate a SIMPLIS `PWLC` / `NON_LINEAR_CAP_V1` voltage-charge primitive.
 ///
 /// Large strictly increasing Q(V) curves use an explicit normalized charge
@@ -278,6 +301,12 @@ fn write_inverse_charge_pwl(
 /// vendor's choice of Q=0. A native capacitor stores the charge span, an inverse
 /// V(Q) PWL source constrains terminal voltage, and mirrored source current
 /// updates the state, preserving `i = dQ/dt`.
+///
+/// Explicit initial voltages are converted to charge using the same
+/// piecewise-linear characteristic (including end-segment extrapolation).
+/// They require an invertible positive differential capacitance curve,
+/// even if its charge span is small. Native Q= ignores the voltage IC
+/// on the reference simulator's hidden storage element.
 ///
 /// The 1 nC charge-span boundary is an ngspice conditioning policy established
 /// by transient regression, not a SIMPLIS semantic boundary. Smaller, decreasing,
@@ -292,12 +321,20 @@ pub fn translate_charge_capacitor(
     node_p: &str,
     node_n: &str,
     points: &[Point],
+    initial_voltage: Option<f64>,
 ) -> Result<Translation> {
     validate_name(name)?;
     validate_node(node_p)?;
     validate_node(node_n)?;
     validate_points(points)?;
 
+    if let Some(voltage) = initial_voltage {
+        anyhow::ensure!(voltage.is_finite(), "non-finite PWLC initial voltage");
+        anyhow::ensure!(
+            strictly_increasing_values(points),
+            "initialized PWLC requires strictly increasing charge; nonpositive differential capacitance is invalid in SIMPLIS"
+        );
+    }
     let mut output = String::new();
     if strictly_increasing_values(points) {
         let charge_min = points
@@ -309,7 +346,11 @@ pub fn translate_charge_capacitor(
             .map(|point| point.value)
             .fold(f64::NEG_INFINITY, f64::max);
         let charge_span = charge_max - charge_min;
-        if charge_span >= EXPLICIT_CHARGE_STATE_MIN_SPAN_COULOMBS {
+        if initial_voltage.is_some() || charge_span >= EXPLICIT_CHARGE_STATE_MIN_SPAN_COULOMBS {
+            anyhow::ensure!(
+                charge_span.is_finite() && charge_span > 0.,
+                "invalid PWLC charge span"
+            );
             let stem = sanitized_name(name);
             let state_node = format!("__{stem}_PWLC_Q");
             let voltage_source = format!("B__{stem}_PWLC_V");
@@ -326,6 +367,11 @@ pub fn translate_charge_capacitor(
             )?;
             write!(output, "C__{stem}_PWLC_Q {state_node} 0 ")?;
             write_number(&mut output, charge_span)?;
+            if let Some(voltage) = initial_voltage {
+                let charge = normalized_initial_charge(points, voltage, charge_min, charge_span)?;
+                output.push_str(" IC=");
+                write_number(&mut output, charge)?;
+            }
             output.push('\n');
             return Ok(Translation {
                 bytes: output.into_bytes(),
@@ -1110,6 +1156,7 @@ mod tests {
                     value: 30.0e-9,
                 },
             ],
+            None,
         )?;
         assert_eq!(translated.kind, TranslationKind::ChargeCapacitor);
         ngspice_accepts(&translated.bytes, ".tran 100p 1n\n.print tran v(in)")
@@ -1135,6 +1182,7 @@ mod tests {
                     value: 0.0,
                 },
             ],
+            None,
         )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("CCDS in 0 Q='pwl(v(in,0)"));
@@ -1162,6 +1210,7 @@ mod tests {
                     value: 8.0e-9,
                 },
             ],
+            None,
         )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("B__CGD_PWLC_V in 0 V='pwl(v(__CGD_PWLC_Q), 0.00000000000000000e0, 0.00000000000000000e0"));
@@ -1185,6 +1234,7 @@ mod tests {
                     value: 30.0e-12,
                 },
             ],
+            None,
         )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("CCGS in 0 Q='pwl(v(in,0)"));
@@ -1212,6 +1262,7 @@ mod tests {
                     value: 5.0e-12,
                 },
             ],
+            None,
         )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("CCGD in 0 Q='pwl(v(in,0)"));

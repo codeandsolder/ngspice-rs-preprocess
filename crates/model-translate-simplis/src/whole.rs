@@ -384,14 +384,16 @@ fn translate_raw_charge_device(
         return Ok(None);
     };
     let parameters = parse_assignments(&tokens[4..])?;
-    if let Some(initial) = parameters.get("IC") {
-        let value = crate::parse_numeric(initial)?;
-        if value != 0.0 {
-            bail!("raw SIMPLIS PWLC IC={initial} is not yet supported");
-        }
-    }
+    anyhow::ensure!(
+        parameters.keys().all(|key| key == "IC"),
+        "unsupported PWLC instance parameter on {name}"
+    );
+    let initial = parameters
+        .get("IC")
+        .map(|value| crate::parse_numeric(value))
+        .transpose()?;
     let instance = name.trim_start_matches('!');
-    translate_charge_capacitor(instance, &tokens[1], &tokens[2], &model.points).map(Some)
+    translate_charge_capacitor(instance, &tokens[1], &tokens[2], &model.points, initial).map(Some)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4113,9 +4115,11 @@ fn distribute_root_init_overrides(items: &mut Vec<Item>) -> Result<()> {
     let mut routed = Vec::new();
     let mut stale = Vec::new();
     for statement in init_statements {
-        let tokens = statement_tokens(&normalized_statement(&statement))?;
-        let assignments = parse_assignments(&tokens[1..])?;
-        for (name, value) in assignments {
+        let assignments =
+            model_preprocess_simplis::parse_init_statement(&normalized_statement(&statement))?
+                .context("missing .INIT assignments")?;
+        for (path, value) in assignments {
+            let name = path.join(".");
             if let Some(route) = resolve_init_route(&routing, &name, &value)? {
                 routed.push(route);
             } else {
@@ -4145,12 +4149,17 @@ fn init_overrides(items: &[Item]) -> Result<std::collections::BTreeMap<String, S
         if directive_name(statement).as_deref() != Some(".INIT") {
             continue;
         }
-        let tokens = statement_tokens(&normalized_statement(statement))?;
-        let assignments = parse_assignments(&tokens[1..])?;
-        for (name, value) in assignments {
-            if name.starts_with("V(") || name.starts_with("I(") || name.contains('.') {
-                bail!("hierarchical/reactive SIMPLIS .INIT override is not yet supported: {name}");
-            }
+        let assignments =
+            model_preprocess_simplis::parse_init_statement(&normalized_statement(statement))?
+                .context("missing .INIT assignments")?;
+        for (path, value) in assignments {
+            let [name] = path.as_slice() else {
+                bail!(
+                    "unrouted hierarchical SIMPLIS .INIT override: {}",
+                    path.join(".")
+                );
+            };
+            let name = name.to_ascii_uppercase();
             if overrides.insert(name.clone(), value).is_some() {
                 bail!("duplicate SIMPLIS .INIT override for {name}");
             }
@@ -6722,15 +6731,24 @@ R1 out 0 1k
     }
 
     #[test]
-    fn raw_pwlc_nonzero_initial_voltage_fails_closed() {
+    fn raw_pwlc_nonzero_initial_voltage_sets_normalized_charge() -> Result<()> {
         let source = br"!CNON a 0 MC IC=1
-.MODEL MC PWLC NSEG=1 X0=0 Y0=0 X1=1 Y1=10p
+.MODEL MC PWLC NSEG=2 X0=-1 Y0=2p X1=0 Y1=4p X2=2 Y2=12p
 .end
 ";
-        let error = translate_simplis_deck(source)
-            .err()
-            .map(|value| value.to_string());
-        assert!(error.is_some_and(|value| value.contains("PWLC IC=1")));
+        let translated = translate_simplis_deck(source)?;
+        let text = std::str::from_utf8(&translated.bytes)?;
+        let state = text
+            .lines()
+            .find(|line| line.starts_with("C__CNON_PWLC_Q "))
+            .context("missing explicit charge state")?;
+        let value = state
+            .split("IC=")
+            .nth(1)
+            .context("missing state initial charge")?
+            .parse::<f64>()?;
+        assert!((value - 0.6).abs() < 1e-15);
+        Ok(())
     }
 
     #[test]
