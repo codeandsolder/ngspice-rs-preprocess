@@ -129,6 +129,15 @@ fn library_projection_and_closed_translated_graph() -> Result<()> {
     req.format = InputFormat::SimetrixDeck;
     assert!(prepare_default(&req).is_err());
     req.libraries.clear();
+    // A SIMetrix include now admits its own source resource and inherits
+    // the parent dialect. An explicit mismatched parsed catalog remains
+    // invalid, as checked above.
+    let output = prepare_default(&req)?;
+    assert_eq!(output.companions.len(), 1);
+    assert!(std::str::from_utf8(&output.companions[0].bytes)?.contains("R1 a b 47"));
+    assert!(std::str::from_utf8(&output.primary.bytes)?.contains(&output.companions[0].filename));
+    assert_eq!(output.primary.dependencies.len(), 1);
+    fs::remove_file(&library)?;
     assert!(prepare_default(&req).is_err());
     Ok(())
 }
