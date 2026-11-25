@@ -215,8 +215,10 @@ mod tests {
     #[test]
     fn inlines_relative_init_snapshot_only() -> Result<()> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("ngspice-rs-preprocess-init-{}-{nonce}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ngspice-rs-preprocess-init-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir_all(dir.join("DVM_SUPPORT"))?;
         fs::create_dir_all(dir.join("SIMPLIS_Data"))?;
         let input = dir.join("SIMPLIS_Data/model.net");

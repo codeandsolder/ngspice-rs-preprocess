@@ -1293,8 +1293,9 @@ fn emit_microchip_complementary_pwm(pending: &Pending, output: &mut String) -> R
     let clamp_high = span.mul_add(duty_max, soc);
     let phase_offset = period * phase / 360.0;
     writeln!(output, ".subckt {} 22 23 24", pending.generated_name)?;
-    output
-        .push_str("* ngspice-rs-preprocess: public behavioral replacement for Microchip Complementary PWM\n");
+    output.push_str(
+        "* ngspice-rs-preprocess: public behavioral replacement for Microchip Complementary PWM\n",
+    );
     output.push_str("B__PWM_CTRL __PWM_CTRL 0 V='(v(24)<=");
     write_pwm_number(output, clamp_low)?;
     output.push_str(" ? ");

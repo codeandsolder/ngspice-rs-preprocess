@@ -177,7 +177,8 @@ fn split_native_deck(input: &[u8], include_path: &str) -> Result<(Vec<u8>, Vec<u
     let text = std::str::from_utf8(input).context("translated ngspice deck is not UTF-8")?;
     let items = parse_items(text)?;
     let mut deck = String::new();
-    let mut library = String::from("* ngspice-rs-preprocess: translated SIMPLIS generated subcircuits\n");
+    let mut library =
+        String::from("* ngspice-rs-preprocess: translated SIMPLIS generated subcircuits\n");
     let mut inserted_include = false;
     let mut subcircuits = 0usize;
     for item in &items {
@@ -6541,8 +6542,9 @@ pub fn translate_simplis_deck(input: &[u8]) -> Result<WholeModelTranslation> {
     let mut items = parse_items(text)?;
     distribute_root_init_overrides(&mut items)?;
     let root_models = ScopeAnalysis::analyze(&items, None)?;
-    let mut output =
-        String::from("* ngspice-rs-preprocess: translated expanded SIMPLIS deck to native ngspice\n");
+    let mut output = String::from(
+        "* ngspice-rs-preprocess: translated expanded SIMPLIS deck to native ngspice\n",
+    );
     let mut primitives = Vec::new();
     let mut stripped_directives = 0usize;
     let mut flattened_subcircuits = 0usize;
@@ -7724,11 +7726,9 @@ A_BUF %gnd_ref 0 [ q qb ] [ inp ] MODEL=MB IC=0
         assert!(text.contains("C1 a b 1u IC=1.25"));
         assert!(text.contains("L1 a b 1u IC=2m"));
         assert!(text.contains("B__A_BUF_INIT __A_BUF_DIFF 0 V='(time<=0 ? "));
-        assert!(
-            text.contains(
-                "* ngspice-rs-preprocess: ignored stale SIMPLIS .INIT snapshot entry XGONE.S1=OPEN"
-            )
-        );
+        assert!(text.contains(
+            "* ngspice-rs-preprocess: ignored stale SIMPLIS .INIT snapshot entry XGONE.S1=OPEN"
+        ));
         assert!(
             !text
                 .lines()
