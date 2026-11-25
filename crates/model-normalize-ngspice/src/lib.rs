@@ -17,6 +17,7 @@ pub mod param_expression;
 pub mod parameter_scope;
 pub mod passive_ic;
 pub mod pspice;
+pub mod tina;
 pub mod vdmos_card;
 pub mod vdmos_ltspice;
 pub mod waveform;
@@ -59,6 +60,10 @@ pub enum NormalizationPass {
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.
     PspicePositionalParams,
+    /// Join a separated PARAMS : marker on subcircuit definitions and calls.
+    PspiceParamsMarker,
+    /// Separate TINA inline subcircuit-local parameter declarations.
+    TinaInlineParam,
     /// Lower explicit `PSpice` source semantics to native SPICE.
     PspiceSource,
     /// Comment a standalone `.END` so the model remains safe to include.
@@ -383,6 +388,69 @@ fn rewrite_pspice_arctan(input: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(lexical::apply_edits(input, edits))
 }
 
+fn rewrite_spaced_parameter_marker(input: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !input
+        .windows(6)
+        .any(|word| word.eq_ignore_ascii_case(b"params"))
+    {
+        return Ok(None);
+    }
+    let mut edits = Vec::new();
+    let mut control = false;
+    for statement in lexical::statements(input)? {
+        let text = &statement.text;
+        let first = text
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .unwrap_or_default();
+        if first.eq_ignore_ascii_case(b".control") {
+            control = true;
+            continue;
+        }
+        if first.eq_ignore_ascii_case(b".endc") {
+            control = false;
+            continue;
+        }
+        if control
+            || !(first.eq_ignore_ascii_case(b".subckt")
+                || first.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'x')))
+        {
+            continue;
+        }
+        let fields = lexical::tokens(text)?;
+        let Some(index) = params_header_end(text, &fields) else {
+            continue;
+        };
+        if index < 4 || text[fields[index - 1].clone()] != *b":" {
+            continue;
+        }
+        // The colon is a marker only when followed by an assignment; leave
+        // unrelated identifiers and punctuation alone.
+        if fields
+            .get(index + 1)
+            .is_none_or(|span| text[span.clone()] != *b"=")
+        {
+            continue;
+        }
+        let marker = statement.source_ranges(fields[index - 2].clone());
+        let colon = statement.source_ranges(fields[index - 1].clone());
+        let ([marker], [colon]) = (marker.as_slice(), colon.as_slice()) else {
+            bail!("line {}: split parameter marker", statement.line);
+        };
+        edits.push((marker.end..marker.end, vec![b':']));
+        edits.push((colon.clone(), Vec::new()));
+        for (plus, code) in &statement.continuations {
+            if code.contains(&colon.start)
+                && input[code.start..colon.start].trim_ascii().is_empty()
+                && input[colon.end..code.end].trim_ascii().is_empty()
+            {
+                edits.push((*plus..*plus + 1, vec![b'*']));
+            }
+        }
+    }
+    Ok(lexical::apply_edits(input, edits))
+}
+
 fn rewrite_pspice_positional_params(input: &[u8]) -> Result<Option<Vec<u8>>> {
     if !input
         .windows(6)
@@ -587,6 +655,10 @@ fn normalize_body(
     if let Some(rewritten) = rewrite_pspice_positional_params(&bytes)? {
         bytes = rewritten;
         passes.push(NormalizationPass::PspicePositionalParams);
+    }
+    if let Some(rewritten) = rewrite_spaced_parameter_marker(&bytes)? {
+        bytes = rewritten;
+        passes.push(NormalizationPass::PspiceParamsMarker);
     }
     if strip_end && let Some(rewritten) = strip_standalone_end(&bytes)? {
         bytes = rewritten;
@@ -938,9 +1010,23 @@ mod tests {
     }
 
     #[test]
+    fn spaced_parameter_markers_keep_physical_lines_and_non_markers() -> Result<()> {
+        let source = b".subckt c a b PARAMS : R=1k\nX1 a b c params\n+ :\n+ R=2k\nX2 params : c\nR1 a b {f('params :')}\n.ends\n";
+        let result = normalize_mapped(source, linked_source::RootKind::Include)?;
+        let actual = std::str::from_utf8(&result.model.bytes)?;
+        assert!(actual.contains("PARAMS:  R=1k"));
+        assert!(actual.contains("params:\n* \n+ R=2k"));
+        assert!(actual.contains("X2 params : c"));
+        assert!(actual.contains("R1 a b {f('params :')}"));
+        assert_eq!(result.input_lines, (1..=7).collect::<Vec<_>>());
+        assert_eq!(result.model.passes, [NormalizationPass::PspiceParamsMarker]);
+        Ok(())
+    }
+
+    #[test]
     fn positional_rewrite_is_scoped_to_subcircuit_params() -> Result<()> {
         let input = b".subckt x a b\n+ PARAMS :\n+ gain {2 +\n+ 3}\n+ k = {4 + 5}\n+ off 1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
-        let expected = b".subckt x a b\n+ PARAMS :\n+ gain={2 +\n+ 3}\n+ k = {4 + 5}\n+ off=1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
+        let expected = b".subckt x a b\n+ PARAMS: \n+ gain={2 +\n+ 3}\n+ k = {4 + 5}\n+ off=1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
         assert_eq!(normalize_ngspice(input)?.bytes, expected);
         Ok(())
     }

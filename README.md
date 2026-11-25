@@ -35,12 +35,28 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | --- | --- | --- |
 | `native-deck` | Native-compatible circuit; link static includes and preserve title/analysis/terminator | `deck.cir` |
 | `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
+| `pspice-deck` | PSpice source deck with native lowering | `deck.cir` |
+| `pspice-library` | PSpice source library with native lowering | `model.lib` |
+| `tina-deck` | TINA/TINA-TI plaintext SPICE export, with local parameter normalization | `deck.cir` |
+| `tina-library` | TINA/TINA-TI plaintext SPICE macro source | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
 | `expanded-library` | Lower already expanded dialect source as an include | `model.lib` |
 | `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
 | `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
+
+TINA support targets plaintext SPICE exports, not TINA schematic/project
+or mixed-language macro containers. Export the electrical netlist first.
+The documented PSpice-style syntax uses the same source linker and lowering pipeline as the explicit PSpice dialect;
+a local `.PARAM` appended to a `.SUBCKT` header is split into a scoped
+directive without changing source location. Formal `PARAMS:` defaults are
+kept separate. Source metadata in comments remains intact. See
+[TI SLVA527](https://www.ti.com/lit/an/slva527/slva527.pdf) and
+[DesignSoft TINA manual](https://www.tina.com/docs/v12/Tina-v12-manual.pdf).
+The inline declaration is observed in the public ISO224X export discussion
+([reference](https://electronics.stackexchange.com/questions/518473/error-importing-third-party-model-to-ltspice-from-tina));
+the regression fixtures are independently authored and contain no vendor model text.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:
