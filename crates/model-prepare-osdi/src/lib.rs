@@ -6,6 +6,10 @@
 use anyhow::{Context, Result, bail, ensure};
 use object::{Object, ObjectKind, ObjectSegment, ObjectSymbol, SymbolKind, SymbolScope};
 use sha2::{Digest, Sha256};
+pub mod binding;
+pub mod compiler;
+mod image;
+pub mod schema;
 
 /// ABI revisions with a documented, inspectable descriptor layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,17 +86,27 @@ fn scalar(file: &object::File<'_>, name: &str) -> Result<u32> {
     read_scalar(file, required(file, name)?).with_context(|| format!("reading OSDI export {name}"))
 }
 
-// OSDI 0.3 descriptor fields are pointers and uint32 values. Derive the
-// C ABI layout from field groups rather than host sizeof or architecture.
-fn prefix_size(pointer: u32) -> u32 {
-    // Field sequence: name; node, Jacobian and collapse metadata; noise
-    // metadata; parameter schema; instance layout; fourteen callbacks.
-    let fields = [
+// ABI structure layouts are calculated using the target pointer width, not
+// host sizeof. The 0.4 additions follow the entire 0.3 callback prefix.
+fn descriptor_size(abi: Abi, pointer: u32) -> u32 {
+    let prefix = [
         pointer, 4, 4, pointer, 4, pointer, 4, pointer, 4, pointer, 4, 4, 4, 4, pointer, 4, 4, 4,
         4, 4, 4, 4,
     ];
+    let extension = [
+        pointer, pointer, 4, 4, pointer, pointer, 4, pointer, pointer, pointer, pointer, pointer,
+        pointer, pointer, 4,
+    ];
+    let extension = match abi {
+        Abi::V03 => &extension[..0],
+        Abi::V04 => extension.as_slice(),
+    };
     let mut offset = 0_u32;
-    for size in fields.into_iter().chain(std::iter::repeat_n(pointer, 14)) {
+    for size in prefix
+        .into_iter()
+        .chain(std::iter::repeat_n(pointer, 14))
+        .chain(extension.iter().copied())
+    {
         offset = offset.next_multiple_of(size) + size;
     }
     offset.next_multiple_of(pointer)
@@ -121,19 +135,14 @@ pub fn inspect(bytes: &[u8]) -> Result<ModuleEnvelope> {
         (major, minor) => bail!("unsupported OSDI ABI {major}.{minor}"),
     };
     let pointer = if file.is_64() { 8_u8 } else { 4_u8 };
-    let minimum = prefix_size(u32::from(pointer));
+    let expected = descriptor_size(abi, u32::from(pointer));
     let stride = match (abi, export(&file, "OSDI_DESCRIPTOR_SIZE")?) {
-        (Abi::V03, None) => minimum,
-        (Abi::V03, Some(size)) => {
-            let stride = read_scalar(&file, size)?;
-            ensure!(stride == minimum, "invalid OSDI 0.3 descriptor stride");
-            stride
-        }
-        (Abi::V04, Some(size)) => {
+        (Abi::V03, None) => expected,
+        (_, Some(size)) => {
             let stride = read_scalar(&file, size)?;
             ensure!(
-                stride > minimum && stride.is_multiple_of(u32::from(pointer)),
-                "invalid OSDI 0.4 descriptor stride"
+                stride == expected,
+                "invalid OSDI descriptor stride: {stride}, expected {expected}"
             );
             stride
         }
@@ -165,8 +174,10 @@ mod tests {
 
     #[test]
     fn descriptor_prefix_matches_documented_lp64_layout() {
-        assert_eq!(prefix_size(8), 240);
-        assert_eq!(prefix_size(4), 144);
+        assert_eq!(descriptor_size(Abi::V03, 8), 240);
+        assert_eq!(descriptor_size(Abi::V03, 4), 144);
+        assert_eq!(descriptor_size(Abi::V04, 8), 352);
+        assert_eq!(descriptor_size(Abi::V04, 4), 204);
     }
 
     #[test]
