@@ -5,6 +5,7 @@
 
 mod functions;
 mod operators;
+mod sources;
 mod table;
 
 use crate::{
@@ -157,7 +158,8 @@ fn validate_model(statement: &lexical::Statement) -> Result<()> {
                     ensure!(
                         match name.as_str() {
                             "vh" => value.is_some_and(|value| value >= 0.),
-                            "level" => value.is_some_and(|value| value == 1.),
+                            "level" =>
+                                value.is_some_and(|value| value.to_bits() == 1_f64.to_bits()),
                             "lser" | "vser" | "ilimit" => false,
                             _ => true,
                         },
@@ -396,6 +398,14 @@ pub fn normalize(
     } else {
         0
     };
+    if let Some(lowered) = sources::rewrite(&input.model.bytes[title..])? {
+        input.model.bytes.truncate(title);
+        input.model.bytes.extend_from_slice(&lowered);
+        input
+            .model
+            .passes
+            .push(NormalizationPass::LtspiceSourceWaveforms);
+    }
     if let Some(lowered) = operators::rewrite(&input.model.bytes[title..])? {
         input.model.bytes.truncate(title);
         input.model.bytes.extend_from_slice(&lowered);

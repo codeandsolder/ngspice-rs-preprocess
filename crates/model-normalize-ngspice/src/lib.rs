@@ -63,6 +63,8 @@ pub enum NormalizationPass {
     LtspiceIntrinsics,
     /// Lower `LTspice`-specific operator precedence and Boolean coercion.
     LtspiceOperators,
+    /// Resolve source-specific independent waveform timing defaults.
+    LtspiceSourceWaveforms,
     /// Map `PSpice` `arctan()` to ngspice `atan()`.
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.

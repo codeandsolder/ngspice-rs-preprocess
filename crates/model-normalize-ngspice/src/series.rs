@@ -68,27 +68,7 @@ struct Rewriter<'a> {
 
 impl Rewriter<'_> {
     fn remove(&mut self, statement: &lexical::Statement, assignments: &[Range<usize>]) {
-        let mut removed = Vec::new();
-        for assignment in assignments {
-            let start = statement.text[..assignment.start].trim_ascii_end().len();
-            let range = start..assignment.end;
-            removed.extend(statement.source_ranges(range.clone()));
-            lexical::replace_span(statement, range, b"", &mut self.edits);
-        }
-        for (plus, code) in &statement.continuations {
-            if self.input[code.clone()]
-                .iter()
-                .enumerate()
-                .all(|(i, byte)| {
-                    byte.is_ascii_whitespace()
-                        || removed
-                            .iter()
-                            .any(|range| range.contains(&(code.start + i)))
-                })
-            {
-                self.edits.push((*plus..*plus + 1, vec![b'*']));
-            }
-        }
+        lexical::remove_spans(statement, self.input, assignments, &mut self.edits);
     }
 
     fn insert_resistor(
@@ -283,7 +263,7 @@ fn rewrite_explicit(
     Ok(())
 }
 
-pub(super) fn rewrite(
+pub fn rewrite(
     input: &[u8],
     inserted: &mut Vec<usize>,
     dialect: NormalizationDialect,

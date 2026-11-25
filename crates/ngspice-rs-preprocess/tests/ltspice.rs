@@ -508,3 +508,78 @@ fn unresolved_passive_topology_is_diagnostic_not_silent() -> Result<()> {
     assert_eq!(bundle.primary.bytes, b"L1 a b 1m\n");
     Ok(())
 }
+
+#[test]
+fn vendor_pulse_timing_defaults_and_relative_duplicate_pwl() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root, b"title\nV1 a 0 PULSE(0 1 1u 0 0 2u 10u)\nV2 b 0 PULSE(0 1 1u 0 1u 8u 10u)\nV3 c 0 PULSE(0 1 -1u 0 0 -2u 10u)\nV4 d 0 PULSE(0 1 1u 0 0)\nV5 e 0 PULSE(0 1 1u .1u .1u 8u 10u 1.5)\nV6 f 0 PWL(0 0 +1u 1\n+ +0 3 +0 8\n+ +1u 0)\nV7 g 0 PWL(+1u 1 +1u 2 +2u 0)\nI1 0 h PULSE(0 1 1u 0 0 2u 10u)\nR1 h 0 1\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing source mapping");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with('*') && !line.contains("+0"))
+    );
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\ntran 5n 25u 0 5n\nwrdata tran.dat v(a) v(b) v(c) v(d) v(e) v(f) v(g) v(h)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let pulse =
+        |time: f64, delay: f64, rise: f64, fall: f64, width: f64, period: f64, cycles: f64| {
+            let elapsed = time - delay;
+            if elapsed <= 0. || (cycles > 0. && elapsed >= cycles * period) {
+                return 0.;
+            }
+            let phase = elapsed % period;
+            if phase < rise {
+                phase / rise
+            } else if phase < rise + width {
+                1.
+            } else if phase < rise + width + fall {
+                (rise + width + fall - phase) / fall
+            } else {
+                0.
+            }
+        };
+    for row in data(&dir.path().join("tran.dat"))? {
+        let t = row[0];
+        // Exact left/right choice at a count cutoff is simulator-dependent.
+        if (t - 16e-6).abs() < 1e-16 {
+            continue;
+        }
+        let f = if t < 1e-6 {
+            4e6 * t
+        } else {
+            (4e6 * (2e-6 - t)).max(0.)
+        };
+        let g = if t < 1e-6 {
+            1.
+        } else if t < 2e-6 {
+            1e6 * t
+        } else {
+            (1e6 * (4e-6 - t)).max(0.)
+        };
+        let expected = [
+            pulse(t, 1e-6, 2e-7, 2e-7, 2e-6, 1e-5, 0.),
+            pulse(t, 1e-6, 1e-7, 1e-6, 8e-6, 1e-5, 0.),
+            pulse(t, 0., 1e-6, 1e-6, 0., 1e-5, 0.),
+            pulse(t, 1e-6, 1e-8, 1e-8, 0., 2e-8 * (1. + 2e-15), 1.),
+            pulse(t, 1e-6, 1e-7, 1e-7, 8e-6, 1e-5, 1.5),
+            f,
+            g,
+            pulse(t, 1e-6, 2e-7, 2e-7, 2e-6, 1e-5, 0.),
+        ];
+        for (&actual, expected) in row[1..].iter().zip(expected) {
+            near(actual, expected).with_context(|| format!("time {t}"))?;
+        }
+    }
+    Ok(())
+}

@@ -331,6 +331,33 @@ pub fn replace_span(
     }
 }
 
+/// Remove logical fields while retaining physical-line provenance. Entirely
+/// consumed continuation lines become comments rather than dangling '+' cards.
+pub fn remove_spans(
+    statement: &Statement,
+    input: &[u8],
+    spans: &[Range<usize>],
+    edits: &mut Vec<Edit>,
+) {
+    let mut removed = Vec::new();
+    for assignment in spans {
+        let start = statement.text[..assignment.start].trim_ascii_end().len();
+        let range = start..assignment.end;
+        removed.extend(statement.source_ranges(range.clone()));
+        replace_span(statement, range, b"", edits);
+    }
+    for (plus, code) in &statement.continuations {
+        if input[code.clone()].iter().enumerate().all(|(i, byte)| {
+            byte.is_ascii_whitespace()
+                || removed
+                    .iter()
+                    .any(|range| range.contains(&(code.start + i)))
+        }) {
+            edits.push((*plus..*plus + 1, vec![b'*']));
+        }
+    }
+}
+
 const fn identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.') || !byte.is_ascii()
 }
