@@ -121,6 +121,38 @@ fn library_marker(line: &str) -> Result<Option<Vec<String>>> {
     directive(line, ".lib").map(operands).transpose()
 }
 
+/// Decode an external named-section reference from an already lexed statement.
+///
+/// # Errors
+/// A .lib directive without exactly a file and a section is invalid here.
+pub fn external_library_reference(text: &str) -> Result<Option<(String, String)>> {
+    let Some(args) = library_marker(text.trim_start())? else {
+        return Ok(None);
+    };
+    let [path, section] = args
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected .lib file section"))?;
+    Ok(Some((path, section)))
+}
+
+/// Select a named section from already projected, joined source statements.
+/// Shares the native linker's section validation and duplicate policy.
+///
+/// # Errors
+/// Missing, duplicate, mismatched, or nested section boundaries.
+pub fn select_named_section(text: &str, path: &Path, section: &str) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut selection = SectionSelection::new(Some(section));
+    let mut output = String::new();
+    for (index, line) in text.lines().enumerate() {
+        if selection.observe(line.trim(), path, index + 1)? && selection.selected() {
+            writeln!(output, "{line}")?;
+        }
+    }
+    selection.finish(path)?;
+    Ok(output)
+}
+
 const fn name_matches(selected: &str, name: &str) -> bool {
     selected.eq_ignore_ascii_case(name)
 }

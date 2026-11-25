@@ -5,9 +5,14 @@ use super::{
     display_path,
 };
 use anyhow::{Context, Result, bail, ensure};
+use model_normalize_ngspice::linked_source::{external_library_reference, select_named_section};
 use model_preprocess_command::AdmissionConfig;
+use model_preprocess_simplis::source_dialect::{
+    DeviceIdentity, DialectContext, ScopedStatement, SourceKind, resolve_device_identities,
+};
 use model_preprocess_simplis::{
-    SubcircuitCatalog, parse_library_for_simulator, preprocess_netlist_linked, project_source,
+    SubcircuitCatalog, lower_simetrix_source_view, parse_library_for_simulator,
+    parse_projected_library, preprocess_netlist_linked, project_simetrix_source, project_source,
     source_include_target,
 };
 use model_translate_simplis::{
@@ -58,6 +63,7 @@ fn bundle(
         primary,
         companions,
         normalization: Vec::new(),
+        device_identities: Vec::new(),
     }
 }
 
@@ -72,7 +78,9 @@ fn parse_root(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBund
         Vec::new(),
         Vec::new(),
     );
-    Ok(bundle(root, format, artifact, Vec::new()))
+    let mut bundle = bundle(root, format, artifact, Vec::new());
+    bundle.device_identities = parsed.device_identities().to_vec();
+    Ok(bundle)
 }
 
 fn resolve_init(session: &SourceSession, parent: &Path, target: &Path) -> Result<PathBuf> {
@@ -110,9 +118,11 @@ struct InitExpansion<'a> {
     session: &'a mut SourceSession,
     output: Vec<u8>,
     sources: BTreeSet<String>,
-    stack: Vec<PathBuf>,
+    stack: Vec<(PathBuf, Option<String>)>,
     limit: usize,
     simulator: LibrarySimulator,
+    search_paths: &'a [PathBuf],
+    statements: Vec<ScopedStatement>,
 }
 
 impl InitExpansion<'_> {
@@ -125,50 +135,146 @@ impl InitExpansion<'_> {
         Ok(())
     }
 
-    fn expand(&mut self, source: &AdmittedSource) -> Result<()> {
-        ensure!(self.stack.len() < 128, "init include depth exceeded");
+    fn expand(
+        &mut self,
+        source: &AdmittedSource,
+        inherited: DialectContext,
+        kind: SourceKind,
+        section: Option<&str>,
+    ) -> Result<DialectContext> {
+        ensure!(self.stack.len() < 128, "source include depth exceeded");
+        let key = (source.path.clone(), section.map(str::to_ascii_lowercase));
         ensure!(
-            !self.stack.contains(&source.path),
-            "recursive init include {}",
+            !self.stack.contains(&key),
+            "recursive source include {}",
             source.path.display()
         );
-        self.stack.push(source.path.clone());
+        self.stack.push(key);
         self.sources.insert(display_path(&source.path));
-        let result = self.expand_lines(source);
+        let result = self.expand_lines(source, inherited, kind, section);
         self.stack.pop();
-        result
+        result.with_context(|| format!("expanding source {}", source.path.display()))
     }
 
-    fn expand_lines(&mut self, source: &AdmittedSource) -> Result<()> {
-        let projected = project_source(&source.bytes, self.simulator)
-            .with_context(|| format!("selecting simulator view of {}", source.path.display()))?;
-        for line in projected.split_inclusive('\n') {
-            if let Some(target) = source_include_target(line)? {
-                let normalized = target.replace('\\', "/");
-                let target = Path::new(&normalized);
-                if target
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| value.eq_ignore_ascii_case("init"))
-                {
-                    let path = resolve_init(self.session, &source.path, target)?;
-                    let snapshot = self.session.load(&path)?;
-                    self.expand(&snapshot)?;
-                    continue;
+    fn resolve_resource(&self, parent: &Path, target: &Path) -> Result<Option<PathBuf>> {
+        let candidates = parent
+            .parent()
+            .into_iter()
+            .map(|dir| dir.join(target))
+            .chain(self.search_paths.iter().map(|dir| dir.join(target)));
+        for candidate in candidates {
+            match self.session.resolve_path(&candidate) {
+                Ok(path) => return Ok(Some(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("resolving {}", candidate.display()));
                 }
+            }
+        }
+        Ok(None)
+    }
+
+    fn expand_lines(
+        &mut self,
+        source: &AdmittedSource,
+        inherited: DialectContext,
+        kind: SourceKind,
+        section: Option<&str>,
+    ) -> Result<DialectContext> {
+        let (context, projected) = if self.simulator == LibrarySimulator::Simetrix {
+            project_simetrix_source(&source.bytes, inherited, kind)?
+        } else {
+            (inherited, project_source(&source.bytes, self.simulator)?)
+        };
+        let projected = if let Some(section) = section {
+            select_named_section(&projected, &source.path, section)?
+        } else {
+            projected
+        };
+        let projected = if self.simulator == LibrarySimulator::Simetrix {
+            lower_simetrix_source_view(
+                &projected,
+                context,
+                self.limit.saturating_sub(self.output.len()),
+            )?
+        } else {
+            projected
+        };
+        for line in projected.split_inclusive('\n') {
+            if self.expand_reference(source, context, line)? {
+                continue;
+            }
+            let include_end =
+                kind == SourceKind::Include && line.trim().eq_ignore_ascii_case(".end");
+            if include_end {
+                self.append(b"* ")?;
+            }
+            if self.simulator == LibrarySimulator::Simetrix {
+                let text = line.trim_end_matches('\n');
+                self.statements.push(ScopedStatement {
+                    source: display_path(&source.path),
+                    context,
+                    text: if include_end {
+                        format!("* {text}")
+                    } else {
+                        text.to_owned()
+                    },
+                });
             }
             self.append(line.as_bytes())?;
             if !line.ends_with('\n') {
                 self.append(b"\n")?;
             }
         }
-        Ok(())
+        Ok(context)
+    }
+
+    fn expand_reference(
+        &mut self,
+        source: &AdmittedSource,
+        context: DialectContext,
+        line: &str,
+    ) -> Result<bool> {
+        if let Some(target) = source_include_target(line)? {
+            let normalized = target.replace('\\', "/");
+            let target = Path::new(&normalized);
+            let init = target
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("init"));
+            let path = if init {
+                Some(resolve_init(self.session, &source.path, target)?)
+            } else if self.simulator == LibrarySimulator::Simetrix {
+                self.resolve_resource(&source.path, target)?
+            } else {
+                None
+            };
+            if let Some(path) = path {
+                let snapshot = self.session.load(&path)?;
+                self.expand(&snapshot, context, SourceKind::Include, None)?;
+                return Ok(true);
+            }
+        }
+        if self.simulator == LibrarySimulator::Simetrix
+            && let Some((target, section)) = external_library_reference(line)?
+        {
+            let normalized = target.replace('\\', "/");
+            let path = self
+                .resolve_resource(&source.path, Path::new(&normalized))?
+                .with_context(|| format!("cannot resolve named library {target}"))?;
+            let snapshot = self.session.load(&path)?;
+            self.expand(&snapshot, context, SourceKind::Include, Some(&section))?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
 struct Catalog {
     catalog: SubcircuitCatalog,
     sources: BTreeMap<String, BTreeSet<String>>,
+    device_identities: Vec<DeviceIdentity>,
 }
 
 fn catalog(
@@ -176,6 +282,7 @@ fn catalog(
     options: &Options,
     cancellation: &Cancellation,
     session: &mut SourceSession,
+    context: DialectContext,
 ) -> Result<Catalog> {
     let simulator = projection(request.format);
     let mut parsed_session = SourceSession::new(
@@ -187,13 +294,22 @@ fn catalog(
     );
     let mut catalog = SubcircuitCatalog::for_simulator(simulator);
     let mut sources = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut device_identities = Vec::new();
     for library in &request.libraries {
         let (parsed, origin) = match library {
             LibraryInput::Source(input) => {
                 let admitted = input.admit(session)?;
                 let origin = display_path(&admitted.path);
                 (
-                    parse_library_for_simulator(&origin, &admitted.bytes, simulator)?,
+                    if simulator == LibrarySimulator::Simetrix {
+                        let (dialect, view) =
+                            project_simetrix_source(&admitted.bytes, context, SourceKind::Include)?;
+                        let view =
+                            lower_simetrix_source_view(&view, dialect, options.output_bytes)?;
+                        parse_projected_library(origin.clone(), &view, simulator, Some(dialect))?
+                    } else {
+                        parse_library_for_simulator(&origin, &admitted.bytes, simulator)?
+                    },
                     origin,
                 )
             }
@@ -213,12 +329,26 @@ fn catalog(
             simulator.as_str()
         );
         catalog.add_parsed_library(&parsed)?;
+        device_identities.extend(
+            parsed
+                .device_identities()
+                .iter()
+                .cloned()
+                .map(|mut identity| {
+                    identity.source.clone_from(&origin);
+                    identity
+                }),
+        );
         sources
             .entry(parsed.source_id().to_owned())
             .or_default()
             .insert(origin);
     }
-    Ok(Catalog { catalog, sources })
+    Ok(Catalog {
+        catalog,
+        sources,
+        device_identities,
+    })
 }
 
 fn check_closed_includes(bytes: &[u8], known: &BTreeSet<&str>) -> Result<()> {
@@ -274,11 +404,27 @@ fn linked(
         stack: Vec::new(),
         limit: options.output_bytes,
         simulator: projection(request.format),
+        search_paths: &request.search_paths,
+        statements: Vec::new(),
     };
-    init.expand(root)?;
+    let context = init.expand(root, DialectContext::default(), SourceKind::Deck, None)?;
     let root_sources = init.sources;
-    let expanded_root = init.output;
-    let Catalog { catalog, sources } = catalog(request, options, cancellation, session)?;
+    let (expanded_root, mut device_identities) = if request.format == InputFormat::SimetrixDeck {
+        let resolved = resolve_device_identities(&init.statements)?;
+        ensure!(
+            resolved.text.len() <= options.output_bytes,
+            "device identity expansion byte budget exceeded"
+        );
+        (resolved.text.into_bytes(), resolved.identities)
+    } else {
+        (init.output, Vec::new())
+    };
+    let Catalog {
+        catalog,
+        sources,
+        device_identities: catalog_identities,
+    } = catalog(request, options, cancellation, session, context)?;
+    device_identities.extend(catalog_identities);
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
     if request.format == InputFormat::SimetrixDeck {
         lower_simetrix_linked_runtime(&mut linked)?;
@@ -327,7 +473,9 @@ fn linked(
         dependencies,
         translated_root.required_code_models,
     );
-    Ok(bundle(root, request.format, primary, companions))
+    let mut bundle = bundle(root, request.format, primary, companions);
+    bundle.device_identities = device_identities;
+    Ok(bundle)
 }
 
 pub fn prepare(
