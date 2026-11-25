@@ -212,7 +212,13 @@ pub(super) fn prepare(
         .enumerate()
     {
         let text = if deck && index == 0 {
-            statement.text.clone()
+            // Native ngspice may expand resource directives before discarding
+            // the title. Protect the title without changing its source span.
+            if statement.text.trim_start().starts_with('.') {
+                format!("* {}", statement.text)
+            } else {
+                statement.text.clone()
+            }
         } else {
             lower_card(
                 &statement.text,

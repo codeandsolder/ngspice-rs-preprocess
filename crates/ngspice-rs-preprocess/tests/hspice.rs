@@ -40,7 +40,7 @@ fn linked_hspice_resource_spans_and_language_overrides() -> Result<()> {
     let bundle = compile(&root, InputFormat::HspiceDeck)?;
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
     ensure!(
-        text.starts_with(".lib is a title, not a directive\n"),
+        text.starts_with("* .lib is a title, not a directive\n"),
         "{text}"
     );
     ensure!(
