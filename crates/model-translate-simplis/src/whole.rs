@@ -4817,68 +4817,39 @@ fn translate_deck_primitive(
     statement: &str,
     models: &ScopeAnalysis,
 ) -> Result<Option<Translation>> {
-    if let Some(value) = translate_level17_mos(statement, &models.level17)? {
-        return Ok(Some(value));
+    // Evaluate in source-dispatch precedence order. Neither a successful
+    // translation nor an error may fall through to a later translator.
+    macro_rules! first_translation {
+        ($($candidate:expr),+ $(,)?) => {{
+            $(
+                if let Some(value) = $candidate? {
+                    return Ok(Some(value));
+                }
+            )+
+            Ok(None)
+        }};
     }
-    if let Some(value) = translate_adc_schmitt_device(statement, &models.adc_schmitt)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) =
-        translate_pspice_mos_series_resistance(statement, &models.pspice_mos_series_resistances)?
-    {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_inline_schematic_x(statement)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_legacy_voltage_poly_source(statement)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) =
-        translate_device_voltage_controlled_source(statement, &models.voltage_branches)?
-    {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_current_controlled_source(statement, &models.current_branches)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = pwls::translate(statement, &models.pwls_prefix)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_waveform(statement)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_transformer(statement)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_mutual_inductance(statement, &models.inductors)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_pwl_device(statement, &models.pwl)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_charge_device(statement, &models.charge)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_srff_device(statement, &models.srff)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_comp_device(statement, &models.comp)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_digital_device(statement, &models.digital)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_numbered_logic_device(statement, &models.numbered_logic)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_vcq_device(statement, models)? {
-        return Ok(Some(value));
-    }
-    if let Some(value) = translate_raw_vcsw_device(statement, models)? {
-        return Ok(Some(value));
-    }
-    Ok(None)
+    first_translation!(
+        translate_level17_mos(statement, &models.level17),
+        translate_adc_schmitt_device(statement, &models.adc_schmitt),
+        translate_pspice_mos_series_resistance(statement, &models.pspice_mos_series_resistances),
+        translate_inline_schematic_x(statement),
+        translate_legacy_voltage_poly_source(statement),
+        translate_device_voltage_controlled_source(statement, &models.voltage_branches),
+        translate_current_controlled_source(statement, &models.current_branches),
+        pwls::translate(statement, &models.pwls_prefix),
+        translate_raw_waveform(statement),
+        translate_raw_transformer(statement),
+        translate_raw_mutual_inductance(statement, &models.inductors),
+        translate_raw_pwl_device(statement, &models.pwl),
+        translate_raw_charge_device(statement, &models.charge),
+        translate_raw_srff_device(statement, &models.srff),
+        translate_raw_comp_device(statement, &models.comp),
+        translate_raw_digital_device(statement, &models.digital),
+        translate_raw_numbered_logic_device(statement, &models.numbered_logic),
+        translate_raw_vcq_device(statement, models),
+        translate_raw_vcsw_device(statement, models),
+    )
 }
 
 fn remove_simple_assignment(statement: &str, name: &str) -> String {

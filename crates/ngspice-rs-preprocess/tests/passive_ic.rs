@@ -37,7 +37,7 @@ fn bias_cap(constraint: BiasConstraint, supply: f64, resistance: f64) -> Result<
         BiasConstraint::CapacitorSoft {
             voltage,
             resistance: series,
-        } => Ok((supply * series + voltage * resistance) / (resistance + series)),
+        } => Ok((voltage.mul_add(resistance, supply * series)) / (resistance + series)),
         _ => bail!("not a capacitor bias constraint"),
     }
 }
@@ -49,7 +49,7 @@ fn bias_inductor(constraint: BiasConstraint, supply: f64, resistance: f64) -> Re
         BiasConstraint::InductorSoft {
             current,
             conductance,
-        } => Ok((current + conductance * supply) / (1. + conductance * resistance)),
+        } => Ok((conductance.mul_add(supply, current)) / (conductance.mul_add(resistance, 1.))),
         _ => bail!("not an inductor bias constraint"),
     }
 }
