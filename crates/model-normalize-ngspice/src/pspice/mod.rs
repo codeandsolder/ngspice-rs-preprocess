@@ -101,6 +101,7 @@ impl Functions {
         let mut cursor = 0;
         let mut output = Vec::with_capacity(input.len());
         let mut quote = None;
+        let mut braces = 0usize;
         while let Some(&byte) = bytes.get(cursor) {
             if quote.is_some() {
                 output.push(byte);
@@ -155,7 +156,10 @@ impl Functions {
                         continue;
                     }
                     if name.eq_ignore_ascii_case("table") {
-                        ensure!(table, "PSpice TABLE() requires an E/G VALUE expression");
+                        ensure!(
+                            table,
+                            "PSpice TABLE() requires an E/G VALUE or G CUR expression"
+                        );
                         output.extend_from_slice(b"pwl");
                         continue;
                     }
@@ -167,6 +171,18 @@ impl Functions {
                 continue;
             }
             match byte {
+                b'{' => {
+                    output.push(if braces == 0 { b'{' } else { b'(' });
+                    braces += 1;
+                    cursor += 1;
+                }
+                b'}' => {
+                    braces = braces
+                        .checked_sub(1)
+                        .context("unmatched PSpice expression brace")?;
+                    output.push(if braces == 0 { b'}' } else { b')' });
+                    cursor += 1;
+                }
                 b'&' | b'|' => {
                     output.extend_from_slice(&[byte, byte]);
                     cursor += 1 + usize::from(bytes.get(cursor + 1) == Some(&byte));
@@ -181,6 +197,7 @@ impl Functions {
                 }
             }
         }
+        ensure!(braces == 0, "unclosed PSpice expression brace");
         Ok(String::from_utf8(output)?)
     }
 }
@@ -495,11 +512,13 @@ fn rewrite(text: &str, line: usize, functions: &mut Functions) -> Result<String>
     };
     let prefix = &text[..start];
     let tail = &text[start..];
-    let table = (lower.starts_with('e') || lower.starts_with('g'))
-        && tail
-            .split_ascii_whitespace()
-            .next()
-            .is_some_and(|word| word.to_ascii_lowercase().starts_with("value"));
+    let table = lexical::tokens(tail.as_bytes())?
+        .first()
+        .is_some_and(|span| {
+            let keyword = &tail[span.clone()];
+            (lower.starts_with(['e', 'g']) && keyword.eq_ignore_ascii_case("value"))
+                || (lower.starts_with('g') && keyword.eq_ignore_ascii_case("cur"))
+        });
     let tail = functions.expression(tail, table)?;
     let tail = if lower == ".subckt" || lower.starts_with('x') {
         commas_to_spaces(&tail)?

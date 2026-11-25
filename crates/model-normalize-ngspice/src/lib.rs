@@ -320,7 +320,7 @@ fn expression_start(text: &[u8], first: &[u8]) -> Result<Option<usize>> {
         [b'e' | b'g', ..] => {
             if fields.get(3).is_some_and(|span| {
                 let field = &text[span.clone()];
-                [b"value".as_slice(), b"table", b"poly"]
+                [b"value".as_slice(), b"table", b"poly", b"vol", b"cur"]
                     .iter()
                     .any(|keyword| {
                         field

@@ -393,3 +393,62 @@ quit
         close(row[2], row[0]);
     })
 }
+
+#[test]
+fn nested_braces_are_grouping_inside_parameter_and_model_expressions() -> Result<()> {
+    let source = br"Nested expressions
+.param a=2 b={{a+1}*2}
+V1 in 0 {b}
+X1 in out CELL
+.subckt CELL a b params: r=1k
+R1 a b {{r*2}+r}
+.ends
+R2 out 0 3k
+.model DM D(IS={{1e-12*2}+1e-12})
+D1 0 out DM
+.control
+set wr_singlescale
+set wr_vecnames
+op
+wrdata response.dat v(in) v(out)
+quit
+.endc
+.end
+";
+    compare(source, |row| {
+        close(row[1], 6.);
+        close(row[2], 3.);
+    })
+}
+
+#[test]
+fn cur_table_and_conditional_local_ground_preserve_sign_and_topology() -> Result<()> {
+    let source = br"Current table and conditional ground
+V1 in 0 0.5
+G1 out 0 CUR={TABLE(V(in),0,0,1,1m)}
+R1 out 0 1k
+V2 source 0 3
+X1 source divided CELL
+.subckt CELL GND out
+.param a=2
+.if (a>1)
+R1 GND out 1k
+.else
+R1 GND out 2k
+.endif
+.ends
+R2 divided 0 1k
+.control
+set wr_singlescale
+set wr_vecnames
+op
+wrdata response.dat v(out) v(divided)
+quit
+.endc
+.end
+";
+    compare(source, |row| {
+        close(row[1], -0.5);
+        close(row[2], 1.5);
+    })
+}
