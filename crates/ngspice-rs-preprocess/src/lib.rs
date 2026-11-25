@@ -329,7 +329,7 @@ fn native(
         device_identities: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,
-        waveforms: Vec::new(),
+        waveforms: normalized.waveforms,
     })
 }
 

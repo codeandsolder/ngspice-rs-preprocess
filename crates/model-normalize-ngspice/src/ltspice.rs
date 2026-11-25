@@ -379,6 +379,35 @@ fn plan_rewrites(
     })
 }
 
+fn normalize_sources(
+    input: &mut MappedNormalization,
+    kind: crate::linked_source::RootKind,
+    title: usize,
+    title_lines: usize,
+) -> Result<()> {
+    let artifact = if kind == crate::linked_source::RootKind::Deck {
+        "deck.cir"
+    } else {
+        "model.lib"
+    };
+    if let Some(lowered) = sources::rewrite(
+        &input.model.bytes[title..],
+        artifact,
+        &input.input_lines[title_lines..],
+    )? {
+        input.model.bytes.truncate(title);
+        input.model.bytes.extend_from_slice(&lowered.bytes);
+        input.input_lines.truncate(title_lines);
+        input.input_lines.extend(lowered.origins);
+        input.waveforms.extend(lowered.waveforms);
+        input
+            .model
+            .passes
+            .push(NormalizationPass::LtspiceSourceWaveforms);
+    }
+    Ok(())
+}
+
 /// Apply documented source-specific rewrites to a linked and normalized
 /// artifact, retaining the composed physical line map.
 ///
@@ -399,20 +428,13 @@ pub fn normalize(
     } else {
         0
     };
-    if let Some(lowered) = sources::rewrite(&input.model.bytes[title..])? {
-        input.model.bytes.truncate(title);
-        input.model.bytes.extend_from_slice(&lowered);
-        input
-            .model
-            .passes
-            .push(NormalizationPass::LtspiceSourceWaveforms);
-    }
+    let title_lines = usize::from(title != 0);
+    normalize_sources(&mut input, kind, title, title_lines)?;
     if let Some(lowered) = operators::rewrite(&input.model.bytes[title..])? {
         input.model.bytes.truncate(title);
         input.model.bytes.extend_from_slice(&lowered);
         input.model.passes.push(NormalizationPass::LtspiceOperators);
     }
-    let title_lines = usize::from(title != 0);
     let mut static_macros = BTreeSet::new();
     if let Some(specialization) = functions::specialize(
         &input.model.bytes,

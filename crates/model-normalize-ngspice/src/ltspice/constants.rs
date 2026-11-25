@@ -37,6 +37,7 @@ fn lower(raw: &str, runtime_literal: bool) -> Result<SpiceExpression> {
 struct Constants {
     frames: Vec<BTreeMap<String, SpiceExpression>>,
     remaining: usize,
+    unbound: bool,
 }
 
 impl Constants {
@@ -60,14 +61,16 @@ impl SpiceExpressionContext for Constants {
             self.frames.push(frame);
             return result;
         }
+        self.unbound = true;
         bail!("waveform parameter {name} needs occurrence-specific binding")
     }
 
     fn function(&mut self, name: &str, args: &[SpiceExpression]) -> Result<f64> {
         self.charge()?;
-        let name = name
-            .strip_prefix(PREFIX)
-            .context("unsupported closed LTspice function")?;
+        let Some(name) = name.strip_prefix(PREFIX) else {
+            self.unbound = true;
+            bail!("source-defined LTspice function needs occurrence-specific binding");
+        };
         let definition = if name == "table" {
             ensure!(
                 args.len() >= 3 && args.len() % 2 == 1,
@@ -107,11 +110,23 @@ impl SpiceExpressionContext for Constants {
     }
 }
 
-pub(super) fn evaluate(raw: &str, runtime_literal: bool) -> Result<f64> {
-    lower(raw, runtime_literal)?.evaluate_with(&mut Constants {
+pub(super) fn try_evaluate(raw: &str, runtime_literal: bool) -> Result<Option<f64>> {
+    let expression = lower(raw, runtime_literal)?;
+    let mut context = Constants {
         frames: Vec::new(),
         remaining: 100_000,
-    })
+        unbound: false,
+    };
+    match expression.evaluate_with(&mut context) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) if context.unbound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn evaluate(raw: &str, runtime_literal: bool) -> Result<f64> {
+    try_evaluate(raw, runtime_literal)?
+        .context("LTspice expression requires occurrence-specific binding")
 }
 
 #[cfg(test)]

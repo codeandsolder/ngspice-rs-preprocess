@@ -339,12 +339,34 @@ pub fn remove_spans(
     spans: &[Range<usize>],
     edits: &mut Vec<Edit>,
 ) {
+    let replacements = spans
+        .iter()
+        .map(|span| {
+            let start = statement.text[..span.start].trim_ascii_end().len();
+            (start..span.end, Vec::new())
+        })
+        .collect::<Vec<_>>();
+    replace_spans(statement, input, &replacements, edits);
+}
+
+/// Replace logical fields and comment wholly consumed continuations.
+pub fn replace_spans(
+    statement: &Statement,
+    input: &[u8],
+    replacements: &[Edit],
+    edits: &mut Vec<Edit>,
+) {
     let mut removed = Vec::new();
-    for assignment in spans {
-        let start = statement.text[..assignment.start].trim_ascii_end().len();
-        let range = start..assignment.end;
-        removed.extend(statement.source_ranges(range.clone()));
-        replace_span(statement, range, b"", edits);
+    for (span, replacement) in replacements {
+        let ranges = statement.source_ranges(span.clone());
+        for (index, range) in ranges.into_iter().enumerate() {
+            if index == 0 && !replacement.is_empty() {
+                edits.push((range, replacement.clone()));
+            } else {
+                removed.push(range.clone());
+                edits.push((range, Vec::new()));
+            }
+        }
     }
     for (plus, code) in &statement.continuations {
         if input[code.clone()].iter().enumerate().all(|(i, byte)| {

@@ -7,6 +7,11 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+mod ltspice;
+mod native;
+pub use ltspice::{LtspicePoint, LtspicePulse, LtspicePwl, LtspiceSine, LtspiceWaveform};
+pub use native::NativePwlReference;
+
 /// Scalar expressions use the emitted circuit's parameter grammar.
 pub type Scalar = String;
 
@@ -17,6 +22,8 @@ pub struct PreparedWaveform {
     pub scope: Vec<String>,
     pub source: String,
     pub spec: WaveformSpec,
+    /// Explicit source bias value, independent of transient time-zero forcing.
+    pub dc_override: Option<Scalar>,
     /// Freeze at the startup value during source periodic operating point
     /// and its associated AC analysis.
     pub idle_in_pop: Scalar,
@@ -26,6 +33,8 @@ pub struct PreparedWaveform {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "shape", rename_all = "kebab-case")]
 pub enum WaveformSpec {
+    /// Positional source forms with LTspice-specific parameter defaults.
+    Ltspice(LtspiceWaveform),
     Pulse(PulseSpec),
     Saw {
         first: Scalar,
@@ -117,6 +126,15 @@ pub struct Repeat {
     pub origin: f64,
     pub period: f64,
     pub hold: Option<f64>,
+    /// Optional exact termination of the repeating forcing.
+    pub limit: Option<RepeatLimit>,
+}
+
+/// Once the absolute cutoff is reached the waveform holds this value.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RepeatLimit {
+    pub time: f64,
+    pub value: f64,
 }
 
 /// Dialect-neutral resolved source forcing. No SPICE expression evaluation
@@ -134,14 +152,21 @@ pub enum Forcing {
         frequency: f64,
         delay: f64,
         damping: f64,
+        /// Phase in degrees, independent of the delay.
+        phase: f64,
         hold_before_delay: bool,
+        /// Optional elapsed-time cap; the sine holds its endpoint thereafter.
+        /// A negative cap is meaningful for a signed-frequency source.
+        stop_after: Option<f64>,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedWaveform {
-    /// Exact right-hand startup value (held level if delay has not elapsed).
+    /// Operating-point bias, honoring an explicit source DC override.
     pub dc: f64,
+    /// Source-defined transient initial value, independent of DC override.
+    pub startup: f64,
     pub forcing: Forcing,
     pub idle_in_pop: bool,
 }
@@ -268,6 +293,7 @@ fn repeat(period: f64, delay: f64, hold: bool, first: f64) -> Repeat {
             period,
             origin: delay,
             hold: Some(first),
+            limit: None,
         }
     } else {
         let remainder = delay % period;
@@ -280,6 +306,7 @@ fn repeat(period: f64, delay: f64, hold: bool, first: f64) -> Repeat {
             period,
             origin: if origin == 0. { 0. } else { origin },
             hold: None,
+            limit: None,
         }
     }
 }
@@ -294,6 +321,21 @@ fn pulse_forcing(
     let delay = scalar(&spec.delay, resolve)?;
     let hold = flag(&spec.hold_before_delay, resolve)?;
     let [rise, width, fall] = spec.edges.resolve(period, resolve)?;
+    let knots = pulse_knots(first, second, rise, width, fall, period)?;
+    Ok(Forcing::PiecewiseLinear {
+        knots,
+        repeat: Some(repeat(period, delay, hold, first)),
+    })
+}
+
+fn pulse_knots(
+    first: f64,
+    second: f64,
+    rise: f64,
+    width: f64,
+    fall: f64,
+    period: f64,
+) -> Result<Vec<Knot>> {
     let high_end = rise + width;
     let end = high_end + fall;
     // At a full-period boundary two rounded additions can produce one
@@ -308,7 +350,7 @@ fn pulse_forcing(
         (width <= 0. || high_end > rise) && (fall <= 0. || end > high_end),
         "pulse duration is smaller than a representable interval"
     );
-    let knots = if end == 0. {
+    Ok(if end == 0. {
         vec![Knot {
             time: 0.,
             left: first,
@@ -322,10 +364,6 @@ fn pulse_forcing(
             (end, first),
             (period, first),
         ])?
-    };
-    Ok(Forcing::PiecewiseLinear {
-        knots,
-        repeat: Some(repeat(period, delay, hold, first)),
     })
 }
 
@@ -365,6 +403,7 @@ impl WaveformSpec {
     /// an inconsistent structural point count.
     pub fn resolve(&self, mut resolve: impl FnMut(&str) -> Result<f64>) -> Result<Forcing> {
         match self {
+            Self::Ltspice(spec) => spec.resolve(&mut resolve),
             Self::Pulse(spec) => pulse_forcing(spec, &mut resolve),
             Self::Saw {
                 first,
@@ -415,7 +454,9 @@ impl WaveformSpec {
                     frequency,
                     delay,
                     damping: scalar(damping, &mut resolve)?,
+                    phase: 0.,
                     hold_before_delay: flag(hold_before_delay, &mut resolve)?,
+                    stop_after: None,
                 })
             }
         }
@@ -431,6 +472,11 @@ fn startup_pwl(knots: &[Knot], repeat: Option<Repeat>) -> Result<f64> {
     let first = knots.first().context("empty resolved waveform")?;
     let last = knots.last().context("empty resolved waveform")?;
     let (time, shift) = if let Some(cycle) = repeat {
+        if let Some(limit) = cycle.limit
+            && limit.time <= 0.
+        {
+            return Ok(limit.value);
+        }
         if let Some(hold) = cycle.hold {
             return Ok(hold);
         }
@@ -487,13 +533,21 @@ impl Forcing {
                 frequency,
                 delay,
                 damping,
+                phase,
                 hold_before_delay,
+                stop_after,
             } => {
-                if *amplitude == 0. || (*hold_before_delay && *delay > 0.) {
+                let elapsed = if *hold_before_delay && *delay >= 0. {
+                    0.
+                } else {
+                    stop_after.map_or(-delay, |stop| (-delay).min(stop))
+                };
+                if *amplitude == 0. {
                     *offset
                 } else {
-                    let phase = (-(delay * frequency) % 1.) * std::f64::consts::TAU;
-                    (amplitude * (damping * delay).exp()).mul_add(phase.sin(), *offset)
+                    let angle = (elapsed * frequency % 1.)
+                        .mul_add(std::f64::consts::TAU, phase.to_radians());
+                    (amplitude * (-damping * elapsed).exp()).mul_add(angle.sin(), *offset)
                 }
             }
         };
@@ -512,10 +566,12 @@ impl PreparedWaveform {
         mut resolve: impl FnMut(&str) -> Result<f64>,
     ) -> Result<ResolvedWaveform> {
         let forcing = self.spec.resolve(&mut resolve)?;
-        let dc = forcing.startup()?;
+        let startup = forcing.startup()?;
+        let dc = optional(self.dc_override.as_deref(), startup, &mut resolve)?;
         let idle_in_pop = flag(&self.idle_in_pop, &mut resolve)?;
         Ok(ResolvedWaveform {
             dc,
+            startup,
             forcing,
             idle_in_pop,
         })

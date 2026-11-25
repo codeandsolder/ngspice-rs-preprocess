@@ -1,8 +1,21 @@
-//! Source waveform timing normalization without global simulator modes.
+//! Source waveform normalization and mandatory occurrence-bound forcing.
 
-use crate::{lexical, model_card::parse_spice_constant};
+use crate::{
+    fresh_identifier, lexical,
+    model_card::parse_spice_constant,
+    source_identifiers,
+    waveform::{
+        LtspicePoint, LtspicePulse, LtspicePwl, LtspiceSine, LtspiceWaveform, PreparedWaveform,
+        WaveformSpec,
+    },
+};
 use anyhow::{Context, Result, ensure};
-use std::ops::Range;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
+
+type Span = Range<usize>;
 
 /// Separate waveform fields at whitespace or commas outside expression groups.
 /// Return the closing parenthesis separately so additional fields can be
@@ -43,341 +56,6 @@ fn literal(text: &[u8]) -> Result<f64> {
     parse_spice_constant(expression)
         .or_else(|_| super::constants::evaluate(expression, grouped.is_none()))
         .context("waveform timing requires occurrence-specific parameter binding")
-}
-
-fn native_literal(text: &[u8]) -> bool {
-    std::str::from_utf8(text)
-        .ok()
-        .and_then(|value| parse_spice_constant(value).ok())
-        .is_some()
-}
-
-fn materialize_closed(
-    statement: &lexical::Statement,
-    span: &Range<usize>,
-    edits: &mut Vec<lexical::Edit>,
-) {
-    let text = &statement.text[span.clone()];
-    if !native_literal(text)
-        && let Ok(value) = literal(text)
-    {
-        lexical::replace_span(statement, span.clone(), value.to_string().as_bytes(), edits);
-    }
-}
-
-/// Resolve source-dialect timing from values already bound in the source
-/// occurrence. Omitted period is a one-shot; an explicitly undersized period
-/// is enlarged before zero-edge defaults are calculated.
-fn pulse_timing(values: &[f64]) -> Result<[f64; 6]> {
-    let [delay, rise, fall, rest @ ..] = values else {
-        anyhow::bail!("LTspice PULSE requires at least five total arguments");
-    };
-    ensure!(rest.len() <= 3, "too many LTspice PULSE arguments");
-    let delay = delay.max(0.);
-    let rise = rise.max(0.);
-    let fall = fall.max(0.);
-    let width = rest.first().copied().unwrap_or(0.).max(0.);
-    let supplied_period = rest.get(1).copied().map(|value| value.max(0.));
-    let sum = rise + fall + width;
-    let period = supplied_period.map_or(0., |period| {
-        if period <= sum {
-            sum * (1. + 2e-15)
-        } else {
-            period
-        }
-    });
-    let default_basis = if period > 0. {
-        let margin = period - sum;
-        if width > 0. {
-            width.min(margin)
-        } else {
-            margin
-        }
-    } else if width > 0. {
-        width
-    } else if sum > 0. {
-        sum
-    } else {
-        1e-7
-    };
-    let default_edge = 0.1 * default_basis;
-    let rise = if rise > 0. { rise } else { default_edge };
-    let fall = if fall > 0. { fall } else { default_edge };
-    let active = rise + fall + width;
-    let one_shot = supplied_period.is_none() || period == 0.;
-    let period = if one_shot {
-        active * (1. + 2e-15)
-    } else {
-        period
-    };
-    let count = if one_shot {
-        1.
-    } else {
-        rest.get(2).copied().unwrap_or(0.)
-    };
-    let timing = [delay, rise, fall, width, period, count];
-    ensure!(
-        timing.iter().all(|value| value.is_finite())
-            && rise > 0.
-            && fall > 0.
-            && period > 0.
-            && active <= period,
-        "LTspice PULSE timing cannot be represented as a native pulse"
-    );
-    Ok(timing)
-}
-
-fn rewrite_pulse(
-    statement: &lexical::Statement,
-    name_end: usize,
-    edits: &mut Vec<lexical::Edit>,
-) -> Result<()> {
-    let text = &statement.text;
-    let (fields, close) = arguments(text, name_end)?;
-    ensure!(
-        (5..=8).contains(&fields.len()),
-        "line {}: invalid LTspice PULSE arity",
-        statement.line
-    );
-    for span in &fields[..2] {
-        materialize_closed(statement, span, edits);
-    }
-    let values = fields[2..]
-        .iter()
-        .map(|span| literal(&text[span.clone()]))
-        .collect::<Result<Vec<_>>>()?;
-    let timing = pulse_timing(&values)?;
-    for (span, (before, after)) in fields[2..].iter().zip(values.iter().zip(timing)) {
-        if before.to_bits() != after.to_bits() || !native_literal(&text[span.clone()]) {
-            lexical::replace_span(statement, span.clone(), after.to_string().as_bytes(), edits);
-        }
-    }
-    // The native engine must not supply its analysis-dependent defaults.
-    if values.len() < 5 || (values.len() == 5 && timing[5] > 0.) {
-        let mut suffix = String::new();
-        for value in &timing[values.len()..] {
-            use std::fmt::Write as _;
-            write!(&mut suffix, " {value}")?;
-        }
-        suffix.push(')');
-        lexical::replace_span(statement, close..close + 1, suffix.as_bytes(), edits);
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct Scale {
-    time: f64,
-    value: f64,
-}
-
-impl Default for Scale {
-    fn default() -> Self {
-        Self {
-            time: 1.,
-            value: 1.,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ScaleAxis {
-    Time,
-    Value,
-}
-
-impl ScaleAxis {
-    fn parse(field: &[u8]) -> Option<Self> {
-        if field.eq_ignore_ascii_case(b"time_scale_factor") {
-            Some(Self::Time)
-        } else if field.eq_ignore_ascii_case(b"value_scale_factor") {
-            Some(Self::Value)
-        } else {
-            None
-        }
-    }
-}
-
-fn scale_assignment(text: &[u8], fields: &[Range<usize>], index: usize) -> Result<Range<usize>> {
-    let equals = fields
-        .get(index + 1)
-        .context("missing PWL scale assignment")?;
-    let value = fields.get(index + 2).context("missing PWL scale value")?;
-    ensure!(
-        &text[equals.clone()] == b"=",
-        "expected PWL scale assignment"
-    );
-    Ok(value.clone())
-}
-
-struct PwlArguments {
-    fields: Vec<Range<usize>>,
-    scale: Scale,
-    removals: Vec<Range<usize>>,
-}
-
-/// Vendor grammar applies scale assignments only before the coordinate
-/// list. Repeated assignments are last-wins; trailing scale assignments
-/// are consumed but do not affect forcing. Do not consume other source
-/// attributes, such as AC phase or physical parasitics.
-fn pwl_arguments(text: &[u8], name_end: usize) -> Result<PwlArguments> {
-    let tokens = lexical::tokens(&text[name_end..])?
-        .into_iter()
-        .map(|span| name_end + span.start..name_end + span.end)
-        .collect::<Vec<_>>();
-    let mut scale = Scale::default();
-    let mut index = 0;
-    let mut removals = Vec::new();
-    let mut latest_time = None;
-    let mut latest_value = None;
-    loop {
-        let field = tokens
-            .get(index)
-            .context("missing LTspice PWL coordinates")?;
-        if text[field.clone()].starts_with(b"(") {
-            break;
-        }
-        let axis = ScaleAxis::parse(&text[field.clone()])
-            .context("LTspice structured PWL requires typed waveform lowering")?;
-        let value = scale_assignment(text, &tokens, index)?;
-        removals.push(field.start..value.end);
-        match axis {
-            ScaleAxis::Time => latest_time = Some(value),
-            ScaleAxis::Value => latest_value = Some(value),
-        }
-        index += 3;
-    }
-    if let Some(value) = latest_time {
-        scale.time = literal(&text[value])?;
-    }
-    if let Some(value) = latest_value {
-        scale.value = literal(&text[value])?;
-    }
-    ensure!(scale.time != 0., "LTspice PWL time scale must be nonzero");
-    let list = &tokens[index];
-    let (fields, close) = arguments(text, list.start)?;
-    index += 1;
-    while let Some(field) = tokens.get(index) {
-        let word = &text[field.clone()];
-        if ScaleAxis::parse(word).is_some() {
-            let value = scale_assignment(text, &tokens, index)?;
-            removals.push(field.start..value.end);
-            index += 3;
-            continue;
-        }
-        ensure!(
-            ![b"repeat".as_slice(), b"endrepeat", b"trigger", b"file"]
-                .iter()
-                .any(|keyword| word.eq_ignore_ascii_case(keyword)),
-            "LTspice structured PWL requires typed waveform lowering"
-        );
-        ensure!(field.start > close, "invalid PWL coordinate list");
-        index += 1;
-    }
-    Ok(PwlArguments {
-        fields,
-        scale,
-        removals,
-    })
-}
-
-fn pwl_time(text: &[u8], previous: f64) -> Result<f64> {
-    let time = literal(text)?;
-    let time = if text.first() == Some(&b'+') {
-        previous + time
-    } else {
-        time
-    };
-    ensure!(time.is_finite(), "nonfinite LTspice PWL coordinate");
-    Ok(time)
-}
-
-fn rewrite_pwl(
-    statement: &lexical::Statement,
-    input: &[u8],
-    name_end: usize,
-    edits: &mut Vec<lexical::Edit>,
-) -> Result<()> {
-    let text = &statement.text;
-    let PwlArguments {
-        fields,
-        scale,
-        mut removals,
-    } = pwl_arguments(text, name_end)?;
-    ensure!(
-        fields.len() >= 2 && fields.len() % 2 == 0,
-        "invalid PWL coordinate pairs"
-    );
-    let points = fields.as_chunks::<2>().0;
-    let mut times = Vec::with_capacity(points.len());
-    let mut previous = 0.;
-    for point in points {
-        previous = pwl_time(&text[point[0].clone()], previous)?;
-        let scaled = previous * scale.time;
-        ensure!(
-            scaled.is_finite() && times.last().is_none_or(|last| scaled >= *last),
-            "LTspice PWL times must be chronological after scaling"
-        );
-        times.push(scaled);
-    }
-    let mut index = 0;
-    while index < points.len() {
-        let time = times[index];
-        let end = times[index..]
-            .iter()
-            .position(|value| *value > time)
-            .map_or(points.len(), |offset| index + offset);
-        let first = &points[index];
-        if scale.time.to_bits() != 1_f64.to_bits() || text[first[0].clone()].first() == Some(&b'+')
-        {
-            lexical::replace_span(
-                statement,
-                first[0].clone(),
-                time.to_string().as_bytes(),
-                edits,
-            );
-        }
-        if end - index > 1 || scale.value.to_bits() != 1_f64.to_bits() {
-            // The vendor collapses repeated coordinates to the arithmetic
-            // mean before interpolation; they are not instantaneous jumps.
-            let count = f64::from(u32::try_from(end - index)?);
-            let mean = points[index..end].iter().try_fold(0., |sum, point| {
-                Ok::<_, anyhow::Error>(sum + literal(&text[point[1].clone()])? / count)
-            })?;
-            let scaled = mean * scale.value;
-            ensure!(scaled.is_finite(), "nonfinite scaled PWL ordinate");
-            lexical::replace_span(
-                statement,
-                first[1].clone(),
-                scaled.to_string().as_bytes(),
-                edits,
-            );
-            for point in &points[index + 1..end] {
-                let preceding = text[..point[0].start].trim_ascii_end();
-                let start = if preceding.last() == Some(&b',') {
-                    preceding.len() - 1
-                } else {
-                    point[0].start
-                };
-                removals.push(start..point[1].end);
-            }
-        }
-        if end - index == 1 && scale.value.to_bits() == 1_f64.to_bits() {
-            materialize_closed(statement, &first[1], edits);
-        }
-        index = end;
-    }
-    lexical::remove_spans(statement, input, &removals, edits);
-    Ok(())
-}
-
-fn waveform_name(text: &[u8], field: &Range<usize>, name: &[u8]) -> bool {
-    text[field.clone()]
-        .get(..name.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
-        && text[field.clone()]
-            .get(name.len())
-            .is_none_or(|byte| *byte == b'(')
 }
 
 fn rewrite_tran(statement: &lexical::Statement, edits: &mut Vec<lexical::Edit>) -> Result<()> {
@@ -449,38 +127,407 @@ fn rewrite_tran(statement: &lexical::Statement, edits: &mut Vec<lexical::Edit>) 
     Ok(())
 }
 
-fn rewrite_statement(
-    statement: &lexical::Statement,
-    input: &[u8],
-    edits: &mut Vec<lexical::Edit>,
-) -> Result<()> {
-    let text = &statement.text;
-    let first = text
-        .split(u8::is_ascii_whitespace)
-        .next()
-        .unwrap_or_default();
-    if first.eq_ignore_ascii_case(b".tran") {
-        return rewrite_tran(statement, edits);
-    }
-    if !matches!(text.first(), Some(b'V' | b'v' | b'I' | b'i')) {
-        return Ok(());
-    }
-    let fields = lexical::tokens(text)?;
-    for field in fields.iter().skip(3) {
-        if waveform_name(text, field, b"pulse") {
-            return rewrite_pulse(statement, field.start + 5, edits);
-        }
-        if waveform_name(text, field, b"pwl") {
-            return rewrite_pwl(statement, input, field.start + 3, edits);
-        }
-    }
-    Ok(())
+fn native_literal(text: &[u8]) -> bool {
+    std::str::from_utf8(text)
+        .ok()
+        .and_then(|value| parse_spice_constant(value).ok())
+        .is_some()
 }
 
-pub(super) fn rewrite(input: &[u8]) -> Result<Option<Vec<u8>>> {
+fn scalar(text: &[u8], field: &Span) -> Result<String> {
+    Ok(std::str::from_utf8(&text[field.clone()])?.to_owned())
+}
+
+fn positional(text: &[u8], fields: &[Span], index: usize) -> Result<Option<String>> {
+    fields
+        .get(index)
+        .map(|field| scalar(text, field))
+        .transpose()
+}
+
+#[derive(Clone, Copy)]
+enum Shape {
+    Pulse,
+    Pwl,
+    Sine,
+}
+
+impl Shape {
+    fn identify(field: &[u8]) -> Option<(Self, usize)> {
+        for (keyword, shape) in [
+            (b"pulse".as_slice(), Self::Pulse),
+            (b"pwl", Self::Pwl),
+            (b"sine", Self::Sine),
+            (b"sin", Self::Sine),
+        ] {
+            if field
+                .get(..keyword.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+                && field.get(keyword.len()).is_none_or(|byte| *byte == b'(')
+            {
+                return Some((shape, keyword.len()));
+            }
+        }
+        None
+    }
+
+    fn positional(self, text: &[u8], fields: &[Span]) -> Result<LtspiceWaveform> {
+        match self {
+            Self::Pulse => {
+                ensure!(
+                    (5..=8).contains(&fields.len()),
+                    "invalid LTspice PULSE arity"
+                );
+                Ok(LtspiceWaveform::Pulse(LtspicePulse {
+                    first: scalar(text, &fields[0])?,
+                    second: scalar(text, &fields[1])?,
+                    delay: scalar(text, &fields[2])?,
+                    rise: scalar(text, &fields[3])?,
+                    fall: scalar(text, &fields[4])?,
+                    width: positional(text, fields, 5)?,
+                    period: positional(text, fields, 6)?,
+                    count: positional(text, fields, 7)?,
+                }))
+            }
+            Self::Sine => {
+                ensure!(
+                    (2..=7).contains(&fields.len()),
+                    "invalid LTspice SINE arity"
+                );
+                Ok(LtspiceWaveform::Sine(LtspiceSine {
+                    offset: scalar(text, &fields[0])?,
+                    amplitude: scalar(text, &fields[1])?,
+                    frequency: positional(text, fields, 2)?,
+                    delay: positional(text, fields, 3)?,
+                    damping: positional(text, fields, 4)?,
+                    phase: positional(text, fields, 5)?,
+                    count: positional(text, fields, 6)?,
+                }))
+            }
+            Self::Pwl => unreachable!("PWL uses scale and relative-coordinate grammar"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScaleAxis {
+    Time,
+    Value,
+}
+impl ScaleAxis {
+    const fn parse(field: &[u8]) -> Option<Self> {
+        if field.eq_ignore_ascii_case(b"time_scale_factor") {
+            Some(Self::Time)
+        } else if field.eq_ignore_ascii_case(b"value_scale_factor") {
+            Some(Self::Value)
+        } else {
+            None
+        }
+    }
+}
+
+fn scale_assignment(text: &[u8], fields: &[Span], index: usize) -> Result<Span> {
+    let equals = fields
+        .get(index + 1)
+        .context("missing PWL scale assignment")?;
+    let value = fields.get(index + 2).context("missing PWL scale value")?;
+    ensure!(
+        &text[equals.clone()] == b"=",
+        "expected PWL scale assignment"
+    );
+    Ok(value.clone())
+}
+
+struct ParsedWaveform {
+    spec: LtspiceWaveform,
+    span: Span,
+    ignored: Vec<Span>,
+}
+
+fn parse_pwl(text: &[u8], start: usize, name_end: usize) -> Result<ParsedWaveform> {
+    let tokens = lexical::tokens(&text[name_end..])?
+        .into_iter()
+        .map(|span| name_end + span.start..name_end + span.end)
+        .collect::<Vec<_>>();
+    let mut time_scale = "1".to_owned();
+    let mut value_scale = "1".to_owned();
+    let mut index = 0;
+    loop {
+        let field = tokens
+            .get(index)
+            .context("missing LTspice PWL coordinates")?;
+        if text[field.clone()].starts_with(b"(") {
+            break;
+        }
+        let axis = ScaleAxis::parse(&text[field.clone()])
+            .context("LTspice structured PWL requires typed repeat/trigger/file lowering")?;
+        let value = scalar(text, &scale_assignment(text, &tokens, index)?)?;
+        match axis {
+            ScaleAxis::Time => time_scale = value,
+            ScaleAxis::Value => value_scale = value,
+        }
+        index += 3;
+    }
+    let list = &tokens[index];
+    let (fields, close) = arguments(text, list.start)?;
+    ensure!(
+        fields.len() >= 2 && fields.len() % 2 == 0,
+        "invalid PWL coordinate pairs"
+    );
+    let points = fields
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[time, value]| {
+            let raw = scalar(text, time)?;
+            let relative = raw.starts_with('+');
+            Ok(LtspicePoint {
+                time: if relative { raw[1..].to_owned() } else { raw },
+                relative,
+                value: scalar(text, value)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    index += 1;
+    let mut ignored = Vec::new();
+    // The vendor consumes trailing scale assignments without applying them.
+    while let Some(field) = tokens.get(index) {
+        let word = &text[field.clone()];
+        if ScaleAxis::parse(word).is_some() {
+            let value = scale_assignment(text, &tokens, index)?;
+            ignored.push(field.start..value.end);
+            index += 3;
+            continue;
+        }
+        ensure!(
+            ![
+                b"repeat".as_slice(),
+                b"endrepeat",
+                b"trigger",
+                b"file",
+                b"r",
+                b"td"
+            ]
+            .iter()
+            .any(|name| word.eq_ignore_ascii_case(name)),
+            "LTspice structured PWL requires typed waveform lowering"
+        );
+        index += 1;
+    }
+    Ok(ParsedWaveform {
+        spec: LtspiceWaveform::Pwl(LtspicePwl {
+            points,
+            time_scale,
+            value_scale,
+        }),
+        span: start..close + 1,
+        ignored,
+    })
+}
+
+fn parse_waveform(text: &[u8], fields: &[Span]) -> Result<Option<ParsedWaveform>> {
+    for field in fields.iter().skip(3) {
+        let Some((shape, length)) = Shape::identify(&text[field.clone()]) else {
+            continue;
+        };
+        let start = field.start;
+        let name_end = start + length;
+        return if matches!(shape, Shape::Pwl) {
+            parse_pwl(text, start, name_end).map(Some)
+        } else {
+            let (arguments, close) = arguments(text, name_end)?;
+            Ok(Some(ParsedWaveform {
+                spec: shape.positional(text, &arguments)?,
+                span: start..close + 1,
+                ignored: Vec::new(),
+            }))
+        };
+    }
+    Ok(None)
+}
+
+/// Preserve explicit leading or named DC independent of transient forcing.
+/// The native source parser gives the leading scalar precedence over DC=.
+fn dc_field(text: &[u8], fields: &[Span], wave: &ParsedWaveform) -> Result<Option<Span>> {
+    if let Some(field) = fields.get(3)
+        && field.end <= wave.span.start
+        && ![b"dc".as_slice(), b"ac", b"distof1", b"distof2"]
+            .iter()
+            .any(|name| text[field.clone()].eq_ignore_ascii_case(name))
+        && fields.get(4).is_none_or(|next| &text[next.clone()] != b"=")
+    {
+        return Ok(Some(field.clone()));
+    }
+    let mut dc = None;
+    for (index, field) in fields.iter().enumerate().skip(3) {
+        if wave.span.contains(&field.start)
+            || wave.ignored.iter().any(|span| span.contains(&field.start))
+        {
+            continue;
+        }
+        if text[field.clone()].eq_ignore_ascii_case(b"dc") {
+            let mut value = index + 1;
+            if fields
+                .get(value)
+                .is_some_and(|next| &text[next.clone()] == b"=")
+            {
+                value += 1;
+            }
+            dc = Some(
+                fields
+                    .get(value)
+                    .context("missing explicit source DC value")?
+                    .clone(),
+            );
+        }
+    }
+    Ok(dc)
+}
+
+struct Bind<'a> {
+    used: &'a mut BTreeSet<Vec<u8>>,
+    aliases: BTreeMap<String, String>,
+    declarations: Vec<u8>,
+}
+
+impl Bind<'_> {
+    fn scalar(&mut self, raw: &str) -> Result<String> {
+        if let Ok(value) = parse_spice_constant(raw) {
+            return Ok(value.to_string());
+        }
+        if let Some(value) = super::constants::try_evaluate(raw, true)? {
+            return Ok(value.to_string());
+        }
+        // Put the expression into its actual declaration scope. All later
+        // dialect-specific operator/macro lowering applies to this .param,
+        // and the mandatory metadata refers only to the native bound name.
+        let expression = crate::param_expression::lower_ltspice(raw, true)?
+            .replace('{', "(")
+            .replace('}', ")");
+        if let Some(alias) = self.aliases.get(&expression) {
+            return Ok(alias.clone());
+        }
+        let name = fresh_identifier(self.used, b"ltprep_waveform")
+            .context("LTspice waveform parameter identifier overflow")?;
+        let name = String::from_utf8(name)?;
+        let line = format!(".param {name}={{{expression}}}\n");
+        self.declarations.extend_from_slice(line.as_bytes());
+        self.aliases.insert(expression, name.clone());
+        Ok(name)
+    }
+}
+
+struct SourcePass<'a> {
+    body: &'a [u8],
+    artifact: &'a str,
+    used: BTreeSet<Vec<u8>>,
+    edits: Vec<lexical::Edit>,
+    inserted: BTreeMap<usize, usize>,
+    waveforms: Vec<PreparedWaveform>,
+    scope: Vec<String>,
+}
+
+impl SourcePass<'_> {
+    fn source(&mut self, statement: &lexical::Statement) -> Result<()> {
+        let text = &statement.text;
+        let fields = lexical::tokens(text)?;
+        let Some(mut parsed) = parse_waveform(text, &fields)? else {
+            return Ok(());
+        };
+        let dc = dc_field(text, &fields, &parsed)?;
+        let mut bind = Bind {
+            used: &mut self.used,
+            aliases: BTreeMap::new(),
+            declarations: Vec::new(),
+        };
+        parsed.spec.map_scalars(|raw| bind.scalar(raw))?;
+        let reference = if bind.aliases.is_empty() {
+            parsed.spec.native_reference(parse_spice_constant)?
+        } else {
+            None
+        };
+        let mut replacements = parsed
+            .ignored
+            .iter()
+            .map(|span| {
+                let start = text[..span.start].trim_ascii_end().len();
+                (start..span.end, Vec::new())
+            })
+            .collect::<Vec<_>>();
+        if let Some(reference) = reference {
+            replacements.push((parsed.span, reference.into_bytes()));
+        } else {
+            let dc_override = dc
+                .as_ref()
+                .map(|field| bind.scalar(std::str::from_utf8(&text[field.clone()])?))
+                .transpose()?;
+            if let Some((field, value)) = dc.zip(dc_override.as_ref()) {
+                let replacement = if parse_spice_constant(value).is_ok() {
+                    value.clone()
+                } else {
+                    format!("{{{value}}}")
+                };
+                replacements.push((field, replacement.into_bytes()));
+            }
+            let name = scalar(text, &fields[0])?;
+            let declaration = PreparedWaveform {
+                artifact: self.artifact.to_owned(),
+                scope: self.scope.clone(),
+                source: name.clone(),
+                spec: WaveformSpec::Ltspice(parsed.spec),
+                idle_in_pop: "0".to_owned(),
+                dc_override,
+            };
+            let initial = if bind.aliases.is_empty() {
+                declaration.resolve(parse_spice_constant)?.dc
+            } else {
+                0.
+            };
+            let replacement = if declaration.dc_override.is_some() {
+                Vec::new()
+            } else {
+                format!("DC {initial}").into_bytes()
+            };
+            replacements.push((parsed.span, replacement));
+            bind.declarations.extend_from_slice(
+                format!("* mandatory prepared waveform binding for {name}\n").as_bytes(),
+            );
+            let count = bind
+                .declarations
+                .split_inclusive(|byte| *byte == b'\n')
+                .count();
+            self.inserted.insert(statement.line, count);
+            self.edits
+                .push((statement.start..statement.start, bind.declarations));
+            self.waveforms.push(declaration);
+        }
+        lexical::replace_spans(statement, self.body, &replacements, &mut self.edits);
+        Ok(())
+    }
+}
+
+pub(super) struct SourceRewrite {
+    pub bytes: Vec<u8>,
+    pub origins: Vec<usize>,
+    pub waveforms: Vec<PreparedWaveform>,
+}
+
+pub(super) fn rewrite(
+    body: &[u8],
+    artifact: &str,
+    origins: &[usize],
+) -> Result<Option<SourceRewrite>> {
+    let mut pass = SourcePass {
+        body,
+        artifact,
+        used: source_identifiers(body),
+        edits: Vec::new(),
+        inserted: BTreeMap::new(),
+        waveforms: Vec::new(),
+        scope: Vec::new(),
+    };
     let mut control = false;
-    let mut edits = Vec::new();
-    for statement in lexical::statements(input)? {
+    for statement in lexical::statements(body)? {
         let first = statement
             .text
             .split(u8::is_ascii_whitespace)
@@ -488,13 +535,52 @@ pub(super) fn rewrite(input: &[u8]) -> Result<Option<Vec<u8>>> {
             .unwrap_or_default();
         if first.eq_ignore_ascii_case(b".control") {
             control = true;
-        } else if first.eq_ignore_ascii_case(b".endc") {
-            control = false;
+            continue;
         }
-        if !control {
-            rewrite_statement(&statement, input, &mut edits)
+        if first.eq_ignore_ascii_case(b".endc") {
+            control = false;
+            continue;
+        }
+        if control {
+            continue;
+        }
+        if first.eq_ignore_ascii_case(b".subckt") {
+            let name = statement
+                .text
+                .split(u8::is_ascii_whitespace)
+                .nth(1)
+                .context("missing subcircuit name")?;
+            pass.scope.push(std::str::from_utf8(name)?.to_owned());
+        } else if first.eq_ignore_ascii_case(b".ends") {
+            ensure!(pass.scope.pop().is_some(), "unmatched .ends");
+        } else if first.eq_ignore_ascii_case(b".tran") {
+            rewrite_tran(&statement, &mut pass.edits)?;
+        } else if matches!(first.first(), Some(b'V' | b'v' | b'I' | b'i')) {
+            pass.source(&statement)
                 .with_context(|| format!("line {}: LTspice source waveform", statement.line))?;
         }
     }
-    Ok(lexical::apply_edits(input, edits))
+    ensure!(
+        pass.scope.is_empty(),
+        "unterminated LTspice subcircuit scope"
+    );
+    let Some(bytes) = lexical::apply_edits(body, pass.edits) else {
+        return Ok(None);
+    };
+    let mut mapped = Vec::new();
+    for (index, origin) in origins.iter().copied().enumerate() {
+        if let Some(count) = pass.inserted.get(&(index + 1)) {
+            mapped.extend(std::iter::repeat_n(origin, *count));
+        }
+        mapped.push(origin);
+    }
+    ensure!(
+        mapped.len() == bytes.split_inclusive(|byte| *byte == b'\n').count(),
+        "waveform source mapping is inconsistent"
+    );
+    Ok(Some(SourceRewrite {
+        bytes,
+        origins: mapped,
+        waveforms: pass.waveforms,
+    }))
 }

@@ -388,6 +388,8 @@ pub struct MappedNormalization {
     pub model: NormalizedModel,
     /// 1-based physical input lines; synthetic elements inherit the source line.
     pub input_lines: Vec<usize>,
+    /// Occurrence-bound source waveforms that require typed execution.
+    pub waveforms: Vec<waveform::PreparedWaveform>,
 }
 
 /// Explicit source dialect for the linked normalization path.
@@ -451,7 +453,11 @@ pub fn normalize_mapped(
             && input_lines.len() == model.bytes.split_inclusive(|byte| *byte == b'\n').count(),
         "normalization source mapping is inconsistent"
     );
-    let mapped = MappedNormalization { model, input_lines };
+    let mapped = MappedNormalization {
+        model,
+        input_lines,
+        waveforms: Vec::new(),
+    };
     if dialect == NormalizationDialect::Ltspice {
         ltspice::normalize(mapped, kind)
     } else {

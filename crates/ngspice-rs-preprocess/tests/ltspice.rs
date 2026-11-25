@@ -640,7 +640,22 @@ fn comma_delimited_pwl_duplicates_do_not_leave_empty_fields() -> Result<()> {
     fs::write(&root, b"title\nV1 a 0 PWL(0,0,1u,1,1u,3,1u,8,2u,0)\n.end\n")?;
     let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
     let output = std::str::from_utf8(&bundle.primary.bytes)?;
-    assert!(output.contains("PWL(0,0,1u,4,2u,0)"), "{output}");
+    assert!(
+        !output.contains(",,") && !output.contains("  ,"),
+        "{output}"
+    );
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset wr_singlescale\ntran 10n 2u 0 10n\nwrdata comma.dat v(a)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    for row in data(&dir.path().join("comma.dat"))? {
+        let expected = (4e6 * row[0]).min((4e6 * (2e-6 - row[0])).max(0.));
+        near(row[1], expected)?;
+    }
     Ok(())
 }
 
@@ -721,10 +736,159 @@ fn vendor_pwl_scaling_rejects_only_unrepresentable_coordinates() -> Result<()> {
         "V1 a 0 PWL TIME_SCALE_FACTOR=0 (0 0 1u 1)",
         "V1 a 0 PWL TIME_SCALE_FACTOR=-1 (0 0 1u 1)",
         "V1 a 0 PWL (1u 0 0 1)",
-        "V1 a 0 PWL TIME_SCALE_FACTOR={unbound} (0 0 1u 1)",
     ] {
         fs::write(&root, format!("title\n{card}\n.end\n"))?;
         assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
+    }
+    Ok(())
+}
+
+#[test]
+fn parameterized_source_waveforms_bind_in_actual_scope_and_rebind_candidates() -> Result<()> {
+    use model_normalize_ngspice::{linked_source::RootKind, parameter_scope::ModelLibrary};
+    use ngspice_rs_preprocess::waveform::Forcing;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root,b"title\n.param ltprep_waveform=99\n.subckt unit p n params: width=2u gain=2 shift=-1u scale=1 cycles=1.5\n.func twice(x) {x+x}\nVdrive p 0 DC {gain*10} PULSE(0 {gain} 0 0 0 {width} {width*5} {cycles}) AC 1\nIwave 0 n PWL TIME_SCALE_FACTOR={scale} VALUE_SCALE_FACTOR={gain} ({shift} 1 {shift+width} 3 {shift+width} 5 {shift+twice(width)} 0)\n.ends unit\nX1 a b unit\nX2 c d unit width=3u gain=3\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    assert_eq!(bundle.waveforms.len(), 2);
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains("* mandatory prepared waveform binding for Vdrive"));
+    assert!(text.contains("* mandatory prepared waveform binding for Iwave"));
+    assert!(text.contains("AC 1"));
+    assert!(!text.contains("PULSE("));
+    let library = ModelLibrary::parse_source(&bundle.primary.bytes, RootKind::Deck)?;
+    let scope = library
+        .scopes
+        .iter()
+        .position(|item| {
+            item.name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("unit"))
+        })
+        .context("missing unit scope")?;
+    let [pulse, pwl] = bundle.waveforms.as_slice() else {
+        anyhow::bail!("missing source metadata");
+    };
+    assert_eq!(pulse.scope, ["unit"]);
+    assert_eq!(pwl.scope, ["unit"]);
+    for (width, gain) in [(2e-6, 2.), (3e-6, 3.), (2e-6, 2.)] {
+        let overrides = [(scope, "width", width), (scope, "gain", gain)];
+        let resolve = |expression: &str| library.evaluate_scalar(scope, expression, &overrides);
+        let pulse = pulse.resolve(resolve)?;
+        near(pulse.dc, gain * 10.)?;
+        near(pulse.startup, 0.)?;
+        let Forcing::PiecewiseLinear {
+            knots,
+            repeat: Some(repeat),
+        } = pulse.forcing
+        else {
+            anyhow::bail!("missing pulse forcing");
+        };
+        near(repeat.period, width * 5.)?;
+        near(
+            repeat.limit.context("missing finite pulse count")?.time,
+            width * 7.5,
+        )?;
+        near(knots[1].time, width * 0.1)?;
+        near(knots[1].right, gain)?;
+        let pwl = pwl.resolve(resolve)?;
+        let Forcing::PiecewiseLinear {
+            knots,
+            repeat: None,
+        } = pwl.forcing
+        else {
+            anyhow::bail!("missing PWL forcing");
+        };
+        assert_eq!(knots.len(), 3);
+        near(knots[0].time, -1e-6)?;
+        near(knots[1].time, width - 1e-6)?;
+        near(knots[1].right, gain * 4.)?;
+        near(pwl.dc, gain * (1. + 3e-6 / width))?;
+        near(pwl.startup, pwl.dc)?;
+    }
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing provenance");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    for (line, origin) in text.lines().zip(lines) {
+        if line.starts_with(".param ltprep_waveform_")
+            || line.contains("mandatory prepared waveform")
+        {
+            assert!(
+                [5, 6].contains(&origin.line),
+                "{line} origin {}",
+                origin.line
+            );
+        }
+    }
+    for source in &bundle.waveforms {
+        let decoded: ngspice_rs_preprocess::waveform::PreparedWaveform =
+            serde_json::from_slice(&serde_json::to_vec(source)?)?;
+        assert_eq!(&decoded, source);
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_sine_phase_and_finite_count_preserve_dc_and_startup() -> Result<()> {
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use ngspice_rs_preprocess::waveform::Forcing;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root,b"title\nV1 a 0 DC 7 SINE(1 2 1Meg -1u 1e5 30)\nV2 b 0 SIN(1 2 -1Meg 1u -1e5 30)\nV3 c 0 SINE(1 2 0 0 0 90)\nV4 d 0 DC 7 SINE(1 2 1Meg 1u 1e5 30 1.5) AC 2\nV5 e 0 SINE(1 2 -1Meg 0 1e5 30 1.5)\nV6 f 0 SINE(1 2 1Meg -2u 1e5 30 1.5)\nV7 g 0 SINE(1 2 0 1u 1e5 30)\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    assert_eq!(bundle.waveforms.len(), 4);
+    for (item, (dc, startup, frequency, stop_after)) in bundle.waveforms.iter().zip([
+        (7., 2., 1e6, Some(1.5e-6)),
+        (2., 2., -1e6, Some(-1.5e-6)),
+        (0.139292023575, 0.139292023575, 1e6, Some(1.5e-6)),
+        (2., 2., 0., None),
+    ]) {
+        let wave = item.resolve(parse_spice_constant)?;
+        near(wave.dc, dc)?;
+        near(wave.startup, startup)?;
+        let Forcing::Sine {
+            frequency: actual,
+            phase,
+            stop_after: cutoff,
+            ..
+        } = wave.forcing
+        else {
+            anyhow::bail!("missing sine forcing");
+        };
+        near(actual, frequency)?;
+        near(phase, 30.)?;
+        assert_eq!(cutoff.map(f64::to_bits), stop_after.map(f64::to_bits));
+    }
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nop\nwrdata op.dat v(a) v(b) v(c)\ntran 5n 4u 0 5n\nwrdata tran.dat v(a) v(b) v(c)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let rows = data(&dir.path().join("op.dat"))?;
+    let row = rows.first().context("missing OP")?;
+    for (&actual, expected) in row[1..].iter().zip([7., 2., 3.]) {
+        near(actual, expected)?;
+    }
+    for row in data(&dir.path().join("tran.dat"))? {
+        let time = row[0];
+        let a_time = time + 1e-6;
+        let b_time = (time - 1e-6).max(0.);
+        let a = (2. * (-1e5 * a_time).exp()).mul_add(
+            (std::f64::consts::TAU * 1e6 * a_time + 30_f64.to_radians()).sin(),
+            1.,
+        );
+        let b = (2. * (1e5 * b_time).exp()).mul_add(
+            (-std::f64::consts::TAU * 1e6 * b_time + 30_f64.to_radians()).sin(),
+            1.,
+        );
+        for (&actual, expected) in row[1..].iter().zip([a, b, 3.]) {
+            near(actual, expected)?;
+        }
     }
     Ok(())
 }
