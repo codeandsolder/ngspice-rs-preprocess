@@ -18,6 +18,7 @@ Usage: ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 Formats: native-deck, native-library, simplis-deck, simetrix-deck,
          expanded-deck, expanded-library, simplis-library, simetrix-library
 Options:
+  --device-config PATH        Request-local SIMetrix device configuration
   --library PATH              Raw catalog library (repeatable)
   --parsed-library PATH       Compiled catalog library (repeatable)
   --search PATH               Native include search directory (repeatable)
@@ -87,6 +88,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
                 .libraries
                 .push(LibraryInput::ParsedFile(value.into())),
             "--search" => request.search_paths.push(value.into()),
+            "--device-config" => options.device_config = Some(value.into()),
             "--command" => command = Some(PathBuf::from(value)),
             "--command-arg" => command_args.push(value),
             "--command-cwd" => cwd = Some(PathBuf::from(value)),
@@ -149,6 +151,8 @@ struct Manifest<'a> {
     normalization: &'a [model_normalize_ngspice::NormalizationPass],
     required_code_models: Vec<ngspice_rs_preprocess::CodeModelRuntime>,
     device_identities: &'a [model_preprocess_simplis::source_dialect::DeviceIdentity],
+    model_selections:
+        &'a [model_preprocess_simplis::source_dialect::model_mapping::ModelSelection],
     initial_conditions: &'a Option<ngspice_rs_preprocess::passive_ic::InitialConditions>,
     waveforms: &'a [ngspice_rs_preprocess::waveform::PreparedWaveform],
 }
@@ -165,7 +169,7 @@ struct ManifestArtifact<'a> {
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 5,
+        version: 6,
         input_format: bundle.format,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,
@@ -183,6 +187,7 @@ fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
         normalization: &bundle.normalization,
         required_code_models: bundle.required_code_models(),
         device_identities: &bundle.device_identities,
+        model_selections: &bundle.model_selections,
         initial_conditions: &bundle.initial_conditions,
         waveforms: &bundle.waveforms,
     }

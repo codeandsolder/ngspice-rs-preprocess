@@ -8,12 +8,13 @@ use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::linked_source::{external_library_reference, select_named_section};
 use model_preprocess_command::AdmissionConfig;
 use model_preprocess_simplis::source_dialect::{
-    DeviceIdentity, DialectContext, ScopedStatement, SourceKind, resolve_device_identities,
+    DeviceIdentity, DialectContext, ScopedStatement, SourceKind,
+    model_mapping::{DeviceConfiguration, MappingTable, ModelSelection},
+    resolve_device_identities,
 };
 use model_preprocess_simplis::{
-    SubcircuitCatalog, lower_simetrix_source_view, parse_library_for_simulator,
-    parse_scoped_library, preprocess_netlist_linked, project_simetrix_source, project_source,
-    source_include_target,
+    SubcircuitCatalog, lower_scoped_statements, parse_library_for_simulator, parse_scoped_library,
+    preprocess_netlist_linked, project_simetrix_source, project_source, source_include_target,
 };
 use model_translate_simplis::{
     capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
@@ -67,6 +68,7 @@ fn bundle(
         companions,
         normalization: Vec::new(),
         device_identities: Vec::new(),
+        model_selections: Vec::new(),
         initial_conditions: None,
         waveforms: Vec::new(),
     }
@@ -215,15 +217,6 @@ impl<'a> SourceExpansion<'a> {
         } else {
             projected
         };
-        let projected = if self.simulator == LibrarySimulator::Simetrix {
-            lower_simetrix_source_view(
-                &projected,
-                context,
-                self.limit.saturating_sub(self.output.len()),
-            )?
-        } else {
-            projected
-        };
         for line in projected.split_inclusive('\n') {
             if self.expand_reference(source, context, line)? {
                 continue;
@@ -320,15 +313,16 @@ struct ResolvedLibraries {
     catalog: SubcircuitCatalog,
     sources: BTreeMap<String, BTreeSet<String>>,
     device_identities: Vec<DeviceIdentity>,
+    model_selections: Vec<ModelSelection>,
 }
 
-fn catalog(
+fn catalog_members(
     request: &Request,
     options: &Options,
     cancellation: &Cancellation,
     session: &mut SourceSession,
     context: DialectContext,
-) -> Result<ResolvedLibraries> {
+) -> Result<Vec<(ParsedLibrary, String)>> {
     let simulator = projection(request.format);
     let mut parsed_session = SourceSession::new(
         AdmissionConfig {
@@ -337,9 +331,7 @@ fn catalog(
         },
         cancellation.clone(),
     );
-    let mut catalog = SubcircuitCatalog::for_simulator(simulator);
-    let mut sources = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut device_identities = Vec::new();
+    let mut members = Vec::new();
     for library in &request.libraries {
         let (parsed, origin) = match library {
             LibraryInput::Source(input) => {
@@ -365,6 +357,29 @@ fn catalog(
             parsed.simulator().as_str(),
             simulator.as_str()
         );
+        members.push((parsed, origin));
+    }
+    Ok(members)
+}
+
+fn catalog(
+    simulator: LibrarySimulator,
+    members: Vec<(ParsedLibrary, String)>,
+    mapping: Option<&MappingTable>,
+    limit: usize,
+) -> Result<ResolvedLibraries> {
+    let mut catalog = SubcircuitCatalog::for_simulator(simulator);
+    let mut sources = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut device_identities = Vec::new();
+    let mut model_selections = Vec::new();
+    for (parsed, origin) in members {
+        let parsed = if let Some(mapping) = mapping {
+            let (parsed, selections) = parsed.mapped(mapping, limit)?;
+            model_selections.extend(selections);
+            parsed
+        } else {
+            parsed
+        };
         catalog.add_parsed_library(&parsed)?;
         device_identities.extend(parsed.device_identities().iter().cloned());
         let origins = sources.entry(parsed.source_id().to_owned()).or_default();
@@ -375,6 +390,7 @@ fn catalog(
         catalog,
         sources,
         device_identities,
+        model_selections,
     })
 }
 
@@ -426,6 +442,99 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
     Ok(result)
 }
 
+struct ResolvedDeck {
+    root: Vec<u8>,
+    root_sources: BTreeSet<String>,
+    libraries: ResolvedLibraries,
+}
+
+fn resolve_deck(
+    root: &AdmittedSource,
+    request: &Request,
+    options: &Options,
+    cancellation: &Cancellation,
+    session: &mut SourceSession,
+) -> Result<ResolvedDeck> {
+    let mut init = SourceExpansion::new(session, request, options);
+    let context = init.expand(root, DialectContext::default(), SourceKind::Deck, None)?;
+    let SourceExpansion {
+        sources: root_sources,
+        statements,
+        output,
+        ..
+    } = init;
+    let members = catalog_members(request, options, cancellation, session, context)?;
+    let mapping = if request.format == InputFormat::SimetrixDeck {
+        let configuration = if let Some(path) = &options.device_config {
+            let mut config_session = SourceSession::new(
+                AdmissionConfig {
+                    command: None,
+                    ..options.admission.clone()
+                },
+                cancellation.clone(),
+            );
+            let admitted = config_session.load(path)?;
+            DeviceConfiguration::parse(
+                &display_path(&admitted.path),
+                std::str::from_utf8(&admitted.bytes)?,
+            )?
+        } else {
+            DeviceConfiguration::default()
+        };
+        // Only netlist resources explicitly included by the root can
+        // change the simulation-wide table. An independently indexed
+        // library cannot introduce global options conditionally.
+        for (parsed, _) in &members {
+            model_preprocess_simplis::source_dialect::model_mapping::validate_catalog_directives(
+                parsed.scoped_statements(),
+            )?;
+        }
+        Some(MappingTable::resolve(&configuration, &statements)?)
+    } else {
+        None
+    };
+    let (expanded_root, mut device_identities, mut model_selections) =
+        if let Some(mapping) = &mapping {
+            let mapped = mapping.apply(&statements)?;
+            let lowered = lower_scoped_statements(&mapped.statements, options.output_bytes)?;
+            let resolved = resolve_device_identities(&lowered)?;
+            ensure!(
+                resolved.text.len() <= options.output_bytes,
+                "device identity expansion byte budget exceeded"
+            );
+            (
+                resolved.text.into_bytes(),
+                resolved.identities,
+                mapped.selections,
+            )
+        } else {
+            (output, Vec::new(), Vec::new())
+        };
+    let ResolvedLibraries {
+        catalog,
+        sources,
+        device_identities: catalog_identities,
+        model_selections: catalog_selections,
+    } = catalog(
+        projection(request.format),
+        members,
+        mapping.as_ref(),
+        options.output_bytes,
+    )?;
+    device_identities.extend(catalog_identities);
+    model_selections.extend(catalog_selections);
+    Ok(ResolvedDeck {
+        root: expanded_root,
+        root_sources,
+        libraries: ResolvedLibraries {
+            catalog,
+            sources,
+            device_identities,
+            model_selections,
+        },
+    })
+}
+
 fn linked(
     root: &AdmittedSource,
     request: &Request,
@@ -433,25 +542,17 @@ fn linked(
     cancellation: &Cancellation,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let mut init = SourceExpansion::new(session, request, options);
-    let context = init.expand(root, DialectContext::default(), SourceKind::Deck, None)?;
-    let root_sources = init.sources;
-    let (expanded_root, mut device_identities) = if request.format == InputFormat::SimetrixDeck {
-        let resolved = resolve_device_identities(&init.statements)?;
-        ensure!(
-            resolved.text.len() <= options.output_bytes,
-            "device identity expansion byte budget exceeded"
-        );
-        (resolved.text.into_bytes(), resolved.identities)
-    } else {
-        (init.output, Vec::new())
-    };
-    let ResolvedLibraries {
-        catalog,
-        sources,
-        device_identities: catalog_identities,
-    } = catalog(request, options, cancellation, session, context)?;
-    device_identities.extend(catalog_identities);
+    let ResolvedDeck {
+        root: expanded_root,
+        root_sources,
+        libraries:
+            ResolvedLibraries {
+                catalog,
+                sources,
+                device_identities,
+                model_selections,
+            },
+    } = resolve_deck(root, request, options, cancellation, session)?;
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
     let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
         lower_simetrix_linked_runtime(&mut linked)?;
@@ -518,6 +619,7 @@ fn linked(
     );
     let mut bundle = bundle(root, request.format, primary, companions);
     bundle.device_identities = device_identities;
+    bundle.model_selections = model_selections;
     if let Some(initialization) = &initial_conditions {
         for artifact in bundle.artifacts() {
             initialization.validate_artifact(&artifact.filename, &artifact.bytes)?;

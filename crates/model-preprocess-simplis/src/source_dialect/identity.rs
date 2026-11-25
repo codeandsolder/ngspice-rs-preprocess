@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt::Write as _};
 
 /// Admitted logical source statement and its effective language.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScopedStatement {
     /// Canonical admitted source identity.
     pub source: String,

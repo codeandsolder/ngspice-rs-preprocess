@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Default bound for the standalone source projection.
 pub const DEFAULT_PROJECTION_BYTES: usize = 128 * 1024 * 1024;
 mod identity;
+pub mod model_mapping;
 pub use identity::{
     DeviceIdentity, ResolvedDeviceSource, ScopedStatement, resolve_device_identities,
 };

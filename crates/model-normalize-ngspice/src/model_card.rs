@@ -5,10 +5,11 @@
 //! distinction avoids silently evaluating vendor symbols with wrong defaults.
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 
 /// A model parameter in original source order; duplicates are deliberately
 /// retained for source-dialect resolution rather than guessed here.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelParameter {
     /// Case-preserved identifier.
     pub name: String,
@@ -17,7 +18,7 @@ pub struct ModelParameter {
 }
 
 /// One lexed `.model` statement. This is deliberately model-family agnostic.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelCard {
     /// Declared model identifier.
     pub name: String,
@@ -25,7 +26,8 @@ pub struct ModelCard {
     pub family: String,
     /// Named parameter tokens, preserving expression text and ordering.
     pub parameters: Vec<ModelParameter>,
-    /// 1-based physical source line where the `.model` begins.
+    /// 1-based physical source line where the `.model` begins, or zero
+    /// when only a projected logical statement is available.
     pub source_line: usize,
 }
 
@@ -231,6 +233,32 @@ impl<'a> Source<'a> {
         &self.text[start..self.offset]
     }
 
+    // Source SOA and other indexed metadata use NAME(qualifier)=value.
+    // Only consume a qualifier when its closing delimiter is followed by
+    // an assignment; an ordinary card-closing parenthesis stays untouched.
+    fn qualified_name(&mut self) -> &'a str {
+        let start = self.offset;
+        let name = self.name();
+        if name.is_empty() || self.text.as_bytes().get(self.offset) != Some(&b'(') {
+            return name;
+        }
+        let Some(close) = self.text[self.offset + 1..].find(')') else {
+            return name;
+        };
+        let end = self.offset + close + 2;
+        let qualifier = &self.text[self.offset + 1..end - 1];
+        if !qualifier.is_empty()
+            && qualifier.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b',' | b' ')
+            })
+            && self.text[end..].trim_start().starts_with('=')
+        {
+            self.offset = end;
+            return &self.text[start..end];
+        }
+        name
+    }
+
     fn value(&mut self) -> Result<&'a str> {
         let start = self.offset;
         let mut quote = None;
@@ -312,20 +340,52 @@ pub fn parse_model_card(
         !family.is_empty(),
         "line {source_line}: .model {name} requires a family"
     );
+    let parameters = fields(&mut source, source_line, positional)?;
+    Ok(ModelCard {
+        name: name.to_owned(),
+        family: family.to_owned(),
+        parameters,
+        source_line,
+    })
+}
+
+/// Parse a joined SPICE assignment/flag list without inventing values.
+///
+/// The same grammar is used by model cards, mapping declarations and
+/// source options. Positional value names are explicit at the call site.
+///
+/// # Errors
+/// Invalid field name, missing value, or unbalanced grouping.
+pub fn parse_parameter_fields(input: &str, positional: &[&str]) -> Result<Vec<ModelParameter>> {
+    fields(
+        &mut Source {
+            text: input,
+            offset: 0,
+        },
+        1,
+        positional,
+    )
+}
+
+fn fields(
+    source: &mut Source<'_>,
+    source_line: usize,
+    positional: &[&str],
+) -> Result<Vec<ModelParameter>> {
     source.skip_space();
-    let wrapper = statement.as_bytes().get(source.offset) == Some(&b'(');
+    let wrapper = source.text.as_bytes().get(source.offset) == Some(&b'(');
     if wrapper {
         source.offset += 1;
     }
     let mut parameters = Vec::new();
     loop {
         source.skip_separators();
-        let next = statement.as_bytes().get(source.offset).copied();
+        let next = source.text.as_bytes().get(source.offset).copied();
         if wrapper && next == Some(b')') {
             source.offset += 1;
             source.skip_space();
             ensure!(
-                source.offset == statement.len(),
+                source.offset == source.text.len(),
                 "line {source_line}: trailing tokens after .model parameters"
             );
             break;
@@ -341,13 +401,13 @@ pub fn parse_model_card(
             next != Some(b')'),
             "line {source_line}: unexpected closing parenthesis"
         );
-        let name = source.name();
+        let name = source.qualified_name();
         ensure!(
             !name.is_empty(),
             "line {source_line}: invalid model parameter identifier"
         );
         source.skip_space();
-        let assigned = statement.as_bytes().get(source.offset) == Some(&b'=');
+        let assigned = source.text.as_bytes().get(source.offset) == Some(&b'=');
         let expression = if assigned || positional.iter().any(|key| name.eq_ignore_ascii_case(key))
         {
             if assigned {
@@ -368,12 +428,7 @@ pub fn parse_model_card(
             expression,
         });
     }
-    Ok(ModelCard {
-        name: name.to_owned(),
-        family: family.to_owned(),
-        parameters,
-        source_line,
-    })
+    Ok(parameters)
 }
 
 /// Decode a single scalar SPICE numeric constant and its engineering suffix.
