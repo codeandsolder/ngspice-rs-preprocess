@@ -17,6 +17,7 @@ pub mod nodal;
 pub mod noise;
 pub mod nqs;
 pub mod parameters;
+pub mod shared;
 pub mod source_defaults;
 pub mod stamps;
 pub mod substrate;

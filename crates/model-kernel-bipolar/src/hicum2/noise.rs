@@ -101,6 +101,10 @@ pub struct ShotCovariance {
     pub base: f64,
     pub collector: f64,
     pub cross_imaginary: f64,
+    /// Independent base contribution, before coherent collector injection.
+    pub base_independent: f64,
+    /// Imaginary base-branch injection per unit collector noise current.
+    pub collector_to_base_imaginary: f64,
     pub correlated: bool,
     pub n1_seconds: f64,
     pub n2_seconds: f64,
@@ -239,6 +243,8 @@ impl Prepared {
             be_ce_shot.base,
             be_ce_shot.collector,
             be_ce_shot.cross_imaginary,
+            be_ce_shot.base_independent,
+            be_ce_shot.collector_to_base_imaginary,
             be_ce_shot.n1_seconds,
             be_ce_shot.n2_seconds,
         ]
@@ -257,6 +263,7 @@ impl Prepared {
         if !p.correlated || p.alit <= 0.0 || p.alqf <= 0.0 {
             return ShotCovariance {
                 base: be,
+                base_independent: be,
                 collector: ce,
                 ..ShotCovariance::default()
             };
@@ -282,6 +289,8 @@ impl Prepared {
                 .mul_add(be, phase_collector * phase_collector * ce),
             collector: ce,
             cross_imaginary: phase_collector * ce,
+            base_independent: phase_base.mul_add(phase_base, 1.0) * be,
+            collector_to_base_imaginary: phase_collector,
             correlated: true,
             n1_seconds: n1,
             n2_seconds: n2,

@@ -31,6 +31,16 @@ coupling; it is never silently zero-filled. A stale thermal-prepared
 kernel is rejected if the local thermal unknown changes. Interface
 tests and an on-demand local benchmark are in tests/hicum2_artifact.rs.
 
+The `hicum2::shared` producer exposes the same isothermal kernel through
+`model-kernel-api`, including topology-specific hidden rows and NQS
+coordinates. Area and multiplicity candidates that cross a physical
+short threshold require a new artifact. The correlated base/collector
+shot spectrum is emitted as independent generators with coherent complex
+branch injections, not by subtracting nearly equal spectral densities.
+Live self-heating is rejected at this interface until the complete
+electrothermal Jacobian is available. The family-specific artifact remains
+available for callers supplying the thermal coupling.
+
 ## Implemented
 
 - **VBIC 1.1.5 B-E/B-C junction currents:** intrinsic/extrinsic and parasitic
