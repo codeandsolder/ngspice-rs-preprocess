@@ -162,6 +162,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-touchstone"
+version = "0.1.0"
+
+[[package]]
 name = "model-translate-simplis"
 version = "0.1.0"
 dependencies = [
