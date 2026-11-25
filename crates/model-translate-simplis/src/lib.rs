@@ -63,6 +63,10 @@ pub enum TranslationKind {
     SrLatch,
     /// SIMPLIS simple S-R flip flop.
     SrFlipFlop,
+    /// Classic edge-triggered SR, JK, D or T state element.
+    ClockedFlipFlop,
+    /// Classic level-sensitive transparent data latch.
+    DataLatch,
     /// SIMPLIS pulse source mapped to native/behavioral ngspice.
     PulseSource,
     /// SIMPLIS sawtooth source mapped to a periodic behavioral source.
@@ -113,6 +117,8 @@ impl TranslationKind {
             | Self::OrGate
             | Self::SrLatch
             | Self::SrFlipFlop
+            | Self::ClockedFlipFlop
+            | Self::DataLatch
             | Self::HystereticSwitch
             | Self::TimedVoltageControlledSwitch
             | Self::TransistorSwitchLevel1
@@ -860,6 +866,16 @@ enum LogicOperation {
     ResetDominant,
     SetDominant,
     HoldWhenEqual,
+    ClockedSrRising,
+    ClockedSrFalling,
+    ClockedJkRising,
+    ClockedJkFalling,
+    ClockedDRising,
+    ClockedDFalling,
+    ClockedTRising,
+    ClockedTFalling,
+    LatchHigh,
+    LatchLow,
 }
 
 impl From<LogicGateKind> for LogicOperation {
