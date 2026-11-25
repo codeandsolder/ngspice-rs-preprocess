@@ -73,7 +73,12 @@ fn nested_source_language_inherits_and_restores_with_named_sections() -> Result<
     run(
         &path.join("root.net"),
         "v(a) v(b) v(c) v(d)",
-        &[6., 2. * 100.0_f64.ln() - 8., 2. * 100.0_f64.ln(), 6.],
+        &[
+            6.,
+            2.0_f64.mul_add(100.0_f64.ln(), -8.),
+            2. * 100.0_f64.ln(),
+            6.,
+        ],
     )
 }
 
