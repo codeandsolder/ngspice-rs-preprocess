@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build against the exact configured reference simulator ABI.
 set -euo pipefail
-if (( $# != 2 )); then
-    printf 'Usage: %s NGSPICE_47_BUILD_TREE OUTPUT_DIRECTORY\n' "$0" >&2
+if (( $# < 2 || $# > 3 )); then
+    printf 'Usage: %s NGSPICE_47_BUILD_TREE OUTPUT_DIRECTORY [MANAGED_COMPILER_WRAPPER]\n' "$0" >&2
     exit 2
 fi
 source_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
@@ -10,7 +10,7 @@ ngspice_tree="$(realpath -- "$1")"
 output_dir="$(realpath -m -- "$2")"
 icm="$ngspice_tree/src/xspice/icm"
 cmpp="$ngspice_tree/src/xspice/cmpp/cmpp"
-wrapper=/usr/local/libexec/sccache-client
+wrapper=$(realpath -- "${3:-/usr/local/libexec/sccache-client}")
 if [[ ! -f "$icm/makedefs" || ! -x "$cmpp" || ! -x "$wrapper" ]]; then
     echo "Configured ngspice 47 tree, built cmpp and managed compiler wrapper required" >&2
     exit 1
