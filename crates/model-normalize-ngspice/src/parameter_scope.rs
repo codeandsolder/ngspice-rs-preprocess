@@ -30,7 +30,10 @@ pub struct ParameterScope {
     pub parent: Option<usize>,
     /// Physical source line of the opening declaration.
     pub source_line: usize,
-    ports: Vec<String>,
+    /// Physical source line of the closing declaration (zero for root).
+    pub end_line: usize,
+    /// Ordered formal terminals.
+    pub ports: Vec<String>,
     cards: Vec<SourceCard>,
     defaults: BTreeMap<String, SpiceExpression>,
     local: BTreeMap<String, SpiceExpression>,
@@ -61,6 +64,70 @@ pub struct ModelLibrary {
     pub models: Vec<ScopedModel>,
     globals: BTreeSet<String>,
     origins: Vec<SourceOrigin>,
+}
+
+/// Shared declaration index for lexical subcircuit lookup, independently of
+/// a simulator's dynamic parameter inheritance rules.
+#[derive(Debug)]
+pub struct SubcircuitIndex {
+    declarations: Vec<BTreeMap<String, usize>>,
+    duplicates: Vec<usize>,
+}
+
+impl SubcircuitIndex {
+    /// Index definitions in declaration order. The first declaration remains
+    /// visible; consumers that reject duplicates can inspect them separately.
+    ///
+    /// # Errors
+    /// Invalid declaration parent or missing name.
+    pub fn new(source: &ModelLibrary) -> Result<Self> {
+        let mut result = Self {
+            declarations: vec![BTreeMap::new(); source.scopes.len()],
+            duplicates: Vec::new(),
+        };
+        for (id, scope) in source.scopes.iter().enumerate().skip(1) {
+            let parent = scope.parent.context("non-root scope without parent")?;
+            let name = scope.name.as_deref().context("unnamed subcircuit")?;
+            let table = result
+                .declarations
+                .get_mut(parent)
+                .context("invalid lexical parent")?;
+            match table.entry(name.to_owned()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(id);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => result.duplicates.push(id),
+            }
+        }
+        Ok(result)
+    }
+
+    /// Later declarations that conflict with an earlier lexical declaration.
+    #[must_use]
+    pub fn duplicates(&self) -> &[usize] {
+        &self.duplicates
+    }
+
+    /// Find the visible subcircuit from a lexical calling scope.
+    #[must_use]
+    pub fn resolve(&self, source: &ModelLibrary, scope: usize, name: &str) -> Option<usize> {
+        lexical_lookup(source, scope, name, &self.declarations)
+    }
+}
+
+fn lexical_lookup(
+    source: &ModelLibrary,
+    mut scope: usize,
+    name: &str,
+    table: &[BTreeMap<String, usize>],
+) -> Option<usize> {
+    let name = name.to_ascii_lowercase();
+    loop {
+        if let Some(&id) = table.get(scope)?.get(&name) {
+            return Some(id);
+        }
+        scope = source.scopes.get(scope)?.parent?;
+    }
 }
 
 fn directive<'a>(source: &'a str, name: &str) -> Option<&'a str> {
@@ -301,6 +368,7 @@ impl ModelLibrary {
                     name: Some(name),
                     parent: Some(parent),
                     source_line: line,
+                    end_line: 0,
                     ports,
                     cards: Vec::new(),
                     defaults,
@@ -321,6 +389,7 @@ impl ModelLibrary {
                     rest.is_empty() || rest.eq_ignore_ascii_case(actual),
                     "line {line}: .ends {rest} does not match .subckt {actual}"
                 );
+                library.scopes[closing].end_line = line;
                 continue;
             }
             library.record(text, line, *stack.last().context("missing scope")?)?;
@@ -370,6 +439,7 @@ impl ModelLibrary {
                 name: None,
                 parent: None,
                 source_line: 0,
+                end_line: 0,
                 ports: Vec::new(),
                 cards: Vec::new(),
                 defaults: BTreeMap::new(),

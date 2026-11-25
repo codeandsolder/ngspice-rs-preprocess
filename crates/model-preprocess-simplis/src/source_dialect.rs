@@ -355,6 +355,7 @@ fn lower_call(
     language: SourceLanguage,
     depth: usize,
     limit: usize,
+    numeric_suffixes: bool,
 ) -> Result<String> {
     if name.eq_ignore_ascii_case("LOG") {
         let args = split_arguments(body)?;
@@ -369,7 +370,7 @@ fn lower_call(
         };
         return Ok(format!(
             "{target}({})",
-            rewrite_expression(body, language, depth + 1, true, limit)?
+            rewrite_expression(body, language, depth + 1, true, limit, numeric_suffixes)?
         ));
     }
     let args = split_arguments(body)?;
@@ -380,8 +381,9 @@ fn lower_call(
         !base.is_empty() && !exponent.is_empty(),
         "PWR requires two arguments"
     );
-    let base = rewrite_expression(base, language, depth + 1, true, limit)?;
-    let exponent = rewrite_expression(exponent, language, depth + 1, true, limit)?;
+    let base = rewrite_expression(base, language, depth + 1, true, limit, numeric_suffixes)?;
+    let exponent =
+        rewrite_expression(exponent, language, depth + 1, true, limit, numeric_suffixes)?;
     if language == SourceLanguage::Simetrix {
         return power::guarded(&base, &exponent, limit);
     }
@@ -408,12 +410,53 @@ fn lower_call(
     }
 }
 
+// Return the complete literal and its engineering suffix. A D/E is an
+// exponent marker only when followed by a signed or unsigned decimal integer.
+fn numeric_literal(bytes: &[u8], start: usize) -> (usize, usize) {
+    let mut end = start;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+    }
+    if matches!(bytes.get(end), Some(b'e' | b'E' | b'd' | b'D')) {
+        let mut exponent = end + 1;
+        exponent += usize::from(matches!(bytes.get(exponent), Some(b'+' | b'-')));
+        let digits = exponent;
+        while bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+            exponent += 1;
+        }
+        if exponent > digits {
+            end = exponent;
+        }
+    }
+    let suffix = end;
+    while bytes.get(end).is_some_and(u8::is_ascii_alphabetic) {
+        end += 1;
+    }
+    (end, suffix)
+}
+
+/// Lower one expression region of a standalone SPICE dialect.
+pub(super) fn lower_expression(
+    input: &str,
+    language: SourceLanguage,
+    limit: usize,
+) -> Result<String> {
+    rewrite_expression(input, language, 0, false, limit, true)
+}
+
 fn rewrite_expression(
     input: &str,
     language: SourceLanguage,
     depth: usize,
     grouped: bool,
     limit: usize,
+    numeric_suffixes: bool,
 ) -> Result<String> {
     ensure!(depth < 128, "source expression nesting exceeds 128");
     ensure!(
@@ -455,9 +498,25 @@ fn rewrite_expression(
                 depth + 1,
                 true,
                 limit.saturating_sub(output.len()),
+                numeric_suffixes,
             )?);
             output.push(if grouped { ')' } else { '}' });
             offset = end + 1;
+        } else if numeric_suffixes
+            && language == SourceLanguage::Hspice
+            && (offset == 0 || !symbol_byte(bytes[offset - 1]))
+            && (ch.is_ascii_digit()
+                || (ch == '.' && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit)))
+        {
+            let (end, suffix) = numeric_literal(bytes, offset);
+            if matches!(bytes.get(suffix), Some(b'x' | b'X')) {
+                output.push_str(&input[offset..suffix]);
+                output.push_str("meg");
+                output.push_str(&input[suffix + 1..end]);
+            } else {
+                output.push_str(&input[offset..end]);
+            }
+            offset = end;
         } else if (ch.is_ascii_alphabetic() || ch == '_')
             && (offset == 0 || !symbol_byte(bytes[offset - 1]))
         {
@@ -487,6 +546,7 @@ fn rewrite_expression(
                         language,
                         depth,
                         limit.saturating_sub(output.len()),
+                        numeric_suffixes,
                     )?);
                 }
                 offset = end + 1;
@@ -529,15 +589,6 @@ pub(super) fn lower_statement(
     context: DialectContext,
     limit: usize,
 ) -> Result<String> {
-    lower_statement_in(statement, context, limit, true)
-}
-
-pub(super) fn lower_statement_in(
-    statement: &str,
-    context: DialectContext,
-    limit: usize,
-    simetrix_element_syntax: bool,
-) -> Result<String> {
     let trimmed = statement.trim_start();
     let Some(first) = trimmed.split_whitespace().next() else {
         return Ok(statement.to_owned());
@@ -574,15 +625,11 @@ pub(super) fn lower_statement_in(
             .split(|ch: char| ch.is_whitespace() || ch == '=' || ch == '{')
             .next()
             .unwrap_or_default();
-        let language = if simetrix_element_syntax {
-            match (device, assignment.to_ascii_uppercase().as_str()) {
-                (b'B', _) => SourceLanguage::Simetrix,
-                (b'E'..=b'H', "VALUE") => SourceLanguage::Pspice,
-                (b'E' | b'G', "VOL" | "CUR") => SourceLanguage::Hspice,
-                _ => context.language,
-            }
-        } else {
-            context.language
+        let language = match (device, assignment.to_ascii_uppercase().as_str()) {
+            (b'B', _) => SourceLanguage::Simetrix,
+            (b'E'..=b'H', "VALUE") => SourceLanguage::Pspice,
+            (b'E' | b'G', "VOL" | "CUR") => SourceLanguage::Hspice,
+            _ => context.language,
         };
         (prefix, language)
     };
@@ -593,6 +640,7 @@ pub(super) fn lower_statement_in(
         0,
         false,
         limit.saturating_sub(prefix_end),
+        false,
     )?);
     if language == SourceLanguage::Simetrix && output.contains("**") {
         let start = match upper.as_str() {

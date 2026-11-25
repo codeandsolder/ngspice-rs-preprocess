@@ -1037,17 +1037,30 @@ pub fn project_spice_resource(
     Ok((context, statements))
 }
 
-/// Lower a standalone resource's expressions with their source language,
-/// rather than imposing the containing SIMetrix simulator's element syntax.
+/// Rewrite parameter references in an expression or device value field list,
+/// excluding assignment destinations, function names and electrical probes.
+///
+/// # Errors
+/// Malformed strings or probe syntax.
+pub fn rewrite_parameter_symbols(
+    expression: &str,
+    names: &BTreeMap<String, String>,
+    preserve_assignments: bool,
+) -> Result<String> {
+    runtime_params::rewrite_symbols(expression, names, preserve_assignments)
+}
+
+/// Lower an expression in its original resource dialect. The caller must
+/// isolate value syntax from device, node, model and resource identifiers.
 ///
 /// # Errors
 /// Invalid expression syntax or exceeded output byte budget.
-pub fn lower_spice_statement(
-    statement: &str,
+pub fn lower_spice_expression(
+    expression: &str,
     context: crate::source_dialect::DialectContext,
     limit: usize,
 ) -> Result<String> {
-    crate::source_dialect::lower_statement_in(statement, context, limit, false)
+    crate::source_dialect::lower_expression(expression, context.language, limit)
 }
 
 /// Lower expressions only after simulator and named-section selection.

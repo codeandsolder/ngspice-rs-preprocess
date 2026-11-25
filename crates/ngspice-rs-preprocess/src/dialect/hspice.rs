@@ -10,10 +10,12 @@ use model_normalize_ngspice::{
     linked_source::RootKind, model_card::parse_parameter_fields, statement_token_spans,
 };
 use model_preprocess_simplis::{
-    lower_spice_statement,
+    lower_spice_expression,
     source_dialect::{DialectContext, SourceKind, SourceLanguage},
 };
 use std::fmt::Write as _;
+
+mod hierarchy;
 
 const HSPICE: DialectContext = DialectContext {
     language: SourceLanguage::Hspice,
@@ -25,6 +27,8 @@ struct DeckOptions {
     nominal_temperature: bool,
     temperature: bool,
     depth: usize,
+    parhier: Option<hierarchy::Precedence>,
+    deck: bool,
 }
 
 fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
@@ -44,6 +48,16 @@ fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
                     value.eq_ignore_ascii_case("LOCAL") || value.eq_ignore_ascii_case("GLOBAL"),
                     "invalid HSPICE PARHIER value {value}"
                 );
+                let precedence = if value.eq_ignore_ascii_case("LOCAL") {
+                    hierarchy::Precedence::Local
+                } else {
+                    hierarchy::Precedence::Global
+                };
+                ensure!(
+                    state.parhier.is_none_or(|old| old == precedence),
+                    "conflicting HSPICE PARHIER options"
+                );
+                state.parhier = Some(precedence);
                 continue;
             }
             "TNOM" => state.nominal_temperature = true,
@@ -109,6 +123,79 @@ fn lower_source(text: &str) -> Result<String> {
     Ok(text.to_owned())
 }
 
+/// Identify electrical names before lowering values. In particular, a node
+/// named 1x is legal and is not a one-mega engineering literal.
+fn map_values(
+    text: &str,
+    limit: usize,
+    mut map: impl FnMut(&str, usize) -> Result<String>,
+) -> Result<String> {
+    let ranges = statement_token_spans(text)?;
+    let command = analysis_plan::command(text);
+    let start = |index: usize| ranges.get(index).map_or(text.len(), |range| range.start);
+    let token = |index: usize| ranges.get(index).map_or("", |range| &text[range.clone()]);
+    let assignment_start = || {
+        ranges
+            .iter()
+            .position(|range| &text[range.clone()] == "=")
+            .map_or(text.len(), |index| start(index.saturating_sub(1)))
+    };
+    let offset = match command.as_str() {
+        ".PARAM" | ".TEMP" | ".OPTIONS" | ".OPTION" | ".OPT" | ".IC" | ".NODESET" | ".TRAN" => {
+            start(1)
+        }
+        ".FUNC" => {
+            let end = ranges.get(1).context("missing function declaration")?.end;
+            end
+        }
+        ".AC" => start(2),
+        ".DC" => {
+            // A second sweep has its own structural source identifier.
+            let mut output = String::new();
+            let mut previous = 0;
+            for index in [2, 6] {
+                if index >= ranges.len() {
+                    break;
+                }
+                let begin = start(index);
+                let end = start(index + 3);
+                output.push_str(&text[previous..begin]);
+                output.push_str(&map(&text[begin..end], limit.saturating_sub(output.len()))?);
+                previous = end;
+            }
+            output.push_str(&text[previous..]);
+            ensure!(
+                output.len() <= limit,
+                "source expression byte budget exceeded"
+            );
+            return Ok(output);
+        }
+        ".SUBCKT" => assignment_start(),
+        _ if command.starts_with('.') => return Ok(text.to_owned()),
+        _ => match command.as_bytes().first() {
+            Some(b'X') => assignment_start(),
+            Some(b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => start(3),
+            Some(b'E' | b'G' | b'F' | b'H')
+                if ["VALUE", "VOL", "CUR", "TABLE", "POLY", "LAPLACE"]
+                    .iter()
+                    .any(|mode| token(3).eq_ignore_ascii_case(mode)) =>
+            {
+                start(3)
+            }
+            Some(b'E' | b'G') => start(5),
+            Some(b'F' | b'H') => start(4),
+            _ => text.len(),
+        },
+    };
+    let mut output = text[..offset].to_owned();
+    output.push_str(&map(&text[offset..], limit.saturating_sub(offset))?);
+    ensure!(
+        output.len() <= limit,
+        "source expression byte budget exceeded"
+    );
+    Ok(output)
+}
+
 fn lower_card(
     text: &str,
     context: DialectContext,
@@ -123,23 +210,20 @@ fn lower_card(
     let hspice = context.language == SourceLanguage::Hspice;
     let fields = statement_token_spans(text)?;
     let assignment = fields.iter().any(|field| &text[field.clone()] == "=");
-    // Until the source hierarchy resolver can represent both HSPICE precedence
-    // modes and nested multiplicity, never emit a native interpretation of
-    // a parameter declaration or actual in a subcircuit.
+    // An independently emitted include cannot resolve dynamic caller
+    // precedence. A complete deck binds these declarations after linking.
     if command == ".SUBCKT" {
         ensure!(
-            !assignment,
-            "HSPICE subcircuit formal parameters require hierarchy lowering"
+            state.deck || !assignment,
+            "HSPICE library formals require a consuming deck for hierarchy lowering"
         );
         state.depth += 1;
     } else if command == ".ENDS" {
         state.depth = state.depth.checked_sub(1).context("unmatched .ENDS")?;
     }
     if state.depth > 0
-        && matches!(
-            command.as_str(),
-            ".PARAM" | ".FUNC" | ".OPTION" | ".OPTIONS" | ".OPT"
-        )
+        && (matches!(command.as_str(), ".FUNC" | ".OPTION" | ".OPTIONS" | ".OPT")
+            || (!state.deck && command == ".PARAM"))
     {
         bail!("HSPICE scoped parameters/options require hierarchy lowering");
     }
@@ -154,8 +238,8 @@ fn lower_card(
         );
         if kind == b'X' {
             ensure!(
-                !assignment,
-                "HSPICE subcircuit actuals/multipliers require hierarchy lowering"
+                state.deck || !assignment,
+                "HSPICE library actuals/multipliers require a consuming deck for hierarchy lowering"
             );
         }
     }
@@ -175,7 +259,9 @@ fn lower_card(
         _ if command.starts_with('.') => bail!("unqualified HSPICE directive {command}"),
         _ => lower_source(text)?,
     };
-    source = lower_spice_statement(&source, context, limit)?;
+    source = map_values(&source, limit, |value, remaining| {
+        lower_spice_expression(value, context, remaining)
+    })?;
     Ok(source)
 }
 
@@ -204,7 +290,10 @@ pub(super) fn prepare(
     )?;
     let mut bytes = Vec::new();
     let mut origins = Vec::new();
-    let mut state = DeckOptions::default();
+    let mut state = DeckOptions {
+        deck,
+        ..DeckOptions::default()
+    };
     for (index, (statement, origin)) in expansion
         .statements
         .iter()
@@ -243,6 +332,13 @@ pub(super) fn prepare(
     }
     ensure!(state.depth == 0, "unclosed HSPICE subcircuit");
     if deck {
+        (bytes, origins) = hierarchy::bind(
+            &bytes,
+            &origins,
+            state.parhier.unwrap_or_default(),
+            options.output_bytes,
+        )?;
+
         // HSPICE defaults to 25 C for both device nominal and analysis
         // temperatures. Native ngspice defaults to 27 C.
         let mut defaults = Vec::new();

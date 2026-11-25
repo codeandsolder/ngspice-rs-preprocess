@@ -3,7 +3,10 @@
 //! Declaration visibility is lexical; numeric parameter inheritance follows
 //! actual callers. Nodes are structured identities, never concatenated names.
 
-use super::{ModelLibrary, ScopeResolver, SourceCard, SourceOrigin, SpiceExpression, assignments};
+use super::{
+    ModelLibrary, ScopeResolver, SourceCard, SourceOrigin, SpiceExpression, SubcircuitIndex,
+    assignments, lexical_lookup,
+};
 use crate::{
     model_card::{ModelParameter, instance_fields, positional_prefix},
     vdmos_card::{VdmosLiterals, VdmosPolarity, vdmos_resolved},
@@ -196,7 +199,7 @@ impl ModelLibrary {
 }
 
 struct Index {
-    subcircuits: Vec<BTreeMap<String, usize>>,
+    subcircuits: SubcircuitIndex,
     models: Vec<BTreeMap<String, usize>>,
     implicit_m: BTreeSet<usize>,
 }
@@ -225,18 +228,10 @@ fn call(card: &SourceCard) -> Result<Call<'_>> {
 impl Index {
     fn new(source: &ModelLibrary) -> Result<Self> {
         let mut result = Self {
-            subcircuits: vec![BTreeMap::new(); source.scopes.len()],
+            subcircuits: SubcircuitIndex::new(source)?,
             models: vec![BTreeMap::new(); source.scopes.len()],
             implicit_m: BTreeSet::new(),
         };
-        for (id, scope) in source.scopes.iter().enumerate().skip(1) {
-            let parent = scope.parent.context("non-root scope without parent")?;
-            let name = scope.name.as_deref().context("unnamed subcircuit")?;
-            // Native ngspice ignores subsequent subcircuit definitions.
-            result.subcircuits[parent]
-                .entry(name.to_owned())
-                .or_insert(id);
-        }
         for (id, model) in source.models.iter().enumerate() {
             // The first matching declaration is visible in its lexical scope.
             result.models[model.scope]
@@ -253,8 +248,7 @@ impl Index {
             for card in &scope.cards {
                 if is_x(card)
                     && let Ok(call) = call(card)
-                    && let Some(target) =
-                        Self::lookup(source, owner, call.target, &result.subcircuits)
+                    && let Some(target) = result.subcircuits.resolve(source, owner, call.target)
                     && !source.scopes[target].defaults.contains_key("m")
                 {
                     edges[owner].push(target);
@@ -272,21 +266,6 @@ impl Index {
             }
         }
         Ok(result)
-    }
-
-    fn lookup(
-        source: &ModelLibrary,
-        mut scope: usize,
-        name: &str,
-        table: &[BTreeMap<String, usize>],
-    ) -> Option<usize> {
-        let name = name.to_ascii_lowercase();
-        loop {
-            if let Some(&id) = table[scope].get(&name) {
-                return Some(id);
-            }
-            scope = source.scopes[scope].parent?;
-        }
     }
 }
 
@@ -449,7 +428,10 @@ impl<'a> Builder<'a> {
     ) -> Result<()> {
         let call = call(card)?;
         let owner = self.result.frames[parent].declaration;
-        let target = Index::lookup(self.source, owner, call.target, &self.index.subcircuits)
+        let target = self
+            .index
+            .subcircuits
+            .resolve(self.source, owner, call.target)
             .with_context(|| format!("unknown lexical subcircuit {}", call.target))?;
         let definition = &self.source.scopes[target];
         ensure!(
@@ -570,7 +552,7 @@ impl<'a> Builder<'a> {
         let (name, _) = tokens.first().context("empty MOS line")?;
         // INP2M checks for an existing model after at least three terminals.
         let (at, declaration) = tokens.iter().enumerate().skip(4).take(5).find_map(|(i, (token, _))| {
-            Index::lookup(self.source, scope, token, &self.index.models).map(|model| (i, model))
+            lexical_lookup(self.source, scope, token, &self.index.models).map(|model| (i, model))
         }).context("no visible exact MOS model name (model bin selection belongs to the family binder)")?;
         let model_frame = self.model_owner(frame, self.source.models[declaration].scope)?;
         let nodes = tokens[1..at]

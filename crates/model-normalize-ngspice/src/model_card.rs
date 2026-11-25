@@ -70,7 +70,10 @@ pub(crate) fn logical_statements(input: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> 
 
 /// Decode named source parameters shared by `.param` and `.subckt` syntax.
 /// Values may contain nested expressions/quoted strings, and names require `=`.
-pub(crate) fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
+///
+/// # Errors
+/// Invalid names, missing assignments or malformed expression values.
+pub fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
     let mut source = Source {
         text: input,
         offset: 0,
@@ -102,9 +105,11 @@ pub(crate) fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
 }
 
 /// Read positional tokens up to the first named parameter or PARAMS: marker.
+///
 /// Parenthesized terminal lists and commas use the same token boundaries as
 /// native ngspice. Return the unconsumed assignment text.
-pub(crate) fn positional_prefix(input: &str) -> (Vec<(&str, usize)>, &str) {
+#[must_use]
+pub fn positional_prefix(input: &str) -> (Vec<(&str, usize)>, &str) {
     let mut source = Source {
         text: input,
         offset: 0,
