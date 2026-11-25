@@ -1,6 +1,6 @@
 //! TINA-specific plaintext SPICE syntax.
 //!
-//! DesignSoft documents PSpice netlist export and PARAMS: subcircuit
+//! `DesignSoft` documents `PSpice` netlist export and `PARAMS:` subcircuit
 //! defaults. An exported macro can also place a local .PARAM declaration
 //! directly on a .SUBCKT header (e.g. TI ISO224X export).
 //! Separate that declaration without making it an overridable formal.
