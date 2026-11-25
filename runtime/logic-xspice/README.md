@@ -45,3 +45,11 @@ resolution.
 
 The event-model operation identifiers are 0 AND, 1 OR, 2 NAND, 3 NOR,
 4 reset-dominant latch, 5 set-dominant latch, and 6 hold-on-equal latch.
+
+The same event model accepts a single receiver for strict hysteretic
+SIMPLIS switch state. The open/closed initial hint is used only within the
+threshold band; control values outside it determine the initial state.
+The analog voltage bridge represents the state as an exact 0 or 1 for
+the branch current law. Simple switches preserve their specified RON
+and ROFF, while transistor switches retain their LEVEL=1 or LEVEL=2
+current law and support current as well as voltage control.

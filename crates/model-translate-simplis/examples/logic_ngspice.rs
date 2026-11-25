@@ -459,6 +459,93 @@ Rsb sb rtn 100
     Ok(())
 }
 
+/// Vendor startup-state sweep at 0, 2, 2.5, 3, and 5 V with
+/// TH=2.5, HYSTWD=1. Independent load-line solutions test both transistor
+/// model levels, both device polarities, voltage/current control and
+/// reverse bias rather than just checking the reported switch state.
+fn switch_startup_and_load_lines(runtime: &Path) -> Result<()> {
+    let mut source = String::from("Vref rtn 0 0.75\nVpos pos rtn 1\nVneg neg rtn -1\n");
+    let mut checks = Vec::new();
+    for (index, control) in [0.0_f64, 2.0, 2.5, 3.0, 5.0].into_iter().enumerate() {
+        writeln!(source, "Vc{index} c{index} rtn {control}")?;
+        // Current sense has 1 ohm resistance, so its branch current is
+        // numerically identical to the differential voltage control.
+        writeln!(
+            source,
+            "Vi{index} c{index} ci{index} 0\nRc{index} ci{index} rtn 1"
+        )?;
+        for (logic, negative) in [("POS", false), ("NEG", true)] {
+            for (ic, suggested) in [("OPEN", false), ("CLOSE", true)] {
+                let closed = if control > 3.0 {
+                    !negative
+                } else if control < 2.0 {
+                    negative
+                } else {
+                    suggested
+                };
+                let id = format!("{index}{logic}{ic}");
+                for (bias, rail) in [(1.0_f64, "pos"), (-1.0, "neg")] {
+                    let suffix = format!("{id}{rail}");
+                    writeln!(
+                        source,
+                        "S{suffix} s{suffix} rtn c{index} rtn ms{suffix} IC={ic}"
+                    )?;
+                    writeln!(
+                        source,
+                        ".model ms{suffix} VCSW RON=10 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC={logic}"
+                    )?;
+                    writeln!(source, "Rs{suffix} {rail} s{suffix} 100")?;
+                    let resistance = if closed { 10.0 } else { 1e6 };
+                    let expected = bias * resistance / (resistance + 100.0);
+                    for time in [0.0, 8.0] {
+                        checks.push((format!("s{suffix}"), time, expected));
+                    }
+                    for (kind, sign) in [("POS", 1.0_f64), ("NEG", -1.0)] {
+                        for level in [1, 2] {
+                            for (control_kind, pins) in [
+                                ("VC", format!("c{index} rtn")),
+                                ("IC", format!("Vi{index}")),
+                            ] {
+                                let q = format!("{suffix}{kind}{level}{control_kind}");
+                                let vsat = 0.1 * sign;
+                                writeln!(source, "Q{q} q{q} rtn {pins} mq{q} IC={ic}")?;
+                                writeln!(
+                                    source,
+                                    ".model mq{q} {control_kind}Q{kind} VSAT={vsat} RSAT=10 ROFF=1Meg GAIN=0.002 TH=2.5 HYSTWD=1 LOGIC={logic} LEVEL={level}"
+                                )?;
+                                writeln!(source, "Rq{q} {rail} q{q} 100")?;
+                                let off = bias / (1.0 + 100.0 / 1e6);
+                                let sat = (bias * 10.0 + 100.0 * vsat) / 110.0;
+                                let overdrive = if negative {
+                                    3.0 - control
+                                } else {
+                                    control - 2.0
+                                };
+                                let active =
+                                    (bias - 100.0 * sign * 0.002 * overdrive) / (1.0 + 100.0 / 1e6);
+                                let expected = if !closed {
+                                    off
+                                } else if level == 1 {
+                                    sat
+                                } else if sign.is_sign_positive() {
+                                    active.max(sat).min(off)
+                                } else {
+                                    active.min(sat).max(off)
+                                };
+                                for time in [0.0, 8.0] {
+                                    checks.push((format!("q{q}"), time, expected));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    source.push_str(".end\n");
+    verify(runtime, &source, &checks)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -475,6 +562,7 @@ fn main() -> Result<()> {
     advanced_latch_vendor_ambiguous_inputs(&runtime)?;
     vendor_timing(&runtime)?;
     threshold_plateau_and_latch_cancellation(&runtime)?;
+    switch_startup_and_load_lines(&runtime)?;
     println!("All native ngspice logic regressions passed");
     Ok(())
 }

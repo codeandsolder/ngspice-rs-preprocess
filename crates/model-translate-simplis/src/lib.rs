@@ -47,8 +47,10 @@ pub enum TranslationKind {
     Ipwlr,
     /// SIMPLIS `PWLC` / `NON_LINEAR_CAP_V1` voltage/charge characteristic.
     ChargeCapacitor,
-    /// SIMPLIS voltage-controlled switch mapped to ngspice `SW`.
+    /// Voltage-controlled switch lowered to native ngspice.
     VoltageControlledSwitch,
+    /// SIMPLIS switch with strict hysteresis and initial-state suggestion.
+    HystereticSwitch,
     /// SIMPLIS LEVEL=1 simple transistor switch.
     TransistorSwitchLevel1,
     /// SIMPLIS LEVEL=2 transistor switch with active/saturated/reverse-biased regions.
@@ -111,9 +113,13 @@ impl TranslationKind {
     #[must_use]
     pub const fn required_runtime(self) -> Option<CodeModelRuntime> {
         match self {
-            Self::AndGate | Self::OrGate | Self::SrLatch | Self::SrFlipFlop => {
-                Some(CodeModelRuntime::Logic)
-            }
+            Self::AndGate
+            | Self::OrGate
+            | Self::SrLatch
+            | Self::SrFlipFlop
+            | Self::HystereticSwitch
+            | Self::TransistorSwitchLevel1
+            | Self::TransistorSwitchLevel2 => Some(CodeModelRuntime::Logic),
             _ => None,
         }
     }
@@ -991,27 +997,52 @@ struct LogicTiming {
     initial: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LogicThresholds {
+    center: f64,
+    width: f64,
+}
+
+impl LogicIo {
+    const fn thresholds(self) -> LogicThresholds {
+        LogicThresholds {
+            center: self.threshold,
+            width: self.hystwd,
+        }
+    }
+}
+
+fn emit_logic_input_loads(
+    output: &mut String,
+    stem: &str,
+    rtn: &str,
+    inputs: &[String],
+    resistance: f64,
+) -> Result<()> {
+    for (index, input) in inputs.iter().enumerate() {
+        write!(output, "R__{stem}_RIN_I{} {input} {rtn} ", index + 1)?;
+        write_number(output, resistance)?;
+        output.push('\n');
+    }
+    Ok(())
+}
+
 fn emit_logic_event(
     output: &mut String,
     stem: &str,
     rtn: &str,
     inputs: &[String],
     receivers: &[LogicReceiver],
-    io: LogicIo,
+    thresholds: LogicThresholds,
     timing: LogicTiming,
 ) -> Result<String> {
-    let upper = io.threshold + io.hystwd / 2.0;
-    let lower = io.threshold - io.hystwd / 2.0;
+    let upper = thresholds.center + thresholds.width / 2.0;
+    let lower = thresholds.center - thresholds.width / 2.0;
     if !upper.is_finite() || !lower.is_finite() {
         bail!("SIMPLIS logic thresholds overflow");
     }
-    if inputs.len() != receivers.len() {
+    if inputs.is_empty() || inputs.len() != receivers.len() {
         bail!("inconsistent logic receiver count");
-    }
-    for (index, input) in inputs.iter().enumerate() {
-        write!(output, "R__{stem}_RIN_I{} {input} {rtn} ", index + 1)?;
-        write_number(output, io.rin)?;
-        output.push('\n');
     }
     let state = format!("__{stem}_Q_STATE");
     let model = format!("__{stem}_EVENT_M");
@@ -1049,6 +1080,24 @@ struct LogicOutput {
     complement: bool,
 }
 
+fn emit_logic_voltage(
+    output: &mut String,
+    stem: &str,
+    out: &str,
+    rtn: &str,
+    state: &str,
+    rails: [f64; 2],
+) -> Result<()> {
+    let model = format!("__{stem}_M");
+    writeln!(output, "A__{stem}V {state} %vd({out} {rtn}) {model}")?;
+    write!(output, ".model {model} preprocess_logic_voltage(out_low=")?;
+    write_number(output, rails[0])?;
+    output.push_str(" out_high=");
+    write_number(output, rails[1])?;
+    output.push_str(")\n");
+    Ok(())
+}
+
 fn emit_logic_output(
     output: &mut String,
     io: LogicIo,
@@ -1060,21 +1109,19 @@ fn emit_logic_output(
 ) -> Result<()> {
     let suffix = if output_mode.complement { "B" } else { "" };
     let internal = format!("__{stem}_OUT{suffix}_INT");
-    let model = format!("__{stem}_OUT{suffix}_M");
-    let (low, high) = if output_mode.complement ^ output_mode.negative {
-        (io.voh, io.vol)
+    let rails = if output_mode.complement ^ output_mode.negative {
+        [io.voh, io.vol]
     } else {
-        (io.vol, io.voh)
+        [io.vol, io.voh]
     };
-    writeln!(
+    emit_logic_voltage(
         output,
-        "A__{stem}_OUT{suffix}V {state} %vd({internal} {rtn}) {model}"
+        &format!("{stem}_OUT{suffix}"),
+        &internal,
+        rtn,
+        state,
+        rails,
     )?;
-    write!(output, ".model {model} preprocess_logic_voltage(out_low=")?;
-    write_number(output, low)?;
-    output.push_str(" out_high=");
-    write_number(output, high)?;
-    output.push_str(")\n");
     write!(output, "R__{stem}_OUT{suffix} {internal} {out} ")?;
     write_number(output, io.rout)?;
     output.push('\n');
@@ -1086,13 +1133,20 @@ fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
     let receivers = (0..spec.inputs.len())
         .map(|index| spec.mode.receiver(spec.kind, index, spec.inputs.len()))
         .collect::<Vec<_>>();
+    emit_logic_input_loads(
+        &mut output,
+        &spec.stem,
+        &spec.rtn,
+        &spec.inputs,
+        spec.io.rin,
+    )?;
     let state = emit_logic_event(
         &mut output,
         &spec.stem,
         &spec.rtn,
         &spec.inputs,
         &receivers,
-        spec.io,
+        spec.io.thresholds(),
         LogicTiming {
             operation: spec.kind.into(),
             delay: spec.io.delay,
