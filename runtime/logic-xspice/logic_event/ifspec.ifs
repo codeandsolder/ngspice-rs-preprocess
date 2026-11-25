@@ -18,7 +18,7 @@ Parameter_Name:        operation         delay             inertial        ic
 Description:           "operation enum"  "seconds"         "cancel pulse"  "initial latch state"
 Data_Type:             int               real              boolean         int
 Default_Value:         0                 0                 true            0
-Limits:                [0 6]             [0 -]             -               [0 1]
+Limits:                [0 16]             [0 -]             -               [0 1]
 Vector:                no                no                no              no
 Vector_Bounds:         -                 -                 -               -
 Null_Allowed:          yes               yes               yes             yes

@@ -302,3 +302,70 @@ fn deeply_nested_library_and_expanded_sources_are_bounded() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn model_configuration_and_deck_share_request_budget() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root =
+        "* model selection\nV1 a 0 1\nD1 a 0 selected\n.model selected D LEVEL=1 IS=1p\n.end\n";
+    let config = "ModelName=D Level=1 Device=Diode3\n";
+    let config_path = dir.path().join("devices.dcf");
+    fs::write(&config_path, config)?;
+    let req = request(dir.path(), InputFormat::SimetrixDeck, root);
+    let total = root.len() + config.len();
+    let mut options = Options {
+        device_config: Some(config_path),
+        work: WorkLimits {
+            input_bytes: total,
+            admitted_bytes: total,
+            sources: 2,
+            ..WorkLimits::default()
+        },
+        ..Options::default()
+    };
+    let token = Cancellation::default();
+    let prepared = prepare(&req, &options, &token)?;
+    assert_eq!(
+        prepared.model_selections[0].mapping.device,
+        model_preprocess_simplis::source_dialect::model_mapping::Device::Diode3
+    );
+    for (work, diagnostic) in [
+        (
+            WorkLimits {
+                input_bytes: total - 1,
+                ..options.work
+            },
+            "InputBytes budget exceeded",
+        ),
+        (
+            WorkLimits {
+                admitted_bytes: total - 1,
+                ..options.work
+            },
+            "AdmittedBytes budget exceeded",
+        ),
+        (
+            WorkLimits {
+                sources: 1,
+                ..options.work
+            },
+            "Sources budget exceeded",
+        ),
+    ] {
+        options.work = work;
+        let error = prepare(&req, &options, &token)
+            .err()
+            .context("device configuration bypassed budget")?;
+        ensure!(
+            format!("{error:#}").contains(diagnostic),
+            "{error:#}; expected {diagnostic}"
+        );
+        options.work = WorkLimits {
+            input_bytes: total,
+            admitted_bytes: total,
+            sources: 2,
+            ..WorkLimits::default()
+        };
+    }
+    Ok(())
+}

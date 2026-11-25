@@ -58,7 +58,8 @@ impl LogicFamily {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DigitalPinDirection {
     Input,
     Output,
@@ -347,7 +348,8 @@ impl LegacyCompatibilityTable {
 }
 
 /// Native bridge direction relative to the analog circuit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnalogBridgeKind {
     Adc,
     Dac,

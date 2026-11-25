@@ -1,3 +1,5 @@
+mod classic_state;
+use classic_state::{ClassicStateModel, classic_state_model, translate_classic_state_device};
 mod passive_ic;
 mod pwls;
 mod waveforms;
@@ -9,10 +11,10 @@ use super::{
     LogicGateSpec, LogicIo, LogicOperation, LogicOutput, LogicPolarity, LogicReceiver,
     LogicThresholds, LogicTiming, Point, Translation, TranslationKind, emit_digital_buffer,
     emit_logic_event, emit_logic_gate, emit_logic_input_loads, emit_logic_output,
-    emit_logic_voltage, indexed_points, integer_parameter, model_statement_tokens,
-    normalized_statement, numeric_parameter, parse_assignments, read_indexed_points,
-    sanitized_name, statement_tokens, translate_charge_capacitor, translate_flux_inductor,
-    translate_ipwlr, translate_vpwlr, validate_node, validate_resistor_end_slopes, write_number,
+    emit_logic_voltage, indexed_points, integer_parameter, normalized_statement, numeric_parameter,
+    parse_assignments, read_indexed_points, sanitized_name, statement_tokens,
+    translate_charge_capacitor, translate_flux_inductor, translate_ipwlr, translate_vpwlr,
+    validate_node, validate_resistor_end_slopes, write_number,
 };
 #[cfg(test)]
 use crate::syntax::logical_statements;
@@ -20,7 +22,7 @@ use crate::syntax::{
     Item, Subcircuit, electrical_statements, file_boundary, matching_behavioral_delimiter,
     model_header, parse_items, simple_assignment_span, simple_assignment_value,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::passive_ic::PassiveKind;
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::Serialize;
@@ -347,31 +349,51 @@ struct RawReactiveModel {
     kind: PassiveKind,
 }
 
-fn raw_reactive_model(statement: &str) -> Result<Option<(String, RawReactiveModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
-        return Ok(None);
-    }
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 4 {
-        return Ok(None);
-    }
-    let kind = match tokens[2].to_ascii_uppercase().as_str() {
+fn model_value<'a>(
+    card: &'a model_normalize_ngspice::model_card::ModelCard,
+    name: &str,
+) -> Option<&'a str> {
+    card.parameters
+        .iter()
+        .rev()
+        .find(|field| field.name.eq_ignore_ascii_case(name) && field.expression.is_some())
+        .and_then(|field| field.expression.as_deref())
+}
+
+fn model_parameters(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+    skip: usize,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    card.parameters
+        .iter()
+        .skip(skip)
+        .map(|parameter| {
+            let value = parameter.expression.as_ref().with_context(|| {
+                format!(
+                    "model {} parameter {} requires a value",
+                    card.name, parameter.name
+                )
+            })?;
+            Ok((parameter.name.to_ascii_uppercase(), value.clone()))
+        })
+        .collect()
+}
+
+fn raw_reactive_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawReactiveModel)>> {
+    let kind = match card.family.to_ascii_uppercase().as_str() {
         "PWLC" => PassiveKind::Capacitor,
         "PWLL" => PassiveKind::Inductor,
         _ => return Ok(None),
     };
-    let parameters = parse_assignments(&tokens[3..])?;
+    let parameters = model_parameters(card, 0)?;
     let segments = integer_parameter(&parameters, "NSEG")?;
     validate_pwl_segment_count(segments)?;
     let points = indexed_points(&parameters, segments, "X", "Y")
-        .with_context(|| format!("parsing SIMPLIS reactive model {}", tokens[1]))?;
+        .with_context(|| format!("parsing SIMPLIS reactive model {}", card.name))?;
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         RawReactiveModel { points, kind },
     )))
 }
@@ -454,34 +476,6 @@ struct RawLevel17Mos {
     vds_limit: Option<String>,
 }
 
-fn strip_level17_vds_limit(body: &str) -> Result<(String, Option<String>)> {
-    let upper = body.to_ascii_uppercase();
-    let Some(start) = upper.find("LIMIT(VDS)=") else {
-        return Ok((body.to_owned(), None));
-    };
-    let value_start = start + "LIMIT(VDS)=".len();
-    let open = body[value_start..]
-        .find('(')
-        .map(|offset| value_start + offset)
-        .context("SIMetrix LEVEL=17 LIMIT(VDS) has no opening parenthesis")?;
-    let close = body[open + 1..]
-        .find(')')
-        .map(|offset| open + 1 + offset)
-        .context("SIMetrix LEVEL=17 LIMIT(VDS) has no closing parenthesis")?;
-    let mut output = String::with_capacity(body.len());
-    output.push_str(&body[..start]);
-    output.push_str(&body[close + 1..]);
-    Ok((
-        output,
-        Some(
-            body[start..=close]
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-    ))
-}
-
 fn optional_numeric(
     parameters: &std::collections::BTreeMap<String, String>,
     name: &str,
@@ -494,35 +488,42 @@ fn optional_numeric(
         .map(|value| value.unwrap_or(default))
 }
 
-fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>> {
-    let normalized = normalized_statement(statement);
-    let upper = normalized.to_ascii_uppercase();
-    if !upper.starts_with(".MODEL ") || !upper.contains("LEVEL=17") {
-        return Ok(None);
-    }
-    let open = normalized
-        .find('(')
-        .context("SIMetrix LEVEL=17 .MODEL has no parameter list")?;
-    let close = normalized
-        .rfind(')')
-        .context("SIMetrix LEVEL=17 .MODEL has no closing parenthesis")?;
-    if close <= open {
-        bail!("malformed SIMetrix LEVEL=17 .MODEL parameter list");
-    }
-    let header = normalized[..open].split_whitespace().collect::<Vec<_>>();
-    if header.len() != 3 || !header[0].eq_ignore_ascii_case(".MODEL") {
-        bail!("malformed SIMetrix LEVEL=17 .MODEL header");
-    }
-    let polarity = if header[2].eq_ignore_ascii_case("NMOS") {
+fn raw_level17_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawLevel17Mos)>> {
+    let polarity = if card.family.eq_ignore_ascii_case("NMOS") {
         MosPolarity::Nmos
-    } else if header[2].eq_ignore_ascii_case("PMOS") {
+    } else if card.family.eq_ignore_ascii_case("PMOS") {
         MosPolarity::Pmos
     } else {
         return Ok(None);
     };
-    let (body, vds_limit) = strip_level17_vds_limit(&normalized[open + 1..close])?;
-    let tokens = statement_tokens(&body)?;
-    let parameters = parse_assignments(&tokens)?;
+    let level = card
+        .parameters
+        .iter()
+        .rev()
+        .find(|field| field.name.eq_ignore_ascii_case("LEVEL"))
+        .and_then(|field| field.expression.as_deref());
+    if level
+        .and_then(|value| crate::parse_numeric(value).ok())
+        .is_none_or(|value| value.to_bits() != 17.0_f64.to_bits())
+    {
+        return Ok(None);
+    }
+    let mut parameters = model_parameters(card, 0)?;
+    let vds_limit = parameters
+        .remove("LIMIT(VDS)")
+        .map(|value| {
+            ensure!(
+                value.starts_with('(') && value.ends_with(')'),
+                "LIMIT(VDS) requires parenthesized bounds"
+            );
+            Ok::<_, anyhow::Error>(format!(
+                "LIMIT(VDS)={}",
+                value.split_whitespace().collect::<Vec<_>>().join(" ")
+            ))
+        })
+        .transpose()?;
     let allowed = [
         "LEVEL", "VTO", "VT0", "KP", "GAMMA", "PHI", "LAMBDA", "RD", "RS", "CBD", "IS", "RG",
         "CGDMAX", "CGDMIN", "XG1CGD", "XG2CGD", "VTCGD", "TC1RD", "TC2RD",
@@ -533,9 +534,6 @@ fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>>
             .any(|allowed| name.eq_ignore_ascii_case(allowed))
     }) {
         bail!("unsupported SIMetrix LEVEL=17 MOS parameter {unknown}");
-    }
-    if integer_parameter(&parameters, "LEVEL")? != 17 {
-        return Ok(None);
     }
     let vto = if parameters.contains_key("VTO") {
         numeric_parameter(&parameters, "VTO")?
@@ -588,9 +586,9 @@ fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>>
         || model.phi <= 0.0
         || !model.lambda.is_finite()
     {
-        bail!("invalid SIMetrix LEVEL=17 MOS parameters for {}", header[1]);
+        bail!("invalid SIMetrix LEVEL=17 MOS parameters for {}", card.name);
     }
-    Ok(Some((header[1].to_ascii_uppercase(), model)))
+    Ok(Some((card.name.to_ascii_uppercase(), model)))
 }
 
 fn level17_core_name(name: &str) -> String {
@@ -753,16 +751,13 @@ struct RawAdcSchmittModel {
     out_family: Option<String>,
 }
 
-fn raw_adc_schmitt_model(statement: &str) -> Result<Option<(String, RawAdcSchmittModel)>> {
-    let normalized = normalized_statement(statement);
-    let tokens = statement_tokens(&normalized)?;
-    if tokens.len() < 3
-        || !tokens[0].eq_ignore_ascii_case(".MODEL")
-        || !tokens[2].eq_ignore_ascii_case("ADC_SCHMITT")
-    {
+fn raw_adc_schmitt_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawAdcSchmittModel)>> {
+    if !card.family.eq_ignore_ascii_case("ADC_SCHMITT") {
         return Ok(None);
     }
-    let parameters = parse_assignments(&tokens[3..])?;
+    let parameters = model_parameters(card, 0)?;
     let supported = [
         "IN_LOW",
         "IN_HIGH",
@@ -779,7 +774,7 @@ fn raw_adc_schmitt_model(statement: &str) -> Result<Option<(String, RawAdcSchmit
         bail!("unsupported SIMetrix adc_schmitt parameter {parameter}");
     }
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         RawAdcSchmittModel {
             in_low: runtime_numeric_or(&parameters, "IN_LOW", 0.1)?,
             in_high: runtime_numeric_or(&parameters, "IN_HIGH", 0.9)?,
@@ -883,54 +878,33 @@ fn validate_pwl_segment_count(segments: usize) -> Result<()> {
     Ok(())
 }
 
-fn raw_pwl_model(statement: &str) -> Result<Option<(String, RawPwlModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
-        return Ok(None);
-    }
-    let normalized = normalized_statement(statement);
-    let tokens = statement_tokens(&normalized)?;
-    if tokens.len() < 3 {
-        bail!("malformed SIMPLIS .MODEL statement {statement}");
-    }
-    let kind = if tokens[2].eq_ignore_ascii_case("VPWLR") {
-        RawPwlKind::Vpwlr
-    } else if tokens[2].eq_ignore_ascii_case("IPWLR") {
-        RawPwlKind::Ipwlr
-    } else {
-        return Ok(None);
+fn raw_pwl_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawPwlModel)>> {
+    let kind = match card.family.to_ascii_uppercase().as_str() {
+        "VPWLR" => RawPwlKind::Vpwlr,
+        "IPWLR" => RawPwlKind::Ipwlr,
+        _ => return Ok(None),
     };
-    let parameters = parse_assignments(&tokens[3..])?;
+    let parameters = model_parameters(card, 0)?;
     let segments = integer_parameter(&parameters, "NSEG")?;
     validate_pwl_segment_count(segments)?;
     let points = read_indexed_points(&parameters, segments, "X", "Y")
-        .with_context(|| format!("parsing SIMPLIS PWL model {}", tokens[1]))?;
+        .with_context(|| format!("parsing SIMPLIS PWL model {}", card.name))?;
     validate_resistor_end_slopes(&points, kind == RawPwlKind::Ipwlr)?;
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         RawPwlModel { kind, points },
     )))
 }
 
-fn raw_comp_model(statement: &str) -> Result<Option<(String, RawCompModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
+fn raw_comp_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawCompModel)>> {
+    if !card.family.eq_ignore_ascii_case("COMP") {
         return Ok(None);
     }
-    let normalized = normalized_statement(statement);
-    let tokens = statement_tokens(&normalized)?;
-    if tokens.len() < 3 || !tokens[2].eq_ignore_ascii_case("COMP") {
-        return Ok(None);
-    }
-    let parameters = parse_assignments(&tokens[3..])?;
+    let parameters = model_parameters(card, 0)?;
     let rin = numeric_parameter(&parameters, "RIN")?;
     let rout = numeric_parameter(&parameters, "ROUT")?;
     let hystwd = numeric_parameter(&parameters, "HYSTWD")?;
@@ -942,10 +916,10 @@ fn raw_comp_model(statement: &str) -> Result<Option<(String, RawCompModel)>> {
         0.0
     };
     if !(rin > 0.0 && rout > 0.0 && hystwd >= 0.0 && delay >= 0.0 && voh > vol) {
-        bail!("invalid SIMPLIS COMP model {}", tokens[1]);
+        bail!("invalid SIMPLIS COMP model {}", card.name);
     }
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         RawCompModel {
             rin,
             rout,
@@ -990,28 +964,17 @@ struct RawVcqModel {
     iflow: RawQFlow,
 }
 
-fn raw_vcq_model(statement: &str) -> Result<Option<(String, RawVcqModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
-        return Ok(None);
-    }
-    let normalized = normalized_statement(statement);
-    let tokens = statement_tokens(&normalized)?;
-    if tokens.len() < 3 {
-        return Ok(None);
-    }
-    let (control, polarity) = match tokens[2].to_ascii_uppercase().as_str() {
+fn raw_vcq_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawVcqModel)>> {
+    let (control, polarity) = match card.family.to_ascii_uppercase().as_str() {
         "VCQPOS" => (SwitchControl::Voltage, RawQPolarity::Positive),
         "VCQNEG" => (SwitchControl::Voltage, RawQPolarity::Negative),
         "ICQPOS" => (SwitchControl::Current, RawQPolarity::Positive),
         "ICQNEG" => (SwitchControl::Current, RawQPolarity::Negative),
         _ => return Ok(None),
     };
-    let parameters = parse_assignments(&tokens[3..])?;
+    let parameters = model_parameters(card, 0)?;
     let vsat = numeric_parameter(&parameters, "VSAT")?;
     let rsat = numeric_parameter(&parameters, "RSAT")?;
     let roff = numeric_parameter(&parameters, "ROFF")?;
@@ -1040,7 +1003,7 @@ fn raw_vcq_model(statement: &str) -> Result<Option<(String, RawVcqModel)>> {
     }) {
         bail!(
             "unsupported SIMPLIS transistor-switch model parameter on {}",
-            tokens[1]
+            card.name
         );
     }
     if iflow == RawQFlow::Bidirectional && vsat != 0.0 {
@@ -1052,7 +1015,7 @@ fn raw_vcq_model(statement: &str) -> Result<Option<(String, RawVcqModel)>> {
         bail!("SIMPLIS transistor-switch VSAT has the wrong polarity");
     }
     if !(rsat > 0.0 && roff > rsat && gain > 0.0 && hystwd > 0.0) {
-        bail!("invalid SIMPLIS transistor-switch model {}", tokens[1]);
+        bail!("invalid SIMPLIS transistor-switch model {}", card.name);
     }
     if !matches!(logic.as_str(), "POS" | "NEG") {
         bail!("unsupported SIMPLIS transistor-switch LOGIC={logic}");
@@ -1061,7 +1024,7 @@ fn raw_vcq_model(statement: &str) -> Result<Option<(String, RawVcqModel)>> {
         bail!("unsupported SIMPLIS transistor-switch LEVEL={level}");
     }
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         RawVcqModel {
             control,
             polarity,
@@ -1284,30 +1247,19 @@ fn parse_vswitch_transfer(
     ))
 }
 
-fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
-        return Ok(None);
-    }
-    let normalized = normalized_statement(statement);
-    let tokens = model_statement_tokens(&normalized)?;
-    if tokens.len() < 3 {
-        return Ok(None);
-    }
-    let kind = tokens[2].to_ascii_uppercase();
+fn raw_vcsw_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawVcswModel)>> {
+    let kind = card.family.to_ascii_uppercase();
     if !matches!(kind.as_str(), "VCSW" | "ICSW" | "VSWITCH") {
         return Ok(None);
     }
-    let parameters = parse_assignments(&tokens[3..])?;
+    let parameters = model_parameters(card, 0)?;
     let transfer = if matches!(kind.as_str(), "VCSW" | "ICSW") {
         let ron = numeric_parameter(&parameters, "RON")?;
         let roff = numeric_parameter(&parameters, "ROFF")?;
         if !(ron > 0.0 && roff > ron) {
-            bail!("invalid {kind} model {}", tokens[1]);
+            bail!("invalid {kind} model {}", card.name);
         }
         let threshold = numeric_parameter(&parameters, "TH")?;
         let hystwd = numeric_parameter(&parameters, "HYSTWD")?;
@@ -1316,7 +1268,7 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
             |value| value.trim_matches('\'').to_ascii_uppercase(),
         );
         if hystwd <= 0.0 {
-            bail!("invalid SIMPLIS VCSW model {}", tokens[1]);
+            bail!("invalid SIMPLIS VCSW model {}", card.name);
         }
         if !matches!(logic.as_str(), "POS" | "NEG") {
             bail!("unsupported SIMPLIS VCSW LOGIC={logic}");
@@ -1325,7 +1277,7 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
             .keys()
             .any(|name| !matches!(name.as_str(), "RON" | "ROFF" | "TH" | "HYSTWD" | "LOGIC"))
         {
-            bail!("unsupported SIMPLIS VCSW model parameter on {}", tokens[1]);
+            bail!("unsupported SIMPLIS VCSW model parameter on {}", card.name);
         }
         VcswTransfer::ShortTransition {
             ron,
@@ -1335,10 +1287,10 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
             logic,
         }
     } else {
-        parse_vswitch_transfer(&parameters, &tokens[1])?
+        parse_vswitch_transfer(&parameters, &card.name)?
     };
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         RawVcswModel {
             control: if kind == "ICSW" {
                 SwitchControl::Current
@@ -1348,60 +1300,6 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
             transfer,
         },
     )))
-}
-
-#[derive(Clone, Debug)]
-struct RawSrffModel {
-    rin: f64,
-    rout: f64,
-    threshold: f64,
-    hystwd: f64,
-    vol: f64,
-    voh: f64,
-    logic: String,
-    delay: f64,
-}
-
-fn raw_srff_model(statement: &str) -> Result<Option<(String, RawSrffModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
-        return Ok(None);
-    }
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 3 || !tokens[2].eq_ignore_ascii_case("SRFF") {
-        return Ok(None);
-    }
-    let parameters = parse_assignments(&tokens[3..])?;
-    let model = RawSrffModel {
-        rin: numeric_parameter(&parameters, "RIN")?,
-        rout: numeric_parameter(&parameters, "ROUT")?,
-        threshold: numeric_parameter(&parameters, "TH")?,
-        hystwd: numeric_parameter(&parameters, "HYSTWD")?,
-        vol: numeric_parameter(&parameters, "VOL")?,
-        voh: numeric_parameter(&parameters, "VOH")?,
-        delay: if parameters.contains_key("DELAY") {
-            numeric_parameter(&parameters, "DELAY")?
-        } else {
-            0.0
-        },
-        logic: parameters.get("LOGIC").map_or_else(
-            || "POS".to_owned(),
-            |value| value.trim_matches('\'').to_ascii_uppercase(),
-        ),
-    };
-    if !(model.rin > 0.0
-        && model.rout > 0.0
-        && model.hystwd >= 0.0
-        && model.delay >= 0.0
-        && model.voh > model.vol)
-    {
-        bail!("invalid SIMPLIS SRFF model {}", tokens[1]);
-    }
-    Ok(Some((tokens[1].to_ascii_uppercase(), model)))
 }
 
 #[derive(Clone, Debug)]
@@ -1439,23 +1337,13 @@ fn numbered_logic_kind(token: &str) -> Option<(LogicGateKind, usize)> {
     None
 }
 
-fn raw_numbered_logic_model(statement: &str) -> Result<Option<(String, RawNumberedLogicModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
-        return Ok(None);
-    }
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 4 {
-        return Ok(None);
-    }
-    let Some((kind, inputs)) = numbered_logic_kind(&tokens[2]) else {
+fn raw_numbered_logic_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawNumberedLogicModel)>> {
+    let Some((kind, inputs)) = numbered_logic_kind(&card.family) else {
         return Ok(None);
     };
-    let parameters = parse_assignments(&tokens[3..])?;
+    let parameters = model_parameters(card, 0)?;
     let rin = numeric_parameter(&parameters, "RIN")?;
     let rout = numeric_parameter(&parameters, "ROUT")?;
     let threshold = numeric_parameter(&parameters, "TH")?;
@@ -1473,10 +1361,10 @@ fn raw_numbered_logic_model(statement: &str) -> Result<Option<(String, RawNumber
     );
     let polarity = LogicPolarity::parse(&logic)?;
     if !(rin > 0.0 && rout > 0.0 && hystwd >= 0.0 && delay >= 0.0 && voh > vol) {
-        bail!("invalid numbered SIMPLIS logic model {}", tokens[1]);
+        bail!("invalid numbered SIMPLIS logic model {}", card.name);
     }
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         RawNumberedLogicModel {
             kind,
             polarity,
@@ -1584,28 +1472,28 @@ struct RawDigitalModel {
     dominance: String,
 }
 
-fn raw_digital_model(statement: &str) -> Result<Option<(String, RawDigitalModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
+fn raw_digital_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, RawDigitalModel)>> {
+    if !card.family.eq_ignore_ascii_case("DIGITAL1") {
         return Ok(None);
     }
-    let normalized = normalized_statement(statement);
-    let tokens = statement_tokens(&normalized)?;
-    if tokens.len() < 4 || !tokens[2].eq_ignore_ascii_case("DIGITAL1") {
-        return Ok(None);
-    }
-    let kind = match tokens[3].to_ascii_uppercase().as_str() {
+    let subtype = card
+        .parameters
+        .first()
+        .context("DIGITAL1 model requires a subtype")?;
+    anyhow::ensure!(
+        subtype.expression.is_none(),
+        "DIGITAL1 subtype must be positional"
+    );
+    let kind = match subtype.name.to_ascii_uppercase().as_str() {
         "D_BUFFER" => RawDigitalKind::Buffer,
         "D_AND" => RawDigitalKind::And,
         "D_OR" => RawDigitalKind::Or,
         "D_SRLATCH" => RawDigitalKind::SrLatch,
         other => bail!("unsupported SIMPLIS DIGITAL1 model type {other}"),
     };
-    let parameters = parse_assignments(&tokens[4..])?;
+    let parameters = model_parameters(card, 1)?;
     let rin = numeric_parameter(&parameters, "RIN")?;
     let rout = numeric_parameter(&parameters, "ROUT")?;
     let threshold = numeric_parameter(&parameters, "TH")?;
@@ -1628,10 +1516,10 @@ fn raw_digital_model(statement: &str) -> Result<Option<(String, RawDigitalModel)
         |value| value.trim_matches('\'').to_ascii_uppercase(),
     );
     if !(rin > 0.0 && rout > 0.0 && hystwd >= 0.0 && delay >= 0.0 && voh > vol) {
-        bail!("invalid SIMPLIS DIGITAL1 model {}", tokens[1]);
+        bail!("invalid SIMPLIS DIGITAL1 model {}", card.name);
     }
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         RawDigitalModel {
             kind,
             rin,
@@ -1680,99 +1568,61 @@ fn bracket_groups(tokens: &[String]) -> Result<Vec<Vec<String>>> {
 }
 
 #[derive(Clone, Copy)]
-struct SrStateSpec<'a> {
+struct StateElementSpec<'a> {
     stem: &'a str,
-    out: &'a str,
-    out_bar: &'a str,
+    outputs: &'a [&'a str],
     rtn: &'a str,
     inputs: &'a [String],
-    initial: usize,
-    operation: LogicOperation,
-    input_polarity: LogicPolarity,
+    receiver: LogicReceiver,
     output_polarity: LogicPolarity,
+    timing: LogicTiming,
     kind: TranslationKind,
 }
 
-fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Translation> {
-    let SrStateSpec {
+fn emit_state_element(io: LogicIo, spec: &StateElementSpec<'_>) -> Result<Translation> {
+    let StateElementSpec {
         stem,
-        out,
-        out_bar,
+        outputs,
         rtn,
         inputs,
-        initial,
-        operation,
-        input_polarity,
+        receiver,
         output_polarity,
+        timing,
         kind,
     } = *spec;
-    if inputs.len() != 2 || initial > 1 {
-        bail!("invalid SIMPLIS S-R state element");
-    }
-    let set = &inputs[0];
-    let reset = &inputs[1];
-    for node in [out, out_bar, rtn, set, reset] {
+    for node in outputs
+        .iter()
+        .copied()
+        .chain(std::iter::once(rtn))
+        .chain(inputs.iter().map(String::as_str))
+    {
         validate_node(node)?;
     }
-    let io = LogicIo {
-        rin: model.rin,
-        rout: model.rout,
-        hystwd: model.hystwd,
-        vol: model.vol,
-        voh: model.voh,
-        delay: model.delay,
-        threshold: model.threshold,
-    };
     let mut output = String::new();
-    let inertial = kind == TranslationKind::SrLatch;
-    let receiver = if inertial {
-        LogicReceiver::digital1(input_polarity)
-    } else {
-        LogicReceiver {
-            polarity: input_polarity,
-            initial: false,
-        }
-    };
     emit_logic_input_loads(&mut output, stem, rtn, inputs, io.rin)?;
     let state = emit_logic_event(
         &mut output,
         stem,
         rtn,
         inputs,
-        &[receiver; 2],
+        &vec![receiver; inputs.len()],
         io.thresholds(),
-        LogicTiming {
-            operation,
-            delay: model.delay,
-            inertial,
-            initial: initial == 1,
-        },
+        timing,
     )?;
-    let negative = output_polarity.negative();
-    emit_logic_output(
-        &mut output,
-        io,
-        stem,
-        out,
-        rtn,
-        &state,
-        LogicOutput {
-            negative,
-            complement: false,
-        },
-    )?;
-    emit_logic_output(
-        &mut output,
-        io,
-        stem,
-        out_bar,
-        rtn,
-        &state,
-        LogicOutput {
-            negative,
-            complement: true,
-        },
-    )?;
+    for (index, node) in outputs.iter().enumerate() {
+        emit_logic_output(
+            &mut output,
+            io,
+            stem,
+            node,
+            rtn,
+            &state,
+            LogicOutput {
+                negative: output_polarity.negative(),
+                complement: index == 1,
+            },
+        )?;
+    }
     Ok(Translation {
         bytes: output.into_bytes(),
         kind,
@@ -1799,18 +1649,34 @@ fn emit_raw_sr_latch(
         "NONE" => LogicOperation::HoldWhenEqual,
         other => bail!("invalid SIMPLIS DIGITAL1 D_SRLATCH DOM={other}"),
     };
-    emit_sr_state(
-        model,
-        &SrStateSpec {
+    anyhow::ensure!(
+        inputs.len() == 2 && initial <= 1,
+        "invalid SIMPLIS S-R state element"
+    );
+    let io = LogicIo {
+        rin: model.rin,
+        rout: model.rout,
+        hystwd: model.hystwd,
+        vol: model.vol,
+        voh: model.voh,
+        delay: model.delay,
+        threshold: model.threshold,
+    };
+    emit_state_element(
+        io,
+        &StateElementSpec {
             stem,
-            out,
-            out_bar,
+            outputs: &[out, out_bar],
             rtn,
             inputs,
-            initial,
-            operation,
-            input_polarity,
+            receiver: LogicReceiver::digital1(input_polarity),
             output_polarity: LogicPolarity::Positive,
+            timing: LogicTiming {
+                operation,
+                delay: io.delay,
+                inertial: true,
+                initial: initial == 1,
+            },
             kind: TranslationKind::SrLatch,
         },
     )
@@ -2309,6 +2175,11 @@ fn translate_device_voltage_controlled_source(
     statement: &str,
     branches: &std::collections::BTreeMap<String, (String, String)>,
 ) -> Result<Option<Translation>> {
+    if model_normalize_ngspice::controlled_transfer::parse(&normalized_statement(statement))?
+        .is_some()
+    {
+        return Ok(None);
+    }
     let trimmed = statement.trim_start();
     let Some(kind) = trimmed.as_bytes().first().map(u8::to_ascii_uppercase) else {
         return Ok(None);
@@ -2364,7 +2235,7 @@ fn translate_device_voltage_controlled_source(
     }))
 }
 
-fn current_controlled_source_stem(name: &str) -> String {
+fn escaped_device_stem(name: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(name.len());
     for byte in name.bytes() {
@@ -2426,7 +2297,7 @@ fn translated_current_branches(
             if let Some(name) = tokens.first() {
                 branches.insert(
                     name.to_ascii_uppercase(),
-                    format!("B__{}", current_controlled_source_stem(name)),
+                    format!("B__{}", escaped_device_stem(name)),
                 );
             }
         }
@@ -2665,7 +2536,7 @@ fn translate_current_controlled_source(
             .get(2)
             .context("current-controlled source has no negative node")?,
     )?;
-    let stem = current_controlled_source_stem(
+    let stem = escaped_device_stem(
         tokens
             .first()
             .context("current-controlled source has no name")?,
@@ -3354,59 +3225,6 @@ fn translate_raw_vcsw_device(
     Ok(Some(translation))
 }
 
-fn translate_raw_srff_device(
-    statement: &str,
-    models: &std::collections::BTreeMap<String, RawSrffModel>,
-) -> Result<Option<Translation>> {
-    if !statement.trim_start().starts_with('!') {
-        return Ok(None);
-    }
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 7 {
-        return Ok(None);
-    }
-    let Some(model) = models.get(&tokens[6].to_ascii_uppercase()) else {
-        return Ok(None);
-    };
-    let polarity = LogicPolarity::parse(&model.logic)?;
-    let parameters = parse_assignments(&tokens[7..])?;
-    let initial = if parameters.contains_key("IC") {
-        integer_parameter(&parameters, "IC")?
-    } else {
-        0
-    };
-    let io = RawDigitalModel {
-        kind: RawDigitalKind::SrLatch,
-        rin: model.rin,
-        rout: model.rout,
-        threshold: model.threshold,
-        hystwd: model.hystwd,
-        vol: model.vol,
-        voh: model.voh,
-        delay: model.delay,
-        num_inverted_inputs: 0,
-        set_reset_level: 1,
-        dominance: "HOLD".to_owned(),
-    };
-    let stem = sanitized_name(tokens[0].trim_start_matches('!'));
-    emit_sr_state(
-        &io,
-        &SrStateSpec {
-            stem: &stem,
-            out: &tokens[1],
-            out_bar: &tokens[2],
-            rtn: &tokens[3],
-            inputs: &tokens[4..6],
-            initial,
-            operation: LogicOperation::HoldWhenEqual,
-            input_polarity: polarity,
-            output_polarity: polarity,
-            kind: TranslationKind::SrFlipFlop,
-        },
-    )
-    .map(Some)
-}
-
 fn source_kind(name: &str) -> Result<char> {
     match name.as_bytes().first().map(u8::to_ascii_uppercase) {
         Some(b'V') => Ok('V'),
@@ -3906,7 +3724,7 @@ fn statement_with_init_override(
 ) -> Result<String> {
     let normalized = normalized_statement(statement);
     let tokens = statement_tokens(&normalized)?;
-    let Some(name) = tokens.first() else {
+    let Some(name) = tokens.first().cloned() else {
         return Ok(statement.to_owned());
     };
     let Some(value) = overrides.get(&name.to_ascii_uppercase()) else {
@@ -3914,11 +3732,29 @@ fn statement_with_init_override(
     };
     let mut output = Vec::with_capacity(tokens.len().saturating_add(1));
     let mut replaced = false;
-    for token in tokens {
-        if token
+    let mut tokens = tokens.into_iter().peekable();
+    while let Some(token) = tokens.next() {
+        let assigned = token
             .split_once('=')
-            .is_some_and(|(key, _)| key.eq_ignore_ascii_case("IC"))
-        {
+            .filter(|(key, _)| key.eq_ignore_ascii_case("IC"));
+        let separate = token.eq_ignore_ascii_case("IC")
+            && tokens.peek().is_some_and(|next| next.starts_with('='));
+        if assigned.is_some() || separate {
+            anyhow::ensure!(!replaced, "duplicate initial condition on {name}");
+            let rhs = if let Some((_, rhs)) = assigned {
+                rhs.to_owned()
+            } else {
+                tokens
+                    .next()
+                    .context("missing initial assignment")?
+                    .strip_prefix('=')
+                    .context("missing initial assignment separator")?
+                    .to_owned()
+            };
+            if rhs.is_empty() {
+                let old = tokens.next().context("missing initial condition value")?;
+                anyhow::ensure!(!old.starts_with('='), "missing initial condition value");
+            }
             output.push(format!("IC={value}"));
             replaced = true;
         } else {
@@ -3984,19 +3820,17 @@ fn bridge_ports(header: Option<&str>) -> Result<std::collections::BTreeSet<Strin
         .collect())
 }
 
-fn native_bridge_model(statement: &str) -> Result<Option<(String, NativeBridgeModel)>> {
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 3 || !tokens[0].eq_ignore_ascii_case(".MODEL") {
-        return Ok(None);
-    }
-    let kind = if tokens[2].eq_ignore_ascii_case("ADC_BRIDGE") {
+fn native_bridge_model(
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Result<Option<(String, NativeBridgeModel)>> {
+    let kind = if card.family.eq_ignore_ascii_case("ADC_BRIDGE") {
         NativeBridgeKind::Adc
-    } else if tokens[2].eq_ignore_ascii_case("DAC_BRIDGE") {
+    } else if card.family.eq_ignore_ascii_case("DAC_BRIDGE") {
         NativeBridgeKind::Dac
     } else {
         return Ok(None);
     };
-    let parameters = parse_assignments(&tokens[3..])?;
+    let parameters = model_parameters(card, 0)?;
     if kind == NativeBridgeKind::Adc {
         const SUPPORTED: &[&str] = &["IN_LOW", "IN_HIGH", "RISE_DELAY", "FALL_DELAY"];
         if let Some(parameter) = parameters.keys().find(|name| {
@@ -4006,7 +3840,7 @@ fn native_bridge_model(statement: &str) -> Result<Option<(String, NativeBridgeMo
         }) {
             bail!(
                 "SIMetrix ADC_BRIDGE parameter {parameter} on model {} requires explicit analog-load/clamp compatibility lowering",
-                tokens[1]
+                card.name
             );
         }
     }
@@ -4032,12 +3866,12 @@ fn native_bridge_model(statement: &str) -> Result<Option<(String, NativeBridgeMo
         }) {
             bail!(
                 "unsupported SIMetrix DAC_BRIDGE parameter {parameter} on model {}",
-                tokens[1]
+                card.name
             );
         }
     }
     Ok(Some((
-        tokens[1].to_ascii_uppercase(),
+        card.name.to_ascii_uppercase(),
         NativeBridgeModel { kind, parameters },
     )))
 }
@@ -4131,23 +3965,13 @@ fn validate_native_bridge_outputs(
     Ok(())
 }
 
-fn rewrite_native_bridge_model(
-    statement: &str,
-    models: &std::collections::BTreeMap<String, NativeBridgeModel>,
-) -> Result<Option<String>> {
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 3 || !tokens[0].eq_ignore_ascii_case(".MODEL") {
-        return Ok(None);
-    }
-    let Some(model) = models.get(&tokens[1].to_ascii_uppercase()) else {
-        return Ok(None);
-    };
+fn rewrite_native_bridge_model(name: &str, model: &NativeBridgeModel) -> Result<String> {
     if model.kind == NativeBridgeKind::Adc {
         let in_low = bridge_runtime_numeric(&model.parameters, "IN_LOW", 0.1)?;
         let in_high = bridge_runtime_numeric(&model.parameters, "IN_HIGH", 0.9)?;
         let rise_delay = bridge_runtime_numeric(&model.parameters, "RISE_DELAY", 1.0e-9)?;
         let fall_delay = bridge_runtime_numeric(&model.parameters, "FALL_DELAY", 1.0e-9)?;
-        let mut output = format!(".model {} adc_bridge(in_low=", tokens[1]);
+        let mut output = format!(".model {name} adc_bridge(in_low=");
         write_runtime_numeric(&mut output, &in_low)?;
         output.push_str(" in_high=");
         write_runtime_numeric(&mut output, &in_high)?;
@@ -4156,14 +3980,14 @@ fn rewrite_native_bridge_model(
         output.push_str(" fall_delay=");
         write_runtime_numeric(&mut output, &fall_delay)?;
         output.push(')');
-        return Ok(Some(output));
+        return Ok(output);
     }
     let out_low = bridge_runtime_numeric(&model.parameters, "OUT_LOW", 0.0)?;
     let out_high = bridge_runtime_numeric(&model.parameters, "OUT_HIGH", 5.0)?;
     let input_load = bridge_runtime_numeric(&model.parameters, "INPUT_LOAD", 1.0e-12)?;
     let t_rise = bridge_runtime_numeric(&model.parameters, "T_RISE", 1.0e-9)?;
     let t_fall = bridge_runtime_numeric(&model.parameters, "T_FALL", 1.0e-9)?;
-    let mut output = format!(".model {} dac_bridge(out_low=", tokens[1]);
+    let mut output = format!(".model {name} dac_bridge(out_low=");
     write_runtime_numeric(&mut output, &out_low)?;
     output.push_str(" out_high=");
     write_runtime_numeric(&mut output, &out_high)?;
@@ -4174,7 +3998,7 @@ fn rewrite_native_bridge_model(
     output.push_str(" t_fall=");
     write_runtime_numeric(&mut output, &t_fall)?;
     output.push(')');
-    Ok(Some(output))
+    Ok(output)
 }
 
 fn rewrite_native_bridge_instance(
@@ -4232,11 +4056,12 @@ struct ScopeAnalysis {
     comp: std::collections::BTreeMap<String, RawCompModel>,
     adc_schmitt: std::collections::BTreeMap<String, RawAdcSchmittModel>,
     native_bridges: std::collections::BTreeMap<String, NativeBridgeModel>,
-    srff: std::collections::BTreeMap<String, RawSrffModel>,
+    srff: std::collections::BTreeMap<String, ClassicStateModel>,
     digital: std::collections::BTreeMap<String, RawDigitalModel>,
     numbered_logic: std::collections::BTreeMap<String, RawNumberedLogicModel>,
     vcsw: std::collections::BTreeMap<String, RawVcswModel>,
     level17: std::collections::BTreeMap<String, RawLevel17Mos>,
+    model_emissions: std::collections::BTreeMap<String, String>,
     pspice_mos_series_resistances: std::collections::BTreeMap<String, PspiceMosSeriesResistance>,
     simetrix_diode_temperatures: std::collections::BTreeMap<String, f64>,
     simetrix_resistor_temperatures: std::collections::BTreeMap<String, f64>,
@@ -4246,13 +4071,14 @@ fn insert_unique_model<T>(
     models: &mut std::collections::BTreeMap<String, T>,
     parsed: Option<(String, T)>,
     label: &str,
-) -> Result<()> {
-    if let Some((name, model)) = parsed
-        && models.insert(name.clone(), model).is_some()
-    {
+) -> Result<bool> {
+    let Some((name, model)) = parsed else {
+        return Ok(false);
+    };
+    if models.insert(name.clone(), model).is_some() {
         bail!("duplicate {label} {name} in one scope");
     }
-    Ok(())
+    Ok(true)
 }
 
 impl ScopeAnalysis {
@@ -4275,6 +4101,7 @@ impl ScopeAnalysis {
             numbered_logic: std::collections::BTreeMap::new(),
             vcsw: std::collections::BTreeMap::new(),
             level17: std::collections::BTreeMap::new(),
+            model_emissions: std::collections::BTreeMap::new(),
             pspice_mos_series_resistances: std::collections::BTreeMap::new(),
             simetrix_diode_temperatures: std::collections::BTreeMap::new(),
             simetrix_resistor_temperatures: std::collections::BTreeMap::new(),
@@ -4387,10 +4214,7 @@ impl ScopeAnalysis {
             if !self.voltage_branches.contains_key(&target) {
                 bail!("SIMPLIS switch references unknown current branch {target}");
             }
-            let stem = format!(
-                "V__{}_CONTROL_SENSE",
-                current_controlled_source_stem(&target)
-            );
+            let stem = format!("V__{}_CONTROL_SENSE", escaped_device_stem(&target));
             let source = allocate_branch_identifier(&stem, &mut reserved)?;
             let node = allocate_branch_identifier(&format!("__{source}_NODE"), &mut reserved)?;
             self.current_branches.insert(target.clone(), source.clone());
@@ -4427,79 +4251,146 @@ impl ScopeAnalysis {
                 }
                 continue;
             };
-            self.collect_model_compatibility(statement, &name, &kind)?;
-            match kind.as_str() {
-                "PWLC" | "PWLL" => insert_unique_model(
-                    &mut self.reactive,
-                    raw_reactive_model(statement)?,
-                    "SIMPLIS reactive model",
-                )?,
-                "VPWLR" | "IPWLR" => insert_unique_model(
-                    &mut self.pwl,
-                    raw_pwl_model(statement)?,
-                    "SIMPLIS PWL model",
-                )?,
-                "COMP" => insert_unique_model(
-                    &mut self.comp,
-                    raw_comp_model(statement)?,
-                    "SIMPLIS COMP model",
-                )?,
-                "ADC_SCHMITT" => insert_unique_model(
-                    &mut self.adc_schmitt,
-                    raw_adc_schmitt_model(statement)?,
-                    "SIMetrix adc_schmitt model",
-                )?,
-                "ADC_BRIDGE" | "DAC_BRIDGE" => insert_unique_model(
-                    &mut self.native_bridges,
-                    native_bridge_model(statement)?,
-                    "mixed-signal bridge model",
-                )?,
-                "VCQPOS" | "VCQNEG" | "ICQPOS" | "ICQNEG" => insert_unique_model(
-                    &mut self.vcq,
-                    raw_vcq_model(statement)?,
-                    "SIMPLIS transistor-switch model",
-                )?,
-                "VCSW" | "ICSW" | "VSWITCH" => insert_unique_model(
-                    &mut self.vcsw,
-                    raw_vcsw_model(statement)?,
-                    "SIMPLIS VCSW model",
-                )?,
-                "SRFF" => insert_unique_model(
-                    &mut self.srff,
-                    raw_srff_model(statement)?,
-                    "SIMPLIS SRFF model",
-                )?,
-                "DIGITAL1" => insert_unique_model(
-                    &mut self.digital,
-                    raw_digital_model(statement)?,
-                    "SIMPLIS DIGITAL1 model",
-                )?,
-                "NMOS" | "PMOS" => insert_unique_model(
-                    &mut self.level17,
-                    raw_level17_model(statement)?,
-                    "SIMetrix LEVEL=17 MOS model",
-                )?,
-                numbered if numbered_logic_kind(numbered).is_some() => insert_unique_model(
-                    &mut self.numbered_logic,
-                    raw_numbered_logic_model(statement)?,
-                    "numbered SIMPLIS logic model",
-                )?,
-                _ => {}
+            if !matches!(
+                kind.as_str(),
+                "D" | "R"
+                    | "RES"
+                    | "NMOS"
+                    | "PMOS"
+                    | "PWLC"
+                    | "PWLL"
+                    | "VPWLR"
+                    | "IPWLR"
+                    | "COMP"
+                    | "ADC_SCHMITT"
+                    | "ADC_BRIDGE"
+                    | "DAC_BRIDGE"
+                    | "VCQPOS"
+                    | "VCQNEG"
+                    | "ICQPOS"
+                    | "ICQNEG"
+                    | "VCSW"
+                    | "ICSW"
+                    | "VSWITCH"
+                    | "SRFF"
+                    | "CLK_SRFF"
+                    | "CLK_JKFF"
+                    | "CLK_DFF"
+                    | "CLK_TFF"
+                    | "LATCH"
+                    | "DIGITAL1"
+            ) && numbered_logic_kind(&kind).is_none()
+            {
+                continue;
+            }
+            let normalized = normalized_statement(statement);
+            let card = model_normalize_ngspice::model_card::parse_model_card(&normalized, 1, &[])?;
+            self.collect_model_compatibility(&card, &name, &kind)?;
+            let translated = self.dispatch_model(&card, &kind)?;
+            let emission = if translated {
+                match kind.as_str() {
+                    "NMOS" | "PMOS" => Some(emit_level17_core_model(
+                        &name,
+                        self.level17
+                            .get(&name)
+                            .context("missing typed level 17 model")?,
+                    )?),
+                    "ADC_BRIDGE" | "DAC_BRIDGE" => {
+                        let mut output = rewrite_native_bridge_model(
+                            &card.name,
+                            self.native_bridges
+                                .get(&name)
+                                .context("missing typed bridge model")?,
+                        )?;
+                        output.push('\n');
+                        Some(output)
+                    }
+                    _ => Some(String::new()),
+                }
+            } else {
+                rewrite_simetrix_model_compat(&normalized, &card).map(|mut text| {
+                    text.push('\n');
+                    text
+                })
+            };
+            if let Some(emission) = emission {
+                self.model_emissions.insert(normalized, emission);
             }
         }
         Ok(())
     }
 
+    fn dispatch_model(
+        &mut self,
+        card: &model_normalize_ngspice::model_card::ModelCard,
+        kind: &str,
+    ) -> Result<bool> {
+        Ok(match kind {
+            "NMOS" | "PMOS" => insert_unique_model(
+                &mut self.level17,
+                raw_level17_model(card)?,
+                "SIMetrix LEVEL=17 MOS model",
+            )?,
+            "PWLC" | "PWLL" => insert_unique_model(
+                &mut self.reactive,
+                raw_reactive_model(card)?,
+                "SIMPLIS reactive model",
+            )?,
+            "VPWLR" | "IPWLR" => {
+                insert_unique_model(&mut self.pwl, raw_pwl_model(card)?, "SIMPLIS PWL model")?
+            }
+            "COMP" => {
+                insert_unique_model(&mut self.comp, raw_comp_model(card)?, "SIMPLIS COMP model")?
+            }
+            "ADC_SCHMITT" => insert_unique_model(
+                &mut self.adc_schmitt,
+                raw_adc_schmitt_model(card)?,
+                "SIMetrix adc_schmitt model",
+            )?,
+            "ADC_BRIDGE" | "DAC_BRIDGE" => insert_unique_model(
+                &mut self.native_bridges,
+                native_bridge_model(card)?,
+                "mixed-signal bridge model",
+            )?,
+            "VCQPOS" | "VCQNEG" | "ICQPOS" | "ICQNEG" => insert_unique_model(
+                &mut self.vcq,
+                raw_vcq_model(card)?,
+                "SIMPLIS transistor-switch model",
+            )?,
+            "VCSW" | "ICSW" | "VSWITCH" => {
+                insert_unique_model(&mut self.vcsw, raw_vcsw_model(card)?, "SIMPLIS VCSW model")?
+            }
+            "SRFF" | "CLK_SRFF" | "CLK_JKFF" | "CLK_DFF" | "CLK_TFF" | "LATCH" => {
+                insert_unique_model(
+                    &mut self.srff,
+                    classic_state_model(card)?,
+                    "SIMPLIS classic state model",
+                )?
+            }
+            "DIGITAL1" => insert_unique_model(
+                &mut self.digital,
+                raw_digital_model(card)?,
+                "SIMPLIS DIGITAL1 model",
+            )?,
+            numbered if numbered_logic_kind(numbered).is_some() => insert_unique_model(
+                &mut self.numbered_logic,
+                raw_numbered_logic_model(card)?,
+                "numbered SIMPLIS logic model",
+            )?,
+            _ => false,
+        })
+    }
+
     fn collect_model_compatibility(
         &mut self,
-        statement: &str,
+        card: &model_normalize_ngspice::model_card::ModelCard,
         name: &str,
         kind: &str,
     ) -> Result<()> {
         if matches!(kind, "D" | "R" | "RES")
-            && let Some(value) = simple_assignment_value(statement, "T_ABS")
+            && let Some(value) = model_value(card, "T_ABS")
         {
-            let temperature = crate::parse_numeric(&value)?;
+            let temperature = crate::parse_numeric(value)?;
             let (temperatures, label) = if kind == "D" {
                 if !temperature.is_finite() || temperature <= -273.15 {
                     bail!("invalid SIMetrix diode T_ABS={value} on model {name}");
@@ -4517,12 +4408,12 @@ impl ScopeAnalysis {
         }
 
         if matches!(kind, "NMOS" | "PMOS") {
-            let rg = simple_assignment_value(statement, "RG")
-                .map(|value| crate::parse_numeric(&value))
+            let rg = model_value(card, "RG")
+                .map(crate::parse_numeric)
                 .transpose()?
                 .unwrap_or(0.0);
-            let rb = simple_assignment_value(statement, "RB")
-                .map(|value| crate::parse_numeric(&value))
+            let rb = model_value(card, "RB")
+                .map(crate::parse_numeric)
                 .transpose()?
                 .unwrap_or(0.0);
             if !(rg.is_finite() && rb.is_finite() && rg >= 0.0 && rb >= 0.0) {
@@ -4739,7 +4630,7 @@ fn translate_deck_primitive(
         translate_raw_mutual_inductance(statement, &models.inductors),
         translate_raw_pwl_device(statement, &models.pwl),
         translate_raw_reactive_device(statement, &models.reactive),
-        translate_raw_srff_device(statement, &models.srff),
+        translate_classic_state_device(statement, &models.srff),
         translate_raw_comp_device(statement, &models.comp),
         translate_raw_digital_device(statement, &models.digital),
         translate_raw_numbered_logic_device(statement, &models.numbered_logic),
@@ -4748,11 +4639,15 @@ fn translate_deck_primitive(
     )
 }
 
-fn remove_simple_assignment(statement: &str, name: &str) -> String {
+fn remove_simple_assignment(statement: &str, name: &str) -> Result<String> {
     let normalized = normalized_statement(statement);
-    let Some((start, _, value_end)) = simple_assignment_span(&normalized, name) else {
-        return normalized;
+    let Some((start, _, value_end)) = simple_assignment_span(&normalized, name)? else {
+        return Ok(normalized);
     };
+    Ok(remove_assignment_span(&normalized, start, value_end))
+}
+
+fn remove_assignment_span(normalized: &str, start: usize, value_end: usize) -> String {
     let mut remove_start = start;
     while remove_start > 0 && normalized.as_bytes()[remove_start - 1].is_ascii_whitespace() {
         remove_start -= 1;
@@ -4792,31 +4687,6 @@ fn remove_simple_assignment(statement: &str, name: &str) -> String {
     }
     output.push_str(suffix);
     output
-}
-
-fn replace_simple_assignment_value(statement: &str, name: &str, value: &str) -> Result<String> {
-    let normalized = normalized_statement(statement);
-    let Some((start, _, value_end)) = simple_assignment_span(&normalized, name) else {
-        bail!("SIMetrix model parameter {name} is missing");
-    };
-    let mut output = String::with_capacity(normalized.len());
-    output.push_str(&normalized[..start]);
-    write!(output, "{name}={value}")?;
-    output.push_str(&normalized[value_end..]);
-    Ok(output)
-}
-
-fn rename_simple_assignment(statement: &str, old_name: &str, new_name: &str) -> Result<String> {
-    let normalized = normalized_statement(statement);
-    let Some((start, value_start, value_end)) = simple_assignment_span(&normalized, old_name)
-    else {
-        bail!("SIMetrix model parameter {old_name} is missing");
-    };
-    let mut output = String::with_capacity(normalized.len() + new_name.len());
-    output.push_str(&normalized[..start]);
-    write!(output, "{new_name}={}", &normalized[value_start..value_end])?;
-    output.push_str(&normalized[value_end..]);
-    Ok(output)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4879,55 +4749,57 @@ fn translate_pspice_mos_series_resistance(
     }))
 }
 
-fn rewrite_simetrix_model_compat(statement: &str) -> Result<Option<String>> {
-    let Some((_name, kind)) = model_header(statement) else {
-        return Ok(None);
-    };
-    let mut output = normalized_statement(statement);
+fn rewrite_simetrix_model_compat(
+    statement: &str,
+    card: &model_normalize_ngspice::model_card::ModelCard,
+) -> Option<String> {
+    let kind = card.family.to_ascii_uppercase();
     let temperature_model = matches!(kind.as_str(), "D" | "R" | "RES");
-    let mut changed = if temperature_model && simple_assignment_value(&output, "T_ABS").is_some() {
-        output = remove_simple_assignment(&output, "T_ABS");
-        true
-    } else {
-        false
-    };
-    if matches!(kind.as_str(), "NMOS" | "PMOS") {
-        if simple_assignment_value(&output, "LEVEL").is_none()
-            && simple_assignment_value(&output, "VLEVEL").is_some()
-        {
-            output = rename_simple_assignment(&output, "VLEVEL", "LEVEL")?;
-            changed = true;
+    let mos = matches!(kind.as_str(), "NMOS" | "PMOS");
+    let level_alias = model_value(card, "LEVEL").is_none();
+    let vto_alias = model_value(card, "VTO").is_none();
+    let level = model_value(card, if level_alias { "VLEVEL" } else { "LEVEL" });
+    let any = |names: &[&str]| names.iter().any(|name| model_value(card, name).is_some());
+    let promote_level = mos
+        && level == Some("7")
+        && !any(&["CGDMAX", "CGDMIN", "XG1CGD", "XG2CGD", "VTCGD"])
+        && model_value(card, "VERSION").is_some_and(|value| value.starts_with("3."))
+        && any(&["MOBMOD", "CAPMOD", "PARAMCHK", "NQSMOD"]);
+
+    let mut output = statement.to_owned();
+    for field in card.parameters.iter().rev() {
+        let (Some(value), Some(value_span)) = (&field.expression, &field.span.value) else {
+            continue;
+        };
+        let name = field.name.to_ascii_uppercase();
+        if (temperature_model && name == "T_ABS") || (mos && matches!(name.as_str(), "RG" | "RB")) {
+            output = remove_assignment_span(&output, field.span.name.start, value_span.end);
+            continue;
         }
-        if simple_assignment_value(&output, "VTO").is_none()
-            && simple_assignment_value(&output, "TO").is_some()
-        {
-            output = rename_simple_assignment(&output, "TO", "VTO")?;
-            changed = true;
+        if !mos {
+            continue;
         }
-        for parameter in ["RG", "RB"] {
-            if simple_assignment_value(&output, parameter).is_some() {
-                output = remove_simple_assignment(&output, parameter);
-                changed = true;
-            }
+        let replacement = match name.as_str() {
+            "VLEVEL" if level_alias => Some((
+                "LEVEL",
+                if promote_level && value == "7" {
+                    "8"
+                } else {
+                    value.as_str()
+                },
+            )),
+            "LEVEL" if promote_level && value == "7" => Some(("LEVEL", "8")),
+            "TO" if vto_alias => Some(("VTO", value.as_str())),
+            _ => None,
+        };
+        if let Some((name, value)) = replacement {
+            output.replace_range(
+                field.span.name.start..value_span.end,
+                &format!("{name}={value}"),
+            );
         }
     }
-    if matches!(kind.as_str(), "NMOS" | "PMOS")
-        && simple_assignment_value(&output, "LEVEL").as_deref() == Some("7")
-    {
-        let discrete = ["CGDMAX", "CGDMIN", "XG1CGD", "XG2CGD", "VTCGD"]
-            .iter()
-            .any(|parameter| simple_assignment_value(&output, parameter).is_some());
-        let version_is_bsim3 = simple_assignment_value(&output, "VERSION")
-            .is_some_and(|value| value.starts_with("3."));
-        let bsim3_controls = ["MOBMOD", "CAPMOD", "PARAMCHK", "NQSMOD"]
-            .iter()
-            .any(|parameter| simple_assignment_value(&output, parameter).is_some());
-        if !discrete && version_is_bsim3 && bsim3_controls {
-            output = replace_simple_assignment_value(&output, "LEVEL", "8")?;
-            changed = true;
-        }
-    }
-    Ok(changed.then_some(output))
+    (output != statement).then_some(output)
 }
 
 fn apply_simetrix_temperature(
@@ -5129,30 +5001,8 @@ fn emit_deck_statement_inner(
     let effective = statement_with_init_override(statement, &models.init)?;
     let instrumented = models.instrument_current_branch(&effective, output)?;
     let statement = instrumented.as_str();
-    if let Some((name, model)) = raw_level17_model(statement)? {
-        output.push_str(&emit_level17_core_model(&name, &model)?);
-        return Ok(());
-    }
-    if let Some(rewritten) = rewrite_native_bridge_model(statement, &models.native_bridges)? {
-        output.push_str(&rewritten);
-        output.push('\n');
-        return Ok(());
-    }
-    if let Some(rewritten) = rewrite_simetrix_model_compat(statement)? {
-        output.push_str(&rewritten);
-        output.push('\n');
-        return Ok(());
-    }
-    if raw_pwl_model(statement)?.is_some()
-        || raw_reactive_model(statement)?.is_some()
-        || raw_comp_model(statement)?.is_some()
-        || raw_adc_schmitt_model(statement)?.is_some()
-        || raw_srff_model(statement)?.is_some()
-        || raw_digital_model(statement)?.is_some()
-        || raw_numbered_logic_model(statement)?.is_some()
-        || raw_vcsw_model(statement)?.is_some()
-        || raw_vcq_model(statement)?.is_some()
-    {
+    if let Some(emission) = models.model_emissions.get(&normalized_statement(statement)) {
+        output.push_str(emission);
         return Ok(());
     }
     if let Some(rewritten) = rewrite_native_bridge_instance(statement, &models.native_bridges)? {
@@ -5547,8 +5397,13 @@ pub fn translate_simplis_deck_with_budget(
     budget.charge(Resource::EmittedBytes, 5)?;
     output.push_str(".end\n");
     reject_residual_simplis(&output)?;
+    let bytes =
+        match model_normalize_ngspice::controlled_transfer::lower_sources(output.as_bytes())? {
+            Some(lowered) => lowered.bytes,
+            None => output.into_bytes(),
+        };
     Ok(WholeModelTranslation {
-        bytes: output.into_bytes(),
+        bytes,
         primitives,
         required_code_models,
         stripped_directives,
@@ -6185,10 +6040,10 @@ X1 c b e T
 
     #[test]
     fn model_compat_handles_comma_assignments_and_legacy_mos_typos() -> Result<()> {
-        let rewritten = rewrite_simetrix_model_compat(
-            ".model pox pmos(vlevel=3,to=-0.75,kp=195u,rd=.5,rs=.5,rg=1,rb=1,cgso=66p)",
-        )?
-        .context("expected MOS compatibility rewrite")?;
+        let source = ".model pox pmos(vlevel=3,to=-0.75,kp=195u,rd=.5,rs=.5,rg=1,rb=1,cgso=66p)";
+        let card = model_normalize_ngspice::model_card::parse_model_card(source, 1, &[])?;
+        let rewritten = rewrite_simetrix_model_compat(source, &card)
+            .context("expected MOS compatibility rewrite")?;
         let upper = rewritten.to_ascii_uppercase();
         assert!(upper.contains("LEVEL=3"));
         assert!(upper.contains("VTO=-0.75"));
@@ -6198,6 +6053,24 @@ X1 c b e T
         assert!(!upper.contains(" RB="));
         assert!(!upper.contains(",RB="));
         assert!(upper.contains("CGSO=66P"));
+        Ok(())
+    }
+
+    #[test]
+    fn model_compat_rewrites_only_ordered_top_level_fields() -> Result<()> {
+        let source = r#".model mos NMOS(VLEVEL=3, VLEVEL = 7, VERSION=3.1, MOBMOD=3, RG=2, RG=4, RB=5, RGO=6, quoted="RG=9 VLEVEL=17", nested={max(x, f(RG=8))})"#;
+        let card = model_normalize_ngspice::model_card::parse_model_card(source, 1, &[])?;
+        assert_eq!(model_value(&card, "RG"), Some("4"));
+        let rewritten =
+            rewrite_simetrix_model_compat(source, &card).context("expected MOS rewrite")?;
+        let result = model_normalize_ngspice::model_card::parse_model_card(&rewritten, 1, &[])?;
+        assert_eq!(model_value(&result, "LEVEL"), Some("8"));
+        assert_eq!(result.parameters[0].expression.as_deref(), Some("3"));
+        assert!(model_value(&result, "RG").is_none());
+        assert!(model_value(&result, "RB").is_none());
+        assert_eq!(model_value(&result, "RGO"), Some("6"));
+        assert_eq!(model_value(&result, "quoted"), Some(r#""RG=9 VLEVEL=17""#));
+        assert_eq!(model_value(&result, "nested"), Some("{max(x, f(RG=8))}"));
         Ok(())
     }
 
@@ -7382,7 +7255,8 @@ M1 d g s s Bsim3 W=2 L=0.5u
     #[test]
     fn level7_with_discrete_cgd_signature_is_not_rewritten_as_bsim3() -> Result<()> {
         let source = ".MODEL OLD NMOS (LEVEL=7 VTO=3 KP=2 CGDMAX=1n CGDMIN=10p XG1CGD=0.1 XG2CGD=0.5 VTCGD=0)";
-        assert!(rewrite_simetrix_model_compat(source)?.is_none());
+        let card = model_normalize_ngspice::model_card::parse_model_card(source, 1, &[])?;
+        assert!(rewrite_simetrix_model_compat(source, &card).is_none());
         Ok(())
     }
 

@@ -47,6 +47,8 @@ pub enum Disposition {
     NativeRequest,
     /// Numerical setting materialized in the circuit.
     Circuit,
+    /// Already applied by source model selection; never emitted as a native option.
+    ModelSelection,
     /// Implemented by the initialization policy.
     Initialization,
     /// Requires explicit analysis/output binding.
@@ -343,8 +345,11 @@ pub(crate) fn tracked(command: &str) -> bool {
 }
 
 fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
-    use Disposition::{Circuit, Initialization, Metadata, RequiresBinding, Unsupported};
+    use Disposition::{
+        Circuit, Initialization, Metadata, ModelSelection, RequiresBinding, Unsupported,
+    };
     match (dialect, name) {
+        (AnalysisDialect::Simetrix, "HSPICEMODELS" | "HSPICECOMPATIBILITY") => ModelSelection,
         (AnalysisDialect::Simetrix, "INITCONDMODE" | "ICRES") => Initialization,
         (
             AnalysisDialect::Simetrix,

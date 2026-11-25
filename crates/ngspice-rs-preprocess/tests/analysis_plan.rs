@@ -175,7 +175,7 @@ fn unknown_physical_options_are_retained_and_not_applied() -> Result<()> {
     let root = dir.path().join("deck.net");
     fs::write(
         &root,
-        b"ordinary title\nV1 a 0 1\nR1 a 0 1k\n.options HSPICEMODELS RELTOL=1e-5\n.op\n.end\n",
+        b"ordinary title\nV1 a 0 1\nR1 a 0 1k\n.options UNQUALIFIEDOPTION RELTOL=1e-5\n.op\n.end\n",
     )?;
     let prepared = prepare_path(&root, InputFormat::SimetrixDeck)?;
     let plan = prepared.analysis_plan.as_ref().context("missing plan")?;
@@ -183,11 +183,11 @@ fn unknown_physical_options_are_retained_and_not_applied() -> Result<()> {
         .validate_supported()
         .err()
         .context("unsupported setting accepted")?;
-    assert!(error.to_string().contains("HSPICEMODELS"));
+    assert!(error.to_string().contains("UNQUALIFIEDOPTION"));
     assert!(error.to_string().contains("first_line: 4"));
     let deck = std::str::from_utf8(&prepared.primary.bytes)?;
     assert!(deck.contains(".options RELTOL=1e-5"));
-    assert!(!deck.contains("HSPICEMODELS"));
+    assert!(!deck.contains("UNQUALIFIEDOPTION"));
     Ok(())
 }
 
@@ -246,7 +246,7 @@ fn original_deck_analysis_round_trip_matches_rc_oracle() -> Result<()> {
         let [frequency, amplitude] = numbers.as_slice() else {
             anyhow::bail!("invalid AC data");
         };
-        let expected = 1. / (1. + (std::f64::consts::TAU * frequency * 1e-3).powi(2)).sqrt();
+        let expected = 1. / 1.0f64.hypot(std::f64::consts::TAU * frequency * 1e-3);
         ensure!(
             (amplitude - expected).abs() < 1e-10,
             "AC {frequency}: {amplitude} vs {expected}"

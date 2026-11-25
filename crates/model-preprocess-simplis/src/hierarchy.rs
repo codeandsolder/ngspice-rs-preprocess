@@ -16,7 +16,7 @@ use std::{
 mod runtime_params;
 use runtime_params::RuntimeScope;
 
-const PARSED_LIBRARY_FORMAT_VERSION: u32 = 5;
+const PARSED_LIBRARY_FORMAT_VERSION: u32 = 6;
 
 fn lower_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -70,6 +70,7 @@ pub struct ParsedLibrary {
     dialect: Option<crate::source_dialect::DialectContext>,
     device_identities: Vec<crate::source_dialect::DeviceIdentity>,
     source_id: String,
+    scoped_statements: Vec<crate::source_dialect::ScopedStatement>,
     source_name: String,
     source_names: BTreeSet<String>,
     support_lines: Vec<String>,
@@ -87,6 +88,41 @@ impl ParsedLibrary {
     #[must_use = "the context determines inherited source semantics"]
     pub const fn dialect(&self) -> Option<crate::source_dialect::DialectContext> {
         self.dialect
+    }
+
+    /// Original projected declarations, before simulation-local mapping.
+    #[must_use]
+    pub fn scoped_statements(&self) -> &[crate::source_dialect::ScopedStatement] {
+        &self.scoped_statements
+    }
+
+    /// Rebuild a `SIMetrix` catalog member with the request's device map.
+    ///
+    /// # Errors
+    /// Invalid source selection or hierarchy.
+    pub fn mapped(
+        &self,
+        table: &crate::source_dialect::model_mapping::MappingTable,
+        limit: usize,
+        budget: &WorkBudget,
+    ) -> Result<(
+        Self,
+        Vec<crate::source_dialect::model_mapping::ModelSelection>,
+    )> {
+        let Some(dialect) = self.dialect else {
+            return Ok((self.clone(), Vec::new()));
+        };
+        let mapped = table.apply(&self.scoped_statements, budget)?;
+        let parsed = parse_scoped_parts(
+            self.source_name.clone(),
+            self.source_names.clone(),
+            dialect,
+            &mapped.statements,
+            self.scoped_statements.clone(),
+            limit,
+            budget,
+        )?;
+        Ok((parsed, mapped.selections))
     }
 
     /// Original declarations and linked tokens before specialization.
@@ -146,6 +182,11 @@ impl ParsedLibrary {
         }
         anyhow::ensure!(
             self.source_names.contains(&self.source_name)
+                && self.scoped_statements.iter().all(|statement| self
+                    .source_names
+                    .contains(&statement.source)
+                    && statement.first_line > 0
+                    && statement.last_line >= statement.first_line)
                 && self
                     .device_identities
                     .iter()
@@ -156,6 +197,7 @@ impl ParsedLibrary {
             self.simulator,
             self.dialect,
             &self.device_identities,
+            &self.scoped_statements,
             &self.support_lines,
             &self.aliases,
             &self.definitions,
@@ -736,15 +778,18 @@ pub fn parse_library_for_simulator(
     parse_library_with_budget(source, input, simulator, &WorkBudget::default())
 }
 
-/// Parse a library with the caller's cumulative preparation counters.
+/// Parse a library using the caller's cumulative preparation budget.
 /// # Errors
-/// Malformed library source or exhausted preprocessing budget.
+/// Invalid source or exhausted work allowance.
 pub fn parse_library_with_budget(
     source: impl Into<String>,
     input: &[u8],
     simulator: LibrarySimulator,
     budget: &WorkBudget,
 ) -> Result<ParsedLibrary> {
+    use crate::source_dialect::{
+        DEFAULT_PROJECTION_BYTES, DialectContext, ScopedStatement, SourceKind,
+    };
     budget.charge(Resource::SourceVisits, 1)?;
     budget.charge(Resource::ScannedBytes, input.len())?;
     budget.charge(
@@ -752,85 +797,22 @@ pub fn parse_library_with_budget(
         input.split_inclusive(|byte| *byte == b'\n').count(),
     )?;
     let source_name = source.into();
-    if simulator == LibrarySimulator::Simetrix {
-        let (context, view) = project_simetrix_source(
-            input,
-            crate::source_dialect::DialectContext::default(),
-            crate::source_dialect::SourceKind::Include,
-        )?;
-        let view = lower_simetrix_source_view_with_budget(
-            &view,
-            context,
-            crate::source_dialect::DEFAULT_PROJECTION_BYTES
-                .min(budget.remaining(Resource::EmittedBytes)?),
-            budget,
-        )?;
-        budget.charge(Resource::EmittedBytes, view.len())?;
-        return parse_projected_library(source_name, &view, simulator, Some(context), budget);
-    }
-    let view = project_source(input, simulator)?;
-    budget.charge(Resource::EmittedBytes, view.len())?;
-    parse_projected_library(source_name, &view, simulator, None, budget)
-}
-
-/// Parse an admitted, scoped source graph whose individual resources have
-/// already been projected and lowered using their own language context.
-///
-/// # Errors
-/// Invalid source identities, hierarchy, or exceeded expansion budget.
-pub fn parse_scoped_library(
-    source_name: String,
-    source_names: BTreeSet<String>,
-    dialect: crate::source_dialect::DialectContext,
-    statements: &[crate::source_dialect::ScopedStatement],
-    limit: usize,
-    budget: &WorkBudget,
-) -> Result<ParsedLibrary> {
-    use crate::source_dialect::resolve_device_identities;
-    anyhow::ensure!(
-        source_names.contains(&source_name)
-            && statements
-                .iter()
-                .all(|line| source_names.contains(&line.source)),
-        "incomplete admitted source graph"
-    );
-    budget.charge(Resource::Statements, statements.len())?;
-    for line in statements {
-        budget.charge(Resource::ScannedBytes, line.text.len())?;
-    }
-    let resolved = resolve_device_identities(statements)?;
-    budget.charge(Resource::EmittedBytes, resolved.text.len())?;
-    anyhow::ensure!(
-        resolved.text.len() <= limit,
-        "device identity expansion byte budget exceeded"
-    );
-    parse_library_parts(
-        source_name,
-        source_names,
-        &resolved.text,
-        LibrarySimulator::Simetrix,
-        Some(dialect),
-        resolved.identities,
-        budget,
-    )
-}
-
-fn parse_projected_library(
-    source_name: String,
-    selected_view: &str,
-    simulator: LibrarySimulator,
-    dialect: Option<crate::source_dialect::DialectContext>,
-    budget: &WorkBudget,
-) -> Result<ParsedLibrary> {
-    use crate::source_dialect::{DEFAULT_PROJECTION_BYTES, ScopedStatement};
     let sources = BTreeSet::from([source_name.clone()]);
-    if let Some(context) = dialect {
-        let statements = selected_view
-            .lines()
-            .map(|text| ScopedStatement {
+    if simulator == LibrarySimulator::Simetrix {
+        let (context, view) = project_resource(
+            input,
+            DialectContext::default(),
+            SourceKind::Include,
+            simulator,
+        )?;
+        let statements = view
+            .into_iter()
+            .map(|line| ScopedStatement {
                 source: source_name.clone(),
                 context,
-                text: text.to_owned(),
+                first_line: line.first_line,
+                last_line: line.last_line,
+                text: line.text,
             })
             .collect::<Vec<_>>();
         return parse_scoped_library(
@@ -842,26 +824,140 @@ fn parse_projected_library(
             budget,
         );
     }
+    let view = project_source(input, simulator)?;
+    budget.charge(Resource::EmittedBytes, view.len())?;
     parse_library_parts(
         source_name,
         sources,
-        selected_view,
-        simulator,
-        None,
+        &view,
+        LibraryProjection {
+            simulator,
+            dialect: None,
+            scoped_statements: Vec::new(),
+        },
         Vec::new(),
         budget,
     )
+}
+
+/// Parse an admitted, scoped source graph whose individual resources have
+/// already been projected using their own language context.
+///
+/// # Errors
+/// Invalid source identities, hierarchy, or exceeded expansion budget.
+pub fn parse_scoped_library(
+    source_name: String,
+    source_names: BTreeSet<String>,
+    dialect: crate::source_dialect::DialectContext,
+    statements: &[crate::source_dialect::ScopedStatement],
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<ParsedLibrary> {
+    parse_scoped_parts(
+        source_name,
+        source_names,
+        dialect,
+        statements,
+        statements.to_vec(),
+        limit,
+        budget,
+    )
+}
+
+/// Lower each source's lexical dialect without losing its neutral card text.
+///
+/// # Errors
+/// Invalid expression or output byte budget exceeded.
+pub fn lower_scoped_statements(
+    statements: &[crate::source_dialect::ScopedStatement],
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<Vec<crate::source_dialect::ScopedStatement>> {
+    let mut remaining = limit;
+    let mut opaque = crate::source_dialect::OpaqueSource::default();
+    statements
+        .iter()
+        .map(|statement| {
+            budget.charge(Resource::Statements, 1)?;
+            budget.charge(Resource::ScannedBytes, statement.text.len())?;
+            let mut statement = statement.clone();
+            if !opaque.consume(&statement.text) {
+                statement.text = crate::source_dialect::lower_statement_with_budget(
+                    &statement.text,
+                    statement.context,
+                    remaining.min(budget.remaining(Resource::EmittedBytes)?),
+                    budget,
+                )?;
+            }
+            remaining = remaining
+                .checked_sub(statement.text.len().saturating_add(1))
+                .context("source dialect output byte budget exceeded")?;
+            budget.charge(
+                Resource::EmittedBytes,
+                statement.text.len().saturating_add(1),
+            )?;
+            Ok(statement)
+        })
+        .collect()
+}
+
+fn parse_scoped_parts(
+    source_name: String,
+    source_names: BTreeSet<String>,
+    dialect: crate::source_dialect::DialectContext,
+    statements: &[crate::source_dialect::ScopedStatement],
+    original: Vec<crate::source_dialect::ScopedStatement>,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<ParsedLibrary> {
+    use crate::source_dialect::resolve_device_identities;
+    anyhow::ensure!(
+        source_names.contains(&source_name)
+            && statements
+                .iter()
+                .all(|line| source_names.contains(&line.source)),
+        "incomplete admitted source graph"
+    );
+    let lowered = lower_scoped_statements(statements, limit, budget)?;
+    let resolved = resolve_device_identities(&lowered)?;
+    budget.charge(Resource::EmittedBytes, resolved.text.len())?;
+    anyhow::ensure!(
+        resolved.text.len() <= limit,
+        "device identity expansion byte budget exceeded"
+    );
+    parse_library_parts(
+        source_name,
+        source_names,
+        &resolved.text,
+        LibraryProjection {
+            simulator: LibrarySimulator::Simetrix,
+            dialect: Some(dialect),
+            scoped_statements: original,
+        },
+        resolved.identities,
+        budget,
+    )
+}
+
+struct LibraryProjection {
+    simulator: LibrarySimulator,
+    dialect: Option<crate::source_dialect::DialectContext>,
+    scoped_statements: Vec<crate::source_dialect::ScopedStatement>,
 }
 
 fn parse_library_parts(
     source_name: String,
     source_names: BTreeSet<String>,
     selected_view: &str,
-    simulator: LibrarySimulator,
-    dialect: Option<crate::source_dialect::DialectContext>,
+    projection: LibraryProjection,
     device_identities: Vec<crate::source_dialect::DeviceIdentity>,
     budget: &WorkBudget,
 ) -> Result<ParsedLibrary> {
+    let LibraryProjection {
+        simulator,
+        dialect,
+        scoped_statements,
+    } = projection;
     let parsed = extract_definitions_scoped(selected_view, None, budget)?;
     let (support_lines, aliases) = parse_library_root(&parsed.root_lines)?;
     let mut definitions = parsed.definitions;
@@ -873,6 +969,7 @@ fn parse_library_parts(
         simulator,
         dialect,
         &device_identities,
+        &scoped_statements,
         &support_lines,
         &aliases,
         &definitions,
@@ -883,6 +980,7 @@ fn parse_library_parts(
         dialect,
         device_identities,
         source_id,
+        scoped_statements,
         source_name,
         source_names,
         support_lines,
@@ -1142,13 +1240,14 @@ fn parsed_library_digest(
     simulator: LibrarySimulator,
     dialect: Option<crate::source_dialect::DialectContext>,
     identities: &[crate::source_dialect::DeviceIdentity],
+    statements: &[crate::source_dialect::ScopedStatement],
     support_lines: &[String],
     aliases: &[Alias],
     definitions: &[Definition],
 ) -> String {
     let semantic_digest = library_digest(support_lines, aliases, definitions);
     let mut hasher = Sha256::new();
-    hasher.update(b"ngspice-rs-preprocess-parsed-library-v5\0");
+    hasher.update(b"ngspice-rs-preprocess-parsed-library-v6\0");
     if let Some(context) = dialect {
         hasher.update([match context.language {
             crate::source_dialect::SourceLanguage::Simetrix => 1,
@@ -1172,6 +1271,23 @@ fn parsed_library_digest(
             hasher.update([0]);
         }
         hasher.update([0xfe]);
+    }
+    for statement in statements {
+        hasher.update([match statement.context.language {
+            crate::source_dialect::SourceLanguage::Simetrix => 1,
+            crate::source_dialect::SourceLanguage::Hspice => 2,
+            crate::source_dialect::SourceLanguage::Pspice => 3,
+        }]);
+        hasher.update(
+            statement
+                .context
+                .separator
+                .map_or(0, u32::from)
+                .to_be_bytes(),
+        );
+        hasher.update(statement.text.len().to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(statement.text.as_bytes());
     }
     hasher.update(simulator.as_str().as_bytes());
     hasher.update([0]);
@@ -1472,7 +1588,7 @@ pub fn active_statement_prefix(statement: &str) -> &str {
 
 /// Identify the assignment tail of a charge-defined capacitor, excluding comments.
 /// A capacitance value and a charge expression are distinct device forms.
-#[must_use]
+#[must_use = "the returned tail identifies the charge-defined capacitor law"]
 pub fn capacitor_charge_assignments(statement: &str) -> Option<&str> {
     let active = active_statement_prefix(statement).trim_start();
     let mut fields = active.split_whitespace();
