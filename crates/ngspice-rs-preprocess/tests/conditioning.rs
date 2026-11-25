@@ -31,6 +31,7 @@ fn condition(library: &str, root: &str) -> Result<ConditionedArtifact> {
             },
         ],
         None,
+        &[],
     )?;
     ensure!(outputs.len() == 2);
     Ok(outputs.remove(1))
@@ -284,5 +285,38 @@ fn driver_current_can_be_used_without_a_separate_sensor() -> Result<()> {
     let text = std::str::from_utf8(&output.bytes)?;
     assert!(text.contains("IC=0"));
     assert!(text.contains("I(Edriver)/"));
+    Ok(())
+}
+
+#[test]
+fn typed_waveform_placeholder_is_not_a_zero_voltage_sensor() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("input.cir");
+    let wave_cell = CELL.replace(
+        "Vmeasure n1 n2 0",
+        "Vmeasure n1 n2 PUL V1=0 V2=1 FREQ=1k DRATIO=0.5 DELAY=0.75m OFF_UNTIL_DELAY=YES",
+    );
+    let untouched_cell = CELL.replace("cell", "other");
+    fs::write(
+        &input,
+        format!("* caller\nX1 a 0 cell\nX2 b 0 other\n{wave_cell}\n{untouched_cell}\n.end\n"),
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::SimetrixDeck,
+            input: SourceInput::File(input),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    assert_eq!(bundle.waveforms.len(), 1);
+    let scalings = bundle
+        .artifacts()
+        .flat_map(|artifact| &artifact.current_scalings)
+        .collect::<Vec<_>>();
+    assert_eq!(scalings.len(), 1);
+    assert_ne!(scalings[0].scope, bundle.waveforms[0].scope);
     Ok(())
 }

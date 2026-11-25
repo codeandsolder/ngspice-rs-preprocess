@@ -1383,6 +1383,28 @@ pub fn active_statement_prefix(statement: &str) -> &str {
     crate::source_dialect::active_prefix(statement, ';')
 }
 
+/// Identify the assignment tail of a charge-defined capacitor, excluding comments.
+/// A capacitance value and a charge expression are distinct device forms.
+#[must_use]
+pub fn capacitor_charge_assignments(statement: &str) -> Option<&str> {
+    let active = active_statement_prefix(statement).trim_start();
+    let mut fields = active.split_whitespace();
+    if !fields
+        .next()?
+        .as_bytes()
+        .first()?
+        .eq_ignore_ascii_case(&b'C')
+    {
+        return None;
+    }
+    fields.next()?;
+    let last_node = fields.next()?;
+    let end = last_node.as_ptr().addr() - active.as_ptr().addr() + last_node.len();
+    let tail = active[end..].trim_start();
+    let (key, _) = tail.split_once('=')?;
+    key.trim().eq_ignore_ascii_case("Q").then_some(tail)
+}
+
 fn legacy_colon_call(trimmed: &str) -> Result<Option<(&str, &str, bool)>> {
     let Some(colon) = find_ascii_case_insensitive(trimmed, " : ") else {
         return Ok(None);
@@ -2415,7 +2437,8 @@ fn make_linked_unit(
     override_text: &str,
     inherited: &Environment,
     init: InitTree,
-    simetrix: bool,
+    parent_runtime: Option<&RuntimeScope>,
+    external: &SubcircuitCatalog,
 ) -> Result<LinkedUnit> {
     let overrides = if explicit_vars {
         parse_overrides(override_text)?
@@ -2459,10 +2482,16 @@ fn make_linked_unit(
         (definition.bytes.clone(), inherited.clone())
     };
     let (bytes, init) = merge_local_init(&bytes, init)?;
-    let (bytes, runtime) = if simetrix {
+    let (bytes, runtime) = if let Some(parent) = parent_runtime {
         let actuals = if explicit_vars { "" } else { override_text };
-        let (prepared, runtime) = RuntimeScope::prepare(&bytes, &definition.scope_id, actuals)
+        let (prepared, mut runtime) = RuntimeScope::prepare(&bytes, &definition.scope_id, actuals)
             .with_context(|| format!("binding SIMetrix parameters for {}", definition.name))?;
+        let support = definition
+            .source_id
+            .as_deref()
+            .and_then(|source| external.source_metadata(source))
+            .map_or(&[][..], |metadata| metadata.support_lines.as_slice());
+        runtime.set_source_scope(parent, support)?;
         (prepared, Some(runtime))
     } else {
         (bytes, None)
@@ -2523,7 +2552,8 @@ fn link_call(
         override_text,
         inherited,
         init,
-        caller.runtime.is_some(),
+        caller.runtime,
+        external,
     )?;
     let rewritten = if !compile_time_vars
         && let (Some(caller), Some(callee)) = (caller.runtime, &unit.runtime)
@@ -2633,7 +2663,12 @@ fn emit_linked_unit(
             children.push(child);
         } else {
             let statement = match &unit.runtime {
-                Some(runtime) => runtime.rewrite_statement(&statement)?,
+                Some(runtime) => {
+                    let rewritten = runtime.rewrite_bare_passive(&statement, |name| {
+                        Ok(external.source_for_model(name)?.is_some())
+                    })?;
+                    runtime.rewrite_statement(&rewritten)?
+                }
                 None => statement,
             };
             rewritten_body.push(annotate_unlinked_init(&statement, &child_init));
@@ -2874,6 +2909,12 @@ fn link_root_statements(
             root_output.push('\n');
             root_units.push(unit);
         } else {
+            let statement = match runtime {
+                Some(runtime) => runtime.rewrite_bare_passive(&statement, |name| {
+                    Ok(external.source_for_model(name)?.is_some())
+                })?,
+                None => statement,
+            };
             root_output.push_str(&annotate_unlinked_init(&statement, &child_init));
             root_output.push('\n');
         }
@@ -2989,7 +3030,8 @@ pub fn preprocess_netlist_linked(
     }
 
     let runtime = (external.simulator == Some(LibrarySimulator::Simetrix))
-        .then(|| RuntimeScope::root(&root_source_id));
+        .then(|| RuntimeScope::root_with_symbols(&root_source_id, &root_support))
+        .transpose()?;
     let (mut root_output, root_units, end_statement) =
         link_root_statements(&extracted.root_lines, &local, external, runtime.as_ref())?;
 

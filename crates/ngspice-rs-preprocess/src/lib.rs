@@ -5,12 +5,12 @@ pub mod analysis_plan;
 mod dialect;
 
 use anyhow::{Context, Result, ensure};
-pub use model_normalize_ngspice::passive_ic;
 use model_normalize_ngspice::{
     NormalizationPass,
     linked_source::{LinkLimits, RootKind, SourceLinker},
     normalize_mapped,
 };
+pub use model_normalize_ngspice::{passive_ic, waveform};
 pub use model_preprocess_command::{
     AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, SourceSession,
 };
@@ -212,6 +212,10 @@ pub struct PreparedBundle {
     pub initial_conditions: Option<passive_ic::InitialConditions>,
     /// Original dialect analysis declarations; native decks retain executable cards.
     pub analysis_plan: Option<analysis_plan::AnalysisPlan>,
+    /// Mandatory named independent-source forcing, bound once per
+    /// elaborated occurrence and parameter candidate. Electrical cards
+    /// retain the source identity but may contain only a DC placeholder.
+    pub waveforms: Vec<waveform::PreparedWaveform>,
 }
 
 impl PreparedBundle {
@@ -302,6 +306,7 @@ fn native(
         device_identities: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,
+        waveforms: Vec::new(),
     })
 }
 
@@ -357,8 +362,18 @@ pub fn prepare(
         condition_generated_bundle(&mut result)?;
     }
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
+    for declaration in &result.waveforms {
+        ensure!(
+            result
+                .artifacts()
+                .any(|artifact| artifact.filename == declaration.artifact),
+            "missing waveform artifact {}",
+            declaration.artifact
+        );
+    }
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
+        waveform::validate_artifact(&result.waveforms, &artifact.filename, &artifact.bytes)?;
         remaining = remaining
             .checked_sub(artifact.bytes.len())
             .context("combined artifact output byte budget exceeded")?;
@@ -377,7 +392,11 @@ fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
             bytes: &artifact.bytes,
         })
         .collect::<Vec<_>>();
-    let outputs = condition_private_differentiators(&inputs, bundle.initial_conditions.as_ref())?;
+    let outputs = condition_private_differentiators(
+        &inputs,
+        bundle.initial_conditions.as_ref(),
+        &bundle.waveforms,
+    )?;
     let mut changed = false;
     for (artifact, output) in std::iter::once(&mut bundle.primary)
         .chain(&mut bundle.companions)

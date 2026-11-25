@@ -4,7 +4,8 @@ Standalone SPICE normalization, dialect lowering, source linking,
 parameter compilation and reusable prepared model kernels.
 
 The workspace contains the ngspice normalizer, SIMPLIS source preprocessor and
-translator, and VDMOS prepared numerical kernel. Experimental ALB/XSPICE
+translator, and prepared diode, VDMOS, bipolar and intrinsic compact-model
+packages. Experimental ALB/XSPICE
 compilation lives in the separate `model-alb-experimental` crate and is
 excluded from default workspace builds. The production translator does not
 link it and rejects unsupported source semantics explicitly.
@@ -72,7 +73,18 @@ SIMetrix decks preserve runtime argument binding, including implicit formals,
 source-order actuals, callee defaults and isolated local scopes. Direct and
 nested electrical model dependencies are resolved against declared catalog
 models, including optional substrate/bulk terminals and passive model/value
-forms; ambiguous model positions are rejected.
+forms; ambiguous model positions are rejected. Bare passive values resolve
+to visible parameters only when no visible model has that name. Charge
+expressions preserve dynamic probe and temperature semantics independently
+of instance parameter bindings; capacitor temperature coefficients lower
+to the native two-coefficient form.
+
+SIMetrix source absolute-base exponentiation (`**` and `PWR`) preserves
+source associativity, unary operands, the zero-base Jacobian and true
+negative-power singularities. Lowering is performed before cross-language
+source linking, within the existing expression expansion budget. Native
+signed power and HSPICE/PSpice expression contexts remain distinct.
+`LIMIT` clamps between either ordering of its two bounds.
 
 Nominal SIMetrix preparation lowers PI, E and the historical BOLTZ/ECHARGE
 constants, stable LNCOSH and lazy nominal GAUSS(x) (always 1). Predefined
@@ -98,7 +110,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 5 includes
+counts, dependencies and provenance. Manifest version 6 includes
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
 `Artifact::required_code_models` and `PreparedBundle::required_code_models()`.
@@ -243,7 +255,7 @@ or capacitances, or requires unchanged internal current observations, select
 ### Original analysis intent
 
 A translated dialect deck is an electrical artifact, not an implicitly
-executable replica of the original netlist. Manifest v5 and
+executable replica of the original netlist. Manifest v6 and
 `PreparedBundle::analysis_plan` carry an ordered analysis plan alongside
 the circuit, with explicit source dialect, title, lexical scope and
 declaration locations. Complete SIMetrix decks reserve their first
@@ -279,7 +291,7 @@ Native ngspice input retains its own native executable directives.
 ### Analysis-scoped passive initialization
 
 The SIMetrix deck policy is carried separately from ordinary electrical
-artifacts in `PreparedBundle::initial_conditions` and manifest v5.
+artifacts in `PreparedBundle::initial_conditions` and manifest v6.
 It retains source-specific `INITCONDMODE`, `ICRES`, per-device `IC`,
 `ICMODE`, and optional `BRANCH`, plus ordered node `.IC` hints. The
 source-only device and node IC fields are removed from the emitted
@@ -327,3 +339,33 @@ consumer explicitly running the native transient with UIC.
 Reference: SIMPLIS simulator manual, sections "Device Models Used in
 Simplis", "SIMPLIS Device Types", and "Control Statements for Setting
 Initial Conditions".
+
+
+### Prepared independent-source waveforms
+
+Manifest v6 carries `PreparedBundle::waveforms`, keyed by emitted artifact,
+lexical subcircuit scope and independent source identity. Bind each declaration
+in its actual occurrence's parameter environment using `PreparedWaveform::resolve`.
+The result includes the time-zero DC value, the time-domain forcing, and the
+periodic-operating-point idle flag. Native positional sources are unchanged.
+
+Named PUL (rectangular or trapezoidal), PWLS PUL, SAW, SIN and PWL share this
+contract. Periodic linear forcing stores one sorted cycle of unique knots with
+separate left and right values, an origin, a positive period and an optional
+pre-delay hold. Ungated cycles extend both ways; the origin is the nearest
+signed cycle boundary to zero, avoiding loss of a small positive delay to
+period subtraction. The first knot is at zero, the endpoint is implicit and
+interpolation approaches its left value. Coincident edges collapse to their
+exterior limits, not artificial finite-duration ramps. DC startup uses the
+right-sided value except while the source is held. PWL may have signed times
+and duplicate times; SIN keeps signed delay and damping. Symbolic timing is
+validated when bound.
+
+The typed payload is authoritative, including when a native-looking source
+card has only its DC placeholder. Consumers must bind the payload before
+analysis; do not silently simulate a placeholder as a constant source.
+The standalone expanded translator can emit native reference cards for
+constant parameters, including ngspice's duplicate-knot PWL syntax; this
+is a reference representation, not the prepared solver contract. The
+native solver binding and exact event scheduling are tracked in
+ngspice-rs-fast issue 223.

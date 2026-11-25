@@ -10,8 +10,8 @@ use super::{
 use crate::{normalized_statement, parse_numeric, statement_tokens};
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_simplis::{
-    LinkedPreprocessedNetlist, active_statement_prefix, parameter_assignments, simetrix_constant,
-    validate_simetrix_parameter_name,
+    LinkedPreprocessedNetlist, active_statement_prefix, capacitor_charge_assignments,
+    parameter_assignments, simetrix_constant, validate_simetrix_parameter_name,
 };
 use std::{collections::BTreeMap, fmt::Write as _};
 
@@ -196,6 +196,28 @@ impl Builtins {
         }
         let normalized = normalized_statement(statement);
         let active = active_statement_prefix(&normalized);
+        if let Some(tail) = capacitor_charge_assignments(active) {
+            let start = tail.as_ptr().addr() - active.as_ptr().addr();
+            let mut output = active[..start].trim_end().to_owned();
+            for (name, value) in parameter_assignments(tail)? {
+                if name.eq_ignore_ascii_case("Q") {
+                    let value = value.trim();
+                    let value = value
+                        .strip_prefix('\'')
+                        .and_then(|v| v.strip_suffix('\''))
+                        .or_else(|| value.strip_prefix('{').and_then(|v| v.strip_suffix('}')))
+                        .unwrap_or(value);
+                    let expression = self.expression(value, ExpressionContext::Behavioral)?;
+                    let expression = lower_simetrix_behavioral_expression(&expression)?;
+                    write!(output, " Q='{expression}'")?;
+                } else {
+                    let expression = self.expression(value, ExpressionContext::Static)?;
+                    let expression = lower_simetrix_behavioral_expression(&expression)?;
+                    write!(output, " {name}={expression}")?;
+                }
+            }
+            return Ok(output);
+        }
         match directive_name(trimmed).as_deref() {
             Some(".MODEL") => self.braced_regions(&materialize_jfet_defaults(active)?),
             Some(".PARAM") => {

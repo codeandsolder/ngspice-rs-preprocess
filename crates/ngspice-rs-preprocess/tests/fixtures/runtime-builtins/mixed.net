@@ -1,0 +1,9 @@
+* quoted power and mixed operators
+V1 x 0 -2
+B1 a 0 V='V(x)**3'
+B2 b 0 V={2**3^2}
+B3 c 0 V={2^3**2}
+B4 d 0 V={-V(x)**3}
+B5 e 0 V={2**-3}
+.op
+.end

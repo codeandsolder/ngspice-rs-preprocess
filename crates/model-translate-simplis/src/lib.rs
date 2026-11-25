@@ -15,16 +15,17 @@ use syntax::{
 mod whole;
 pub use whole::{
     SplitDeckTranslation, WholeModelTranslation, capture_artifact_initial_conditions,
-    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
-    translate_simplis_deck_split, translate_simplis_expanded_library,
+    capture_artifact_waveforms, capture_linked_waveforms, capture_passive_initial_conditions,
+    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_deck_split,
+    translate_simplis_expanded_library,
 };
 
 /// One numeric point on a piecewise-linear characteristic.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
-    /// Independent voltage or current coordinate.
+    /// First model coordinate (voltage for resistors/capacitors, current for inductors).
     pub voltage: f64,
-    /// Dependent current or charge coordinate.
+    /// Second model coordinate (current, charge or flux linkage).
     pub value: f64,
 }
 
@@ -141,7 +142,7 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_points(points: &[Point]) -> Result<()> {
+fn validate_finite_points(points: &[Point]) -> Result<()> {
     if points.len() < 2 {
         bail!("piecewise-linear characteristic requires at least two points");
     }
@@ -151,6 +152,11 @@ fn validate_points(points: &[Point]) -> Result<()> {
     {
         bail!("piecewise-linear characteristic contains a non-finite coordinate");
     }
+    Ok(())
+}
+
+fn validate_points(points: &[Point]) -> Result<()> {
+    validate_finite_points(points)?;
     if points
         .windows(2)
         .any(|window| window[0].voltage >= window[1].voltage)
@@ -177,6 +183,36 @@ fn write_pwl(output: &mut String, node_p: &str, node_n: &str, points: &[Point]) 
     Ok(())
 }
 
+fn validate_resistor_end_slopes(points: &[Point], current_defined: bool) -> Result<()> {
+    validate_finite_points(points)?;
+    let independent = |point: &Point| {
+        if current_defined {
+            point.value
+        } else {
+            point.voltage
+        }
+    };
+    let dependent = |point: &Point| {
+        if current_defined {
+            point.voltage
+        } else {
+            point.value
+        }
+    };
+    anyhow::ensure!(
+        points
+            .windows(2)
+            .all(|pair| independent(&pair[0]) < independent(&pair[1])),
+        "piecewise-linear resistor independent coordinates must be strictly increasing"
+    );
+    anyhow::ensure!(
+        dependent(&points[0]) < dependent(&points[1])
+            && dependent(&points[points.len() - 2]) < dependent(&points[points.len() - 1]),
+        "piecewise-linear resistor end segments require positive differential resistance"
+    );
+    Ok(())
+}
+
 /// Translate a SIMPLIS `VPWLR` two-terminal V-I primitive to an ngspice
 /// behavioral current source.
 ///
@@ -193,7 +229,7 @@ pub fn translate_vpwlr(
     validate_name(name)?;
     validate_node(node_p)?;
     validate_node(node_n)?;
-    validate_points(points)?;
+    validate_resistor_end_slopes(points, false)?;
 
     let mut output = String::new();
     write!(output, "B{name} {node_p} {node_n} I=")?;
@@ -208,10 +244,13 @@ pub fn translate_vpwlr(
 /// Translate a SIMPLIS `IPWLR` two-terminal I-V primitive to an ngspice
 /// series current sensor plus behavioral voltage source.
 ///
+/// As with VPWLR, points are voltage/current pairs; only the independent coordinate
+/// changes. Interior voltage slopes may be negative or zero.
+///
 /// # Errors
 ///
 /// Returns an error for invalid identifiers, fewer than two points, non-finite
-/// coordinates, or non-monotonic current coordinates.
+/// coordinates, non-monotonic current coordinates, or nonpositive end slopes.
 pub fn translate_ipwlr(
     name: &str,
     node_p: &str,
@@ -221,7 +260,7 @@ pub fn translate_ipwlr(
     validate_name(name)?;
     validate_node(node_p)?;
     validate_node(node_n)?;
-    validate_points(points)?;
+    validate_resistor_end_slopes(points, true)?;
 
     let stem = sanitized_name(name);
     let sense = format!("V__{stem}_IPWLR_SENSE");
@@ -231,9 +270,9 @@ pub fn translate_ipwlr(
     write!(output, "B__{stem}_IPWLR {middle} {node_n} V=pwl(i({sense})")?;
     for point in points {
         output.push_str(", ");
-        write_number(&mut output, point.voltage)?;
-        output.push_str(", ");
         write_number(&mut output, point.value)?;
+        output.push_str(", ");
+        write_number(&mut output, point.voltage)?;
     }
     output.push_str(")\n");
     Ok(Translation {
@@ -537,7 +576,7 @@ fn sanitized_name(input: &str) -> String {
         .collect()
 }
 
-fn indexed_points(
+fn read_indexed_points(
     parameters: &std::collections::BTreeMap<String, String>,
     count: usize,
     voltage_prefix: &str,
@@ -550,6 +589,16 @@ fn indexed_points(
             value: numeric_parameter(parameters, &format!("{value_prefix}{index}"))?,
         });
     }
+    Ok(points)
+}
+
+fn indexed_points(
+    parameters: &std::collections::BTreeMap<String, String>,
+    count: usize,
+    voltage_prefix: &str,
+    value_prefix: &str,
+) -> Result<Vec<Point>> {
+    let points = read_indexed_points(parameters, count, voltage_prefix, value_prefix)?;
     validate_points(&points)?;
     Ok(points)
 }

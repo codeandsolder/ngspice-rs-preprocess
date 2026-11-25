@@ -21,8 +21,9 @@ use model_preprocess_simplis::{
     source_include_target,
 };
 use model_translate_simplis::{
-    capture_artifact_initial_conditions, capture_passive_initial_conditions,
-    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_expanded_library,
+    capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
+    translate_simplis_expanded_library,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -73,6 +74,7 @@ fn bundle(
         device_identities: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,
+        waveforms: Vec::new(),
     }
 }
 
@@ -498,6 +500,12 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
         Some(&root.path),
         &[],
     )?;
+    let mut waveforms = Vec::new();
+    capture_artifact_waveforms(
+        &mut source,
+        if include { "model.lib" } else { "deck.cir" },
+        &mut waveforms,
+    )?;
     let translated = if include {
         translate_simplis_expanded_library(&source)?
     } else {
@@ -514,6 +522,7 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
     );
     let mut bundle = bundle(root, format, artifact, Vec::new());
     bundle.analysis_plan = Some(plan);
+    bundle.waveforms = waveforms;
     Ok(bundle)
 }
 
@@ -611,6 +620,7 @@ fn linked(
     } else {
         None
     };
+    let waveforms = capture_linked_waveforms(&mut linked)?;
     let known = linked
         .libraries
         .iter()
@@ -661,6 +671,7 @@ fn linked(
             || !policy.devices.is_empty()
             || !policy.nodes.is_empty()
     });
+    bundle.waveforms = waveforms;
     Ok(bundle)
 }
 

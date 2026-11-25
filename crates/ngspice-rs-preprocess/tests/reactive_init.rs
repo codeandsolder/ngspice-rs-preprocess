@@ -54,9 +54,9 @@ fn materialize_uic(dir: &Path, bundle: &PreparedBundle, control: &str) -> Result
                     && d.scope == scope
                     && d.device.eq_ignore_ascii_case(first)
             }) {
-                let resolved = device.resolve(analysis, defaults, resolver)?;
-                assert_eq!(resolved.bias, BiasConstraint::None);
-                let initial = resolved.storage_ic.context("missing storage IC")?;
+                let startup = device.resolve(analysis, defaults, resolver)?;
+                assert_eq!(startup.bias, BiasConstraint::None);
+                let initial = startup.storage_ic.context("missing storage IC")?;
                 writeln!(output, "{line} IC={initial:.17e}")?;
                 count += 1;
             } else if first.eq_ignore_ascii_case(".end")
@@ -115,9 +115,9 @@ fn run_native(dir: &Path, bundle: &PreparedBundle, control: &str) -> Result<Vec<
 // is 4 at zero voltage. The two capacitances are 2 and 4 respectively.
 fn physical_charge(voltage: f64) -> f64 {
     if voltage < 0. {
-        2. * voltage + 4.
+        2.0_f64.mul_add(voltage, 4.)
     } else {
-        4. * voltage + 4.
+        4.0_f64.mul_add(voltage, 4.)
     }
 }
 
@@ -160,13 +160,13 @@ XC p n CELL
         let defaults = policy
             .resolve_defaults(|expr| evaluate_expression(expr, analysis, |s| bail!("{s}")))?;
         for device in &policy.devices {
-            let resolved = device.resolve(analysis, defaults, |expr| {
+            let startup = device.resolve(analysis, defaults, |expr| {
                 evaluate_expression(expr, analysis, |s| bail!("{s}"))
             })?;
             assert_eq!(
-                resolved.bias,
+                startup.bias,
                 BiasConstraint::CapacitorHard {
-                    voltage: resolved.storage_ic.context("missing coordinate")?
+                    voltage: startup.storage_ic.context("missing coordinate")?
                 }
             );
         }
@@ -217,6 +217,10 @@ V2 b 0 -1
 !L2 b 0 ML IC=0
 .MODEL ML PWLL NSEG=2 X0=-2 Y0=-1m X1=0 Y1=3m X2=2 Y2=11m
 .INIT I(!L1)=-1 I(!L2)=3
+H1 ha 0 !L1 1
+H2 hb 0 !L2 1
+Rha ha 0 1k
+Rhb hb 0 1k
 Icap 0 c 1m
 C1 c 0 1u IC=-5
 .INIT V(C1)=2
@@ -241,20 +245,32 @@ tran 1u 4m 0 0.5u uic
 let ia=-i(v1)
 let ib=-i(v2)
 let ilin=-i(vlin)
-wrdata wave.dat ia ib v(c) ilin
+wrdata wave.dat ia ib v(c) ilin v(ha) v(hb)
 quit
 .endc",
     )?;
     assert!(trace.len() > 8000);
     let flux = |current: f64| {
         if current < 0. {
-            2e-3 * current + 3e-3
+            2e-3_f64.mul_add(current, 3e-3)
         } else {
-            4e-3 * current + 3e-3
+            4e-3_f64.mul_add(current, 3e-3)
         }
     };
+    // The same two flux/current trajectories were measured independently
+    // in SIMPLIS 9.40 (201 samples per polarity). Verify branch-current
+    // observation and the energy integral in addition to flux.
+    let energy = |current: f64| {
+        if current < 0. {
+            1e-3 * current * current
+        } else {
+            2e-3 * current * current
+        }
+    };
+    let (mut previous_time, mut previous_a, mut previous_b) = (0.0, -1.0, 3.0);
+    let (mut work_a, mut work_b) = (0.0, 0.0);
     for row in trace {
-        let [time, a, b, c, i] = row.as_slice() else {
+        let [time, a, b, c, i, ha, hb] = row.as_slice() else {
             bail!("unexpected flux trace width")
         };
         ensure!(
@@ -265,8 +281,24 @@ quit
             (flux(*b) - flux(3.) + time).abs() < 1e-10,
             "t={time} i2={b}"
         );
-        assert!((c - (2. + time * 1000.)).abs() < 1e-7);
-        assert!((i - (-0.5 + time * 1000.)).abs() < 1e-7);
+        ensure!(
+            (ha - a).abs() < 1e-10 && (hb - b).abs() < 1e-10,
+            "controlled source observes wrong physical branch"
+        );
+        let step = time - previous_time;
+        work_a = (a + previous_a).mul_add(0.5 * step, work_a);
+        work_b = (b + previous_b).mul_add(-0.5 * step, work_b);
+        ensure!(
+            (energy(*a) - energy(-1.) - work_a).abs() < 1e-9,
+            "forward energy balance"
+        );
+        ensure!(
+            (energy(*b) - energy(3.) - work_b).abs() < 1e-9,
+            "reverse energy balance"
+        );
+        (previous_time, previous_a, previous_b) = (*time, *a, *b);
+        assert!((c - 1000.0_f64.mul_add(*time, 2.)).abs() < 1e-7);
+        assert!((i - 1000.0_f64.mul_add(*time, -0.5)).abs() < 1e-7);
     }
     Ok(())
 }

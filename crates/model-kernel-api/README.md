@@ -54,6 +54,6 @@ cargo test --locked -p model-kernel-api -p model-kernel-vdmos
 cargo test --locked -p model-kernel-vdmos --test ngspice47 -- --ignored
 ```
 
-The first real producer is the VDMOS artifact. Its circuit-coupled
-engine integration is a separate task. This is a native Rust source-level
+The VDMOS and SIMetrix level-1 diode artifacts implement this contract.
+Their circuit-coupled engine integration is a separate task. This is a native Rust source-level
 contract, not a stable dynamic-library ABI.
