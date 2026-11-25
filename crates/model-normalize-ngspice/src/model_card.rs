@@ -403,7 +403,11 @@ pub fn parse_spice_constant(raw: &str) -> Result<f64> {
         }
     }
     ensure!(digits > 0, "not a scalar SPICE number: {raw}");
-    if matches!(bytes.get(offset), Some(b'e' | b'E' | b'd' | b'D')) {
+    if matches!(bytes.get(offset), Some(b'e' | b'E' | b'd' | b'D'))
+        && !["db", "deg"]
+            .iter()
+            .any(|unit| raw[offset..].eq_ignore_ascii_case(unit))
+    {
         offset += 1;
         if matches!(bytes.get(offset), Some(b'+' | b'-')) {
             offset += 1;
@@ -423,7 +427,12 @@ pub fn parse_spice_constant(raw: &str) -> Result<f64> {
         suffix.bytes().all(|byte| byte.is_ascii_alphabetic()),
         "invalid SPICE unit suffix in {raw}"
     );
-    let scale = if suffix.starts_with("meg") {
+    let scale = if matches!(
+        suffix.as_str(),
+        "hz" | "v" | "ohm" | "s" | "rad" | "db" | "deg"
+    ) {
+        1.0
+    } else if suffix.starts_with("meg") {
         1e6
     } else if suffix.starts_with("mil") {
         25.4e-6
@@ -513,6 +522,12 @@ mod tests {
             (".5pF", 5e-13),
             ("+6", 6.0),
             ("1a", 1e-18),
+            ("1.0e7Hz", 1e7),
+            ("100V", 100.0),
+            ("45deg", 45.0),
+            ("3dB", 3.0),
+            ("20rad", 20.0),
+            ("10Ohm", 10.0),
         ] {
             let actual = parse_spice_constant(raw)?;
             assert!(
