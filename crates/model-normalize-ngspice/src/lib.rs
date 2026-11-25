@@ -423,9 +423,9 @@ fn rewrite_spaced_parameter_marker(input: &[u8]) -> Result<Option<Vec<u8>>> {
         }
         // The colon is a marker only when followed by an assignment; leave
         // unrelated identifiers and punctuation alone.
-        if !fields
+        if fields
             .get(index + 1)
-            .is_some_and(|span| text[span.clone()] == *b"=")
+            .is_none_or(|span| text[span.clone()] != *b"=")
         {
             continue;
         }
