@@ -24,7 +24,7 @@ use crate::syntax::{
     Item, Subcircuit, electrical_statements, file_boundary, matching_behavioral_delimiter,
     model_header, parse_items, simple_assignment_span, simple_assignment_value,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use model_normalize_ngspice::passive_ic::PassiveKind;
 use serde::Serialize;
 pub use simetrix_runtime::lower_simetrix_linked_runtime;

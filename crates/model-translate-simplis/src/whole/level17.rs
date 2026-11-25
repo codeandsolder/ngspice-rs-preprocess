@@ -433,7 +433,7 @@ pub(super) fn translate_level17_mos(
     let stem = format!(
         "{}I_{}",
         scope.prefix,
-        super::current_controlled_source_stem(&name.to_ascii_uppercase())
+        super::escaped_device_stem(&name.to_ascii_uppercase())
     );
     let drain = if model.rd == 0. {
         tokens[1].clone()
@@ -554,7 +554,7 @@ impl<'a> Scope<'a> {
         let path = format!(
             "{}__{}",
             self.path,
-            super::current_controlled_source_stem(&block.name.to_ascii_uppercase())
+            super::escaped_device_stem(&block.name.to_ascii_uppercase())
         );
         let mut result = Scope {
             prefix: self.prefix,
@@ -582,7 +582,7 @@ impl<'a> Scope<'a> {
         let Some((_, mut model)) = raw_level17_model(statement)? else {
             return Ok(None);
         };
-        let stem = super::current_controlled_source_stem(name);
+        let stem = super::escaped_device_stem(name);
         model.lexical = self.parent.is_some();
         model.native_name = if model.lexical {
             format!("{}L{}__{stem}", self.prefix, self.path)
