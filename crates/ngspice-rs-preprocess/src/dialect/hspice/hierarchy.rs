@@ -84,10 +84,6 @@ fn collect_definitions(source: &ModelLibrary, lines: &[&str]) -> Result<Vec<Defi
             owner = child;
             let (_, fields) = positional_prefix(text);
             collect_parameters(fields, line, false, &mut definitions[owner].parameters)?;
-            ensure!(
-                !definitions[owner].parameters.contains_key("M"),
-                "explicit HSPICE M formal requires multiplier-default qualification"
-            );
         } else if owner != 0 && source.scopes[owner].end_line == line + 1 {
             owner = source.scopes[owner]
                 .parent
@@ -232,6 +228,7 @@ struct Binder<'a> {
     lines: &'a [&'a str],
     definitions: Vec<Definition>,
     precedence: Precedence,
+    xmult_in_exp: bool,
     prefix: String,
     serial: usize,
     active: Vec<usize>,
@@ -399,9 +396,14 @@ impl Binder<'_> {
         let mut actuals = Parameters::new();
         collect_parameters(fields, line, true, &mut actuals)?;
         let local_multiplier = actuals
-            .remove("M")
+            .get("M")
             .map(|parameter| rewrite_parameter_symbols(&parameter.value, parent, false))
             .transpose()?;
+        // The X multiplier affects device multiplicity independently of the
+        // ordinary M expression parameter. HSPICE defaults XMULT_IN_EXP to NO.
+        if !self.xmult_in_exp {
+            actuals.remove("M");
+        }
         let multiplier = if let Some(local) = local_multiplier {
             let alias = self.fresh('m')?;
             let expression = inherited_multiplier.map_or_else(
@@ -510,6 +512,7 @@ pub fn bind(
     bytes: &[u8],
     origins: &[OriginLine],
     precedence: Precedence,
+    xmult_in_exp: bool,
     mos_options: &mos::Options,
     limit: usize,
 ) -> Result<(Vec<u8>, Vec<OriginLine>)> {
@@ -549,6 +552,7 @@ pub fn bind(
         lines: &lines,
         definitions,
         precedence,
+        xmult_in_exp,
         prefix,
         serial: 0,
         active: Vec::new(),

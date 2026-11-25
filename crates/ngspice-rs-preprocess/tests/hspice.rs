@@ -166,10 +166,7 @@ fn unqualified_hspice_semantics_are_errors() -> Result<()> {
             ".subckt cell a b\nXrec a b cell\n.ends cell\nX1 a b cell",
             "recursive HSPICE subcircuit",
         ),
-        (
-            ".subckt cell a b m=4\n.ends cell",
-            "multiplier-default qualification",
-        ),
+        (".option XMULT_IN_EXP=maybe", "invalid HSPICE XMULT_IN_EXP"),
         (".model mos NMOS LEVEL=49", "qualified native mapping"),
         (".temp 25 50", "multiple-temperature"),
         (".tran 1n 10n 2n 20n", "multipoint transient"),
@@ -622,6 +619,28 @@ fn bsim4_unqualified_versions_parameters_and_bin_gaps_reject() -> Result<()> {
         ensure!(
             format!("{error:#}").contains(expected),
             "{model} {instance}: {error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn multiplier_and_expression_parameter_have_independent_semantics() -> Result<()> {
+    for (option, expected) in [
+        ("", -0.002),
+        (".option XMULT_IN_EXP=NO", -0.002),
+        (".option XMULT_IN_EXP=YES", -0.001),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let source = format!(
+            "Independent M semantics\n{option}\nV1 a 0 1\nX1 a 0 cell M=2\n.subckt cell p n M=1\nR1 p n 'M*1k'\n.ends cell\n.end\n"
+        );
+        let text = numeric_deck(dir.path(), &source, "op\nwrdata op.dat i(v1)")?;
+        let rows = values(dir.path(), "op.dat")?;
+        let current = rows.first().context("missing operating point")?[1];
+        ensure!(
+            (current - expected).abs() < 1e-12,
+            "{option}: {current} != {expected}\n{text}"
         );
     }
     Ok(())

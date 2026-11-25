@@ -32,6 +32,7 @@ struct DeckOptions {
     temperature: bool,
     depth: usize,
     parhier: Option<hierarchy::Precedence>,
+    xmult_in_exp: Option<bool>,
     mos: mos::Options,
 }
 
@@ -62,6 +63,25 @@ fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
                     "conflicting HSPICE PARHIER options"
                 );
                 state.parhier = Some(precedence);
+                continue;
+            }
+            "XMULT_IN_EXP" => {
+                let value = field
+                    .expression
+                    .as_deref()
+                    .context("XMULT_IN_EXP requires YES or NO")?;
+                let enabled = if value.eq_ignore_ascii_case("YES") {
+                    true
+                } else if value.eq_ignore_ascii_case("NO") {
+                    false
+                } else {
+                    bail!("invalid HSPICE XMULT_IN_EXP value {value}");
+                };
+                ensure!(
+                    state.xmult_in_exp.is_none_or(|old| old == enabled),
+                    "conflicting HSPICE XMULT_IN_EXP options"
+                );
+                state.xmult_in_exp = Some(enabled);
                 continue;
             }
             "DCAP" => continue,
@@ -462,6 +482,7 @@ pub(super) fn prepare(
             &bytes,
             &origins,
             state.parhier.unwrap_or_default(),
+            state.xmult_in_exp.unwrap_or_default(),
             &state.mos,
             options.output_bytes,
         )?;
