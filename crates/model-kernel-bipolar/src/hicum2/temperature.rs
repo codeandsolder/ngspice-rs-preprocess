@@ -66,8 +66,8 @@ impl ThermalCoefficients {
     }
 }
 
-impl Default for ThermalCoefficients {
-    fn default() -> Self {
+impl ThermalCoefficients {
+    pub(super) const fn source_defaults() -> Self {
         Self {
             tnom_celsius: 27.0,
             dt: 0.0,
@@ -99,6 +99,12 @@ impl Default for ThermalCoefficients {
             zetarth: 0.0,
             alrth: 0.0,
         }
+    }
+}
+
+impl Default for ThermalCoefficients {
+    fn default() -> Self {
+        Self::source_defaults()
     }
 }
 

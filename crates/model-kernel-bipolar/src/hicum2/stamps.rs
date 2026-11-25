@@ -147,8 +147,16 @@ impl Output {
         );
         self.set(
             Branch::Rbi,
-            base_current(polarity_sign, op.internal_base),
-            base_charge(polarity_sign, op.internal_base),
+            base_quantity(
+                polarity_sign,
+                op.internal_base.resistor_current,
+                op.internal_base.branch_conductance,
+            ),
+            base_quantity(
+                polarity_sign,
+                op.internal_base.hf_shunt_charge,
+                op.internal_base.hf_branch_capacitance,
+            ),
         );
         self.set(
             Branch::Rcx,
@@ -427,44 +435,14 @@ fn substrate(sign: f64, value: substrate::Value2) -> Quantity {
     add_endpoints(output, Node::Si, Node::Ci, value.d_vsici)
 }
 
-fn base_current(sign: f64, output: internal_base::Output) -> Quantity {
-    let mut current = Quantity {
-        value: output.resistor_current.value,
+fn base_quantity(sign: f64, quantity: transport::Value2, branch_derivative: f64) -> Quantity {
+    let output = Quantity {
+        value: quantity.value,
         ..Quantity::default()
     };
-    current = add_endpoints(current, Node::Bp, Node::Bi, output.branch_conductance);
-    current = add_endpoints(
-        current,
-        Node::Bi,
-        Node::Ei,
-        sign * output.resistor_current.d_vbiei,
-    );
-    add_endpoints(
-        current,
-        Node::Bi,
-        Node::Ci,
-        sign * output.resistor_current.d_vbici,
-    )
-}
-
-fn base_charge(sign: f64, output: internal_base::Output) -> Quantity {
-    let mut charge = Quantity {
-        value: output.hf_shunt_charge.value,
-        ..Quantity::default()
-    };
-    charge = add_endpoints(charge, Node::Bp, Node::Bi, output.hf_branch_capacitance);
-    charge = add_endpoints(
-        charge,
-        Node::Bi,
-        Node::Ei,
-        sign * output.hf_shunt_charge.d_vbiei,
-    );
-    add_endpoints(
-        charge,
-        Node::Bi,
-        Node::Ci,
-        sign * output.hf_shunt_charge.d_vbici,
-    )
+    let output = add_endpoints(output, Node::Bp, Node::Bi, branch_derivative);
+    let output = add_endpoints(output, Node::Bi, Node::Ei, sign * quantity.d_vbiei);
+    add_endpoints(output, Node::Bi, Node::Ci, sign * quantity.d_vbici)
 }
 
 fn tunnel_quantity(sign: f64, output: tunneling::Output) -> Quantity {
