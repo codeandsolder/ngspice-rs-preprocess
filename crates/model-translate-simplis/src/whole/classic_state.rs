@@ -2,7 +2,7 @@
 
 use super::{StateElementSpec, WhitespaceProbe, emit_state_element, escaped_device_stem};
 use crate::{
-    LogicIo, LogicOperation, LogicPolarity, LogicReceiver, LogicTiming, Translation,
+    LogicIo, LogicOperation, LogicPolarity, LogicReceiver, LogicTiming, OutputPins, Translation,
     TranslationKind, integer_parameter, normalized_statement, numeric_parameter, statement_tokens,
 };
 use anyhow::{Result, bail};
@@ -254,10 +254,17 @@ pub(super) fn translate_classic_state_device(
     let rtn_index = 1 + model.kind.outputs();
     let rtn = &tokens[rtn_index];
     let inputs = &tokens[rtn_index + 1..index];
-    let outputs = tokens[1..rtn_index]
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
+    let outputs = match &tokens[1..rtn_index] {
+        [primary] => OutputPins {
+            primary,
+            complement: None,
+        },
+        [primary, complement] => OutputPins {
+            primary,
+            complement: Some(complement),
+        },
+        _ => bail!("invalid classic state output count"),
+    };
     let stem = escaped_device_stem(tokens[0].trim_start_matches('!'));
     let io = LogicIo {
         rin: model.rin,
@@ -272,7 +279,7 @@ pub(super) fn translate_classic_state_device(
         io,
         &StateElementSpec {
             stem: &stem,
-            outputs: &outputs,
+            outputs,
             rtn,
             inputs,
             receiver: LogicReceiver {
