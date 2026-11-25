@@ -9,18 +9,13 @@ pub mod vdmos_card;
 pub mod vdmos_ltspice;
 
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::{Cancellation, ProcessLimits, capture};
 use regex::bytes::Regex;
 use serde::Serialize;
 use std::{
-    collections::BTreeSet,
-    fs,
-    io::Write,
-    process::{Command, Stdio},
-    sync::LazyLock,
-    time::Duration,
+    collections::BTreeSet, fs, io::Write, path::Path, sync::Arc, sync::LazyLock, time::Duration,
 };
 use tempfile::TempDir;
-use wait_timeout::ChildExt;
 
 static NGSPICE_ERROR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?im)^(?:fatal|error)[: ]")
@@ -521,6 +516,12 @@ fn ngspice_once(
     } else {
         ".lib"
     };
+    anyhow::ensure!(
+        suffix[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "invalid model suffix"
+    );
     let model_name = format!("model{suffix}");
     fs::write(temp.path().join(&model_name), data)?;
     if mode == CompatibilityMode::Pspice {
@@ -532,23 +533,19 @@ fn ngspice_once(
             ".title normalized-model-parse-check\n.include \"{model_name}\"\nV__MODEL_CHECK ncheck 0 1\nR__MODEL_CHECK ncheck 0 1k\n.op\n.end\n"
         ),
     )?;
-    let mut child = Command::new("ngspice")
-        .args(["-b", "deck.cir"])
-        .current_dir(temp.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("starting ngspice")?;
-    if child.wait_timeout(timeout)?.is_none() {
-        child.kill().context("killing timed-out ngspice")?;
-        let _ = child.wait();
-        return Ok(ValidationResult {
-            ok: false,
-            mode: None,
-            detail: "ngspice parse timeout".to_owned(),
-        });
-    }
-    let output = child.wait_with_output()?;
+    let output = capture(
+        Path::new("ngspice"),
+        temp.path(),
+        &["-b".into(), "deck.cir".into()],
+        Arc::from([]),
+        ProcessLimits {
+            timeout,
+            output_bytes: 4 * 1024 * 1024,
+            diagnostic_bytes: 4 * 1024 * 1024,
+        },
+        &Cancellation::default(),
+    )
+    .context("running bounded ngspice validation")?;
     let combined = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -619,6 +616,7 @@ pub fn normalize_and_validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn rewrites_only_targeted_syntax() -> Result<()> {
@@ -697,7 +695,7 @@ mod tests {
         let input = b"* header\n  R1 a b 1k\n\tL1 a b 2u\n  C1 b 0 10p\n";
         let normalized = normalize_ngspice(input)?;
         assert_eq!(normalized.bytes, input);
-        assert!(normalized.passes.is_empty());
+        assert_eq!(normalized.passes, [] as [NormalizationPass; 0]);
         Ok(())
     }
 
@@ -802,7 +800,7 @@ mod tests {
                 bail!("unexpected AC result: {line}");
             };
             let reactance = std::f64::consts::TAU * frequency * inductance;
-            let denominator = resistance * resistance + reactance * reactance;
+            let denominator = reactance.mul_add(reactance, resistance * resistance);
             assert!((real + resistance / denominator).abs() < 1e-10);
             assert!((imaginary - reactance / denominator).abs() < 1e-10);
         }

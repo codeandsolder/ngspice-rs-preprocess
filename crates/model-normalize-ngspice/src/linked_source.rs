@@ -5,6 +5,7 @@
 
 use crate::model_card::logical_statements;
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::SourceSession;
 use std::path::{Path, PathBuf};
 
 /// Physical source location corresponding to a linked logical statement.
@@ -12,7 +13,8 @@ use std::path::{Path, PathBuf};
 pub struct SourceOrigin {
     /// Canonical input path whose bytes contained this statement.
     pub path: PathBuf,
-    /// 1-based physical source line, before `+` continuation merging.
+    /// 1-based admitted-source line, before `+` continuation merging.
+    /// External commands may change line numbering; the path remains original.
     pub line: usize,
 }
 
@@ -43,6 +45,7 @@ pub struct SourceLinker {
 
 struct LinkState<'a> {
     settings: &'a SourceLinker,
+    admission: &'a mut SourceSession,
     stack: Vec<(PathBuf, Option<String>)>,
     output: LinkedSource,
 }
@@ -178,8 +181,23 @@ impl SourceLinker {
     /// Errors on missing/ambiguous sections, include cycles, malformed
     /// directives, invalid text, and unsupported bare `.lib` references.
     pub fn link(&self, source: &Path) -> Result<LinkedSource> {
+        self.link_with_session(source, &mut SourceSession::default())
+    }
+
+    /// Link through a caller-owned source admission session. Repeated files
+    /// and named sections use one immutable transformed snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As in [`Self::link`], plus source admission and external command errors.
+    pub fn link_with_session(
+        &self,
+        source: &Path,
+        admission: &mut SourceSession,
+    ) -> Result<LinkedSource> {
         let mut state = LinkState {
             settings: self,
+            admission,
             stack: Vec::new(),
             output: LinkedSource {
                 bytes: Vec::new(),
@@ -260,8 +278,8 @@ impl LinkState<'_> {
     }
 
     fn expand_inner(&mut self, path: &Path, section: Option<&str>) -> Result<()> {
-        let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let lines = logical_statements(&raw)?;
+        let source = self.admission.load(path)?;
+        let lines = logical_statements(&source.bytes)?;
         let selected = select_statements(lines, section, path)?;
         let mut in_control = false;
         for (physical_line, bytes) in selected {
@@ -308,6 +326,52 @@ mod tests {
     use super::*;
     use crate::parameter_scope::ModelLibrary;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn command_runs_once_per_original_source_across_includes_and_sections() -> Result<()> {
+        use model_preprocess_command::{AdmissionConfig, Cancellation, CommandConfig};
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root.cir");
+        let library = temp.path().join("library.lib");
+        fs::write(
+            &root,
+            b"title\n.lib library.lib one\n.lib library.lib two\n.inc replacement.inc\n.inc alias.inc\n",
+        )?;
+        fs::write(
+            &library,
+            b".lib one\n.param a=1\n.endl one\n.lib two\n.param b=REPLACE_VALUE\n.endl two\n",
+        )?;
+        let common = temp.path().join("common.inc");
+        fs::write(&common, b".param c=3\n")?;
+        std::os::unix::fs::symlink(&common, temp.path().join("alias.inc"))?;
+        let config = AdmissionConfig {
+            command: Some(CommandConfig {
+                executable: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    r#"printf '%s\n' "$1" >> calls; sed "s/replacement.inc/common.inc/g; s/REPLACE_VALUE/2/g""#.into(),
+                    "fixture".into(),
+                ],
+                working_directory: None,
+            }),
+            ..AdmissionConfig::default()
+        };
+        let mut admission = SourceSession::new(config, Cancellation::default());
+        let linked = SourceLinker::default().link_with_session(&root, &mut admission)?;
+        let output = String::from_utf8(linked.bytes)?;
+        assert!(output.contains(".param a=1"));
+        assert!(output.contains(".param b=2"));
+        assert_eq!(output.matches(".param c=3").count(), 2);
+        let calls = fs::read_to_string(temp.path().join("calls"))?;
+        assert_eq!(calls.lines().count(), 3);
+        assert_eq!(calls.matches("library.lib").count(), 1);
+        assert_eq!(calls.matches("common.inc").count(), 1);
+        let again = SourceLinker::default().link_with_session(&root, &mut admission)?;
+        assert_eq!(again.bytes, output.as_bytes());
+        assert_eq!(fs::read_to_string(temp.path().join("calls"))?, calls);
+        Ok(())
+    }
 
     #[test]
     fn nested_includes_named_sections_provenance_and_scope() -> Result<()> {

@@ -12,8 +12,9 @@ mod hierarchy;
 pub use hierarchy::{
     LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
     ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, linked_library_filename,
-    parse_init_target_path, parse_library, parse_library_for_simulator, preprocess_netlist,
-    preprocess_netlist_linked,
+    parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
+    preprocess_netlist, preprocess_netlist_file, preprocess_netlist_linked,
+    preprocess_netlist_linked_file,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {

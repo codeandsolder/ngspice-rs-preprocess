@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
-use model_preprocess_simplis::{LibrarySimulator, parse_library_for_simulator};
+use model_preprocess_command::SourceSession;
+use model_preprocess_simplis::{LibrarySimulator, parse_library_file};
 use std::{env, fs, path::PathBuf};
 
 const USAGE: &str = "usage: simplis-parse-library [--simulator simplis|simetrix] INPUT OUTPUT.json";
@@ -29,8 +30,7 @@ fn main() -> Result<()> {
     }
     let input = PathBuf::from(&args[offset]);
     let output = PathBuf::from(&args[offset + 1]);
-    let bytes = fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
-    let parsed = parse_library_for_simulator(input.to_string_lossy(), &bytes, simulator)?;
+    let parsed = parse_library_file(&input, simulator, &mut SourceSession::default())?;
     fs::write(&output, parsed.to_json()?)
         .with_context(|| format!("writing {}", output.display()))?;
     eprintln!(

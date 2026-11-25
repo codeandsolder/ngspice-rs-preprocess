@@ -11,8 +11,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+model-preprocess-command = { path = "../model-preprocess-command" }
 anyhow = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
-wait-timeout = "0.2"

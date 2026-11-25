@@ -4,9 +4,13 @@ use super::{
     specialize_subcircuit_with_base,
 };
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::SourceSession;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 const PARSED_LIBRARY_FORMAT_VERSION: u32 = 4;
 
@@ -193,6 +197,21 @@ impl SubcircuitCatalog {
         simulator: LibrarySimulator,
     ) -> Result<usize> {
         let parsed = parse_library_for_simulator(source, input, simulator)?;
+        self.add_parsed_library(&parsed)
+    }
+
+    /// Admit and parse a source library with the same session as its root deck.
+    ///
+    /// # Errors
+    ///
+    /// Source admission, external command, or library parsing errors.
+    pub fn add_library_file(
+        &mut self,
+        path: &Path,
+        simulator: LibrarySimulator,
+        admission: &mut SourceSession,
+    ) -> Result<usize> {
+        let parsed = parse_library_file(path, simulator, admission)?;
         self.add_parsed_library(&parsed)
     }
 
@@ -550,6 +569,20 @@ impl SubcircuitCatalog {
 /// Returns an error for malformed subcircuit nesting or active non-ASCII syntax.
 pub fn parse_library(source: impl Into<String>, input: &[u8]) -> Result<ParsedLibrary> {
     parse_library_for_simulator(source, input, LibrarySimulator::Simplis)
+}
+
+/// Admit a source library before parsing its simulator-specific projection.
+///
+/// # Errors
+///
+/// Source admission, external command, or library parsing errors.
+pub fn parse_library_file(
+    path: &Path,
+    simulator: LibrarySimulator,
+    admission: &mut SourceSession,
+) -> Result<ParsedLibrary> {
+    let source = admission.load(path)?;
+    parse_library_for_simulator(source.path.to_string_lossy(), &source.bytes, simulator)
 }
 
 /// Parse one library using an explicit simulator projection.
@@ -1429,6 +1462,20 @@ pub struct PreprocessedNetlist {
     pub stats: NetlistPreprocessStats,
 }
 
+/// Admit the root source and expand it using already parsed libraries.
+///
+/// # Errors
+///
+/// Source admission, external command, or preprocessing errors.
+pub fn preprocess_netlist_file(
+    path: &Path,
+    external: &SubcircuitCatalog,
+    admission: &mut SourceSession,
+) -> Result<PreprocessedNetlist> {
+    let source = admission.load(path)?;
+    preprocess_netlist(&source.bytes, external)
+}
+
 /// Expand parameterized SIMPLIS subcircuit calls into static `$N` definitions.
 ///
 /// Root calls are numbered first in source order, matching SIMPLIS deck structure;
@@ -2248,6 +2295,20 @@ fn link_root_statements(
     Ok((root_output, root_units, end_statement))
 }
 
+/// Admit the root source before generating independently linkable libraries.
+///
+/// # Errors
+///
+/// Source admission, external command, or preprocessing errors.
+pub fn preprocess_netlist_linked_file(
+    path: &Path,
+    external: &SubcircuitCatalog,
+    admission: &mut SourceSession,
+) -> Result<LinkedPreprocessedNetlist> {
+    let source = admission.load(path)?;
+    preprocess_netlist_linked(&source.bytes, external)
+}
+
 /// Preprocess a SIMPLIS root netlist into independently linkable source-library artifacts.
 ///
 /// Every referenced subcircuit is renamed into a content-addressed namespace. Parameterized
@@ -2362,6 +2423,48 @@ pub fn preprocess_netlist_linked(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn file_admission_transforms_root_and_library_before_simulator_projection() -> Result<()> {
+        use model_preprocess_command::{
+            AdmissionConfig, Cancellation, CommandConfig, SourceSession,
+        };
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("root.net");
+        let library = dir.path().join("library.lb");
+        std::fs::write(&source, b"X1 1 0 PLACEHOLDER\n.end\n")?;
+        std::fs::write(
+            &library,
+            b".subckt PLACEHOLDER 1 2\nR1 1 2 VALUE\n.ends PLACEHOLDER\n",
+        )?;
+        let config = AdmissionConfig {
+            command: Some(CommandConfig {
+                executable: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    r#"printf x >> calls; sed 's/PLACEHOLDER/HELPER/g; s/VALUE/47/g'"#.into(),
+                    "fixture".into(),
+                ],
+                working_directory: None,
+            }),
+            ..AdmissionConfig::default()
+        };
+        let mut admission = SourceSession::new(config, Cancellation::default());
+        let mut catalog = SubcircuitCatalog::new();
+        assert_eq!(
+            catalog.add_library_file(&library, LibrarySimulator::Simplis, &mut admission)?,
+            1
+        );
+        let result = preprocess_netlist_linked_file(&source, &catalog, &mut admission)?;
+        assert_eq!(result.libraries.len(), 1);
+        assert!(std::str::from_utf8(&result.libraries[0].bytes)?.contains("R1 1 2 47"));
+        assert!(std::str::from_utf8(&result.root_bytes)?.contains("sr_HELPER_lib_"));
+        let parsed = parse_library_file(&library, LibrarySimulator::Simplis, &mut admission)?;
+        assert_eq!(parsed.definitions(), 1);
+        assert_eq!(std::fs::read(dir.path().join("calls"))?, b"xx");
+        Ok(())
+    }
+
     use super::*;
 
     #[test]
