@@ -6,8 +6,8 @@ mod dialect;
 
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
-    NormalizationPass,
-    linked_source::{LibrarySyntax, LinkLimits, RootKind, SourceLinker},
+    MappedNormalization, NormalizationPass,
+    linked_source::{LibrarySyntax, LinkLimits, LinkedSource, RootKind, SourceLinker},
     normalize_mapped,
 };
 pub use model_normalize_ngspice::{passive_ic, waveform};
@@ -268,6 +268,67 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+struct NativeProjection {
+    normalized: MappedNormalization,
+    device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
+    waveforms: Vec<waveform::PreparedWaveform>,
+}
+
+fn project_native(
+    linked: &LinkedSource,
+    kind: RootKind,
+    syntax: LibrarySyntax,
+) -> Result<NativeProjection> {
+    match syntax {
+        LibrarySyntax::Pspice => {
+            let normalized =
+                model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?;
+            let identities = normalized
+                .renamed
+                .into_iter()
+                .map(|device| {
+                    let origin = linked
+                        .origin(device.input_line)
+                        .context("missing renamed device origin")?;
+                    Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
+                        source: display_path(&origin.path),
+                        scope: device.scope,
+                        displayed: device.declared.clone(),
+                        declared: device.declared,
+                        linked: device.linked,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(NativeProjection {
+                normalized: normalized.mapped,
+                device_identities: identities,
+                waveforms: Vec::new(),
+            })
+        }
+        LibrarySyntax::Qspice => {
+            let lowered = model_normalize_ngspice::qspice::lower_linked(linked, kind)?;
+            let mut normalized =
+                normalize_mapped(lowered.bytes.as_deref().unwrap_or(&linked.bytes), kind)?;
+            if lowered.bytes.is_some() {
+                normalized
+                    .model
+                    .passes
+                    .insert(0, NormalizationPass::QspiceSource);
+            }
+            Ok(NativeProjection {
+                normalized,
+                device_identities: Vec::new(),
+                waveforms: lowered.waveforms,
+            })
+        }
+        LibrarySyntax::NamedSections => Ok(NativeProjection {
+            normalized: normalize_mapped(&linked.bytes, kind)?,
+            device_identities: Vec::new(),
+            waveforms: Vec::new(),
+        }),
+    }
+}
+
 fn native(
     root: &AdmittedSource,
     request: &Request,
@@ -300,46 +361,11 @@ fn native(
         },
         session,
     )?;
-    let (normalized, device_identities, waveforms) = match syntax {
-        LibrarySyntax::Pspice => {
-            let normalized =
-                model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?;
-            let identities = normalized
-                .renamed
-                .into_iter()
-                .map(|device| {
-                    let origin = linked
-                        .origin(device.input_line)
-                        .context("missing renamed device origin")?;
-                    Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
-                        source: display_path(&origin.path),
-                        scope: device.scope,
-                        displayed: device.declared.clone(),
-                        declared: device.declared,
-                        linked: device.linked,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (normalized.mapped, identities, Vec::new())
-        }
-        LibrarySyntax::Qspice => {
-            let lowered = model_normalize_ngspice::qspice::lower_linked(&linked, kind)?;
-            let mut normalized =
-                normalize_mapped(lowered.bytes.as_deref().unwrap_or(&linked.bytes), kind)?;
-            if lowered.bytes.is_some() {
-                normalized
-                    .model
-                    .passes
-                    .insert(0, NormalizationPass::QspiceSource);
-            }
-            (normalized, Vec::new(), lowered.waveforms)
-        }
-        LibrarySyntax::NamedSections => (
-            normalize_mapped(&linked.bytes, kind)?,
-            Vec::new(),
-            Vec::new(),
-        ),
-    };
+    let NativeProjection {
+        normalized,
+        device_identities,
+        waveforms,
+    } = project_native(&linked, kind, syntax)?;
     let lines = normalized
         .input_lines
         .into_iter()
