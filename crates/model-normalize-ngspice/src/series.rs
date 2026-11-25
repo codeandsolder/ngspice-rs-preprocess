@@ -1,4 +1,4 @@
-//! Shared physical-line-preserving lowering of series passive resistance.
+//! Shared physical-line-preserving lowering of series resistance.
 
 use crate::{
     NormalizationDialect, fresh_identifier, lexical, model_card::parse_spice_constant,
@@ -9,14 +9,19 @@ use std::{collections::BTreeSet, io::Write, ops::Range};
 
 type Assignment = (Range<usize>, Range<usize>);
 
-fn assignment(
+fn assignments(
     statement: &lexical::Statement,
     fields: &[Range<usize>],
     key: &[u8],
-) -> Result<Option<Assignment>> {
+) -> Result<Vec<Assignment>> {
     let text = &statement.text;
-    let mut result = None;
-    for index in 4..fields.len() {
+    let mut result = Vec::new();
+    let start = if matches!(text.first(), Some(b'v' | b'V' | b'i' | b'I')) {
+        3
+    } else {
+        4
+    };
+    for index in start..fields.len() {
         if !text[fields[index].clone()].eq_ignore_ascii_case(key)
             || text[fields[index - 1].clone()] == *b"="
             || fields
@@ -40,15 +45,24 @@ fn assignment(
                     String::from_utf8_lossy(key)
                 )
             })?;
-        ensure!(
-            result.is_none(),
-            "line {}: duplicate {} assignment",
-            statement.line,
-            String::from_utf8_lossy(key)
-        );
-        result = Some((fields[index].start..value.end, value.clone()));
+        result.push((fields[index].start..value.end, value.clone()));
     }
     Ok(result)
+}
+
+fn assignment(
+    statement: &lexical::Statement,
+    fields: &[Range<usize>],
+    key: &[u8],
+) -> Result<Option<Assignment>> {
+    let mut found = assignments(statement, fields, key)?;
+    ensure!(
+        found.len() <= 1,
+        "line {}: duplicate {} assignment",
+        statement.line,
+        String::from_utf8_lossy(key)
+    );
+    Ok(found.pop())
 }
 
 fn literal_zero(text: &[u8]) -> bool {
@@ -210,6 +224,61 @@ fn unsupported_parasitics(
     Ok(removals)
 }
 
+/// Voltage-source series resistance is a real, noisy resistor, but an
+/// internal shunt capacitance changes the observable source branch current.
+/// A symbolic series resistance may change the device topology at zero.
+fn rewrite_source(rewriter: &mut Rewriter<'_>, statement: &lexical::Statement) -> Result<()> {
+    let text = &statement.text;
+    let fields = lexical::tokens(text)?;
+    let voltage = matches!(text.first(), Some(b'v' | b'V'));
+    let mut removals = Vec::new();
+    for key in [b"rpar".as_slice(), b"lser", b"rlshunt"] {
+        ensure!(
+            assignments(statement, &fields, key)?.is_empty(),
+            "line {}: unsupported LTspice source {} assignment",
+            statement.line,
+            String::from_utf8_lossy(key)
+        );
+    }
+    let capacitances = assignments(statement, &fields, b"cpar")?;
+    if let Some((_, value)) = capacitances.last() {
+        ensure!(
+            voltage && crate::ltspice::closed_scalar(&text[value.clone()])? == Some(0.),
+            "line {}: LTspice source Cpar requires typed parasitic current observation",
+            statement.line
+        );
+        removals.extend(capacitances.into_iter().map(|(span, _)| span));
+    }
+    let resistances = assignments(statement, &fields, b"rser")?;
+    if let Some((_, value)) = resistances.last() {
+        ensure!(
+            voltage,
+            "line {}: unsupported LTspice current-source Rser",
+            statement.line
+        );
+        let resistance =
+            crate::ltspice::closed_scalar(&text[value.clone()])?.with_context(|| {
+                format!(
+                    "line {}: symbolic source Rser requires typed topology binding",
+                    statement.line
+                )
+            })?;
+        ensure!(
+            resistance >= 0.,
+            "line {}: negative source Rser requires typed thermal noise",
+            statement.line
+        );
+        if resistance > 0. {
+            rewriter.insert_resistor(statement, &fields, resistance.to_string().as_bytes(), &[])?;
+        }
+        removals.extend(resistances.into_iter().map(|(span, _)| span));
+    }
+    if !removals.is_empty() {
+        rewriter.remove(statement, &removals);
+    }
+    Ok(())
+}
+
 fn rewrite_explicit(
     rewriter: &mut Rewriter<'_>,
     statement: &lexical::Statement,
@@ -218,6 +287,9 @@ fn rewrite_explicit(
     include: bool,
 ) -> Result<()> {
     let text = &statement.text;
+    if matches!(text.first(), Some(b'v' | b'V' | b'i' | b'I')) {
+        return rewrite_source(rewriter, statement);
+    }
     if !matches!(text.first(), Some(b'c' | b'C' | b'l' | b'L')) {
         return Ok(());
     }

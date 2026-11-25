@@ -57,6 +57,16 @@ const HELPERS: &[(&[u8], &str)] = &[
     ),
 ];
 
+/// Evaluate a closed scalar using the source dialect's expression semantics.
+/// Free parameters must instead be resolved at the actual occurrence.
+pub(crate) fn closed_scalar(raw: &[u8]) -> Result<Option<f64>> {
+    let text = std::str::from_utf8(raw)?.trim();
+    if let Ok(value) = crate::model_card::parse_spice_constant(text) {
+        return Ok(Some(value));
+    }
+    constants::try_evaluate(text, true)
+}
+
 fn resistor_flags(statement: &lexical::Statement, edits: &mut Vec<Edit>) -> Result<()> {
     let text = &statement.text;
     let fields = lexical::tokens(text)?;

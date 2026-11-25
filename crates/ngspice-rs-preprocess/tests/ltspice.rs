@@ -892,3 +892,81 @@ fn vendor_sine_phase_and_finite_count_preserve_dc_and_startup() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn voltage_source_series_resistance_preserves_identity_and_noise() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root, b"title\n.temp 27\nV1 a 0 DC 1 AC 1 Rser=2 Rser={500*2}\nRload a 0 1k noiseless\nV2 b 0 PULSE(0 1 0 1u 1u 2u 5u) Rser=2\nR2 b 0 3\nV3 c 0 1 Rser={2-2} Cpar=0\nR3 c 0 3\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains("R__V1_RSER a"));
+    assert!(text.contains("R__V2_RSER b"));
+    assert!(text.contains("V3 c 0 1"));
+    assert!(!text.contains("R__V3_RSER"));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing source map");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    for (line, origin) in text.lines().zip(lines) {
+        if line.starts_with("R__V1_RSER") {
+            assert_eq!(origin.line, 3);
+        }
+        if line.starts_with("R__V2_RSER") {
+            assert_eq!(origin.line, 5);
+        }
+    }
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nop\nwrdata op.dat v(a) i(v1) v(c)\nac lin 2 1k 10k\nwrdata ac.dat v(a) i(v1)\nnoise v(a) V1 lin 2 1k 10k\nsetplot noise1\nwrdata noise.dat onoise_spectrum inoise_spectrum\ntran 20n 5u 0 20n\nwrdata tran.dat v(b) i(v2)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let rows = data(&dir.path().join("op.dat"))?;
+    for (&actual, expected) in rows.first().context("missing OP")?[1..]
+        .iter()
+        .zip([0.5, -0.0005, 1.])
+    {
+        near(actual, expected)?;
+    }
+    for row in data(&dir.path().join("ac.dat"))? {
+        for (&actual, expected) in row[1..].iter().zip([0.5, 0., -0.0005, 0.]) {
+            near(actual, expected)?;
+        }
+    }
+    // LTspice 24.0.12: 1k internal series resistance and a noiseless 1k load.
+    let expected_noise = 2.035687076996364e-9;
+    for row in data(&dir.path().join("noise.dat"))? {
+        assert!((row[1] / expected_noise - 1.).abs() < 1e-4, "{row:?}");
+        assert!(
+            (row[2] / (2. * expected_noise) - 1.).abs() < 1e-4,
+            "{row:?}"
+        );
+    }
+    for row in data(&dir.path().join("tran.dat"))? {
+        let t = row[0];
+        let voltage = 0.6 * (t / 1e-6).min(1.).min(((4e-6 - t) / 1e-6).max(0.));
+        near(row[1], voltage)?;
+        near(row[2], -voltage / 3.)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn source_parasitics_without_equivalent_observations_are_diagnostic() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for card in [
+        "V1 a 0 1 Rser=-500",
+        "V1 a 0 1 Rser={r}",
+        "V1 a 0 1 Cpar=1u",
+        "V1 a 0 1 Rpar=1k",
+        "I1 a 0 1 Rser=1k",
+    ] {
+        fs::write(&root, format!("title\n{card}\n.end\n"))?;
+        assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
+    }
+    Ok(())
+}

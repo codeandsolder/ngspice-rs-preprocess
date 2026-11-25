@@ -53,7 +53,7 @@ pub enum NormalizationPass {
     NormalizeNbspWhitespace,
     /// Expand `LTspice`'s `L ... Rser=` extension to an ideal inductor plus resistor.
     LtspiceInductorRser,
-    /// Lower explicit `LTspice` capacitor/inductor series loss and implicit uncoupled inductor loss.
+    /// Lower `LTspice` passive and voltage-source series loss, including uncoupled inductor defaults.
     LtspiceSeriesParasitics,
     /// Comment the schematic-only `LTspice` backannotation directive.
     LtspiceBackannotation,
