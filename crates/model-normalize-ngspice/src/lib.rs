@@ -16,6 +16,7 @@ pub mod model_card;
 pub mod param_expression;
 pub mod parameter_scope;
 pub mod passive_ic;
+pub mod pspice;
 pub mod vdmos_card;
 pub mod vdmos_ltspice;
 pub mod waveform;
@@ -58,6 +59,8 @@ pub enum NormalizationPass {
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.
     PspicePositionalParams,
+    /// Lower explicit `PSpice` source semantics to native SPICE.
+    PspiceSource,
     /// Comment a standalone `.END` so the model remains safe to include.
     StripStandaloneEnd,
     /// Scale proven private differentiator currents and compensate feedback.

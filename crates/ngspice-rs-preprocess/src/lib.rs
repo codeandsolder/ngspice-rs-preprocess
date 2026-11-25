@@ -30,6 +30,10 @@ pub enum InputFormat {
     NativeDeck,
     /// Native-compatible library; emit include-safe text.
     NativeLibrary,
+    /// Standalone `PSpice` deck lowered to native SPICE.
+    PspiceDeck,
+    /// Standalone `PSpice` library lowered to include-safe native SPICE.
+    PspiceLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,
     /// `SIMetrix` source deck with optional library catalog.
@@ -53,6 +57,8 @@ impl InputFormat {
         match value {
             "native-deck" => Ok(Self::NativeDeck),
             "native-library" => Ok(Self::NativeLibrary),
+            "pspice-deck" => Ok(Self::PspiceDeck),
+            "pspice-library" => Ok(Self::PspiceLibrary),
             "simplis-deck" => Ok(Self::SimplisDeck),
             "simetrix-deck" => Ok(Self::SimetrixDeck),
             "expanded-deck" => Ok(Self::ExpandedDeck),
@@ -262,24 +268,35 @@ fn native(
     options: &Options,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let kind = if request.format == InputFormat::NativeDeck {
+    let kind = if matches!(
+        request.format,
+        InputFormat::NativeDeck | InputFormat::PspiceDeck
+    ) {
         RootKind::Deck
     } else {
         RootKind::Include
     };
     let origin = root.path.clone();
-    let linked = SourceLinker {
+    let linker = SourceLinker {
         search_paths: request.search_paths.clone(),
-    }
-    .link_admitted(
-        root,
-        kind,
-        LinkLimits {
-            output_bytes: options.output_bytes,
-        },
-        session,
-    )?;
-    let normalized = normalize_mapped(&linked.bytes, kind)?;
+    };
+    let limits = LinkLimits {
+        output_bytes: options.output_bytes,
+    };
+    let pspice = matches!(
+        request.format,
+        InputFormat::PspiceDeck | InputFormat::PspiceLibrary
+    );
+    let linked = if pspice {
+        linker.link_pspice_admitted(root, kind, limits, session)?
+    } else {
+        linker.link_admitted(root, kind, limits, session)?
+    };
+    let normalized = if pspice {
+        model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?
+    } else {
+        normalize_mapped(&linked.bytes, kind)?
+    };
     let lines = normalized
         .input_lines
         .into_iter()
@@ -334,6 +351,8 @@ fn validate_request(request: &Request) -> Result<()> {
                 request.format,
                 InputFormat::NativeDeck
                     | InputFormat::NativeLibrary
+                    | InputFormat::PspiceDeck
+                    | InputFormat::PspiceLibrary
                     | InputFormat::SimetrixDeck
                     | InputFormat::SimetrixLibrary
             ),
@@ -364,9 +383,10 @@ pub fn prepare(
     let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
     let root = request.input.admit(&mut session)?;
     let mut result = match request.format {
-        InputFormat::NativeDeck | InputFormat::NativeLibrary => {
-            native(&root, request, options, &mut session)
-        }
+        InputFormat::NativeDeck
+        | InputFormat::NativeLibrary
+        | InputFormat::PspiceDeck
+        | InputFormat::PspiceLibrary => native(&root, request, options, &mut session),
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
     if request.format == InputFormat::SimetrixDeck

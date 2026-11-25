@@ -1,0 +1,637 @@
+//! Explicit `PSpice` source lowering. The target is ordinary ngspice syntax,
+//! not a deck that needs the global `ngbehavior=ps` parser mode.
+//!
+//! Reference: ngspice-47 frontend inpcompat.c, `pspice_compat`. Unsupported
+//! physical model families and stochastic declarations fail explicitly.
+
+use crate::{
+    MappedNormalization, NormalizationPass,
+    lexical::{self, Edit},
+    linked_source::RootKind,
+    model_card::{ModelCard, ModelParameter, parse_spice_constant},
+};
+use anyhow::{Context, Result, bail, ensure};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+};
+
+mod instances;
+mod nodes;
+mod scope;
+use scope::Scopes;
+
+const TEMPERATURE_PARAMS: &str = ".param temp='temper'\n.param vt='(temper+273.15)*8.6173303e-5'";
+
+const FUNCTIONS: &[(&str, &str)] = &[
+    (
+        "limit",
+        "(x,a,b) {ternary_fcn(a>b,max(min(x,a),b),max(min(x,b),a))}",
+    ),
+    ("pwr", "(x,a) {pow(x,a)}"),
+    ("pwrs", "(x,a) {sgn(x)*pow(x,a)}"),
+    ("stp", "(x) {u(x)}"),
+    ("if", "(a,b,c) {ternary_fcn(a,b,c)}"),
+    ("int", "(x) {sgn(x)*floor(abs(x))}"),
+];
+
+const fn identifier(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.' | b'#')
+}
+
+struct Functions {
+    names: BTreeMap<String, String>,
+    used: BTreeSet<String>,
+    scopes: Scopes,
+    scope: usize,
+    ground: String,
+    identifiers: BTreeSet<Vec<u8>>,
+    temperature: bool,
+    gmin: bool,
+}
+
+impl Functions {
+    fn new(input: &[u8], scopes: Scopes) -> Result<Self> {
+        let mut identifiers = crate::source_identifiers(input);
+        let mut names = BTreeMap::new();
+        for (name, _) in FUNCTIONS {
+            let base = format!("__ps_{name}");
+            let chosen = crate::fresh_identifier(&mut identifiers, base.as_bytes())
+                .context("PSpice helper identifier overflow")?;
+            names.insert((*name).to_owned(), String::from_utf8(chosen)?);
+        }
+        let ground = String::from_utf8(
+            crate::fresh_identifier(&mut identifiers, b"__ps_gnd")
+                .context("PSpice ground identifier overflow")?,
+        )?;
+        Ok(Self {
+            names,
+            used: BTreeSet::new(),
+            scopes,
+            scope: 0,
+            ground,
+            identifiers,
+            temperature: false,
+            gmin: false,
+        })
+    }
+
+    fn definitions(&self) -> Result<String> {
+        let mut result = String::new();
+        for (name, body) in FUNCTIONS {
+            if self.used.contains(*name) {
+                let generated = self.names.get(*name).context("missing PSpice helper")?;
+                writeln!(result, ".func {generated}{body}")?;
+            }
+        }
+        if self.temperature {
+            result.push_str(TEMPERATURE_PARAMS);
+            result.push('\n');
+        }
+        if self.gmin {
+            result.push_str(".param gmin=1e-12\n");
+        }
+        Ok(result)
+    }
+
+    fn expression(&mut self, input: &str, table: bool) -> Result<String> {
+        let bytes = input.as_bytes();
+        let mut cursor = 0;
+        let mut output = Vec::with_capacity(input.len());
+        let mut quote = None;
+        while let Some(&byte) = bytes.get(cursor) {
+            if quote.is_some() {
+                output.push(byte);
+                cursor += 1;
+                if byte == b'\\'
+                    && let Some(&next) = bytes.get(cursor)
+                {
+                    output.push(next);
+                    cursor += 1;
+                } else if quote == Some(byte) {
+                    quote = None;
+                }
+                continue;
+            }
+            if byte == b'"' {
+                quote = Some(byte);
+                output.push(byte);
+                cursor += 1;
+                continue;
+            }
+            if (byte.is_ascii_alphabetic() || byte == b'_')
+                && (cursor == 0 || !identifier(bytes[cursor - 1]))
+            {
+                let start = cursor;
+                cursor += 1;
+                while bytes.get(cursor).is_some_and(|&b| identifier(b)) {
+                    cursor += 1;
+                }
+                let name = &input[start..cursor];
+                let mut after = cursor;
+                while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+                    after += 1;
+                }
+                if bytes.get(after) == Some(&b'(') {
+                    if name.eq_ignore_ascii_case("v") || name.eq_ignore_ascii_case("i") {
+                        // Probe operands are node/branch identities, not expressions.
+                        let close = bytes[after + 1..]
+                            .iter()
+                            .position(|&b| b == b')')
+                            .map(|index| after + index + 2)
+                            .context("unterminated PSpice probe")?;
+                        output.extend_from_slice(&bytes[start..close]);
+                        cursor = close;
+                        continue;
+                    }
+                    let lower = name.to_ascii_lowercase();
+                    if let Some(generated) = self.names.get(&lower)
+                        && !self.scopes.shadows(self.scope, &lower)
+                    {
+                        output.extend_from_slice(generated.as_bytes());
+                        self.used.insert(lower);
+                        continue;
+                    }
+                    if name.eq_ignore_ascii_case("table") {
+                        ensure!(table, "PSpice TABLE() requires an E/G VALUE expression");
+                        output.extend_from_slice(b"pwl");
+                        continue;
+                    }
+                }
+                self.temperature |=
+                    name.eq_ignore_ascii_case("temp") || name.eq_ignore_ascii_case("vt");
+                self.gmin |= name.eq_ignore_ascii_case("gmin");
+                output.extend_from_slice(name.as_bytes());
+                continue;
+            }
+            match byte {
+                b'&' | b'|' => {
+                    output.extend_from_slice(&[byte, byte]);
+                    cursor += 1 + usize::from(bytes.get(cursor + 1) == Some(&byte));
+                }
+                b'~' => {
+                    output.push(b'!');
+                    cursor += 1;
+                }
+                _ => {
+                    output.push(byte);
+                    cursor += 1;
+                }
+            }
+        }
+        Ok(String::from_utf8(output)?)
+    }
+}
+
+fn parameter(card: &ModelCard, name: &str) -> Option<String> {
+    card.parameters
+        .iter()
+        .rev()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .and_then(|p| p.expression.clone())
+}
+
+fn set_parameter(card: &mut ModelCard, name: &str, expression: &str) {
+    card.parameters
+        .retain(|p| !p.name.eq_ignore_ascii_case(name));
+    card.parameters.push(ModelParameter {
+        name: name.to_owned(),
+        expression: Some(expression.to_owned()),
+    });
+}
+
+fn default_parameter(card: &mut ModelCard, name: &str, expression: &str) {
+    if parameter(card, name).is_none() {
+        set_parameter(card, name, expression);
+    }
+}
+
+fn rename_parameter(card: &mut ModelCard, from: &str, to: &str) {
+    for p in &mut card.parameters {
+        if p.name.eq_ignore_ascii_case(from) {
+            to.clone_into(&mut p.name);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SwitchLaw {
+    ThresholdVoltage,
+    ThresholdCurrent,
+    ContinuousVoltage,
+    ContinuousCurrent,
+}
+
+impl SwitchLaw {
+    fn from_model(card: &ModelCard) -> Result<Option<Self>> {
+        let voltage = card.family.eq_ignore_ascii_case("vswitch");
+        if !voltage && !card.family.eq_ignore_ascii_case("iswitch") {
+            return Ok(None);
+        }
+        let (threshold, hysteresis, on, off) = if voltage {
+            ("vt", "vh", "von", "voff")
+        } else {
+            ("it", "ih", "ion", "ioff")
+        };
+        let discrete =
+            parameter(card, threshold).is_some() || parameter(card, hysteresis).is_some();
+        let continuous = parameter(card, on).is_some() || parameter(card, off).is_some();
+        ensure!(
+            discrete != continuous,
+            "PSpice switch must select exactly one threshold or continuous law"
+        );
+        let allowed = if discrete {
+            [threshold, hysteresis, "ron", "roff"]
+        } else {
+            [on, off, "ron", "roff"]
+        };
+        for field in &card.parameters {
+            ensure!(
+                allowed
+                    .iter()
+                    .any(|name| field.name.eq_ignore_ascii_case(name))
+                    && field.expression.is_some(),
+                "unsupported PSpice switch parameter {}",
+                field.name
+            );
+        }
+        Ok(Some(match (voltage, discrete) {
+            (true, true) => Self::ThresholdVoltage,
+            (false, true) => Self::ThresholdCurrent,
+            (true, false) => Self::ContinuousVoltage,
+            (false, false) => Self::ContinuousCurrent,
+        }))
+    }
+
+    fn lower_model(self, card: &mut ModelCard) {
+        match self {
+            Self::ThresholdVoltage | Self::ThresholdCurrent => {
+                let (native, threshold, hysteresis) = if matches!(self, Self::ThresholdVoltage) {
+                    ("SW", "vt", "vh")
+                } else {
+                    ("CSW", "it", "ih")
+                };
+                native.clone_into(&mut card.family);
+                for (name, value) in [
+                    (threshold, "0"),
+                    (hysteresis, "0"),
+                    ("ron", "1"),
+                    ("roff", "1e12"),
+                ] {
+                    default_parameter(card, name, value);
+                }
+            }
+            Self::ContinuousVoltage | Self::ContinuousCurrent => {
+                let (native, on, off) = if matches!(self, Self::ContinuousVoltage) {
+                    ("pswitch", "von", "voff")
+                } else {
+                    ("aswitch", "ion", "ioff")
+                };
+                native.clone_into(&mut card.family);
+                for (from, to) in [
+                    (on, "cntl_on"),
+                    (off, "cntl_off"),
+                    ("ron", "r_on"),
+                    ("roff", "r_off"),
+                ] {
+                    rename_parameter(card, from, to);
+                }
+                for (name, value) in [
+                    ("cntl_on", "1"),
+                    ("cntl_off", "0"),
+                    ("r_on", "1"),
+                    ("r_off", "1e6"),
+                    ("log", "true"),
+                ] {
+                    default_parameter(card, name, value);
+                }
+                if matches!(self, Self::ContinuousCurrent) {
+                    set_parameter(card, "limit", "true");
+                }
+            }
+        }
+    }
+
+    fn lower_instance(self, fields: &[&str], functions: &mut Functions) -> Result<Option<String>> {
+        let (model_index, input) = match self {
+            Self::ThresholdVoltage | Self::ThresholdCurrent => return Ok(None),
+            Self::ContinuousVoltage => {
+                ensure!(
+                    fields.len() == 6 && fields[0].starts_with(['s', 'S']),
+                    "invalid continuous voltage switch instance"
+                );
+                (5, format!("%gd({} {})", fields[3], fields[4]))
+            }
+            Self::ContinuousCurrent => {
+                ensure!(
+                    fields.len() == 5 && fields[0].starts_with(['w', 'W']),
+                    "invalid continuous current switch instance"
+                );
+                (4, format!("%vnam({})", fields[3]))
+            }
+        };
+        let base = format!("A__ps_{}", fields[0]);
+        let name = String::from_utf8(
+            crate::fresh_identifier(&mut functions.identifiers, base.as_bytes())
+                .context("PSpice switch identifier overflow")?,
+        )?;
+        Ok(Some(format!(
+            "{name} {input} %gd({} {}) {}",
+            fields[1], fields[2], fields[model_index]
+        )))
+    }
+}
+
+fn switch_instance(text: &str, functions: &mut Functions) -> Result<String> {
+    let Some(first) = text.as_bytes().first().map(u8::to_ascii_lowercase) else {
+        return Ok(text.to_owned());
+    };
+    let index = match first {
+        b's' => 5,
+        b'w' => 4,
+        _ => return Ok(text.to_owned()),
+    };
+    let (positions, _) = crate::model_card::positional_prefix(text);
+    let fields: Vec<_> = positions.iter().map(|(word, _)| *word).collect();
+    let Some(name) = fields.get(index) else {
+        return Ok(text.to_owned());
+    };
+    let Some(line) = functions
+        .scopes
+        .find_model(functions.scope, &name.to_ascii_lowercase())?
+    else {
+        return Ok(text.to_owned());
+    };
+    let model = functions.scopes.model(line)?;
+    let Some(law) = SwitchLaw::from_model(&model)? else {
+        return Ok(text.to_owned());
+    };
+    // Do not drop source instance assignments while changing its designator.
+    if matches!(
+        law,
+        SwitchLaw::ContinuousCurrent | SwitchLaw::ContinuousVoltage
+    ) {
+        ensure!(
+            lexical::tokens(text.as_bytes())?
+                .iter()
+                .all(|span| &text[span.clone()] != "="),
+            "continuous PSpice switch instance assignments are unsupported"
+        );
+    }
+    Ok(law
+        .lower_instance(&fields, functions)?
+        .unwrap_or_else(|| text.to_owned()))
+}
+
+fn model(line: usize, functions: &mut Functions) -> Result<String> {
+    let mut card = functions.scopes.model(line)?;
+    let family = card.family.to_ascii_lowercase();
+    for p in &card.parameters {
+        let name = p.name.to_ascii_lowercase();
+        ensure!(
+            !matches!(name.split('/').next(), Some("dev" | "lot")),
+            "PSpice statistical model field {} requires a realization policy",
+            p.name
+        );
+        ensure!(
+            name != "t_rel_local",
+            "PSpice T_REL_LOCAL requires AKO model inheritance"
+        );
+    }
+    for (from, to) in [
+        ("t_abs", "temp"),
+        ("t_rel_global", "dtemp"),
+        ("t_measured", "tnom"),
+    ] {
+        rename_parameter(&mut card, from, to);
+    }
+    if matches!(family.as_str(), "nmos" | "pmos" | "npn" | "pnp")
+        && let Some(level) = parameter(&card, "level")
+    {
+        let level =
+            parse_spice_constant(&level).context("PSpice physical model level must be constant")?;
+        // Model levels are discrete identifiers, not measured quantities.
+        if matches!(family.as_str(), "nmos" | "pmos") {
+            match level {
+                5.0 => bail!("PSpice MOS level 5 requires an EKV physical kernel"),
+                6.0 | 7.0 => {
+                    set_parameter(&mut card, "level", "8");
+                    set_parameter(&mut card, "version", "3.2.4");
+                }
+                8.0 => {
+                    set_parameter(&mut card, "level", "14");
+                    set_parameter(&mut card, "version", "4.5.0");
+                }
+                _ => {}
+            }
+        } else if matches!(level, 2.0) {
+            bail!("PSpice BJT level 2 requires a MEXTRAM physical kernel");
+        }
+    }
+    if family == "lpnp" {
+        "PNP".clone_into(&mut card.family);
+        set_parameter(&mut card, "level", "1");
+        set_parameter(&mut card, "subs", "-1");
+    }
+    if let Some(switch) = SwitchLaw::from_model(&card)? {
+        switch.lower_model(&mut card);
+    }
+    let mut output = format!(".model {} {}(", card.name, card.family);
+    for (index, p) in card.parameters.iter().enumerate() {
+        if index != 0 {
+            output.push(' ');
+        }
+        output.push_str(&p.name);
+        if let Some(value) = &p.expression {
+            output.push('=');
+            output.push_str(&functions.expression(value, false)?);
+        }
+    }
+    output.push(')');
+    Ok(output)
+}
+
+fn commas_to_spaces(text: &str) -> Result<String> {
+    let edits = lexical::comma_tokens(text.as_bytes())?
+        .into_iter()
+        .filter(|span| &text[span.clone()] == ",")
+        .map(|span| (span, vec![b' ']))
+        .collect();
+    Ok(String::from_utf8(
+        lexical::apply_edits(text.as_bytes(), edits).unwrap_or_else(|| text.as_bytes().to_vec()),
+    )?)
+}
+
+fn rewrite(text: &str, line: usize, functions: &mut Functions) -> Result<String> {
+    let first = text.split_ascii_whitespace().next().unwrap_or_default();
+    let lower = first.to_ascii_lowercase();
+    if lower == ".model" {
+        return model(line, functions);
+    }
+    if lower == ".distribution" || lower == ".mc" || lower == ".worstcase" {
+        bail!("PSpice statistical directives require a realization policy");
+    }
+    if lower.starts_with('u') {
+        bail!("PSpice digital U-device requires a typed digital primitive");
+    }
+    let Some(start) = crate::expression_start(text.as_bytes(), first.as_bytes())? else {
+        return Ok(text.to_owned());
+    };
+    let prefix = &text[..start];
+    let tail = &text[start..];
+    let table = (lower.starts_with('e') || lower.starts_with('g'))
+        && tail
+            .split_ascii_whitespace()
+            .next()
+            .is_some_and(|word| word.to_ascii_lowercase().starts_with("value"));
+    let tail = functions.expression(tail, table)?;
+    let tail = if lower == ".subckt" || lower.starts_with('x') {
+        commas_to_spaces(&tail)?
+    } else {
+        tail
+    };
+    Ok(format!("{prefix}{tail}"))
+}
+
+fn lower_body(body: &[u8]) -> Result<(Vec<u8>, Vec<usize>, String)> {
+    let statements = lexical::statements(body)?;
+    let scopes = Scopes::collect(&statements)?;
+    let mut functions = Functions::new(body, scopes)?;
+    let mut edits: Vec<Edit> = Vec::new();
+    let mut inserted = BTreeMap::<usize, usize>::new();
+    let mut rewritten_statements = Vec::with_capacity(statements.len());
+    let mut in_control = false;
+    for statement in &statements {
+        let text = std::str::from_utf8(&statement.text).context("PSpice source is not UTF-8")?;
+        let first = text.split_ascii_whitespace().next().unwrap_or_default();
+        if first.eq_ignore_ascii_case(".control") {
+            in_control = true;
+        }
+        if first.eq_ignore_ascii_case(".endc") {
+            in_control = false;
+            rewritten_statements.push(text.to_owned());
+            continue;
+        }
+        let rewritten = if in_control {
+            nodes::rewrite(text, false, &functions.ground, true, |node| {
+                functions.scopes.hierarchical_ground(0, node)
+            })?
+        } else {
+            functions.scope = functions.scopes.scope(statement.line)?;
+            let text = instances::rewrite(
+                text,
+                functions.scopes.local_ground(functions.scope),
+                &functions.ground,
+            )?;
+            let rewritten = rewrite(&text, statement.line, &mut functions)
+                .with_context(|| format!("PSpice source line {}", statement.line))?;
+            let rewritten = nodes::rewrite(
+                &rewritten,
+                functions.scopes.local_ground(functions.scope),
+                &functions.ground,
+                false,
+                |node| functions.scopes.hierarchical_ground(functions.scope, node),
+            )?;
+            switch_instance(&rewritten, &mut functions)?
+        };
+        rewritten_statements.push(rewritten);
+    }
+    for (statement, mut rewritten) in statements.iter().zip(rewritten_statements) {
+        if functions.temperature
+            && statement
+                .text
+                .split(u8::is_ascii_whitespace)
+                .next()
+                .is_some_and(|first| first.eq_ignore_ascii_case(b".subckt"))
+        {
+            let newline = if body[statement.start..]
+                .split_inclusive(|b| *b == b'\n')
+                .next()
+                .is_some_and(|line| line.ends_with(b"\r\n"))
+            {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            rewritten.push_str(newline);
+            rewritten.push_str(&TEMPERATURE_PARAMS.replace('\n', newline));
+            inserted.insert(statement.line, TEMPERATURE_PARAMS.lines().count());
+        }
+        if rewritten.as_bytes() == statement.text {
+            continue;
+        }
+        lexical::replace_span(
+            statement,
+            0..statement.text.len(),
+            rewritten.as_bytes(),
+            &mut edits,
+        );
+        for (plus, _) in &statement.continuations {
+            edits.push((*plus..*plus + 1, vec![b'*']));
+        }
+    }
+    // PSpice treats *# directives as comments, not native simulator commands.
+    let mut offset = 0;
+    for line in body.split_inclusive(|byte| *byte == b'\n') {
+        let trimmed = line.trim_ascii_start();
+        if trimmed.starts_with(b"*#") {
+            let position = offset + line.len() - trimmed.len() + 1;
+            edits.push((position..position, vec![b' ']));
+        }
+        offset += line.len();
+    }
+    let bytes = lexical::apply_edits(body, edits).unwrap_or_else(|| body.to_vec());
+    let lines = (1..=body.split_inclusive(|b| *b == b'\n').count())
+        .flat_map(|line| {
+            std::iter::repeat_n(line, inserted.get(&line).copied().unwrap_or_default() + 1)
+        })
+        .collect();
+    Ok((bytes, lines, functions.definitions()?))
+}
+
+/// Lower a linked `PSpice` artifact and retain physical source provenance.
+/// The ordinary native normalizer is applied first for existing shared syntax.
+///
+/// # Errors
+/// Malformed statements, unsupported physical source semantics or invalid provenance.
+pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<MappedNormalization> {
+    let shared = super::normalize_mapped(input, kind)?;
+    let first = usize::from(kind == RootKind::Deck);
+    let title_end = if first != 0 {
+        shared
+            .model
+            .bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(shared.model.bytes.len(), |at| at + 1)
+    } else {
+        0
+    };
+    let (body, lines, definitions) = lower_body(&shared.model.bytes[title_end..])?;
+    let mut bytes = shared.model.bytes[..title_end].to_vec();
+    let mut input_lines = shared.input_lines[..first].to_vec();
+    let origin = shared.input_lines.get(first).copied().unwrap_or(1);
+    bytes.extend_from_slice(definitions.as_bytes());
+    input_lines.extend(std::iter::repeat_n(origin, definitions.lines().count()));
+    bytes.extend_from_slice(&body);
+    for line in lines {
+        input_lines.push(
+            *shared
+                .input_lines
+                .get(first + line - 1)
+                .context("missing PSpice source origin")?,
+        );
+    }
+    let mut passes = shared.model.passes;
+    if bytes != shared.model.bytes {
+        passes.push(NormalizationPass::PspiceSource);
+    }
+    ensure!(
+        input_lines.len() == bytes.split_inclusive(|b| *b == b'\n').count(),
+        "PSpice source mapping is inconsistent"
+    );
+    Ok(MappedNormalization {
+        model: crate::NormalizedModel { bytes, passes },
+        input_lines,
+    })
+}
