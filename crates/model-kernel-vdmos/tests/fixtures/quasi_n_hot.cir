@@ -1,0 +1,14 @@
+ngspice 47 quasi-saturation drain resistance DC voltage sweep
+.options gmin=1e-20 temp=70
+Vg g 0 0
+Vd d 0 0
+M1 d g 0 dut
+.model dut vdmos (vto=3 kp=20 rd=0.05 rq=0.2 vq=1.5 texp0=0.8 texp1=1.2)
+.control
+set width=200
+save @m1[rd]
+dc Vd -2 6 1
+print @m1[rd]
+quit
+.endc
+.end

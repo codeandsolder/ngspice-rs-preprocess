@@ -1,0 +1,14 @@
+ngspice 47 electrothermal on/off transient at imposed electrical biases
+.options gmin=1e-20 reltol=1e-7 abstol=1e-14 method=trap
+Vg g 0 PWL(0 0 20u 0 21u 4 400u 4 401u 0 800u 0)
+Vd d 0 0.3
+M1 d g 0 junction case dut thermal
+.model dut vdmos (vto=3 kp=20 rthjc=1 rthca=5 cthj=10u mu=-1.5)
+.control
+set width=200
+save v(g) v(junction) v(case) @m1[id]
+tran 1u 800u 0 1u
+print time v(g) v(junction) v(case) @m1[id]
+quit
+.endc
+.end

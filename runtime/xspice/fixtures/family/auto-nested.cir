@@ -1,0 +1,15 @@
+* 2 levels of SPICE hierarchy: ALB pin triples are carried through WRAP
+Vin ANALOG_INPUT 0 1.5
+Xtop d_in d_in_sink d_in_source d_out d_out_sink d_out_source WRAP
+Rload ANALOG_OUTPUT 0 100k
+.subckt WRAP sin sin_sink sin_source sout sout_sink sout_source
+Xcore sin sin_sink sin_source sout sout_sink sout_source ALB_BUFFER
+.ends WRAP
+.include "generated.inc"
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(ANALOG_OUTPUT)
+quit
+.endc
+.end

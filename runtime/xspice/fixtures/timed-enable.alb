@@ -1,0 +1,8 @@
+PORT A in[0] ;
+PORT B in[1] ;
+PORT OE in[2] ;
+PORT Y out[0] ;
+COMB (WIDTH=1, DELAY=2n) D = 0 ;
+D = A & B ;
+Y = D ;
+Y.En = OE ;

@@ -1,0 +1,22 @@
+* Original SIMetrix logical A block, no physical three-node ports in source
+Vin analog_input 0 1.5
+Xtop analog_input analog_output TOP
+Rload analog_output 0 100k
+.subckt TOP din dout
+A1 [din] [dout] DL
+.model DL d_logic_block file=logic input_load=2p out_res=40 out_delay=2n family="HC"
+.file logic
+PORT A in[0] ;
+PORT Y out[0] ;
+COMB (WIDTH=1, DELAY=2n) D ;
+D = A ;
+Y = D ;
+.endf
+.ends TOP
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(analog_output)
+quit
+.endc
+.end

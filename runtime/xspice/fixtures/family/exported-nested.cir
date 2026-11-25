@@ -1,0 +1,18 @@
+* Analog-only ports span two nested wrappers; bridge remains at INNER
+Vin analog_in 0 1.5
+Xtop analog_in analog_out OUTER
+Rload analog_out 0 100k
+.subckt OUTER public_in public_out
+Xinner public_in public_out INNER
+.ends OUTER
+.subckt INNER pin_in pin_out
+A1 [pin_in] [pin_out] DL
+.model DL d_logic_block def="out[0] = in[0];" input_load=2p out_res=40 out_delay=2n family="HC"
+.ends INNER
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(analog_out)
+quit
+.endc
+.end

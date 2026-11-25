@@ -1,0 +1,25 @@
+* Two instances of original ALB with private ADC and DAC in subckt
+Xone o1 TOP
+Xtwo o2 TOP
+Rprobe1 o1 0 100k
+Rprobe2 o2 0 100k
+.subckt TOP output
+Vlocal local_in 0 1.5
+A1 [local_in] [local_out] DL
+Rmeter local_out output 1m
+.model DL d_logic_block file=logic input_load=2p out_res=40 out_delay=2n family="HC"
+.file logic
+PORT A in[0] ;
+PORT Y out[0] ;
+COMB (WIDTH=1, DELAY=2n) D ;
+D = A ;
+Y = D ;
+.endf
+.ends TOP
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(o1) v(o2)
+quit
+.endc
+.end

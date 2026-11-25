@@ -1,0 +1,15 @@
+* Shared family ADC: two separate Rust-compiled physical ALB inputs
+* each contribute 2pF without a duplicate bridge-input load.
+Vin vin 0 PULSE(0 5 1n 1p 1p 30n 60n)
+Rin vin analog_input 1k
+Xalb1 d_in d_in_sink d_in_source d_out1 d_out1_sink d_out1_source ALB_BUFFER
+Xalb2 d_in d_in_sink d_in_source d_out2 d_out2_sink d_out2_source ALB_BUFFER
+.include "generated.inc"
+.include "bridge.inc"
+.tran 20p 13n
+.control
+run
+wrdata result.dat v(analog_input)
+quit
+.endc
+.end

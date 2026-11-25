@@ -1,0 +1,59 @@
+NAME_TABLE:
+Spice_Model_Name:      sr_alb_lut_bit
+C_Function_Name:       cm_sr_alb_lut_bit
+Description:           "ngspice-rs-preprocess experimental timed per-bit ALB LUT"
+
+PORT_TABLE:
+Port_Name:             in                   out                  sink_meta           source_meta          wake
+Description:           "digital sources"    "one output bit"     "sink current sum"   "source current sum"   "startup wake"
+Direction:             in                   out                  out                 out                  in
+Default_Type:          d                    d                    d                   d                    v
+Allowed_Types:         [d]                  [d]                  [d]                 [d]                  [v]
+Vector:                yes                  no                   no                  no                   no
+Vector_Bounds:         -                    -                    -                   -                    -
+Null_Allowed:          no                   no                   no                  no                   no
+
+PARAMETER_TABLE:
+Parameter_Name:        table_values          delay                 out_res
+Description:           "binary row LUT"      "stage base delay"    "output resistance"
+Data_Type:             string                real                  real
+Default_Value:         -                     1e-9                  0
+Limits:                -                     [1e-12 -]             [0 -]
+Vector:                no                    no                    no
+Vector_Bounds:         -                     -                     -
+Null_Allowed:          no                    yes                   yes
+
+PARAMETER_TABLE:
+Parameter_Name:        min_sink            max_source
+Description:           "sink current floor" "source current ceiling"
+Data_Type:             real                real
+Default_Value:         -1e99               1e99
+Limits:                -                   -
+Vector:                no                  no
+Vector_Bounds:         -                   -
+Null_Allowed:          yes                 yes
+
+PARAMETER_TABLE:
+Parameter_Name:        input_load            ic                    inertial_delay
+Description:           "input capacitance"   "initial state"       "swallow pulses"
+Data_Type:             real                  int                   boolean
+Default_Value:         0                     0                     true
+Limits:                [0 -]                 [0 2]                 -
+Vector:                no                    no                    no
+Vector_Bounds:         -                     -                     -
+Null_Allowed:          yes                   yes                   yes
+
+STATIC_VAR_TABLE:
+Static_Var_Name:       is_inertial           transient_wake_queued   valid
+Data_Type:             boolean               boolean                 boolean
+Description:           "inertial timing"     "startup event queued"  "valid LUT"
+
+PARAMETER_TABLE:
+Parameter_Name:        unknown_as_zero
+Description:           "coerce UNKNOWN input level to LOW, as SIMetrix ALB expressions do"
+Data_Type:             boolean
+Default_Value:         false
+Limits:                -
+Vector:                no
+Vector_Bounds:         -
+Null_Allowed:          yes

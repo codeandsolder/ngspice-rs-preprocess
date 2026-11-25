@@ -1,0 +1,23 @@
+* Two logical ALB receivers share the same digital input within TOP
+Vin vin 0 PULSE(0 5 1n 1p 1p 30n 60n)
+Rin vin analog_input 1k
+Xtop analog_input TOP
+.subckt TOP input
+A1 [input] [left] DL
+A2 [input] [right] DL
+.model DL d_logic_block file=logic input_load=2p out_res=40 out_delay=2n family="HC"
+.file logic
+PORT A in[0] ;
+PORT Y out[0] ;
+COMB (WIDTH=1, DELAY=2n) D ;
+D = A ;
+Y = D ;
+.endf
+.ends TOP
+.tran 20p 13n
+.control
+run
+wrdata result.dat v(analog_input)
+quit
+.endc
+.end

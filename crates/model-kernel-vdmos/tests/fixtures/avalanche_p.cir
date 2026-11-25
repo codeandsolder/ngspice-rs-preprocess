@@ -1,0 +1,13 @@
+ngspice 47 diode reverse-breakdown sweep
+.options gmin=1e-20
+Vg g 0 0
+Vd d 0 0
+M1 d g 0 dut
+.model dut vdmosp (vto=-3 kp=10 is=1e-14 bv=40 ibv=1e-9 nbv=1.3)
+.control
+save @m1[idio]
+dc Vd -37 -43 -1
+print @m1[idio]
+quit
+.endc
+.end

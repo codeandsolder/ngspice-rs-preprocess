@@ -1,0 +1,18 @@
+* Original logical ALB ports carried through nested wrappers
+Vin analog_input 0 1.5
+Xouter analog_input analog_output OUTER
+Rload analog_output 0 100k
+.subckt OUTER in out
+Xinner in out INNER
+.ends OUTER
+.subckt INNER p q
+A1 [p] [q] DL
+.model DL d_logic_block def="out[0] = in[0];" input_load=2p out_res=40 out_delay=2n family="HC"
+.ends INNER
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(analog_output)
+quit
+.endc
+.end

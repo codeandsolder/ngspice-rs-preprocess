@@ -1,0 +1,10 @@
+* Named VDMOS library sections
+.lib blocked
+.model dut VDMOS(vto=3 kp=999)
+.endl blocked
+.lib power
+.model dut VDMOS(vto=3 kp={scaled(base)+1})
+.endl power
+.lib unused
+.model other VDMOS(vto=3 kp=2)
+.endl unused

@@ -1,0 +1,18 @@
+IRF7220 reversed Cgd endpoint catalog model verification
+* Parameter values sourced from LTspice standard.mos, IRF7220; model card restructured.
+* https://github.com/evenator/LTSpice-Libraries/blob/master/cmp/standard.mos
+.options gmin=1e-20
+Vg g 0 0
+Vd d 0 0
+M1 d g 0 dut
+.model dut VDMOS (PCHAN Vto=-.75 Kp=86 Rg=3 Rd=4.8m Rs=3.6m Rb=6m
++ Cgdmin=4.25n Cgdmax=1.5n Cgs=7n Cjo=1n Is=168p
++ mfg=International_Rectifier Vds=-12 Ron=12m Qg=84n)
+.control
+set width=200
+save v(d) @m1[cgd] @m1[vds] @m1[vgs]
+dc Vd -5 5 1
+print v(d) @m1[cgd] @m1[vds] @m1[vgs]
+quit
+.endc
+.end

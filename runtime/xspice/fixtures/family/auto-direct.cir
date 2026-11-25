@@ -1,0 +1,12 @@
+* Auto-discovered physical family wiring from a compiled ALB subckt
+Vin ANALOG_INPUT 0 1.5
+Xalb d_in d_in_sink d_in_source d_out d_out_sink d_out_source ALB_BUFFER
+Rload ANALOG_OUTPUT 0 100k
+.include "generated.inc"
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(ANALOG_OUTPUT)
+quit
+.endc
+.end

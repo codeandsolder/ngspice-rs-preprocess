@@ -1,0 +1,20 @@
+* Vendor-only: asynchronous reset on EDGE register while clock remains LOW.
+.model MEDGE d_logic_block file=EDGE_ASYNC family="UNIV"
+.file EDGE_ASYNC
+PORT Data in[0] ;
+PORT Clock in[1] ;
+PORT Reset in[2] ;
+PORT (DELAY=250p) Q out[0] ;
+EDGE (WIDTH=1, DELAY=1n, ASYNCDELAY=200p, CLOCK=in[1]) Flip=0 ;
+Flip := !Reset ? 0 ;
+Flip = Data ;
+Q = Flip ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 35n 5 35.1n 0 52n 0)
+Vclock ck 0 PWL(0 0 9.9n 0 10n 5 12n 5 12.1n 0 29.9n 0 30n 5 32n 5 32.1n 0 52n 0)
+Vreset rst 0 PWL(0 5 19.9n 5 20n 0 23n 0 23.1n 5 52n 5)
+Aseq [d ck rst] [q] MEDGE
+Rout q 0 100k
+.tran 20p 52n 0 20p
+.PRINT TRAN V(d) V(ck) V(rst) V(q)
+.end

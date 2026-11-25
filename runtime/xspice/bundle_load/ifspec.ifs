@@ -1,0 +1,24 @@
+NAME_TABLE:
+Spice_Model_Name:      sr_bundle_load
+C_Function_Name:       cm_sr_bundle_load
+Description:           "ngspice-rs-preprocess digital signal bundle input load"
+
+PORT_TABLE:
+Port_Name:             state               sink_meta           source_meta
+Description:           "logic state"       "sink metadata"     "source metadata"
+Direction:             in                  in                  in
+Default_Type:          d                   d                   d
+Allowed_Types:         [d]                 [d]                 [d]
+Vector:                no                  no                  no
+Vector_Bounds:         -                   -                   -
+Null_Allowed:          no                  no                  no
+
+PARAMETER_TABLE:
+Parameter_Name:        capacitance         sink_current        source_current
+Description:           "input capacitance" "sink current"     "source current"
+Data_Type:             real                real                real
+Default_Value:         0                   0                   0
+Limits:                -                   -                   -
+Vector:                no                  no                  no
+Vector_Bounds:         -                   -                   -
+Null_Allowed:          yes                 yes                 yes

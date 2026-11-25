@@ -1,0 +1,14 @@
+# Synthetic compatibility table for tests, NOT a SIMetrix vendor table.
+# Rows are INPUT families, columns OUTPUT families, then IN-IN, OUT-OUT.
+HC LS ECL
+OK WARN ERR
+OK OK ERR
+ERR ERR OK
+
+ROW ROW ERR
+COL ROW ERR
+ERR ERR ROW
+
+ROW ROW ERR
+COL ROW ERR
+ERR ERR ROW

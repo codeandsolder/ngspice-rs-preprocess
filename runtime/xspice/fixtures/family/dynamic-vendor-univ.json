@@ -1,0 +1,98 @@
+{
+  "connections": [
+    {
+      "scope": [
+        "TOP"
+      ],
+      "analog_net": "pin",
+      "digital_net": "D_LEFT",
+      "direction": "output",
+      "producer": {
+        "path": [
+          "Xgateway",
+          "Xgroup",
+          "Xleft",
+          "Xinner",
+          "A1"
+        ],
+        "output_pin": 0
+      },
+      "out_family": "UNIV",
+      "supply_v": 5.0
+    },
+    {
+      "scope": [
+        "TOP"
+      ],
+      "analog_net": "pin",
+      "digital_net": "D_RIGHT",
+      "direction": "output",
+      "producer": {
+        "path": [
+          "Xgateway",
+          "Xgroup",
+          "Xright",
+          "Xinner",
+          "A1"
+        ],
+        "output_pin": 0
+      },
+      "out_family": "UNIV",
+      "supply_v": 5.0
+    },
+    {
+      "scope": [
+        "TOP"
+      ],
+      "analog_net": "a",
+      "digital_net": "D_A",
+      "direction": "input",
+      "in_family": "UNIV",
+      "supply_v": 5.0
+    },
+    {
+      "scope": [
+        "TOP"
+      ],
+      "analog_net": "b",
+      "digital_net": "D_B",
+      "direction": "input",
+      "in_family": "UNIV",
+      "supply_v": 5.0
+    },
+    {
+      "scope": [
+        "TOP"
+      ],
+      "analog_net": "pin",
+      "digital_net": "D_SENSE",
+      "direction": "input",
+      "in_family": "UNIV",
+      "supply_v": 5.0
+    },
+    {
+      "scope": [
+        "TOP"
+      ],
+      "analog_net": "observe",
+      "digital_net": "D_OBSERVE",
+      "direction": "output",
+      "out_family": "UNIV",
+      "supply_v": 5.0
+    }
+  ],
+  "bridge_models": [
+    {
+      "name": "UNIV_ADC",
+      "kind": "adc",
+      "family": "UNIV",
+      "nominal_supply_v": 5
+    },
+    {
+      "name": "UNIV_DAC",
+      "kind": "dac",
+      "family": "UNIV",
+      "nominal_supply_v": 5
+    }
+  ]
+}

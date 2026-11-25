@@ -1,0 +1,18 @@
+* Vendor-only SIMetrix 9.40d ALB: transparent HIGH-enable register.
+* Data changes while enabled and while disabled distinguish LEVEL from EDGE.
+.model MLEVEL d_logic_block file=LEVEL_BASIC family="UNIV"
+.file LEVEL_BASIC
+PORT Data in[0] ;
+PORT Enable in[1] ;
+PORT (DELAY=250p) Q out[0] ;
+LEVEL (WIDTH=1, DELAY=750p, SETUP=0, CLOCK=in[1]) Latch=0 ;
+Latch = Data ;
+Q = Latch ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 14n 5 14.1n 0 24n 0 24.1n 5 34n 5 34.1n 0 44n 0 44.1n 5 52n 5)
+Venable en 0 PWL(0 0 9.9n 0 10n 5 19.9n 5 20n 0 29.9n 0 30n 5 39.9n 5 40n 0 52n 0)
+Alatch [d en] [q] MLEVEL
+Rout q 0 100k
+.tran 20p 52n 0 20p
+.PRINT TRAN V(d) V(en) V(q)
+.end

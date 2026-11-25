@@ -1,0 +1,13 @@
+ngspice 47 VDMOS prescribed reverse-recovery transient
+.options gmin=1e-20 reltol=1e-7 abstol=1e-14 method=trap
+Vg g 0 0
+Vd d 0 PWL(0 0.55 200n 0.55 205n -0.1 700n -0.1)
+M1 d g 0 dut
+.model dut vdmosp (vto=-3 kp=10 is=1e-12 n=1 cjo=1n m=0.5 fc=0.5 tt=100n vp=0.4)
+.control
+save v(d) @m1[qdio] @m1[idio]
+tran 2n 700n 0 2n
+print time v(d) @m1[qdio] @m1[idio]
+quit
+.endc
+.end

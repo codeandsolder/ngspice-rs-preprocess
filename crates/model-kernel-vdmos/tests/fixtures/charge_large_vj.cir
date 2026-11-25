@@ -1,0 +1,14 @@
+ngspice 47 junction potential limiting, high-VJ fitted model family
+.options gmin=1e-20
+.temp 70
+Vg g 0 0
+Vd d 0 0
+M1 d g 0 dut
+.model dut vdmos (vto=3 kp=20 is=1e-14 cjo=1e-9 vj=16.58 n=1.045 m=0.85 fc=0.5 tt=27n cgdmin=20p cgdmax=2n a=1 cgs=1.4n)
+.control
+save @m1[cgd] @m1[cds] @m1[cgs]
+dc Vd -0.4 0.6 0.2
+print @m1[cgd] @m1[cds] @m1[cgs]
+quit
+.endc
+.end

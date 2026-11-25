@@ -1,0 +1,22 @@
+* Mixed public port types: producer analog input -> shared digital bus -> two consumer analog outputs
+Vin analog_in 0 1.5
+Xproducer analog_in bus PRODUCER
+Xconsumer_a bus out_a CONSUMER
+Xconsumer_b bus out_b CONSUMER
+Rload_a out_a 0 100k
+Rload_b out_b 0 100k
+.subckt PRODUCER pin_in pin_digital
+A1 [pin_in] [pin_digital] DL
+.model DL d_logic_block def="out[0] = in[0];" input_load=2p out_res=40 out_delay=2n family="HC"
+.ends PRODUCER
+.subckt CONSUMER pin_digital pin_out
+A1 [pin_digital] [pin_out] DL
+.model DL d_logic_block def="out[0] = in[0];" input_load=2p out_res=40 out_delay=2n family="HC"
+.ends CONSUMER
+.tran 20p 18n
+.control
+run
+wrdata result.dat v(out_a) v(out_b)
+quit
+.endc
+.end

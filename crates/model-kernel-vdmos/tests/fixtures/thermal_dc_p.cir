@@ -1,0 +1,12 @@
+ngspice 47 VDMOS self-heating DC benchmark
+.options gmin=1e-20 temp=27
+Vg g 0 -4
+Vd d 0 -0.3
+M1 d g 0 junction case dut thermal
+.model dut vdmosp (vto=-3 kp=10 rthjc=1 rthca=5 cthj=10u mu=-1.5)
+.control
+op
+print v(junction) v(case) @m1[id] @m1[temp]
+quit
+.endc
+.end

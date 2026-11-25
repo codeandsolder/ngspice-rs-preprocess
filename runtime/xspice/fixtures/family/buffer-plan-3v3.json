@@ -1,0 +1,37 @@
+{
+  "digital_nets": [],
+  "analog_pins": [
+    {
+      "id": "ALB.in0",
+      "analog_net": "analog_input",
+      "direction": "input",
+      "family": {
+        "in_family": "HC"
+      },
+      "supply_v": 3.3
+    },
+    {
+      "id": "ALB.out0",
+      "analog_net": "analog_output",
+      "direction": "output",
+      "family": {
+        "out_family": "HC"
+      },
+      "supply_v": 3.3
+    }
+  ],
+  "bridge_models": [
+    {
+      "name": "HC_ADC",
+      "kind": "adc",
+      "family": "HC",
+      "nominal_supply_v": 5
+    },
+    {
+      "name": "HC_DAC",
+      "kind": "dac",
+      "family": "HC",
+      "nominal_supply_v": 5
+    }
+  ]
+}

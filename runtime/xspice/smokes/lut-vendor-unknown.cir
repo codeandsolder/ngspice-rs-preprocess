@@ -1,0 +1,51 @@
+* SIMetrix 9.40d: UNKNOWN input is coerced to a LOW expression bit.
+* Native generic consensus remains separately available for other LUTs.
+Vlow nlow 0 0
+Vhigh nhigh 0 1
+Vunknown nx 0 .5
+Vpull supply 0 5
+Aadc [nlow nhigh nx] [d0 d1 dx] ADC
+.model ADC adc_bridge(in_low=.25 in_high=.75 rise_delay=1p fall_delay=1p)
+Aand [d0 dx] dand andsink andsource 0 AND
+.model AND sr_alb_lut_bit(table_values="0001" delay=1n ic=2 unknown_as_zero=true)
+Aor [d1 dx] dor orsink orsource 0 OR
+.model OR sr_alb_lut_bit(table_values="0111" delay=1n ic=2 unknown_as_zero=true)
+Axor [d1 dx] dxor xorsink xorsource 0 XOR
+.model XOR sr_alb_lut_bit(table_values="0110" delay=1n ic=2 unknown_as_zero=true)
+Aidentity [dx] did idsink idsource 0 ID
+.model ID sr_alb_lut_bit(table_values="01" delay=1n ic=2 unknown_as_zero=true)
+Ainverter [dx] dnot notsink notsource 0 INV
+.model INV sr_alb_lut_bit(table_values="10" delay=1n ic=2 unknown_as_zero=true)
+AenableX [dx] denx exsink exsource 0 ENABLE
+Aenable0 [d0] den0 e0sink e0source 0 ENABLE
+Aenable1 [d1] den1 e1sink e1source 0 ENABLE
+.model ENABLE sr_alb_lut_bit(table_values="Z0" delay=1n ic=2 unknown_as_zero=true)
+* Generic possible-state consensus must still yield UNKNOWN for 1 XOR X.
+Ageneric [d1 dx] dgeneric gen_sink gen_source 0 GENERIC
+.model GENERIC sr_alb_lut_bit(table_values="0110" delay=1n ic=2)
+Adacand dand andsink andsource %gd(yand 0) DAC
+Adacor dor orsink orsource %gd(yor 0) DAC
+Adacxor dxor xorsink xorsource %gd(yxor 0) DAC
+Adacid did idsink idsource %gd(yid 0) DAC
+Adacnot dnot notsink notsource %gd(ynot 0) DAC
+Adacenx denx exsink exsource %gd(yenx 0) DAC
+Adacen0 den0 e0sink e0source %gd(yen0 0) DAC
+Adacen1 den1 e1sink e1source %gd(yen1 0) DAC
+Adacgen dgeneric gen_sink gen_source %gd(ygeneric 0) DAC
+.model DAC sr_family_dac(out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 knee_low=2 knee_high=2.75 v_smooth=.5 input_load=-31p t_rise=2n t_fall=2n sink_current=0 source_current=0)
+Rpulland yand supply 10k
+Rpullor yor supply 10k
+Rpullxor yxor supply 10k
+Rpullid yid supply 10k
+Rpullnot ynot supply 10k
+Rpullenx yenx supply 10k
+Rpullen0 yen0 supply 10k
+Rpullen1 yen1 supply 10k
+Rpullgeneric ygeneric supply 10k
+.tran 20p 6n
+.control
+run
+wrdata lut-vendor-unknown.dat v(yand) v(yor) v(yxor) v(yid) v(ynot) v(yenx) v(yen0) v(yen1) v(ygeneric)
+quit
+.endc
+.end

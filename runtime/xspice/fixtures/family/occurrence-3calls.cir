@@ -1,0 +1,28 @@
+* One original ALB definition, three independent calls with two supply variants
+Vin_a in_a 0 1.5
+Vin_b in_b 0 1.5
+Vin_c in_c 0 1.5
+Xone in_a out_a TOP
+Xtwo in_b out_b TOP
+Xthree in_c out_c TOP
+Rload_a out_a 0 100k
+Rload_b out_b 0 100k
+Rload_c out_c 0 100k
+.subckt TOP analog_in analog_out
+A1 [analog_in] [analog_out] DL
+.model DL d_logic_block file=logic input_load=2p out_res=40 out_delay=2n family="HC"
+.file logic
+PORT A in[0] ;
+PORT Y out[0] ;
+COMB (WIDTH=1, DELAY=2n) D ;
+D = A ;
+Y = D ;
+.endf
+.ends TOP
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(out_a) v(out_b) v(out_c)
+quit
+.endc
+.end

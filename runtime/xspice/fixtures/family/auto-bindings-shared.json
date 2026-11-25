@@ -1,0 +1,19 @@
+{
+  "connections": [
+    {
+      "analog_net": "ANALOG_INPUT",
+      "digital_net": "d_in",
+      "direction": "input",
+      "in_family": "HC",
+      "supply_v": 5
+    }
+  ],
+  "bridge_models": [
+    {
+      "name": "HC_ADC",
+      "kind": "adc",
+      "family": "HC",
+      "nominal_supply_v": 5
+    }
+  ]
+}

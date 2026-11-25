@@ -1,0 +1,14 @@
+# Keep local Clippy behavior aligned with the rust-skills2 strict gate.
+avoid-breaking-exported-api = false
+
+allow-dbg-in-tests = false
+allow-expect-in-consts = false
+allow-expect-in-tests = false
+allow-panic-in-tests = false
+allow-print-in-tests = false
+allow-unwrap-in-consts = false
+allow-unwrap-in-tests = false
+
+check-incompatible-msrv-in-tests = true
+suppress-restriction-lint-in-const = false
+allow-mixed-uninlined-format-args = false

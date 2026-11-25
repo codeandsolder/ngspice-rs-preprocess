@@ -1,0 +1,98 @@
+{
+  "digital_nets": [
+    {
+      "node": "DIG_COMPAT",
+      "inputs": [
+        "LS"
+      ],
+      "outputs": [
+        "HC"
+      ]
+    },
+    {
+      "node": "DIG_WARN",
+      "inputs": [
+        "HC_SCHMITT"
+      ],
+      "outputs": [
+        "LS"
+      ]
+    }
+  ],
+  "analog_pins": [
+    {
+      "id": "X1.in",
+      "analog_net": "a_input",
+      "direction": "input",
+      "family": {
+        "in_family": "HC"
+      },
+      "supply_v": 5
+    },
+    {
+      "id": "X2.in",
+      "analog_net": "A_INPUT",
+      "direction": "input",
+      "family": {
+        "in_family": "hc"
+      },
+      "supply_v": 5
+    },
+    {
+      "id": "X3.schmitt",
+      "analog_net": "A_INPUT",
+      "direction": "input",
+      "family": {
+        "in_family": "HC_SCHMITT"
+      },
+      "supply_v": 5
+    },
+    {
+      "id": "X4.in",
+      "analog_net": "A_INPUT",
+      "direction": "input",
+      "family": {
+        "in_family": "HC"
+      },
+      "supply_v": 3.3
+    },
+    {
+      "id": "X5.out",
+      "analog_net": "A_INPUT",
+      "direction": "output",
+      "family": {
+        "out_family": "HC"
+      },
+      "supply_v": 5
+    },
+    {
+      "id": "X6.out",
+      "analog_net": "a_input",
+      "direction": "output",
+      "family": {
+        "out_family": "HC"
+      },
+      "supply_v": 5
+    }
+  ],
+  "bridge_models": [
+    {
+      "name": "HC_ADC",
+      "kind": "adc",
+      "family": "HC",
+      "nominal_supply_v": 5
+    },
+    {
+      "name": "HC_SCHMITT_ADC",
+      "kind": "adc",
+      "family": "HC_SCHMITT",
+      "nominal_supply_v": 5
+    },
+    {
+      "name": "HC_DAC",
+      "kind": "dac",
+      "family": "HC",
+      "nominal_supply_v": 5
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+NAME_TABLE:
+Spice_Model_Name:      sr_alb_probe
+C_Function_Name:       cm_sr_alb_probe
+Description:           "ngspice-rs-preprocess ALB backend timing probe"
+
+PORT_TABLE:
+Port_Name:             in                  out                 wake
+Description:           "digital input"     "digital output"    "startup wake input"
+Direction:             in                  out                 in
+Default_Type:          d                   d                   v
+Allowed_Types:         [d]                 [d]                 [v]
+Vector:                no                  no                  no
+Vector_Bounds:         -                   -                   -
+Null_Allowed:          no                  no                  no
+
+PARAMETER_TABLE:
+Parameter_Name:        delay               input_load         out_res
+Description:           "base delay"        "input load"       "output resistance"
+Data_Type:             real                real               real
+Default_Value:         1.0e-9              1.0e-12            0.0
+Limits:                [1e-12 -]           -                  [0 -]
+Vector:                no                  no                 no
+Vector_Bounds:         -                   -                  -
+Null_Allowed:          yes                 yes                yes
+
+PARAMETER_TABLE:
+Parameter_Name:        ic                  inertial_delay     family
+Description:           "initial state"     "swallow pulses"  "Logic family for bridging"
+Data_Type:             int                 boolean            string
+Default_Value:         0                   true               -
+Limits:                [0 2]               -                  -
+Vector:                no                  no                 no
+Vector_Bounds:         -                   -                  -
+Null_Allowed:          yes                 yes                yes
+
+STATIC_VAR_TABLE:
+Static_Var_Name:       is_inertial         transient_wake_queued
+Data_Type:             boolean             boolean
+Description:           "using inertial delay" "startup event queued"

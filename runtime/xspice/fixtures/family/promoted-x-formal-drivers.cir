@@ -1,0 +1,31 @@
+* Two ALB X occurrences originally spell the same logical PIN output net.
+* Producer-specific physical bundles split the original PIN without cloning OUTER.
+Vleft a 0 PWL(0 0 8n 0 8.1n 3.3 20n 3.3 20.1n 0 40n 0)
+Vright b 0 PWL(0 0 14n 0 14.1n 3.3 30n 3.3 30.1n 0 40n 0)
+Xone pin a b TOP
+Rload pin 0 100k
+.subckt TOP pin a b
+Xgateway a b pin GATE
+Xidle a b spare GROUP
+.ends TOP
+.subckt GATE a b pin
+Xgroup a b pin GROUP
+.ends GATE
+.subckt GROUP a b pin
+Xleft a pin OUTER
+Xright b pin OUTER
+.ends GROUP
+.subckt OUTER control drive
+Xinner control drive INNER
+.ends OUTER
+.subckt INNER input output
+A1 [input] [output] DL
+.model DL d_logic_block def="out[0] = in[0];" input_load=2p out_res=40 out_delay=1n family="HC"
+.ends INNER
+.tran 20p 40n
+.control
+run
+wrdata result.dat v(pin) v(a) v(b)
+quit
+.endc
+.end
