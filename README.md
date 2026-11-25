@@ -36,8 +36,11 @@ work before returning and must not leave persistent descendants.
 
 Default admission ceilings are 64 MiB of original input per source, 128 MiB
 of stdout and 64 KiB of stderr per invocation, and a 30-second process
-deadline. The input stream and both output streams are handled concurrently;
-the deadline includes waiting for the process to exit after its pipes close.
+deadline. The child receives an anonymous input snapshot (memory-backed on
+Linux, temporary file elsewhere), and both output streams are drained
+concurrently. Adapters may consume all, some or none of stdin. The deadline
+covers staging the input and waiting for the process to exit after its pipes
+close.
 Cancellation uses a shared `Cancellation` token. On Unix, failed invocations
 terminate the child process group; on Windows, the direct child is terminated.
 Cleanup is separately bounded to five seconds. Ordinary filesystem reads

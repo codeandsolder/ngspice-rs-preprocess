@@ -29,7 +29,7 @@ pub struct LinkedSource {
 
 impl LinkedSource {
     /// Map a linked 1-based source line back to the original file and line.
-    #[must_use]
+    #[must_use = "the returned origin maps a diagnostic to its admitted source"]
     pub fn origin(&self, linked_line: usize) -> Option<&SourceOrigin> {
         self.origins.get(linked_line.checked_sub(1)?)
     }

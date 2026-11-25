@@ -42,17 +42,17 @@ impl LogicFamily {
         Ok(Self { full, base })
     }
 
-    #[must_use]
+    #[must_use = "the name identifies the full family"]
     pub fn full_name(&self) -> &str {
         &self.full
     }
 
-    #[must_use]
+    #[must_use = "the name identifies the base family"]
     pub fn base_name(&self) -> &str {
         &self.base
     }
 
-    #[must_use]
+    #[must_use = "the result distinguishes a subfamily from its base"]
     pub fn is_subfamily(&self) -> bool {
         self.full != self.base
     }
@@ -227,7 +227,7 @@ impl LegacyCompatibilityTable {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned slice enumerates known families"]
     pub fn families(&self) -> &[String] {
         &self.families
     }

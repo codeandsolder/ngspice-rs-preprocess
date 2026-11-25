@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::HashMap,
     ffi::OsString,
-    fs::OpenOptions,
-    io::{self, Read, Write},
+    fs::{File, OpenOptions},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -229,7 +229,7 @@ impl SourceSession {
                 &config.executable,
                 directory,
                 &arguments,
-                bytes,
+                &bytes,
                 self.config.process,
                 &self.cancellation,
             )
@@ -362,14 +362,40 @@ struct BoundedStream<'a> {
     cancellation: &'a Cancellation,
 }
 
+fn check_io(deadline: Instant, cancellation: &Cancellation) -> io::Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(io::Error::other("source processing cancelled"));
+    }
+    if Instant::now() >= deadline {
+        return Err(io::Error::other("process deadline elapsed"));
+    }
+    Ok(())
+}
+
+// A seekable anonymous snapshot also supports commands which deliberately
+// ignore stdin and use the original pathname. There is no writer pipe to
+// become stuck when a successful child closes its read end prematurely.
+fn stage_input(bytes: &[u8], deadline: Instant, cancellation: &Cancellation) -> io::Result<File> {
+    check_io(deadline, cancellation)?;
+    #[cfg(target_os = "linux")]
+    let mut file = File::from(rustix::fs::memfd_create(
+        "spice-source",
+        rustix::fs::MemfdFlags::CLOEXEC,
+    )?);
+    #[cfg(not(target_os = "linux"))]
+    let mut file = tempfile::tempfile()?;
+    for chunk in bytes.chunks(64 * 1024) {
+        check_io(deadline, cancellation)?;
+        file.write_all(chunk)?;
+    }
+    file.rewind()?;
+    check_io(deadline, cancellation)?;
+    Ok(file)
+}
+
 impl Write for BoundedStream<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.cancellation.is_cancelled() {
-            return Err(io::Error::other("source processing cancelled"));
-        }
-        if Instant::now() >= self.deadline {
-            return Err(io::Error::other("process deadline elapsed"));
-        }
+        check_io(self.deadline, self.cancellation)?;
         let count = bytes.len().min(self.limit.saturating_sub(self.bytes.len()));
         self.bytes.extend_from_slice(&bytes[..count]);
         if count != bytes.len() {
@@ -388,8 +414,8 @@ impl Write for BoundedStream<'_> {
 
 /// Execute a direct child with bounded concurrent I/O.
 ///
-/// Concurrently supplying stdin and capturing stdout
-/// and stderr. This low-level helper also supports simulator diagnostics;
+/// Supply an anonymous stdin snapshot and capture stdout and stderr concurrently.
+/// This low-level helper also supports simulator diagnostics;
 /// only the source command configuration requires an absolute executable.
 ///
 /// The deadline includes process exit after pipes close. Cancellation is
@@ -404,7 +430,7 @@ pub fn capture(
     program: &Path,
     directory: &Path,
     arguments: &[OsString],
-    input: Arc<[u8]>,
+    input: &[u8],
     limits: ProcessLimits,
     cancellation: &Cancellation,
 ) -> Result<CapturedProcess> {
@@ -416,9 +442,13 @@ pub fn capture(
     let exec = Exec::cmd(program)
         .args(arguments)
         .cwd(directory)
-        .stdin(subprocess::InputData::from_bytes(input))
         .stdout(Redirection::Pipe)
         .stderr(Redirection::Pipe);
+    let exec = if input.is_empty() {
+        exec.stdin(Redirection::Null)
+    } else {
+        exec.stdin(stage_input(input, deadline, cancellation)?)
+    };
     #[cfg(unix)]
     let exec = exec.setpgid();
     let job = exec
@@ -502,5 +532,24 @@ fn collect(
         if let Some(status) = job.wait_timeout(remaining(deadline, cancellation)?)? {
             return Ok(status);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_snapshot_checks_cancel_and_deadline_before_copying() -> Result<()> {
+        let token = Cancellation::default();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut input = stage_input(b"abcdef", deadline, &token)?;
+        let mut buffer = Vec::new();
+        input.read_to_end(&mut buffer)?;
+        assert_eq!(buffer, b"abcdef");
+        token.cancel();
+        assert!(stage_input(b"abcdef", deadline, &token).is_err());
+        assert!(stage_input(b"abcdef", Instant::now(), &Cancellation::default()).is_err());
+        Ok(())
     }
 }

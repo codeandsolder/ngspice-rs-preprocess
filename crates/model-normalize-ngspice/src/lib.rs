@@ -12,9 +12,7 @@ use anyhow::{Context, Result, bail};
 use model_preprocess_command::{Cancellation, ProcessLimits, capture};
 use regex::bytes::Regex;
 use serde::Serialize;
-use std::{
-    collections::BTreeSet, fs, io::Write, path::Path, sync::Arc, sync::LazyLock, time::Duration,
-};
+use std::{collections::BTreeSet, fs, io::Write, path::Path, sync::LazyLock, time::Duration};
 use tempfile::TempDir;
 
 static NGSPICE_ERROR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -81,7 +79,7 @@ pub struct ValidationResult {
 }
 
 /// Return true when the bytes contain strong SIMPLIS-only syntax.
-#[must_use]
+#[must_use = "the result determines whether SIMPLIS handling is required"]
 pub fn looks_like_simplis(input: &[u8]) -> bool {
     SIMPLIS_MODEL_RE.is_match(input)
         || SIMPLIS_DEVICE_RE.is_match(input)
@@ -537,7 +535,7 @@ fn ngspice_once(
         Path::new("ngspice"),
         temp.path(),
         &["-b".into(), "deck.cir".into()],
-        Arc::from([]),
+        &[],
         ProcessLimits {
             timeout,
             output_bytes: 4 * 1024 * 1024,

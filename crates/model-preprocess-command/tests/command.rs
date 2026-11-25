@@ -208,3 +208,17 @@ fn failed_admission_and_virtual_origin_are_each_invoked_once() -> Result<()> {
     assert!(Arc::ptr_eq(&first.bytes, &next.bytes));
     Ok(())
 }
+
+#[test]
+fn adapter_may_exit_without_reading_large_input() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source");
+    fs::write(&path, vec![0x55; 1024 * 1024])?;
+    let mut config = settings("printf replacement");
+    config.process.timeout = Duration::from_secs(2);
+    for _ in 0..20 {
+        let mut session = SourceSession::new(config.clone(), Cancellation::default());
+        assert_eq!(&*session.load(&path)?.bytes, b"replacement");
+    }
+    Ok(())
+}

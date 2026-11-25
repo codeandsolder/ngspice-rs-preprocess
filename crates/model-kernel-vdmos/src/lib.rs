@@ -32,7 +32,7 @@ pub enum Polarity {
 impl Polarity {
     /// Physical channel/diode sign: +1 for N-channel and -1 for P-channel.
     /// The solver uses this once when binding polarity-normalized Qp states.
-    #[must_use]
+    #[must_use = "the polarity sign is needed for normalization"]
     pub const fn sign(self) -> f64 {
         match self {
             Self::N => 1.0,
@@ -322,7 +322,7 @@ pub struct Model {
 
 impl Model {
     /// ngspice 47 defaults for the chosen device type.
-    #[must_use]
+    #[must_use = "the returned model contains polarity-specific parameters"]
     pub fn defaults(polarity: Polarity) -> Self {
         Self {
             polarity,
@@ -713,7 +713,7 @@ pub struct Conductance {
 impl Conductance {
     /// Evaluate branch dissipation G·V² and derivatives. A shorted/coalesced
     /// branch has zero voltage drop and contributes no heat.
-    #[must_use]
+    #[must_use = "power and derivatives contribute to the thermal balance"]
     pub fn ohmic_power(self, voltage_drop: f64) -> OhmicPower {
         let g = self.value.unwrap_or(0.0);
         let v2 = voltage_drop * voltage_drop;
@@ -729,7 +729,7 @@ impl Conductance {
 impl PreparedModel {
     /// The validated source parameters used for this prepared model.
     /// Reading them belongs to setup/inspection, not to per-device dispatch.
-    #[must_use]
+    #[must_use = "the returned reference contains the prepared parameters"]
     pub const fn parameters(&self) -> &Model {
         &self.model
     }

@@ -95,7 +95,7 @@ pub struct Environment {
 }
 
 impl Environment {
-    #[must_use]
+    #[must_use = "the returned environment owns parameter and option bindings"]
     pub fn new() -> Self {
         Self::default()
     }
@@ -105,12 +105,12 @@ impl Environment {
             .insert(name.as_ref().to_ascii_uppercase(), value);
     }
 
-    #[must_use]
+    #[must_use = "the returned value is the requested parameter binding"]
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.get(&name.to_ascii_uppercase())
     }
 
-    #[must_use]
+    #[must_use = "the result reports whether the parameter is bound"]
     pub fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
     }
@@ -120,12 +120,12 @@ impl Environment {
             .insert(name.as_ref().to_ascii_uppercase(), value);
     }
 
-    #[must_use]
+    #[must_use = "the returned value is the requested option binding"]
     pub fn get_option(&self, name: &str) -> Option<&Value> {
         self.options.get(&name.to_ascii_uppercase())
     }
 
-    #[must_use]
+    #[must_use = "the result reports whether any bindings exist"]
     pub(crate) fn is_empty(&self) -> bool {
         self.values.is_empty() && self.options.is_empty()
     }

@@ -50,7 +50,7 @@ pub enum LibrarySimulator {
 }
 
 impl LibrarySimulator {
-    #[must_use]
+    #[must_use = "the returned name identifies the simulator"]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Simplis => "simplis",
@@ -71,22 +71,22 @@ pub struct ParsedLibrary {
 }
 
 impl ParsedLibrary {
-    #[must_use]
+    #[must_use = "the result identifies the library projection"]
     pub const fn simulator(&self) -> LibrarySimulator {
         self.simulator
     }
 
-    #[must_use]
+    #[must_use = "the identity distinguishes the source library"]
     pub fn source_id(&self) -> &str {
         &self.source_id
     }
 
-    #[must_use]
+    #[must_use = "the result identifies the original source name"]
     pub fn source_name(&self) -> &str {
         &self.source_name
     }
 
-    #[must_use]
+    #[must_use = "the count reports the parsed definitions"]
     pub const fn definitions(&self) -> usize {
         self.definitions.len()
     }
@@ -156,7 +156,7 @@ pub struct SubcircuitCatalog {
 }
 
 impl SubcircuitCatalog {
-    #[must_use]
+    #[must_use = "the returned catalog owns the library definitions"]
     pub fn new() -> Self {
         Self::default()
     }
@@ -280,7 +280,7 @@ impl SubcircuitCatalog {
         Ok(added)
     }
 
-    #[must_use]
+    #[must_use = "the returned identities enumerate registered libraries"]
     pub fn source_ids(&self) -> Vec<String> {
         self.sources.keys().cloned().collect()
     }
@@ -1779,7 +1779,7 @@ pub struct LinkedPreprocessedNetlist {
 }
 
 /// Deterministic companion filename for one parsed SIMPLIS library identity.
-#[must_use]
+#[must_use = "the filename is used to link the generated library"]
 pub fn linked_library_filename(source_id: &str) -> String {
     format!("simplis-{source_id}.generated.lib")
 }
