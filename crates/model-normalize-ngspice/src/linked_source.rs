@@ -54,6 +54,8 @@ pub enum LibrarySyntax {
     /// A single operand references an entire file outside a selected section.
     /// Two operands reference a named section in another file.
     Qspice,
+    /// Whole-file and named-section imports with PSpice path and header rules.
+    Pspice,
 }
 
 /// Root source treatment. Included resources are always include-safe.
@@ -312,12 +314,50 @@ fn portable_qspice_path(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(text.replace('\\', "/")))
 }
 
+fn check_pspice_header(body: &[u8], path: &Path, kind: RootKind) -> Result<()> {
+    let mut lines = body.split_inclusive(|byte| *byte == b'\n');
+    let first = lines.next().unwrap_or_default().trim_ascii();
+    let second = lines.next().unwrap_or_default().trim_ascii();
+    let header = if kind == RootKind::Include && (first.is_empty() || first.starts_with(b"*")) {
+        [first, second]
+            .into_iter()
+            .find(|line| line.starts_with(b"*#"))
+            .unwrap_or_default()
+    } else {
+        first
+    };
+    let declaration = header
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or_default();
+    ensure!(
+        ![
+            b"*#SIMETRIX".as_slice(),
+            b"*#HSPICE",
+            b"*#LTSPICE",
+            b"*#NATIVE"
+        ]
+        .iter()
+        .any(|name| declaration.eq_ignore_ascii_case(name)),
+        "{}: explicit foreign source dialect in standalone PSpice graph",
+        path.display()
+    );
+    Ok(())
+}
+
 impl LinkState<'_> {
     fn resolve(&self, path: &Path, parent: &Path) -> Result<PathBuf> {
         let portable;
         let qspice = self.settings.library_syntax == LibrarySyntax::Qspice;
         let path = if qspice {
             portable = portable_qspice_path(path)?;
+            portable.as_path()
+        } else if self.settings.library_syntax == LibrarySyntax::Pspice {
+            portable = PathBuf::from(
+                path.to_str()
+                    .context("non-UTF-8 PSpice resource path")?
+                    .replace('\\', "/"),
+            );
             portable.as_path()
         } else {
             path
@@ -438,6 +478,9 @@ impl LinkState<'_> {
         } else {
             (&decoded[..], 1)
         };
+        if self.settings.library_syntax == LibrarySyntax::Pspice {
+            check_pspice_header(body, path, kind)?;
+        }
         let records = records(body, first_line)?;
         if self.settings.library_syntax == LibrarySyntax::Qspice && self.stack.len() == 1 {
             self.collect_source_paths(path, &records)?;
@@ -570,7 +613,7 @@ impl LinkState<'_> {
         if let Some(args) = library_marker(text)? {
             return match args.as_slice() {
                 [file, section] => self.expand(Path::new(file), path, Some(section)),
-                [file] if self.settings.library_syntax == LibrarySyntax::Qspice => {
+                [file] if self.settings.library_syntax != LibrarySyntax::NamedSections => {
                     self.expand(Path::new(file), path, None)
                 }
                 _ => bail!(

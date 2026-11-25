@@ -16,6 +16,7 @@ pub mod model_card;
 pub mod param_expression;
 pub mod parameter_scope;
 pub mod passive_ic;
+pub mod pspice;
 pub mod qspice;
 pub mod vdmos_card;
 pub mod vdmos_ltspice;
@@ -61,6 +62,8 @@ pub enum NormalizationPass {
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.
     PspicePositionalParams,
+    /// Lower explicit `PSpice` source semantics to native SPICE.
+    PspiceSource,
     /// Comment a standalone `.END` so the model remains safe to include.
     StripStandaloneEnd,
     /// Scale proven private differentiator currents and compensate feedback.
@@ -320,7 +323,7 @@ fn expression_start(text: &[u8], first: &[u8]) -> Result<Option<usize>> {
         [b'e' | b'g', ..] => {
             if fields.get(3).is_some_and(|span| {
                 let field = &text[span.clone()];
-                [b"value".as_slice(), b"table", b"poly"]
+                [b"value".as_slice(), b"table", b"poly", b"vol", b"cur"]
                     .iter()
                     .any(|keyword| {
                         field

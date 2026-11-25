@@ -3,6 +3,7 @@ members = [
     "crates/model-alb-xspice-ffi",
     "crates/model-alb-experimental",
     "crates/model-kernel-api",
+    "crates/model-prepare-osdi",
     "crates/model-kernel-diode",
     "crates/model-kernel-bipolar",
     "crates/model-compact-intrinsic",
@@ -16,6 +17,7 @@ members = [
 ]
 default-members = [
     "crates/model-kernel-api",
+    "crates/model-prepare-osdi",
     "crates/model-kernel-diode",
     "crates/model-kernel-bipolar",
     "crates/model-compact-intrinsic",

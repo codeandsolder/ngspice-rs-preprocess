@@ -30,6 +30,10 @@ pub enum InputFormat {
     NativeDeck,
     /// Native-compatible library; emit include-safe text.
     NativeLibrary,
+    /// Standalone `PSpice` deck lowered to native SPICE.
+    PspiceDeck,
+    /// Standalone `PSpice` library lowered to include-safe native SPICE.
+    PspiceLibrary,
     /// QSPICE plaintext circuit deck.
     QspiceDeck,
     /// QSPICE plaintext model library.
@@ -57,6 +61,8 @@ impl InputFormat {
         match value {
             "native-deck" => Ok(Self::NativeDeck),
             "native-library" => Ok(Self::NativeLibrary),
+            "pspice-deck" => Ok(Self::PspiceDeck),
+            "pspice-library" => Ok(Self::PspiceLibrary),
             "qspice-deck" => Ok(Self::QspiceDeck),
             "qspice-library" => Ok(Self::QspiceLibrary),
             "simplis-deck" => Ok(Self::SimplisDeck),
@@ -270,24 +276,21 @@ fn native(
 ) -> Result<PreparedBundle> {
     let kind = if matches!(
         request.format,
-        InputFormat::NativeDeck | InputFormat::QspiceDeck
+        InputFormat::NativeDeck | InputFormat::PspiceDeck | InputFormat::QspiceDeck
     ) {
         RootKind::Deck
     } else {
         RootKind::Include
     };
     let origin = root.path.clone();
-    let qspice = matches!(
-        request.format,
-        InputFormat::QspiceDeck | InputFormat::QspiceLibrary
-    );
+    let syntax = match request.format {
+        InputFormat::PspiceDeck | InputFormat::PspiceLibrary => LibrarySyntax::Pspice,
+        InputFormat::QspiceDeck | InputFormat::QspiceLibrary => LibrarySyntax::Qspice,
+        _ => LibrarySyntax::NamedSections,
+    };
     let linked = SourceLinker {
         search_paths: request.search_paths.clone(),
-        library_syntax: if qspice {
-            LibrarySyntax::Qspice
-        } else {
-            LibrarySyntax::NamedSections
-        },
+        library_syntax: syntax,
     }
     .link_admitted(
         root,
@@ -297,19 +300,46 @@ fn native(
         },
         session,
     )?;
-    let (lowered, waveforms) = if qspice {
-        let lowered = model_normalize_ngspice::qspice::lower_linked(&linked, kind)?;
-        (lowered.bytes, lowered.waveforms)
-    } else {
-        (None, Vec::new())
+    let (normalized, device_identities, waveforms) = match syntax {
+        LibrarySyntax::Pspice => {
+            let normalized =
+                model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?;
+            let identities = normalized
+                .renamed
+                .into_iter()
+                .map(|device| {
+                    let origin = linked
+                        .origin(device.input_line)
+                        .context("missing renamed device origin")?;
+                    Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
+                        source: display_path(&origin.path),
+                        scope: device.scope,
+                        displayed: device.declared.clone(),
+                        declared: device.declared,
+                        linked: device.linked,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (normalized.mapped, identities, Vec::new())
+        }
+        LibrarySyntax::Qspice => {
+            let lowered = model_normalize_ngspice::qspice::lower_linked(&linked, kind)?;
+            let mut normalized =
+                normalize_mapped(lowered.bytes.as_deref().unwrap_or(&linked.bytes), kind)?;
+            if lowered.bytes.is_some() {
+                normalized
+                    .model
+                    .passes
+                    .insert(0, NormalizationPass::QspiceSource);
+            }
+            (normalized, Vec::new(), lowered.waveforms)
+        }
+        LibrarySyntax::NamedSections => (
+            normalize_mapped(&linked.bytes, kind)?,
+            Vec::new(),
+            Vec::new(),
+        ),
     };
-    let mut normalized = normalize_mapped(lowered.as_deref().unwrap_or(&linked.bytes), kind)?;
-    if lowered.is_some() {
-        normalized
-            .model
-            .passes
-            .insert(0, NormalizationPass::QspiceSource);
-    }
     let lines = normalized
         .input_lines
         .into_iter()
@@ -341,7 +371,7 @@ fn native(
         },
         companions: Vec::new(),
         normalization: normalized.model.passes,
-        device_identities: Vec::new(),
+        device_identities,
         model_selections: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,
@@ -364,6 +394,8 @@ fn validate_request(request: &Request) -> Result<()> {
                 request.format,
                 InputFormat::NativeDeck
                     | InputFormat::NativeLibrary
+                    | InputFormat::PspiceDeck
+                    | InputFormat::PspiceLibrary
                     | InputFormat::QspiceDeck
                     | InputFormat::QspiceLibrary
                     | InputFormat::SimetrixDeck
@@ -398,6 +430,8 @@ pub fn prepare(
     let mut result = match request.format {
         InputFormat::NativeDeck
         | InputFormat::NativeLibrary
+        | InputFormat::PspiceDeck
+        | InputFormat::PspiceLibrary
         | InputFormat::QspiceDeck
         | InputFormat::QspiceLibrary => native(&root, request, options, &mut session),
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),

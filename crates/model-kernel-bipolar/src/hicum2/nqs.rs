@@ -117,7 +117,7 @@ impl Prepared {
     /// Source FLNQS=1 enables this for modern models. Legacy FLCOMP
     /// 0 and 2.1 enable vertical NQS even when FLNQS=0; FLCOMP 2.2
     /// and >=2.3 do not. Tf=0 or ALIT=ALQF=0 disables all auxiliaries.
-    #[must_use]
+    #[must_use = "the result determines whether auxiliary state equations are active"]
     pub fn is_active(&self, tf: f64) -> bool {
         let legacy = self.p.flcomp == 0.0 || self.p.flcomp.to_bits() == 2.1f64.to_bits();
         (self.p.flnqs || legacy) && tf != 0.0 && (self.p.alit > 0.0 || self.p.alqf > 0.0)

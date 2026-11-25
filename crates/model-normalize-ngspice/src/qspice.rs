@@ -375,14 +375,12 @@ fn check_recovery(
             .expression
             .as_deref()
             .and_then(|value| literal(value.as_bytes()));
-        if parameter.name.eq_ignore_ascii_case("tt") {
-            if transit.replace(value).is_some() {
-                return Err(reject(
-                    origin,
-                    Feature::ModelLaw,
-                    "duplicate TT assignment has unqualified source precedence",
-                ));
-            }
+        if parameter.name.eq_ignore_ascii_case("tt") && transit.replace(value).is_some() {
+            return Err(reject(
+                origin,
+                Feature::ModelLaw,
+                "duplicate TT assignment has unqualified source precedence",
+            ));
         }
         if parameter.name.eq_ignore_ascii_case("vp") {
             if soft.replace(value).is_some() {

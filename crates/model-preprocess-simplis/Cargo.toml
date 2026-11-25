@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+model-kernel-diode = { path = "../model-kernel-diode" }
 model-normalize-ngspice = { path = "../model-normalize-ngspice" }
 model-preprocess-command = { path = "../model-preprocess-command" }
 anyhow = "1"

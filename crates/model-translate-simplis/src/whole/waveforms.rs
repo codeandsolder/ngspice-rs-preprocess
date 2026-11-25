@@ -1,6 +1,6 @@
 //! Named independent-source grammars and exact prepared waveform capture.
 
-use super::{Item, parse_items, render_native_subcircuit, source_kind};
+use super::{Item, capture_artifact_items, source_kind};
 use crate::{
     Translation, TranslationKind, normalized_statement, statement_tokens, validate_name,
     validate_node,
@@ -543,19 +543,7 @@ pub fn capture_artifact_waveforms(
     artifact: &str,
     output: &mut Vec<PreparedWaveform>,
 ) -> Result<()> {
-    let mut items = parse_items(std::str::from_utf8(bytes)?)?;
-    if !capture_items(&mut items, artifact, &[], output)? {
-        return Ok(());
-    }
-    let mut text = String::new();
-    for item in items {
-        match item {
-            Item::Statement(statement) => writeln!(text, "{statement}")?,
-            Item::Subcircuit(block) => render_native_subcircuit(&block, &mut text)?,
-        }
-    }
-    *bytes = text.into_bytes();
-    Ok(())
+    capture_artifact_items(bytes, |items| capture_items(items, artifact, &[], output))
 }
 
 /// Capture named source declarations across the linked artifact closure.

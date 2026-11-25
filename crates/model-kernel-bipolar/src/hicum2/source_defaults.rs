@@ -12,13 +12,13 @@ impl temperature::Nominal {
     /// Exact HICUM/L2 2.4.0 Verilog-A nominal defaults. Source FLcomp=0
     /// intentionally selects its historical 2.1-compatible equations.
     /// Polarity is initially NPN; callers may select PNP before binding.
-    #[must_use]
+    #[must_use = "the constructed nominal model is returned rather than modifying any state"]
     pub const fn source_defaults() -> Self {
         Self {
             polarity: Polarity::Npn,
             transport: source_transport(),
             diodes: source_diodes(),
-            coefficients: source_coefficients(),
+            coefficients: temperature::ThermalCoefficients::source_defaults(),
             auxiliary: source_auxiliary(),
             noise: source_noise(),
         }
@@ -88,40 +88,6 @@ const fn source_diodes() -> Diodes {
         mbcx: 1.0,
         iscs: 0.0,
         msc: 1.0,
-    }
-}
-
-const fn source_coefficients() -> temperature::ThermalCoefficients {
-    temperature::ThermalCoefficients {
-        tnom_celsius: 27.0,
-        dt: 0.0,
-        vgb: 1.17,
-        vge: 1.17,
-        vgc: 1.17,
-        vgs: 1.17,
-        f1vg: -1.02377e-4,
-        f2vg: 4.3215e-4,
-        zetact: 3.0,
-        zetabet: 3.5,
-        zetaci: 0.0,
-        zetacx: 1.0,
-        zetarbi: 0.0,
-        zetarbx: 0.0,
-        zetarcx: 0.0,
-        zetare: 0.0,
-        alb: 0.0,
-        alvs: 0.0,
-        alces: 0.0,
-        alt0: 0.0,
-        kt0: 0.0,
-        zetahjei: 1.0,
-        zetavgbe: 1.0,
-        dvgbe: 0.0,
-        alfav: 0.0,
-        alqav: 0.0,
-        alkav: 0.0,
-        zetarth: 0.0,
-        alrth: 0.0,
     }
 }
 

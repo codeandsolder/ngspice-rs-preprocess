@@ -237,26 +237,40 @@ pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
 /// Top-level whitespace and assignment separators, with balanced expression
 /// delimiters and quotes kept intact as a single token.
 pub fn tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
-    separated_tokens(text, false)
+    separated_tokens(text, Commas::Literal)
 }
 
-/// Waveform arguments also accept commas between balanced scalar fields.
+/// Keep top-level commas as tokens for dialects with comma-sensitive syntax.
+pub fn comma_tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
+    separated_tokens(text, Commas::Token)
+}
+
+/// Waveform arguments accept commas between balanced scalar fields.
 pub fn waveform_tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
-    separated_tokens(text, true)
+    separated_tokens(text, Commas::Separator)
 }
 
-fn separated_tokens(text: &[u8], comma: bool) -> Result<Vec<Range<usize>>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Commas {
+    Literal,
+    Separator,
+    Token,
+}
+
+fn separated_tokens(text: &[u8], comma: Commas) -> Result<Vec<Range<usize>>> {
     let mut ranges = Vec::new();
     let mut start = None;
     let mut context = Context::default();
     let mut stack = Vec::new();
     for (i, &b) in text.iter().enumerate() {
         if context.quote.is_none() {
-            if stack.is_empty() && (b.is_ascii_whitespace() || b == b'=' || comma && b == b',') {
+            if stack.is_empty()
+                && (b.is_ascii_whitespace() || b == b'=' || comma != Commas::Literal && b == b',')
+            {
                 if let Some(begin) = start.take() {
                     ranges.push(begin..i);
                 }
-                if b == b'=' {
+                if b == b'=' || comma == Commas::Token && b == b',' {
                     ranges.push(i..i + 1);
                 }
                 continue;
