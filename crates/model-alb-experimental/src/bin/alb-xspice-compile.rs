@@ -2,7 +2,7 @@
 //! Not a mode of normal `SIMetrix` model translation.
 
 use anyhow::{Context, Result, bail};
-use model_translate_simplis::{TimingEnvironment, XspiceElectrical, compile_alb_xspice_subcircuit};
+use model_alb_experimental::{TimingEnvironment, XspiceElectrical, compile_alb_xspice_subcircuit};
 use serde::Deserialize;
 use std::{env, fs, path::Path};
 

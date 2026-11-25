@@ -2,7 +2,7 @@
 //! No model is silently loaded from the proprietary `SIMetrix` installation.
 
 use anyhow::{Context, Result, bail};
-use model_translate_simplis::{
+use model_alb_experimental::{
     AnalogBoundaryPin, AnalogBridgeKind, BridgeCatalog, BridgeModel, DigitalPinDirection,
     LegacyCompatibilityTable, LogicFamily, LogicFamilyAssignment, plan_analog_bridges,
 };

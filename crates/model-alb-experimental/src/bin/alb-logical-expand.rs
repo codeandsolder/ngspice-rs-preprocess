@@ -3,7 +3,7 @@
 //! Production `D_LOGIC_BLOCK` translation stays disabled.
 
 use anyhow::{Context, Result, bail, ensure};
-use model_translate_simplis::{
+use model_alb_experimental::{
     AlbOutputProducer, DigitalPinDirection, LogicalAlbBoundary, expand_logical_alb_source,
 };
 use serde::Deserialize;

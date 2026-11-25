@@ -4,8 +4,10 @@ Standalone SPICE normalization, dialect lowering, source linking,
 parameter compilation and reusable prepared model kernels.
 
 The workspace contains the ngspice normalizer, SIMPLIS source preprocessor and
-translator, and VDMOS prepared numerical kernel. The ALB/XSPICE runtime is
-experimental; unsupported source semantics remain explicit errors.
+translator, and VDMOS prepared numerical kernel. Experimental ALB/XSPICE
+compilation lives in the separate `model-alb-experimental` crate and is
+excluded from default workspace builds. The production translator does not
+link it and rejects unsupported source semantics explicitly.
 
 The simulator owns numerical circuit orchestration. Source admission is
 handled by `model-preprocess-command` before normalization, linking or model
@@ -62,7 +64,9 @@ electrical circuit and known generated libraries; attach the desired
 analysis separately. Residual external includes are rejected rather than
 silently referring to the original working directory. Experimental ALB
 compilation remains an explicit specialized workflow, not an automatic
-fallback from the unified entry point.
+fallback from the unified entry point. Build its CLI tools explicitly with
+`cargo build --locked -p model-alb-experimental`; see the
+[experimental runtime guide](runtime/xspice/README.md).
 
 SIMetrix decks preserve runtime argument binding, including implicit formals,
 source-order actuals, callee defaults and isolated local scopes. Direct and
