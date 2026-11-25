@@ -15,7 +15,7 @@ pub use whole::{
     SplitDeckTranslation, WholeModelTranslation, capture_artifact_initial_conditions,
     capture_artifact_waveforms, capture_linked_waveforms, capture_passive_initial_conditions,
     lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_deck_split,
-    translate_simplis_expanded_library,
+    translate_simplis_expanded_library, translate_simplis_linked_netlist,
 };
 
 /// One numeric point on a piecewise-linear characteristic.

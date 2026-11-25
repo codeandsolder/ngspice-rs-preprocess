@@ -289,6 +289,65 @@ fn indexed_library_cannot_change_the_global_device_mapping() -> Result<()> {
 }
 
 #[test]
+fn discrete_mos_model_selection_and_linked_binding_survive_compilation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.net");
+    let lib = dir.path().join("parts.lib");
+    // Level 7 with a discrete charge signature must select Level 17.
+    fs::write(
+        &lib,
+        "*#SIMETRIX\n.model selected NMOS (LEVEL=7 VTO=1 KP=.1 CGDMIN=1n LIMIT(VDS)=(*, 400))\n",
+    )?;
+    fs::write(
+        &root,
+        "* test\nVbias d 0 1\nVgate g 0 3\nM1 d g 0 0 selected M=3\n.end\n",
+    )?;
+    let req = request(&root, InputFormat::SimetrixDeck);
+    let mut raw = req.clone();
+    raw.libraries
+        .push(LibraryInput::Source(SourceInput::File(lib.clone())));
+    let admitted = prepare(&raw, &Options::default(), &Cancellation::default())?;
+    let compiled = prepare(
+        &request(&lib, InputFormat::SimetrixLibrary),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let mut cached = req;
+    cached
+        .libraries
+        .push(LibraryInput::Parsed(ParsedLibrary::from_json(
+            &compiled.primary.bytes,
+        )?));
+    let restored = prepare(&cached, &Options::default(), &Cancellation::default())?;
+    for bundle in [&admitted, &restored] {
+        let selection = bundle
+            .model_selections
+            .iter()
+            .find(|selection| selection.card.name.eq_ignore_ascii_case("selected"))
+            .context("missing model selection")?;
+        assert_eq!(selection.mapping.device, Device::Mos17);
+        assert_eq!(
+            selection.mapping.origin,
+            SelectionOrigin::LegacyMos17Signature
+        );
+        assert_eq!(selection.declared_level, Some(7));
+        assert!(
+            selection
+                .card
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name.eq_ignore_ascii_case("LIMIT(VDS)"))
+        );
+        let current = execute(bundle)?;
+        assert!(
+            (current + 0.45).abs() < 1e-8,
+            "linked Level 17 current {current}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn prepared_diode_identity_survives_local_models_and_source_parameter_expressions() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.net");

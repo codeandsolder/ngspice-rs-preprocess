@@ -39,6 +39,8 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `pspice-library` | PSpice plaintext models; include-safe native source | `model.lib` |
 | `qspice-deck` | QSPICE plaintext circuit; link libraries and normalize qualified source semantics | `deck.cir` |
 | `qspice-library` | QSPICE plaintext models; include-safe native source | `model.lib` |
+| `tina-deck` | TINA/TINA-TI plaintext SPICE export, with local parameter normalization | `deck.cir` |
+| `tina-library` | TINA/TINA-TI plaintext SPICE macro source | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
@@ -53,6 +55,18 @@ when present; the source card may contain a placeholder DC bias. Known
 unsupported source laws and topology directives have physical-source
 diagnostics. See [the QSPICE adapter contract](docs/qspice.md) for the
 qualified behavior, boundaries and reference evidence.
+
+TINA support targets plaintext SPICE exports, not TINA schematic/project
+or mixed-language macro containers. Export the electrical netlist first.
+The documented PSpice-style syntax uses the same source linker and lowering pipeline as the explicit PSpice dialect;
+a local `.PARAM` appended to a `.SUBCKT` header is split into a scoped
+directive without changing source location. Formal `PARAMS:` defaults are
+kept separate. Source metadata in comments remains intact. See
+[TI SLVA527](https://www.ti.com/lit/an/slva527/slva527.pdf) and
+[DesignSoft TINA manual](https://www.tina.com/docs/v12/Tina-v12-manual.pdf).
+The inline declaration is observed in the public ISO224X export discussion
+([reference](https://electronics.stackexchange.com/questions/518473/error-importing-third-party-model-to-ltspice-from-tina));
+the regression fixtures are independently authored and contain no vendor model text.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:
@@ -108,6 +122,19 @@ instances in model scope, preserving explicit instance TEMP precedence.
 A different nominal temperature requires preparing the source again.
 Statistical analyses and conflicting or multiple analysis temperatures
 are rejected rather than approximated by the nominal translation.
+
+SIMetrix discrete MOS level 17 cards use explicit absolute geometry and a
+native MOS level-1 channel and junction core, with series-resistance
+multiplicity and temperature binding. The nonlinear gate-drain capacitance
+is lowered as conserved terminal charge (not capacitance times voltage).
+Model references resolve across linked artifacts and lexical scopes; local
+native model declarations shadow inherited discrete MOS models. Independent
+DC, transient and complex AC measurements qualify both polarities,
+resistance temperature coefficients, multiplicity, and junction and gate
+charge. Native semiconductor constants differ slightly from the historical
+source constants. Unsupported geometry and nonconstant instance fields
+are rejected; source SOA annotations are retained as metadata, not enforced
+by the native MOS core.
 
 ### Source model selection
 
