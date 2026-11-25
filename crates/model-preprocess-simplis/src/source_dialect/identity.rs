@@ -1,7 +1,7 @@
 //! Device identity resolution after file inclusion but before subcircuit
 //! specialization. Electrical names are scoped to their containing circuit.
 
-use super::DialectContext;
+use super::{DialectContext, OpaqueSource};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt::Write as _};
@@ -13,6 +13,10 @@ pub struct ScopedStatement {
     pub source: String,
     /// Effective file language, not the language of the root deck.
     pub context: DialectContext,
+    /// First one-based physical source line.
+    pub first_line: usize,
+    /// Last physical line, including continuations.
+    pub last_line: usize,
     /// Joined, projected source statement.
     pub text: String,
 }
@@ -135,16 +139,18 @@ fn collect(statements: &[ScopedStatement]) -> Result<Scan> {
     let mut stack = vec![0usize];
     let mut assignments = Vec::with_capacity(statements.len());
     let mut identities = Vec::new();
-    let mut control = false;
+    let mut opaque = OpaqueSource::default();
     for line in statements {
         let scope = *stack.last().context("missing root identity scope")?;
+        if opaque.consume(&line.text) {
+            assignments.push((scope, None));
+            continue;
+        }
         let first = first_token(&line.text).unwrap_or_default();
         let upper = first.to_ascii_uppercase();
         let mut identity = None;
         match upper.as_str() {
-            ".CONTROL" => control = true,
-            ".ENDC" => control = false,
-            ".SUBCKT" if !control => {
+            ".SUBCKT" => {
                 if let Some(name) = line.text.split_whitespace().nth(1) {
                     let mut path = scopes[scope].path.clone();
                     path.push(name.to_owned());
@@ -155,14 +161,14 @@ fn collect(statements: &[ScopedStatement]) -> Result<Scan> {
                     });
                 }
             }
-            ".ENDS" if !control => {
+            ".ENDS" => {
                 ensure!(
                     stack.len() > 1,
                     "unmatched .ends while resolving device identities"
                 );
                 stack.pop();
             }
-            _ if !control && is_device(&line.text) => {
+            _ if is_device(&line.text) => {
                 let (displayed, linked) = device_name(first, line.context)?;
                 let mapping = DeviceIdentity {
                     source: line.source.clone(),
@@ -179,6 +185,7 @@ fn collect(statements: &[ScopedStatement]) -> Result<Scan> {
         }
         assignments.push((scope, identity));
     }
+    opaque.finish()?;
     ensure!(
         stack.len() == 1,
         "unterminated subcircuit while resolving device identities"
@@ -286,9 +293,12 @@ fn expression_references(text: &str, scope: &Scope) -> Result<String> {
 pub fn resolve_device_identities(statements: &[ScopedStatement]) -> Result<ResolvedDeviceSource> {
     let scan = collect(statements)?;
     let mut output = String::new();
+    let mut opaque = OpaqueSource::default();
     for (line, (scope, identity)) in statements.iter().zip(scan.assignments) {
         let scope = &scan.scopes[scope];
-        if let Some(identity) = identity {
+        if opaque.consume(&line.text) {
+            writeln!(output, "{}", line.text)?;
+        } else if let Some(identity) = identity {
             let identity = &scan.identities[identity];
             let text = line.text.trim_start();
             let tail = &text[identity.declared.len()..];

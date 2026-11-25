@@ -154,6 +154,7 @@ struct Manifest<'a> {
     model_selections:
         &'a [model_preprocess_simplis::source_dialect::model_mapping::ModelSelection],
     initial_conditions: &'a Option<ngspice_rs_preprocess::passive_ic::InitialConditions>,
+    analysis_plan: &'a Option<ngspice_rs_preprocess::analysis_plan::AnalysisPlan>,
     waveforms: &'a [ngspice_rs_preprocess::waveform::PreparedWaveform],
 }
 
@@ -169,7 +170,7 @@ struct ManifestArtifact<'a> {
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 6,
+        version: 7,
         input_format: bundle.format,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,
@@ -189,6 +190,7 @@ fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
         device_identities: &bundle.device_identities,
         model_selections: &bundle.model_selections,
         initial_conditions: &bundle.initial_conditions,
+        analysis_plan: &bundle.analysis_plan,
         waveforms: &bundle.waveforms,
     }
 }

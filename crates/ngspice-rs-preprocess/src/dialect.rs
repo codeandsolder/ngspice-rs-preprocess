@@ -1,11 +1,16 @@
 //! Shared dialect source preparation and artifact construction.
+use super::analysis_plan::{
+    self, AnalysisDialect, AnalysisPlan, DirectiveOrigin, PlanKind, SourceDeclaration,
+};
 use super::{
     AdmittedSource, Artifact, Cancellation, CodeModelRuntime, InputFormat, LibraryInput,
     LibrarySimulator, Options, ParsedLibrary, PreparedBundle, Provenance, Request, SourceSession,
     display_path,
 };
 use anyhow::{Context, Result, bail, ensure};
-use model_normalize_ngspice::linked_source::{external_library_reference, select_named_section};
+use model_normalize_ngspice::linked_source::{
+    external_library_reference, select_named_section_lines,
+};
 use model_preprocess_command::AdmissionConfig;
 use model_preprocess_simplis::source_dialect::{
     DeviceIdentity, DialectContext, ScopedStatement, SourceKind,
@@ -14,7 +19,7 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_scoped_statements, parse_library_for_simulator, parse_scoped_library,
-    preprocess_netlist_linked, project_simetrix_source, project_source, source_include_target,
+    preprocess_netlist_linked, project_resource, source_include_target,
 };
 use model_translate_simplis::{
     capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
@@ -70,6 +75,7 @@ fn bundle(
         device_identities: Vec::new(),
         model_selections: Vec::new(),
         initial_conditions: None,
+        analysis_plan: None,
         waveforms: Vec::new(),
     }
 }
@@ -135,6 +141,9 @@ struct SourceExpansion<'a> {
     simulator: LibrarySimulator,
     search_paths: &'a [PathBuf],
     statements: Vec<ScopedStatement>,
+    declarations: Vec<SourceDeclaration>,
+    capture_plan: bool,
+    scope_depth: usize,
 }
 
 impl<'a> SourceExpansion<'a> {
@@ -148,6 +157,9 @@ impl<'a> SourceExpansion<'a> {
             simulator: projection(request.format),
             search_paths: &request.search_paths,
             statements: Vec::new(),
+            declarations: Vec::new(),
+            capture_plan: false,
+            scope_depth: 0,
         }
     }
 
@@ -207,43 +219,112 @@ impl<'a> SourceExpansion<'a> {
         kind: SourceKind,
         section: Option<&str>,
     ) -> Result<DialectContext> {
-        let (context, projected) = if self.simulator == LibrarySimulator::Simetrix {
-            project_simetrix_source(&source.bytes, inherited, kind)?
-        } else {
-            (inherited, project_source(&source.bytes, self.simulator)?)
-        };
-        let projected = if let Some(section) = section {
-            select_named_section(&projected, &source.path, section)?
-        } else {
-            projected
-        };
-        for line in projected.split_inclusive('\n') {
-            if self.expand_reference(source, context, line)? {
-                continue;
+        let (context, mut projected) =
+            project_resource(&source.bytes, inherited, kind, self.simulator)?;
+        if let Some(section) = section {
+            let selected = select_named_section_lines(
+                projected.iter().map(|line| line.text.as_str()),
+                &source.path,
+                section,
+            )?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            projected = projected
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, line)| selected.contains(&index).then_some(line))
+                .collect();
+        }
+        let mut embedded = false;
+        let mut projected = projected.into_iter();
+        while let Some(line) = projected.next() {
+            let name = analysis_plan::command(&line.text);
+            if let Some(start) = model_translate_simplis::syntax::file_boundary(&line.text) {
+                embedded = start;
             }
-            let include_end =
-                kind == SourceKind::Include && line.trim().eq_ignore_ascii_case(".end");
-            if include_end {
-                self.append(b"* ")?;
+            if !embedded && name != ".ENDF" {
+                ensure!(
+                    !line.text.starts_with(analysis_plan::TAG_PREFIX),
+                    "reserved internal analysis marker at {}:{}",
+                    source.path.display(),
+                    line.first_line
+                );
+                if name == ".ENDS" {
+                    self.scope_depth = self
+                        .scope_depth
+                        .checked_sub(1)
+                        .context("unmatched .ENDS in source expansion")?;
+                }
+                if self.capture_plan && self.scope_depth == 0 && analysis_plan::tracked(&name) {
+                    let mut declaration = SourceDeclaration {
+                        origin: DirectiveOrigin::Source {
+                            path: source.path.clone(),
+                            first_line: line.first_line,
+                            last_line: line.last_line,
+                        },
+                        text: line.text.clone(),
+                    };
+                    if name == ".CONTROL" {
+                        let mut end = None;
+                        for body in projected.by_ref() {
+                            declaration.text.push('\n');
+                            declaration.text.push_str(&body.text);
+                            if analysis_plan::command(&body.text) == ".ENDC" {
+                                end = Some(body.last_line);
+                                break;
+                            }
+                        }
+                        let last_line = end.context("unterminated .CONTROL block")?;
+                        declaration.origin = DirectiveOrigin::Source {
+                            path: source.path.clone(),
+                            first_line: line.first_line,
+                            last_line,
+                        };
+                    }
+                    let tag = format!("{}{}", analysis_plan::TAG_PREFIX, self.declarations.len());
+                    self.declarations.push(declaration);
+                    self.append_projected(source, context, &line, &tag)?;
+                    if name == ".CONTROL" {
+                        continue;
+                    }
+                }
+                if self.expand_reference(source, context, &line.text)? {
+                    continue;
+                }
+                if name == ".SUBCKT" {
+                    self.scope_depth = self
+                        .scope_depth
+                        .checked_add(1)
+                        .context("source scope depth overflow")?;
+                }
             }
-            if self.simulator == LibrarySimulator::Simetrix {
-                let text = line.trim_end_matches('\n');
-                self.statements.push(ScopedStatement {
-                    source: display_path(&source.path),
-                    context,
-                    text: if include_end {
-                        format!("* {text}")
-                    } else {
-                        text.to_owned()
-                    },
-                });
-            }
-            self.append(line.as_bytes())?;
-            if !line.ends_with('\n') {
-                self.append(b"\n")?;
+            if kind == SourceKind::Include && name == ".END" && !embedded {
+                self.append_projected(source, context, &line, &format!("* {}", line.text))?;
+            } else {
+                self.append_projected(source, context, &line, &line.text)?;
             }
         }
         Ok(context)
+    }
+
+    fn append_projected(
+        &mut self,
+        source: &AdmittedSource,
+        context: DialectContext,
+        original: &model_preprocess_simplis::source_dialect::ProjectedStatement,
+        line: &str,
+    ) -> Result<()> {
+        if self.simulator == LibrarySimulator::Simetrix {
+            self.statements.push(ScopedStatement {
+                source: display_path(&source.path),
+                context,
+                first_line: original.first_line,
+                last_line: original.last_line,
+                text: line.to_owned(),
+            });
+        }
+        self.append(line.as_bytes())?;
+        self.append(b"\n")
     }
 
     fn expand_reference(
@@ -416,17 +497,33 @@ fn check_closed_includes(bytes: &[u8], known: &BTreeSet<&str>) -> Result<()> {
 
 fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle> {
     let include = format == InputFormat::ExpandedLibrary;
-    let mut bytes = root.bytes.to_vec();
+    let mut plan = AnalysisPlan::new(
+        AnalysisDialect::Expanded,
+        if include {
+            PlanKind::Library
+        } else {
+            PlanKind::Deck
+        },
+        None,
+    );
+    let mut source = root.bytes.to_vec();
+    analysis_plan::capture(
+        &mut plan,
+        &mut source,
+        if include { "model.lib" } else { "deck.cir" },
+        Some(&root.path),
+        &[],
+    )?;
     let mut waveforms = Vec::new();
     capture_artifact_waveforms(
-        &mut bytes,
+        &mut source,
         if include { "model.lib" } else { "deck.cir" },
         &mut waveforms,
     )?;
     let translated = if include {
-        translate_simplis_expanded_library(&bytes)?
+        translate_simplis_expanded_library(&source)?
     } else {
-        translate_simplis_deck(&bytes)?
+        translate_simplis_deck(&source)?
     };
     check_closed_includes(&translated.bytes, &BTreeSet::new())?;
     let artifact = generated(
@@ -437,14 +534,84 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
         Vec::new(),
         translated.required_code_models,
     );
-    let mut result = bundle(root, format, artifact, Vec::new());
-    result.waveforms = waveforms;
-    Ok(result)
+    let mut bundle = bundle(root, format, artifact, Vec::new());
+    bundle.analysis_plan = Some(plan);
+    bundle.waveforms = waveforms;
+    Ok(bundle)
+}
+
+fn translate_companions(
+    linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
+    known: &BTreeSet<&str>,
+    sources: &BTreeMap<String, BTreeSet<String>>,
+    root_sources: &BTreeSet<String>,
+    initial_conditions: &mut Option<super::passive_ic::InitialConditions>,
+    mut remaining: usize,
+) -> Result<(Vec<Artifact>, Vec<String>)> {
+    let mut companions = Vec::new();
+    let mut dependencies = Vec::new();
+    for library in &linked.libraries {
+        let mut translated = translate_simplis_expanded_library(&library.bytes)
+            .with_context(|| format!("translating linked library {}", library.source_id))?;
+        if let Some(policy) = &mut *initial_conditions {
+            capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
+        }
+        check_closed_includes(&translated.bytes, known)?;
+        remaining = remaining
+            .checked_sub(translated.bytes.len())
+            .context("combined artifact output byte budget exceeded")?;
+        let origins = sources
+            .get(&library.source_id)
+            .unwrap_or(root_sources)
+            .iter()
+            .cloned()
+            .collect();
+        dependencies.push(library.source_id.clone());
+        companions.push(generated(
+            library.filename.clone(),
+            translated.bytes,
+            origins,
+            Some(library.source_id.clone()),
+            library.dependencies.clone(),
+            translated.required_code_models,
+        ));
+    }
+    Ok((companions, dependencies))
+}
+
+fn capture_linked_plan(
+    linked: &mut model_preprocess_simplis::LinkedPreprocessedNetlist,
+    root: &AdmittedSource,
+    format: InputFormat,
+    declarations: &[analysis_plan::SourceDeclaration],
+) -> Result<AnalysisPlan> {
+    let dialect = if format == InputFormat::SimetrixDeck {
+        AnalysisDialect::Simetrix
+    } else {
+        AnalysisDialect::Simplis
+    };
+    let mut plan = AnalysisPlan::new(
+        dialect,
+        PlanKind::Deck,
+        (dialect == AnalysisDialect::Simetrix).then(|| analysis_plan::source_title(&root.bytes)),
+    );
+    analysis_plan::capture(
+        &mut plan,
+        &mut linked.root_bytes,
+        "deck.cir",
+        None,
+        declarations,
+    )?;
+    for library in &mut linked.libraries {
+        analysis_plan::capture(&mut plan, &mut library.bytes, &library.filename, None, &[])?;
+    }
+    Ok(plan)
 }
 
 struct ResolvedDeck {
     root: Vec<u8>,
     root_sources: BTreeSet<String>,
+    declarations: Vec<SourceDeclaration>,
     libraries: ResolvedLibraries,
 }
 
@@ -456,9 +623,11 @@ fn resolve_deck(
     session: &mut SourceSession,
 ) -> Result<ResolvedDeck> {
     let mut init = SourceExpansion::new(session, request, options);
+    init.capture_plan = true;
     let context = init.expand(root, DialectContext::default(), SourceKind::Deck, None)?;
     let SourceExpansion {
         sources: root_sources,
+        declarations,
         statements,
         output,
         ..
@@ -526,6 +695,7 @@ fn resolve_deck(
     Ok(ResolvedDeck {
         root: expanded_root,
         root_sources,
+        declarations,
         libraries: ResolvedLibraries {
             catalog,
             sources,
@@ -545,6 +715,7 @@ fn linked(
     let ResolvedDeck {
         root: expanded_root,
         root_sources,
+        declarations,
         libraries:
             ResolvedLibraries {
                 catalog,
@@ -554,6 +725,7 @@ fn linked(
             },
     } = resolve_deck(root, request, options, cancellation, session)?;
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
+    let plan = capture_linked_plan(&mut linked, root, request.format, &declarations)?;
     let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
         lower_simetrix_linked_runtime(&mut linked)?;
         Some(capture_passive_initial_conditions(&mut linked)?)
@@ -576,39 +748,20 @@ fn linked(
     if let Some(policy) = &mut initial_conditions {
         capture_artifact_initial_conditions(&mut translated_root.bytes, "deck.cir", policy)?;
     }
+    plan.append_native_options(&mut translated_root.bytes)?;
     check_closed_includes(&translated_root.bytes, &known)?;
-    let mut remaining = options
+    let remaining = options
         .output_bytes
         .checked_sub(translated_root.bytes.len())
         .context("combined artifact output byte budget exceeded")?;
-    let mut companions = Vec::new();
-    let mut dependencies = Vec::new();
-    for library in &linked.libraries {
-        let mut translated = translate_simplis_expanded_library(&library.bytes)
-            .with_context(|| format!("translating linked library {}", library.source_id))?;
-        if let Some(policy) = &mut initial_conditions {
-            capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
-        }
-        check_closed_includes(&translated.bytes, &known)?;
-        remaining = remaining
-            .checked_sub(translated.bytes.len())
-            .context("combined artifact output byte budget exceeded")?;
-        let origins = sources
-            .get(&library.source_id)
-            .unwrap_or(&root_sources)
-            .iter()
-            .cloned()
-            .collect();
-        dependencies.push(library.source_id.clone());
-        companions.push(generated(
-            library.filename.clone(),
-            translated.bytes,
-            origins,
-            Some(library.source_id.clone()),
-            library.dependencies.clone(),
-            translated.required_code_models,
-        ));
-    }
+    let (companions, dependencies) = translate_companions(
+        &linked,
+        &known,
+        &sources,
+        &root_sources,
+        &mut initial_conditions,
+        remaining,
+    )?;
     let primary = generated(
         "deck.cir".to_owned(),
         translated_root.bytes,
@@ -620,6 +773,7 @@ fn linked(
     let mut bundle = bundle(root, request.format, primary, companions);
     bundle.device_identities = device_identities;
     bundle.model_selections = model_selections;
+    bundle.analysis_plan = Some(plan);
     if let Some(initialization) = &initial_conditions {
         for artifact in bundle.artifacts() {
             initialization.validate_artifact(&artifact.filename, &artifact.bytes)?;

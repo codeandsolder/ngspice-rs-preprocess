@@ -171,6 +171,8 @@ fn strip_directive(statement: &str) -> bool {
                 | ".PRINT"
                 | ".POST_PROCESS"
                 | ".OPTIONS"
+                | ".OPTION"
+                | ".OPT"
                 | ".AC"
                 | ".POP"
                 | ".TRAN"

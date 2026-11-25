@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use model_preprocess_simplis::source_dialect::model_mapping::{Device, SelectionOrigin};
+use ngspice_rs_preprocess::analysis_plan::{Directive, Disposition};
 use ngspice_rs_preprocess::{
     Cancellation, InputFormat, LibraryInput, Options, ParsedLibrary, PreparedBundle, Request,
     SourceInput, prepare,
@@ -71,6 +72,26 @@ fn map_changes_breakdown_current_and_does_not_leak_between_decks() -> Result<()>
         SelectionOrigin::HspicePreset
     );
     assert!((execute(&preset)? / execute(&mapped)? - 1.).abs() < 1e-10);
+    let plan = preset
+        .analysis_plan
+        .as_ref()
+        .context("missing analysis plan")?;
+    plan.validate_supported()?;
+    let option = plan
+        .entries
+        .iter()
+        .find_map(|entry| {
+            if let Directive::Options { settings } = &entry.directive {
+                settings
+                    .iter()
+                    .find(|setting| setting.name == "HSPICEMODELS")
+            } else {
+                None
+            }
+        })
+        .context("missing source selection in analysis plan")?;
+    assert_eq!(option.disposition, Disposition::ModelSelection);
+    assert!(!std::str::from_utf8(&preset.primary.bytes)?.contains("HSPICEMODELS"));
     fs::write(&root, format!("{content}.end\n"))?;
     let repeat = prepare(&req, &Options::default(), &Cancellation::default())?;
     assert_eq!(repeat.model_selections[0].mapping.device, Device::Diode1);
@@ -84,7 +105,7 @@ fn included_and_precompiled_libraries_share_deck_mapping() -> Result<()> {
     let root = dir.path().join("root.net");
     let lib = dir.path().join("parts.lib");
     let remap = dir.path().join("selection.inc");
-    let body = "*#HSPICE\n.model selected D ( LEVEL=1 IS=1p BV=5 IBV=100u )\n";
+    let body = "*#HSPICE\n.model selected D ( LEVEL=1 IS=1p\n+ BV=5 IBV=100u )\n";
     fs::write(&lib, body)?;
     fs::write(&remap, ".map ModelName=D Level=1 Device=Diode3\n")?;
     fs::write(
@@ -96,6 +117,8 @@ fn included_and_precompiled_libraries_share_deck_mapping() -> Result<()> {
     assert_eq!(included.model_selections[0].mapping.device, Device::Diode3);
     assert!(included.model_selections[0].source.ends_with("parts.lib"));
     assert!(included.model_selections[0].original.contains("LEVEL=1"));
+    assert_eq!(included.model_selections[0].card.source_line, 2);
+    assert_eq!(included.model_selections[0].last_line, 3);
     let compiled = prepare(
         &request(&lib, InputFormat::SimetrixLibrary),
         &Options::default(),
@@ -110,6 +133,8 @@ fn included_and_precompiled_libraries_share_deck_mapping() -> Result<()> {
     req.libraries.push(LibraryInput::Parsed(parsed));
     let cached = prepare(&req, &Options::default(), &Cancellation::default())?;
     assert_eq!(cached.model_selections[0].mapping.device, Device::Diode3);
+    assert_eq!(cached.model_selections[0].card.source_line, 2);
+    assert_eq!(cached.model_selections[0].last_line, 3);
     assert!((execute(&included)? / execute(&cached)? - 1.).abs() < 1e-10);
     Ok(())
 }

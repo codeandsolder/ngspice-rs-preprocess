@@ -405,7 +405,7 @@ pub fn capture_statement(
     if !matches!(
         first.as_bytes().first().map(u8::to_ascii_uppercase),
         Some(b'C' | b'L')
-    ) && ![".ic", ".option", ".options"]
+    ) && ![".ic", ".opt", ".option", ".options"]
         .iter()
         .any(|name| first.eq_ignore_ascii_case(name))
     {
@@ -427,7 +427,10 @@ pub fn capture_statement(
     if first.eq_ignore_ascii_case(".ic") {
         return capture_nodes(conditions, artifact, scope, &fields[1..]);
     }
-    if first.eq_ignore_ascii_case(".options") || first.eq_ignore_ascii_case(".option") {
+    if [".opt", ".option", ".options"]
+        .iter()
+        .any(|name| first.eq_ignore_ascii_case(name))
+    {
         let retained = capture_options(conditions, scope, &fields[1..])?;
         return Ok(if retained.is_empty() {
             "* source initialization options recorded in typed policy".to_owned()

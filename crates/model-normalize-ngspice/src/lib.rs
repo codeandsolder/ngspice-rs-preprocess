@@ -2,6 +2,14 @@
 
 pub mod conditioning;
 mod lexical;
+
+/// Token spans of a logical SPICE statement, with balanced expression groups
+/// and top-level assignment delimiters retained.
+/// # Errors
+/// Mismatched or unterminated expressions and quotes.
+pub fn statement_token_spans(text: &str) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+    lexical::tokens(text.as_bytes())
+}
 pub mod linked_source;
 pub mod model_card;
 pub mod param_expression;

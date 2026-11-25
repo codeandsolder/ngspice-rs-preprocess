@@ -1,6 +1,7 @@
 //! Unified source preparation. The caller explicitly selects the dialect and
 //! artifact kind; this crate does not run an analysis or infer a file's dialect.
 
+pub mod analysis_plan;
 mod dialect;
 
 use anyhow::{Context, Result, ensure};
@@ -217,6 +218,8 @@ pub struct PreparedBundle {
     /// Source-specific initialization policy; absent for native decks.
     /// Consumers must bind it per instance and enclosing analysis.
     pub initial_conditions: Option<passive_ic::InitialConditions>,
+    /// Original dialect analysis declarations; native decks retain executable cards.
+    pub analysis_plan: Option<analysis_plan::AnalysisPlan>,
     /// Mandatory named independent-source forcing, bound once per
     /// elaborated occurrence and parameter candidate. Electrical cards
     /// retain the source identity but may contain only a DC placeholder.
@@ -311,6 +314,7 @@ fn native(
         device_identities: Vec::new(),
         model_selections: Vec::new(),
         initial_conditions: None,
+        analysis_plan: None,
         waveforms: Vec::new(),
     })
 }

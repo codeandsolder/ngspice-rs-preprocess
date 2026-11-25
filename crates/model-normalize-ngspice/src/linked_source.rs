@@ -142,11 +142,28 @@ pub fn external_library_reference(text: &str) -> Result<Option<(String, String)>
 /// Missing, duplicate, mismatched, or nested section boundaries.
 pub fn select_named_section(text: &str, path: &Path, section: &str) -> Result<String> {
     use std::fmt::Write as _;
-    let mut selection = SectionSelection::new(Some(section));
+    let lines = text.lines().collect::<Vec<_>>();
+    let selected = select_named_section_lines(lines.iter().copied(), path, section)?;
     let mut output = String::new();
-    for (index, line) in text.lines().enumerate() {
+    for index in selected {
+        writeln!(output, "{}", lines[index])?;
+    }
+    Ok(output)
+}
+
+/// Return selected logical line indices without discarding the caller's map.
+/// # Errors
+/// Missing, duplicate, mismatched, or nested section boundaries.
+pub fn select_named_section_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    path: &Path,
+    section: &str,
+) -> Result<Vec<usize>> {
+    let mut selection = SectionSelection::new(Some(section));
+    let mut output = Vec::new();
+    for (index, line) in lines.enumerate() {
         if selection.observe(line.trim(), path, index + 1)? && selection.selected() {
-            writeln!(output, "{line}")?;
+            output.push(index);
         }
     }
     selection.finish(path)?;

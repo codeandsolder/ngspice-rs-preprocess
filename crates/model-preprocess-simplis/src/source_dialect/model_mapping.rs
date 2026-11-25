@@ -13,7 +13,7 @@ use model_normalize_ngspice::model_card::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{DialectContext, ScopedStatement};
+use super::{DialectContext, OpaqueSource, ScopedStatement};
 
 /// Simulator implementation identity. Different charge, temperature and
 /// geometry laws must not share an identity solely because a native
@@ -152,6 +152,8 @@ pub struct ModelSelection {
     pub context: DialectContext,
     pub original: String,
     pub card: ModelCard,
+    /// Inclusive physical end of the source declaration.
+    pub last_line: usize,
     pub declared_level: Option<u16>,
     pub declared_version: Option<String>,
     pub effective_version: Option<String>,
@@ -330,33 +332,41 @@ fn bool_option(value: Option<&str>, name: &str) -> Result<bool> {
 
 /// A global directive in the admitted graph; .FILE and .CONTROL bodies
 /// are separate languages and must not contribute electrical mappings.
-fn directives(statements: &[ScopedStatement]) -> impl Iterator<Item = &ScopedStatement> {
-    let mut opaque = None;
-    statements.iter().filter(move |line| {
+fn directives(statements: &[ScopedStatement]) -> impl Iterator<Item = (&ScopedStatement, bool)> {
+    let mut opaque = OpaqueSource::default();
+    let mut scope_depth = 0usize;
+    let mut conditional_depth = 0usize;
+    statements.iter().filter_map(move |line| {
+        if opaque.consume(&line.text) {
+            return None;
+        }
         let first = line
             .text
             .split_whitespace()
             .next()
             .unwrap_or_default()
             .to_ascii_uppercase();
-        if let Some(end) = opaque {
-            if first == end {
-                opaque = None;
-            }
-            return false;
-        }
         match first.as_str() {
-            ".FILE" => {
-                opaque = Some(".ENDF");
-                false
+            ".SUBCKT" => scope_depth = scope_depth.saturating_add(1),
+            ".ENDS" => scope_depth = scope_depth.saturating_sub(1),
+            ".IF" | ".WHILE" | ".FOR" => conditional_depth = conditional_depth.saturating_add(1),
+            ".ENDIF" | ".ENDWHILE" | ".ENDFOR" => {
+                conditional_depth = conditional_depth.saturating_sub(1);
             }
-            ".CONTROL" => {
-                opaque = Some(".ENDC");
-                false
-            }
-            _ => true,
+            _ => (),
         }
+        Some((line, scope_depth != 0 || conditional_depth != 0))
     })
+}
+
+fn require_global(line: &ScopedStatement, nested: bool) -> Result<()> {
+    ensure!(
+        !nested,
+        "simulation-wide model selection in a local or conditional scope at {}:{}",
+        line.source,
+        line.first_line
+    );
+    Ok(())
 }
 
 impl MappingTable {
@@ -375,13 +385,17 @@ impl MappingTable {
     ) -> Result<Self> {
         let mut table = Self::default();
         let mut hspice_models = None;
-        for line in directives(statements) {
+        for (line, nested) in directives(statements) {
             let text = line.text.trim_start();
             let (first, tail) = text.split_at(text.find(char::is_whitespace).unwrap_or(text.len()));
-            if first.eq_ignore_ascii_case(".OPTIONS") || first.eq_ignore_ascii_case(".OPTION") {
+            if [".OPTIONS", ".OPTION", ".OPT"]
+                .iter()
+                .any(|name| first.eq_ignore_ascii_case(name))
+            {
                 let fields = parse_parameter_fields(tail, &[])?;
                 for field in fields {
                     if field.name.eq_ignore_ascii_case("HSPICEMODELS") {
+                        require_global(line, nested)?;
                         let enabled = bool_option(field.expression.as_deref(), &field.name)?;
                         ensure!(
                             hspice_models.is_none_or(|previous| previous == enabled),
@@ -389,6 +403,7 @@ impl MappingTable {
                         );
                         hspice_models = Some(enabled);
                     } else if field.name.eq_ignore_ascii_case("HSPICECOMPATIBILITY") {
+                        require_global(line, nested)?;
                         ensure!(
                             !bool_option(field.expression.as_deref(), &field.name)?,
                             "HSPICECOMPATIBILITY also selects TEMP, TNOM and MCHSPICE; use HSPICEMODELS for model mapping alone"
@@ -401,10 +416,11 @@ impl MappingTable {
         for entry in &configuration.entries {
             table.insert(entry, SelectionOrigin::DeviceConfiguration)?;
         }
-        for line in directives(statements) {
+        for (line, nested) in directives(statements) {
             let text = line.text.trim_start();
             let (first, tail) = text.split_at(text.find(char::is_whitespace).unwrap_or(text.len()));
             if first.eq_ignore_ascii_case(".MAP") {
+                require_global(line, nested)?;
                 let entry = MapDeclaration::parse(tail, &line.source)?;
                 table.insert(&entry, SelectionOrigin::NetlistMap)?;
             }
@@ -536,7 +552,7 @@ impl MappingTable {
         if !known_family(&family) && !self.entries.keys().any(|key| key.model_type == family) {
             return Ok(None);
         }
-        let card = parse_model_card(text, 0, &["LEVEL", "VERSION", "VLEVEL"])?;
+        let card = parse_model_card(text, line.first_line, &["LEVEL", "VERSION", "VLEVEL"])?;
         let level = one(&card.parameters, "LEVEL")?;
         let vlevel = if matches!(family.as_str(), "NMOS" | "PMOS") {
             one(&card.parameters, "VLEVEL")?
@@ -579,6 +595,7 @@ impl MappingTable {
             context: line.context,
             original: line.text.clone(),
             card,
+            last_line: line.last_line,
             declared_level,
             declared_version: version,
             effective_version,
@@ -801,38 +818,10 @@ impl ModelSelection {
     }
 }
 
-fn consume_selection_options(text: &str) -> Result<String> {
-    let trimmed = text.trim_start();
-    let (_, tail) = trimmed.split_at(trimmed.find(char::is_whitespace).unwrap_or(trimmed.len()));
-    let fields = parse_parameter_fields(tail, &[])?;
-    if !fields.iter().any(|field| {
-        field.name.eq_ignore_ascii_case("HSPICEMODELS")
-            || field.name.eq_ignore_ascii_case("HSPICECOMPATIBILITY")
-    }) {
-        return Ok(text.to_owned());
-    }
-    let mut result = ".options".to_owned();
-    for field in fields {
-        if field.name.eq_ignore_ascii_case("HSPICEMODELS")
-            || field.name.eq_ignore_ascii_case("HSPICECOMPATIBILITY")
-        {
-            continue;
-        }
-        write!(result, " {}", field.name)?;
-        if let Some(value) = field.expression {
-            write!(result, "={value}")?;
-        }
-    }
-    if result == ".options" {
-        Ok(format!("* consumed {text}"))
-    } else {
-        Ok(result)
-    }
-}
-
 impl MappingTable {
-    /// Resolve and consume mapping directives while retaining declaration
-    /// provenance. The same table is applied to root and catalog sources.
+    /// Resolve model mapping directives while retaining declaration
+    /// provenance. The same table is applied to root and catalog sources. Selection
+    /// options remain available to the analysis-plan capture stage.
     ///
     /// # Errors
     /// Invalid model selection, nested scope or unavailable lowering.
@@ -840,19 +829,13 @@ impl MappingTable {
         let mut output = Vec::with_capacity(statements.len());
         let mut selections = Vec::new();
         let mut scope = Vec::new();
-        let mut opaque = None;
+        let mut opaque = OpaqueSource::default();
         for line in statements {
             let mut line = line.clone();
             let mut tokens = line.text.split_whitespace();
             let directive = tokens.next().unwrap_or_default().to_ascii_uppercase();
-            if let Some(end) = opaque {
-                if directive == end {
-                    opaque = None;
-                }
-            } else {
+            if !opaque.consume(&line.text) {
                 match directive.as_str() {
-                    ".FILE" => opaque = Some(".ENDF"),
-                    ".CONTROL" => opaque = Some(".ENDC"),
                     ".SUBCKT" => {
                         scope.push(tokens.next().context("missing subcircuit name")?.to_owned());
                     }
@@ -860,7 +843,6 @@ impl MappingTable {
                         scope.pop().context("unmatched .ENDS")?;
                     }
                     ".MAP" => line.text = format!("* consumed {}", line.text),
-                    ".OPTIONS" | ".OPTION" => line.text = consume_selection_options(&line.text)?,
                     ".MODEL" => {
                         if let Some(selection) = self.select_card(&line, &scope)? {
                             line.text = selection.lower().with_context(|| {
@@ -874,6 +856,7 @@ impl MappingTable {
             }
             output.push(line);
         }
+        opaque.finish()?;
         ensure!(scope.is_empty(), "unclosed subcircuit in model mapping");
         Ok(MappedSource {
             statements: output,
@@ -888,7 +871,7 @@ impl MappingTable {
 /// # Errors
 /// A catalog member contains a simulation-wide selection directive.
 pub fn validate_catalog_directives(statements: &[ScopedStatement]) -> Result<()> {
-    for line in directives(statements) {
+    for (line, _) in directives(statements) {
         let text = line.text.trim_start();
         let (first, tail) = text.split_at(text.find(char::is_whitespace).unwrap_or(text.len()));
         if first.eq_ignore_ascii_case(".MAP") {
@@ -897,7 +880,10 @@ pub fn validate_catalog_directives(statements: &[ScopedStatement]) -> Result<()>
                 line.source
             );
         }
-        if first.eq_ignore_ascii_case(".OPTIONS") || first.eq_ignore_ascii_case(".OPTION") {
+        if [".OPTIONS", ".OPTION", ".OPT"]
+            .iter()
+            .any(|name| first.eq_ignore_ascii_case(name))
+        {
             let fields = parse_parameter_fields(tail, &[])?;
             ensure!(
                 !fields

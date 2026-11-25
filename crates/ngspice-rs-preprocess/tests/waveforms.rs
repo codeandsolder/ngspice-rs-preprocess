@@ -6,7 +6,7 @@ use ngspice_rs_preprocess::{
     Cancellation, InputFormat, Options, PreparedBundle, Request, SourceInput, prepare,
     waveform::{Forcing, Knot, PreparedWaveform, Repeat, ResolvedWaveform},
 };
-use std::{fs, path::Path, process::Command};
+use std::{fmt::Write as _, fs, path::Path, process::Command};
 
 fn prepared(dir: &Path, source: &str, format: InputFormat) -> Result<PreparedBundle> {
     let input = dir.join("source.net");
@@ -66,7 +66,7 @@ fn period_area(knots: &[Knot], repeat: Repeat) -> f64 {
     knots
         .iter()
         .zip(knots.iter().skip(1).chain(std::iter::once(&end)))
-        .map(|(left, right)| 0.5 * (left.right + right.left) * (right.time - left.time))
+        .map(|(left, right)| left.right.midpoint(right.left) * (right.time - left.time))
         .sum()
 }
 
@@ -98,7 +98,7 @@ fn exact_pulse_limits_and_charge_for_all_edge_degeneracies() -> Result<()> {
         close(repeat.origin, -0.25, 1e-15)?;
         close(
             period_area(knots, repeat),
-            -2. + 8. * (width + 0.5 * (rise + fall)),
+            8.0f64.mul_add(width + f64::midpoint(rise, fall), -2.),
             1e-14,
         )?;
         let first = knots[0];
@@ -216,9 +216,9 @@ Vadvance d 0 SIN VOFFSET=1 APEAK=2 FREQ=1k TDELAY=-250u OFF_UNTIL_DELAY=YES DAMP
     );
     close(waveform.dc, 3., 0.)?;
     for (declaration, expected) in bundle.waveforms.iter().skip(1).zip([
-        1. - 2. * 0.05f64.exp(),
+        (-2.0f64).mul_add(0.05f64.exp(), 1.),
         1.,
-        1. + 2. * (-0.05f64).exp(),
+        2.0f64.mul_add((-0.05f64).exp(), 1.),
     ]) {
         close(resolve(declaration)?.dc, expected, 1e-14)?;
     }
@@ -357,7 +357,10 @@ R2 c 0 1k
             .strip_suffix(".end\n")
             .context("missing end")?
             .to_owned();
-        input.push_str(&format!(".control\nset numdgt=17\nset wr_singlescale\ntran {step} 3u 0 0.25n uic\nwrdata wave.dat v(a) v(b) v(c) i(vsaw)\nquit\n.endc\n.end\n"));
+        write!(
+            input,
+            ".control\nset numdgt=17\nset wr_singlescale\ntran {step} 3u 0 0.25n uic\nwrdata wave.dat v(a) v(b) v(c) i(vsaw)\nquit\n.endc\n.end\n"
+        )?;
         fs::write(dir.path().join("reference.cir"), input)?;
         let run = Command::new("ngspice")
             .current_dir(dir.path())
@@ -389,8 +392,8 @@ R2 c 0 1k
                 close(*branch, -saw / 1000., 1e-10)?;
             }
             let elapsed = *time - 250e-9;
-            let want =
-                1. + 2. * (-1000. * elapsed).exp() * (std::f64::consts::TAU * 1e6 * elapsed).sin();
+            let want = (2. * (-1000. * elapsed).exp())
+                .mul_add((std::f64::consts::TAU * 1e6 * elapsed).sin(), 1.);
             close(*sine, want, 1e-7)?;
             last = *cap;
             rows += 1;
@@ -429,7 +432,7 @@ fn waveform_identity_and_native_passthrough() -> Result<()> {
         "* native\nV1 a 0 PULSE(0 1 0 0 0 1u 2u)\n.end\n",
         InputFormat::NativeDeck,
     )?;
-    assert!(native.waveforms.is_empty());
+    assert_eq!(native.waveforms, []);
     assert!(std::str::from_utf8(&native.primary.bytes)?.contains("PULSE(0 1 0 0 0 1u 2u)"));
     Ok(())
 }

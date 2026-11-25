@@ -172,33 +172,116 @@ pub(super) fn active_prefix(line: &str, marker: char) -> &str {
     CommentState::default().prefix(line, marker)
 }
 
+/// A projected source statement with its admitted physical source span.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedStatement {
+    /// Joined active source text, or a retained comment.
+    pub text: String,
+    /// First one-based physical source line.
+    pub first_line: usize,
+    /// Last one-based physical source line, including continuations.
+    pub last_line: usize,
+}
+
+/// Opaque file and command bodies have independent closing delimiters.
+#[derive(Clone, Copy)]
+enum OpaqueBlock {
+    File,
+    Control,
+}
+
+/// Track an opaque body without interpreting directives within its payload.
+#[derive(Default)]
+pub(super) struct OpaqueSource(Option<OpaqueBlock>);
+
+impl OpaqueSource {
+    pub(super) fn consume(&mut self, statement: &str) -> bool {
+        let first = statement
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or_default();
+        match self.0 {
+            Some(block) => {
+                let close = match block {
+                    OpaqueBlock::File => ".endf",
+                    OpaqueBlock::Control => ".endc",
+                };
+                if first.eq_ignore_ascii_case(close) {
+                    self.0 = None;
+                }
+                true
+            }
+            None if first.eq_ignore_ascii_case(".file") => {
+                self.0 = Some(OpaqueBlock::File);
+                true
+            }
+            None if first.eq_ignore_ascii_case(".control") => {
+                self.0 = Some(OpaqueBlock::Control);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn finish(&self) -> Result<()> {
+        ensure!(self.0.is_none(), "unterminated opaque source block");
+        Ok(())
+    }
+}
+
 /// Join physical continuation lines after stripping source-specific comments.
 /// Quoting and brace state persists across continuation boundaries.
-pub(super) fn logical_source(input: &str, context: DialectContext) -> Result<Vec<String>> {
-    let mut statements = Vec::<String>::new();
+pub(super) fn logical_source(
+    input: &str,
+    context: DialectContext,
+) -> Result<Vec<ProjectedStatement>> {
+    let mut statements = Vec::<ProjectedStatement>::new();
     let mut active = None;
     let mut state = CommentState::default();
+    let mut opaque = OpaqueSource::default();
     let marker = if context.language == SourceLanguage::Hspice {
         '$'
     } else {
         ';'
     };
-    for line in input.lines() {
+    for (index, line) in input.lines().enumerate() {
+        let line_number = index + 1;
+        if opaque.consume(line) {
+            statements.push(ProjectedStatement {
+                text: line.to_owned(),
+                first_line: line_number,
+                last_line: line_number,
+            });
+            active = None;
+            continue;
+        }
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('*') {
-            statements.push(line.to_owned());
+            statements.push(ProjectedStatement {
+                text: line.to_owned(),
+                first_line: line_number,
+                last_line: line_number,
+            });
             continue;
         }
         if let Some(tail) = trimmed.strip_prefix('+') {
             let index: usize = active.context("orphan source continuation")?;
-            statements[index].push(' ');
-            statements[index].push_str(state.prefix(tail.trim_start(), marker));
+            statements[index].text.push(' ');
+            statements[index]
+                .text
+                .push_str(state.prefix(tail.trim_start(), marker));
+            statements[index].last_line = line_number;
         } else {
             state = CommentState::default();
             active = Some(statements.len());
-            statements.push(state.prefix(line, marker).to_owned());
+            statements.push(ProjectedStatement {
+                text: state.prefix(line, marker).to_owned(),
+                first_line: line_number,
+                last_line: line_number,
+            });
         }
     }
+    opaque.finish()?;
     Ok(statements)
 }
 
@@ -453,7 +536,7 @@ pub(super) fn lower_statement(
     let upper = first.to_ascii_uppercase();
     let (prefix_end, language) = if upper.starts_with('.') {
         let prefix = match upper.as_str() {
-            ".PARAM" => token_end(trimmed, 1),
+            ".PARAM" | ".TRAN" | ".AC" | ".TEMP" => token_end(trimmed, 1),
             ".MODEL" => {
                 let start = token_end(trimmed, 2);
                 // Stop after the model family, including the compact D(...).

@@ -147,7 +147,7 @@ fn reserved_parameter_declarations_fail_before_hygienic_renaming() -> Result<()>
         "X1 a 0 T\n.subckt T p n params: e=3\nR1 p n {e}\n.ends\n.end\n",
         "X1 a 0 T\n.subckt T p n\n.param BOLTZ=2\nR1 p n {BOLTZ}\n.ends\n.end\n",
     ] {
-        fs::write(&source, deck)?;
+        fs::write(&source, format!("* reserved declaration\n{deck}"))?;
         let request = Request {
             format: InputFormat::SimetrixDeck,
             input: SourceInput::File(source.clone()),

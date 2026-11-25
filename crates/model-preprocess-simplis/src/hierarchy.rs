@@ -179,10 +179,11 @@ impl ParsedLibrary {
         }
         anyhow::ensure!(
             self.source_names.contains(&self.source_name)
-                && self
-                    .scoped_statements
-                    .iter()
-                    .all(|statement| self.source_names.contains(&statement.source))
+                && self.scoped_statements.iter().all(|statement| self
+                    .source_names
+                    .contains(&statement.source)
+                    && statement.first_line > 0
+                    && statement.last_line >= statement.first_line)
                 && self
                     .device_identities
                     .iter()
@@ -747,17 +748,46 @@ pub fn parse_library_for_simulator(
     input: &[u8],
     simulator: LibrarySimulator,
 ) -> Result<ParsedLibrary> {
+    use crate::source_dialect::{
+        DEFAULT_PROJECTION_BYTES, DialectContext, ScopedStatement, SourceKind,
+    };
     let source_name = source.into();
+    let sources = BTreeSet::from([source_name.clone()]);
     if simulator == LibrarySimulator::Simetrix {
-        let (context, view) = project_simetrix_source(
+        let (context, view) = project_resource(
             input,
-            crate::source_dialect::DialectContext::default(),
-            crate::source_dialect::SourceKind::Include,
+            DialectContext::default(),
+            SourceKind::Include,
+            simulator,
         )?;
-        return parse_projected_library(source_name, &view, simulator, Some(context));
+        let statements = view
+            .into_iter()
+            .map(|line| ScopedStatement {
+                source: source_name.clone(),
+                context,
+                first_line: line.first_line,
+                last_line: line.last_line,
+                text: line.text,
+            })
+            .collect::<Vec<_>>();
+        return parse_scoped_library(
+            source_name,
+            sources,
+            context,
+            &statements,
+            DEFAULT_PROJECTION_BYTES,
+        );
     }
     let view = project_source(input, simulator)?;
-    parse_projected_library(source_name, &view, simulator, None)
+    parse_library_parts(
+        source_name,
+        sources,
+        &view,
+        simulator,
+        None,
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 /// Parse an admitted, scoped source graph whose individual resources have
@@ -791,15 +821,18 @@ pub fn lower_scoped_statements(
     limit: usize,
 ) -> Result<Vec<crate::source_dialect::ScopedStatement>> {
     let mut remaining = limit;
+    let mut opaque = crate::source_dialect::OpaqueSource::default();
     statements
         .iter()
         .map(|statement| {
             let mut statement = statement.clone();
-            statement.text = crate::source_dialect::lower_statement(
-                &statement.text,
-                statement.context,
-                remaining,
-            )?;
+            if !opaque.consume(&statement.text) {
+                statement.text = crate::source_dialect::lower_statement(
+                    &statement.text,
+                    statement.context,
+                    remaining,
+                )?;
+            }
             remaining = remaining
                 .checked_sub(statement.text.len().saturating_add(1))
                 .context("source dialect output byte budget exceeded")?;
@@ -838,42 +871,6 @@ fn parse_scoped_parts(
         Some(dialect),
         resolved.identities,
         original,
-    )
-}
-
-fn parse_projected_library(
-    source_name: String,
-    selected_view: &str,
-    simulator: LibrarySimulator,
-    dialect: Option<crate::source_dialect::DialectContext>,
-) -> Result<ParsedLibrary> {
-    use crate::source_dialect::{DEFAULT_PROJECTION_BYTES, ScopedStatement};
-    let sources = BTreeSet::from([source_name.clone()]);
-    if let Some(context) = dialect {
-        let statements = selected_view
-            .lines()
-            .map(|text| ScopedStatement {
-                source: source_name.clone(),
-                context,
-                text: text.to_owned(),
-            })
-            .collect::<Vec<_>>();
-        return parse_scoped_library(
-            source_name,
-            sources,
-            context,
-            &statements,
-            DEFAULT_PROJECTION_BYTES,
-        );
-    }
-    parse_library_parts(
-        source_name,
-        sources,
-        selected_view,
-        simulator,
-        None,
-        Vec::new(),
-        Vec::new(),
     )
 }
 
@@ -937,12 +934,71 @@ pub fn project_simetrix_source(
     inherited: crate::source_dialect::DialectContext,
     kind: crate::source_dialect::SourceKind,
 ) -> Result<(crate::source_dialect::DialectContext, String)> {
-    use crate::source_dialect::{DialectContext, logical_source};
-    let decoded = decode_simplis_text(input)?;
-    let context = DialectContext::resolve(&decoded, inherited, kind);
-    let stripped = logical_source(&decoded, context)?.join("\n");
-    let selected = select_library_view(&stripped, LibrarySimulator::Simetrix)?;
-    Ok((context, selected))
+    let (context, statements) =
+        project_resource(input, inherited, kind, LibrarySimulator::Simetrix)?;
+    Ok((context, render_projection(&statements)))
+}
+
+/// Render mapped statements without altering their logical boundaries.
+#[must_use = "the result is the selected source text"]
+pub fn render_projection(statements: &[crate::source_dialect::ProjectedStatement]) -> String {
+    let mut output = String::new();
+    for statement in statements {
+        output.push_str(&statement.text);
+        output.push('\n');
+    }
+    output
+}
+
+/// Project a resource with exact admitted physical source spans.
+///
+/// Only a complete `SIMetrix` deck has a mandatory first-line title. Included
+/// files and SIMPLIS source streams retain their first electrical statement.
+/// # Errors
+/// Invalid source encoding, continuation, simulator view or source nesting.
+pub fn project_resource(
+    input: &[u8],
+    inherited: crate::source_dialect::DialectContext,
+    kind: crate::source_dialect::SourceKind,
+    simulator: LibrarySimulator,
+) -> Result<(
+    crate::source_dialect::DialectContext,
+    Vec<crate::source_dialect::ProjectedStatement>,
+)> {
+    use crate::source_dialect::{DialectContext, SourceKind, logical_source};
+    let decoded = if kind == SourceKind::Deck && simulator == LibrarySimulator::Simetrix {
+        // A title is data, even when it looks like a directive or a device.
+        let mut protected = Vec::with_capacity(input.len().saturating_add(2));
+        let first = input
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii_start();
+        if !first.starts_with(b"*") || first.starts_with(b"*#") {
+            protected.extend_from_slice(b"* ");
+        }
+        protected.extend_from_slice(input);
+        decode_simplis_text(&protected)?
+    } else {
+        decode_simplis_text(input)?
+    };
+    let context = if simulator == LibrarySimulator::Simetrix {
+        DialectContext::resolve(&decoded, inherited, kind)
+    } else {
+        inherited
+    };
+    let statements = logical_source(&decoded, context)?;
+    let selected =
+        selected_library_lines(statements.iter().map(|line| line.text.as_str()), simulator)?;
+    let selected = selected.into_iter().collect::<BTreeSet<_>>();
+    Ok((
+        context,
+        statements
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, line)| selected.contains(&i).then_some(line))
+            .collect(),
+    ))
 }
 
 /// Lower expressions only after simulator and named-section selection.
@@ -954,26 +1010,53 @@ pub fn lower_simetrix_source_view(
     context: crate::source_dialect::DialectContext,
     limit: usize,
 ) -> Result<String> {
-    use crate::source_dialect::lower_statement;
+    use crate::source_dialect::{OpaqueSource, lower_statement};
     use std::fmt::Write as _;
     let mut output = String::new();
+    let mut opaque = OpaqueSource::default();
     for statement in selected.lines() {
-        let lowered = lower_statement(statement, context, limit.saturating_sub(output.len()))?;
+        let lowered = if opaque.consume(statement) {
+            statement.to_owned()
+        } else {
+            lower_statement(statement, context, limit.saturating_sub(output.len()))?
+        };
         anyhow::ensure!(
             lowered.len().saturating_add(1) <= limit.saturating_sub(output.len()),
             "source dialect output byte budget exceeded"
         );
         writeln!(output, "{lowered}")?;
     }
+    opaque.finish()?;
     Ok(output)
 }
 
 fn select_library_view(input: &str, simulator: LibrarySimulator) -> Result<String> {
-    let target = simulator.as_str().to_ascii_uppercase();
+    let selected = selected_library_lines(input.lines(), simulator)?;
+    let lines = input.lines().collect::<Vec<_>>();
     let mut output = String::new();
+    for index in selected {
+        output.push_str(lines[index]);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn selected_library_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    simulator: LibrarySimulator,
+) -> Result<Vec<usize>> {
+    let target = simulator.as_str().to_ascii_uppercase();
+    let mut output = Vec::new();
     let mut enabled = true;
     let mut subcircuit_depth = 0usize;
-    for (line_index, line) in input.lines().enumerate() {
+    let mut opaque = crate::source_dialect::OpaqueSource::default();
+    for (line_index, line) in lines.enumerate() {
+        if opaque.consume(line) {
+            if enabled {
+                output.push(line_index);
+            }
+            continue;
+        }
         if is_directive(line, "SIMULATOR") {
             if subcircuit_depth != 0 {
                 bail!(
@@ -1009,10 +1092,10 @@ fn select_library_view(input: &str, simulator: LibrarySimulator) -> Result<Strin
             subcircuit_depth -= 1;
         }
         if enabled {
-            output.push_str(line);
-            output.push('\n');
+            output.push(line_index);
         }
     }
+    opaque.finish()?;
     if subcircuit_depth != 0 {
         bail!(
             "unterminated subcircuit while selecting {} library view",

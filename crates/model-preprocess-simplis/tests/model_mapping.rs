@@ -7,9 +7,12 @@ use model_preprocess_simplis::source_dialect::{
 fn statements(input: &str) -> Vec<ScopedStatement> {
     input
         .lines()
-        .map(|line| ScopedStatement {
+        .enumerate()
+        .map(|(index, line)| ScopedStatement {
             source: "root.net".into(),
             context: DialectContext::default(),
+            first_line: index + 1,
+            last_line: index + 1,
             text: line.into(),
         })
         .collect()
@@ -154,6 +157,28 @@ fn full_compatibility_cannot_silently_drop_other_physical_options() -> Result<()
     assert!(table(".options HSPICEMODELS=1\n.options HSPICEMODELS=0").is_err());
     let source = statements(".options TEMP=85 HSPICEMODELS=1 RELTOL=1e-4");
     let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source)?.apply(&source)?;
-    assert_eq!(mapped.statements[0].text, ".options TEMP=85 RELTOL=1e-4");
+    assert_eq!(
+        mapped.statements[0].text,
+        ".options TEMP=85 HSPICEMODELS=1 RELTOL=1e-4"
+    );
+    Ok(())
+}
+
+#[test]
+fn global_mapping_cannot_be_applied_from_inactive_or_local_scopes() -> Result<()> {
+    for source in [
+        ".if {0}\n.map ModelName=D Level=1 Device=Diode3\n.endif",
+        ".while {0}\n.opt HSPICEMODELS\n.endwhile",
+        ".subckt idle a b\n.options HSPICEMODELS\n.ends",
+    ] {
+        let error = table(source)
+            .err()
+            .context("nested global selector accepted")?;
+        assert!(
+            error
+                .to_string()
+                .contains("simulation-wide model selection")
+        );
+    }
     Ok(())
 }
