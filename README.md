@@ -13,3 +13,6 @@ normalization. Ordinary plaintext inputs need no external command.
 
 See per-crate documentation and upstream notices for model-specific
 provenance, supported formats and reproducible reference validation.
+
+See [third-party notices](THIRD_PARTY_NOTICES.md) for upstream licensing and
+reference-fixture provenance.
