@@ -96,6 +96,60 @@ impl Functions {
         Ok(result)
     }
 
+    // Keep electrical probe operands opaque while rewriting actual function
+    // calls and detecting the predefined scalar parameters.
+    fn expression_identifier(
+        &mut self,
+        input: &str,
+        start: usize,
+        table: bool,
+        output: &mut Vec<u8>,
+    ) -> Result<usize> {
+        let bytes = input.as_bytes();
+        let mut end = start + 1;
+        while bytes.get(end).is_some_and(|&byte| identifier(byte)) {
+            end += 1;
+        }
+        let name = &input[start..end];
+        let mut after = end;
+        while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+            after += 1;
+        }
+        if bytes.get(after) == Some(&b'(') {
+            if name.eq_ignore_ascii_case("v") || name.eq_ignore_ascii_case("i") {
+                let close = bytes[after + 1..]
+                    .iter()
+                    .position(|&byte| byte == b')')
+                    .map(|index| after + index + 2)
+                    .context("unterminated PSpice probe")?;
+                output.extend_from_slice(&bytes[start..close]);
+                return Ok(close);
+            }
+            let lower = name.to_ascii_lowercase();
+            if !self.scopes.shadows(self.scope, &lower) {
+                if let Some(generated) = self.names.get(&lower) {
+                    output.extend_from_slice(generated.as_bytes());
+                    self.used.insert(lower);
+                    return Ok(end);
+                }
+                if lower == "table" {
+                    ensure!(
+                        table,
+                        "PSpice TABLE() requires an E/G VALUE or G CUR expression"
+                    );
+                    output.extend_from_slice(b"pwl");
+                    return Ok(end);
+                }
+            }
+        } else {
+            self.temperature |=
+                name.eq_ignore_ascii_case("temp") || name.eq_ignore_ascii_case("vt");
+            self.gmin |= name.eq_ignore_ascii_case("gmin");
+        }
+        output.extend_from_slice(name.as_bytes());
+        Ok(end)
+    }
+
     fn expression(&mut self, input: &str, table: bool) -> Result<String> {
         let bytes = input.as_bytes();
         let mut cursor = 0;
@@ -125,49 +179,7 @@ impl Functions {
             if (byte.is_ascii_alphabetic() || byte == b'_')
                 && (cursor == 0 || !identifier(bytes[cursor - 1]))
             {
-                let start = cursor;
-                cursor += 1;
-                while bytes.get(cursor).is_some_and(|&b| identifier(b)) {
-                    cursor += 1;
-                }
-                let name = &input[start..cursor];
-                let mut after = cursor;
-                while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
-                    after += 1;
-                }
-                if bytes.get(after) == Some(&b'(') {
-                    if name.eq_ignore_ascii_case("v") || name.eq_ignore_ascii_case("i") {
-                        // Probe operands are node/branch identities, not expressions.
-                        let close = bytes[after + 1..]
-                            .iter()
-                            .position(|&b| b == b')')
-                            .map(|index| after + index + 2)
-                            .context("unterminated PSpice probe")?;
-                        output.extend_from_slice(&bytes[start..close]);
-                        cursor = close;
-                        continue;
-                    }
-                    let lower = name.to_ascii_lowercase();
-                    if let Some(generated) = self.names.get(&lower)
-                        && !self.scopes.shadows(self.scope, &lower)
-                    {
-                        output.extend_from_slice(generated.as_bytes());
-                        self.used.insert(lower);
-                        continue;
-                    }
-                    if name.eq_ignore_ascii_case("table") {
-                        ensure!(
-                            table,
-                            "PSpice TABLE() requires an E/G VALUE or G CUR expression"
-                        );
-                        output.extend_from_slice(b"pwl");
-                        continue;
-                    }
-                }
-                self.temperature |=
-                    name.eq_ignore_ascii_case("temp") || name.eq_ignore_ascii_case("vt");
-                self.gmin |= name.eq_ignore_ascii_case("gmin");
-                output.extend_from_slice(name.as_bytes());
+                cursor = self.expression_identifier(input, cursor, table, &mut output)?;
                 continue;
             }
             match byte {
