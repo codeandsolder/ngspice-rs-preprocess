@@ -36,12 +36,33 @@ fn arguments(text: &[u8], name_end: usize) -> Result<(Vec<Range<usize>>, usize)>
 
 fn literal(text: &[u8]) -> Result<f64> {
     let text = std::str::from_utf8(text)?.trim();
-    let text = text
+    let grouped = text
         .strip_prefix('{')
-        .and_then(|text| text.strip_suffix('}'))
-        .unwrap_or(text);
-    parse_spice_constant(text)
+        .and_then(|text| text.strip_suffix('}'));
+    let expression = grouped.unwrap_or(text);
+    parse_spice_constant(expression)
+        .or_else(|_| super::constants::evaluate(expression, grouped.is_none()))
         .context("waveform timing requires occurrence-specific parameter binding")
+}
+
+fn native_literal(text: &[u8]) -> bool {
+    std::str::from_utf8(text)
+        .ok()
+        .and_then(|value| parse_spice_constant(value).ok())
+        .is_some()
+}
+
+fn materialize_closed(
+    statement: &lexical::Statement,
+    span: &Range<usize>,
+    edits: &mut Vec<lexical::Edit>,
+) {
+    let text = &statement.text[span.clone()];
+    if !native_literal(text)
+        && let Ok(value) = literal(text)
+    {
+        lexical::replace_span(statement, span.clone(), value.to_string().as_bytes(), edits);
+    }
 }
 
 /// Resolve source-dialect timing from values already bound in the source
@@ -118,13 +139,16 @@ fn rewrite_pulse(
         "line {}: invalid LTspice PULSE arity",
         statement.line
     );
+    for span in &fields[..2] {
+        materialize_closed(statement, span, edits);
+    }
     let values = fields[2..]
         .iter()
         .map(|span| literal(&text[span.clone()]))
         .collect::<Result<Vec<_>>>()?;
     let timing = pulse_timing(&values)?;
     for (span, (before, after)) in fields[2..].iter().zip(values.iter().zip(timing)) {
-        if before.to_bits() != after.to_bits() {
+        if before.to_bits() != after.to_bits() || !native_literal(&text[span.clone()]) {
             lexical::replace_span(statement, span.clone(), after.to_string().as_bytes(), edits);
         }
     }
@@ -141,6 +165,122 @@ fn rewrite_pulse(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct Scale {
+    time: f64,
+    value: f64,
+}
+
+impl Default for Scale {
+    fn default() -> Self {
+        Self {
+            time: 1.,
+            value: 1.,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScaleAxis {
+    Time,
+    Value,
+}
+
+impl ScaleAxis {
+    fn parse(field: &[u8]) -> Option<Self> {
+        if field.eq_ignore_ascii_case(b"time_scale_factor") {
+            Some(Self::Time)
+        } else if field.eq_ignore_ascii_case(b"value_scale_factor") {
+            Some(Self::Value)
+        } else {
+            None
+        }
+    }
+}
+
+fn scale_assignment(text: &[u8], fields: &[Range<usize>], index: usize) -> Result<Range<usize>> {
+    let equals = fields
+        .get(index + 1)
+        .context("missing PWL scale assignment")?;
+    let value = fields.get(index + 2).context("missing PWL scale value")?;
+    ensure!(
+        &text[equals.clone()] == b"=",
+        "expected PWL scale assignment"
+    );
+    Ok(value.clone())
+}
+
+struct PwlArguments {
+    fields: Vec<Range<usize>>,
+    scale: Scale,
+    removals: Vec<Range<usize>>,
+}
+
+/// Vendor grammar applies scale assignments only before the coordinate
+/// list. Repeated assignments are last-wins; trailing scale assignments
+/// are consumed but do not affect forcing. Do not consume other source
+/// attributes, such as AC phase or physical parasitics.
+fn pwl_arguments(text: &[u8], name_end: usize) -> Result<PwlArguments> {
+    let tokens = lexical::tokens(&text[name_end..])?
+        .into_iter()
+        .map(|span| name_end + span.start..name_end + span.end)
+        .collect::<Vec<_>>();
+    let mut scale = Scale::default();
+    let mut index = 0;
+    let mut removals = Vec::new();
+    let mut latest_time = None;
+    let mut latest_value = None;
+    loop {
+        let field = tokens
+            .get(index)
+            .context("missing LTspice PWL coordinates")?;
+        if text[field.clone()].starts_with(b"(") {
+            break;
+        }
+        let axis = ScaleAxis::parse(&text[field.clone()])
+            .context("LTspice structured PWL requires typed waveform lowering")?;
+        let value = scale_assignment(text, &tokens, index)?;
+        removals.push(field.start..value.end);
+        match axis {
+            ScaleAxis::Time => latest_time = Some(value),
+            ScaleAxis::Value => latest_value = Some(value),
+        }
+        index += 3;
+    }
+    if let Some(value) = latest_time {
+        scale.time = literal(&text[value])?;
+    }
+    if let Some(value) = latest_value {
+        scale.value = literal(&text[value])?;
+    }
+    ensure!(scale.time != 0., "LTspice PWL time scale must be nonzero");
+    let list = &tokens[index];
+    let (fields, close) = arguments(text, list.start)?;
+    index += 1;
+    while let Some(field) = tokens.get(index) {
+        let word = &text[field.clone()];
+        if ScaleAxis::parse(word).is_some() {
+            let value = scale_assignment(text, &tokens, index)?;
+            removals.push(field.start..value.end);
+            index += 3;
+            continue;
+        }
+        ensure!(
+            ![b"repeat".as_slice(), b"endrepeat", b"trigger", b"file"]
+                .iter()
+                .any(|keyword| word.eq_ignore_ascii_case(keyword)),
+            "LTspice structured PWL requires typed waveform lowering"
+        );
+        ensure!(field.start > close, "invalid PWL coordinate list");
+        index += 1;
+    }
+    Ok(PwlArguments {
+        fields,
+        scale,
+        removals,
+    })
+}
+
 fn pwl_time(text: &[u8], previous: f64) -> Result<f64> {
     let time = literal(text)?;
     let time = if text.first() == Some(&b'+') {
@@ -148,10 +288,7 @@ fn pwl_time(text: &[u8], previous: f64) -> Result<f64> {
     } else {
         time
     };
-    ensure!(
-        time.is_finite() && time >= previous,
-        "LTspice PWL times must be chronological"
-    );
+    ensure!(time.is_finite(), "nonfinite LTspice PWL coordinate");
     Ok(time)
 }
 
@@ -162,36 +299,27 @@ fn rewrite_pwl(
     edits: &mut Vec<lexical::Edit>,
 ) -> Result<()> {
     let text = &statement.text;
-    let (fields, close) = arguments(text, name_end)
-        .context("LTspice structured PWL requires typed waveform lowering")?;
+    let PwlArguments {
+        fields,
+        scale,
+        mut removals,
+    } = pwl_arguments(text, name_end)?;
     ensure!(
         fields.len() >= 2 && fields.len() % 2 == 0,
         "invalid PWL coordinate pairs"
-    );
-    let tail = &text[close + 1..];
-    ensure!(
-        ![
-            b"repeat".as_slice(),
-            b"endrepeat",
-            b"trigger",
-            b"file",
-            b"time_scale_factor",
-            b"value_scale_factor"
-        ]
-        .iter()
-        .any(|keyword| tail
-            .windows(keyword.len())
-            .any(|part| part.eq_ignore_ascii_case(keyword))),
-        "LTspice structured PWL requires typed waveform lowering"
     );
     let points = fields.as_chunks::<2>().0;
     let mut times = Vec::with_capacity(points.len());
     let mut previous = 0.;
     for point in points {
         previous = pwl_time(&text[point[0].clone()], previous)?;
-        times.push(previous);
+        let scaled = previous * scale.time;
+        ensure!(
+            scaled.is_finite() && times.last().is_none_or(|last| scaled >= *last),
+            "LTspice PWL times must be chronological after scaling"
+        );
+        times.push(scaled);
     }
-    let mut removals = Vec::new();
     let mut index = 0;
     while index < points.len() {
         let time = times[index];
@@ -200,7 +328,8 @@ fn rewrite_pwl(
             .position(|value| *value > time)
             .map_or(points.len(), |offset| index + offset);
         let first = &points[index];
-        if text[first[0].clone()].first() == Some(&b'+') {
+        if scale.time.to_bits() != 1_f64.to_bits() || text[first[0].clone()].first() == Some(&b'+')
+        {
             lexical::replace_span(
                 statement,
                 first[0].clone(),
@@ -208,18 +337,19 @@ fn rewrite_pwl(
                 edits,
             );
         }
-        if end - index > 1 {
+        if end - index > 1 || scale.value.to_bits() != 1_f64.to_bits() {
             // The vendor collapses repeated coordinates to the arithmetic
             // mean before interpolation; they are not instantaneous jumps.
             let count = f64::from(u32::try_from(end - index)?);
             let mean = points[index..end].iter().try_fold(0., |sum, point| {
                 Ok::<_, anyhow::Error>(sum + literal(&text[point[1].clone()])? / count)
             })?;
-            ensure!(mean.is_finite(), "nonfinite averaged PWL ordinate");
+            let scaled = mean * scale.value;
+            ensure!(scaled.is_finite(), "nonfinite scaled PWL ordinate");
             lexical::replace_span(
                 statement,
                 first[1].clone(),
-                mean.to_string().as_bytes(),
+                scaled.to_string().as_bytes(),
                 edits,
             );
             for point in &points[index + 1..end] {
@@ -231,6 +361,9 @@ fn rewrite_pwl(
                 };
                 removals.push(start..point[1].end);
             }
+        }
+        if end - index == 1 && scale.value.to_bits() == 1_f64.to_bits() {
+            materialize_closed(statement, &first[1], edits);
         }
         index = end;
     }
@@ -263,7 +396,7 @@ fn rewrite_tran(statement: &lexical::Statement, edits: &mut Vec<lexical::Edit>) 
     );
     let values = timing.iter().map(|span| literal(&text[span.clone()])).collect::<Result<Vec<_>>>()
         .context("LTspice transient timing requires bound scalar fields; startup/steady modes require typed analysis")?;
-    let (step, stop, start, max_step) = if values.len() == 1 {
+    let (interval, final_time, start, max_step) = if values.len() == 1 {
         (0., values[0], 0., 0.)
     } else {
         (
@@ -274,25 +407,25 @@ fn rewrite_tran(statement: &lexical::Statement, edits: &mut Vec<lexical::Edit>) 
         )
     };
     ensure!(
-        stop > start && max_step >= 0.,
+        final_time > start && max_step >= 0.,
         "LTspice transient needs positive duration and nonnegative maximum step"
     );
     // Vendor adaptive default: exactly stop/1024, regardless of plotting step.
     let max_step = if max_step > 0. {
         max_step
     } else {
-        stop / 1024.
+        final_time / 1024.
     };
-    let step = if step > 0. { step } else { max_step };
+    let interval = if interval > 0. { interval } else { max_step };
     ensure!(
-        step > 0. && max_step > 0.,
+        interval > 0. && max_step > 0.,
         "unrepresentable LTspice transient timestep"
     );
     if timing.len() == 1 {
-        let replacement = format!("{step} {stop} {start} {max_step}");
+        let replacement = format!("{interval} {final_time} {start} {max_step}");
         lexical::replace_span(statement, timing[0].clone(), replacement.as_bytes(), edits);
     } else {
-        let resolved = [step, stop, start, max_step];
+        let resolved = [interval, final_time, start, max_step];
         for (index, span) in timing.iter().enumerate() {
             if index + 1 == timing.len() && timing.len() < resolved.len() {
                 let replacement = resolved[index..]
@@ -301,7 +434,9 @@ fn rewrite_tran(statement: &lexical::Statement, edits: &mut Vec<lexical::Edit>) 
                     .collect::<Vec<_>>()
                     .join(" ");
                 lexical::replace_span(statement, span.clone(), replacement.as_bytes(), edits);
-            } else if values[index].to_bits() != resolved[index].to_bits() {
+            } else if values[index].to_bits() != resolved[index].to_bits()
+                || !native_literal(&text[span.clone()])
+            {
                 lexical::replace_span(
                     statement,
                     span.clone(),

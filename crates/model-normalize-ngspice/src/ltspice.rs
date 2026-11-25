@@ -3,6 +3,7 @@
 //! Preserve physical source mapping; generated helper definitions inherit the
 //! line of their first use. Native decks do not receive these dialect rewrites.
 
+mod constants;
 mod functions;
 mod operators;
 mod sources;

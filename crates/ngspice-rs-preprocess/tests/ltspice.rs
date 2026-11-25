@@ -643,3 +643,88 @@ fn comma_delimited_pwl_duplicates_do_not_leave_empty_fields() -> Result<()> {
     assert!(output.contains("PWL(0,0,1u,4,2u,0)"), "{output}");
     Ok(())
 }
+
+#[test]
+fn vendor_scaled_pwl_signed_coordinates_and_closed_waveform_expressions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root, b"title\nV1 a 0 PWL TIME_SCALE_FACTOR=2 VALUE_SCALE_FACTOR=3 (0 0 +1u 1 +0 3 +1u 0)\nV2 b 0 PWL VALUE_SCALE_FACTOR=-2 TIME_SCALE_FACTOR=.5 (1u 1 +1u 2)\nV3 c 0 PWL(0 0 1u 1 2u 0) TIME_SCALE_FACTOR=2 VALUE_SCALE_FACTOR=3\nV4 d 0 PWL TIME_SCALE_FACTOR=2 TIME_SCALE_FACTOR={2+1} VALUE_SCALE_FACTOR={2*3} (0 0 1u 1 2u 0)\nV5 e 0 PWL(-1u 1 1u 3)\nV6 f 0 PWL TIME_SCALE_FACTOR=-1 (0 1 -1u 3 -2u 8)\nV7 g 0 PWL TIME_SCALE_FACTOR=-1 (2u 1 1u 3 0 8)\nV8 h 0 PWL VALUE_SCALE_FACTOR=0 (0 1 1u 3)\nV9 j 0 PWL(0 1 0 3)\nV10 k 0 PULSE({-2**2} {2**3**2} {1u/2} {1u/10} {1u/10} {1u*2} {1u*10})\nV11 l 0 PWL TIME_SCALE_FACTOR=3%2 (0 0 1u 1 2u 0)\nI1 0 m PWL TIME_SCALE_FACTOR=2 VALUE_SCALE_FACTOR=3\n+ (0 0 +1u 1 +0 3 +1u 0)\nR1 m 0 1\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(!text.to_ascii_lowercase().contains("scale_factor"));
+    assert!(text.contains("PULSE(4 512"));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing source mapping");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\ntran 10n 8u 0 10n\nwrdata tran.dat v(a) v(b) v(c) v(d) v(e) v(f) v(g) v(h) v(j) v(k) v(l) v(m)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let rows = data(&dir.path().join("tran.dat"))?;
+    assert!(rows.len() > 500);
+    for row in rows {
+        let t = row[0];
+        let triangle = |half: f64, peak: f64| {
+            if t <= half {
+                peak * t / half
+            } else {
+                peak * (2. - t / half).max(0.)
+            }
+        };
+        let negative_scale = if t < 1e-6 {
+            2e6_f64.mul_add(t, 1.)
+        } else {
+            5e6_f64.mul_add(t.min(2e-6) - 1e-6, 3.)
+        };
+        let pulse = if t <= 0.5e-6 {
+            4.
+        } else if t < 0.6e-6 {
+            508e7_f64.mul_add(t - 0.5e-6, 4.)
+        } else if t < 2.6e-6 {
+            512.
+        } else if t < 2.7e-6 {
+            508e7_f64.mul_add(2.7e-6 - t, 4.)
+        } else {
+            4.
+        };
+        let expected = [
+            triangle(2e-6, 6.),
+            -2. * (2e6 * t).clamp(1., 2.),
+            triangle(1e-6, 1.),
+            triangle(3e-6, 6.),
+            1e6_f64.mul_add(t.min(1e-6), 2.),
+            negative_scale,
+            8.,
+            0.,
+            2.,
+            pulse,
+            triangle(32e-9, 1.),
+            triangle(2e-6, 6.),
+        ];
+        for (index, (&actual, expected)) in row[1..].iter().zip(expected).enumerate() {
+            near(actual, expected).with_context(|| format!("scaled waveform {index}, time {t}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_pwl_scaling_rejects_only_unrepresentable_coordinates() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for card in [
+        "V1 a 0 PWL TIME_SCALE_FACTOR=0 (0 0 1u 1)",
+        "V1 a 0 PWL TIME_SCALE_FACTOR=-1 (0 0 1u 1)",
+        "V1 a 0 PWL (1u 0 0 1)",
+        "V1 a 0 PWL TIME_SCALE_FACTOR={unbound} (0 0 1u 1)",
+    ] {
+        fs::write(&root, format!("title\n{card}\n.end\n"))?;
+        assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
+    }
+    Ok(())
+}
