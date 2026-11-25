@@ -8,7 +8,7 @@ use crate::{
     MappedNormalization, NormalizationPass,
     lexical::{self, Edit},
     linked_source::RootKind,
-    model_card::{ModelCard, ModelParameter, parse_spice_constant},
+    model_card::{ModelCard, parse_parameter_fields, parse_spice_constant},
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -193,19 +193,21 @@ fn parameter(card: &ModelCard, name: &str) -> Option<String> {
         .and_then(|p| p.expression.clone())
 }
 
-fn set_parameter(card: &mut ModelCard, name: &str, expression: &str) {
+fn set_parameter(card: &mut ModelCard, name: &str, expression: &str) -> Result<()> {
+    // These are newly emitted fields; their spans describe the generated
+    // assignment, not a position in the original source declaration.
+    let generated = parse_parameter_fields(&format!("{name}={expression}"), &[])?;
     card.parameters
         .retain(|p| !p.name.eq_ignore_ascii_case(name));
-    card.parameters.push(ModelParameter {
-        name: name.to_owned(),
-        expression: Some(expression.to_owned()),
-    });
+    card.parameters.extend(generated);
+    Ok(())
 }
 
-fn default_parameter(card: &mut ModelCard, name: &str, expression: &str) {
+fn default_parameter(card: &mut ModelCard, name: &str, expression: &str) -> Result<()> {
     if parameter(card, name).is_none() {
-        set_parameter(card, name, expression);
+        set_parameter(card, name, expression)?;
     }
+    Ok(())
 }
 
 fn rename_parameter(card: &mut ModelCard, from: &str, to: &str) {
@@ -265,7 +267,7 @@ impl SwitchLaw {
         }))
     }
 
-    fn lower_model(self, card: &mut ModelCard) {
+    fn lower_model(self, card: &mut ModelCard) -> Result<()> {
         match self {
             Self::ThresholdVoltage | Self::ThresholdCurrent => {
                 let (native, threshold, hysteresis) = if matches!(self, Self::ThresholdVoltage) {
@@ -280,7 +282,7 @@ impl SwitchLaw {
                     ("ron", "1"),
                     ("roff", "1e12"),
                 ] {
-                    default_parameter(card, name, value);
+                    default_parameter(card, name, value)?;
                 }
             }
             Self::ContinuousVoltage | Self::ContinuousCurrent => {
@@ -305,13 +307,14 @@ impl SwitchLaw {
                     ("r_off", "1e6"),
                     ("log", "true"),
                 ] {
-                    default_parameter(card, name, value);
+                    default_parameter(card, name, value)?;
                 }
                 if matches!(self, Self::ContinuousCurrent) {
-                    set_parameter(card, "limit", "true");
+                    set_parameter(card, "limit", "true")?;
                 }
             }
         }
+        Ok(())
     }
 
     fn lower_instance(self, fields: &[&str], functions: &mut Functions) -> Result<Option<String>> {
@@ -358,13 +361,13 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
     let Some(name) = fields.get(index) else {
         return Ok(text.to_owned());
     };
-    let Some(line) = functions
+    let Some(model_line) = functions
         .scopes
         .find_model(functions.scope, &name.to_ascii_lowercase())?
     else {
         return Ok(text.to_owned());
     };
-    let model = functions.scopes.model(line)?;
+    let model = functions.scopes.model(model_line)?;
     let Some(law) = SwitchLaw::from_model(&model)? else {
         return Ok(text.to_owned());
     };
@@ -428,12 +431,12 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
             match level {
                 5.0 => bail!("PSpice MOS level 5 requires an EKV physical kernel"),
                 6.0 | 7.0 => {
-                    set_parameter(&mut card, "level", "8");
-                    set_parameter(&mut card, "version", "3.2.4");
+                    set_parameter(&mut card, "level", "8")?;
+                    set_parameter(&mut card, "version", "3.2.4")?;
                 }
                 8.0 => {
-                    set_parameter(&mut card, "level", "14");
-                    set_parameter(&mut card, "version", "4.5.0");
+                    set_parameter(&mut card, "level", "14")?;
+                    set_parameter(&mut card, "version", "4.5.0")?;
                 }
                 _ => {}
             }
@@ -443,11 +446,11 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
     }
     if family == "lpnp" {
         "PNP".clone_into(&mut card.family);
-        set_parameter(&mut card, "level", "1");
-        set_parameter(&mut card, "subs", "-1");
+        set_parameter(&mut card, "level", "1")?;
+        set_parameter(&mut card, "subs", "-1")?;
     }
     if let Some(switch) = SwitchLaw::from_model(&card)? {
-        switch.lower_model(&mut card);
+        switch.lower_model(&mut card)?;
     }
     let mut output = format!(".model {} {}(", card.name, card.family);
     for (index, p) in card.parameters.iter().enumerate() {
