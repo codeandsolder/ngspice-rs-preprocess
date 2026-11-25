@@ -2136,6 +2136,17 @@ fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<St
             offset = offset.saturating_add(1);
             continue;
         }
+        if !quote
+            && (expression || brace_depth > 0)
+            && character == '='
+            && !matches!(
+                offset.checked_sub(1).and_then(|index| bytes.get(index)),
+                Some(b'=' | b'!' | b'<' | b'>')
+            )
+            && bytes.get(offset + 1) != Some(&b'=')
+        {
+            output.push('=');
+        }
         if !quote && character == '~' {
             output.push('!');
             offset = offset.saturating_add(1);
