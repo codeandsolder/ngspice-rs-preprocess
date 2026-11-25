@@ -1,3 +1,5 @@
+mod prepared_diode;
+
 use anyhow::{Context, Result, ensure};
 use ngspice_rs_preprocess::{Cancellation, InputFormat, Options, Request, SourceInput, prepare};
 use std::{fs, path::Path, process::Command};
@@ -55,6 +57,10 @@ fn run_case(fixtures: &Path, name: &str, outcome: &str, abs: f64, rel: f64) -> R
         return Ok(());
     }
     let bundle = result?;
+    if name == "diode-temp" {
+        return measured_scoped_diode_temperatures(&bundle, fixtures, abs, rel);
+    }
+
     let dir = tempfile::tempdir()?;
     for artifact in &bundle.companions {
         fs::write(dir.path().join(&artifact.filename), &artifact.bytes)?;
@@ -121,6 +127,73 @@ fn run_case(fixtures: &Path, name: &str, outcome: &str, abs: f64, rel: f64) -> R
         ensure!(
             (actual - expected).abs() <= rel.mul_add(expected.abs(), abs),
             "actual {actual}, expected {expected}"
+        );
+    }
+    Ok(())
+}
+
+fn measured_scoped_diode_temperatures(
+    bundle: &ngspice_rs_preprocess::PreparedBundle,
+    fixtures: &Path,
+    abs: f64,
+    rel: f64,
+) -> Result<()> {
+    use model_kernel_diode::{Instance, MODEL_FAMILY, compile_simetrix};
+    let source = prepared_diode::linked_library(bundle)?;
+    let topology = source.instantiate(Default::default())?;
+    let mut currents = Vec::new();
+    for frame in topology.frames.iter().skip(1) {
+        let model = source
+            .models
+            .iter()
+            .find(|model| {
+                model.scope == frame.declaration
+                    && model.card.family.eq_ignore_ascii_case(MODEL_FAMILY)
+            })
+            .context("missing scoped level-1 diode")?;
+        let overrides = frame
+            .overrides
+            .iter()
+            .map(|(name, value)| (frame.declaration, name.as_str(), *value))
+            .collect::<Vec<_>>();
+        let values = model
+            .card
+            .parameters
+            .iter()
+            .map(|p| {
+                Ok((
+                    p.name.as_str(),
+                    source.evaluate_scalar(
+                        model.scope,
+                        p.expression.as_deref().context("missing value")?,
+                        &overrides,
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let diode = compile_simetrix(values)?.bind(Instance {
+            analysis_temperature: 358.15,
+            ..Instance::default()
+        })?;
+        currents.push(-diode.evaluate(0.65)?.current);
+    }
+    let csv = fs::read_to_string(fixtures.join("diode-temp.csv"))?;
+    let expected = csv
+        .lines()
+        .nth(1)
+        .context("missing diode temperature reference")?
+        .split(',')
+        .skip(1)
+        .map(str::parse::<f64>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        currents.len() == expected.len(),
+        "diode temperature reference shape"
+    );
+    for (actual, expected) in currents.into_iter().zip(expected) {
+        ensure!(
+            (actual - expected).abs() <= rel.mul_add(expected.abs(), abs),
+            "diode temperature: {actual} vs {expected}"
         );
     }
     Ok(())
