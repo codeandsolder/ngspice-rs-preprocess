@@ -340,12 +340,12 @@ fn relative_pwl_is_cumulative_and_preserves_value_signs() -> Result<()> {
         };
         let expected = if *time <= 0.001 {
             0.
-        } else if *time < 0.001001 {
+        } else if *time < 0.001_001 {
             (*time - 0.001) / 1e-6
-        } else if *time < 0.003001 {
+        } else if *time < 0.003_001 {
             1.
-        } else if *time < 0.003002 {
-            (0.003002 - *time) / 1e-6
+        } else if *time < 0.003_002 {
+            (0.003_002 - *time) / 1e-6
         } else {
             0.
         };
