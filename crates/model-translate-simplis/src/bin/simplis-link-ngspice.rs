@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use model_preprocess_simplis::{
     LibrarySimulator, ParsedLibrary, SubcircuitCatalog, preprocess_netlist_linked,
 };
-use model_translate_simplis::{translate_simplis_deck, translate_simplis_expanded_library};
+use model_translate_simplis::{
+    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_expanded_library,
+};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -164,7 +166,10 @@ fn main() -> Result<()> {
         definitions = definitions.saturating_add(added);
     }
 
-    let linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
+    let mut linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
+    if simulator == LibrarySimulator::Simetrix {
+        lower_simetrix_linked_runtime(&mut linked)?;
+    }
     let translated_root = translate_simplis_deck(&linked.root_bytes)?;
     let output_dir = output_root
         .parent()

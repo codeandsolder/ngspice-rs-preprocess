@@ -1,4 +1,5 @@
 mod logical_ports;
+mod simetrix_runtime;
 use super::{
     AndSpec, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, Point, Translation,
     TranslationKind, emit_digital_buffer, emit_logic_and, indexed_points, integer_parameter,
@@ -14,6 +15,7 @@ pub use logical_ports::{
     OccurrenceFamilyBoundary, expand_logical_alb_source, specialize_family_occurrences,
 };
 use serde::Serialize;
+pub use simetrix_runtime::lower_simetrix_linked_runtime;
 use std::fmt::Write as _;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2368,10 +2370,15 @@ fn lower_simetrix_table_expression(input: &str, open: usize) -> Result<(String, 
 }
 
 fn lower_simetrix_behavioral_expression(input: &str) -> Result<String> {
+    lower_simetrix_expression_regions(input, true)
+}
+
+fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<String> {
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
     let mut offset = 0usize;
     let mut quote = false;
+    let mut brace_depth = 0usize;
     while offset < bytes.len() {
         if bytes[offset] == b'\'' {
             quote = !quote;
@@ -2397,7 +2404,16 @@ fn lower_simetrix_behavioral_expression(input: &str) -> Result<String> {
                 open += 1;
             }
             let name = &input[name_start..name_end];
-            if name.eq_ignore_ascii_case("TEMP")
+            if bytes.get(open) == Some(&b'(')
+                && (name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I"))
+            {
+                let close = matching_behavioral_parenthesis(input, open)?;
+                output.push_str(&input[name_start..=close]);
+                offset = close + 1;
+                continue;
+            }
+            if (expression || brace_depth > 0)
+                && name.eq_ignore_ascii_case("TEMP")
                 && bytes.get(open) != Some(&b'(')
                 && bytes.get(open) != Some(&b'=')
             {
@@ -2440,6 +2456,13 @@ fn lower_simetrix_behavioral_expression(input: &str) -> Result<String> {
             .chars()
             .next()
             .context("behavioral expression character boundary")?;
+        if !quote {
+            match character {
+                '{' => brace_depth = brace_depth.saturating_add(1),
+                '}' => brace_depth = brace_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
         if !quote && matches!(character, '&' | '|') {
             let byte = character as u8;
             if bytes.get(offset.saturating_add(1)) == Some(&byte) {
@@ -2507,7 +2530,15 @@ fn lower_simetrix_behavioral_statement(statement: &str) -> Result<String> {
     if !runtime_parameter && !runtime_function && !runtime_device {
         return Ok(statement.to_owned());
     }
-    lower_simetrix_behavioral_expression(statement)
+    if let Some((prefix, expression)) = simetrix_runtime::behavioral_rhs(statement) {
+        return Ok(format!(
+            "{prefix}{}",
+            lower_simetrix_behavioral_expression(expression)?
+        ));
+    }
+    // Only explicit expression regions may contain a temperature symbol on
+    // ordinary device cards: terminals and model names are electrical names.
+    lower_simetrix_expression_regions(statement, false)
 }
 
 fn translate_device_voltage_controlled_source(
@@ -5658,12 +5689,25 @@ fn simple_assignment_span(statement: &str, name: &str) -> Option<(usize, usize, 
             cursor += 1;
         }
         let value_start = cursor;
-        while upper
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b')' | b','))
-        {
-            cursor += 1;
+        if upper.as_bytes().get(cursor) == Some(&b'{') {
+            cursor = matching_behavioral_delimiter(
+                statement,
+                cursor,
+                '{',
+                '}',
+                "assignment brace underflow",
+                "unterminated assignment expression",
+            )
+            .ok()?
+                + 1;
+        } else {
+            while upper
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b')' | b','))
+            {
+                cursor += 1;
+            }
         }
         if cursor == value_start {
             return None;

@@ -1,0 +1,11 @@
+* Nominal statistical expressions
+.param g1={GAUSS(1)}
+.param g2={GAUSS(2)}
+.param g0={GAUSS(0)}
+.param gneg={GAUSS(-3)}
+V1 x 0 {g1}
+V2 y 0 {g2}
+V3 z 0 {g0}
+V4 a 0 {gneg}
+.op
+.end

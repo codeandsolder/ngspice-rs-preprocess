@@ -64,6 +64,23 @@ silently referring to the original working directory. Experimental ALB
 compilation remains an explicit specialized workflow, not an automatic
 fallback from the unified entry point.
 
+SIMetrix decks preserve runtime argument binding, including implicit formals,
+source-order actuals, callee defaults and isolated local scopes. Direct and
+nested electrical model dependencies are resolved against declared catalog
+models, including optional substrate/bulk terminals and passive model/value
+forms; ambiguous model positions are rejected.
+
+Nominal SIMetrix preparation lowers PI, E and the historical BOLTZ/ECHARGE
+constants, stable LNCOSH and lazy nominal GAUSS(x) (always 1). Predefined
+parameters cannot be redeclared and electrical node names are not rewritten
+as parameter symbols. Static TEMP binds to the single declared analysis
+temperature (default 27 °C); behavioral TEMP becomes native live temperature.
+Model T_ABS on diode, BJT and resistor cards is moved to matching device
+instances in model scope, preserving explicit instance TEMP precedence.
+A different nominal temperature requires preparing the source again.
+Statistical analyses and conflicting or multiple analysis temperatures
+are rejected rather than approximated by the nominal translation.
+
 Native linking preserves physical source lines, comments, continuations,
 scope boundaries and the root title. Static `.include`, `.inc` and named
 `.lib path section` resources are resolved relative to their containing

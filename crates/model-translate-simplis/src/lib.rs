@@ -24,8 +24,8 @@ mod whole;
 pub use whole::{
     AlbOutputProducer, FamilySpecialization, LogicalAlbBoundary, LogicalAlbExpansion,
     OccurrenceFamilyBoundary, SplitDeckTranslation, WholeModelTranslation,
-    expand_logical_alb_source, specialize_family_occurrences, translate_simplis_deck,
-    translate_simplis_deck_split, translate_simplis_expanded_library,
+    expand_logical_alb_source, lower_simetrix_linked_runtime, specialize_family_occurrences,
+    translate_simplis_deck, translate_simplis_deck_split, translate_simplis_expanded_library,
 };
 
 /// One numeric point on a piecewise-linear characteristic.

@@ -11,10 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 mod hierarchy;
 pub use hierarchy::{
     LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
-    ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, linked_library_filename,
-    parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
-    preprocess_netlist, preprocess_netlist_file, preprocess_netlist_linked,
-    preprocess_netlist_linked_file, project_source, source_include_target,
+    ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, active_statement_prefix,
+    linked_library_filename, parse_init_target_path, parse_library, parse_library_file,
+    parse_library_for_simulator, preprocess_netlist, preprocess_netlist_file,
+    preprocess_netlist_linked, preprocess_netlist_linked_file, project_source,
+    source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
@@ -1531,7 +1532,35 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn parameter_assignments(input: &str) -> Result<Vec<(&str, &str)>> {
+/// Historical fixed nominal `SIMetrix` constants, as decimal source literals.
+#[must_use = "the result determines whether the source symbol is a fixed constant"]
+pub fn simetrix_constant(name: &str) -> Option<&'static str> {
+    match name.to_ascii_uppercase().as_str() {
+        "PI" => Some("3.141592653589793"),
+        "E" => Some("2.718281828459045"),
+        "BOLTZ" => Some("1.3806226e-23"),
+        "ECHARGE" => Some("1.6021918e-19"),
+        _ => None,
+    }
+}
+
+/// Reject attempts to bind a predefined nominal parameter as an ordinary one.
+///
+/// # Errors
+/// The name is reserved by the source simulator.
+pub fn validate_simetrix_parameter_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        simetrix_constant(name).is_none() && !name.eq_ignore_ascii_case("TEMP"),
+        "SIMetrix predefined parameter {name} has already been defined"
+    );
+    Ok(())
+}
+
+/// Parse ordered parameter assignments without evaluating their expressions.
+///
+/// # Errors
+/// Rejects malformed names, missing values and unbalanced expression delimiters.
+pub fn parameter_assignments(input: &str) -> Result<Vec<(&str, &str)>> {
     let bytes = input.as_bytes();
     let mut offset = 0usize;
     let mut assignments = Vec::new();

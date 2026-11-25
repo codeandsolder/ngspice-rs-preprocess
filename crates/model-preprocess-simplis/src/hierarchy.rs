@@ -1089,7 +1089,9 @@ struct Pending {
     local_key: Option<String>,
 }
 
-fn active_statement_prefix(statement: &str) -> &str {
+/// Portion of a logical statement preceding an unquoted semicolon comment.
+#[must_use = "the active prefix excludes non-executable source text"]
+pub fn active_statement_prefix(statement: &str) -> &str {
     let mut quote = false;
     let mut brace_depth = 0usize;
     for (index, character) in statement.char_indices() {
@@ -2279,18 +2281,114 @@ fn assign_local_source(definitions: &mut [Definition], source_id: &str, source_n
     }
 }
 
-fn direct_device_models(root: &str) -> BTreeSet<String> {
-    root.lines()
-        .filter_map(|statement| {
-            let fields = statement.split_whitespace().collect::<Vec<_>>();
-            let name = fields.first()?;
-            name.as_bytes()
-                .first()
-                .is_some_and(|byte| matches!(byte.to_ascii_uppercase(), b'D'))
-                .then(|| fields.get(3).map(|model| model.to_ascii_uppercase()))
-                .flatten()
-        })
-        .collect()
+struct ModelNamespace<'a> {
+    globals: &'a BTreeSet<String>,
+    local: &'a BTreeSet<String>,
+    external: &'a SubcircuitCatalog,
+}
+
+impl ModelNamespace<'_> {
+    fn defined(&self, name: &str) -> bool {
+        let name = name.to_ascii_uppercase();
+        self.globals.contains(&name) || self.local.contains(&name)
+    }
+
+    fn known(&self, name: &str) -> Result<bool> {
+        Ok(self.defined(name) || self.external.source_for_model(name)?.is_some())
+    }
+
+    fn select<'a>(
+        &self,
+        first: Option<&'a str>,
+        second: Option<&'a str>,
+        family: &str,
+        statement: &str,
+    ) -> Result<Option<&'a str>> {
+        let first = match first {
+            Some(name) if self.known(name)? => Some(name),
+            _ => None,
+        };
+        let second = match second {
+            Some(name) if self.known(name)? => Some(name),
+            _ => None,
+        };
+        match (first, second) {
+            (Some(first), Some(second)) => bail!(
+                "ambiguous {family} model position in {statement}: both {first} and {second} name available models"
+            ),
+            (Some(name), None) | (None, Some(name)) => Ok(Some(name)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn device_model<'a>(&self, statement: &'a str) -> Result<Option<&'a str>> {
+        let fields = statement.split_whitespace().collect::<Vec<_>>();
+        let Some(device) = fields.first().and_then(|name| name.as_bytes().first()) else {
+            return Ok(None);
+        };
+        let field = |index| fields.get(index).copied();
+        match device.to_ascii_uppercase() {
+            b'D' => Ok(field(3)),
+            // Passive devices may place the model before or after the value.
+            b'R' | b'C' | b'L' => self.select(field(3), field(4), "passive", statement),
+            b'J' | b'Z' | b'U' | b'W' => Ok(field(4)),
+            b'S' | b'O' => Ok(field(5)),
+            // Resolve optional substrate/bulk terminals against actual model
+            // names, not a guess based on node spelling. Unknown models stay
+            // unchanged for the simulator's explicit diagnostic.
+            b'M' => self.select(field(4), field(5), "MOS", statement),
+            b'Q' => self.select(field(4), field(5), "BJT", statement),
+            _ => Ok(None),
+        }
+    }
+}
+
+fn direct_device_models(
+    netlist: &str,
+    globals: &BTreeSet<String>,
+    external: &SubcircuitCatalog,
+) -> Result<BTreeSet<String>> {
+    // The linker emits flattened subcircuit definitions. Collect the local
+    // declarations first so forward references do not pull unrelated global
+    // catalog cards with the same name.
+    let mut scopes = vec![BTreeSet::new()];
+    let mut scope = 0;
+    let mut statements = Vec::new();
+    let mut control = false;
+    for statement in netlist.lines() {
+        if is_directive(statement, "CONTROL") {
+            control = true;
+        } else if is_directive(statement, "ENDC") {
+            control = false;
+        } else if control {
+            continue;
+        } else if is_directive(statement, "SUBCKT") {
+            scopes.push(BTreeSet::new());
+            scope = scopes.len() - 1;
+        } else if is_directive(statement, "ENDS") {
+            scope = 0;
+        } else if is_directive(statement, "MODEL") {
+            if let Some(name) = statement.split_whitespace().nth(1) {
+                scopes[scope].insert(name.to_ascii_uppercase());
+            }
+        } else {
+            statements.push((scope, statement));
+        }
+    }
+    let mut found = BTreeSet::new();
+    for (scope, statement) in statements {
+        let namespace = ModelNamespace {
+            globals,
+            local: &scopes[scope],
+            external,
+        };
+        if let Some(model) = namespace.device_model(statement)?
+            && !namespace.defined(model)
+        {
+            found.insert(model.to_ascii_uppercase());
+        }
+    }
+    Ok(found)
 }
 
 fn validate_linked_model_namespace(
@@ -2394,6 +2492,56 @@ fn link_root_statements(
     Ok((root_output, root_units, end_statement))
 }
 
+fn include_referenced_device_model_libraries(
+    root_output: &str,
+    builders: &mut BTreeMap<String, LinkedLibraryBuilder>,
+    external: &SubcircuitCatalog,
+) -> Result<()> {
+    // Device-model dependencies can appear directly in a root deck or
+    // inside a specialized subcircuit supplied by another vendor library.
+    // Keep models already supplied in the root or the source of a linked
+    // subcircuit. In particular, two independent libraries with conflicting
+    // global model cards must reach the namespace validator, not be reported
+    // as an ambiguous unrelated catalog lookup.
+    let defined_models = root_output
+        .lines()
+        .chain(
+            builders
+                .values()
+                .flat_map(|builder| builder.support_lines.iter().map(String::as_str)),
+        )
+        .filter_map(|statement| {
+            let mut fields = statement.split_whitespace();
+            if !fields.next()?.eq_ignore_ascii_case(".MODEL") {
+                return None;
+            }
+            fields.next().map(str::to_ascii_uppercase)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut models = BTreeSet::new();
+    for netlist in
+        std::iter::once(root_output).chain(builders.values().map(|builder| builder.output.as_str()))
+    {
+        models.extend(direct_device_models(netlist, &defined_models, external)?);
+    }
+    for model in models {
+        if defined_models.contains(&model) {
+            continue;
+        }
+        let Some(source_id) = external.source_for_model(&model)? else {
+            continue;
+        };
+        let source_name = external
+            .source_metadata(&source_id)
+            .with_context(|| format!("missing SIMPLIS source metadata {source_id}"))?
+            .source_name
+            .clone();
+        let builder = builders.entry(source_id.clone()).or_default();
+        initialize_linked_builder(builder, &source_id, &source_name, external)?;
+    }
+    Ok(())
+}
+
 /// Admit the root source before generating independently linkable libraries.
 ///
 /// # Errors
@@ -2459,18 +2607,7 @@ pub fn preprocess_netlist_linked(
             &mut generated_subcircuits,
         )?;
     }
-    for model in direct_device_models(&root_output) {
-        let Some(source_id) = external.source_for_model(&model)? else {
-            continue;
-        };
-        let source_name = external
-            .source_metadata(&source_id)
-            .with_context(|| format!("missing SIMPLIS source metadata {source_id}"))?
-            .source_name
-            .clone();
-        let builder = builders.entry(source_id.clone()).or_default();
-        initialize_linked_builder(builder, &source_id, &source_name, external)?;
-    }
+    include_referenced_device_model_libraries(&root_output, &mut builders, external)?;
 
     validate_linked_model_namespace(&builders)?;
 
@@ -2989,6 +3126,122 @@ Q1 1 2 3 ALT
         assert!(generated.contains(".model BASE NPN IS=1e-15 BF=100"));
         assert!(generated.contains(".model ALT NPN IS=1e-15 BF=100"));
         assert!(generated.contains("Q1 1 2 3 ALT"));
+        Ok(())
+    }
+
+    #[test]
+    fn links_model_cards_for_all_spice_device_families() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        let cases = [
+            ("R1 a b 1k RECT", ".model RECT R (RSH=2)"),
+            ("C1 a b CEXT", ".model CEXT C (CJ=1e-12)"),
+            ("L1 a b LEXT", ".model LEXT L (CPL=0)"),
+            ("D1 a b DEXT", ".model DEXT D (IS=1e-14)"),
+            (
+                "Q1 a b c QALIAS 2 OFF\nQ2 a b c 0 QALIAS",
+                ".model QB PNP (IS=1e-15 BF=100)\n.alias QALIAS QB PNP",
+            ),
+            (
+                "M1 a b c d MEXT",
+                ".model MEXT NMOS (LEVEL=1 KP=1e-3 VTO=1)",
+            ),
+            ("M2 a b c VEXT", ".model VEXT VDMOS (VTO=2)"),
+            ("J1 a b c JEXT", ".model JEXT NJF (BETA=1e-4 VTO=-1)"),
+            ("Z1 a b c ZEXT", ".model ZEXT NMF (BETA=1e-4 VTO=-1)"),
+            (
+                "S1 a b c d SEXT",
+                ".model SEXT SW (RON=1 ROFF=1e6 VT=0.5 VH=0)",
+            ),
+            (
+                "W1 a b VSENSE WEXT",
+                ".model WEXT CSW (RON=1 ROFF=1e6 IT=0.5 IH=0)",
+            ),
+            ("U1 a b c UEXT", ".model UEXT URC (RPERL=1 CPERL=1e-12)"),
+            ("O1 a b c d OEXT", ".model OEXT LTRA (R=1 L=1u C=1p LEN=1)"),
+        ];
+        for (index, (_, card)) in cases.iter().enumerate() {
+            catalog.add_library_named(format!("model-{index}.lb"), card.as_bytes())?;
+        }
+        for (device, card) in cases {
+            let linked =
+                preprocess_netlist_linked(format!("{device}\n.end\n").as_bytes(), &catalog)?;
+            assert_eq!(linked.libraries.len(), 1, "{device}");
+            let library = linked
+                .libraries
+                .first()
+                .context("missing model dependency")?;
+            let generated = std::str::from_utf8(&library.bytes)?;
+            assert!(
+                generated.contains(card.lines().next().context("missing model card")?),
+                "{device}"
+            );
+            if device.contains("QALIAS") {
+                assert!(generated.contains(".model QALIAS PNP"));
+            }
+            assert!(std::str::from_utf8(&linked.root_bytes)?.contains(&library.filename));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_model_shadows_unrelated_catalog_card() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named("unrelated.lb", b".model LOCAL NPN IS=9e-12\n")?;
+        let linked = preprocess_netlist_linked(
+            b"X1 a b T\n.subckt T c e\nQ1 c c e LOCAL\n.model LOCAL NPN IS=1e-15\n.ends\n.end\n",
+            &catalog,
+        )?;
+        assert_eq!(linked.libraries.len(), 1);
+        assert!(
+            std::str::from_utf8(&linked.libraries[0].bytes)?.contains(".model LOCAL NPN IS=1e-15")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bjt_model_selection_uses_the_actual_model_namespace() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named(
+            "transistors.lb",
+            b".model THREE PNP IS=1e-15\n.model FOUR NPN IS=1e-15\n",
+        )?;
+        // Neither the substrate node's spelling nor an unrelated
+        // trailing node determines whether the BJT has three or four
+        // nodes. Both positions must be resolved against actual models.
+        let linked = preprocess_netlist_linked(
+            b"Q1 c b e THREE 2 OFF\nQ2 c b e substrate FOUR\n.end\n",
+            &catalog,
+        )?;
+        assert_eq!(linked.libraries.len(), 1);
+        let generated = std::str::from_utf8(&linked.libraries[0].bytes)?;
+        assert!(generated.contains(".model THREE PNP"));
+        assert!(generated.contains(".model FOUR NPN"));
+
+        // Both syntactic positions naming known model cards cannot be
+        // distinguished without guessing the author's meaning.
+        let result = preprocess_netlist_linked(b"Q1 c b e THREE FOUR\n.end\n", &catalog);
+        assert!(result.is_err_and(|err| err.to_string().contains("ambiguous BJT model position")));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_subcircuit_model_dependency_imports_external_model_library() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named(
+            "subcircuits.lb",
+            b".subckt DRIVER p n\nQ1 p n 0 0 VENDOR_PNP\n.ends DRIVER\n",
+        )?;
+        catalog.add_library_named("devices.lb", b".model VENDOR_PNP PNP IS=1e-15 BF=100\n")?;
+        let linked = preprocess_netlist_linked(b"X1 out input DRIVER\n.end\n", &catalog)?;
+        assert_eq!(linked.libraries.len(), 2);
+        let root = std::str::from_utf8(&linked.root_bytes)?;
+        for library in &linked.libraries {
+            assert!(root.contains(&library.filename));
+        }
+        assert!(linked.libraries.iter().any(|library| {
+            std::str::from_utf8(&library.bytes)
+                .is_ok_and(|text| text.contains(".model VENDOR_PNP PNP"))
+        }));
         Ok(())
     }
 

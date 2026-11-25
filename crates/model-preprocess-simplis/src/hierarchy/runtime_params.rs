@@ -8,7 +8,7 @@
 //! preserve the source binding, without evaluating electrical expressions.
 
 use super::{active_statement_prefix, logical_statements, lower_hex};
-use crate::{find_ascii_case_insensitive, parameter_assignments};
+use crate::{find_ascii_case_insensitive, parameter_assignments, validate_simetrix_parameter_name};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -210,12 +210,14 @@ impl RuntimeScope {
         let mut scope = Self::root(identity);
         let mut formal_names = BTreeSet::new();
         for (name, _) in &defaults {
+            validate_simetrix_parameter_name(name)?;
             if !formal_names.insert(name.to_ascii_uppercase()) {
                 bail!("duplicate subcircuit formal {name}");
             }
         }
         let mut implicit = BTreeSet::new();
         for (name, _) in &actuals {
+            validate_simetrix_parameter_name(name)?;
             let key = name.to_ascii_uppercase();
             if formal_names.insert(key.clone()) {
                 implicit.insert(key);
@@ -229,6 +231,7 @@ impl RuntimeScope {
         for statement in body {
             if let Some(tail) = param_tail(statement) {
                 for (name, _) in parameter_assignments(tail)? {
+                    validate_simetrix_parameter_name(name)?;
                     let key = name.to_ascii_uppercase();
                     if scope.names.contains_key(&key) {
                         bail!("subcircuit parameter {name} has already been defined");
@@ -442,15 +445,15 @@ mod tests {
     #[test]
     fn electrical_names_and_function_arguments_are_not_parameter_symbols() -> Result<()> {
         let (_, scope) = RuntimeScope::prepare(
-            b".subckt T p n\nB1 n 0 V=gain*V(p)+p+1e-9\n.ends\n",
+            b".subckt T p n\nB1 n 0 V=gain*V(p)+p+1k\n.ends\n",
             "scope",
-            "gain=3 p=9 e=2",
+            "gain=3 p=9 k=2",
         )?;
         let gain = scope.lookup("gain")?;
         let p = scope.lookup("p")?;
         assert_eq!(
-            scope.rewrite_statement("B1 n 0 V=gain*V(p)+p+1e-9")?,
-            format!("B1 n 0 V={gain}*V(p)+{p}+1e-9")
+            scope.rewrite_statement("B1 n 0 V=gain*V(p)+p+1k")?,
+            format!("B1 n 0 V={gain}*V(p)+{p}+1k")
         );
         assert_eq!(
             scope.rewrite_statement(".func f(p) {p*gain}")?,

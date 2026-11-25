@@ -9,7 +9,9 @@ use model_preprocess_simplis::{
     SubcircuitCatalog, parse_library_for_simulator, preprocess_netlist_linked, project_source,
     source_include_target,
 };
-use model_translate_simplis::{translate_simplis_deck, translate_simplis_expanded_library};
+use model_translate_simplis::{
+    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_expanded_library,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -272,7 +274,10 @@ fn linked(
     let root_sources = init.sources;
     let expanded_root = init.output;
     let Catalog { catalog, sources } = catalog(request, options, cancellation, session)?;
-    let linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
+    let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
+    if request.format == InputFormat::SimetrixDeck {
+        lower_simetrix_linked_runtime(&mut linked)?;
+    }
     let known = linked
         .libraries
         .iter()
