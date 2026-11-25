@@ -486,25 +486,7 @@ impl Model {
     }
 }
 
-/// Model preparation or runtime domain failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ModelError {
-    /// Invalid input value.
-    Invalid(&'static str),
-    /// Named, currently unsupported physical model feature.
-    Unsupported(&'static str),
-}
-
-impl std::fmt::Display for ModelError {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Invalid(name) => write!(fmt, "invalid VDMOS parameter or bias: {name}"),
-            Self::Unsupported(name) => write!(fmt, "unsupported VDMOS physics: {name}"),
-        }
-    }
-}
-
-impl std::error::Error for ModelError {}
+pub use model_kernel_api::ModelError;
 
 /// Validated, immutable model shared by independent device instances.
 #[derive(Clone, Copy, Debug)]

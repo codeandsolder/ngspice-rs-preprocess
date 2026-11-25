@@ -164,6 +164,13 @@ name = "model-kernel-api"
 version = "0.1.0"
 
 [[package]]
+name = "model-kernel-diode"
+version = "0.1.0"
+dependencies = [
+ "model-kernel-api",
+]
+
+[[package]]
 name = "model-kernel-vdmos"
 version = "0.1.0"
 dependencies = [

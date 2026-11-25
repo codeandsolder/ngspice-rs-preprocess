@@ -3,6 +3,7 @@ members = [
     "crates/model-alb-xspice-ffi",
     "crates/model-alb-experimental",
     "crates/model-kernel-api",
+    "crates/model-kernel-diode",
     "crates/model-kernel-vdmos",
     "crates/model-normalize-ngspice",
     "crates/model-preprocess-simplis",
@@ -13,6 +14,7 @@ members = [
 ]
 default-members = [
     "crates/model-kernel-api",
+    "crates/model-kernel-diode",
     "crates/model-kernel-vdmos",
     "crates/model-normalize-ngspice",
     "crates/model-preprocess-simplis",
