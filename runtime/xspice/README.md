@@ -99,6 +99,19 @@ runtime/xspice/smoke-stateful-compiled.sh MODEL.cm BUILD_DIR/debug SCRATCH_ROOT
 runtime/xspice/smoke-logical-alb-auto.sh MODEL.cm BUILD_DIR/debug SCRATCH_ROOT
 ```
 
+Run the complete opt-in native regression suite against a stateful
+code-model library with:
+
+```sh
+runtime/xspice/test.sh MODEL.cm BUILD_DIR/debug SCRATCH_ROOT
+```
+
+The runner reports every independent suite and returns a nonzero exit
+status on any failure. Append one or more suite names (for example,
+`smoke-stateful-compiled` or `smoke-generated`) to reproduce just those
+cases. The default list avoids replaying the original-model tests that
+are already included by the automatic physical ALB suite.
+
 Other smoke scripts cover source-derived timing/qualifier boundaries,
 UNKNOWN and release history, physical ADC/DAC domain and clamp
 behavior, dynamic loading, directional drive, signed parameters,
