@@ -65,27 +65,27 @@ impl StatefulProgram {
 }
 
 impl StatefulPhysicalEventEngine {
-    #[must_use]
+    #[must_use = "the input width determines the required input vector size"]
     pub const fn input_width(&self) -> usize {
         self.logical.input_width()
     }
 
-    #[must_use]
+    #[must_use = "the output width determines the required output vector size"]
     pub const fn output_width(&self) -> usize {
         self.driven.len()
     }
 
-    #[must_use]
+    #[must_use = "the returned bits describe the currently driven outputs"]
     pub fn output(&self) -> &[AlbDigitalBit] {
         &self.driven
     }
 
-    #[must_use]
+    #[must_use = "the returned words describe the requested register state"]
     pub fn register_words(&self, name: &str) -> Option<&[u32]> {
         self.logical.register_words(name)
     }
 
-    #[must_use]
+    #[must_use = "the next due time determines when the simulator must evaluate again"]
     pub fn next_due_time(&self) -> Option<f64> {
         self.logical
             .next_due_time()
