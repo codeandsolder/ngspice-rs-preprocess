@@ -970,3 +970,68 @@ fn source_parasitics_without_equivalent_observations_are_diagnostic() -> Result<
     }
     Ok(())
 }
+
+#[test]
+fn exponential_sources_preserve_independent_edges_and_source_bias() -> Result<()> {
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use ngspice_rs_preprocess::waveform::Forcing;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root, b"title\nV1 a 0 EXP(1 3 1u 2u 5u 3u)\nI1 0 b EXP(1 3 1u 2u 5u 3u)\nR1 b 0 1\nV2 c 0 DC 7 EXP(1 3 -1u 2u 5u 3u)\nV3 d 0 EXP(1 3 5u 2u 1u 3u)\nV4 e 0 EXP(1 3 0 2u 5u 3u)\nV5 f 0 EXP(1 3 -2u 2u -1u 3u)\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    assert_eq!(bundle.waveforms.len(), 4);
+    for (declaration, expected) in bundle.waveforms.iter().zip([
+        (7., 1.786938680574733, -1e-6, 5e-6),
+        (1., 1., 5e-6, 1e-6),
+        (1., 1., 0., 5e-6),
+        (1.6973037388046939, 1.6973037388046939, -2e-6, -1e-6),
+    ]) {
+        let waveform = declaration.resolve(parse_spice_constant)?;
+        let Forcing::Exponential(exp) = waveform.forcing else {
+            anyhow::bail!("expected exponential forcing");
+        };
+        let (dc, startup, rise, fall) = expected;
+        near(waveform.dc, dc)?;
+        near(waveform.startup, startup)?;
+        near(exp.rise_delay, rise)?;
+        near(exp.fall_delay, fall)?;
+        near(exp.rise_tau, 2e-6)?;
+        near(exp.fall_tau, 3e-6)?;
+        let decoded: ngspice_rs_preprocess::waveform::PreparedWaveform =
+            serde_json::from_slice(&serde_json::to_vec(declaration)?)?;
+        assert_eq!(&decoded, declaration);
+    }
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\ntran 20n 10u 0 20n\nwrdata exp.dat v(a) v(b)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    for row in data(&dir.path().join("exp.dat"))? {
+        let t = row[0];
+        let rise = -(-(t - 1e-6).max(0.) / 2e-6).exp_m1();
+        let fall = -(-(t - 5e-6).max(0.) / 3e-6).exp_m1();
+        let expected = 2_f64.mul_add(rise - fall, 1.);
+        near(row[1], expected)?;
+        near(row[2], expected)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exp_analysis_dependent_defaults_require_binding_instead_of_native_substitution() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for card in [
+        "V1 a 0 EXP(1 3)",
+        "V1 a 0 EXP(1 3 1u 0 5u 3u)",
+        "V1 a 0 EXP(1 3 1u 2u 0 3u)",
+        "V1 a 0 EXP(1 3 1u 2u 5u 0)",
+    ] {
+        fs::write(&root, format!("title\n{card}\n.end\n"))?;
+        assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
+    }
+    Ok(())
+}

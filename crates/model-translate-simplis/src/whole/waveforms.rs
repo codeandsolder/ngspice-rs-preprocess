@@ -279,6 +279,7 @@ impl Parsed {
 
     fn strict_native_reference(resolved: &ResolvedWaveform) -> bool {
         match &resolved.forcing {
+            Forcing::Exponential(exp) => exp.native_reference().is_some(),
             Forcing::PiecewiseLinear { knots, repeat } => {
                 NativePwlReference::build(knots, *repeat, resolved.dc)
                     .is_ok_and(|reference| reference.is_continuous())
@@ -318,6 +319,14 @@ impl Parsed {
             self.name, self.positive, self.negative, resolved.dc
         )?;
         match &resolved.forcing {
+            Forcing::Exponential(exp) => {
+                write!(
+                    output,
+                    " {}",
+                    exp.native_reference()
+                        .context("exponential source requires typed execution")?
+                )?;
+            }
             Forcing::PiecewiseLinear { knots, repeat } => {
                 NativePwlReference::build(knots, *repeat, resolved.dc)?.write(&mut output)?;
             }

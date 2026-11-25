@@ -5,8 +5,8 @@ use crate::{
     model_card::parse_spice_constant,
     source_identifiers,
     waveform::{
-        LtspicePoint, LtspicePulse, LtspicePwl, LtspiceSine, LtspiceWaveform, PreparedWaveform,
-        WaveformSpec,
+        LtspiceExp, LtspicePoint, LtspicePulse, LtspicePwl, LtspiceSine, LtspiceWaveform,
+        PreparedWaveform, WaveformSpec,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -147,6 +147,7 @@ fn positional(text: &[u8], fields: &[Span], index: usize) -> Result<Option<Strin
 
 #[derive(Clone, Copy)]
 enum Shape {
+    Exp,
     Pulse,
     Pwl,
     Sine,
@@ -155,7 +156,8 @@ enum Shape {
 impl Shape {
     fn identify(field: &[u8]) -> Option<(Self, usize)> {
         for (keyword, shape) in [
-            (b"pulse".as_slice(), Self::Pulse),
+            (b"exp".as_slice(), Self::Exp),
+            (b"pulse", Self::Pulse),
             (b"pwl", Self::Pwl),
             (b"sine", Self::Sine),
             (b"sin", Self::Sine),
@@ -173,6 +175,20 @@ impl Shape {
 
     fn positional(self, text: &[u8], fields: &[Span]) -> Result<LtspiceWaveform> {
         match self {
+            Self::Exp => {
+                ensure!(
+                    fields.len() == 6,
+                    "LTspice EXP omitted timing requires typed analysis binding"
+                );
+                Ok(LtspiceWaveform::Exp(LtspiceExp {
+                    initial: scalar(text, &fields[0])?,
+                    pulsed: scalar(text, &fields[1])?,
+                    rise_delay: scalar(text, &fields[2])?,
+                    rise_tau: scalar(text, &fields[3])?,
+                    fall_delay: scalar(text, &fields[4])?,
+                    fall_tau: scalar(text, &fields[5])?,
+                }))
+            }
             Self::Pulse => {
                 ensure!(
                     (5..=8).contains(&fields.len()),

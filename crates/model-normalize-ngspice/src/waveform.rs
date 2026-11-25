@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 mod ltspice;
 mod native;
-pub use ltspice::{LtspicePoint, LtspicePulse, LtspicePwl, LtspiceSine, LtspiceWaveform};
+pub use ltspice::{
+    LtspiceExp, LtspicePoint, LtspicePulse, LtspicePwl, LtspiceSine, LtspiceWaveform,
+};
 pub use native::NativePwlReference;
 
 /// Scalar expressions use the emitted circuit's parameter grammar.
@@ -137,11 +139,53 @@ pub struct RepeatLimit {
     pub value: f64,
 }
 
+/// Two independent exponential transitions. Delays are signed absolute
+/// times, so a falling transition may precede a rising transition.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExponentialForcing {
+    pub initial: f64,
+    pub pulsed: f64,
+    pub rise_delay: f64,
+    pub rise_tau: f64,
+    pub fall_delay: f64,
+    pub fall_tau: f64,
+}
+
+impl ExponentialForcing {
+    fn startup(self) -> f64 {
+        let rise = -((self.rise_delay.min(0.) / self.rise_tau).exp_m1());
+        let fall = -((self.fall_delay.min(0.) / self.fall_tau).exp_m1());
+        (self.pulsed - self.initial).mul_add(rise - fall, self.initial)
+    }
+
+    /// Native positional EXP is only equivalent when neither delay needs
+    /// native timestep substitution and the rise precedes the fall.
+    #[must_use = "non-equivalent EXP sources require typed waveform binding"]
+    pub fn native_reference(self) -> Option<String> {
+        (self.rise_delay > 0.
+            && self.fall_delay >= self.rise_delay
+            && self.rise_tau > 0.
+            && self.fall_tau > 0.)
+            .then(|| {
+                format!(
+                    "EXP({} {} {} {} {} {})",
+                    self.initial,
+                    self.pulsed,
+                    self.rise_delay,
+                    self.rise_tau,
+                    self.fall_delay,
+                    self.fall_tau
+                )
+            })
+    }
+}
+
 /// Dialect-neutral resolved source forcing. No SPICE expression evaluation
 /// is needed during transient stepping.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Forcing {
+    Exponential(ExponentialForcing),
     PiecewiseLinear {
         knots: Vec<Knot>,
         repeat: Option<Repeat>,
@@ -527,6 +571,7 @@ impl Forcing {
     fn startup(&self) -> Result<f64> {
         let value = match self {
             Self::PiecewiseLinear { knots, repeat } => startup_pwl(knots, *repeat)?,
+            Self::Exponential(exponential) => exponential.startup(),
             Self::Sine {
                 offset,
                 amplitude,

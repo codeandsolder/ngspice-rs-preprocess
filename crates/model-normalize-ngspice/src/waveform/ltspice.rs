@@ -1,7 +1,9 @@
 //! Occurrence-bound `LTspice` independent-source parameters and timing laws.
 //! The dialect-specific input is resolved into shared, numeric forcing.
 
-use super::{Forcing, Knot, Repeat, RepeatLimit, Scalar, optional, pulse_knots, scalar};
+use super::{
+    ExponentialForcing, Forcing, Knot, Repeat, RepeatLimit, Scalar, optional, pulse_knots, scalar,
+};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -48,11 +50,42 @@ pub struct LtspiceSine {
     pub count: Option<Scalar>,
 }
 
+/// Exponential source with explicit timing fields. Analysis-dependent
+/// omitted/zero time constants and fall delay need a bound analysis plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LtspiceExp {
+    pub initial: Scalar,
+    pub pulsed: Scalar,
+    pub rise_delay: Scalar,
+    pub rise_tau: Scalar,
+    pub fall_delay: Scalar,
+    pub fall_tau: Scalar,
+}
+
+impl LtspiceExp {
+    fn forcing(&self, resolve: &mut impl FnMut(&str) -> Result<f64>) -> Result<Forcing> {
+        let exponential = ExponentialForcing {
+            initial: scalar(&self.initial, resolve)?,
+            pulsed: scalar(&self.pulsed, resolve)?,
+            rise_delay: scalar(&self.rise_delay, resolve)?,
+            rise_tau: scalar(&self.rise_tau, resolve)?,
+            fall_delay: scalar(&self.fall_delay, resolve)?,
+            fall_tau: scalar(&self.fall_tau, resolve)?,
+        };
+        ensure!(
+            exponential.rise_tau > 0. && exponential.fall_tau > 0. && exponential.fall_delay != 0.,
+            "LTspice EXP zero/default timing or nonpositive time constant needs qualified analysis binding"
+        );
+        Ok(Forcing::Exponential(exponential))
+    }
+}
+
 /// Source-specific declarations resolved by the generic prepared-waveform
 /// binder, not by a runtime compatibility-mode expression interpreter.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "form", content = "fields", rename_all = "kebab-case")]
 pub enum LtspiceWaveform {
+    Exp(LtspiceExp),
     Pulse(LtspicePulse),
     Pwl(LtspicePwl),
     Sine(LtspiceSine),
@@ -260,6 +293,7 @@ impl LtspiceSine {
 impl LtspiceWaveform {
     pub(super) fn resolve(&self, resolve: &mut impl FnMut(&str) -> Result<f64>) -> Result<Forcing> {
         match self {
+            Self::Exp(exp) => exp.forcing(resolve),
             Self::Pulse(pulse) => pulse.forcing(resolve),
             Self::Pwl(pwl) => pwl.forcing(resolve),
             Self::Sine(sine) => sine.forcing(resolve),
@@ -277,6 +311,18 @@ impl LtspiceWaveform {
             Ok(())
         };
         match self {
+            Self::Exp(exp) => {
+                for value in [
+                    &mut exp.initial,
+                    &mut exp.pulsed,
+                    &mut exp.rise_delay,
+                    &mut exp.rise_tau,
+                    &mut exp.fall_delay,
+                    &mut exp.fall_tau,
+                ] {
+                    apply(value)?;
+                }
+            }
             Self::Pulse(pulse) => {
                 for value in [
                     &mut pulse.first,
@@ -345,6 +391,7 @@ impl LtspiceWaveform {
             return Ok(Some(output));
         }
         match self.resolve(&mut resolve)? {
+            Forcing::Exponential(exp) => return Ok(exp.native_reference()),
             Forcing::PiecewiseLinear {
                 knots,
                 repeat: None,
