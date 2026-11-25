@@ -166,7 +166,7 @@ X1 a ab d clk CELL
 X2 b bb d clk CELL
 .INIT X1.!D1=1 X2.!D1=0
 .subckt CELL q qb d c
-!D1 q qb 0 d c M IC=0
+!D1 q qb 0 d c M IC = 0
 .MODEL M CLK_DFF {FIELDS} TRIG_COND=0_TO_1
 .ends CELL
 .end
@@ -193,5 +193,20 @@ X2 b bb d clk CELL
     }
     states.sort();
     assert_eq!(states, ["0", "1"]);
+    Ok(())
+}
+
+#[test]
+fn distinct_escaped_names_and_positional_model_lookup() -> Result<()> {
+    // The enable pin happens to be named like a different model. The
+    // actual model is the final positional token, not the first match.
+    let source = format!(
+        "* names\n!D_a q qa 0 data M2 M IC=0\n!D$a b bb 0 data M2 M IC=1\n.MODEL M CLK_DFF {FIELDS} TRIG_COND=0_TO_1\n.MODEL M2 LATCH {FIELDS} ENABLE_LEVEL=1\n.end\n"
+    );
+    let result = translate_simplis_deck(source.as_bytes())?;
+    assert_eq!(result.primitives, [TranslationKind::ClockedFlipFlop; 2]);
+    let text = std::str::from_utf8(&result.bytes)?;
+    assert!(text.contains("__D_5Fa_EVENT_M"));
+    assert!(text.contains("__D_24a_EVENT_M"));
     Ok(())
 }

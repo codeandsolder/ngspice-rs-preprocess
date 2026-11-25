@@ -1,10 +1,9 @@
 //! Classic SR and clocked state-element grammar.
 
-use super::{StateElementSpec, WhitespaceProbe, emit_state_element};
+use super::{StateElementSpec, WhitespaceProbe, emit_state_element, escaped_device_stem};
 use crate::{
     LogicIo, LogicOperation, LogicPolarity, LogicReceiver, LogicTiming, Translation,
-    TranslationKind, integer_parameter, normalized_statement, numeric_parameter, sanitized_name,
-    statement_tokens,
+    TranslationKind, integer_parameter, normalized_statement, numeric_parameter, statement_tokens,
 };
 use anyhow::{Result, bail};
 
@@ -116,9 +115,9 @@ pub(super) fn classic_state_model(statement: &str) -> Result<Option<(String, Cla
     let parameters = state_assignments(&tokens[3..])?;
     let rising = match kind {
         ClassicStateKind::Sr => true,
-        ClassicStateKind::Latch => match parameters.get("ENABLE_LEVEL").map(String::as_str) {
-            Some("1") => true,
-            Some("0") => false,
+        ClassicStateKind::Latch => match integer_parameter(&parameters, "ENABLE_LEVEL")? {
+            1 => true,
+            0 => false,
             _ => bail!("LATCH requires ENABLE_LEVEL=0 or 1"),
         },
         _ => match parameters
@@ -259,7 +258,7 @@ pub(super) fn translate_classic_state_device(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let stem = sanitized_name(tokens[0].trim_start_matches('!'));
+    let stem = escaped_device_stem(tokens[0].trim_start_matches('!'));
     let io = LogicIo {
         rin: model.rin,
         rout: model.rout,

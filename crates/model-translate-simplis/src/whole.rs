@@ -2289,7 +2289,7 @@ fn translate_device_voltage_controlled_source(
     }))
 }
 
-fn current_controlled_source_stem(name: &str) -> String {
+fn escaped_device_stem(name: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(name.len());
     for byte in name.bytes() {
@@ -2351,7 +2351,7 @@ fn translated_current_branches(
             if let Some(name) = tokens.first() {
                 branches.insert(
                     name.to_ascii_uppercase(),
-                    format!("B__{}", current_controlled_source_stem(name)),
+                    format!("B__{}", escaped_device_stem(name)),
                 );
             }
         }
@@ -2590,7 +2590,7 @@ fn translate_current_controlled_source(
             .get(2)
             .context("current-controlled source has no negative node")?,
     )?;
-    let stem = current_controlled_source_stem(
+    let stem = escaped_device_stem(
         tokens
             .first()
             .context("current-controlled source has no name")?,
@@ -3778,7 +3778,7 @@ fn statement_with_init_override(
 ) -> Result<String> {
     let normalized = normalized_statement(statement);
     let tokens = statement_tokens(&normalized)?;
-    let Some(name) = tokens.first() else {
+    let Some(name) = tokens.first().cloned() else {
         return Ok(statement.to_owned());
     };
     let Some(value) = overrides.get(&name.to_ascii_uppercase()) else {
@@ -3786,11 +3786,29 @@ fn statement_with_init_override(
     };
     let mut output = Vec::with_capacity(tokens.len().saturating_add(1));
     let mut replaced = false;
-    for token in tokens {
-        if token
+    let mut tokens = tokens.into_iter().peekable();
+    while let Some(token) = tokens.next() {
+        let assigned = token
             .split_once('=')
-            .is_some_and(|(key, _)| key.eq_ignore_ascii_case("IC"))
-        {
+            .filter(|(key, _)| key.eq_ignore_ascii_case("IC"));
+        let separate = token.eq_ignore_ascii_case("IC")
+            && tokens.peek().is_some_and(|next| next.starts_with('='));
+        if assigned.is_some() || separate {
+            anyhow::ensure!(!replaced, "duplicate initial condition on {name}");
+            let rhs = if let Some((_, rhs)) = assigned {
+                rhs.to_owned()
+            } else {
+                tokens
+                    .next()
+                    .context("missing initial assignment")?
+                    .strip_prefix('=')
+                    .context("missing initial assignment separator")?
+                    .to_owned()
+            };
+            if rhs.is_empty() {
+                let old = tokens.next().context("missing initial condition value")?;
+                anyhow::ensure!(!old.starts_with('='), "missing initial condition value");
+            }
             output.push(format!("IC={value}"));
             replaced = true;
         } else {
@@ -4259,10 +4277,7 @@ impl ScopeAnalysis {
             if !self.voltage_branches.contains_key(&target) {
                 bail!("SIMPLIS switch references unknown current branch {target}");
             }
-            let stem = format!(
-                "V__{}_CONTROL_SENSE",
-                current_controlled_source_stem(&target)
-            );
+            let stem = format!("V__{}_CONTROL_SENSE", escaped_device_stem(&target));
             let source = allocate_branch_identifier(&stem, &mut reserved)?;
             let node = allocate_branch_identifier(&format!("__{source}_NODE"), &mut reserved)?;
             self.current_branches.insert(target.clone(), source.clone());
@@ -4340,8 +4355,8 @@ impl ScopeAnalysis {
                     insert_unique_model(
                         &mut self.srff,
                         classic_state_model(statement)?,
-                        "SIMPLIS SRFF model",
-                    )?
+                        "SIMPLIS classic state model",
+                    )?;
                 }
                 "DIGITAL1" => insert_unique_model(
                     &mut self.digital,
