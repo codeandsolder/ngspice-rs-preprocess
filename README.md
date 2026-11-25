@@ -110,6 +110,42 @@ source constants. Unsupported geometry and nonconstant instance fields
 are rejected; source SOA annotations are retained as metadata, not enforced
 by the native MOS core.
 
+### Source model selection
+
+SIMetrix model selection is request-local. The typed mapping key is the
+case-insensitive model type and declared level (zero denotes omission).
+The selection layers are built-in defaults, `HSPICEMODELS`, an optional
+explicit device configuration (`--device-config PATH`), and deck `.MAP`
+declarations, in increasing priority. Conflicting declarations within a
+layer are rejected. Simulation-wide mapping directives in conditional or
+subcircuit scopes are rejected until their global evaluation semantics
+are qualified. The source-language header controls expression and
+lexical semantics independently of model selection. The mapping table is
+shared across the deck's admitted includes; indexed catalog libraries
+cannot independently introduce global selection directives. Include such
+resources explicitly instead. Parsed-library format v6 retains projected
+source statements so that a catalog can be selected again under a new
+request's mapping rather than baking in a previous request's defaults.
+
+For example, `.MAP ModelName=D Level=1 Device=Diode3` selects the
+level-3 diode implementation for cards declared `D LEVEL=1`. The
+manifest's `model_selections` list records original projected card text,
+source identity, lexical scope, dialect, declared and effective version,
+and selection origin. Model selections retain the admitted physical line
+span, including continuations. A new alias requires an explicit `LETTER`.
+The analysis plan records consumed model options with the
+`model_selection` disposition; native option emission skips them.
+Selection identifies the intended physical implementation; it does not
+certify numerical equivalence of every parameter or geometry variant.
+Unsupported target implementations, versions, and access letters are
+reported instead of falling back to a different model. In particular,
+HSPICE resistor model cards and unsupported diode geometry parameters
+are not qualified for native lowering. `HSPICECOMPATIBILITY` is rejected
+when enabled because its additional temperature and statistical options
+must also be implemented; `HSPICEMODELS` selects models alone.
+
+See the [SIMetrix device configuration reference](https://help.simetrix.co.uk/9.3/simetrix/simulator_reference/topics/simulatordevices_customisingdeviceconfiguration.htm).
+
 Native linking preserves physical source lines, comments, continuations,
 scope boundaries and the root title. Static `.include`, `.inc` and named
 `.lib path section` resources are resolved relative to their containing
@@ -123,7 +159,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 6 includes
+counts, dependencies and provenance. Manifest version 7 includes
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
 `Artifact::required_code_models` and `PreparedBundle::required_code_models()`.
@@ -304,7 +340,7 @@ Native ngspice input retains its own native executable directives.
 ### Analysis-scoped passive initialization
 
 The SIMetrix deck policy is carried separately from ordinary electrical
-artifacts in `PreparedBundle::initial_conditions` and manifest v6.
+artifacts in `PreparedBundle::initial_conditions` and manifest v7.
 It retains source-specific `INITCONDMODE`, `ICRES`, per-device `IC`,
 `ICMODE`, and optional `BRANCH`, plus ordered node `.IC` hints. The
 source-only device and node IC fields are removed from the emitted

@@ -131,6 +131,9 @@ pub struct Options {
     /// Disable conditioning when the consumer adds artificial topology
     /// (such as global shunts) or requires unchanged internal current names.
     pub conditioning: ConditioningPolicy,
+    /// Explicit request-local device configuration file for `SIMetrix` decks.
+    /// It is admitted as data, without the source transformation command.
+    pub device_config: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -139,6 +142,7 @@ impl Default for Options {
             admission: AdmissionConfig::default(),
             output_bytes: 128 * 1024 * 1024,
             conditioning: ConditioningPolicy::default(),
+            device_config: None,
         }
     }
 }
@@ -207,6 +211,10 @@ pub struct PreparedBundle {
     /// Source declaration identities, before native primitive lowering or
     /// subcircuit specialization. Unused catalog declarations may be present.
     pub device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
+    /// Source model declarations and selected physical implementation, before
+    /// specialization. Unused catalog declarations may be present.
+    pub model_selections:
+        Vec<model_preprocess_simplis::source_dialect::model_mapping::ModelSelection>,
     /// Source-specific initialization policy; absent for native decks.
     /// Consumers must bind it per instance and enclosing analysis.
     pub initial_conditions: Option<passive_ic::InitialConditions>,
@@ -304,6 +312,7 @@ fn native(
         companions: Vec::new(),
         normalization: normalized.model.passes,
         device_identities: Vec::new(),
+        model_selections: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,
         waveforms: Vec::new(),
@@ -347,6 +356,10 @@ pub fn prepare(
     cancellation: &Cancellation,
 ) -> Result<PreparedBundle> {
     validate_request(request)?;
+    ensure!(
+        options.device_config.is_none() || request.format == InputFormat::SimetrixDeck,
+        "device configuration is only valid for SIMetrix decks"
+    );
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
     let root = request.input.admit(&mut session)?;

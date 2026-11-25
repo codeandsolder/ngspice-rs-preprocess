@@ -7,12 +7,16 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt::Write as _};
 
 /// Admitted logical source statement and its effective language.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScopedStatement {
     /// Canonical admitted source identity.
     pub source: String,
     /// Effective file language, not the language of the root deck.
     pub context: DialectContext,
+    /// First one-based physical source line.
+    pub first_line: usize,
+    /// Last physical line, including continuations.
+    pub last_line: usize,
     /// Joined, projected source statement.
     pub text: String,
 }

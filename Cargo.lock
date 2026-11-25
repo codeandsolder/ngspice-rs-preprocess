@@ -220,6 +220,7 @@ name = "model-preprocess-simplis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-normalize-ngspice",
  "model-preprocess-command",
  "serde",
  "serde_json",

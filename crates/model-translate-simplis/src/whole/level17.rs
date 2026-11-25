@@ -4,12 +4,12 @@
 //! two-terminal charge primitive. The two arctangent terms have opposite
 //! slopes, as verified by independent simulator measurements.
 use super::{
-    Translation, TranslationKind, model_header, normalized_statement, simple_assignment_value,
-    statement_tokens, validate_node, write_number,
+    Translation, TranslationKind, model_header, normalized_statement, statement_tokens,
+    validate_node, write_number,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::model_card::{
-    ModelCard, instance_fields, parse_model_card, parse_spice_constant,
+    ModelCard, ModelParameter, instance_fields, parse_model_card, parse_spice_constant,
 };
 use std::{collections::BTreeMap, fmt::Write as _};
 
@@ -53,7 +53,7 @@ pub(super) struct RawLevel17Mos {
     tc1rd: f64,
     tc2rd: f64,
     cgd: GateDrain,
-    vds_limit: Option<String>,
+    soa_limits: Vec<ModelParameter>,
     native_name: String,
     resistance_name: String,
     lexical: bool,
@@ -119,34 +119,6 @@ const CORE_FIELDS: &[CoreField] = &[
     field("AF", 1., Domain::Nonnegative),
 ];
 
-fn strip_level17_vds_limit(body: &str) -> Result<(String, Option<String>)> {
-    let upper = body.to_ascii_uppercase();
-    let Some(start) = upper.find("LIMIT(VDS)=") else {
-        return Ok((body.to_owned(), None));
-    };
-    let value_start = start + "LIMIT(VDS)=".len();
-    let open = body[value_start..]
-        .find('(')
-        .map(|offset| value_start + offset)
-        .context("SIMetrix LEVEL=17 LIMIT(VDS) has no opening parenthesis")?;
-    let close = body[open + 1..]
-        .find(')')
-        .map(|offset| open + 1 + offset)
-        .context("SIMetrix LEVEL=17 LIMIT(VDS) has no closing parenthesis")?;
-    let mut output = String::with_capacity(body.len());
-    output.push_str(&body[..start]);
-    output.push_str(&body[close + 1..]);
-    Ok((
-        output,
-        Some(
-            body[start..=close]
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-    ))
-}
-
 fn scalar(
     fields: &mut BTreeMap<String, String>,
     name: &str,
@@ -180,10 +152,21 @@ fn model_fields(card: ModelCard) -> Result<BTreeMap<String, String>> {
     Ok(fields)
 }
 
-fn candidate_level(statement: &str) -> Option<f64> {
-    simple_assignment_value(statement, "LEVEL")
-        .or_else(|| simple_assignment_value(statement, "VLEVEL"))
-        .and_then(|value| parse_spice_constant(&value).ok())
+fn selected_level(card: &ModelCard) -> Result<Option<f64>> {
+    let mut levels = card.parameters.iter().filter(|field| {
+        field.name.eq_ignore_ascii_case("LEVEL") || field.name.eq_ignore_ascii_case("VLEVEL")
+    });
+    let level = levels.next();
+    ensure!(
+        levels.next().is_none(),
+        "ambiguous MOS level on {}",
+        card.name
+    );
+    level
+        .map(|field| {
+            parse_spice_constant(field.expression.as_deref().context("missing MOS level")?)
+        })
+        .transpose()
 }
 
 fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>> {
@@ -196,15 +179,23 @@ fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>>
         _ => return Ok(None),
     };
     let normalized = normalized_statement(statement);
-    let legacy = ["CGDMAX", "CGDMIN", "XG1CGD", "XG2CGD", "VTCGD"]
-        .iter()
-        .any(|parameter| simple_assignment_value(&normalized, parameter).is_some());
-    let candidate = candidate_level(&normalized);
+    let active = model_preprocess_simplis::active_statement_prefix(&normalized).trim();
+    let mut card = parse_model_card(active, 1, &["LEVEL", "VLEVEL"])?;
+    let legacy = card.parameters.iter().any(|field| {
+        ["CGDMAX", "CGDMIN", "XG1CGD", "XG2CGD", "VTCGD"]
+            .iter()
+            .any(|name| field.name.eq_ignore_ascii_case(name))
+    });
+    let candidate = selected_level(&card)?;
     if !(matches!(candidate, Some(17.)) || matches!(candidate, Some(7.)) && legacy) {
         return Ok(None);
     }
-    let (text, vds_limit) = strip_level17_vds_limit(&normalized)?;
-    let mut fields = model_fields(parse_model_card(text.trim(), 1, &["LEVEL", "VLEVEL"])?)?;
+    let (soa_limits, parameters) = card
+        .parameters
+        .into_iter()
+        .partition(|field| field.name.to_ascii_uppercase().starts_with("LIMIT("));
+    card.parameters = parameters;
+    let mut fields = model_fields(card)?;
     fields.remove("LEVEL");
     let core = CORE_FIELDS
         .iter()
@@ -246,7 +237,7 @@ fn raw_level17_model(statement: &str) -> Result<Option<(String, RawLevel17Mos)>>
             tc1rd,
             tc2rd,
             cgd,
-            vds_limit,
+            soa_limits,
             native_name: String::new(),
             resistance_name: String::new(),
             lexical: false,
@@ -261,10 +252,15 @@ fn write_scalar(output: &mut String, name: &str, value: f64) -> Result<()> {
 
 pub(super) fn emit_level17_core_model(name: &str, model: &RawLevel17Mos) -> Result<String> {
     let mut output = String::new();
-    if let Some(limit) = &model.vds_limit {
+    for limit in &model.soa_limits {
+        let value = limit
+            .expression
+            .as_deref()
+            .context("SOA limit requires a value")?;
         writeln!(
             output,
-            "* SIMetrix LEVEL=17 {limit} SOA metadata for {name}; not enforced by native simulator"
+            "* SIMetrix LEVEL=17 {}={value} SOA metadata for {name}; not enforced by native simulator",
+            limit.name
         )?;
     }
     write!(
