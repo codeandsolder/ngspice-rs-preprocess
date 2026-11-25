@@ -106,7 +106,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
                 options.conditioning = match value.to_str() {
                     Some("private-differentiators") => ConditioningPolicy::PrivateDifferentiators,
                     Some("disabled") => ConditioningPolicy::Disabled,
-                    _ => bail!("unknown conditioning policy {value:?}"),
+                    _ => bail!("unknown conditioning policy {}", value.display()),
                 };
             }
             _ => bail!("unknown option {name:?}\n{USAGE}"),
