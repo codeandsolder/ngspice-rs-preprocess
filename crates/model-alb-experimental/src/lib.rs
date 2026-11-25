@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use model_translate_simplis::syntax::{parse_numeric, validate_node};
 mod alb;
+pub mod annotations;
 pub use alb::{
     AlbDigitalBit, AlbDriveStrength, AlbLogicLevel, AlbTimedOutput, AnalogBoundaryPin,
     AnalogBridgeKind, AnalogDigitalConnection, BridgeCatalog, BridgeModel, DigitalFamilyResolution,

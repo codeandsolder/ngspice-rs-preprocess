@@ -1,8 +1,9 @@
 //! Separate ADC routes by actual input occurrences without duplicating
 //! receiver loads or specializing reusable X definitions.
 use super::{
-    AlbInputReceiver, DigitalPinDirection, Graph, Item, LogicalAlbBoundary, ProducerSlot, Result,
-    ScopeRenames, allocate_bundle, key, new_promoted_name, reserved, valid_analog_node, valid_node,
+    AlbInputReceiver, DigitalPinDirection, Graph, LogicalAlbBoundary, ProducerSlot, Result,
+    ScopeRenames, SourceOccurrence, allocate_bundle, key, new_promoted_name, reserved,
+    valid_analog_node, valid_node,
 };
 use anyhow::{Context, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,24 +89,18 @@ pub(super) fn mark_lifted_formals(
                 .take(receiver.path.len().saturating_sub(1))
                 .enumerate()
             {
-                let owner = graph
-                    .scopes
-                    .get(&scope)
-                    .context("missing lifted receiver scope")?;
-                let mut matches = Vec::new();
-                for item in &owner.items {
-                    if let Item::Statement(statement) = item
-                        && let Some(call) = graph.call(statement, &scope)?
-                        && key(&call.name) == key(instance)
-                    {
-                        matches.push(call.target);
-                    }
-                }
+                let mut matches = graph
+                    .occurrences(&scope)?
+                    .calls()
+                    .filter(|call| call.name.eq_ignore_ascii_case(instance));
+                let matched = matches.next().with_context(|| {
+                    format!("missing lifted ADC X instance {instance} in {scope:?}")
+                })?;
                 ensure!(
-                    matches.len() == 1,
-                    "ambiguous or missing lifted ADC X instance {instance} in {scope:?}"
+                    matches.next().is_none(),
+                    "ambiguous lifted ADC X instance {instance} in {scope:?}"
                 );
-                scope = matches.pop().context("missing lifted ADC child scope")?;
+                scope = matched.target.clone();
                 if let Some(formal) = receiver.analog_hops.get(&index) {
                     let formal = valid_node(formal)?;
                     let child = graph
@@ -336,15 +331,8 @@ fn route(
     assignment: &Assignment,
     plans: &mut BTreeMap<Vec<String>, ScopeRenames>,
 ) -> Result<()> {
-    let owner = graph
-        .scopes
-        .get(scope)
-        .context("missing input route scope")?;
-    for item in &owner.items {
-        let Item::Statement(statement) = item else {
-            continue;
-        };
-        if let Some(alb) = graph.alb_instance(statement, scope)? {
+    for occurrence in &graph.occurrences(scope)?.ordered {
+        if let SourceOccurrence::Alb(alb) = occurrence {
             for (bit, input) in alb.inputs.iter().enumerate() {
                 if input == node {
                     let identity = AlbInputReceiver {
@@ -363,7 +351,7 @@ fn route(
                     )?;
                 }
             }
-        } else if let Some(call) = graph.call(statement, scope)? {
+        } else if let SourceOccurrence::Call(call) = occurrence {
             let child = graph
                 .scopes
                 .get(&call.target)

@@ -1,83 +1,12 @@
 use anyhow::{Context, Result, ensure};
+use model_alb_experimental::annotations::{AnnotationDocument, read_json, verify_source_contracts};
 use model_alb_experimental::{
-    AlbInputReceiver, AlbOutputProducer, AnalogBridgeKind, AnalogDigitalConnection, BridgeCatalog,
-    BridgeModel, CodeModelContract, DefinitionFamilyBoundary, DigitalPinDirection, LogicFamily,
-    LogicFamilyAssignment, NativeFamilySpecification, OccurrenceFamilyBoundary, OpaqueXInterface,
-    ScopedAnalogDigitalConnection, materialize_scoped_family_bridges, verify_external_code_models,
-    verify_external_native_libraries,
+    AnalogDigitalConnection, BridgeCatalog, BridgeModel, CodeModelContract,
+    DefinitionFamilyBoundary, DigitalPinDirection, LogicFamily, LogicFamilyAssignment,
+    NativeFamilySpecification, OccurrenceFamilyBoundary, OpaqueXInterface,
+    ScopedAnalogDigitalConnection, materialize_scoped_family_bridges,
 };
-use serde::Deserialize;
-use std::{collections::BTreeMap, fmt::Write as _, fs, path::Path};
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Direction {
-    Input,
-    Output,
-}
-impl From<Direction> for DigitalPinDirection {
-    fn from(value: Direction) -> Self {
-        match value {
-            Direction::Input => Self::Input,
-            Direction::Output => Self::Output,
-        }
-    }
-}
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum BridgeKind {
-    Adc,
-    Dac,
-}
-impl From<BridgeKind> for AnalogBridgeKind {
-    fn from(value: BridgeKind) -> Self {
-        match value {
-            BridgeKind::Adc => Self::Adc,
-            BridgeKind::Dac => Self::Dac,
-        }
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Mapping {
-    #[serde(default)]
-    scope: Vec<String>,
-    occurrence: Option<Vec<String>>,
-    producer: Option<AlbOutputProducer>,
-    #[serde(default)]
-    receivers: Vec<AlbInputReceiver>,
-    analog_net: String,
-    digital_net: String,
-    direction: Direction,
-    #[serde(default)]
-    family: Option<String>,
-    #[serde(default)]
-    in_family: Option<String>,
-    #[serde(default)]
-    out_family: Option<String>,
-    supply_v: f64,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Bridge {
-    name: String,
-    kind: BridgeKind,
-    family: String,
-    nominal_supply_v: f64,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Config {
-    connections: Vec<Mapping>,
-    bridge_models: Vec<Bridge>,
-    /// Model-level interface data is consumed by discovery and logical
-    /// lowering; preserve its validated presence without interpreting it as
-    /// family bridge configuration in this final analog wiring stage.
-    #[serde(default)]
-    opaque_x_interfaces: Vec<OpaqueXInterface>,
-    #[serde(default)]
-    code_model_contracts: Vec<CodeModelContract>,
-}
+use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
 /// The X wiring resolver needs only the verified external model port
 /// layout; these topology-only declarations never enter the output deck.
@@ -139,10 +68,10 @@ pub struct FamilyConfig {
 
 impl FamilyConfig {
     pub fn read(bindings: &Path, models: &Path) -> Result<Self> {
-        let config: Config = serde_json::from_slice(&fs::read(bindings)?)
-            .context("decoding source analog/digital boundary annotations")?;
-        let native: NativeFamilySpecification = serde_json::from_slice(&fs::read(models)?)
-            .context("decoding exact native family electrical models")?;
+        let config: AnnotationDocument =
+            read_json(bindings).context("decoding source analog/digital boundary annotations")?;
+        let native: NativeFamilySpecification =
+            read_json(models).context("decoding exact native family electrical models")?;
         ensure!(
             native.pins.is_empty(),
             "automatic wiring accepts model parameters only, not handwritten physical pin triples"
@@ -152,15 +81,15 @@ impl FamilyConfig {
         for c in config.connections {
             if let Some(producer) = &c.producer {
                 ensure!(
-                    !producer.path.is_empty() && matches!(c.direction, Direction::Output),
+                    !producer.path.is_empty() && c.direction == DigitalPinDirection::Output,
                     "physical ALB producer requires an output boundary and nonempty path"
                 );
             }
             let boundary = AnalogDigitalConnection {
                 analog_net: c.analog_net,
                 digital_net: c.digital_net,
-                direction: c.direction.into(),
-                supply_v: c.supply_v,
+                direction: c.direction,
+                supply_v: c.supply_v.context("physical wiring requires supply_v")?,
                 family: LogicFamilyAssignment {
                     family: c.family,
                     in_family: c.in_family,
@@ -185,10 +114,13 @@ impl FamilyConfig {
             }
         }
         let mut catalog = BridgeCatalog::default();
-        for model in config.bridge_models {
+        for model in config
+            .bridge_models
+            .context("physical wiring requires bridge_models")?
+        {
             catalog.add(BridgeModel {
                 name: model.name,
-                kind: model.kind.into(),
+                kind: model.kind,
                 family: LogicFamily::parse(&model.family)?,
                 nominal_supply_v: model.nominal_supply_v,
             })?;
@@ -204,8 +136,7 @@ impl FamilyConfig {
     }
 
     pub fn verify(&self, path: &Path, source: &str) -> Result<()> {
-        verify_external_native_libraries(path, source, &self.interfaces)?;
-        verify_external_code_models(path, source, &self.contracts, &self.interfaces)
+        verify_source_contracts(path, source, &self.interfaces, &self.contracts)
     }
 
     pub fn wire(

@@ -172,8 +172,7 @@ pub fn specialize_family_occurrences(
         });
     }
     let items = parse_items(deck)?;
-    let mut graph = Graph::default();
-    graph.collect(&items, &[], None)?;
+    let graph = Graph::new(&items, None)?;
     recursive::run(&graph, &items, occurrence_connections, lexical_connections)
 }
 
