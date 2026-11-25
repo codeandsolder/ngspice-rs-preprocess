@@ -11,5 +11,8 @@ description = "Prepared ngspice 47 VDMOS channel, charge, diode and electrotherm
 [lints]
 workspace = true
 
+[dependencies]
+model-kernel-api = { path = "../model-kernel-api" }
+
 [dev-dependencies]
 model-normalize-ngspice = { path = "../model-normalize-ngspice" }

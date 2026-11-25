@@ -147,3 +147,31 @@ ngspice-rs-fast #189. The Bramble LTC3854 synchronous buck, Bramble LTC3872
 boost, and ADI ADALM-SR1 boost use published component values with fixed PWM
 and explicit device models, compared against C47 on the same decks.
 These are power-stage reconstructions, not full controller-IC replicas.
+
+## Shared prepared artifact
+
+`artifact::artifact` binds the existing immutable prepared model to
+`model-kernel-api` ABI v3. The descriptor exposes three electrical terminals
+and, when enabled, junction and case thermal terminals in absolute kelvin.
+Positive series resistances add local electrical coordinates, while exact
+zero-ohm branches coalesce at preparation. The recovery coordinate, when
+present, is the polarity-normalized Qp variable already used by the kernel.
+Model parameter changes rebuild the artifact; parallel multiplicity remains
+a numeric candidate slot. The content fingerprint must identify the compiled
+model and structural options.
+
+The artifact assembles conservative residuals and stored quantities from the
+same native model laws and analytic derivatives; it neither duplicates those
+laws nor owns integration history. In particular, a temperature-dependent
+diode recovery gain `g(T)` multiplying `dQs/dt` cannot be represented by
+differentiating `g(T)*Qs`. Instead, use the recovery row
+`Fq + dQs/dt = 0` to substitute `-g(T)*Fq` for that electrical current.
+This exact row transformation preserves the DAE solution, including variable
+temperature; its Jacobian includes both the recovery-residual and gain
+temperature derivatives.
+
+The generalized residual tests verify every Jacobian entry by finite
+differences, both polarities, thermal and nonthermal configurations, common
+electrical reference shifts, candidate isolation, native noise densities
+and contiguous homogeneous batches. Circuit-coupled engine validation
+remains separate from the producer tests.

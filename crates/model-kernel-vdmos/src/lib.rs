@@ -13,6 +13,7 @@
 //! BV/IBV/NBV avalanche is modeled natively; unsupported source options
 //! fail at parameter compilation rather than substituting MOS1 or BSIM.
 
+pub mod artifact;
 mod breakdown;
 mod parameters;
 
