@@ -129,6 +129,7 @@ pub enum SelectionOrigin {
     Builtin,
     DeviceConfiguration,
     HspicePreset,
+    StandaloneHspice,
     NetlistMap,
     LegacyMos17Signature,
 }
@@ -518,6 +519,33 @@ impl MappingTable {
             .cloned()
             .or_else(|| self.base(&key))
             .is_some_and(|mapping| mapping.device == Device::HspiceResistor)
+    }
+
+    /// Select a qualified standalone HSPICE model, not a SIMetrix deck preset.
+    ///
+    /// # Errors
+    /// The family, level or version has no qualified native lowering.
+    pub fn select_standalone_hspice(
+        line: &ScopedStatement,
+        scope: &[String],
+    ) -> Result<ModelSelection> {
+        let table = Self {
+            hspice_models: true,
+            ..Self::default()
+        };
+        let mut selection = table
+            .select_card(line, scope)?
+            .context("HSPICE model has no qualified native mapping")?;
+        ensure!(
+            selection.mapping.device == Device::Diode3
+                && selection.mapping.key.model_type == "D"
+                && selection.mapping.key.level <= 1
+                && selection.declared_version.is_none(),
+            "HSPICE model {} has no qualified native mapping",
+            selection.card.name
+        );
+        selection.mapping.origin = SelectionOrigin::StandaloneHspice;
+        Ok(selection)
     }
 
     /// Resolve an admitted card before source-family lowering. Other

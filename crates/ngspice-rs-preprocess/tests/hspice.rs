@@ -130,6 +130,12 @@ fn unqualified_hspice_semantics_are_errors() -> Result<()> {
         ),
         (".model mos NMOS LEVEL=49", "qualified native mapping"),
         (".temp 25 50", "multiple-temperature"),
+        (".tran 1n 10n 2n 20n", "multipoint transient"),
+        (".dc gain 1 2 1", "parameter/temperature sweep"),
+        (
+            ".ac lin 1 1k 2k SWEEP gain 1 2 1",
+            "unqualified HSPICE analysis",
+        ),
         (".option post=2", "unqualified HSPICE option"),
     ] {
         fs::write(&root, format!("test\n{card}\n.end\n"))?;
@@ -297,5 +303,88 @@ C1 p n 'cval/2' m=2
         (row[1] - expected).abs() < 5e-5,
         "{row:?} != {expected}\n{text}"
     );
+    Ok(())
+}
+
+#[test]
+fn standalone_diode_breakdown_and_area_scaling() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let text = numeric_deck(
+        dir.path(),
+        r#"HSPICE dimensionless junction
+V1 a 0 -5
+V2 b 0 -5
+D1 a 0 junction AREA=1
+D2 b 0 junction AREA=7 M=2
+.model junction D (IS=1p BV=5 IBV=100u)
+.end
+"#,
+        "op\nwrdata op.dat i(v1) i(v2)",
+    )?;
+    let row = &values(dir.path(), "op.dat")?[0];
+    ensure!((row[1] - 100e-6).abs() < 2e-7, "{row:?}\n{text}");
+    ensure!((row[2] / row[1] - 14.).abs() < 0.002, "{row:?}\n{text}");
+    Ok(())
+}
+
+#[test]
+fn depletion_modes_and_lexical_model_occurrences() -> Result<()> {
+    for mode in [1, 2] {
+        let dir = tempfile::tempdir()?;
+        let text = numeric_deck(
+            dir.path(),
+            &format!(
+                r#"HSPICE junction charge
+.option parhier=local
+V1 a 0 dc 0.2 ac 1
+V2 b 0 dc 0.2 ac 1
+X1 a 0 outer cap=2n
+X2 b 0 outer cap=5n
+.subckt outer p n cap=1n
+.model junction D (IS=1p CJ='cap' PB=0.8 M=0.5)
+.subckt inner q r
+D1 q r junction AREA=3 M=2
+.ends inner
+Xinside p n inner
+.ends outer
+.option dcap={mode}
+.end
+"#
+            ),
+            "ac lin 1 1000 1000\nwrdata ac.dat i(v1) i(v2)",
+        )?;
+        let row = &values(dir.path(), "ac.dat")?[0];
+        let factor = if mode == 1 {
+            (1.0_f64 - 0.2 / 0.8).powf(-0.5)
+        } else {
+            1. + 0.5 * 0.2 / 0.8
+        };
+        for (actual, cap) in [(row[2], 2e-9), (row[4], 5e-9)] {
+            let expected = -std::f64::consts::TAU * 1000. * 6. * cap * factor;
+            ensure!(
+                (actual / expected - 1.).abs() < 1e-5,
+                "{row:?} expected {expected}\n{text}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn transient_start_is_normalized_without_reinterpreting_schedules() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("tran.sp");
+    for (source, expected) in [
+        (".tran 1n 10n START=2n UIC", ".tran 1n 10n 2n UIC"),
+        (".tran 1n 10n 2n 0.5n", ".tran 1n 10n 2n 0.5n"),
+    ] {
+        fs::write(
+            &root,
+            format!("Transient\nV1 a 0 1\nR1 a 0 1k\n{source}\n.end\n"),
+        )?;
+        let bundle = compile(&root, InputFormat::HspiceDeck)?;
+        let native = std::str::from_utf8(&bundle.primary.bytes)?;
+        ensure!(native.contains(expected), "{native}");
+    }
     Ok(())
 }

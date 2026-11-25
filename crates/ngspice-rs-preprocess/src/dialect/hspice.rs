@@ -15,7 +15,9 @@ use model_preprocess_simplis::{
 };
 use std::fmt::Write as _;
 
+mod analysis;
 mod hierarchy;
+mod models;
 
 const HSPICE: DialectContext = DialectContext {
     language: SourceLanguage::Hspice,
@@ -60,6 +62,7 @@ fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
                 state.parhier = Some(precedence);
                 continue;
             }
+            "DCAP" => continue,
             "TNOM" => state.nominal_temperature = true,
             "TEMP" => state.temperature = true,
             "ABSTOL" | "VNTOL" | "RELTOL" | "GMIN" | "ITL1" | "ITL2" | "ITL4" | "CHGTOL" => (),
@@ -144,10 +147,7 @@ fn map_values(
         ".PARAM" | ".TEMP" | ".OPTIONS" | ".OPTION" | ".OPT" | ".IC" | ".NODESET" | ".TRAN" => {
             start(1)
         }
-        ".FUNC" => {
-            let end = ranges.get(1).context("missing function declaration")?.end;
-            end
-        }
+        ".FUNC" => ranges.get(1).context("missing function declaration")?.end,
         ".AC" => start(2),
         ".DC" => {
             // A second sweep has its own structural source identifier.
@@ -174,8 +174,9 @@ fn map_values(
         _ if command.starts_with('.') => return Ok(text.to_owned()),
         _ => match command.as_bytes().first() {
             Some(b'X') => assignment_start(),
+            Some(b'D') => start(4),
             Some(b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => start(3),
-            Some(b'E' | b'G' | b'F' | b'H')
+            Some(b'E'..=b'H')
                 if ["VALUE", "VOL", "CUR", "TABLE", "POLY", "LAPLACE"]
                     .iter()
                     .any(|mode| token(3).eq_ignore_ascii_case(mode)) =>
@@ -223,7 +224,8 @@ fn lower_card(
     }
     if state.depth > 0
         && (matches!(command.as_str(), ".FUNC" | ".OPTION" | ".OPTIONS" | ".OPT")
-            || (!state.deck && command == ".PARAM"))
+            || (!state.deck && command == ".PARAM")
+            || matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN" | ".TEMP"))
     {
         bail!("HSPICE scoped parameters/options require hierarchy lowering");
     }
@@ -232,10 +234,21 @@ fn lower_card(
         ensure!(
             matches!(
                 kind,
-                b'R' | b'C' | b'L' | b'V' | b'I' | b'E' | b'G' | b'F' | b'H' | b'B' | b'X'
+                b'R' | b'C' | b'L' | b'V' | b'I' | b'E' | b'G' | b'F' | b'H' | b'B' | b'X' | b'D'
             ),
             "HSPICE device {command} requires qualified model/device lowering"
         );
+        if kind == b'D' {
+            for field in fields.iter().skip(4) {
+                let token = &text[field.clone()];
+                ensure!(
+                    !["W", "L", "LM", "LP", "WM", "WP", "THERMAL"]
+                        .iter()
+                        .any(|name| token.eq_ignore_ascii_case(name)),
+                    "geometric or thermal HSPICE diode instance is not qualified"
+                );
+            }
+        }
         if kind == b'X' {
             ensure!(
                 state.deck || !assignment,
@@ -262,7 +275,47 @@ fn lower_card(
     source = map_values(&source, limit, |value, remaining| {
         lower_spice_expression(value, context, remaining)
     })?;
+    if matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN") {
+        ensure!(
+            state.deck,
+            "analysis directive in standalone HSPICE library"
+        );
+        source = analysis::lower(&source)?;
+    }
     Ok(source)
+}
+
+fn depletion_mode(
+    statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
+) -> Result<u8> {
+    let mut mode = None;
+    for statement in statements {
+        if !matches!(
+            analysis_plan::command(&statement.text).as_str(),
+            ".OPTION" | ".OPTIONS" | ".OPT"
+        ) {
+            continue;
+        }
+        let tail = statement
+            .text
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, tail)| tail);
+        for field in parse_parameter_fields(tail, &[])? {
+            if field.name.eq_ignore_ascii_case("DCAP") {
+                let value = match field.expression.as_deref() {
+                    Some("1") => 1,
+                    Some("2") => 2,
+                    _ => bail!("unqualified HSPICE DCAP selection"),
+                };
+                ensure!(
+                    mode.is_none_or(|old| old == value),
+                    "conflicting HSPICE DCAP options"
+                );
+                mode = Some(value);
+            }
+        }
+    }
+    Ok(mode.unwrap_or(2))
 }
 
 pub(super) fn prepare(
@@ -288,6 +341,9 @@ pub(super) fn prepare(
         },
         None,
     )?;
+    let dcap = depletion_mode(&expansion.statements[usize::from(deck)..])?;
+    let mut selections = Vec::new();
+    let mut scope = Vec::new();
     let mut bytes = Vec::new();
     let mut origins = Vec::new();
     let mut state = DeckOptions {
@@ -308,7 +364,31 @@ pub(super) fn prepare(
             } else {
                 statement.text.clone()
             }
+        } else if analysis_plan::command(&statement.text) == ".MODEL" {
+            let (text, selection) = models::lower(
+                statement,
+                &scope,
+                dcap,
+                options.output_bytes.saturating_sub(bytes.len()),
+            )
+            .with_context(|| format!("{}:{}", statement.source, statement.first_line))?;
+            selections.push(selection);
+            text
         } else {
+            match analysis_plan::command(&statement.text).as_str() {
+                ".SUBCKT" => scope.push(
+                    statement
+                        .text
+                        .split_whitespace()
+                        .nth(1)
+                        .context("missing subcircuit name")?
+                        .to_owned(),
+                ),
+                ".ENDS" => {
+                    scope.pop().context("unmatched .ends")?;
+                }
+                _ => (),
+            }
             lower_card(
                 &statement.text,
                 statement.context,
@@ -366,5 +446,7 @@ pub(super) fn prepare(
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
     }
-    native_bundle(root.path.clone(), request.format, kind, &bytes, &origins)
+    let mut bundle = native_bundle(root.path.clone(), request.format, kind, &bytes, &origins)?;
+    bundle.model_selections = selections;
+    Ok(bundle)
 }

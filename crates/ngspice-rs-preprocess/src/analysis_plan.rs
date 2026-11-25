@@ -418,7 +418,7 @@ fn options(fields: &[String], dialect: AnalysisDialect) -> Result<Vec<OptionSett
     Ok(result)
 }
 
-fn arguments(statement: &str) -> Result<Vec<String>> {
+pub(crate) fn arguments(statement: &str) -> Result<Vec<String>> {
     let fields = model_normalize_ngspice::statement_token_spans(statement)?;
     Ok(fields
         .into_iter()
@@ -427,7 +427,7 @@ fn arguments(statement: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-fn analysis_kind(name: &str) -> AnalysisKind {
+pub(crate) fn analysis_kind(name: &str) -> AnalysisKind {
     match name {
         ".OP" => AnalysisKind::OperatingPoint,
         ".DC" => AnalysisKind::DcSweep,
@@ -440,7 +440,7 @@ fn analysis_kind(name: &str) -> AnalysisKind {
     }
 }
 
-fn native_analysis_shape(kind: AnalysisKind, args: &[String]) -> bool {
+pub(crate) fn native_analysis_shape(kind: AnalysisKind, args: &[String]) -> bool {
     let sweep = |value: &str| matches!(value.to_ascii_uppercase().as_str(), "LIN" | "DEC" | "OCT");
     let scalar = |value: &str| {
         model_translate_simplis::syntax::parse_numeric(value).is_ok()

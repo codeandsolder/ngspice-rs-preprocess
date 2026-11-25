@@ -441,6 +441,19 @@ fn numeric_literal(bytes: &[u8], start: usize) -> (usize, usize) {
     (end, suffix)
 }
 
+fn append_hspice_number(input: &str, start: usize, output: &mut String) -> usize {
+    let bytes = input.as_bytes();
+    let (end, suffix) = numeric_literal(bytes, start);
+    if matches!(bytes.get(suffix), Some(b'x' | b'X')) {
+        output.push_str(&input[start..suffix]);
+        output.push_str("meg");
+        output.push_str(&input[suffix + 1..end]);
+    } else {
+        output.push_str(&input[start..end]);
+    }
+    end
+}
+
 /// Lower one expression region of a standalone SPICE dialect.
 pub(super) fn lower_expression(
     input: &str,
@@ -508,15 +521,7 @@ fn rewrite_expression(
             && (ch.is_ascii_digit()
                 || (ch == '.' && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit)))
         {
-            let (end, suffix) = numeric_literal(bytes, offset);
-            if matches!(bytes.get(suffix), Some(b'x' | b'X')) {
-                output.push_str(&input[offset..suffix]);
-                output.push_str("meg");
-                output.push_str(&input[suffix + 1..end]);
-            } else {
-                output.push_str(&input[offset..end]);
-            }
-            offset = end;
+            offset = append_hspice_number(input, offset, &mut output);
         } else if (ch.is_ascii_alphabetic() || ch == '_')
             && (offset == 0 || !symbol_byte(bytes[offset - 1]))
         {

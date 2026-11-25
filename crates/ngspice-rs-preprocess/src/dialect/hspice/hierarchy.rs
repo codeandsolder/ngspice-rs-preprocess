@@ -1,12 +1,12 @@
 //! Explicit HSPICE occurrence bindings. Symbolic aliases avoid evaluating
 //! parameters at preparation time, so native analysis still owns expressions.
 //! Electrical instance names and terminal identities are never flattened.
-use super::{analysis_plan, map_values};
+use super::{analysis_plan, map_values, models};
 use crate::OriginLine;
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
     linked_source::RootKind,
-    model_card::{parse_assignments, positional_prefix},
+    model_card::{parse_assignments, parse_model_card, positional_prefix},
     parameter_scope::{ModelLibrary, SubcircuitIndex},
     statement_token_spans,
 };
@@ -112,7 +112,7 @@ fn inner(expression: &str) -> &str {
         .trim()
         .strip_prefix('{')
         .and_then(|text| text.strip_suffix('}'))
-        .unwrap_or(expression.trim())
+        .unwrap_or_else(|| expression.trim())
 }
 
 fn bind_values(text: &str, names: &Names, limit: usize) -> Result<String> {
@@ -167,7 +167,7 @@ fn multiplier_card(text: &str, factor: Option<&str>) -> Result<String> {
         return Ok(text.to_owned());
     }
     ensure!(
-        matches!(device, b'R' | b'C' | b'L' | b'I' | b'G' | b'F') || current_behavioral,
+        matches!(device, b'R' | b'C' | b'L' | b'I' | b'G' | b'F' | b'D') || current_behavioral,
         "unqualified multiplier on HSPICE device {command}"
     );
     let mut explicit = None;
@@ -205,6 +205,7 @@ struct Binder<'a> {
     prefix: String,
     serial: usize,
     active: Vec<usize>,
+    model_frames: Vec<(usize, Names)>,
     parameters: Rows,
     emitted_definitions: Rows,
     emitted_bytes: usize,
@@ -256,6 +257,57 @@ impl Binder<'_> {
         Ok(names)
     }
 
+    fn enter_models(&mut self, scope: usize, names: &Names) -> Result<()> {
+        let mut aliases = Names::new();
+        for line in self.definitions[scope].body.clone() {
+            if analysis_plan::command(self.lines[line]) != ".MODEL" {
+                continue;
+            }
+            let card = parse_model_card(self.lines[line], line + 1, &[])?;
+            let alias = if scope == 0 {
+                card.name.clone()
+            } else {
+                self.fresh('d')?
+            };
+            ensure!(
+                aliases
+                    .insert(card.name.to_ascii_uppercase(), alias.clone())
+                    .is_none(),
+                "duplicate HSPICE model {}",
+                card.name
+            );
+            let text = models::render(&card, &alias, |value| {
+                rewrite_parameter_symbols(value, names, false)
+            })?;
+            let row = self.account(text, line)?;
+            self.parameters.push(row);
+        }
+        self.model_frames.push((scope, aliases));
+        Ok(())
+    }
+
+    fn model_reference(&self, mut scope: usize, text: &str) -> Result<String> {
+        let spans = statement_token_spans(text)?;
+        let range = spans.get(3).context("missing HSPICE diode model name")?;
+        let model = text[range.clone()].to_ascii_uppercase();
+        loop {
+            let aliases = self
+                .model_frames
+                .iter()
+                .rev()
+                .find(|(id, _)| *id == scope)
+                .context("inactive lexical HSPICE model scope")?;
+            if let Some(alias) = aliases.1.get(&model) {
+                let mut output = text.to_owned();
+                output.replace_range(range.clone(), alias);
+                return Ok(output);
+            }
+            scope = self.source.scopes[scope]
+                .parent
+                .with_context(|| format!("unknown HSPICE diode model {model}"))?;
+        }
+    }
+
     fn call(
         &mut self,
         owner: usize,
@@ -304,6 +356,7 @@ impl Binder<'_> {
         let visible = self.visible(scope, parent, actuals)?;
         let native_name = self.fresh('s')?;
         self.active.push(scope);
+        self.enter_models(scope, &visible)?;
         let mut header = format!(".subckt {native_name}");
         for port in &self.source.scopes[scope].ports {
             write!(header, " {port}")?;
@@ -312,7 +365,10 @@ impl Binder<'_> {
         let closing = self.source.scopes[scope].end_line - 1;
         let mut body = vec![self.account(header, opening)?];
         for card in self.definitions[scope].body.clone() {
-            if analysis_plan::command(self.lines[card]) == ".PARAM" {
+            if matches!(
+                analysis_plan::command(self.lines[card]).as_str(),
+                ".PARAM" | ".MODEL"
+            ) {
                 continue;
             }
             let text = self.card(scope, card, &visible, multiplier.as_deref())?;
@@ -320,6 +376,7 @@ impl Binder<'_> {
         }
         body.push(self.account(format!(".ends {native_name}"), closing)?);
         self.active.pop();
+        self.model_frames.pop();
         self.emitted_definitions.extend(body);
         let mut call = instance.0.to_owned();
         for (node, _) in nodes {
@@ -349,6 +406,11 @@ impl Binder<'_> {
             return Ok(text.to_owned());
         }
         let bound = bind_values(text, names, self.limit)?;
+        let bound = if command.starts_with('D') {
+            self.model_reference(owner, &bound)?
+        } else {
+            bound
+        };
         multiplier_card(&bound, multiplier)
     }
 
@@ -359,9 +421,13 @@ impl Binder<'_> {
             .keys()
             .map(|name| (name.clone(), name.clone()))
             .collect();
+        self.enter_models(0, &names)?;
         let mut root = Vec::new();
         let mut ends = Vec::new();
         for card in self.definitions[0].body.clone() {
+            if analysis_plan::command(self.lines[card]) == ".MODEL" {
+                continue;
+            }
             let text = self.card(0, card, &names, None)?;
             let row = self.account(text, card)?;
             if analysis_plan::command(self.lines[card]) == ".END" {
@@ -424,6 +490,7 @@ pub fn bind(
         prefix,
         serial: 0,
         active: Vec::new(),
+        model_frames: Vec::new(),
         parameters: Vec::new(),
         emitted_definitions: Vec::new(),
         emitted_bytes: 0,

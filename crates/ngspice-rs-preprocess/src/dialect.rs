@@ -252,14 +252,13 @@ impl<'a> SourceExpansion<'a> {
                 continue;
             }
             let name = analysis_plan::command(&line.text);
-            if self.standalone {
-                ensure!(
-                    !matches!(name.as_str(), ".CONTROL" | ".ENDC" | ".FILE" | ".ENDF"),
-                    "unsupported standalone SPICE command {name} at {}:{}",
-                    source.path.display(),
-                    line.first_line
-                );
-            }
+            ensure!(
+                !self.standalone
+                    || !matches!(name.as_str(), ".CONTROL" | ".ENDC" | ".FILE" | ".ENDF"),
+                "unsupported standalone SPICE command {name} at {}:{}",
+                source.path.display(),
+                line.first_line
+            );
             if let Some(start) = model_translate_simplis::syntax::file_boundary(&line.text) {
                 embedded = start;
             }

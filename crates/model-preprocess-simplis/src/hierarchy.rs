@@ -1001,8 +1001,9 @@ pub fn project_resource(
     ))
 }
 
-/// Project a standalone SPICE-family resource, without selecting a SIMPLIS or
-/// SIMetrix multi-simulator library view. The deck title is retained verbatim
+/// Project a standalone SPICE-family resource.
+///
+/// Unlike multi-simulator projection, the deck title is retained verbatim
 /// and cannot participate in comment, continuation, or directive processing.
 ///
 /// # Errors
