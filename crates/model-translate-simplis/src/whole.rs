@@ -931,6 +931,12 @@ enum RawQPolarity {
     Negative,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RawQFlow {
+    Unidirectional,
+    Bidirectional,
+}
+
 #[derive(Clone, Debug)]
 struct RawVcqModel {
     control: RawQControl,
@@ -943,7 +949,7 @@ struct RawVcqModel {
     hystwd: f64,
     logic: String,
     level: usize,
-    iflow: String,
+    iflow: RawQFlow,
 }
 
 fn raw_vcq_model(statement: &str) -> Result<Option<(String, RawVcqModel)>> {
@@ -979,11 +985,35 @@ fn raw_vcq_model(statement: &str) -> Result<Option<(String, RawVcqModel)>> {
         || "POS".to_owned(),
         |value| value.trim_matches('\'').to_ascii_uppercase(),
     );
-    let iflow = parameters.get("IFLOW").map_or_else(
-        || "BIDIR".to_owned(),
-        |value| value.trim_matches('\'').to_ascii_uppercase(),
-    );
-    if !(rsat > 0.0 && roff > rsat && gain > 0.0 && hystwd >= 0.0) {
+    let iflow = match parameters
+        .get("IFLOW")
+        .map(|value| value.trim_matches('\'').to_ascii_uppercase())
+        .as_deref()
+    {
+        None | Some("UNIDIR") => RawQFlow::Unidirectional,
+        Some("BIDIR") => RawQFlow::Bidirectional,
+        Some(other) => bail!("unsupported SIMPLIS transistor-switch IFLOW={other}"),
+    };
+    if parameters.keys().any(|name| {
+        !matches!(
+            name.as_str(),
+            "VSAT" | "RSAT" | "ROFF" | "GAIN" | "TH" | "HYSTWD" | "LOGIC" | "LEVEL" | "IFLOW"
+        )
+    }) {
+        bail!(
+            "unsupported SIMPLIS transistor-switch model parameter on {}",
+            tokens[1]
+        );
+    }
+    if iflow == RawQFlow::Bidirectional && vsat != 0.0 {
+        bail!("SIMPLIS IFLOW=BIDIR requires VSAT=0");
+    }
+    if (polarity == RawQPolarity::Positive && vsat < 0.0)
+        || (polarity == RawQPolarity::Negative && vsat > 0.0)
+    {
+        bail!("SIMPLIS transistor-switch VSAT has the wrong polarity");
+    }
+    if !(rsat > 0.0 && roff > rsat && gain > 0.0 && hystwd > 0.0) {
         bail!("invalid SIMPLIS transistor-switch model {}", tokens[1]);
     }
     if !matches!(logic.as_str(), "POS" | "NEG") {
@@ -1246,11 +1276,17 @@ fn raw_vcsw_model(statement: &str) -> Result<Option<(String, RawVcswModel)>> {
             || "POS".to_owned(),
             |value| value.trim_matches('\'').to_ascii_uppercase(),
         );
-        if hystwd < 0.0 {
+        if hystwd <= 0.0 {
             bail!("invalid SIMPLIS VCSW model {}", tokens[1]);
         }
         if !matches!(logic.as_str(), "POS" | "NEG") {
             bail!("unsupported SIMPLIS VCSW LOGIC={logic}");
+        }
+        if parameters
+            .keys()
+            .any(|name| !matches!(name.as_str(), "RON" | "ROFF" | "TH" | "HYSTWD" | "LOGIC"))
+        {
+            bail!("unsupported SIMPLIS VCSW model parameter on {}", tokens[1]);
         }
         VcswTransfer::ShortTransition {
             ron,
@@ -2859,16 +2895,19 @@ fn q_closed_current_expression(
     }
 
     let logic_sign = if model.logic == "POS" { 1.0 } else { -1.0 };
-    let type_sign = match model.polarity {
-        RawQPolarity::Positive => 1.0,
-        RawQPolarity::Negative => -1.0,
-    };
-    let gain = spice_number(type_sign * logic_sign * model.gain)?;
+    let gain = spice_number(logic_sign * model.gain)?;
     let offset = spice_number(model.threshold - logic_sign * model.hystwd / 2.0)?;
-    let active = format!("({leak}+{gain}*(({control})-{offset}))");
-    let closed = match model.polarity {
-        RawQPolarity::Positive => format!("max({leak},min({active},{saturated}))"),
-        RawQPolarity::Negative => format!("min({leak},max({active},{saturated}))"),
+    let amplitude = format!("max(0,{gain}*(({control})-{offset}))");
+    let lower = format!("({leak}-{amplitude})");
+    let upper = format!("({leak}+{amplitude})");
+    let closed = match (model.iflow, model.polarity) {
+        (RawQFlow::Bidirectional, _) => format!("max({lower},min({upper},{saturated}))"),
+        (RawQFlow::Unidirectional, RawQPolarity::Positive) => {
+            format!("max({leak},min({upper},{saturated}))")
+        }
+        (RawQFlow::Unidirectional, RawQPolarity::Negative) => {
+            format!("min({leak},max({lower},{saturated}))")
+        }
     };
     Ok((leak, closed))
 }
@@ -2951,13 +2990,13 @@ fn emit_qswitch(
 
 fn switch_closed_hint(value: Option<&str>) -> Result<bool> {
     match value
-        .unwrap_or("OPEN")
+        .context("SIMPLIS switch requires IC=OPEN or IC=CLOSE")?
         .trim_matches('\'')
         .to_ascii_uppercase()
         .as_str()
     {
         "OPEN" => Ok(false),
-        "CLOSE" | "CLOSED" => Ok(true),
+        "CLOSE" => Ok(true),
         other => bail!("unsupported SIMPLIS switch IC={other}"),
     }
 }
@@ -2982,9 +3021,6 @@ fn translate_raw_vcq_device(statement: &str, scope: &ScopeAnalysis) -> Result<Op
     };
     if matches!(model.control, RawQControl::Current) && model_index != 4 {
         bail!("SIMPLIS current-controlled transistor switch requires one control branch");
-    }
-    if model.iflow != "BIDIR" {
-        bail!("SIMPLIS transistor-switch lowering requires IFLOW=BIDIR");
     }
     for node in &tokens[1..3] {
         validate_node(node)?;
@@ -5944,7 +5980,7 @@ Q1 drain 0 !RGAIN MQ IC=OPEN
         let source = br"!RGAIN gate 0 MG IC=1
 .MODEL MG VPWLR NSEG=2 X0=-1 Y0=-1 X1=0 Y1=0 X2=1 Y2=1
 Q1 0 drain !RGAIN MQ IC=CLOSE
-.MODEL MQ ICQNEG VSAT=-0.2 RSAT=0.1 ROFF=10Meg GAIN=3 TH=0 HYSTWD=2m LOGIC=NEG LEVEL=2 IFLOW=BIDIR
+.MODEL MQ ICQNEG VSAT=-0.2 RSAT=0.1 ROFF=10Meg GAIN=3 TH=0 HYSTWD=2m LOGIC=NEG LEVEL=2 IFLOW=UNIDIR
 .end
 ";
         let translated = translate_simplis_deck(source)?;
@@ -5964,7 +6000,7 @@ Q1 0 drain !RGAIN MQ IC=CLOSE
     fn translates_level_one_vcqpos_with_vsat() -> Result<()> {
         let source = br"VCTRL ctrl 0 3
 Q1 a 0 ctrl 0 MQ IC=CLOSE
-.MODEL MQ VCQPOS VSAT=0.1 RSAT=0.1 ROFF=10Meg GAIN=7 TH=2.5 HYSTWD=0.1 LOGIC=POS LEVEL=1 IFLOW=BIDIR
+.MODEL MQ VCQPOS VSAT=0.1 RSAT=0.1 ROFF=10Meg GAIN=7 TH=2.5 HYSTWD=0.1 LOGIC=POS LEVEL=1 IFLOW=UNIDIR
 R1 a 0 1k
 .end
 ";
@@ -5978,6 +6014,59 @@ R1 a 0 1k
         assert!(text.contains("B__Q1_BRANCH a 0 I='"));
         assert!(text.contains("-1.00000000000000006e-1"));
         assert!(!text.contains(" VCQPOS "));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_switch_rejects_vendor_invalid_models_and_initial_conditions() -> Result<()> {
+        let model = ".MODEL MQ VCQPOS VSAT=0 RSAT=10 ROFF=1Meg GAIN=0.002 TH=2.5 HYSTWD=1 LOGIC=POS LEVEL=2";
+        for (from, to) in [
+            ("HYSTWD=1", "HYSTWD=0"),
+            ("ROFF=1Meg", "ROFF=10"),
+            ("VSAT=0", "VSAT=-0.1"),
+            ("GAIN=0.002", "GAIN=0"),
+            ("LEVEL=2", "LEVEL=3"),
+            ("LEVEL=2", "LEVEL=2 IFLOW=OTHER"),
+            ("VSAT=0", "VSAT=0.1 IFLOW=BIDIR"),
+            ("LEVEL=2", "LEVEL=2 UNSUPPORTED=1"),
+        ] {
+            let source = format!(
+                "Vctrl c 0 5\nQ1 a 0 c 0 MQ IC=CLOSE\n{}\n.end\n",
+                model.replace(from, to)
+            );
+            assert!(
+                translate_simplis_deck(source.as_bytes()).is_err(),
+                "{source}"
+            );
+        }
+        for hint in ["", " IC=CLOSED", " IC=OTHER"] {
+            let source = format!("Vctrl c 0 5\nQ1 a 0 c 0 MQ{hint}\n{model}\n.end\n");
+            assert!(
+                translate_simplis_deck(source.as_bytes()).is_err(),
+                "{source}"
+            );
+        }
+        for hint in ["", " IC=CLOSED"] {
+            let source = format!(
+                "Vctrl c 0 5\nS1 a 0 c 0 MS{hint}\n.MODEL MS VCSW RON=10 ROFF=1Meg TH=2.5 HYSTWD=1 LOGIC=POS\n.end\n"
+            );
+            assert!(
+                translate_simplis_deck(source.as_bytes()).is_err(),
+                "{source}"
+            );
+        }
+        let default = format!("Vctrl c 0 5\nQ1 a 0 c 0 MQ IC=CLOSE\n{model}\n.end\n");
+        let explicit = default.replace("LEVEL=2", "LEVEL=2 IFLOW=UNIDIR");
+        let bidir = default.replace("LEVEL=2", "LEVEL=2 IFLOW=BIDIR");
+        let default = translate_simplis_deck(default.as_bytes())?;
+        assert_eq!(
+            default.bytes,
+            translate_simplis_deck(explicit.as_bytes())?.bytes
+        );
+        assert_ne!(
+            default.bytes,
+            translate_simplis_deck(bidir.as_bytes())?.bytes
+        );
         Ok(())
     }
 

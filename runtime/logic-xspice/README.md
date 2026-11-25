@@ -53,7 +53,20 @@ threshold band; control values outside it determine the initial state.
 The analog voltage bridge represents the state as an exact 0 or 1 for
 the branch current law. Simple switches preserve their specified RON
 and ROFF, while transistor switches retain their LEVEL=1 or LEVEL=2
-current law and support current as well as voltage control.
+current law and support current as well as voltage control. Raw SIMPLIS
+switch instances require `IC=OPEN` or `IC=CLOSE`. For transistor
+switches, omitted `IFLOW` means `UNIDIR`. Let L = V/ROFF,
+S = (V - VSAT)/RSAT, and A = GAIN times the nonnegative overdrive
+measured from the release threshold for the selected control logic.
+Open current is L. Closed LEVEL=1 current is S; LEVEL=2 clamps S to
+[L-A,L+A] for BIDIR, [L,L+A] for positive UNIDIR, or [L-A,L] for
+negative UNIDIR. BIDIR requires VSAT=0. The signed VSAT must agree
+with the device polarity, RSAT must be less than ROFF, and hysteresis
+width and gain must be positive. These constraints apply to raw SIMPLIS
+models, not SIMetrix timed VSWITCH or PSpice resistance interpolation.
+The native regression checks the independent load-line solution for
+both bias signs, threshold endpoints, in-band initial hints, both
+control types, both levels and both flow modes (including the default).
 
 Timed SIMetrix VSWITCH (the VT form) uses the separate
 `preprocess_timed_switch` model. Its differential voltage input has no

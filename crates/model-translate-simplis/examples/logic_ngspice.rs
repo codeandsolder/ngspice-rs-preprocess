@@ -510,34 +510,54 @@ fn switch_startup_and_load_lines(runtime: &Path) -> Result<()> {
                                 ("VC", format!("c{index} rtn")),
                                 ("IC", format!("Vi{index}")),
                             ] {
-                                let q = format!("{suffix}{kind}{level}{control_kind}");
-                                let vsat = 0.1 * sign;
-                                writeln!(source, "Q{q} q{q} rtn {pins} mq{q} IC={ic}")?;
-                                writeln!(
-                                    source,
-                                    ".model mq{q} {control_kind}Q{kind} VSAT={vsat} RSAT=10 ROFF=1Meg GAIN=0.002 TH=2.5 HYSTWD=1 LOGIC={logic} LEVEL={level}"
-                                )?;
-                                writeln!(source, "Rq{q} {rail} q{q} 100")?;
-                                let off = bias / (1.0 + 100.0 / 1e6);
-                                let sat = 100.0_f64.mul_add(vsat, bias * 10.0) / 110.0;
-                                let overdrive = if negative {
-                                    3.0 - control
-                                } else {
-                                    control - 2.0
-                                };
-                                let active = (100.0 * sign * 0.002).mul_add(-overdrive, bias)
-                                    / (1.0 + 100.0 / 1e6);
-                                let expected = if !closed {
-                                    off
-                                } else if level == 1 {
-                                    sat
-                                } else if sign.is_sign_positive() {
-                                    active.max(sat).min(off)
-                                } else {
-                                    active.min(sat).max(off)
-                                };
-                                for time in [0.0, 8.0] {
-                                    checks.push((format!("q{q}"), time, expected));
+                                for (flow, bidir) in [
+                                    ("", false),
+                                    (" IFLOW=UNIDIR", false),
+                                    (" IFLOW=BIDIR", true),
+                                ] {
+                                    let flow_id = if flow.is_empty() {
+                                        "default"
+                                    } else if bidir {
+                                        "bi"
+                                    } else {
+                                        "uni"
+                                    };
+                                    let q = format!("{suffix}{kind}{level}{control_kind}{flow_id}");
+                                    let vsat = if bidir { 0.0 } else { 0.1 * sign };
+                                    writeln!(source, "Q{q} q{q} rtn {pins} mq{q} IC={ic}")?;
+                                    writeln!(
+                                        source,
+                                        ".model mq{q} {control_kind}Q{kind} VSAT={vsat} RSAT=10 ROFF=1Meg GAIN=0.002 TH=2.5 HYSTWD=1 LOGIC={logic} LEVEL={level}{flow}"
+                                    )?;
+                                    writeln!(source, "Rq{q} {rail} q{q} 100")?;
+                                    let off = bias / (1.0 + 100.0 / 1e6);
+                                    let sat = 100.0_f64.mul_add(vsat, bias * 10.0) / 110.0;
+                                    let overdrive = if negative {
+                                        3.0 - control
+                                    } else {
+                                        control - 2.0
+                                    };
+                                    let amplitude = 100.0 * 0.002 * overdrive.max(0.0);
+                                    let lo = if bidir || sign.is_sign_positive() {
+                                        (bias - amplitude) / (1.0 + 100.0 / 1e6)
+                                    } else {
+                                        off
+                                    };
+                                    let hi = if bidir || sign.is_sign_negative() {
+                                        (bias + amplitude) / (1.0 + 100.0 / 1e6)
+                                    } else {
+                                        off
+                                    };
+                                    let expected = if !closed {
+                                        off
+                                    } else if level == 1 {
+                                        sat
+                                    } else {
+                                        sat.clamp(lo, hi)
+                                    };
+                                    for time in [0.0, 8.0] {
+                                        checks.push((format!("q{q}"), time, expected));
+                                    }
                                 }
                             }
                         }
