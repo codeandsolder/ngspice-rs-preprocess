@@ -99,6 +99,93 @@ pub(crate) fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
     Ok(parsed)
 }
 
+/// Read positional tokens up to the first named parameter or PARAMS: marker.
+/// Parenthesized terminal lists and commas use the same token boundaries as
+/// native ngspice. Return the unconsumed assignment text.
+pub(crate) fn positional_prefix(input: &str) -> (Vec<(&str, usize)>, &str) {
+    let mut source = Source {
+        text: input,
+        offset: 0,
+    };
+    let mut tokens = Vec::new();
+    loop {
+        while input
+            .as_bytes()
+            .get(source.offset)
+            .is_some_and(|b| b.is_ascii_whitespace() || matches!(*b, b',' | b'(' | b')'))
+        {
+            source.offset += 1;
+        }
+        let start = source.offset;
+        let token = source.name();
+        if token.is_empty() {
+            return (tokens, &input[start..]);
+        }
+        if token
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("params:"))
+        {
+            return (tokens, &input[start + 7..]);
+        }
+        source.skip_space();
+        if input.as_bytes().get(source.offset) == Some(&b'=') {
+            return (tokens, &input[start..]);
+        }
+        tokens.push((token, start + token.len()));
+    }
+}
+
+/// Named scalar/flag parameters of an already identified MOS instance.
+pub(crate) fn instance_fields(input: &str) -> Result<Vec<ModelParameter>> {
+    let mut source = Source {
+        text: input,
+        offset: 0,
+    };
+    let mut parsed = Vec::new();
+    loop {
+        source.skip_separators();
+        if source.offset == input.len() {
+            return Ok(parsed);
+        }
+        let name = source.name();
+        ensure!(!name.is_empty(), "invalid instance parameter in {input}");
+        source.skip_space();
+        let expression = if input.as_bytes().get(source.offset) == Some(&b'=') {
+            source.offset += 1;
+            source.skip_space();
+            let start = source.offset;
+            source.value()?;
+            // Native IC supports one or two scalars, parenthesized or
+            // comma-separated; keep the entire vector for typed binding.
+            if name.eq_ignore_ascii_case("ic") {
+                let end = source.offset;
+                source.skip_space();
+                let first = input.as_bytes().get(source.offset).copied();
+                if first == Some(b',') {
+                    source.offset += 1;
+                    source.skip_space();
+                    source.value()?;
+                } else if input[start..end].starts_with('(') {
+                    source.offset = end;
+                } else if first.is_some_and(|b| {
+                    b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'{' | b'\'' | b'(')
+                }) {
+                    source.value()?;
+                } else {
+                    source.offset = end;
+                }
+            }
+            Some(input[start..source.offset].to_owned())
+        } else {
+            None
+        };
+        parsed.push(ModelParameter {
+            name: name.to_owned(),
+            expression,
+        });
+    }
+}
+
 fn is_model_start(line: &[u8]) -> bool {
     let Some(prefix) = line.get(..6) else {
         return false;
@@ -188,7 +275,7 @@ impl<'a> Source<'a> {
     }
 }
 
-fn parse_one(statement: &str, source_line: usize) -> Result<ModelCard> {
+pub(crate) fn parse_one(statement: &str, source_line: usize) -> Result<ModelCard> {
     let mut source = Source {
         text: statement,
         offset: 6,

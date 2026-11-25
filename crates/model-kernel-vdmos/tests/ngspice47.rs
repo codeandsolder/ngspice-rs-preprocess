@@ -895,40 +895,30 @@ fn synthetic_reversed_cgd_endpoints_match_ngspice47() -> Result<()> {
 }
 
 fn parameterized_oracle(fixture: &str) -> Result<()> {
-    use model_normalize_ngspice::{parameter_scope::ModelLibrary, vdmos_card::VdmosPolarity};
+    use model_normalize_ngspice::{
+        linked_source::RootKind,
+        parameter_scope::{ModelLibrary, topology::Limits},
+    };
     let source = std::fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(fixture),
     )?;
-    let library = ModelLibrary::parse(&source)?;
-    if library.models.len() != 1 {
-        return Err("unexpected source model count".into());
-    }
+    let library = ModelLibrary::parse_source(&source, RootKind::Deck)?;
+    let topology = library.instantiate(Limits::default())?;
     let stdout = run_oracle(fixture)?;
-    let call_gain = if fixture.ends_with("scope_expr.cir") {
-        library.evaluate_scalar(0, "{gain*2}", &[])?
-    } else {
-        4.0
-    };
-    let overrides = [(1, "gain", call_gain)];
-    let cases = if fixture.ends_with("scope.cir")
-        || fixture.ends_with("scope_expr.cir")
-        || fixture.ends_with("function_scope.cir")
-        || fixture.ends_with("function_capture.cir")
-        || fixture.ends_with("param_capture.cir")
-    {
-        vec![
-            ("@m.x1.m1[id]", overrides.as_slice()),
-            ("@m.x2.m1[id]", &[][..]),
-        ]
-    } else {
-        vec![("@m1[id]", &[][..])]
-    };
-    for (vector, overrides) in cases {
-        let model = library
-            .resolve_vdmos(0, overrides)?
-            .ok_or("no VDMOS model")?;
+    assert!(!topology.mos.is_empty());
+    for mos in &topology.mos {
+        let bound = mos.vdmos.as_ref().ok_or("no VDMOS binding")?;
+        let model = &topology.models[bound.model].values;
+        // These fixtures contain root or one-level X occurrences. The C
+        // printed name is an oracle locator, not the topology identity.
+        let frame = &topology.frames[mos.frame];
+        let vector = if frame.parent.is_none() {
+            format!("@{}[id]", mos.name)
+        } else {
+            format!("@m.{}.{}[id]", frame.name, mos.name)
+        };
         let sign = if matches!(model.polarity, VdmosPolarity::N) {
             1.0
         } else {
@@ -936,18 +926,21 @@ fn parameterized_oracle(fixture: &str) -> Result<()> {
         };
         let prepared = compile_ngspice(
             if sign > 0.0 { Polarity::N } else { Polarity::P },
-            model.parameters,
+            model.parameters.iter().copied(),
         )?;
-        let device = prepared.bind(Instance::default())?;
+        let device = prepared.bind(Instance {
+            multiplier: bound.instance.multiplier,
+            self_heating: bound.self_heating,
+        })?;
         let evaluated = device.evaluate(Bias {
             vgs: sign * 4.0,
             vds: sign * 0.25,
-            temperature: 300.15,
+            temperature: bound.instance.ambient_kelvin(300.15)?,
             ..Bias::default()
         })?;
         let line = stdout
             .lines()
-            .find(|line| line.trim_start().starts_with(vector))
+            .find(|line| line.trim_start().starts_with(&vector))
             .ok_or_else(|| format!("{fixture}: no {vector} in ngspice output"))?;
         let (_, raw) = line
             .split_once('=')
