@@ -69,15 +69,25 @@ fn parse_root(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBund
     Ok(bundle(root, format, artifact, Vec::new()))
 }
 
-fn resolve_init(parent: &Path, target: &Path) -> Result<PathBuf> {
+fn resolve_init(session: &SourceSession, parent: &Path, target: &Path) -> Result<PathBuf> {
     if target.is_absolute() {
-        return Ok(target.canonicalize()?);
+        return Ok(session.resolve_path(target)?);
     }
     let base = parent.parent().context("source has no parent directory")?;
-    let matches = base
-        .ancestors()
-        .filter_map(|ancestor| ancestor.join(target).canonicalize().ok())
-        .collect::<BTreeSet<_>>();
+    let mut matches = BTreeSet::new();
+    for ancestor in base.ancestors() {
+        let candidate = ancestor.join(target);
+        match session.resolve_path(&candidate) {
+            Ok(path) => {
+                matches.insert(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("resolving init snapshot {}", candidate.display()));
+            }
+        }
+    }
     ensure!(
         matches.len() == 1,
         "missing or ambiguous init snapshot {} from {}: {matches:?}",
@@ -135,7 +145,7 @@ impl InitExpansion<'_> {
                     .and_then(|value| value.to_str())
                     .is_some_and(|value| value.eq_ignore_ascii_case("init"))
                 {
-                    let path = resolve_init(&source.path, target)?;
+                    let path = resolve_init(self.session, &source.path, target)?;
                     let snapshot = self.session.load(&path)?;
                     self.expand(&snapshot)?;
                     continue;

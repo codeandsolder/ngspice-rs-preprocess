@@ -104,6 +104,17 @@ pub struct AdmittedSource {
     pub bytes: Arc<[u8]>,
 }
 
+fn missing_origin(origin: &Path) -> io::Result<PathBuf> {
+    let name = origin
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "origin must name a source"))?;
+    let directory = origin
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(directory.canonicalize()?.join(name))
+}
+
 /// A source graph's admission cache.
 ///
 /// Paths are canonicalized before admission;
@@ -137,10 +148,39 @@ impl SourceSession {
     /// invalid process configuration, child failure or timeout.
     pub fn load(&mut self, path: &Path) -> Result<AdmittedSource> {
         self.cancellation.check()?;
-        let path = path
-            .canonicalize()
+        let path = self
+            .resolve_path(path)
             .with_context(|| format!("resolving {}", path.display()))?;
         self.admit(path, Self::read)
+    }
+
+    /// Resolve a resource to its canonical source identity, including virtual
+    /// files and removed files already admitted in this session.
+    ///
+    /// # Errors
+    ///
+    /// The resource does not exist in the filesystem or session, is not a
+    /// regular file, or its path cannot be resolved.
+    pub fn resolve_path(&self, path: &Path) -> io::Result<PathBuf> {
+        let canonical = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let candidate = missing_origin(path)?;
+                if self.sources.contains_key(&candidate) {
+                    return Ok(candidate);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if self.sources.contains_key(&canonical) || canonical.metadata()?.is_file() {
+            Ok(canonical)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("source is not a regular file: {}", canonical.display()),
+            ))
+        }
     }
 
     /// Admit caller-owned bytes with an explicit original pathname. A virtual
@@ -161,14 +201,7 @@ impl SourceSession {
                 );
                 path
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let name = origin.file_name().context("origin must name a source")?;
-                let directory = origin
-                    .parent()
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                directory.canonicalize()?.join(name)
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing_origin(origin)?,
             Err(error) => return Err(error.into()),
         };
         self.admit(path, |session, path| {

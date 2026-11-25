@@ -276,3 +276,27 @@ fn equal_library_content_under_multiple_names_retains_all_include_aliases() -> R
     assert_eq!(sources.len(), 2);
     Ok(())
 }
+
+#[test]
+fn virtual_source_can_reference_its_own_named_section_and_detect_cycles() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("virtual.cir");
+    let mut req = request(InputFormat::NativeDeck, &path);
+    req.input = SourceInput::Bytes {
+        origin: path.clone(),
+        bytes: Arc::from(
+            &b"Title\n.lib chosen\nR1 a 0 1k\n.endl chosen\n.lib virtual.cir chosen\n.end\n"[..],
+        ),
+    };
+    let output = prepare_default(&req)?;
+    assert_eq!(output.primary.bytes, b"Title\nR1 a 0 1k\n.end\n");
+    req.input = SourceInput::Bytes {
+        origin: path,
+        bytes: Arc::from(&b"Title\n.include virtual.cir\n.end\n"[..]),
+    };
+    let error = prepare_default(&req)
+        .err()
+        .context("recursive include accepted")?;
+    assert!(format!("{error:#}").contains("recursive ngspice source include"));
+    Ok(())
+}

@@ -235,13 +235,14 @@ impl LinkState<'_> {
         let local = parent.parent().into_iter().map(|dir| dir.join(path));
         let candidates = local.chain(self.settings.search_paths.iter().map(|dir| dir.join(path)));
         for candidate in candidates {
-            if let Ok(canonical) = candidate.canonicalize() {
-                ensure!(
-                    canonical.is_file(),
-                    "linked source is not a regular file: {}",
-                    canonical.display()
-                );
-                return Ok(canonical);
+            match self.admission.resolve_path(&candidate) {
+                Ok(canonical) => return Ok(canonical),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("resolving linked source {}", candidate.display())
+                    });
+                }
             }
         }
         bail!(
