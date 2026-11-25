@@ -2119,9 +2119,7 @@ fn lower_simetrix_conditional(input: &str, name: &str, open: usize) -> Result<(S
     let lowered = if name.eq_ignore_ascii_case("IF") || name.eq_ignore_ascii_case("IFF") {
         format!("(({first}) ? ({second}) : ({third}))")
     } else {
-        format!(
-            "(({first}) > ({second}) ? ({second}) : (({first}) < ({third}) ? ({third}) : ({first})))"
-        )
+        format!("min(max({first},min({second},{third})),max({second},{third}))")
     };
     Ok((lowered, close + 1))
 }
@@ -5198,7 +5196,7 @@ fn sanitize_native_passive(statement: &str) -> Result<String> {
             );
         }
 
-        if kind == Some(b'R') && key.eq_ignore_ascii_case("TC") {
+        if matches!(kind, Some(b'R' | b'C')) && index >= 3 && key.eq_ignore_ascii_case("TC") {
             let mut values = Vec::new();
             if let Some((_, value)) = token.split_once('=') {
                 values.extend(
@@ -5211,7 +5209,7 @@ fn sanitize_native_passive(statement: &str) -> Result<String> {
             } else {
                 let first = tokens
                     .get(index.saturating_add(1))
-                    .context("PSpice resistor TC has no first coefficient")?;
+                    .context("PSpice passive TC has no first coefficient")?;
                 values.extend(
                     first
                         .split(',')
@@ -5230,7 +5228,7 @@ fn sanitize_native_passive(statement: &str) -> Result<String> {
                 index += 1;
             }
             if values.is_empty() || values.len() > 2 {
-                bail!("unsupported PSpice resistor TC coefficients in {statement}");
+                bail!("unsupported PSpice passive TC coefficients in {statement}");
             }
             filtered.push(format!("TC1={}", values[0]));
             if let Some(second) = values.get(1) {

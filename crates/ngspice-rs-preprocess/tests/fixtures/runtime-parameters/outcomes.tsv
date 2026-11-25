@@ -20,3 +20,10 @@ nested-lexical	undefined
 no-global-default	undefined
 sibling-expression	pass
 unused	pass
+bare-capacitor-inductor	pass
+bare-formal	pass
+bare-forward	pass
+bare-global	pass
+bare-implicit	pass
+bare-local	pass
+bare-same-instance	pass
