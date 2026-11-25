@@ -452,3 +452,75 @@ quit
         close(row[2], 1.5);
     })
 }
+
+#[test]
+fn model_temperature_inheritance_preserves_measurement_and_operating_coordinates() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    let source = br"Temperature model inheritance
+.param base_temp=25 delta=10
+V1 a 0 1
+V2 b 0 1
+V3 c 0 1
+V4 d 0 1
+V5 e 0 1
+R1 a 0 ABSOLUTE 1k
+R2 b 0 RELATIVE 1k
+R3 c 0 DERIVED 1k
+R4 d 0 AMBIENT 1k
+R5 e 0 DERIVED2 1k
+.model ABSOLUTE RES(R=1 TC1=0.001 T_MEASURED=0 T_ABS={base_temp})
+.model RELATIVE AKO:ABSOLUTE RES(T_REL_GLOBAL={delta})
+.model DERIVED AKO:ABSOLUTE RES(T_REL_LOCAL={delta})
+.model AMBIENT AKO:RELATIVE RES(T_REL_LOCAL={delta})
+.model DERIVED2 AKO:DERIVED RES(T_REL_LOCAL=5)
+.temp 100
+.control
+set wr_singlescale
+set wr_vecnames
+op
+wrdata response.dat i(v1) i(v2) i(v3) i(v4) i(v5)
+quit
+.endc
+.end
+";
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    let native = std::str::from_utf8(&prepared.primary.bytes)?;
+    assert!(!native.to_ascii_lowercase().contains("t_rel_"));
+    assert!(!native.to_ascii_lowercase().contains("t_abs"));
+    assert!(!native.to_ascii_lowercase().contains("t_measured"));
+    // Independent vendor-defined temperature coordinates. The C compatibility
+    // frontend does not implement T_REL_LOCAL and can miss T_MEASURED when
+    // T_ABS also occurs, so it is not the oracle for this particular case.
+    if let Some(rows) = rows(
+        &directory.path().join("native"),
+        &prepared.primary.bytes,
+        false,
+    )? {
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 6);
+        for (&current, temperature) in rows[0][1..].iter().zip([25., 110., 35., 100., 40.]) {
+            close(current, -1. / (1000. * (1. + 0.001 * temperature)));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn conflicting_model_temperature_customizations_fail() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.lib");
+    for input in [
+        ".model D1 D(T_ABS=20 T_REL_GLOBAL=5)\n",
+        ".model D1 D(T_REL_LOCAL=5)\n",
+        ".model D1 D(T_ABS=20)\n.model D2 AKO:D1 D(T_REL_LOCAL=5 T_ABS=30)\n",
+    ] {
+        fs::write(&path, input)?;
+        assert!(
+            prepare_source(&path, InputFormat::PspiceLibrary).is_err(),
+            "{input}"
+        );
+    }
+    Ok(())
+}

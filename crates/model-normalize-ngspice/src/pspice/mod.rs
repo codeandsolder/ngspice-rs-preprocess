@@ -19,6 +19,7 @@ use std::{
 mod instances;
 mod nodes;
 mod scope;
+mod temperature;
 use scope::Scopes;
 
 const TEMPERATURE_PARAMS: &str = ".param temp='temper'\n.param vt='(temper+273.15)*8.6173303e-5'";
@@ -437,10 +438,6 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
             !matches!(name.split('/').next(), Some("dev" | "lot")),
             "PSpice statistical model field {} requires a realization policy",
             p.name
-        );
-        ensure!(
-            name != "t_rel_local",
-            "PSpice T_REL_LOCAL requires AKO model inheritance"
         );
     }
     for (from, to) in [

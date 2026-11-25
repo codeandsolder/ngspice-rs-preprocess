@@ -277,7 +277,7 @@ fn native(
         RootKind::Include
     };
     let origin = root.path.clone();
-    let linker = SourceLinker {
+    let source_resolver = SourceLinker {
         search_paths: request.search_paths.clone(),
     };
     let limits = LinkLimits {
@@ -288,9 +288,9 @@ fn native(
         InputFormat::PspiceDeck | InputFormat::PspiceLibrary
     );
     let linked = if pspice {
-        linker.link_pspice_admitted(root, kind, limits, session)?
+        source_resolver.link_pspice_admitted(root, kind, limits, session)?
     } else {
-        linker.link_admitted(root, kind, limits, session)?
+        source_resolver.link_admitted(root, kind, limits, session)?
     };
     let (normalized, device_identities) = if pspice {
         let normalized = model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?;

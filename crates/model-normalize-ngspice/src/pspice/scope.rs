@@ -207,6 +207,7 @@ impl Scopes {
         }
         let base = stack.pop().context("empty PSpice model chain")?;
         let mut model = base.card.clone();
+        super::temperature::validate_base(&model)?;
         for derived in stack.into_iter().rev() {
             ensure!(
                 derived.card.family.eq_ignore_ascii_case(&model.family),
@@ -217,9 +218,7 @@ impl Scopes {
             );
             model.name.clone_from(&derived.card.name);
             model.source_line = derived.card.source_line;
-            model
-                .parameters
-                .extend(derived.card.parameters.iter().cloned());
+            super::temperature::inherit(&mut model, &derived.card)?;
         }
         Ok(model)
     }
