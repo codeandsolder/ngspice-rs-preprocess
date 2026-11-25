@@ -1,0 +1,76 @@
+The following licenses and notices apply to different portions of this package.
+
+Original codeandsolder Rust code is available under the MIT license below.
+Source-derived HiSIM-HV1/HV2 rules and numerical expressions are subject to
+Hiroshima University / STARC's upstream HiSIM_HV Distribution Statement and
+Copyright Notice, reproduced after the MIT text. The repository's root MIT
+license does not override those third-party rights and conditions.
+
+=== MIT license for independently authored code ===
+
+MIT License
+
+Copyright (c) 2026 Jan Równicki / codeandsolder
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+=== HiSIM-HV1/HV2 upstream source notice and terms ===
+
+Copyright (C) 2012 Hiroshima University & STARC (HiSIM-HV1)
+Copyright (C) 2014 Hiroshima University & STARC (HiSIM-HV2)
+
+-----HISIM_HV Distribution Statement and Copyright Notice--------------
+
+Software is distributed as is, completely without warranty or service
+support. Hiroshima University or STARC and its employees are not liable
+for the condition or performance of the software.
+
+Hiroshima University and STARC own the copyright and grant users a perpetual,
+irrevocable, worldwide, non-exclusive, royalty-free license with respect
+to the software as set forth below.
+
+Hiroshima University and STARC hereby disclaims all implied warranties.
+
+Hiroshima University and STARC grant the users the right to modify, copy,
+and redistribute the software and documentation, both within the user's
+organization and externally, subject to the following restrictions
+
+1. The users agree not to charge for Hiroshima University and STARC code
+itself but may charge for additions, extensions, or support.
+
+2. In any product based on the software, the users agree to acknowledge
+Hiroshima University and STARC that developed the software. This
+acknowledgment shall appear in the product documentation.
+
+3. The users agree to reproduce any copyright notice which appears on
+the software on any copy or modification of such made available
+to others."
+
+Toshimasa Asahara, President, Hiroshima University
+Mitiko Miura-Mattausch, Professor, Hiroshima University
+Katsuhiro Shimohigashi, President&CEO, STARC
+June 2008 (revised October 2011)
+
+Upstream reference files (ngspice checkout commit 972dbf45d):
+src/spicelib/devices/hisimhv1/hsmhvset.c
+src/spicelib/devices/hisimhv1/hsmhvtemp.c
+src/spicelib/devices/hisimhv1/hsmhvtemp_eval.h
+src/spicelib/devices/hisimhv2/hsmhv2set.c
+src/spicelib/devices/hisimhv2/hsmhv2temp.c
+src/spicelib/devices/hisimhv2/hsmhv2temp_eval.h

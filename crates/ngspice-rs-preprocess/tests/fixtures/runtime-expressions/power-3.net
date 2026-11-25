@@ -1,0 +1,60 @@
+* seeded source-power derivatives
+VX0 x0 0 DC -1.5 AC 0
+VP0 p0 0 DC -2 AC 1
+B0 out0 0 V={(V(x0)**V(p0))**2}
+VX1 x1 0 DC -1.5 AC 0
+VP1 p1 0 DC 1 AC 1
+B1 out1 0 V={2*V(x1)**V(p1)+0.3}
+VX2 x2 0 DC 1.7 AC 0
+VP2 p2 0 DC 0.25 AC 1
+B2 out2 0 V={V(x2)**V(p2)^2}
+VX3 x3 0 DC 4 AC 0
+VP3 p3 0 DC 0.25 AC 1
+B3 out3 0 V={PWR(V(x3)+0.25,V(p3))}
+VX4 x4 0 DC 0.2 AC 0
+VP4 p4 0 DC -2 AC 1
+B4 out4 0 V={IF(V(x4)<0,PWR(V(x4),V(p4)),V(x4)**V(p4))}
+VX5 x5 0 DC 1.7 AC 0
+VP5 p5 0 DC 2 AC 1
+B5 out5 0 V={V(x5)**V(p5)}
+VX6 x6 0 DC -0.2 AC 0
+VP6 p6 0 DC 3 AC 1
+B6 out6 0 V={PWR(V(x6),V(p6))}
+VX7 x7 0 DC 4 AC 0
+VP7 p7 0 DC 1 AC 1
+B7 out7 0 V={(-V(x7))**V(p7)}
+VX8 x8 0 DC -1.5 AC 0
+VP8 p8 0 DC 0.5 AC 1
+B8 out8 0 V={(V(x8)**V(p8))**2}
+VX9 x9 0 DC -4 AC 0
+VP9 p9 0 DC 1 AC 1
+B9 out9 0 V={2*V(x9)**V(p9)+0.3}
+VX10 x10 0 DC 0 AC 0
+VP10 p10 0 DC 1.5 AC 1
+B10 out10 0 V={V(x10)**V(p10)^2}
+VX11 x11 0 DC 0 AC 0
+VP11 p11 0 DC 1.5 AC 1
+B11 out11 0 V={PWR(V(x11)+0.25,V(p11))}
+VX12 x12 0 DC -0.2 AC 0
+VP12 p12 0 DC 0 AC 1
+B12 out12 0 V={IF(V(x12)<0,PWR(V(x12),V(p12)),V(x12)**V(p12))}
+VX13 x13 0 DC -1.5 AC 0
+VP13 p13 0 DC 1 AC 1
+B13 out13 0 V={V(x13)**V(p13)}
+VX14 x14 0 DC 0.2 AC 0
+VP14 p14 0 DC 1.5 AC 1
+B14 out14 0 V={PWR(V(x14),V(p14))}
+VX15 x15 0 DC 4 AC 0
+VP15 p15 0 DC 0.5 AC 1
+B15 out15 0 V={(-V(x15))**V(p15)}
+.op
+.ac lin 2 1k 2k
+.PRINT AC V(out0) V(out1) V(out2) V(out3)
+.PRINT AC V(out4) V(out5) V(out6) V(out7)
+.PRINT AC V(out8) V(out9) V(out10) V(out11)
+.PRINT AC V(out12) V(out13) V(out14) V(out15)
+.PRINT AC VP(out0) VP(out1) VP(out2) VP(out3)
+.PRINT AC VP(out4) VP(out5) VP(out6) VP(out7)
+.PRINT AC VP(out8) VP(out9) VP(out10) VP(out11)
+.PRINT AC VP(out12) VP(out13) VP(out14) VP(out15)
+.end

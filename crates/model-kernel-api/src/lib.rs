@@ -480,3 +480,22 @@ impl<K: Kernel> Artifact<K> {
         }
     }
 }
+/// Model preparation or runtime domain failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelError {
+    /// Invalid input or nonrepresentable derived value.
+    Invalid(&'static str),
+    /// Named, currently unsupported physical model feature.
+    Unsupported(&'static str),
+}
+
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(name) => write!(formatter, "invalid model parameter or bias: {name}"),
+            Self::Unsupported(name) => write!(formatter, "unsupported model physics: {name}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}

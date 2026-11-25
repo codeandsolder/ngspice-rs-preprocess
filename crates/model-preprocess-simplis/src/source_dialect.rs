@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Default bound for the standalone source projection.
 pub const DEFAULT_PROJECTION_BYTES: usize = 128 * 1024 * 1024;
 mod identity;
+mod power;
 pub use identity::{
     DeviceIdentity, ResolvedDeviceSource, ScopedStatement, resolve_device_identities,
 };
@@ -219,7 +220,8 @@ fn group_end(input: &str, start: usize) -> Result<usize> {
             '"' | '\'' => quote = Some(ch),
             '(' => stack.push(')'),
             '{' => stack.push('}'),
-            ')' | '}' => {
+            '[' => stack.push(']'),
+            ')' | '}' | ']' => {
                 ensure!(
                     stack.pop() == Some(ch),
                     "mismatched expression delimiters in {input}"
@@ -244,7 +246,7 @@ fn split_arguments(input: &str) -> Result<Vec<&str>> {
             .next()
             .context("expression boundary")?;
         match ch {
-            '(' | '{' => offset = group_end(input, offset)? + 1,
+            '(' | '{' | '[' => offset = group_end(input, offset)? + 1,
             '"' | '\'' => {
                 let end = input[offset + 1..]
                     .find(ch)
@@ -296,6 +298,9 @@ fn lower_call(
     );
     let base = rewrite_expression(base, language, depth + 1, true, limit)?;
     let exponent = rewrite_expression(exponent, language, depth + 1, true, limit)?;
+    if language == SourceLanguage::Simetrix {
+        return power::guarded(&base, &exponent, limit);
+    }
     // ngspice's behavioral PWR is signed, but its static PWR is unsigned.
     // Use the same explicit mathematical operators in both contexts.
     let expansion = base
@@ -413,7 +418,11 @@ fn rewrite_expression(
             "source expression expansion byte budget exceeded"
         );
     }
-    Ok(output)
+    if grouped && language == SourceLanguage::Simetrix {
+        power::lower(&output, limit)
+    } else {
+        Ok(output)
+    }
 }
 
 fn token_end(input: &str, count: usize) -> usize {
@@ -488,6 +497,18 @@ pub(super) fn lower_statement(
         false,
         limit.saturating_sub(prefix_end),
     )?);
+    if language == SourceLanguage::Simetrix && output.contains("**") {
+        let start = match upper.as_str() {
+            ".PARAM" | ".MODEL" | ".FUNC" => prefix_end,
+            _ if matches!(upper.as_bytes()[0], b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => {
+                token_end(&output, 3)
+            }
+            _ => output.find('=').map_or(output.len(), |index| index + 1),
+        };
+        let lowered = power::lower(&output[start..], limit.saturating_sub(start))?;
+        output.truncate(start);
+        output.push_str(&lowered);
+    }
     Ok(output)
 }
 
@@ -517,6 +538,46 @@ mod tests {
         assert_eq!(root.device_identity("R:A")?, "A");
         assert_eq!(child.device_identity("R:A")?, "R:A");
         assert!(root.device_identity("R:").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_power_is_lowered_only_in_its_source_language() -> Result<()> {
+        let native = DialectContext::default();
+        let hspice = DialectContext {
+            language: SourceLanguage::Hspice,
+            separator: None,
+        };
+        let pspice = DialectContext {
+            language: SourceLanguage::Pspice,
+            separator: None,
+        };
+        for source in [
+            ".param gain=2**3",
+            ".func f(x) x**3",
+            "R1 a b 2**3",
+            "C1 p n Q=(V(p,n)**3)",
+            "B1 out 0 V=V(a)**.5",
+        ] {
+            let lowered = lower_statement(source, native, 4096)?;
+            assert!(!lowered.contains("**"), "{lowered}");
+            assert!(lowered.contains("abs("), "{lowered}");
+        }
+        for context in [hspice, pspice] {
+            assert_eq!(
+                lower_statement(".param a={-2**3}", context, 4096)?,
+                ".param a={-2**3}"
+            );
+            assert_eq!(
+                lower_statement("E1 p n VALUE={V(a)**3}", context, 4096)?,
+                "E1 p n VALUE={V(a)**3}"
+            );
+            assert!(!lower_statement("B1 p n V=V(a)**3", context, 4096)?.contains("**"));
+        }
+        assert_eq!(
+            lower_statement("R1 p**q n 1k", native, 4096)?,
+            "R1 p**q n 1k"
+        );
         Ok(())
     }
 
