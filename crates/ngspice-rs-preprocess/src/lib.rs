@@ -109,13 +109,26 @@ pub struct Request {
     pub search_paths: Vec<PathBuf>,
 }
 
-/// Admission and artifact publication ceilings.
+/// Whether the consumer permits an equivalent internal-current coordinate change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConditioningPolicy {
+    /// Retain the original internal current coordinates.
+    Disabled,
+    /// Scale electrically isolated differentiator loops.
+    #[default]
+    PrivateDifferentiators,
+}
+
+/// Admission, conditioning and artifact publication options.
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Optional source command and independent per-source limits.
     pub admission: AdmissionConfig,
     /// Ceiling on linked intermediate bytes and combined final artifact bytes.
     pub output_bytes: usize,
+    /// Disable conditioning when the consumer adds artificial topology
+    /// (such as global shunts) or requires unchanged internal current names.
+    pub conditioning: ConditioningPolicy,
 }
 
 impl Default for Options {
@@ -123,6 +136,7 @@ impl Default for Options {
         Self {
             admission: AdmissionConfig::default(),
             output_bytes: 128 * 1024 * 1024,
+            conditioning: ConditioningPolicy::default(),
         }
     }
 }
@@ -170,6 +184,9 @@ pub struct Artifact {
     /// Supplemental code-model schemas introduced by this translation.
     /// Native input is preserved without inferring arbitrary external models.
     pub required_code_models: Vec<CodeModelRuntime>,
+    /// Internal current-coordinate changes; original branch current is the
+    /// emitted current divided by the recorded factor.
+    pub current_scalings: Vec<model_normalize_ngspice::conditioning::CurrentScaling>,
 }
 
 /// Deterministic primary artifact and any generated companion libraries.
@@ -271,6 +288,7 @@ fn native(
             provenance: Provenance::Native { lines },
             dependencies: Vec::new(),
             required_code_models: Vec::new(),
+            current_scalings: Vec::new(),
         },
         companions: Vec::new(),
         normalization: normalized.model.passes,
@@ -318,12 +336,17 @@ pub fn prepare(
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
     let root = request.input.admit(&mut session)?;
-    let result = match request.format {
+    let mut result = match request.format {
         InputFormat::NativeDeck | InputFormat::NativeLibrary => {
             native(&root, request, options, &mut session)
         }
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
+    if request.format == InputFormat::SimetrixDeck
+        && options.conditioning == ConditioningPolicy::PrivateDifferentiators
+    {
+        condition_generated_bundle(&mut result)?;
+    }
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
@@ -332,4 +355,28 @@ pub fn prepare(
             .context("combined artifact output byte budget exceeded")?;
     }
     Ok(result)
+}
+
+fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
+    use model_normalize_ngspice::conditioning::condition_private_differentiators;
+    let inputs = bundle
+        .artifacts()
+        .map(|artifact| artifact.bytes.as_slice())
+        .collect::<Vec<_>>();
+    let outputs = condition_private_differentiators(&inputs)?;
+    let mut changed = false;
+    for (artifact, output) in std::iter::once(&mut bundle.primary)
+        .chain(&mut bundle.companions)
+        .zip(outputs)
+    {
+        changed |= !output.scalings.is_empty();
+        artifact.bytes = output.bytes;
+        artifact.current_scalings = output.scalings;
+    }
+    if changed {
+        bundle
+            .normalization
+            .push(NormalizationPass::PrivateDifferentiatorConditioning);
+    }
+    Ok(())
 }

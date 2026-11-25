@@ -1,5 +1,6 @@
 //! Deterministic compatibility normalization and validation for ngspice model includes.
 
+pub mod conditioning;
 mod lexical;
 pub mod linked_source;
 pub mod model_card;
@@ -46,6 +47,8 @@ pub enum NormalizationPass {
     PspicePositionalParams,
     /// Comment a standalone `.END` so the model remains safe to include.
     StripStandaloneEnd,
+    /// Scale proven private differentiator currents and compensate feedback.
+    PrivateDifferentiatorConditioning,
 }
 
 /// ngspice parser mode that accepted the normalized artifact.

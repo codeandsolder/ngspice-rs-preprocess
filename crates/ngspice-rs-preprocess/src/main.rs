@@ -1,8 +1,8 @@
 //! Command-line adapter for the same public preparation API used by callers.
 use anyhow::{Context, Result, bail, ensure};
 use ngspice_rs_preprocess::{
-    Cancellation, CommandConfig, InputFormat, LibraryInput, Options, PreparedBundle, Request,
-    SourceInput, prepare,
+    Cancellation, CommandConfig, ConditioningPolicy, InputFormat, LibraryInput, Options,
+    PreparedBundle, Request, SourceInput, prepare,
 };
 use serde::Serialize;
 use std::{
@@ -29,6 +29,7 @@ Options:
   --max-diagnostic-bytes N
   --timeout-ms N              Per-command deadline in milliseconds
   --max-output-bytes N        Combined artifact bytes ceiling
+  --conditioning MODE         private-differentiators (default) or disabled
 The output directory must not already exist.
 ";
 
@@ -101,6 +102,13 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
                     Duration::from_millis(u64::try_from(numeric(&value)?)?);
             }
             "--max-output-bytes" => options.output_bytes = numeric(&value)?,
+            "--conditioning" => {
+                options.conditioning = match value.to_str() {
+                    Some("private-differentiators") => ConditioningPolicy::PrivateDifferentiators,
+                    Some("disabled") => ConditioningPolicy::Disabled,
+                    _ => bail!("unknown conditioning policy {}", value.display()),
+                };
+            }
             _ => bail!("unknown option {name:?}\n{USAGE}"),
         }
     }
@@ -150,6 +158,7 @@ struct ManifestArtifact<'a> {
     provenance: &'a ngspice_rs_preprocess::Provenance,
     dependencies: &'a [String],
     required_code_models: &'a [ngspice_rs_preprocess::CodeModelRuntime],
+    current_scalings: &'a [model_normalize_ngspice::conditioning::CurrentScaling],
 }
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
@@ -166,6 +175,7 @@ fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
                 provenance: &artifact.provenance,
                 dependencies: &artifact.dependencies,
                 required_code_models: &artifact.required_code_models,
+                current_scalings: &artifact.current_scalings,
             })
             .collect(),
         normalization: &bundle.normalization,

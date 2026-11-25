@@ -48,6 +48,7 @@ const fn generated(
         provenance: Provenance::Generated { sources, source_id },
         dependencies,
         required_code_models,
+        current_scalings: Vec::new(),
     }
 }
 
