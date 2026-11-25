@@ -184,10 +184,10 @@ fn rewrite_pwl(
             .any(|part| part.eq_ignore_ascii_case(keyword))),
         "LTspice structured PWL requires typed waveform lowering"
     );
-    let points = fields.chunks_exact(2).collect::<Vec<_>>();
+    let points = fields.as_chunks::<2>().0;
     let mut times = Vec::with_capacity(points.len());
     let mut previous = 0.;
-    for point in &points {
+    for point in points {
         previous = pwl_time(&text[point[0].clone()], previous)?;
         times.push(previous);
     }
@@ -199,7 +199,7 @@ fn rewrite_pwl(
             .iter()
             .position(|value| *value > time)
             .map_or(points.len(), |offset| index + offset);
-        let first = points[index];
+        let first = &points[index];
         if text[first[0].clone()].first() == Some(&b'+') {
             lexical::replace_span(
                 statement,
@@ -223,7 +223,13 @@ fn rewrite_pwl(
                 edits,
             );
             for point in &points[index + 1..end] {
-                removals.push(point[0].start..point[1].end);
+                let preceding = text[..point[0].start].trim_ascii_end();
+                let start = if preceding.last() == Some(&b',') {
+                    preceding.len() - 1
+                } else {
+                    point[0].start
+                };
+                removals.push(start..point[1].end);
             }
         }
         index = end;
@@ -241,12 +247,86 @@ fn waveform_name(text: &[u8], field: &Range<usize>, name: &[u8]) -> bool {
             .is_none_or(|byte| *byte == b'(')
 }
 
+fn rewrite_tran(statement: &lexical::Statement, edits: &mut Vec<lexical::Edit>) -> Result<()> {
+    let text = &statement.text;
+    let fields = lexical::tokens(text)?;
+    let mut timing = &fields[1..];
+    if timing
+        .last()
+        .is_some_and(|span| text[span.clone()].eq_ignore_ascii_case(b"uic"))
+    {
+        timing = &timing[..timing.len() - 1];
+    }
+    ensure!(
+        (1..=4).contains(&timing.len()),
+        "unsupported LTspice transient analysis options"
+    );
+    let values = timing.iter().map(|span| literal(&text[span.clone()])).collect::<Result<Vec<_>>>()
+        .context("LTspice transient timing requires bound scalar fields; startup/steady modes require typed analysis")?;
+    let (step, stop, start, max_step) = if values.len() == 1 {
+        (0., values[0], 0., 0.)
+    } else {
+        (
+            values[0],
+            values[1],
+            values.get(2).copied().unwrap_or(0.).max(0.),
+            values.get(3).copied().unwrap_or(0.),
+        )
+    };
+    ensure!(
+        stop > start && max_step >= 0.,
+        "LTspice transient needs positive duration and nonnegative maximum step"
+    );
+    // Vendor adaptive default: exactly stop/1024, regardless of plotting step.
+    let max_step = if max_step > 0. {
+        max_step
+    } else {
+        stop / 1024.
+    };
+    let step = if step > 0. { step } else { max_step };
+    ensure!(
+        step > 0. && max_step > 0.,
+        "unrepresentable LTspice transient timestep"
+    );
+    if timing.len() == 1 {
+        let replacement = format!("{step} {stop} {start} {max_step}");
+        lexical::replace_span(statement, timing[0].clone(), replacement.as_bytes(), edits);
+    } else {
+        let resolved = [step, stop, start, max_step];
+        for (index, span) in timing.iter().enumerate() {
+            if index + 1 == timing.len() && timing.len() < resolved.len() {
+                let replacement = resolved[index..]
+                    .iter()
+                    .map(f64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                lexical::replace_span(statement, span.clone(), replacement.as_bytes(), edits);
+            } else if values[index].to_bits() != resolved[index].to_bits() {
+                lexical::replace_span(
+                    statement,
+                    span.clone(),
+                    resolved[index].to_string().as_bytes(),
+                    edits,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_statement(
     statement: &lexical::Statement,
     input: &[u8],
     edits: &mut Vec<lexical::Edit>,
 ) -> Result<()> {
     let text = &statement.text;
+    let first = text
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or_default();
+    if first.eq_ignore_ascii_case(b".tran") {
+        return rewrite_tran(statement, edits);
+    }
     if !matches!(text.first(), Some(b'V' | b'v' | b'I' | b'i')) {
         return Ok(());
     }

@@ -44,7 +44,9 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
 | `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
 
-The LTspice formats normalize whole-file library imports, relative Windows-style paths, `noiseless` resistor flags, `.backanno`, and selected scalar intrinsics. They do not yet provide complete LTspice semantic compatibility: idealized diode models and known unsupported intrinsic functions are diagnosed; Boolean operators, other device extensions and analysis semantics still require dedicated translation. Do not assume successful normalization establishes equivalence for arbitrary LTspice decks.
+The LTspice formats normalize whole-file library imports, relative Windows-style paths, `noiseless` resistor flags, `.backanno`, scalar intrinsics and operator precedence, runtime versus parameter-phase evaluation, endpoint-clamped numeric tables (including phase-specialized macros), explicit capacitor/inductor series resistance, the uncoupled inductor default series resistance, and literal PULSE/PWL timing, and explicit transient timing (including omitted or zero plotting step). Relative PWL times are accumulated and duplicate-time ordinates averaged before interpolation. These passes preserve source provenance and do not require a simulator-wide compatibility mode.
+
+The source-specific transformations have native ngspice OP/DC/AC/transient regressions based on independent LTspice XVII and 24.0.12 measurements. Successful normalization alone does not establish equivalence for arbitrary decks. Idealized diode and smooth-switch models, passive IC and richer parasitic networks, occurrence-parametric and structured/triggered waveforms, and unsupported expression forms require additional typed preparation or solver support. End-to-end Rust solver acceptance of the generated scalar functions also depends on its full native parameter-expression and macro-expansion grammar.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:

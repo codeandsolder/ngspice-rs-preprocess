@@ -583,3 +583,63 @@ fn vendor_pulse_timing_defaults_and_relative_duplicate_pwl() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn vendor_transient_timing_is_explicit_in_native_decks() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for (source, expected) in [
+        (".tran 1", [1. / 1024., 1., 0., 1. / 1024.]),
+        (".tran 0 1 .2", [1. / 1024., 1., 0.2, 1. / 1024.]),
+        (".tran .03 1", [0.03, 1., 0., 1. / 1024.]),
+        (".tran 0 1 0 .02 uic", [0.02, 1., 0., 0.02]),
+        (".tran 0 1 -.2 0", [1. / 1024., 1., 0., 1. / 1024.]),
+    ] {
+        fs::write(
+            &root,
+            format!("title\nV1 a 0 1\nR1 a 0 1k\n{source}\n.print tran v(a)\n.end\n"),
+        )?;
+        let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+        let output = std::str::from_utf8(&bundle.primary.bytes)?;
+        let tran = output
+            .lines()
+            .find(|line| line.starts_with(".tran"))
+            .context("missing transient analysis")?;
+        let actual = tran
+            .split_whitespace()
+            .skip(1)
+            .take(4)
+            .map(str::parse::<f64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(actual.len(), 4);
+        for (&actual, expected) in actual.iter().zip(expected) {
+            near(actual, expected)?;
+        }
+        assert_eq!(source.ends_with("uic"), tran.ends_with("uic"));
+        native(dir.path(), &bundle.primary.bytes)?;
+    }
+    for source in [
+        ".tran 0 1 startup",
+        ".tran 0 1 steady",
+        ".tran 0 1 1",
+        ".tran 0 1 0 -1",
+    ] {
+        fs::write(&root, format!("title\n{source}\n.end\n"))?;
+        assert!(
+            prepared(&root, InputFormat::LtspiceDeck).is_err(),
+            "{source}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn comma_delimited_pwl_duplicates_do_not_leave_empty_fields() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(&root, b"title\nV1 a 0 PWL(0,0,1u,1,1u,3,1u,8,2u,0)\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let output = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(output.contains("PWL(0,0,1u,4,2u,0)"), "{output}");
+    Ok(())
+}
