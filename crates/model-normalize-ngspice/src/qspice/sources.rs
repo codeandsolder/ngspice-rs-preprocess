@@ -3,8 +3,10 @@
 
 use super::{Feature, literal, reject};
 use crate::{
-    lexical::{Edit, Statement, replace_span, waveform_tokens},
+    lexical::{Edit, Statement, replace_span, replace_spans, waveform_tokens},
     linked_source::SourceOrigin,
+    param_expression::SpiceExpression,
+    waveform::{QspicePoint, QspiceWaveform},
 };
 use anyhow::{Context, Result};
 use std::ops::Range;
@@ -125,10 +127,16 @@ fn validate_modifiers(
     fields: &[Range<usize>],
 ) -> Result<()> {
     let text = &statement.text;
-    let command = args.fields.first().is_some_and(|span| {
-        [b"repeat".as_slice(), b"file"]
-            .iter()
-            .any(|keyword| text[span.clone()].eq_ignore_ascii_case(keyword))
+    let command = args.fields.iter().any(|span| {
+        [
+            b"repeat".as_slice(),
+            b"endrepeat",
+            b"file",
+            b"xtrap",
+            b"log",
+        ]
+        .iter()
+        .any(|keyword| text[span.clone()].eq_ignore_ascii_case(keyword))
     });
     let tail_flag = fields
         .iter()
@@ -195,7 +203,7 @@ fn pwl(
                 ));
             };
             let resolved = base + increment;
-            if increment <= 0. || !resolved.is_finite() || resolved <= base {
+            if increment < 0. || !resolved.is_finite() || (index > 0 && resolved <= base) {
                 return Err(reject(
                     origin,
                     Feature::Waveform,
@@ -272,12 +280,184 @@ fn wrap_bare(statement: &Statement, args: &Arguments, edits: &mut Vec<Edit>) -> 
     Ok(())
 }
 
+pub(super) struct Binding {
+    pub waveform: QspiceWaveform,
+    pub dc_override: Option<String>,
+}
+
+fn scalar_expression(raw: &[u8], origin: &SourceOrigin) -> Result<String> {
+    let text = std::str::from_utf8(raw)?;
+    let text = text
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .or_else(|| text.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(text);
+    if literal(text.as_bytes()).is_none() {
+        SpiceExpression::parse(text).map_err(|error| {
+            reject(
+                origin,
+                Feature::Waveform,
+                &format!("invalid source expression: {error:#}"),
+            )
+        })?;
+    }
+    Ok(text.to_owned())
+}
+
+fn bound_waveform(
+    text: &[u8],
+    shape: Shape,
+    args: &Arguments,
+    origin: &SourceOrigin,
+) -> Result<QspiceWaveform> {
+    match shape {
+        Shape::Pwl => {
+            if args.fields.len() < 4 || !args.fields.len().is_multiple_of(2) {
+                return Err(reject(
+                    origin,
+                    Feature::Waveform,
+                    "PWL requires at least two time/value pairs",
+                ));
+            }
+            let points = args
+                .fields
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| {
+                    let time = &text[pair[0].clone()];
+                    let relative = time.starts_with(b"+");
+                    let time = time.strip_prefix(b"+").unwrap_or(time);
+                    Ok(QspicePoint {
+                        time: scalar_expression(time, origin)?,
+                        relative,
+                        value: scalar_expression(&text[pair[1].clone()], origin)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(QspiceWaveform::Pwl(points))
+        }
+        Shape::Pulse => {
+            let [first, second, delay, rise, fall, width, period] = args.fields.as_slice() else {
+                return Err(reject(
+                    origin,
+                    Feature::Waveform,
+                    "implicit or finite-repetition PULSE timing requires a separately qualified law",
+                ));
+            };
+            let scalar = |field: &Range<usize>| scalar_expression(&text[field.clone()], origin);
+            Ok(QspiceWaveform::Pulse {
+                first: scalar(first)?,
+                second: scalar(second)?,
+                delay: scalar(delay)?,
+                rise: scalar(rise)?,
+                fall: scalar(fall)?,
+                width: scalar(width)?,
+                period: scalar(period)?,
+            })
+        }
+    }
+}
+
+fn waveform_span(args: &Arguments) -> Result<Range<usize>> {
+    let end = if args.bare {
+        args.fields
+            .last()
+            .context("missing waveform final value")?
+            .end
+    } else {
+        args.tail
+    };
+    Ok(args.keyword.start..end)
+}
+
+// Parse bias declarations outside the waveform, never treating a waveform
+// ordinate, an AC magnitude or a node name as an explicit DC override.
+fn dc_field(
+    text: &[u8],
+    fields: &[Range<usize>],
+    wave: &Range<usize>,
+    origin: &SourceOrigin,
+) -> Result<Option<Range<usize>>> {
+    let leading = fields
+        .get(3)
+        .filter(|field| {
+            field.end <= wave.start
+                && ![b"dc".as_slice(), b"ac", b"distof1", b"distof2"]
+                    .iter()
+                    .any(|name| text[(*field).clone()].eq_ignore_ascii_case(name))
+                && fields.get(4).is_none_or(|next| text[next.clone()] != *b"=")
+        })
+        .cloned();
+    let mut dc = leading;
+    for (index, field) in fields.iter().enumerate().skip(3) {
+        if wave.contains(&field.start) || !text[field.clone()].eq_ignore_ascii_case(b"dc") {
+            continue;
+        }
+        let mut value = index + 1;
+        if fields
+            .get(value)
+            .is_some_and(|next| text[next.clone()] == *b"=")
+        {
+            value += 1;
+        }
+        let span = fields
+            .get(value)
+            .filter(|span| !wave.contains(&span.start))
+            .ok_or_else(|| reject(origin, Feature::Waveform, "missing explicit DC value"))?;
+        if dc.replace(span.clone()).is_some() {
+            return Err(reject(
+                origin,
+                Feature::Waveform,
+                "conflicting explicit DC declarations",
+            ));
+        }
+    }
+    Ok(dc)
+}
+
+fn prepare_binding(
+    statement: &Statement,
+    origin: &SourceOrigin,
+    fields: &[Range<usize>],
+    shape: Shape,
+    args: &Arguments,
+    edits: &mut Vec<Edit>,
+    input: &[u8],
+) -> Result<Binding> {
+    let text = &statement.text;
+    let waveform = bound_waveform(text, shape, args, origin)?;
+    let span = waveform_span(args)?;
+    let dc = dc_field(text, fields, &span, origin)?;
+    let dc_override = dc
+        .as_ref()
+        .map(|field| scalar_expression(&text[field.clone()], origin))
+        .transpose()?;
+    let mut replacements = Vec::new();
+    if let Some(dc) = dc {
+        // A symbolic bias is also bound from the mandatory declaration. The
+        // native placeholder must be executable before occurrence binding.
+        if literal(&text[dc.clone()]).is_none() {
+            replacements.push((dc, b"0".to_vec()));
+        }
+        replacements.push((span, Vec::new()));
+    } else {
+        replacements.push((span, b"DC 0".to_vec()));
+    }
+    replace_spans(statement, input, &replacements, edits);
+    Ok(Binding {
+        waveform,
+        dc_override,
+    })
+}
+
 pub(super) fn rewrite(
     statement: &Statement,
     origin: &SourceOrigin,
     fields: &[Range<usize>],
     edits: &mut Vec<Edit>,
-) -> Result<()> {
+    input: &[u8],
+) -> Result<Option<Binding>> {
     let text = &statement.text;
     if fields
         .get(3..)
@@ -296,6 +476,14 @@ pub(super) fn rewrite(
         let args = arguments(text, fields, index, name_len)
             .map_err(|error| reject(origin, Feature::Waveform, &error.to_string()))?;
         validate_modifiers(statement, origin, &args, fields)?;
+        if args
+            .fields
+            .iter()
+            .any(|span| literal(&text[span.clone()]).is_none())
+        {
+            return prepare_binding(statement, origin, fields, shape, &args, edits, input)
+                .map(Some);
+        }
         match shape {
             Shape::Pwl => pwl(statement, origin, &args, edits)?,
             Shape::Pulse => pulse(statement, origin, &args)?,
@@ -305,5 +493,5 @@ pub(super) fn rewrite(
         }
         break;
     }
-    Ok(())
+    Ok(None)
 }

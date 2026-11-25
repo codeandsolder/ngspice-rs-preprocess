@@ -219,6 +219,16 @@ impl Declarations {
             .map(|scope| &self.scopes[scope])
     }
 
+    pub(crate) fn scope_names(&self, line: usize) -> Result<Vec<String>> {
+        let mut names = self
+            .ancestry(line)
+            .filter_map(|scope| scope.name.as_deref())
+            .map(|name| Ok(std::str::from_utf8(name)?.to_owned()))
+            .collect::<Result<Vec<_>>>()?;
+        names.reverse();
+        Ok(names)
+    }
+
     pub(crate) fn model(&self, line: usize, name: &[u8]) -> Visibility<&[u8]> {
         let name = name.to_ascii_lowercase();
         for scope in self.ancestry(line) {

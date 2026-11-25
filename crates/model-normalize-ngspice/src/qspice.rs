@@ -8,6 +8,7 @@ use crate::{
     linked_source::{LinkedSource, RootKind, SourceOrigin},
     model_card::{parse_model_card, parse_spice_constant},
     parameter_scope::declarations::Declarations,
+    waveform::{PreparedWaveform, WaveformSpec},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -408,7 +409,6 @@ fn lower_statement(
             Feature::Directive,
             "analysis or output directive needs source-specific qualification",
         )),
-        [b'v' | b'i', ..] => sources::rewrite(statement, origin, fields, edits),
         [b'l' | b'c', ..] => lower_passive(statement, origin, fields, edits, input),
         [b'a' | b'u' | b'y' | b'n' | b'o' | b'@', ..] => Err(reject(
             origin,
@@ -419,11 +419,19 @@ fn lower_statement(
     }
 }
 
+/// Native source projection and mandatory occurrence-bound waveform metadata.
+pub struct Lowered {
+    /// Rewritten bytes, or no change to the linked source.
+    pub bytes: Option<Vec<u8>>,
+    /// Mandatory waveform declarations for sources with symbolic timing.
+    pub waveforms: Vec<PreparedWaveform>,
+}
+
 /// Apply the source-specific pass to a linked graph. Rewrites preserve the
 /// physical line count, so every subsequent native pass retains provenance.
 /// # Errors
 /// Unsupported source semantics, malformed statements or invalid source map.
-pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Option<Vec<u8>>> {
+pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Lowered> {
     let input = &linked.bytes;
     let title_len = if kind == RootKind::Deck {
         input
@@ -454,6 +462,7 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Option<Vec<
     let lowered = apply_edits(body, numeric_edits);
     let body = lowered.as_deref().unwrap_or(body);
     let mut edits = Vec::new();
+    let mut waveforms = Vec::new();
     let source_statements = statements(body)?;
     let settings = analysis::collect(&source_statements, linked, title_len != 0, &declarations)?;
     for statement in source_statements {
@@ -465,14 +474,40 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Option<Vec<
         if settings.rewrite(&statement, origin, &fields, &mut edits, body)? {
             continue;
         }
+        if let Some(name) = fields.first().map(|field| &statement.text[field.clone()])
+            && name
+                .first()
+                .is_some_and(|byte| matches!(byte.to_ascii_lowercase(), b'v' | b'i'))
+        {
+            if let Some(binding) = sources::rewrite(&statement, origin, &fields, &mut edits, body)?
+            {
+                waveforms.push(PreparedWaveform {
+                    artifact: if kind == RootKind::Deck {
+                        "deck.cir"
+                    } else {
+                        "model.lib"
+                    }
+                    .to_owned(),
+                    scope: declarations.scope_names(statement.line)?,
+                    source: std::str::from_utf8(name)?.to_owned(),
+                    spec: WaveformSpec::Qspice(binding.waveform),
+                    dc_override: binding.dc_override,
+                    idle_in_pop: "0".to_owned(),
+                });
+            }
+            continue;
+        }
         bindings::rewrite(&statement, origin, &declarations, &fields, &mut edits, body)?;
         lower_statement(&statement, origin, &fields, &mut edits, body)
             .with_context(|| format!("QSPICE source {}:{}", origin.path.display(), origin.line))?;
     }
     let final_body = apply_edits(body, edits).or(lowered);
-    Ok(final_body.map(|body| {
-        let mut bytes = input[..title_len].to_vec();
-        bytes.extend_from_slice(&body);
-        bytes
-    }))
+    Ok(Lowered {
+        bytes: final_body.map(|body| {
+            let mut bytes = input[..title_len].to_vec();
+            bytes.extend_from_slice(&body);
+            bytes
+        }),
+        waveforms,
+    })
 }

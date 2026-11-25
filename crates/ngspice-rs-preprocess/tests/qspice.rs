@@ -367,7 +367,6 @@ fn unqualified_waveform_laws_are_source_located() -> Result<()> {
         "V1 a 0 PWL REPEAT FOR 2 0 0 1u 1 ENDREPEAT",
         "V1 a 0 PWL(FILE 3k4.csv)",
         "V1 a 0 PWL(0 0 1u 1 1u 2)",
-        "V1 a 0 PWL(0 0 1u 1 +{dt} 2)",
         "V1 a 0 PWL(0 0 1u 1) TRIGGER=V(a)",
         "V1 a 0 PULSE(0 1 -1u 1n 1n 1u 2u)",
         "V1 a 0 PULSE(0 1 0 0 0 1u 2u)",
@@ -566,5 +565,78 @@ fn conditional_resources_are_not_eagerly_opened() -> Result<()> {
     assert_eq!(diagnostic.feature, Feature::ConditionalTopology);
     assert_eq!(diagnostic.path, library.canonicalize()?);
     assert_eq!(diagnostic.line, 2);
+    Ok(())
+}
+
+#[test]
+fn symbolic_waveforms_bind_per_instance_and_preserve_bias() -> Result<()> {
+    use model_normalize_ngspice::{
+        param_expression::SpiceExpression,
+        waveform::{Forcing, PreparedWaveform},
+    };
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("deck.cir");
+    let source = "* symbolic sources\n.subckt stim a b dt=1u height=2 bias=7\nVlocal a 0 DC {BIAS} AC 2 PWL(0 0 {DT} {HEIGHT},\n+ +{DT} -1 +{DT} {HEIGHT}) ; source law\nIlocal 0 b PULSE(0 {HEIGHT} {DT} 1n 1n {DT} {3*DT})\n.ends stim\nX1 a b stim dt=1u height=3 bias=7\nX2 c d stim dt=2u height=4 bias=9\nR1 a 0 1k\nR2 b 0 1\nR3 c 0 1k\nR4 d 0 1\n.tran 0 9u 0 1n\n.end\n";
+    fs::write(&root, source)?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    assert_eq!(bundle.waveforms.len(), 2);
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains("Vlocal a 0 DC 0 AC 2"));
+    assert!(text.contains("Ilocal 0 b DC 0"));
+    assert!(text.contains("source law"));
+    assert!(!text.contains("PWL("));
+    assert!(!text.contains("PULSE("));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        bail!("missing source map");
+    };
+    assert_eq!(lines.len(), source.lines().count());
+    let json = serde_json::to_string(&bundle.waveforms)?;
+    let declarations: Vec<PreparedWaveform> = serde_json::from_str(&json)?;
+    assert_eq!(declarations, bundle.waveforms);
+    for (dt, height, bias) in [(1e-6, 3., 7.), (2e-6, 4., 9.)] {
+        for declaration in &declarations {
+            assert_eq!(declaration.scope, ["stim"]);
+            let bound = declaration.resolve(|raw| {
+                SpiceExpression::parse(raw)?.evaluate(|name| match name {
+                    "dt" => Ok(dt),
+                    "height" => Ok(height),
+                    "bias" => Ok(bias),
+                    _ => bail!("unknown symbol {name}"),
+                })
+            })?;
+            let Forcing::PiecewiseLinear { knots, repeat } = bound.forcing else {
+                bail!("unexpected forcing");
+            };
+            ensure!(bound.startup.abs() < 1e-15);
+            if declaration.source == "Vlocal" {
+                ensure!((bound.dc - bias).abs() < 1e-15);
+                assert!(repeat.is_none());
+                assert_eq!(knots.len(), 4);
+                for (index, (knot, expected)) in
+                    knots.iter().zip([0., height, -1., height]).enumerate()
+                {
+                    let time = f64::from(u32::try_from(index)?) * dt;
+                    ensure!((knot.time - time).abs() < 1e-18);
+                    ensure!((knot.left - expected).abs() < 1e-15);
+                    assert_eq!(knot.left.to_bits(), knot.right.to_bits());
+                }
+            } else {
+                ensure!(bound.dc.abs() < 1e-15);
+                let cycle = repeat.context("missing pulse repetition")?;
+                ensure!(3.0f64.mul_add(-dt, cycle.period).abs() < 1e-18);
+                ensure!((cycle.origin - dt).abs() < 1e-18);
+                assert!(cycle.hold.is_some_and(|value| value.abs() < 1e-15));
+                ensure!((knots[1].right - height).abs() < 1e-15);
+            }
+        }
+    }
+    let invalid = declarations[0].resolve(|raw| {
+        SpiceExpression::parse(raw)?.evaluate(|name| match name {
+            "dt" => Ok(0.),
+            "height" | "bias" => Ok(1.),
+            _ => bail!("unknown symbol {name}"),
+        })
+    });
+    assert!(invalid.is_err(), "nonadvancing relative waveform accepted");
     Ok(())
 }

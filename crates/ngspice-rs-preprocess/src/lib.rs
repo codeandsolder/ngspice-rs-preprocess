@@ -297,10 +297,11 @@ fn native(
         },
         session,
     )?;
-    let lowered = if qspice {
-        model_normalize_ngspice::qspice::lower_linked(&linked, kind)?
+    let (lowered, waveforms) = if qspice {
+        let lowered = model_normalize_ngspice::qspice::lower_linked(&linked, kind)?;
+        (lowered.bytes, lowered.waveforms)
     } else {
-        None
+        (None, Vec::new())
     };
     let mut normalized = normalize_mapped(lowered.as_deref().unwrap_or(&linked.bytes), kind)?;
     if lowered.is_some() {
@@ -344,7 +345,7 @@ fn native(
         model_selections: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,
-        waveforms: Vec::new(),
+        waveforms,
     })
 }
 
