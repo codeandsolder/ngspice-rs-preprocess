@@ -181,15 +181,49 @@ pub struct ProjectedStatement {
     pub last_line: usize,
 }
 
-/// Embedded file and command blocks are opaque to electrical projection.
-pub(super) fn opaque_block_boundary(statement: &str) -> Option<bool> {
-    let first = statement.split_ascii_whitespace().next()?;
-    if first.eq_ignore_ascii_case(".file") || first.eq_ignore_ascii_case(".control") {
-        Some(true)
-    } else if first.eq_ignore_ascii_case(".endf") || first.eq_ignore_ascii_case(".endc") {
-        Some(false)
-    } else {
-        None
+/// Opaque file and command bodies have independent closing delimiters.
+#[derive(Clone, Copy)]
+enum OpaqueBlock {
+    File,
+    Control,
+}
+
+/// Track an opaque body without interpreting directives within its payload.
+#[derive(Default)]
+pub(super) struct OpaqueSource(Option<OpaqueBlock>);
+
+impl OpaqueSource {
+    pub(super) fn consume(&mut self, statement: &str) -> bool {
+        let first = statement
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or_default();
+        match self.0 {
+            Some(block) => {
+                let close = match block {
+                    OpaqueBlock::File => ".endf",
+                    OpaqueBlock::Control => ".endc",
+                };
+                if first.eq_ignore_ascii_case(close) {
+                    self.0 = None;
+                }
+                true
+            }
+            None if first.eq_ignore_ascii_case(".file") => {
+                self.0 = Some(OpaqueBlock::File);
+                true
+            }
+            None if first.eq_ignore_ascii_case(".control") => {
+                self.0 = Some(OpaqueBlock::Control);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn finish(&self) -> Result<()> {
+        ensure!(self.0.is_none(), "unterminated opaque source block");
+        Ok(())
     }
 }
 
@@ -202,7 +236,7 @@ pub(super) fn logical_source(
     let mut statements = Vec::<ProjectedStatement>::new();
     let mut active = None;
     let mut state = CommentState::default();
-    let mut opaque = false;
+    let mut opaque = OpaqueSource::default();
     let marker = if context.language == SourceLanguage::Hspice {
         '$'
     } else {
@@ -210,11 +244,7 @@ pub(super) fn logical_source(
     };
     for (index, line) in input.lines().enumerate() {
         let line_number = index + 1;
-        let boundary = opaque_block_boundary(line);
-        if opaque || boundary.is_some() {
-            if let Some(start) = boundary {
-                opaque = start;
-            }
+        if opaque.consume(line) {
             statements.push(ProjectedStatement {
                 text: line.to_owned(),
                 first_line: line_number,
@@ -249,6 +279,7 @@ pub(super) fn logical_source(
             });
         }
     }
+    opaque.finish()?;
     Ok(statements)
 }
 
@@ -495,7 +526,7 @@ pub(super) fn lower_statement(
     let upper = first.to_ascii_uppercase();
     let (prefix_end, language) = if upper.starts_with('.') {
         let prefix = match upper.as_str() {
-            ".PARAM" => token_end(trimmed, 1),
+            ".PARAM" | ".TRAN" | ".AC" | ".TEMP" => token_end(trimmed, 1),
             ".MODEL" => {
                 let start = token_end(trimmed, 2);
                 // Stop after the model family, including the compact D(...).

@@ -929,26 +929,23 @@ pub fn lower_simetrix_source_view(
     context: crate::source_dialect::DialectContext,
     limit: usize,
 ) -> Result<String> {
-    use crate::source_dialect::{lower_statement, opaque_block_boundary};
+    use crate::source_dialect::{OpaqueSource, lower_statement};
     use std::fmt::Write as _;
     let mut output = String::new();
-    let mut opaque = false;
+    let mut opaque = OpaqueSource::default();
     for statement in selected.lines() {
-        let boundary = opaque_block_boundary(statement);
-        let lowered = if opaque || boundary.is_some() {
+        let lowered = if opaque.consume(statement) {
             statement.to_owned()
         } else {
             lower_statement(statement, context, limit.saturating_sub(output.len()))?
         };
-        if let Some(start) = boundary {
-            opaque = start;
-        }
         anyhow::ensure!(
             lowered.len().saturating_add(1) <= limit.saturating_sub(output.len()),
             "source dialect output byte budget exceeded"
         );
         writeln!(output, "{lowered}")?;
     }
+    opaque.finish()?;
     Ok(output)
 }
 
@@ -971,13 +968,9 @@ fn selected_library_lines<'a>(
     let mut output = Vec::new();
     let mut enabled = true;
     let mut subcircuit_depth = 0usize;
-    let mut opaque = false;
+    let mut opaque = crate::source_dialect::OpaqueSource::default();
     for (line_index, line) in lines.enumerate() {
-        let boundary = crate::source_dialect::opaque_block_boundary(line);
-        if opaque || boundary.is_some() {
-            if let Some(start) = boundary {
-                opaque = start;
-            }
+        if opaque.consume(line) {
             if enabled {
                 output.push(line_index);
             }
@@ -1021,6 +1014,7 @@ fn selected_library_lines<'a>(
             output.push(line_index);
         }
     }
+    opaque.finish()?;
     if subcircuit_depth != 0 {
         bail!(
             "unterminated subcircuit while selecting {} library view",

@@ -7,7 +7,7 @@ use std::{fmt::Write as _, path::PathBuf};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalysisDialect {
-    /// Ordinary SPICE analyses with SIMetrix extensions.
+    /// Ordinary SPICE analyses with `SIMetrix` extensions.
     Simetrix,
     /// SIMPLIS transient and periodic analyses.
     Simplis,
@@ -156,7 +156,7 @@ pub struct AnalysisPlan {
     pub dialect: AnalysisDialect,
     /// Execution scope of the artifact.
     pub kind: PlanKind,
-    /// Complete SIMetrix title, including an empty title.
+    /// Complete `SIMetrix` title, including an empty title.
     pub title: Option<String>,
     /// Declarations in source/linked scope order.
     pub entries: Vec<PlanEntry>,
@@ -452,7 +452,9 @@ fn native_analysis_shape(kind: AnalysisKind, args: &[String]) -> bool {
         AnalysisKind::DcSweep => {
             matches!(args.len(), 4 | 8)
                 && args
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .all(|chunk| chunk[1..].iter().all(|value| scalar(value)))
         }
         AnalysisKind::Noise => {
@@ -465,14 +467,14 @@ fn native_analysis_shape(kind: AnalysisKind, args: &[String]) -> bool {
     }
 }
 
-/// SIMetrix defaults both output and maximum step to (stop-start)/50.
+/// `SIMetrix` defaults both output and maximum step to `(stop-start)/50`.
 /// Do not delegate omitted or zero steps to a different simulator's defaults.
 fn transient_arguments(args: &[String]) -> Option<Vec<String>> {
     use model_translate_simplis::syntax::parse_numeric;
     let number = |value: &str| parse_numeric(value).ok();
-    let (step, stop, start, maximum) = match args {
+    let (interval, stop, start, maximum) = match args {
         [stop] => (None, stop, None, None),
-        [step, stop, rest @ ..] => (Some(step), stop, rest.first(), rest.get(1)),
+        [interval, stop, rest @ ..] => (Some(interval), stop, rest.first(), rest.get(1)),
         _ => return None,
     };
     let start_number = start.map_or(Some(0.0), |v| number(v))?;
@@ -498,7 +500,7 @@ fn transient_arguments(args: &[String]) -> Option<Vec<String>> {
         }
     };
     Some(vec![
-        normalize_step(step)?,
+        normalize_step(interval)?,
         stop.clone(),
         start.cloned().unwrap_or_else(|| "0".to_owned()),
         normalize_step(maximum)?,
@@ -577,12 +579,10 @@ fn classify(
             (AnalysisDialect::Simetrix, AnalysisKind::Transient)
                 if native_analysis_shape(analysis, &args) =>
             {
-                if let Some(native) = transient_arguments(&args) {
+                transient_arguments(&args).map_or(RequiresBinding, |native| {
                     args = native;
                     NativeRequest
-                } else {
-                    RequiresBinding
-                }
+                })
             }
             (AnalysisDialect::Simetrix, _) if native_analysis_shape(analysis, &args) => {
                 NativeRequest
@@ -626,6 +626,164 @@ fn push_entry(
     Ok(())
 }
 
+struct Capture<'a> {
+    plan: &'a mut AnalysisPlan,
+    artifact: &'a str,
+    source: Option<&'a std::path::Path>,
+    declarations: &'a [SourceDeclaration],
+    physical: Vec<&'a str>,
+    removed: Vec<bool>,
+    scope: Vec<String>,
+    pending: Option<&'a SourceDeclaration>,
+    embedded: bool,
+    control: Option<usize>,
+}
+
+impl Capture<'_> {
+    fn library(&self) -> bool {
+        self.artifact != "deck.cir" || self.plan.kind == PlanKind::Library
+    }
+
+    fn origin(&self, first_line: usize, last_line: usize) -> DirectiveOrigin {
+        self.source.map_or_else(
+            || DirectiveOrigin::Generated {
+                artifact: self.artifact.to_owned(),
+                first_line,
+                last_line,
+            },
+            |path| DirectiveOrigin::Source {
+                path: path.to_path_buf(),
+                first_line,
+                last_line,
+            },
+        )
+    }
+
+    fn entry(&mut self, origin: DirectiveOrigin, text: &str) -> Result<()> {
+        let library = self.library();
+        push_entry(self.plan, origin, &self.scope, text, library)
+    }
+
+    fn tag(&mut self, tag: &str, first_line: usize) -> Result<()> {
+        ensure!(self.pending.is_none(), "lost analysis source declaration");
+        let index = tag
+            .parse::<usize>()
+            .context("invalid internal analysis origin tag")?;
+        let declaration = self
+            .declarations
+            .get(index)
+            .context("missing internal analysis origin")?;
+        self.removed[first_line - 1] = true;
+        if matches!(command(&declaration.text).as_str(), ".INIT" | ".CONTROL") {
+            self.entry(declaration.origin.clone(), &declaration.text)?;
+        } else {
+            self.pending = Some(declaration);
+        }
+        Ok(())
+    }
+
+    fn consume(
+        &mut self,
+        line: &model_preprocess_simplis::source_dialect::ProjectedStatement,
+    ) -> Result<()> {
+        use model_translate_simplis::syntax::file_boundary;
+        let name = command(&line.text);
+        if let Some(first) = self.control {
+            if name == ".ENDC" {
+                let statement = self.physical[first - 1..line.last_line].concat();
+                self.entry(self.origin(first, line.last_line), &statement)?;
+                self.removed[first - 1..line.last_line].fill(true);
+                self.control = None;
+            }
+            return Ok(());
+        }
+        if self.embedded {
+            if file_boundary(&line.text) == Some(false) {
+                self.embedded = false;
+            }
+            return Ok(());
+        }
+        if file_boundary(&line.text) == Some(true) {
+            self.embedded = true;
+            return Ok(());
+        }
+        if let Some(tag) = line.text.strip_prefix(TAG_PREFIX) {
+            return self.tag(tag, line.first_line);
+        }
+        if line.text.trim().is_empty() || line.text.trim_start().starts_with('*') {
+            return Ok(());
+        }
+        if name == ".SUBCKT" {
+            self.scope.push(
+                line.text
+                    .split_ascii_whitespace()
+                    .nth(1)
+                    .context("missing subcircuit name")?
+                    .to_owned(),
+            );
+            return Ok(());
+        }
+        if name == ".ENDS" {
+            self.scope
+                .pop()
+                .context("unmatched subcircuit end in analysis capture")?;
+            return Ok(());
+        }
+        if !tracked(&name) {
+            return Ok(());
+        }
+        // The linker reorders .INIT snapshot entries; original root declarations
+        // were retained at their source tags. Keep effective entries for initialization.
+        if name == ".INIT"
+            && self.pending.is_none()
+            && !self.declarations.is_empty()
+            && self.scope.is_empty()
+        {
+            return Ok(());
+        }
+        if name == ".CONTROL" {
+            self.control = Some(line.first_line);
+            return Ok(());
+        }
+        let origin = if let Some(declaration) = self.pending.take() {
+            ensure!(
+                command(&declaration.text) == name,
+                "analysis origin does not match {name}"
+            );
+            declaration.origin.clone()
+        } else {
+            self.origin(line.first_line, line.last_line)
+        };
+        self.entry(origin, &line.text)?;
+        if !matches!(
+            name.as_str(),
+            ".OPTIONS" | ".OPTION" | ".OPT" | ".TEMP" | ".IC" | ".INIT" | ".NODESET" | ".SAVE"
+        ) {
+            self.removed[line.first_line - 1..line.last_line].fill(true);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<u8>> {
+        ensure!(
+            self.pending.is_none(),
+            "lost final analysis source declaration"
+        );
+        ensure!(self.control.is_none(), "unterminated .CONTROL block");
+        ensure!(
+            self.scope.is_empty(),
+            "unterminated subcircuit in analysis capture"
+        );
+        Ok(self
+            .physical
+            .into_iter()
+            .zip(self.removed)
+            .filter_map(|(line, remove)| (!remove).then_some(line))
+            .collect::<String>()
+            .into_bytes())
+    }
+}
+
 /// Capture active declarations from linked source. Source tags follow root
 /// conditional preprocessing and never enter final artifact bytes.
 pub(crate) fn capture(
@@ -639,7 +797,6 @@ pub(crate) fn capture(
         LibrarySimulator, project_resource,
         source_dialect::{DialectContext, SourceKind},
     };
-    use model_translate_simplis::syntax::file_boundary;
     let simulator = if plan.dialect == AnalysisDialect::Simetrix {
         LibrarySimulator::Simetrix
     } else {
@@ -651,127 +808,25 @@ pub(crate) fn capture(
         SourceKind::Include,
         simulator,
     )?;
-    let library = artifact != "deck.cir" || plan.kind == PlanKind::Library;
-    let text = std::str::from_utf8(bytes)?;
-    let physical = text.split_inclusive('\n').collect::<Vec<_>>();
-    let mut removed = vec![false; physical.len()];
-    let mut scope = Vec::new();
-    let mut pending: Option<&SourceDeclaration> = None;
-    let mut embedded = false;
-    let mut control = None;
-    let origin_at = |first_line, last_line| {
-        source.map_or_else(
-            || DirectiveOrigin::Generated {
-                artifact: artifact.to_owned(),
-                first_line,
-                last_line,
-            },
-            |path| DirectiveOrigin::Source {
-                path: path.to_path_buf(),
-                first_line,
-                last_line,
-            },
-        )
+    let physical = std::str::from_utf8(bytes)?
+        .split_inclusive('\n')
+        .collect::<Vec<_>>();
+    let removed = vec![false; physical.len()];
+    let mut capture = Capture {
+        plan,
+        artifact,
+        source,
+        declarations,
+        physical,
+        removed,
+        scope: Vec::new(),
+        pending: None,
+        embedded: false,
+        control: None,
     };
     for line in lines {
-        let name = command(&line.text);
-        if let Some(first) = control {
-            if name == ".ENDC" {
-                let statement = physical[first - 1..line.last_line].concat();
-                push_entry(
-                    plan,
-                    origin_at(first, line.last_line),
-                    &scope,
-                    &statement,
-                    library,
-                )?;
-                removed[first - 1..line.last_line].fill(true);
-                control = None;
-            }
-            continue;
-        }
-        if let Some(start) = file_boundary(&line.text) {
-            embedded = start;
-        }
-        if embedded || name == ".ENDF" {
-            continue;
-        }
-        if let Some(tag) = line.text.strip_prefix(TAG_PREFIX) {
-            ensure!(pending.is_none(), "lost analysis source declaration");
-            let index = tag
-                .parse::<usize>()
-                .context("invalid internal analysis origin tag")?;
-            let declaration = declarations
-                .get(index)
-                .context("missing internal analysis origin")?;
-            removed[line.first_line - 1] = true;
-            if matches!(command(&declaration.text).as_str(), ".INIT" | ".CONTROL") {
-                push_entry(
-                    plan,
-                    declaration.origin.clone(),
-                    &scope,
-                    &declaration.text,
-                    library,
-                )?;
-            } else {
-                pending = Some(declaration);
-            }
-            continue;
-        }
-        if line.text.trim().is_empty() || line.text.trim_start().starts_with('*') {
-            continue;
-        }
-        if name == ".SUBCKT" {
-            scope.push(
-                line.text
-                    .split_ascii_whitespace()
-                    .nth(1)
-                    .context("missing subcircuit name")?
-                    .to_owned(),
-            );
-            continue;
-        }
-        if name == ".ENDS" {
-            scope.pop();
-            continue;
-        }
-        if !tracked(&name) {
-            continue;
-        }
-        // The linker reorders .INIT snapshot entries; original root declarations
-        // were retained at their source tags. Keep the effective entries in
-        // electrical text for the existing initialization pass.
-        if name == ".INIT" && pending.is_none() && !declarations.is_empty() && scope.is_empty() {
-            continue;
-        }
-        if name == ".CONTROL" {
-            control = Some(line.first_line);
-            continue;
-        }
-        let origin = if let Some(declaration) = pending.take() {
-            ensure!(
-                command(&declaration.text) == name,
-                "analysis origin does not match {name}"
-            );
-            declaration.origin.clone()
-        } else {
-            origin_at(line.first_line, line.last_line)
-        };
-        push_entry(plan, origin, &scope, &line.text, library)?;
-        if !matches!(
-            name.as_str(),
-            ".OPTIONS" | ".OPTION" | ".OPT" | ".TEMP" | ".IC" | ".INIT" | ".NODESET" | ".SAVE"
-        ) {
-            removed[line.first_line - 1..line.last_line].fill(true);
-        }
+        capture.consume(&line)?;
     }
-    ensure!(pending.is_none(), "lost final analysis source declaration");
-    ensure!(control.is_none(), "unterminated .CONTROL block");
-    *bytes = physical
-        .into_iter()
-        .zip(removed)
-        .filter_map(|(line, remove)| (!remove).then_some(line))
-        .collect::<String>()
-        .into_bytes();
+    *bytes = capture.finish()?;
     Ok(())
 }

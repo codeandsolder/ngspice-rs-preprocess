@@ -105,7 +105,10 @@ fn library_projection_and_closed_translated_graph() -> Result<()> {
     let parsed_bundle = prepare_default(&request(InputFormat::SimplisLibrary, &library))?;
     let parsed = ParsedLibrary::from_json(&parsed_bundle.primary.bytes)?;
     let root = dir.path().join("root.net");
-    fs::write(&root, b".include parts.lb\nX1 a 0 PART\n.end\n")?;
+    fs::write(
+        &root,
+        b"* linked parts\n.include parts.lb\nX1 a 0 PART\n.end\n",
+    )?;
     let mut req = request(InputFormat::SimplisDeck, &root);
     req.libraries.push(LibraryInput::Parsed(parsed));
     let output = prepare_default(&req)?;

@@ -242,7 +242,7 @@ impl<'a> SourceExpansion<'a> {
                 "source lowering changed logical statement count"
             );
             for (line, lowered) in projected.iter_mut().zip(lowered.lines()) {
-                line.text = lowered.to_owned();
+                lowered.clone_into(&mut line.text);
             }
         }
         let mut embedded = false;
@@ -517,6 +517,45 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
     Ok(bundle)
 }
 
+fn translate_companions(
+    linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
+    known: &BTreeSet<&str>,
+    sources: &BTreeMap<String, BTreeSet<String>>,
+    root_sources: &BTreeSet<String>,
+    initial_conditions: &mut Option<super::passive_ic::InitialConditions>,
+    mut remaining: usize,
+) -> Result<(Vec<Artifact>, Vec<String>)> {
+    let mut companions = Vec::new();
+    let mut dependencies = Vec::new();
+    for library in &linked.libraries {
+        let mut translated = translate_simplis_expanded_library(&library.bytes)
+            .with_context(|| format!("translating linked library {}", library.source_id))?;
+        if let Some(policy) = &mut *initial_conditions {
+            capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
+        }
+        check_closed_includes(&translated.bytes, known)?;
+        remaining = remaining
+            .checked_sub(translated.bytes.len())
+            .context("combined artifact output byte budget exceeded")?;
+        let origins = sources
+            .get(&library.source_id)
+            .unwrap_or(root_sources)
+            .iter()
+            .cloned()
+            .collect();
+        dependencies.push(library.source_id.clone());
+        companions.push(generated(
+            library.filename.clone(),
+            translated.bytes,
+            origins,
+            Some(library.source_id.clone()),
+            library.dependencies.clone(),
+            translated.required_code_models,
+        ));
+    }
+    Ok((companions, dependencies))
+}
+
 fn linked(
     root: &AdmittedSource,
     request: &Request,
@@ -589,38 +628,18 @@ fn linked(
     }
     plan.append_native_options(&mut translated_root.bytes)?;
     check_closed_includes(&translated_root.bytes, &known)?;
-    let mut remaining = options
+    let remaining = options
         .output_bytes
         .checked_sub(translated_root.bytes.len())
         .context("combined artifact output byte budget exceeded")?;
-    let mut companions = Vec::new();
-    let mut dependencies = Vec::new();
-    for library in &linked.libraries {
-        let mut translated = translate_simplis_expanded_library(&library.bytes)
-            .with_context(|| format!("translating linked library {}", library.source_id))?;
-        if let Some(policy) = &mut initial_conditions {
-            capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
-        }
-        check_closed_includes(&translated.bytes, &known)?;
-        remaining = remaining
-            .checked_sub(translated.bytes.len())
-            .context("combined artifact output byte budget exceeded")?;
-        let origins = sources
-            .get(&library.source_id)
-            .unwrap_or(&root_sources)
-            .iter()
-            .cloned()
-            .collect();
-        dependencies.push(library.source_id.clone());
-        companions.push(generated(
-            library.filename.clone(),
-            translated.bytes,
-            origins,
-            Some(library.source_id.clone()),
-            library.dependencies.clone(),
-            translated.required_code_models,
-        ));
-    }
+    let (companions, dependencies) = translate_companions(
+        &linked,
+        &known,
+        &sources,
+        &root_sources,
+        &mut initial_conditions,
+        remaining,
+    )?;
     let primary = generated(
         "deck.cir".to_owned(),
         translated_root.bytes,
