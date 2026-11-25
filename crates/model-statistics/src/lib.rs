@@ -58,7 +58,7 @@ pub struct Function {
 impl Function {
     /// Identify a source function case-insensitively, including documented
     /// aliases. These are not the similarly named ngspice functions.
-    #[must_use]
+    #[must_use = "the result identifies the typed distribution and correlation"]
     pub fn simetrix(name: &str) -> Option<Self> {
         use Correlation::{Independent, Lot};
         let (kind, correlation) = match name.to_ascii_lowercase().as_str() {
@@ -90,7 +90,7 @@ impl Function {
     }
 
     /// Canonical source spelling; aliases share one distribution identity.
-    #[must_use]
+    #[must_use = "the returned spelling identifies the canonical distribution"]
     pub const fn name(self) -> &'static str {
         match (self.kind, self.correlation) {
             (Kind::Gaussian, Correlation::Independent) => "gauss",
@@ -134,7 +134,7 @@ impl Function {
             | Kind::GaussianTruncated
             | Kind::UniformAsymmetric
             | Kind::EndpointsAsymmetric => {
-                ensure!(count == 2, "{} requires two arguments", self.name())
+                ensure!(count == 2, "{} requires two arguments", self.name());
             }
             _ => ensure!(count == 1, "{} requires one argument", self.name()),
         }
@@ -142,7 +142,7 @@ impl Function {
     }
 
     /// Whether a numerically specified realization is available.
-    #[must_use]
+    #[must_use = "the result determines whether realization is supported"]
     pub const fn sampled_supported(self) -> bool {
         !matches!(
             self.kind,
@@ -240,13 +240,13 @@ pub struct Identity([u8; 32]);
 
 impl Identity {
     /// Start an identity domain.
-    #[must_use]
+    #[must_use = "the returned identity establishes a sampling domain"]
     pub fn root(domain: &[u8]) -> Self {
         Self(Sha256::digest(domain).into())
     }
 
     /// Extend a path by one independent component.
-    #[must_use]
+    #[must_use = "the returned identity extends the immutable path"]
     pub fn child(self, component: &[u8]) -> Self {
         let mut hash = Sha256::new();
         hash.update(self.0);
@@ -255,7 +255,7 @@ impl Identity {
     }
 
     /// Stable identity bytes used by the sampling kernel.
-    #[must_use]
+    #[must_use = "the returned bytes identify the immutable sampling path"]
     pub const fn bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -265,7 +265,9 @@ impl Identity {
 /// Ordinary native statistical functions have different argument semantics.
 pub const PREPARED_PREFIX: &str = "simetrix_stat_";
 
-/// Explicit sampled source call. The first six native operands encode
+/// Explicit sampled source call.
+///
+/// The first six native operands encode
 /// seed, sample, and static source site as pairs of exact 32-bit words.
 /// This preserves the full experiment identity in a scalar expression
 /// without depending on floating-point seed parsing or ambient state.
@@ -275,15 +277,16 @@ pub struct Invocation {
     pub function: Function,
     /// Experiment identity.
     pub realization: Realization,
-    /// Stable call site assigned before physical instance expansion.
+    /// Static call ordinal within the containing declaration, before physical instance expansion.
+    /// The consumer also binds the declaration and macro invocation identity.
     pub site: u64,
 }
 
-fn words(value: u64) -> [u32; 2] {
-    let [a, b, c, d, e, f, g, h] = value.to_le_bytes();
+const fn words(value: u64) -> [u32; 2] {
+    let bytes = value.to_le_bytes();
     [
-        u32::from_le_bytes([a, b, c, d]),
-        u32::from_le_bytes([e, f, g, h]),
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
     ]
 }
 
@@ -293,22 +296,29 @@ fn join(words: [u32; 2]) -> u64 {
 
 impl Invocation {
     /// Function name of the explicit native representation.
-    #[must_use]
+    #[must_use = "the returned function name encodes the source distribution"]
     pub fn marker_name(self) -> String {
         format!("{PREPARED_PREFIX}{}", self.function.name())
     }
 
     /// Exact metadata operands, in wire order.
-    #[must_use]
-    pub fn metadata(self) -> [u32; 6] {
-        let [a, b] = words(self.realization.seed);
-        let [c, d] = words(self.realization.sample);
-        let [e, f] = words(self.site);
-        [a, b, c, d, e, f]
+    #[must_use = "the returned words preserve the complete experiment identity"]
+    pub const fn metadata(self) -> [u32; 6] {
+        let [seed_low, seed_high] = words(self.realization.seed);
+        let [sample_low, sample_high] = words(self.realization.sample);
+        let [site_low, site_high] = words(self.site);
+        [
+            seed_low,
+            seed_high,
+            sample_low,
+            sample_high,
+            site_low,
+            site_high,
+        ]
     }
 
     /// Recognize a canonical prepared source function.
-    #[must_use]
+    #[must_use = "the result identifies the encoded source distribution"]
     pub fn function_for_marker(name: &str) -> Option<Function> {
         let name = name.to_ascii_lowercase();
         let suffix = name.strip_prefix(PREPARED_PREFIX)?;
@@ -333,23 +343,33 @@ impl Invocation {
             );
             #[expect(
                 clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
                 reason = "range and integral value are validated above"
+            )]
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "nonnegative range is validated above"
             )]
             {
                 *output = value as u32;
             }
         }
-        let [a, b, c, d, e, f] = decoded;
+        let [
+            seed_low,
+            seed_high,
+            sample_low,
+            sample_high,
+            site_low,
+            site_high,
+        ] = decoded;
         function.validate_arity(law.len())?;
         Ok((
             Self {
                 function,
                 realization: Realization {
-                    seed: join([a, b]),
-                    sample: join([c, d]),
+                    seed: join([seed_low, seed_high]),
+                    sample: join([sample_low, sample_high]),
                 },
-                site: join([e, f]),
+                site: join([site_low, site_high]),
             },
             law,
         ))
@@ -409,7 +429,10 @@ impl Random {
         // Midpoints of 2^52 equal intervals: both endpoints are excluded,
         // including the largest representable variate.
         let mantissa = u64::from_le_bytes(bits) >> 12;
-        (f64::from_bits(0x3ff0_0000_0000_0000 | mantissa) - 1.) + 0.5 * f64::EPSILON
+        0.5_f64.mul_add(
+            f64::EPSILON,
+            f64::from_bits(0x3ff0_0000_0000_0000 | mantissa) - 1.,
+        )
     }
 
     fn normal(&self, counter: u64) -> f64 {
@@ -570,7 +593,7 @@ impl Density {
                 let scale = left.abs().max(right.abs());
                 scale.ln() + (right / scale - left / scale).ln()
             };
-            let weight = log_width + peak.ln() + (0.5 * (a / peak + b / peak)).ln();
+            let weight = log_width + peak.ln() + f64::midpoint(a / peak, b / peak).ln();
             maximum = maximum.max(weight);
             weighted.push((
                 Segment {
@@ -624,7 +647,7 @@ impl Density {
         let position = if fraction == 0. {
             0.
         } else {
-            let mass = 0.5 * (a + b) * fraction;
+            let mass = f64::midpoint(a, b) * fraction;
             let root = (2. * (b - a)).mul_add(mass, a * a).max(0.).sqrt();
             2. * mass / (a + root)
         };

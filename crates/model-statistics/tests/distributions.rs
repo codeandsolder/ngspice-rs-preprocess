@@ -178,3 +178,40 @@ fn validate_shapes_and_extreme_density() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn invocation_encoding_preserves_every_bit_and_bound_call_identity() -> Result<()> {
+    use model_statistics::Invocation;
+    let invocation = Invocation {
+        function: function("UD2L")?,
+        realization: Realization {
+            seed: 0xfedc_ba98_7654_3210,
+            sample: 0x0123_4567_89ab_cdef,
+        },
+        site: 0x8000_0000_ffff_ffff,
+    };
+    let arguments = [0.2, -1., 1., 1., 1.];
+    let mut encoded: Vec<_> = invocation.metadata().into_iter().map(f64::from).collect();
+    encoded.extend(arguments);
+    let (decoded, law) = Invocation::decode(&invocation.marker_name(), &encoded)?;
+    assert_eq!(decoded, invocation);
+    assert_eq!(law, arguments);
+    assert_eq!(
+        decoded.sample(law, SITE)?,
+        invocation.sample(&arguments, SITE)?
+    );
+    assert_ne!(
+        decoded.sample(law, SITE)?,
+        Invocation {
+            site: invocation.site - 1,
+            ..invocation
+        }
+        .sample(law, SITE)?
+    );
+    for invalid in [-1., 0.5, f64::from(u32::MAX) + 1., f64::INFINITY, f64::NAN] {
+        encoded[0] = invalid;
+        assert!(Invocation::decode(&invocation.marker_name(), &encoded).is_err());
+    }
+    assert!(Invocation::decode("simetrix_stat_ud2l", &encoded).is_err());
+    Ok(())
+}
