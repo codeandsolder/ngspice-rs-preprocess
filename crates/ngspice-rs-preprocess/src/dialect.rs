@@ -12,7 +12,7 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_simetrix_source_view, parse_library_for_simulator,
-    parse_projected_library, preprocess_netlist_linked, project_simetrix_source, project_source,
+    parse_scoped_library, preprocess_netlist_linked, project_simetrix_source, project_source,
     source_include_target,
 };
 use model_translate_simplis::{
@@ -67,18 +67,23 @@ fn bundle(
     }
 }
 
-fn parse_root(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle> {
-    let name = display_path(&root.path);
-    let parsed = parse_library_for_simulator(&name, &root.bytes, projection(format))?;
+fn parse_root(
+    root: &AdmittedSource,
+    request: &Request,
+    options: &Options,
+    session: &mut SourceSession,
+) -> Result<PreparedBundle> {
+    let parsed =
+        parse_admitted_library(root, request, options, session, DialectContext::default())?;
     let artifact = generated(
         "library.json".to_owned(),
         parsed.to_json()?,
-        vec![name],
+        parsed.source_names().iter().cloned().collect(),
         Some(parsed.source_id().to_owned()),
         Vec::new(),
         Vec::new(),
     );
-    let mut bundle = bundle(root, format, artifact, Vec::new());
+    let mut bundle = bundle(root, request.format, artifact, Vec::new());
     bundle.device_identities = parsed.device_identities().to_vec();
     Ok(bundle)
 }
@@ -114,7 +119,7 @@ fn resolve_init(session: &SourceSession, parent: &Path, target: &Path) -> Result
         .context("init snapshot is missing")
 }
 
-struct InitExpansion<'a> {
+struct SourceExpansion<'a> {
     session: &'a mut SourceSession,
     output: Vec<u8>,
     sources: BTreeSet<String>,
@@ -125,11 +130,24 @@ struct InitExpansion<'a> {
     statements: Vec<ScopedStatement>,
 }
 
-impl InitExpansion<'_> {
+impl<'a> SourceExpansion<'a> {
+    fn new(session: &'a mut SourceSession, request: &'a Request, options: &Options) -> Self {
+        Self {
+            session,
+            output: Vec::new(),
+            sources: BTreeSet::new(),
+            stack: Vec::new(),
+            limit: options.output_bytes,
+            simulator: projection(request.format),
+            search_paths: &request.search_paths,
+            statements: Vec::new(),
+        }
+    }
+
     fn append(&mut self, bytes: &[u8]) -> Result<()> {
         ensure!(
             bytes.len() <= self.limit.saturating_sub(self.output.len()),
-            "init expansion byte budget exceeded"
+            "source expansion byte budget exceeded"
         );
         self.output.extend_from_slice(bytes);
         Ok(())
@@ -271,6 +289,28 @@ impl InitExpansion<'_> {
     }
 }
 
+fn parse_admitted_library(
+    source: &AdmittedSource,
+    request: &Request,
+    options: &Options,
+    session: &mut SourceSession,
+    inherited: DialectContext,
+) -> Result<ParsedLibrary> {
+    let origin = display_path(&source.path);
+    if projection(request.format) != LibrarySimulator::Simetrix {
+        return parse_library_for_simulator(origin, &source.bytes, projection(request.format));
+    }
+    let mut expansion = SourceExpansion::new(session, request, options);
+    let dialect = expansion.expand(source, inherited, SourceKind::Include, None)?;
+    parse_scoped_library(
+        origin,
+        expansion.sources,
+        dialect,
+        &expansion.statements,
+        options.output_bytes,
+    )
+}
+
 struct ResolvedLibraries {
     catalog: SubcircuitCatalog,
     sources: BTreeMap<String, BTreeSet<String>>,
@@ -301,15 +341,7 @@ fn catalog(
                 let admitted = input.admit(session)?;
                 let origin = display_path(&admitted.path);
                 (
-                    if simulator == LibrarySimulator::Simetrix {
-                        let (dialect, view) =
-                            project_simetrix_source(&admitted.bytes, context, SourceKind::Include)?;
-                        let view =
-                            lower_simetrix_source_view(&view, dialect, options.output_bytes)?;
-                        parse_projected_library(origin.clone(), &view, simulator, Some(dialect))?
-                    } else {
-                        parse_library_for_simulator(&origin, &admitted.bytes, simulator)?
-                    },
+                    parse_admitted_library(&admitted, request, options, session, context)?,
                     origin,
                 )
             }
@@ -329,20 +361,10 @@ fn catalog(
             simulator.as_str()
         );
         catalog.add_parsed_library(&parsed)?;
-        device_identities.extend(
-            parsed
-                .device_identities()
-                .iter()
-                .cloned()
-                .map(|mut identity| {
-                    identity.source.clone_from(&origin);
-                    identity
-                }),
-        );
-        sources
-            .entry(parsed.source_id().to_owned())
-            .or_default()
-            .insert(origin);
+        device_identities.extend(parsed.device_identities().iter().cloned());
+        let origins = sources.entry(parsed.source_id().to_owned()).or_default();
+        origins.extend(parsed.source_names().iter().cloned());
+        origins.insert(origin);
     }
     Ok(ResolvedLibraries {
         catalog,
@@ -397,16 +419,7 @@ fn linked(
     cancellation: &Cancellation,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let mut init = InitExpansion {
-        session,
-        output: Vec::new(),
-        sources: BTreeSet::new(),
-        stack: Vec::new(),
-        limit: options.output_bytes,
-        simulator: projection(request.format),
-        search_paths: &request.search_paths,
-        statements: Vec::new(),
-    };
+    let mut init = SourceExpansion::new(session, request, options);
     let context = init.expand(root, DialectContext::default(), SourceKind::Deck, None)?;
     let root_sources = init.sources;
     let (expanded_root, mut device_identities) = if request.format == InputFormat::SimetrixDeck {
@@ -491,7 +504,7 @@ pub fn prepare(
     );
     match request.format {
         InputFormat::SimplisLibrary | InputFormat::SimetrixLibrary => {
-            parse_root(root, request.format)
+            parse_root(root, request, options, session)
         }
         InputFormat::ExpandedDeck | InputFormat::ExpandedLibrary => expanded(root, request.format),
         InputFormat::SimplisDeck | InputFormat::SimetrixDeck => {

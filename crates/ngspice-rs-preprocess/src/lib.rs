@@ -105,7 +105,7 @@ pub struct Request {
     pub input: SourceInput,
     /// Explicit catalog members (only for SIMPLIS/SIMetrix source decks).
     pub libraries: Vec<LibraryInput>,
-    /// Directories searched after the containing directory for native includes.
+    /// Directories searched after the containing directory for source includes.
     pub search_paths: Vec<PathBuf>,
 }
 
@@ -291,9 +291,12 @@ fn validate_request(request: &Request) -> Result<()> {
         request.search_paths.is_empty()
             || matches!(
                 request.format,
-                InputFormat::NativeDeck | InputFormat::NativeLibrary
+                InputFormat::NativeDeck
+                    | InputFormat::NativeLibrary
+                    | InputFormat::SimetrixDeck
+                    | InputFormat::SimetrixLibrary
             ),
-        "search paths are only defined for native source linking"
+        "search paths require native or SIMetrix source linking"
     );
     Ok(())
 }

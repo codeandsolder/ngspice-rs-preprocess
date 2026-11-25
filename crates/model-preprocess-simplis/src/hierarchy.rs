@@ -70,6 +70,7 @@ pub struct ParsedLibrary {
     device_identities: Vec<crate::source_dialect::DeviceIdentity>,
     source_id: String,
     source_name: String,
+    source_names: BTreeSet<String>,
     support_lines: Vec<String>,
     aliases: Vec<Alias>,
     definitions: Vec<Definition>,
@@ -101,6 +102,12 @@ impl ParsedLibrary {
     #[must_use = "the result identifies the original source name"]
     pub fn source_name(&self) -> &str {
         &self.source_name
+    }
+
+    /// Original admitted resources, including nested source files.
+    #[must_use = "the result retains source graph provenance"]
+    pub const fn source_names(&self) -> &BTreeSet<String> {
+        &self.source_names
     }
 
     #[must_use = "the count reports the parsed definitions"]
@@ -136,6 +143,14 @@ impl ParsedLibrary {
                 self.format_version
             );
         }
+        anyhow::ensure!(
+            self.source_names.contains(&self.source_name)
+                && self
+                    .device_identities
+                    .iter()
+                    .all(|identity| self.source_names.contains(&identity.source)),
+            "parsed library source provenance is incomplete"
+        );
         let actual = parsed_library_digest(
             self.simulator,
             self.dialect,
@@ -711,18 +726,50 @@ pub fn parse_library_for_simulator(
     parse_projected_library(source_name, &view, simulator, None)
 }
 
-/// Parse a source whose file language and simulator projection were resolved.
+/// Parse an admitted, scoped source graph whose individual resources have
+/// already been projected and lowered using their own language context.
 ///
 /// # Errors
-/// Invalid subcircuit hierarchy or library declarations.
-pub fn parse_projected_library(
+/// Invalid source identities, hierarchy, or exceeded expansion budget.
+pub fn parse_scoped_library(
+    source_name: String,
+    source_names: BTreeSet<String>,
+    dialect: crate::source_dialect::DialectContext,
+    statements: &[crate::source_dialect::ScopedStatement],
+    limit: usize,
+) -> Result<ParsedLibrary> {
+    use crate::source_dialect::resolve_device_identities;
+    anyhow::ensure!(
+        source_names.contains(&source_name)
+            && statements
+                .iter()
+                .all(|line| source_names.contains(&line.source)),
+        "incomplete admitted source graph"
+    );
+    let resolved = resolve_device_identities(statements)?;
+    anyhow::ensure!(
+        resolved.text.len() <= limit,
+        "device identity expansion byte budget exceeded"
+    );
+    parse_library_parts(
+        source_name,
+        source_names,
+        &resolved.text,
+        LibrarySimulator::Simetrix,
+        Some(dialect),
+        resolved.identities,
+    )
+}
+
+fn parse_projected_library(
     source_name: String,
     selected_view: &str,
     simulator: LibrarySimulator,
     dialect: Option<crate::source_dialect::DialectContext>,
 ) -> Result<ParsedLibrary> {
-    use crate::source_dialect::{ScopedStatement, resolve_device_identities};
-    let (selected_view, device_identities) = if let Some(context) = dialect {
+    use crate::source_dialect::{DEFAULT_PROJECTION_BYTES, ScopedStatement};
+    let sources = BTreeSet::from([source_name.clone()]);
+    if let Some(context) = dialect {
         let statements = selected_view
             .lines()
             .map(|text| ScopedStatement {
@@ -731,12 +778,33 @@ pub fn parse_projected_library(
                 text: text.to_owned(),
             })
             .collect::<Vec<_>>();
-        let resolved = resolve_device_identities(&statements)?;
-        (resolved.text, resolved.identities)
-    } else {
-        (selected_view.to_owned(), Vec::new())
-    };
-    let parsed = extract_definitions(&selected_view)?;
+        return parse_scoped_library(
+            source_name,
+            sources,
+            context,
+            &statements,
+            DEFAULT_PROJECTION_BYTES,
+        );
+    }
+    parse_library_parts(
+        source_name,
+        sources,
+        selected_view,
+        simulator,
+        None,
+        Vec::new(),
+    )
+}
+
+fn parse_library_parts(
+    source_name: String,
+    source_names: BTreeSet<String>,
+    selected_view: &str,
+    simulator: LibrarySimulator,
+    dialect: Option<crate::source_dialect::DialectContext>,
+    device_identities: Vec<crate::source_dialect::DeviceIdentity>,
+) -> Result<ParsedLibrary> {
+    let parsed = extract_definitions(selected_view)?;
     let (support_lines, aliases) = parse_library_root(&parsed.root_lines)?;
     let mut definitions = parsed.definitions;
     for definition in &mut definitions {
@@ -758,6 +826,7 @@ pub fn parse_projected_library(
         device_identities,
         source_id,
         source_name,
+        source_names,
         support_lines,
         aliases,
         definitions,

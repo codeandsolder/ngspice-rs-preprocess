@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, ensure};
-use ngspice_rs_preprocess::{Cancellation, InputFormat, Options, Request, SourceInput, prepare};
+use ngspice_rs_preprocess::{
+    Cancellation, InputFormat, LibraryInput, Options, ParsedLibrary, PreparedBundle, Provenance,
+    Request, SourceInput, prepare,
+};
 use std::{fs, path::Path, process::Command};
 
 fn run(root: &Path, vectors: &str, expected: &[f64]) -> Result<()> {
@@ -13,6 +16,10 @@ fn run(root: &Path, vectors: &str, expected: &[f64]) -> Result<()> {
         &Options::default(),
         &Cancellation::default(),
     )?;
+    run_prepared(&bundle, vectors, expected)
+}
+
+fn run_prepared(bundle: &PreparedBundle, vectors: &str, expected: &[f64]) -> Result<()> {
     let dir = tempfile::tempdir()?;
     for artifact in &bundle.companions {
         fs::write(dir.path().join(&artifact.filename), &artifact.bytes)?;
@@ -167,5 +174,81 @@ fn duplicate_displayed_names_fail_even_when_types_differ() -> Result<()> {
         format!("{error:#}").contains("duplicate device identity"),
         "{error:#}"
     );
+    Ok(())
+}
+
+fn scoped_library_request(path: &Path) -> Result<Request> {
+    let search = path.join("parts");
+    fs::create_dir(&search)?;
+    fs::write(path.join("cell.lb"), b"*#SIMETRIX sep=:\n.subckt cell out rtn\n.param native_log={LOG(100)}\nV:sense n rtn 0\nV2 vdd rtn 1\nR1 vdd n 1k\n.inc 'helper.lib'\n.param restored_log={LOG(100)}\nB1 out rtn V=1000*I(sense)+native_log+hslog+grandpow+pspow+restored_log\n.ends cell\n")?;
+    fs::write(search.join("helper.lib"), b"*#HSPICE\n.param hslog='LOG(100)' $ HSPICE comment\n.lib 'nested.lib' tt\n.inc 'ps.lib'\n")?;
+    fs::write(
+        search.join("nested.lib"),
+        b".lib tt\n.param grandpow='PWR(-2,2)'\n.endl tt\n.lib ss\n.param grandpow=999\n.endl ss\n",
+    )?;
+    fs::write(
+        search.join("ps.lib"),
+        b"*#PSPICE\n.param pspow={PWR(-2,2)} ; PSPICE comment\n",
+    )?;
+    fs::write(
+        path.join("root.net"),
+        b"* root\n*#HSPICE\nX1 out 0 cell\n.end\n",
+    )?;
+    Ok(Request {
+        format: InputFormat::SimetrixLibrary,
+        input: SourceInput::File(path.join("cell.lb")),
+        libraries: Vec::new(),
+        search_paths: vec![search],
+    })
+}
+
+#[test]
+fn standalone_and_catalog_libraries_share_scoped_source_admission() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path();
+    let mut request = scoped_library_request(path)?;
+    let options = Options::default();
+    let cancel = Cancellation::default();
+    let parsed_bundle = prepare(&request, &options, &cancel)?;
+    let parsed = ParsedLibrary::from_json(&parsed_bundle.primary.bytes)?;
+    assert_eq!(parsed.source_names().len(), 4);
+    assert!(
+        parsed
+            .source_names()
+            .iter()
+            .any(|p| p.ends_with("nested.lib"))
+    );
+    let branch = parsed
+        .device_identities()
+        .iter()
+        .find(|id| id.displayed == "sense")
+        .context("missing custom device identity")?;
+    assert!(branch.source.ends_with("cell.lb"));
+    assert_eq!(branch.scope, ["cell"]);
+    let input = request.input.clone();
+    request.format = InputFormat::SimetrixDeck;
+    request.input = SourceInput::File(path.join("root.net"));
+    let expected = 5. + 100.0_f64.ln();
+    for library in [LibraryInput::Source(input), LibraryInput::Parsed(parsed)] {
+        request.libraries = vec![library];
+        let bundle = prepare(&request, &options, &cancel)?;
+        let Provenance::Generated { sources, .. } = &bundle
+            .companions
+            .first()
+            .context("missing linked library")?
+            .provenance
+        else {
+            anyhow::bail!("expected generated provenance");
+        };
+        assert_eq!(sources.len(), 4);
+        assert!(sources.iter().any(|p| p.ends_with("helper.lib")));
+        assert!(
+            bundle
+                .device_identities
+                .iter()
+                .any(|id| id.displayed == "sense" && id.source.ends_with("cell.lb"))
+        );
+        run_prepared(&bundle, "v(out)", &[expected])?;
+    }
     Ok(())
 }
