@@ -132,7 +132,7 @@ pub struct VdmosBinding {
 impl VdmosBinding {
     /// Local identity of the immutable model and structural configuration.
     /// Numeric multiplicity and temperature are prepared separately.
-    #[must_use]
+    #[must_use = "the key selects the shared immutable model artifact"]
     pub const fn artifact_key(&self) -> (usize, bool) {
         (self.model, self.self_heating)
     }

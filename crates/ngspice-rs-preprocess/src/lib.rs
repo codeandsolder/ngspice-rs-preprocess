@@ -194,7 +194,7 @@ impl PreparedBundle {
     }
 
     /// Unique supplemental model runtimes required across the closed bundle.
-    #[must_use]
+    #[must_use = "the result describes the prepared bundle runtime requirements"]
     pub fn required_code_models(&self) -> Vec<CodeModelRuntime> {
         let mut runtimes = self
             .artifacts()

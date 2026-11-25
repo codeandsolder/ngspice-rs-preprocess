@@ -98,7 +98,7 @@ pub enum CodeModelRuntime {
 impl CodeModelRuntime {
     /// Matching C-reference module filename. Native execution may implement
     /// the corresponding model schemas directly instead of loading a C module.
-    #[must_use]
+    #[must_use = "the filename identifies the reference runtime module"]
     pub const fn reference_module(self) -> &'static str {
         match self {
             Self::Logic => "ngspice_preprocess_logic.cm",
@@ -108,7 +108,7 @@ impl CodeModelRuntime {
 
 impl TranslationKind {
     /// Additional simulator runtime required by this electrical primitive.
-    #[must_use]
+    #[must_use = "the result declares the primitive runtime dependency"]
     pub const fn required_runtime(self) -> Option<CodeModelRuntime> {
         match self {
             Self::AndGate | Self::OrGate | Self::SrLatch | Self::SrFlipFlop => {
