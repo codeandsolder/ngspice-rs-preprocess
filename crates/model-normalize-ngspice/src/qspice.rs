@@ -26,6 +26,8 @@ pub enum Feature {
     SourceEncoding,
     /// Numeric spelling not representable in the native grammar.
     NumericLiteral,
+    /// Conditional topology requires a source-specific binding phase.
+    ConditionalTopology,
     /// Ambiguous or contradictory source declaration binding.
     Binding,
     /// Digital, specialized or compiled device class.
@@ -49,6 +51,7 @@ impl fmt::Display for Feature {
             Self::SourceEncoding => "source encoding",
             Self::NumericLiteral => "numeric literal",
             Self::Binding => "declaration binding",
+            Self::ConditionalTopology => "conditional topology",
             Self::SpecialDevice => "specialized device class",
             Self::Directive => "simulator-specific directive",
             Self::PassiveParasitics => "passive parasitics",
@@ -199,6 +202,39 @@ pub(crate) fn decode_resource<'a>(path: &Path, input: &'a [u8]) -> Result<Cow<'a
         }
     }
     Ok(Cow::Owned(decoded.into_bytes()))
+}
+
+// QSPICE's netlist conditionals are not the native solver's run-time
+// expressions. Reject before resource expansion, not after eagerly opening
+// all branches. See https://forum.qorvo.com/t/are-there-examples-of-using-the-new-sim-directives-display-if-else-and-endif/23763.
+pub(crate) fn check_topology_directive(path: &Path, line: usize, text: &str) -> Result<()> {
+    let name = text
+        .split(|c: char| c.is_ascii_whitespace() || c == '(')
+        .next()
+        .unwrap_or_default();
+    if [
+        ".if", ".elseif", ".elif", ".else", ".endif", ".case", ".endcase",
+    ]
+    .iter()
+    .any(|directive| name.eq_ignore_ascii_case(directive))
+    {
+        return Err(unsupported(
+            path,
+            line,
+            Feature::ConditionalTopology,
+            "conditional selection must precede resource admission and occurrence binding",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_nested_search(path: &Path, line: usize) -> anyhow::Error {
+    unsupported(
+        path,
+        line,
+        Feature::Directive,
+        "nested .libpath requires source-specific resource binding",
+    )
 }
 
 pub(crate) fn reject_special_device(path: &Path, line: usize) -> Result<()> {
@@ -367,7 +403,7 @@ fn lower_statement(
             "external execution or source-defined resource search is not native; use explicit caller search directories for text resources",
         )),
         b".model" => check_model(statement, origin),
-        b".step" | b".noise" | b".four" => Err(reject(
+        b".step" | b".noise" | b".four" | b".display" => Err(reject(
             origin,
             Feature::Directive,
             "analysis or output directive needs source-specific qualification",

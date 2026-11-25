@@ -516,10 +516,6 @@ fn transient_rejects_unqualified_output_time_and_option_precedence() -> Result<(
         ("Title\n.tran 0 2m 0 2u\n.option maxstep=1u\n.end\n", 2),
         ("Title\n.option maxstep=0\n.tran 2m\n.end\n", 2),
         ("Title\n.option maxstep=1u\n.end\n", 2),
-        (
-            "Title\n.if (1)\n.option maxstep=1u\n.endif\n.tran 2m\n.end\n",
-            3,
-        ),
     ] {
         fs::write(&root, source)?;
         let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
@@ -531,5 +527,44 @@ fn transient_rejects_unqualified_output_time_and_option_precedence() -> Result<(
         assert_eq!(diagnostic.feature, Feature::TransientTiming);
         assert_eq!(diagnostic.line, line);
     }
+    Ok(())
+}
+
+#[test]
+fn conditional_resources_are_not_eagerly_opened() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let library = dir.path().join("part.lib");
+    // The inactive branch contains both an unresolvable library and an
+    // invalid search directory. Diagnose the selection boundary itself.
+    for command in [".if (enabled)", ".if(enabled)", ".IF (0)", ".case enabled"] {
+        fs::write(
+            &root,
+            format!("Title\n{command}\n.lib missing.lib\n.libpath missing\n.end\n"),
+        )?;
+        let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+            .err()
+            .context("conditional graph accepted")?;
+        let diagnostic = error
+            .downcast_ref::<Unsupported>()
+            .with_context(|| format!("{error:#}"))?;
+        assert_eq!(diagnostic.feature, Feature::ConditionalTopology);
+        assert_eq!(diagnostic.path, root.canonicalize()?);
+        assert_eq!(diagnostic.line, 2);
+    }
+    fs::write(&library, b".lib unselected\n.if (0)\n.lib missing.lib\n.endif\n.endl unselected\n.lib selected\nR1 a b 1k\n.endl selected\n")?;
+    fs::write(&root, b"Title\n.lib part.lib selected\n.end\n")?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    assert!(std::str::from_utf8(&bundle.primary.bytes)?.contains("R1 a b 1k"));
+    fs::write(&root, b"Title\n.lib part.lib unselected\n.end\n")?;
+    let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+        .err()
+        .context("selected conditional graph accepted")?;
+    let diagnostic = error
+        .downcast_ref::<Unsupported>()
+        .with_context(|| format!("{error:#}"))?;
+    assert_eq!(diagnostic.feature, Feature::ConditionalTopology);
+    assert_eq!(diagnostic.path, library.canonicalize()?);
+    assert_eq!(diagnostic.line, 2);
     Ok(())
 }

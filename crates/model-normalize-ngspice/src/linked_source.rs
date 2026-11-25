@@ -485,6 +485,9 @@ impl LinkState<'_> {
                 if in_control || control_end {
                     self.emit_record(path, &record, &physical)?;
                 } else {
+                    if self.settings.library_syntax == LibrarySyntax::Qspice {
+                        crate::qspice::check_topology_directive(path, record.line, text)?;
+                    }
                     self.expand_record(path, &record, &physical, text, kind)?;
                 }
             }
@@ -504,26 +507,24 @@ impl LinkState<'_> {
         let mut depth = 0usize;
         for record in records {
             let text = std::str::from_utf8(&record.logical)?;
-            if [".if", ".subckt", ".control"]
+            crate::qspice::check_topology_directive(path, record.line, text)?;
+            if [".subckt", ".control"]
                 .iter()
                 .any(|name| directive(text, name).is_some())
             {
                 depth = depth
                     .checked_add(1)
                     .context("QSPICE source scope overflow")?;
-            } else if [".endif", ".ends", ".endc"]
+            } else if [".ends", ".endc"]
                 .iter()
                 .any(|name| directive(text, name).is_some())
             {
                 depth = depth.saturating_sub(1);
             }
             if let Some(rest) = directive(text, ".libpath") {
-                ensure!(
-                    depth == 0,
-                    "{}:{}: .libpath in a conditional or nested scope requires source-specific binding",
-                    path.display(),
-                    record.line
-                );
+                if depth != 0 {
+                    return Err(crate::qspice::reject_nested_search(path, record.line));
+                }
                 let args = operands(rest)?;
                 let [directory] = args.as_slice() else {
                     bail!(
