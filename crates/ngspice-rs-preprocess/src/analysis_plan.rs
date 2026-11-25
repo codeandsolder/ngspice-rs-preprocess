@@ -398,7 +398,7 @@ fn options(fields: &[String], dialect: AnalysisDialect) -> Result<Vec<OptionSett
 }
 
 fn arguments(statement: &str) -> Result<Vec<String>> {
-    let fields = model_normalize_ngspice::lexical::tokens(statement.as_bytes())?;
+    let fields = model_normalize_ngspice::statement_token_spans(statement)?;
     Ok(fields
         .into_iter()
         .skip(1)
