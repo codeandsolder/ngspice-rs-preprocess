@@ -1001,6 +1001,55 @@ pub fn project_resource(
     ))
 }
 
+/// Project a standalone SPICE-family resource, without selecting a SIMPLIS or
+/// SIMetrix multi-simulator library view. The deck title is retained verbatim
+/// and cannot participate in comment, continuation, or directive processing.
+///
+/// # Errors
+/// Invalid text or orphan continuation in the resource.
+pub fn project_spice_resource(
+    input: &[u8],
+    inherited: crate::source_dialect::DialectContext,
+    kind: crate::source_dialect::SourceKind,
+) -> Result<(
+    crate::source_dialect::DialectContext,
+    Vec<crate::source_dialect::ProjectedStatement>,
+)> {
+    use crate::source_dialect::{DialectContext, ProjectedStatement, SourceKind, logical_source};
+    let decoded = decode_simplis_text(input)?;
+    let context = DialectContext::resolve(&decoded, inherited, kind);
+    if kind == SourceKind::Include {
+        return Ok((context, logical_source(&decoded, context)?));
+    }
+    let mut lines = decoded.splitn(2, '\n');
+    let title = lines.next().context("SPICE deck has no title")?;
+    ensure!(!input.is_empty(), "SPICE deck has no title");
+    let mut statements = vec![ProjectedStatement {
+        text: title.trim_end_matches('\r').to_owned(),
+        first_line: 1,
+        last_line: 1,
+    }];
+    for mut statement in logical_source(lines.next().unwrap_or_default(), context)? {
+        statement.first_line += 1;
+        statement.last_line += 1;
+        statements.push(statement);
+    }
+    Ok((context, statements))
+}
+
+/// Lower a standalone resource's expressions with their source language,
+/// rather than imposing the containing SIMetrix simulator's element syntax.
+///
+/// # Errors
+/// Invalid expression syntax or exceeded output byte budget.
+pub fn lower_spice_statement(
+    statement: &str,
+    context: crate::source_dialect::DialectContext,
+    limit: usize,
+) -> Result<String> {
+    crate::source_dialect::lower_statement_in(statement, context, limit, false)
+}
+
 /// Lower expressions only after simulator and named-section selection.
 ///
 /// # Errors

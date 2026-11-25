@@ -30,6 +30,10 @@ pub enum InputFormat {
     NativeDeck,
     /// Native-compatible library; emit include-safe text.
     NativeLibrary,
+    /// Standalone HSPICE deck lowered to native SPICE.
+    HspiceDeck,
+    /// Standalone HSPICE library lowered to include-safe native SPICE.
+    HspiceLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,
     /// `SIMetrix` source deck with optional library catalog.
@@ -45,6 +49,10 @@ pub enum InputFormat {
 }
 
 impl InputFormat {
+    const fn is_hspice(self) -> bool {
+        matches!(self, Self::HspiceDeck | Self::HspiceLibrary)
+    }
+
     /// Parse the explicit CLI spelling.
     ///
     /// # Errors
@@ -53,6 +61,8 @@ impl InputFormat {
         match value {
             "native-deck" => Ok(Self::NativeDeck),
             "native-library" => Ok(Self::NativeLibrary),
+            "hspice-deck" => Ok(Self::HspiceDeck),
+            "hspice-library" => Ok(Self::HspiceLibrary),
             "simplis-deck" => Ok(Self::SimplisDeck),
             "simetrix-deck" => Ok(Self::SimetrixDeck),
             "expanded-deck" => Ok(Self::ExpandedDeck),
@@ -153,8 +163,10 @@ pub struct OriginLine {
     /// Exact original source path. JSON uses its display spelling.
     #[serde(serialize_with = "serialize_path")]
     pub source: PathBuf,
-    /// One-based physical line in the admitted source.
+    /// One-based physical line in the admitted source, or zero for a generated dialect default.
     pub line: usize,
+    /// Inclusive end of the admitted physical source span, or zero for a generated dialect default.
+    pub last_line: usize,
 }
 
 /// Provenance of an artifact. Generated dialect output is not falsely given
@@ -279,22 +291,41 @@ fn native(
         },
         session,
     )?;
-    let normalized = normalize_mapped(&linked.bytes, kind)?;
+    let origins = linked
+        .origins
+        .into_iter()
+        .map(|mapped| OriginLine {
+            source: mapped.path,
+            line: mapped.line,
+            last_line: mapped.line,
+        })
+        .collect::<Vec<_>>();
+    native_bundle(origin, request.format, kind, &linked.bytes, &origins)
+}
+
+fn native_bundle(
+    origin: PathBuf,
+    format: InputFormat,
+    kind: RootKind,
+    bytes: &[u8],
+    origins: &[OriginLine],
+) -> Result<PreparedBundle> {
+    let normalized = normalize_mapped(bytes, kind)?;
     let lines = normalized
         .input_lines
         .into_iter()
         .map(|line| {
-            let mapped = linked
-                .origin(line)
-                .context("missing linked source location")?;
-            Ok(OriginLine {
-                source: mapped.path.clone(),
-                line: mapped.line,
-            })
+            origins
+                .get(
+                    line.checked_sub(1)
+                        .context("invalid linked source location")?,
+                )
+                .cloned()
+                .context("missing linked source location")
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(PreparedBundle {
-        format: request.format,
+        format,
         origin,
         primary: Artifact {
             filename: if kind == RootKind::Deck {
@@ -334,10 +365,12 @@ fn validate_request(request: &Request) -> Result<()> {
                 request.format,
                 InputFormat::NativeDeck
                     | InputFormat::NativeLibrary
+                    | InputFormat::HspiceDeck
+                    | InputFormat::HspiceLibrary
                     | InputFormat::SimetrixDeck
                     | InputFormat::SimetrixLibrary
             ),
-        "search paths require native or SIMetrix source linking"
+        "search paths require native, HSPICE or SIMetrix source linking"
     );
     Ok(())
 }

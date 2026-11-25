@@ -529,6 +529,15 @@ pub(super) fn lower_statement(
     context: DialectContext,
     limit: usize,
 ) -> Result<String> {
+    lower_statement_in(statement, context, limit, true)
+}
+
+pub(super) fn lower_statement_in(
+    statement: &str,
+    context: DialectContext,
+    limit: usize,
+    simetrix_element_syntax: bool,
+) -> Result<String> {
     let trimmed = statement.trim_start();
     let Some(first) = trimmed.split_whitespace().next() else {
         return Ok(statement.to_owned());
@@ -565,11 +574,15 @@ pub(super) fn lower_statement(
             .split(|ch: char| ch.is_whitespace() || ch == '=' || ch == '{')
             .next()
             .unwrap_or_default();
-        let language = match (device, assignment.to_ascii_uppercase().as_str()) {
-            (b'B', _) => SourceLanguage::Simetrix,
-            (b'E'..=b'H', "VALUE") => SourceLanguage::Pspice,
-            (b'E' | b'G', "VOL" | "CUR") => SourceLanguage::Hspice,
-            _ => context.language,
+        let language = if simetrix_element_syntax {
+            match (device, assignment.to_ascii_uppercase().as_str()) {
+                (b'B', _) => SourceLanguage::Simetrix,
+                (b'E'..=b'H', "VALUE") => SourceLanguage::Pspice,
+                (b'E' | b'G', "VOL" | "CUR") => SourceLanguage::Hspice,
+                _ => context.language,
+            }
+        } else {
+            context.language
         };
         (prefix, language)
     };
