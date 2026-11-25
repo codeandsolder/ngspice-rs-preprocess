@@ -90,7 +90,7 @@ impl ParsedLibrary {
     }
 
     /// Original projected declarations, before simulation-local mapping.
-    #[must_use]
+    #[must_use = "the returned declarations are inputs to request-local model mapping"]
     pub fn scoped_statements(&self) -> &[crate::source_dialect::ScopedStatement] {
         &self.scoped_statements
     }
