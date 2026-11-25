@@ -197,6 +197,7 @@ impl Builtins {
         let normalized = normalized_statement(statement);
         let active = active_statement_prefix(&normalized);
         match directive_name(trimmed).as_deref() {
+            Some(".MODEL") => self.braced_regions(&materialize_jfet_defaults(active)?),
             Some(".PARAM") => {
                 let tail = active
                     .split_once(char::is_whitespace)
@@ -256,6 +257,58 @@ impl Builtins {
                 }
             }
         }
+    }
+}
+
+/// The ordinary `SIMetrix` JFET has a cubic gate saturation-current
+/// temperature factor. Do not change other levels or explicit overrides.
+fn materialize_jfet_defaults(statement: &str) -> Result<String> {
+    let Some((_, kind)) = model_header(statement) else {
+        return Ok(statement.to_owned());
+    };
+    if !matches!(kind.as_str(), "NJF" | "PJF") {
+        return Ok(statement.to_owned());
+    }
+    let active = active_statement_prefix(statement).trim();
+    let card = model_normalize_ngspice::model_card::parse_model_card(active, 1, &["XTI", "LEVEL"])?;
+    if card
+        .parameters
+        .iter()
+        .any(|field| field.name.eq_ignore_ascii_case("XTI"))
+    {
+        return Ok(active.to_owned());
+    }
+    if let Some(level) = card
+        .parameters
+        .iter()
+        .rev()
+        .find(|field| field.name.eq_ignore_ascii_case("LEVEL"))
+    {
+        let value = level
+            .expression
+            .as_deref()
+            .context("JFET LEVEL requires a value")?;
+        let level = model_normalize_ngspice::param_expression::SpiceExpression::parse(value)?
+            .evaluate(|name| bail!("unresolved JFET LEVEL symbol {name}"))
+            .context("JFET LEVEL must be known to select its source defaults")?;
+        if level.to_bits() != 1.0f64.to_bits() {
+            return Ok(active.to_owned());
+        }
+    }
+    // The lexer has already established the family and wrapper boundaries.
+    let family = active
+        .split_whitespace()
+        .nth(2)
+        .context("missing JFET family")?;
+    let offset = family.as_ptr().addr() - active.as_ptr().addr() + kind.len();
+    let tail = active[offset..].trim_start();
+    if tail.starts_with('(') {
+        let body = active
+            .strip_suffix(')')
+            .context("missing model wrapper terminator")?;
+        Ok(format!("{body} XTI=3)"))
+    } else {
+        Ok(format!("{active} XTI=3"))
     }
 }
 
@@ -485,4 +538,51 @@ pub fn lower_simetrix_linked_runtime(linked: &mut LinkedPreprocessedNetlist) -> 
         library.bytes = render_items(&items)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod jfet_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_jfet_temperature_default_preserves_explicit_models() -> Result<()> {
+        for (source, expected) in [
+            (".model JX PJF(IS=15p)", ".model JX PJF(IS=15p XTI=3)"),
+            (".model JX NJF LEVEL=1", ".model JX NJF LEVEL=1 XTI=3"),
+            (".model JX NJF(IS=15p XTI=0)", ".model JX NJF(IS=15p XTI=0)"),
+            (".model JX PJF(LEVEL=2)", ".model JX PJF(LEVEL=2)"),
+            (".model JX NJF(XTI 0)", ".model JX NJF(XTI 0)"),
+            (".model JX NJF VTO=abs(1)", ".model JX NJF VTO=abs(1) XTI=3"),
+            (".model DX D(IS=15p)", ".model DX D(IS=15p)"),
+            (
+                ".model JX NJF(IS=15p) ; XTI=0",
+                ".model JX NJF(IS=15p XTI=3)",
+            ),
+            (".model XTI NJF(IS=15p)", ".model XTI NJF(IS=15p XTI=3)"),
+            (
+                ".model JX NJF(IS={xti+1}, LEVEL=1)",
+                ".model JX NJF(IS={xti+1}, LEVEL=1 XTI=3)",
+            ),
+            (
+                ".model JX NJF(IS=15p, XTI = {2+1})",
+                ".model JX NJF(IS=15p, XTI = {2+1})",
+            ),
+            (".model JX NJF(LEVEL 2)", ".model JX NJF(LEVEL 2)"),
+            (".model JX NJF", ".model JX NJF XTI=3"),
+        ] {
+            assert_eq!(materialize_jfet_defaults(source)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_or_unresolved_jfet_level_is_not_guessed() {
+        for source in [
+            ".model JX NJF(LEVEL)",
+            ".model JX NJF(LEVEL={unknown})",
+            ".model JX NJF(XTI=)",
+        ] {
+            assert!(materialize_jfet_defaults(source).is_err(), "{source}");
+        }
+    }
 }

@@ -210,3 +210,40 @@ fn nominal_preparation_rejects_ambiguous_temperature_and_statistical_analysis() 
     }
     Ok(())
 }
+
+#[test]
+fn simetrix_jfet_gate_current_temperature_reference() -> Result<()> {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jfet-temperature");
+    for temperature in [27, 65, 85] {
+        let name = format!("temp-{temperature}");
+        run_case(&fixtures, &name, "pass", 1e-13, 1e-3)
+            .with_context(|| format!("JFET temperature {temperature} C"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn jfet_default_is_specific_to_simetrix_projection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("models.net");
+    fs::write(&source, b"* dialect-specific JFET\n.temp 85\nV1 d 0 2\nV2 g 0 -2\nJ1 d g 0 MOD\n.model MOD NJF(IS=15p)\n.end\n")?;
+    for (format, expected) in [
+        (InputFormat::SimetrixDeck, true),
+        (InputFormat::SimplisDeck, false),
+        (InputFormat::NativeDeck, false),
+    ] {
+        let request = Request {
+            format,
+            input: SourceInput::File(source.clone()),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        };
+        let bundle = prepare(&request, &Options::default(), &Cancellation::default())?;
+        let text = std::str::from_utf8(&bundle.primary.bytes)?;
+        ensure!(
+            text.to_ascii_uppercase().contains("XTI=3") == expected,
+            "{format:?}: {text}"
+        );
+    }
+    Ok(())
+}

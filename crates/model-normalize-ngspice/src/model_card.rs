@@ -276,6 +276,26 @@ impl<'a> Source<'a> {
 }
 
 pub(crate) fn parse_one(statement: &str, source_line: usize) -> Result<ModelCard> {
+    parse_model_card(statement, source_line, &[])
+}
+
+/// Parse one already joined model statement.
+///
+/// Allow explicitly selected
+/// parameter names to use the source dialect's positional value syntax.
+/// All other bare tokens remain flags; native parsing uses no positional names.
+///
+/// # Errors
+/// Rejects malformed headers, missing selected values and unbalanced expressions.
+pub fn parse_model_card(
+    statement: &str,
+    source_line: usize,
+    positional: &[&str],
+) -> Result<ModelCard> {
+    ensure!(
+        is_model_start(statement.as_bytes()),
+        "expected .model statement"
+    );
     let mut source = Source {
         text: statement,
         offset: 6,
@@ -327,9 +347,13 @@ pub(crate) fn parse_one(statement: &str, source_line: usize) -> Result<ModelCard
             "line {source_line}: invalid model parameter identifier"
         );
         source.skip_space();
-        let expression = if statement.as_bytes().get(source.offset) == Some(&b'=') {
-            source.offset += 1;
-            source.skip_space();
+        let assigned = statement.as_bytes().get(source.offset) == Some(&b'=');
+        let expression = if assigned || positional.iter().any(|key| name.eq_ignore_ascii_case(key))
+        {
+            if assigned {
+                source.offset += 1;
+                source.skip_space();
+            }
             Some(
                 source
                     .value()

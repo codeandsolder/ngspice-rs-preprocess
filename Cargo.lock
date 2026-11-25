@@ -188,6 +188,7 @@ name = "model-translate-simplis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-normalize-ngspice",
  "model-preprocess-simplis",
  "serde",
  "serde_json",
