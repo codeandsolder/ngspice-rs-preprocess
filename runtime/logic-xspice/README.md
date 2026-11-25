@@ -5,9 +5,10 @@ gates, DIGITAL1 AND/OR and S-R latches, and classic SRFF. This runtime is
 independent of the experimental ALB runtime. Translation results advertise
 the required code-model library through `required_code_models`. The unified
 preparation API and version-2 JSON manifest report the per-artifact requirements
-and their bundle-wide union. The native engine implements the model schemas;
-the C module is an independent reference backend, not a required native-engine
-binary plugin.
+and their bundle-wide union. A native engine can bind the same schemas to
+typed kernels rather than loading the C module. The module is the independent
+C ngspice reference backend; it does not by itself provide native-engine
+model binding.
 
 Build against the configured in-tree **matching** ngspice source tree, including
 its CIDER/KLU/XSPICE configuration and built cmpp. Code-model ABI mismatches
