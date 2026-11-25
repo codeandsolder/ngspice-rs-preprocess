@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use model_kernel_api::{
-    Binding, EquationKind, PointBuffer, Result,
+    Binding, EquationKind, Error, PointBuffer, Result,
     batch::{BatchOutput, PreparedTile},
     noise::{Sink, Source},
 };
@@ -47,20 +47,22 @@ fn generalized_jacobian_matches_numerical_derivatives()
             let coordinates: Vec<_> = descriptor
                 .equations
                 .iter()
-                .map(|row| match row.name.as_str() {
-                    "drain" => 2. * sign,
-                    "gate" => 5.1 * sign,
-                    "source" => 0.,
-                    "drain_prime" => 1.9 * sign,
-                    "gate_prime" => 5. * sign,
-                    "source_prime" => 0.1 * sign,
-                    "body_prime" => 0.02 * sign,
-                    "junction" => 340.,
-                    "case" => 320.,
-                    "recovery" => 1e-8,
-                    name => panic!("unexpected row: {name}"),
+                .map(|row| {
+                    Ok(match row.name.as_str() {
+                        "drain" => 2. * sign,
+                        "gate" => 5.1 * sign,
+                        "source" => 0.,
+                        "drain_prime" => 1.9 * sign,
+                        "gate_prime" => 5. * sign,
+                        "source_prime" => 0.1 * sign,
+                        "body_prime" => 0.02 * sign,
+                        "junction" => 340.,
+                        "case" => 320.,
+                        "recovery" => 1e-8,
+                        name => return Err(Error::Domain(format!("unexpected row: {name}"))),
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             assert_eq!(
                 descriptor
                     .equations
@@ -150,15 +152,15 @@ fn recovery_row_transformation_preserves_physical_current()
                 .equations
                 .iter()
                 .position(|eq| eq.name == name)
-                .unwrap()
+                .ok_or(Error::Shape("missing test coordinate"))
         };
         let mut x = vec![0.; width];
         let sign = polarity.sign();
-        x[idx("drain")] = -0.55 * sign;
-        x[idx("gate")] = -1. * sign;
-        x[idx("junction")] = 330.;
-        x[idx("case")] = 310.;
-        x[idx("recovery")] = 2e-9;
+        x[idx("drain")?] = -0.55 * sign;
+        x[idx("gate")?] = -sign;
+        x[idx("junction")?] = 330.;
+        x[idx("case")?] = 310.;
+        x[idx("recovery")?] = 2e-9;
         let raw = model
             .bind(Instance {
                 multiplier: 2.,
@@ -172,22 +174,26 @@ fn recovery_row_transformation_preserves_physical_current()
                 recovery_node: 2e-9,
                 temperature: 330.,
             })?;
-        let recovery = raw.diode.recovery.unwrap();
+        let recovery = raw.diode.recovery.ok_or(Error::Shape("missing recovery"))?;
         let mut out = PointBuffer::new(width)?;
         artifact.evaluate(&instance, &x, &mut out.point())?;
         let point = out.point();
-        let expected_source = -raw.channel.value + raw.diode.current.value
-            - recovery.diode_charge_rate_gain * recovery.residual
-            - raw.series.shunt * x[idx("drain")];
-        close(point.current[idx("source")], expected_source, 1e-14, 1e-12);
+        let expected_source = raw.series.shunt.mul_add(
+            -x[idx("drain")?],
+            recovery.diode_charge_rate_gain.mul_add(
+                -recovery.residual,
+                raw.diode.current.value - raw.channel.value,
+            ),
+        );
+        close(point.current[idx("source")?], expected_source, 1e-14, 1e-12);
         close(
-            point.current[idx("recovery")],
+            point.current[idx("recovery")?],
             recovery.residual,
             1e-18,
             1e-12,
         );
         close(
-            point.charge[idx("recovery")],
+            point.charge[idx("recovery")?],
             recovery.stored_charge.value,
             1e-24,
             1e-12,
@@ -195,8 +201,13 @@ fn recovery_row_transformation_preserves_physical_current()
         // At a converged recovery equation dQs/dt=-Fq. The row
         // transformation is exact even when the gain varies with temperature.
         close(
-            point.current[idx("source")] + raw.channel.value + raw.series.shunt * x[idx("drain")],
-            raw.diode.current.value + recovery.diode_charge_rate_gain * (-recovery.residual),
+            raw.series.shunt.mul_add(
+                x[idx("drain")?],
+                point.current[idx("source")?] + raw.channel.value,
+            ),
+            recovery
+                .diode_charge_rate_gain
+                .mul_add(-recovery.residual, raw.diode.current.value),
             1e-14,
             1e-12,
         );
@@ -283,41 +294,50 @@ fn changing_temperature_backward_euler_recovery_is_equivalent()
             .evaluate(bias(300., 2e-9, 0.6 * sign))?
             .diode
             .recovery
-            .unwrap();
+            .ok_or(Error::Shape("missing recovery"))?;
         let next_zero = device
             .evaluate(bias(350., 0., 0.5 * sign))?
             .diode
             .recovery
-            .unwrap();
+            .ok_or(Error::Shape("missing recovery"))?;
         let step = 20e-9;
         // Independently solve the affine backward-Euler recovery equation:
         // Fq(0)+qp/VP+(TT_new*qp-Qs_old)/h=0.
         let qp = (old.stored_charge.value / step - next_zero.residual)
             / (next_zero.d_node + next_zero.stored_charge.d_voltage / step);
         let next = device.evaluate(bias(350., qp, 0.5 * sign))?;
-        let recovery = next.diode.recovery.unwrap();
+        let recovery = next
+            .diode
+            .recovery
+            .ok_or(Error::Shape("missing recovery"))?;
         let rate = (recovery.stored_charge.value - old.stored_charge.value) / step;
         close(recovery.residual + rate, 0., 1e-18, 1e-12);
         let coords: Vec<_> = kernel
             .descriptor()
             .equations
             .iter()
-            .map(|row| match row.name.as_str() {
-                "drain" => -0.5 * sign,
-                "gate" => -sign,
-                "source" => 0.,
-                "junction" => 350.,
-                "case" => 315.,
-                "recovery" => qp,
-                name => panic!("unexpected row: {name}"),
+            .map(|row| {
+                Ok(match row.name.as_str() {
+                    "drain" => -0.5 * sign,
+                    "gate" => -sign,
+                    "source" => 0.,
+                    "junction" => 350.,
+                    "case" => 315.,
+                    "recovery" => qp,
+                    name => return Err(Error::Domain(format!("unexpected row: {name}"))),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let mut out = PointBuffer::new(coords.len())?;
         kernel.evaluate(&instance, &coords, &mut out.point())?;
         let source = out.point().current[2];
-        let expected = next.diode.current.value + recovery.diode_charge_rate_gain * rate
-            - next.channel.value
-            + next.series.shunt * 0.5 * sign;
+        let expected = (next.series.shunt * 0.5).mul_add(
+            sign,
+            recovery
+                .diode_charge_rate_gain
+                .mul_add(rate, next.diode.current.value)
+                - next.channel.value,
+        );
         close(source, expected, 1e-14, 1e-12);
     }
     Ok(())
