@@ -24,14 +24,14 @@ fn caller_bindings_lexical_models_and_node_identities() -> Result<()> {
 .param gain=1
 .func twice(a) {a*2}
 .global supply
-X1 d g 0 outer gain=2
+X1 d g gnd outer gain=2
 X2 d g 0 outer gain=3
 X3 d g 0 outer gain=2
 .subckt outer d g s params: gain=5
 .param local={gain+1}
 .func f(a) {twice(a)+local}
 Xinner localnode g s inner k={f(1)}
-Mouter d g s dut
+Mouter d g GND dut
 .model dut vdmos(vto=3 kp={gain})
 .subckt inner d g s k=4
 M1 d g s dut
@@ -78,6 +78,7 @@ print foo
     );
     assert_eq!(topology.mos[1].nodes[1], Node::Global("supply".into()));
     assert_eq!(topology.mos[0].nodes[2], Node::Global("0".into()));
+    assert_eq!(topology.mos[2].nodes[2], Node::Global("0".into()));
     assert_eq!(topology.frames[1].location.linked_line, 5);
     assert_eq!(topology.frames[2].definition_location.linked_line, 14);
     Ok(())

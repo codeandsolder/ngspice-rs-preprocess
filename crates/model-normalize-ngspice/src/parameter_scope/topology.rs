@@ -427,7 +427,11 @@ impl<'a> Builder<'a> {
     }
 
     fn node(&self, frame: usize, name: &str) -> Node {
-        let name = name.to_ascii_lowercase();
+        let name = if name.eq_ignore_ascii_case("gnd") {
+            "0".to_owned()
+        } else {
+            name.to_ascii_lowercase()
+        };
         if frame == 0 || name == "0" || self.source.globals.contains(&name) {
             Node::Global(name)
         } else if let Some(bound) = self.result.frames[frame].ports.get(&name) {

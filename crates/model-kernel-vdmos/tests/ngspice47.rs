@@ -1022,35 +1022,45 @@ fn ngspice47_global_parameter_retains_owning_scope() -> Result<()> {
 
 fn compare_linked_source(fixture: &str, model_file: &str, model_line: usize) -> Result<()> {
     use model_normalize_ngspice::{
-        linked_source::SourceLinker, parameter_scope::ModelLibrary, vdmos_card::VdmosPolarity,
+        linked_source::{RootKind, SourceLinker},
+        parameter_scope::{ModelLibrary, topology::Limits},
+        vdmos_card::VdmosPolarity,
     };
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(fixture);
     let linked = SourceLinker::default().link(&root)?;
-    let source = ModelLibrary::parse(&linked.bytes)?;
-    if source.models.len() != 1 {
+    let source = ModelLibrary::parse_linked(&linked, RootKind::Deck)?;
+    let topology = source.instantiate(Limits::default())?;
+    if topology.models.len() != 1 || topology.mos.len() != 1 {
         return Err("unexpected linked model count".into());
     }
-    let origin = linked
-        .origin(source.models[0].card.source_line)
+    let origin = topology.models[0]
+        .location
+        .origin
         .ok_or("no linked model origin")?;
     if origin.path.file_name().and_then(std::ffi::OsStr::to_str) != Some(model_file)
         || origin.line != model_line
     {
         return Err(format!("incorrect linked model origin: {origin:?}").into());
     }
-    let model = source.resolve_vdmos(0, &[])?.ok_or("no resolved model")?;
+    let binding = topology.mos[0].vdmos.as_ref().ok_or("no VDMOS binding")?;
+    let model = &topology.models[binding.model].values;
     if model.polarity != VdmosPolarity::N {
         return Err("linked model polarity".into());
     }
-    let prepared = compile_ngspice(Polarity::N, model.parameters)?;
-    let evaluation = prepared.bind(Instance::default())?.evaluate(Bias {
-        vgs: 4.0,
-        vds: 0.25,
-        temperature: 300.15,
-        ..Bias::default()
-    })?;
+    let prepared = compile_ngspice(Polarity::N, model.parameters.iter().copied())?;
+    let evaluation = prepared
+        .bind(Instance {
+            multiplier: binding.instance.multiplier,
+            self_heating: binding.self_heating,
+        })?
+        .evaluate(Bias {
+            vgs: 4.0,
+            vds: 0.25,
+            temperature: binding.instance.ambient_kelvin(300.15)?,
+            ..Bias::default()
+        })?;
     let oracle = run_oracle(fixture)?;
     for (vector, calculated) in [
         ("@m1[id]", evaluation.channel.value.abs()),
