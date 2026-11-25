@@ -15,6 +15,7 @@
 
 pub mod artifact;
 mod breakdown;
+pub mod observation;
 mod parameters;
 
 pub use parameters::{ParameterError, compile_ngspice};
@@ -319,6 +320,10 @@ pub struct Model {
     pub thermal: Thermal,
     /// Intrinsic noise law.
     pub noise: Noise,
+    /// Nominal surface potential for distortion setup (V).
+    pub phi: f64,
+    /// Diagnostic-only safe operating area declarations.
+    pub soa: observation::SoaLimits,
 }
 
 impl Model {
@@ -334,6 +339,8 @@ impl Model {
             series: Series::default(),
             thermal: Thermal::default(),
             noise: Noise::default(),
+            phi: 0.6,
+            soa: observation::SoaLimits::default(),
         }
     }
 
@@ -350,6 +357,7 @@ impl Model {
         let thermal = self.thermal;
 
         self.validate_finite()?;
+        self.soa.validate()?;
         if let Some(exponent) = series.texp0
             && !exponent.is_finite()
         {
@@ -372,6 +380,7 @@ impl Model {
         }
         for (name, invalid) in [
             ("tnom", self.tnom <= 0.0),
+            ("phi", self.phi <= 0.0),
             ("kp", channel.kp < 0.0),
             ("ksubthres", channel.ksubthres < 0.0),
             ("mtriode", channel.mtriode <= 0.0),
@@ -419,6 +428,7 @@ impl Model {
         let thermal = self.thermal;
         for (name, value) in [
             ("tnom", self.tnom),
+            ("phi", self.phi),
             ("kp", channel.kp),
             ("vth", channel.vth),
             ("lambda", channel.lambda),

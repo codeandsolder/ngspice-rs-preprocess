@@ -1,0 +1,13 @@
+* SOA thermal reference
+Vd d 0 1
+Vg g 0 5
+M1 d g 0 tj tc test thermal
+.model test VDMOS (vto=3 kp=2 vgs_max=2 vgd_max=2 id_max=1 idr_max=1 pd_max=1 te_max=100 tnom=27 derating=.02 phi=.9 rthjc=1 rthca=5)
+.temp 77
+Vcase tc 0 127
+.control
+set numdgt=17
+op
+print @m1[id] @m1[idio] @test[phi] @test[pd_max]
+.endc
+.end
