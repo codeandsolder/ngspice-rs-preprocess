@@ -32,14 +32,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install pinned translator reference simulator
-        id: simulator
-        run: |
-          set -euo pipefail
-          directory="$(mktemp -d "$RUNNER_TEMP/ngspice-reference.XXXXXXXX")"
-          printf 'directory=%s\n' "$directory" >> "$GITHUB_OUTPUT"
-          bash .github/scripts/install-reference-ngspice.sh "$directory/reference"
-          printf '%s\n' "$directory/reference/bin" >> "$GITHUB_PATH"
       - name: Install repository toolchain
         run: rustup toolchain install
       - name: Toolchain versions
@@ -50,6 +42,16 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
           rust-toolchain: "nightly-2026-11-20"
+      - name: Install reference build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential bison flex libtool pkg-config
+      - name: Install pinned translator reference simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+          directory="$(mktemp -d "$RUNNER_TEMP/ngspice-reference.XXXXXXXX")"
+          printf 'directory=%s\n' "$directory" >> "$GITHUB_OUTPUT"
+          bash .github/scripts/install-reference-ngspice.sh "$directory/reference"
+          printf '%s\n' "$directory/reference/bin" >> "$GITHUB_PATH"
       - name: Lockfile consistency
         run: cargo metadata --locked --format-version 1 >/dev/null
       - name: Format
