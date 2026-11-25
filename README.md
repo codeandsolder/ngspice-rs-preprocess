@@ -35,6 +35,8 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | --- | --- | --- |
 | `native-deck` | Native-compatible circuit; link static includes and preserve title/analysis/terminator | `deck.cir` |
 | `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
+| `pspice-deck` | PSpice plaintext circuit; link libraries and lower qualified syntax | `deck.cir` |
+| `pspice-library` | PSpice plaintext models; include-safe native source | `model.lib` |
 | `qspice-deck` | QSPICE plaintext circuit; link libraries and normalize qualified source semantics | `deck.cir` |
 | `qspice-library` | QSPICE plaintext models; include-safe native source | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |

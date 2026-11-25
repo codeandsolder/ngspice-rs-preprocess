@@ -54,7 +54,7 @@ pub enum LibrarySyntax {
     /// A single operand references an entire file outside a selected section.
     /// Two operands reference a named section in another file.
     Qspice,
-    /// Whole-file and named-section imports with PSpice path and header rules.
+    /// Whole-file and named-section imports with `PSpice` path and header rules.
     Pspice,
 }
 
