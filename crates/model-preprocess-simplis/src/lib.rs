@@ -1025,7 +1025,17 @@ fn brace_belongs_to_runtime_annotation(line: &str, start: usize) -> bool {
     )
 }
 
-fn substitute_line(line: &str, env: &Environment) -> Result<(String, usize)> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Substitution {
+    None,
+    Known,
+    All,
+}
+
+fn substitute_line(line: &str, env: &Environment, mode: Substitution) -> Result<(String, usize)> {
+    if mode == Substitution::None {
+        return Ok((line.to_owned(), 0));
+    }
     let mut output = String::new();
     let mut offset = 0usize;
     let mut substitutions = 0usize;
@@ -1036,9 +1046,18 @@ fn substitute_line(line: &str, env: &Environment) -> Result<(String, usize)> {
         if brace_belongs_to_runtime_annotation(line, start) {
             output.push_str(&line[start..=end]);
         } else {
-            let value = eval_expression(&line[start..=end], env)?;
-            output.push_str(&value.render()?);
-            substitutions = substitutions.saturating_add(1);
+            match eval_expression(&line[start..=end], env) {
+                Ok(value) => {
+                    output.push_str(&value.render()?);
+                    substitutions = substitutions.saturating_add(1);
+                }
+                // A plain definition may carry runtime electrical
+                // expressions. The source preprocessor expands its
+                // known compile-time expressions while preserving
+                // expressions outside that environment.
+                Err(_) if mode == Substitution::Known => output.push_str(&line[start..=end]),
+                Err(error) => return Err(error),
+            }
         }
         offset = end.saturating_add(1);
     }
@@ -1046,7 +1065,62 @@ fn substitute_line(line: &str, env: &Environment) -> Result<(String, usize)> {
     Ok((output.replace("%%", "%"), substitutions))
 }
 
+// Elements 9.40d uses 1000, despite the reference manual listing 100.
+// The source cap and the independent implementation resource ceiling are
+// different contracts. A source cap is fixed when entering its loop.
+const DEFAULT_WHILE_ITERATIONS: usize = 1_000;
 const MAX_WHILE_ITERATIONS: usize = 100_000;
+
+fn while_header(header: &str) -> Result<(&str, Option<&str>)> {
+    let header = active_statement_prefix(header).trim();
+    anyhow::ensure!(!header.is_empty(), "SIMPLIS .WHILE requires a condition");
+    let end = if header.starts_with('{') {
+        find_closing_brace(header, 0)? + 1
+    } else {
+        // The vendor also accepts an unbraced, whitespace-delimited
+        // condition. Expressions containing spaces belong in braces.
+        header.find(char::is_whitespace).unwrap_or(header.len())
+    };
+    let condition = &header[..end];
+    let remaining = header[end..].trim();
+    if remaining.is_empty() {
+        return Ok((condition, None));
+    }
+    let limit_end = if remaining.starts_with('{') {
+        find_closing_brace(remaining, 0)? + 1
+    } else {
+        remaining
+            .find(char::is_whitespace)
+            .unwrap_or(remaining.len())
+    };
+    Ok((condition, Some(&remaining[..limit_end])))
+}
+
+fn while_limit(expression: Option<&str>, env: &Environment) -> Result<usize> {
+    let Some(expression) = expression else {
+        return Ok(DEFAULT_WHILE_ITERATIONS);
+    };
+    // Unlike truth testing, the limit requires a numeric value rather
+    // than numeric conversion of a string. Invalid expressions must not
+    // accidentally disable the independent execution ceiling.
+    let Ok(Value::Number(value)) = eval_expression(expression, env) else {
+        // The source tool falls back to its default for unresolved
+        // names, invalid expressions and nonnumeric values (including
+        // quoted numeric strings).
+        return Ok(DEFAULT_WHILE_ITERATIONS);
+    };
+    anyhow::ensure!(
+        value.is_finite() && value <= f64::from(i32::MAX),
+        "SIMPLIS .WHILE limit exceeds signed 32-bit range"
+    );
+    if value < 1.0 {
+        return Ok(0);
+    }
+    let count: usize = format!("{:.0}", value.trunc())
+        .parse()
+        .context("SIMPLIS .WHILE limit does not fit usize")?;
+    Ok(count)
+}
 
 fn find_if_bounds(lines: &[&str], start: usize, end: usize) -> Result<(Option<usize>, usize)> {
     let mut depth = 1usize;
@@ -1105,8 +1179,54 @@ struct PreprocessState<'a> {
     evaluated_conditionals: &'a mut usize,
     substituted_expressions: &'a mut usize,
     parameter_names: &'a mut BTreeSet<String>,
-    substitute_active_lines: bool,
+    substitution: Substitution,
     evaluate_parameters: bool,
+}
+
+fn process_while(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    header: &str,
+    state: &mut PreprocessState<'_>,
+) -> Result<()> {
+    let line = start + 1;
+    let (condition, source_limit) =
+        while_header(header).with_context(|| format!("SIMPLIS .WHILE at line {line}"))?;
+    let mut limit = None;
+    let mut iterations = 0usize;
+    loop {
+        let active = eval_expression(condition, state.env)
+            .and_then(|value| Evaluation::new(state.env).truthy(&value))
+            .with_context(|| format!("SIMPLIS .WHILE condition at line {line}"))?;
+        *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
+        if !active {
+            return Ok(());
+        }
+        // An inactive loop never evaluates its count. An entered loop
+        // computes it only once, before executing the first body.
+        let limit = if let Some(limit) = limit {
+            limit
+        } else {
+            let value = while_limit(source_limit, state.env)
+                .with_context(|| format!("SIMPLIS .WHILE limit at line {line}"))?;
+            limit = Some(value);
+            value
+        };
+        // The vendor emits a partial deck after an overrun, but reports
+        // an error. Our API is transactional: never execute or return the
+        // extra iteration once the condition remains true at the cap.
+        anyhow::ensure!(
+            iterations < limit,
+            "SIMPLIS .WHILE at line {line} exceeded source limit {limit} iterations"
+        );
+        anyhow::ensure!(
+            iterations < MAX_WHILE_ITERATIONS,
+            "SIMPLIS .WHILE at line {line} exceeded implementation ceiling {MAX_WHILE_ITERATIONS} iterations"
+        );
+        process_range(lines, start + 1, end, state)?;
+        iterations += 1;
+    }
 }
 
 fn process_range(
@@ -1139,25 +1259,9 @@ fn process_range(
         if directive(line, "ELSE").is_some() || directive(line, "ENDIF").is_some() {
             bail!("unexpected SIMPLIS IF terminator at line {}", index + 1);
         }
-        if let Some(condition) = directive(line, "WHILE") {
+        if let Some(header) = directive(line, "WHILE") {
             let endwhile_index = find_while_end(lines, index, end)?;
-            let mut iterations = 0usize;
-            loop {
-                let active =
-                    Evaluation::new(state.env).truthy(&eval_expression(condition, state.env)?)?;
-                *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
-                if !active {
-                    break;
-                }
-                iterations = iterations.saturating_add(1);
-                if iterations > MAX_WHILE_ITERATIONS {
-                    let line_number = index + 1;
-                    bail!(
-                        "SIMPLIS .WHILE at line {line_number} exceeded {MAX_WHILE_ITERATIONS} iterations"
-                    );
-                }
-                process_range(lines, index.saturating_add(1), endwhile_index, state)?;
-            }
+            process_while(lines, index, endwhile_index, header, state)?;
             index = endwhile_index.saturating_add(1);
             continue;
         }
@@ -1190,7 +1294,7 @@ fn process_range(
             continue;
         }
         if let Some(message) = directive(line, "ERROR") {
-            let (message, _) = substitute_line(message, state.env)?;
+            let (message, _) = substitute_line(message, state.env, Substitution::All)?;
             bail!("SIMPLIS .ERROR at line {}: {}", index + 1, message.trim());
         }
         for unsupported in ["FOR", "ENDFOR"] {
@@ -1198,14 +1302,17 @@ fn process_range(
                 bail!("unsupported SIMPLIS .{unsupported} at line {}", index + 1);
             }
         }
-        if state.substitute_active_lines {
-            let (rendered, count) = substitute_line(line, state.env)
-                .with_context(|| format!("SIMPLIS substitution at line {}", index + 1))?;
-            *state.substituted_expressions = state.substituted_expressions.saturating_add(count);
-            state.output.push_str(&rendered);
+        // A runtime parameter declaration must retain its expression and
+        // binding; control-flow expansion does not evaluate runtime parameters.
+        let mode = if !state.evaluate_parameters && directive(line, "PARAM").is_some() {
+            Substitution::None
         } else {
-            state.output.push_str(line);
-        }
+            state.substitution
+        };
+        let (rendered, count) = substitute_line(line, state.env, mode)
+            .with_context(|| format!("SIMPLIS substitution at line {}", index + 1))?;
+        *state.substituted_expressions = state.substituted_expressions.saturating_add(count);
+        state.output.push_str(&rendered);
         state.output.push('\n');
         index = index.saturating_add(1);
     }
@@ -1216,7 +1323,9 @@ fn process_range(
 /// model-library bodies. The caller provides the subcircuit parameter environment.
 ///
 /// Supported today: `.VAR`, `.GLOBALVAR`, `.IF/.ELSE/.ENDIF`, bounded
-/// `.WHILE/.ENDWHILE`, arithmetic, strings, vectors/indexing, `IFF`, `ExistVec`,
+/// `.WHILE/.ENDWHILE` (numeric source count, default 1000 as observed in
+/// Elements 9.40d, independent implementation ceiling), arithmetic, strings,
+/// vectors/indexing, `IFF`, `ExistVec`,
 /// and selected functions. `.FOR`, library lookup, and unsupported expressions fail closed.
 ///
 /// # Errors
@@ -1230,7 +1339,7 @@ pub fn preprocess_body(input: &[u8], initial: &Environment) -> Result<Preprocess
 fn run_preprocess_body(
     input: &[u8],
     initial: &Environment,
-    substitute_active_lines: bool,
+    substitution: Substitution,
     evaluate_parameters: bool,
     parameter_names: &mut BTreeSet<String>,
 ) -> Result<Preprocessed> {
@@ -1252,7 +1361,7 @@ fn run_preprocess_body(
             evaluated_conditionals: &mut evaluated_conditionals,
             substituted_expressions: &mut substituted_expressions,
             parameter_names,
-            substitute_active_lines,
+            substitution,
             evaluate_parameters,
         },
     )?;
@@ -1267,17 +1376,36 @@ fn run_preprocess_body(
     })
 }
 
+// Execute source controls and substitute known compile-time expressions
+// without consuming native runtime .PARAM declarations or electrical
+// expressions. Used for root statements and plain subcircuits.
+fn preprocess_control_flow(input: &[u8], initial: &Environment) -> Result<Preprocessed> {
+    run_preprocess_body(
+        input,
+        initial,
+        Substitution::Known,
+        false,
+        &mut BTreeSet::new(),
+    )
+}
+
 fn preprocess_body_with_mode(
     input: &[u8],
     initial: &Environment,
     substitute_active_lines: bool,
 ) -> Result<Preprocessed> {
     if !substitute_active_lines {
-        return run_preprocess_body(input, initial, false, false, &mut BTreeSet::new());
+        return preprocess_control_flow(input, initial);
     }
 
     let mut discovered_names = BTreeSet::new();
-    let discovery = run_preprocess_body(input, initial, false, true, &mut discovered_names)?;
+    let discovery = run_preprocess_body(
+        input,
+        initial,
+        Substitution::None,
+        true,
+        &mut discovered_names,
+    )?;
     let mut seeded = initial.clone();
     for name in discovered_names {
         let value = discovery
@@ -1287,7 +1415,13 @@ fn preprocess_body_with_mode(
             .clone();
         seeded.set(name, value);
     }
-    run_preprocess_body(input, &seeded, true, true, &mut BTreeSet::new())
+    run_preprocess_body(
+        input,
+        &seeded,
+        Substitution::All,
+        true,
+        &mut BTreeSet::new(),
+    )
 }
 
 #[cfg(test)]
@@ -1544,6 +1678,7 @@ R1 1 0 {RUNTIME}
         let (line, count) = substitute_line(
             "C1 P N {C} BRANCH={IF(ANALYSIS=2,1,0)} ICMODE={RUNTIME_MODE}",
             &env,
+            Substitution::All,
         )?;
         assert_eq!(count, 1);
         assert!(line.contains("C1 P N 1e-6"));
@@ -1784,6 +1919,112 @@ R1 1 0 1k
         assert!(text.contains("+ X1= 20"));
         assert!(text.contains("+ X2= 30"));
         assert_eq!(result.environment.get("SEG_CNT"), Some(&n(3.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn source_while_count_matches_vendor_boundaries() -> Result<()> {
+        for (limit, bound) in [
+            ("", 1000),
+            ("garbage", 1000),
+            ("{UNKNOWN}", 1000),
+            ("'2'", 1000),
+            ("{'2'}", 1000),
+            (r#""2""#, 1000),
+            ("3", 3),
+            ("1002", 1002),
+            ("2.9", 2),
+            ("2e+0", 2),
+            ("2x", 2),
+            ("LIMIT", 2),
+            ("{LIMIT}", 2),
+            ("2+1", 3),
+            ("{LIMIT + 1}", 3),
+            ("3 4", 3),
+            ("0", 0),
+            ("-1", 0),
+            ("-0.5", 0),
+            ("0.5", 0),
+        ] {
+            for count in [bound, bound + 1] {
+                let input = format!(
+                    ".VAR I=0\n.VAR LIMIT=2\n.WHILE {{I<{count}}} {limit}\n.VAR I={{I+1}}\n.ENDWHILE\nR1 1 0 {{I+1}}\n"
+                );
+                let result = preprocess_body(input.as_bytes(), &Environment::new());
+                if count == bound {
+                    let result = result?;
+                    assert_eq!(result.environment.get("I"), Some(&n(f64::from(count))));
+                    assert_eq!(
+                        result.stats.evaluated_conditionals,
+                        usize::try_from(count + 1)?
+                    );
+                } else {
+                    let error = result.err().context("expected source count error")?;
+                    assert!(
+                        format!("{error:#}").contains(&format!("source limit {bound} iterations")),
+                        "{error:#}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn while_source_limit_does_not_disable_the_implementation_ceiling() -> Result<()> {
+        let overflow = preprocess_body(b".WHILE {1} 2147483648\n.ENDWHILE\n", &Environment::new())
+            .err()
+            .context("expected out-of-range limit error")?;
+        assert!(format!("{overflow:#}").contains("signed 32-bit range"));
+        let ceiling = preprocess_body(b".WHILE {1} 100001\n.ENDWHILE\n", &Environment::new())
+            .err()
+            .context("expected implementation ceiling error")?;
+        assert!(format!("{ceiling:#}").contains("implementation ceiling 100000"));
+        Ok(())
+    }
+
+    #[test]
+    fn while_counts_are_entry_local_and_inactive_bodies_are_lazy() -> Result<()> {
+        let source = br".VAR I=0
+.VAR SUM=0
+.WHILE {I<3} 3
+.VAR J=0
+.WHILE {J<2} {2}
+.IF {I==1}
+.VAR SUM={SUM+10}
+.ELSE
+.VAR SUM={SUM+1}
+.ENDIF
+.VAR J={J+1}
+.ENDWHILE
+.VAR I={I+1}
+.ENDWHILE
+.IF {0}
+.WHILE {UNDEFINED} UNKNOWN
+.ERROR 'unreachable'
+.ENDWHILE
+.ENDIF
+.WHILE {0} UNKNOWN
+.ERROR 'unreachable'
+.ENDWHILE
+R1 1 0 {SUM}
+";
+        let result = preprocess_body(source, &Environment::new())?;
+        assert_eq!(std::str::from_utf8(&result.bytes)?.trim(), "R1 1 0 24");
+        for (limit, next) in [(2, 10), (3, 0)] {
+            let input = format!(
+                ".VAR I=0\n.VAR LIMIT={limit}\n.WHILE {{I<5}} {{LIMIT}}\n.VAR I={{I+1}}\n.VAR LIMIT={next}\n.ENDWHILE\n"
+            );
+            let error = preprocess_body(input.as_bytes(), &Environment::new())
+                .err()
+                .context("entry count must not change")?;
+            assert!(format!("{error:#}").contains(&format!("source limit {limit} iterations")));
+        }
+        let naked = preprocess_body(
+            b".VAR I=0\n.WHILE I<3 3\n.VAR I={I+1}\n.ENDWHILE\nR1 1 0 {I+1}\n",
+            &Environment::new(),
+        )?;
+        assert_eq!(std::str::from_utf8(&naked.bytes)?.trim(), "R1 1 0 4");
         Ok(())
     }
 
