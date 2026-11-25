@@ -565,6 +565,35 @@ fn translate_companions(
     Ok((companions, dependencies))
 }
 
+fn capture_linked_plan(
+    linked: &mut model_preprocess_simplis::LinkedPreprocessedNetlist,
+    root: &AdmittedSource,
+    format: InputFormat,
+    declarations: &[analysis_plan::SourceDeclaration],
+) -> Result<AnalysisPlan> {
+    let dialect = if format == InputFormat::SimetrixDeck {
+        AnalysisDialect::Simetrix
+    } else {
+        AnalysisDialect::Simplis
+    };
+    let mut plan = AnalysisPlan::new(
+        dialect,
+        PlanKind::Deck,
+        (dialect == AnalysisDialect::Simetrix).then(|| analysis_plan::source_title(&root.bytes)),
+    );
+    analysis_plan::capture(
+        &mut plan,
+        &mut linked.root_bytes,
+        "deck.cir",
+        None,
+        declarations,
+    )?;
+    for library in &mut linked.libraries {
+        analysis_plan::capture(&mut plan, &mut library.bytes, &library.filename, None, &[])?;
+    }
+    Ok(plan)
+}
+
 fn linked(
     root: &AdmittedSource,
     request: &Request,
@@ -594,26 +623,7 @@ fn linked(
     } = catalog(request, options, cancellation, session, context)?;
     device_identities.extend(catalog_identities);
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
-    let dialect = if request.format == InputFormat::SimetrixDeck {
-        AnalysisDialect::Simetrix
-    } else {
-        AnalysisDialect::Simplis
-    };
-    let mut plan = AnalysisPlan::new(
-        dialect,
-        PlanKind::Deck,
-        (dialect == AnalysisDialect::Simetrix).then(|| analysis_plan::source_title(&root.bytes)),
-    );
-    analysis_plan::capture(
-        &mut plan,
-        &mut linked.root_bytes,
-        "deck.cir",
-        None,
-        &declarations,
-    )?;
-    for library in &mut linked.libraries {
-        analysis_plan::capture(&mut plan, &mut library.bytes, &library.filename, None, &[])?;
-    }
+    let plan = capture_linked_plan(&mut linked, root, request.format, &declarations)?;
     let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
         lower_simetrix_linked_runtime(&mut linked)?;
         Some(capture_passive_initial_conditions(&mut linked)?)
