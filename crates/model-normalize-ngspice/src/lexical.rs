@@ -2,7 +2,7 @@
 use anyhow::{Result, ensure};
 use std::ops::Range;
 
-pub(crate) fn ensure_textual(input: &[u8]) -> Result<()> {
+pub fn ensure_textual(input: &[u8]) -> Result<()> {
     ensure!(
         !input.contains(&0),
         "ngspice normalization requires a textual model"
@@ -37,27 +37,27 @@ impl Context {
         }
     }
 
-    fn comment(&self, line: &[u8], index: usize) -> bool {
-        if self.quote.is_some() || self.braces != 0 {
+    fn comment(&self, line: &[u8], index: usize, separated: bool) -> bool {
+        if self.quote.is_some() {
             return false;
         }
         match line[index] {
             b';' => true,
-            b'$' => index == 0 || matches!(line[index - 1], b' ' | b'\t' | b','),
+            b'$' => self.braces == 0 && separated,
             b'/' => line.get(index + 1) == Some(&b'/'),
             _ => false,
         }
     }
 }
 
-fn comment_line(line: &[u8]) -> bool {
+const fn comment_line(line: &[u8]) -> bool {
     matches!(
-        line.trim_ascii_start().first(),
-        None | Some(b'*' | b'#' | b'$' | b';')
+        line.trim_ascii_start(),
+        [] | [b'*' | b'#' | b'$' | b';', ..] | [b'/', b'/', ..]
     )
 }
 
-pub(crate) fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
+pub fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
     let body = line
         .strip_suffix(b"\n")
         .map_or(line, |s| s.strip_suffix(b"\r").unwrap_or(s));
@@ -66,7 +66,7 @@ pub(crate) fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
 
 /// Logical statement with one compact source mapping segment per physical line.
 /// Synthetic continuation separators do not map to source bytes.
-pub(crate) struct Statement {
+pub struct Statement {
     pub line: usize,
     pub start: usize,
     pub text: Vec<u8>,
@@ -88,7 +88,7 @@ impl Statement {
     }
 }
 
-pub(crate) fn statements(input: &[u8]) -> Result<Vec<Statement>> {
+pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
     ensure_textual(input)?;
     let mut statements: Vec<Statement> = Vec::new();
     let mut offset = 0;
@@ -109,7 +109,11 @@ pub(crate) fn statements(input: &[u8]) -> Result<Vec<Statement>> {
         }
         let mut end = body.len();
         for at in code_start..body.len() {
-            if context.comment(body, at) {
+            if context.comment(
+                body,
+                at,
+                at == code_start || matches!(body[at - 1], b' ' | b'\t' | b','),
+            ) {
                 end = at;
                 break;
             }
@@ -171,43 +175,68 @@ fn utf8_width(bytes: &[u8]) -> usize {
     }
 }
 
-pub(crate) fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
+fn trim_lexical_indent(mut bytes: &[u8]) -> &[u8] {
+    loop {
+        bytes = bytes.trim_ascii_start();
+        if let Some(rest) = bytes
+            .strip_prefix(b"\xc2\xa0")
+            .or_else(|| bytes.strip_prefix(b"\xa0"))
+        {
+            bytes = rest;
+        } else {
+            return bytes;
+        }
+    }
+}
+
+pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
     if !input.contains(&0xa0) {
         return None;
     }
     let mut out = Vec::with_capacity(input.len());
     let mut context = Context::default();
     for line in input.split_inclusive(|b| *b == b'\n') {
-        if comment_line(line) {
-            out.extend_from_slice(line);
-            continue;
-        }
-        if line.trim_ascii_start().first() != Some(&b'+') {
+        let tail = trim_lexical_indent(line);
+        let comment = comment_line(tail);
+        let scan_end = if comment {
+            line.len() - tail.len()
+        } else {
+            line.len()
+        };
+        if !comment && tail.first() != Some(&b'+') {
             context = Context::default();
         }
         let mut index = 0;
-        while index < line.len() {
-            if context.comment(line, index) {
-                out.extend_from_slice(&line[index..]);
+        while index < scan_end {
+            let separated = index == 0
+                || out
+                    .last()
+                    .is_some_and(|b| matches!(*b, b' ' | b'\t' | b','));
+            if !comment && context.comment(line, index, separated) {
                 break;
             }
-            let width = utf8_width(&line[index..]);
+            let width = utf8_width(&line[index..scan_end]);
             let bytes = &line[index..index + width];
-            if context.quote.is_none() && matches!(bytes, b"\xa0" | b"\xc2\xa0") {
+            if (index < line.len() - tail.len() || context.quote.is_none())
+                && matches!(bytes, b"\xa0" | b"\xc2\xa0")
+            {
                 out.push(b' ');
             } else {
                 out.extend_from_slice(bytes);
             }
-            context.advance(line[index]);
+            if !comment {
+                context.advance(line[index]);
+            }
             index += width;
         }
+        out.extend_from_slice(&line[index..]);
     }
     (out != input).then_some(out)
 }
 
 /// Top-level whitespace and assignment separators, with balanced expression
 /// delimiters and quotes kept intact as a single token.
-pub(crate) fn tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
+pub fn tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
     let mut ranges = Vec::new();
     let mut start = None;
     let mut context = Context::default();
@@ -252,9 +281,9 @@ pub(crate) fn tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
     Ok(ranges)
 }
 
-pub(crate) type Edit = (Range<usize>, Vec<u8>);
+pub type Edit = (Range<usize>, Vec<u8>);
 
-pub(crate) fn apply_edits(input: &[u8], mut edits: Vec<Edit>) -> Option<Vec<u8>> {
+pub fn apply_edits(input: &[u8], mut edits: Vec<Edit>) -> Option<Vec<u8>> {
     if edits.is_empty() {
         return None;
     }
@@ -270,7 +299,7 @@ pub(crate) fn apply_edits(input: &[u8], mut edits: Vec<Edit>) -> Option<Vec<u8>>
     Some(out)
 }
 
-pub(crate) fn replace_span(
+pub fn replace_span(
     statement: &Statement,
     span: Range<usize>,
     replacement: &[u8],
@@ -294,7 +323,7 @@ const fn identifier_byte(byte: u8) -> bool {
 
 /// Locate function calls outside quoted literal text. Single-quoted arithmetic
 /// expressions are handled by the caller only on expression-bearing cards.
-pub(crate) fn function_names(text: &[u8], name: &[u8], start: usize) -> Vec<Range<usize>> {
+pub fn function_names(text: &[u8], name: &[u8], start: usize) -> Vec<Range<usize>> {
     let mut context = Context::default();
     let mut matches = Vec::new();
     for (index, &byte) in text.iter().enumerate().skip(start) {

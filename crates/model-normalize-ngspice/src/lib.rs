@@ -22,10 +22,6 @@ use std::{
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
-static END_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?im)^[ \t]*\.end[ \t]*(?:\r?\n|$)")
-        .unwrap_or_else(|error| unreachable!("static regex must compile: {error}"))
-});
 static NGSPICE_ERROR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?im)^(?:fatal|error)[: ]")
         .unwrap_or_else(|error| unreachable!("static regex must compile: {error}"))
@@ -142,6 +138,38 @@ fn fresh_identifier(used: &mut BTreeSet<Vec<u8>>, base: &[u8]) -> Option<Vec<u8>
     }
 }
 
+/// Find the unique top-level series-resistance assignment after the device
+/// name, two nodes and inductance. Names occurring within values are not keys.
+fn rser_assignment(
+    text: &[u8],
+    fields: &[std::ops::Range<usize>],
+    line: usize,
+) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    let mut rser = None;
+    for index in 4..fields.len() {
+        if !text[fields[index].clone()].eq_ignore_ascii_case(b"rser")
+            || text[fields[index - 1].clone()] == *b"="
+            || fields
+                .get(index + 1)
+                .is_none_or(|span| text[span.clone()] != *b"=")
+        {
+            continue;
+        }
+        let value = fields
+            .get(index + 2)
+            .filter(|span| text[(*span).clone()] != *b"=")
+            .filter(|_| {
+                fields
+                    .get(index + 3)
+                    .is_none_or(|span| text[span.clone()] != *b"=")
+            })
+            .with_context(|| format!("line {line}: Rser requires a value"))?;
+        anyhow::ensure!(rser.is_none(), "line {line}: duplicate Rser assignment");
+        rser = Some((fields[index].start..value.end, value.clone()));
+    }
+    Ok(rser)
+}
+
 fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
     use lexical::{apply_edits, replace_span, statements, tokens};
     if !input
@@ -157,7 +185,7 @@ fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
     for statement in statements(input)? {
         let text = &statement.text;
         let first = text
-            .split(|byte| byte.is_ascii_whitespace())
+            .split(u8::is_ascii_whitespace)
             .next()
             .unwrap_or_default();
         if first.eq_ignore_ascii_case(b".control") {
@@ -177,33 +205,7 @@ fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
         if fields.len() < 5 {
             continue;
         }
-        let mut rser = None;
-        for index in 4..fields.len() {
-            if !text[fields[index].clone()].eq_ignore_ascii_case(b"rser") {
-                continue;
-            }
-            // A value named rser is not an assignment.
-            if text[fields[index - 1].clone()] == *b"=" {
-                continue;
-            }
-            if fields
-                .get(index + 1)
-                .is_none_or(|span| text[span.clone()] != *b"=")
-            {
-                continue;
-            }
-            let value = fields
-                .get(index + 2)
-                .filter(|span| text[(*span).clone()] != *b"=")
-                .with_context(|| format!("line {}: Rser requires a value", statement.line))?;
-            anyhow::ensure!(
-                rser.is_none(),
-                "line {}: duplicate Rser assignment",
-                statement.line
-            );
-            rser = Some((fields[index].start..value.end, value.clone()));
-        }
-        let Some((assignment, resistance)) = rser else {
+        let Some((assignment, resistance)) = rser_assignment(text, &fields, statement.line)? else {
             continue;
         };
         let ind = &text[fields[0].clone()];
@@ -255,6 +257,77 @@ fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(apply_edits(input, edits))
 }
 
+fn params_header_end(text: &[u8], fields: &[std::ops::Range<usize>]) -> Option<usize> {
+    for (index, span) in fields.iter().enumerate() {
+        let field = &text[span.clone()];
+        if field.eq_ignore_ascii_case(b"params:") {
+            return Some(index + 1);
+        }
+        if field.eq_ignore_ascii_case(b"params")
+            && fields
+                .get(index + 1)
+                .is_some_and(|next| text[next.clone()] == *b":")
+        {
+            return Some(index + 2);
+        }
+    }
+    None
+}
+
+/// Locate the expression-bearing part of cards without interpreting their
+/// positional node/model identifiers as arithmetic.
+fn expression_start(text: &[u8], first: &[u8]) -> Result<Option<usize>> {
+    let fields = lexical::tokens(text)?;
+    let assignment = || {
+        fields
+            .iter()
+            .position(|span| text[span.clone()] == *b"=")
+            .map(|index| index + 1)
+    };
+    let lower = first.to_ascii_lowercase();
+    let index = match lower.as_slice() {
+        b".param" | b".if" | b".elseif" => Some(1),
+        b".model" => Some(2),
+        b".func" => Some(
+            if fields
+                .get(1)
+                .is_some_and(|span| text[span.clone()].contains(&b'('))
+            {
+                2
+            } else {
+                3
+            },
+        ),
+        b".subckt" => params_header_end(text, &fields).or_else(assignment),
+        [b'b' | b'r' | b'l' | b'c' | b'v' | b'i', ..] => Some(3),
+        [b'f' | b'h', ..] => Some(4),
+        [b'e' | b'g', ..] => {
+            if fields.get(3).is_some_and(|span| {
+                let field = &text[span.clone()];
+                [b"value".as_slice(), b"table", b"poly"]
+                    .iter()
+                    .any(|keyword| {
+                        field
+                            .get(..keyword.len())
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+                            && field.get(keyword.len()).is_none_or(|b| *b == b'(')
+                    })
+            }) {
+                Some(3)
+            } else {
+                Some(5)
+            }
+        }
+        [
+            b'd' | b'j' | b'q' | b'm' | b'x' | b's' | b'w' | b't' | b'o' | b'u' | b'k' | b'a'
+            | b'z',
+            ..,
+        ] => assignment(),
+        _ => None,
+    };
+    Ok(index.and_then(|at| fields.get(at)).map(|span| span.start))
+}
+
 fn rewrite_pspice_arctan(input: &[u8]) -> Result<Option<Vec<u8>>> {
     if !input
         .windows(6)
@@ -267,7 +340,7 @@ fn rewrite_pspice_arctan(input: &[u8]) -> Result<Option<Vec<u8>>> {
     for statement in lexical::statements(input)? {
         let text = &statement.text;
         let first = text
-            .split(|b| b.is_ascii_whitespace())
+            .split(u8::is_ascii_whitespace)
             .next()
             .unwrap_or_default();
         if first.eq_ignore_ascii_case(b".control") {
@@ -278,22 +351,16 @@ fn rewrite_pspice_arctan(input: &[u8]) -> Result<Option<Vec<u8>>> {
         if in_control {
             continue;
         }
-        // Only expression-bearing cards, never source paths or arbitrary
-        // title/control text. For element cards skip the element identifier.
-        let expression_card = [
-            b".param".as_slice(),
-            b".model",
-            b".func",
-            b".subckt",
-            b".if",
-            b".elseif",
-        ]
-        .iter()
-        .any(|name| first.eq_ignore_ascii_case(name));
-        if !expression_card && !first.first().is_some_and(u8::is_ascii_alphabetic) {
+        if !text
+            .windows(6)
+            .any(|word| word.eq_ignore_ascii_case(b"arctan"))
+        {
             continue;
         }
-        for span in lexical::function_names(text, b"arctan", first.len()) {
+        let Some(start) = expression_start(text, first)? else {
+            continue;
+        };
+        for span in lexical::function_names(text, b"arctan", start) {
             lexical::replace_span(&statement, span, b"atan", &mut edits);
         }
     }
@@ -311,7 +378,7 @@ fn rewrite_pspice_positional_params(input: &[u8]) -> Result<Option<Vec<u8>>> {
     for statement in lexical::statements(input)? {
         let text = &statement.text;
         let first = text
-            .split(|b| b.is_ascii_whitespace())
+            .split(u8::is_ascii_whitespace)
             .next()
             .unwrap_or_default();
         if !first.eq_ignore_ascii_case(b".subckt") {
@@ -321,13 +388,9 @@ fn rewrite_pspice_positional_params(input: &[u8]) -> Result<Option<Vec<u8>>> {
         // section of a subcircuit declaration and physical continuation
         // boundaries. Existing assignments and split expressions stay intact.
         let fields = lexical::tokens(text)?;
-        let Some(header) = fields
-            .iter()
-            .position(|span| text[span.clone()].eq_ignore_ascii_case(b"params:"))
-        else {
+        let Some(mut index) = params_header_end(text, &fields) else {
             continue;
         };
-        let mut index = header + 1;
         while index < fields.len() {
             let name = &fields[index];
             let Some(value) = fields.get(index + 1) else {
@@ -363,6 +426,26 @@ fn rewrite_pspice_positional_params(input: &[u8]) -> Result<Option<Vec<u8>>> {
             } else {
                 index += 1;
             }
+        }
+    }
+    Ok(lexical::apply_edits(input, edits))
+}
+
+fn strip_standalone_end(input: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut edits = Vec::new();
+    let mut in_control = false;
+    for statement in lexical::statements(input)? {
+        if statement.text.eq_ignore_ascii_case(b".control") {
+            in_control = true;
+        } else if statement.text.eq_ignore_ascii_case(b".endc") {
+            in_control = false;
+        } else if !in_control && statement.text.eq_ignore_ascii_case(b".end") {
+            lexical::replace_span(
+                &statement,
+                0..statement.text.len(),
+                b"* .END stripped for ngspice include",
+                &mut edits,
+            );
         }
     }
     Ok(lexical::apply_edits(input, edits))
@@ -419,10 +502,8 @@ pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
         bytes = rewritten;
         passes.push(NormalizationPass::PspicePositionalParams);
     }
-    let stripped =
-        END_LINE_RE.replace_all(&bytes, b"* .END stripped for ngspice include\n".as_slice());
-    if stripped.as_ref() != bytes.as_slice() {
-        bytes = stripped.into_owned();
+    if let Some(rewritten) = strip_standalone_end(&bytes)? {
+        bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
     Ok(NormalizedModel { bytes, passes })
@@ -634,6 +715,22 @@ mod tests {
     }
 
     #[test]
+    fn nbsp_indentation_does_not_rewrite_comment_payload() -> Result<()> {
+        let input = b"\xc2\xa0* keep\xc2\xa0this\nR1 a b 1k\xa0$ keep\xa0this\n";
+        let expected = b" * keep\xc2\xa0this\nR1 a b 1k $ keep\xa0this\n";
+        assert_eq!(normalize_ngspice(input)?.bytes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn end_statement_is_commented_without_discarding_trailing_text() -> Result<()> {
+        let input = b"* .end\r\n.subckt x a b\r\nR1 a b 1k\r\n.ends x\r\n .END ; marker";
+        let expected = b"* .end\r\n.subckt x a b\r\nR1 a b 1k\r\n.ends x\r\n * .END stripped for ngspice include ; marker";
+        assert_eq!(normalize_ngspice(input)?.bytes, expected);
+        Ok(())
+    }
+
+    #[test]
     fn nul_after_original_sample_boundary_is_rejected_everywhere() {
         let mut input = vec![b' '; 131_073];
         input.push(0);
@@ -724,16 +821,16 @@ mod tests {
 
     #[test]
     fn arctan_does_not_change_comments_titles_or_paths() -> Result<()> {
-        let input = b"* arctan(x)\n.title arctan(x)\n.include 'arctan(x).lib'\nB1 a 0 V=arctan (v(b)) ; arctan(x)\n";
-        let expected = b"* arctan(x)\n.title arctan(x)\n.include 'arctan(x).lib'\nB1 a 0 V=atan (v(b)) ; arctan(x)\n";
+        let input = b"* arctan(x)\n.title arctan(x)\n.include 'arctan(x).lib'\nB1 a 0 V=arctan (v(b)) ; arctan(x)\nR1 'arctan(x)' b 1k\n";
+        let expected = b"* arctan(x)\n.title arctan(x)\n.include 'arctan(x).lib'\nB1 a 0 V=atan (v(b)) ; arctan(x)\nR1 'arctan(x)' b 1k\n";
         assert_eq!(normalize_ngspice(input)?.bytes, expected);
         Ok(())
     }
 
     #[test]
     fn positional_rewrite_is_scoped_to_subcircuit_params() -> Result<()> {
-        let input = b".subckt x a b\n+ PARAMS:\n+ gain {2 +\n+ 3}\n+ k = {4 + 5}\n+ off 1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
-        let expected = b".subckt x a b\n+ PARAMS:\n+ gain={2 +\n+ 3}\n+ k = {4 + 5}\n+ off=1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
+        let input = b".subckt x a b\n+ PARAMS :\n+ gain {2 +\n+ 3}\n+ k = {4 + 5}\n+ off 1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
+        let expected = b".subckt x a b\n+ PARAMS :\n+ gain={2 +\n+ 3}\n+ k = {4 + 5}\n+ off=1\n.ends x\nL1 a b 1u\n+ PARAMS:\n+ gain 2\n";
         assert_eq!(normalize_ngspice(input)?.bytes, expected);
         Ok(())
     }
