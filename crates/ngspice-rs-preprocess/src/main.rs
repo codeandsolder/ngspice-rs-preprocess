@@ -49,6 +49,18 @@ fn numeric(value: &OsStr) -> Result<usize> {
         .parse()?)
 }
 
+fn statistical_sample(value: &OsStr) -> Result<ngspice_rs_preprocess::StatisticalSample> {
+    let (seed, sample) = value
+        .to_str()
+        .context("statistical sample must be UTF-8")?
+        .split_once(':')
+        .context("statistical sample requires SEED:INDEX")?;
+    Ok(ngspice_rs_preprocess::StatisticalSample {
+        seed: seed.parse()?,
+        sample: sample.parse()?,
+    })
+}
+
 fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>> {
     let first = args.next().context(USAGE)?;
     if first == "--help" || first == "-h" {
@@ -92,15 +104,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
             "--search" => request.search_paths.push(value.into()),
             "--device-config" => options.device_config = Some(value.into()),
             "--statistical-sample" => {
-                let (seed, sample) = value
-                    .to_str()
-                    .context("statistical sample must be UTF-8")?
-                    .split_once(':')
-                    .context("statistical sample requires SEED:INDEX")?;
-                options.statistical_sample = Some(ngspice_rs_preprocess::StatisticalSample {
-                    seed: seed.parse()?,
-                    sample: sample.parse()?,
-                });
+                options.statistical_sample = Some(statistical_sample(&value)?)
             }
             "--command" => command = Some(PathBuf::from(value)),
             "--command-arg" => command_args.push(value),
