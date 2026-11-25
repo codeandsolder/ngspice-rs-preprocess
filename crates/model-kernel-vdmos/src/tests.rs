@@ -1062,11 +1062,10 @@ fn diode_avalanche_thermal_power_is_differentiable() -> Result<(), ModelError> {
 }
 
 #[test]
-fn catalog_reversed_cgd_endpoints_preserve_positive_differential_charge() -> Result<(), ModelError>
-{
+fn reversed_cgd_endpoints_preserve_positive_differential_charge() -> Result<(), ModelError> {
     let mut model = Model::defaults(Polarity::P);
-    model.gate.cgdmin = 4.25e-9;
-    model.gate.cgdmax = 1.5e-9;
+    model.gate.cgdmin = 6e-9;
+    model.gate.cgdmax = 2e-9;
     let prepared = model.prepare()?;
     let device = prepared.bind(Instance::default())?;
     for vds in [-100.0, -5.0, -1.0, 0.0, 1.0, 5.0, 100.0] {
@@ -1077,8 +1076,11 @@ fn catalog_reversed_cgd_endpoints_preserve_positive_differential_charge() -> Res
             ..Bias::default()
         };
         let evaluated = device.evaluate(bias)?;
-        assert!(evaluated.qgd.d_voltage >= model.gate.cgdmax);
-        assert!(evaluated.qgd.d_voltage <= model.gate.cgdmin);
+        // The analytic asymptotes can round by a few ulps.
+        let roundoff = 8.0 * f64::EPSILON * model.gate.cgdmin;
+        assert!(evaluated.qgd.d_voltage > 0.0);
+        assert!(evaluated.qgd.d_voltage >= model.gate.cgdmax - roundoff);
+        assert!(evaluated.qgd.d_voltage <= model.gate.cgdmin + roundoff);
         let numeric = derivative(
             bias,
             |b, delta| b.vgs += delta,
@@ -1086,7 +1088,7 @@ fn catalog_reversed_cgd_endpoints_preserve_positive_differential_charge() -> Res
             1e-5,
         )?;
         close(
-            "catalog IRF7220 Cgd positive charge derivative",
+            "reversed Cgd positive charge derivative",
             evaluated.qgd.d_voltage,
             numeric,
             2e-15,
