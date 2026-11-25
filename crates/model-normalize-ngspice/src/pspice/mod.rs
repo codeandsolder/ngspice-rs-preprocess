@@ -18,6 +18,7 @@ use std::{
 
 mod instances;
 mod nodes;
+mod passive;
 mod scope;
 mod temperature;
 use scope::Scopes;
@@ -47,6 +48,7 @@ struct Functions {
     scope: usize,
     ground: String,
     identifiers: BTreeSet<Vec<u8>>,
+    passives: passive::PassiveModels,
     temperature: bool,
     gmin: bool,
     renamed: Vec<RenamedDevice>,
@@ -66,6 +68,7 @@ impl Functions {
             crate::fresh_identifier(&mut identifiers, b"__ps_gnd")
                 .context("PSpice ground identifier overflow")?,
         )?;
+        let passives = passive::PassiveModels::collect(&scopes, &mut identifiers)?;
         Ok(Self {
             names,
             used: BTreeSet::new(),
@@ -73,6 +76,7 @@ impl Functions {
             scope: 0,
             ground,
             identifiers,
+            passives,
             temperature: false,
             gmin: false,
             renamed: Vec::new(),
@@ -478,7 +482,13 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
     if let Some(switch) = SwitchLaw::from_model(&card)? {
         switch.lower_model(&mut card)?;
     }
-    let mut output = format!(".model {} {}(", card.name, card.family);
+    let multiplier = functions.passives.lower_model(line, &mut card);
+    let mut output = String::new();
+    if let Some((name, value)) = multiplier {
+        let value = functions.expression(temperature::expression(&value), false)?;
+        writeln!(output, ".param {name}={{{value}}}")?;
+    }
+    write!(output, ".model {} {}(", card.name, card.family)?;
     for (index, p) in card.parameters.iter().enumerate() {
         if index != 0 {
             output.push(' ');
@@ -574,8 +584,16 @@ fn lower_body(body: &[u8]) -> Result<LoweredBody> {
                 functions.scopes.local_ground(functions.scope),
                 &functions.ground,
             )?;
+            let text =
+                functions
+                    .passives
+                    .rewrite_instance(&text, functions.scope, &functions.scopes)?;
             let rewritten = rewrite(&text, statement.line, &mut functions)
                 .with_context(|| format!("PSpice source line {}", statement.line))?;
+            if first.eq_ignore_ascii_case(".model") {
+                rewritten_statements.push(rewritten);
+                continue;
+            }
             let rewritten = nodes::rewrite(
                 &rewritten,
                 functions.scopes.local_ground(functions.scope),
@@ -595,21 +613,22 @@ fn lower_body(body: &[u8]) -> Result<LoweredBody> {
                 .next()
                 .is_some_and(|first| first.eq_ignore_ascii_case(b".subckt"))
         {
-            let newline = if body[statement.start..]
-                .split_inclusive(|b| *b == b'\n')
-                .next()
-                .is_some_and(|line| line.ends_with(b"\r\n"))
-            {
-                "\r\n"
-            } else {
-                "\n"
-            };
-            rewritten.push_str(newline);
-            rewritten.push_str(&TEMPERATURE_PARAMS.replace('\n', newline));
-            inserted.insert(statement.line, TEMPERATURE_PARAMS.lines().count());
+            rewritten.push('\n');
+            rewritten.push_str(TEMPERATURE_PARAMS);
         }
         if rewritten.as_bytes() == statement.text {
             continue;
+        }
+        let extra = rewritten.bytes().filter(|byte| *byte == b'\n').count();
+        if extra != 0 {
+            inserted.insert(statement.line, extra);
+            let physical = body[statement.start..]
+                .split_inclusive(|b| *b == b'\n')
+                .next()
+                .unwrap_or_default();
+            if physical.ends_with(b"\r\n") {
+                rewritten = rewritten.replace('\n', "\r\n");
+            }
         }
         lexical::replace_span(
             statement,

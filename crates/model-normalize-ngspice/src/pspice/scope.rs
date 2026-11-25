@@ -37,9 +37,14 @@ fn parse_model(text: &str, line: usize) -> Result<(ModelCard, Option<String>)> {
         .get(..4)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ako:"))
     {
-        let base = &token[4..];
+        let (base, end) = if token.len() == 4 {
+            let name = spans.get(3).context("missing PSpice AKO base model")?;
+            (&text[name.clone()], name.end)
+        } else {
+            (&token[4..], family.end)
+        };
         ensure!(!base.is_empty(), "missing PSpice AKO base model");
-        let direct = format!("{}{}", &text[..family.start], &text[family.end..]);
+        let direct = format!("{}{}", &text[..family.start], &text[end..]);
         return Ok((
             parse_model_card(&direct, line, &[])?,
             Some(base.to_ascii_lowercase()),
@@ -181,6 +186,12 @@ impl Scopes {
             };
             scope = parent;
         }
+    }
+
+    pub(super) fn model_declarations(&self) -> impl Iterator<Item = (usize, &str)> {
+        self.models
+            .iter()
+            .map(|(&line, declaration)| (line, declaration.card.family.as_str()))
     }
 
     pub(super) fn model(&self, line: usize) -> Result<ModelCard> {

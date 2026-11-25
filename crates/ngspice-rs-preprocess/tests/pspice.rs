@@ -524,3 +524,140 @@ fn conflicting_model_temperature_customizations_fail() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn passive_model_multipliers_bind_in_declaration_scope_and_per_occurrence() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    let source = br"Scoped passive multipliers
+.param scale=2
+V1 a 0 1
+V2 b 0 1
+V3 c 0 1
+V4 d 0 1
+X1 a 0 GLOBAL
+X2 b 0 LOCAL PARAMS: scale=3
+X3 c 0 LOCAL PARAMS: scale=7
+R4 d 0 DERIVED 1k
+.subckt GLOBAL p n
+.param scale=9
+R1 p n RM 1k
+.ends GLOBAL
+.subckt LOCAL p n PARAMS: scale=1
+.model RM RES(R={scale})
+XH p n NESTED
+.subckt NESTED a b
+R1 a b RM 1k
+.ends NESTED
+.ends LOCAL
+.model RM RES(R={scale})
+.model DERIVED AKO: RM RES(R=4)
+.control
+set wr_singlescale
+set wr_vecnames
+op
+wrdata response.dat i(v1) i(v2) i(v3) i(v4)
+quit
+.endc
+.end
+";
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    if let Some(values) = rows(
+        &directory.path().join("native"),
+        &prepared.primary.bytes,
+        false,
+    )? {
+        assert_eq!(values.len(), 1);
+        for (&current, factor) in values[0][1..].iter().zip([2., 3., 7., 4.]) {
+            close(current, -1. / (1000. * factor));
+        }
+    }
+    let Provenance::Native { lines } = &prepared.primary.provenance else {
+        anyhow::bail!("missing passive multiplier provenance");
+    };
+    let emitted = std::str::from_utf8(&prepared.primary.bytes)?;
+    assert_eq!(lines.len(), emitted.lines().count());
+    for (text, origin) in emitted.lines().zip(lines) {
+        if text.starts_with(".param __ps_passive_") {
+            assert!(
+                std::str::from_utf8(source)?
+                    .lines()
+                    .nth(origin.line - 1)
+                    .context("missing original model card")?
+                    .starts_with(".model")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn linear_passive_model_multipliers_preserve_complex_ac_admittance() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    let source = br"Passive AC analytic fixture
+.param factor=2
+V1 r 0 AC 1
+V2 c 0 AC 1
+I1 0 l AC 1
+R1 r 0 RM 1k
+C1 c 0 CM 1n
+L1 l 0 LM 1m
+.model RM RES(R={factor} TC1=0.001 T_MEASURED=0 T_ABS=25)
+.model CM CAP(C={factor} TC1=0.001 T_MEASURED=0 T_ABS=25 VC1=0 VC2=0)
+.model LM IND(L={factor} TC1=0.001 T_MEASURED=0 T_ABS=25 IL1=0 IL2=0)
+.temp 100
+.control
+set wr_singlescale
+set wr_vecnames
+ac lin 3 1000 3000
+wrdata response.dat i(v1) i(v2) v(l)
+quit
+.endc
+.end
+";
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    if let Some(values) = rows(
+        &directory.path().join("native"),
+        &prepared.primary.bytes,
+        false,
+    )? {
+        assert_eq!(values.len(), 3);
+        for row in values {
+            assert_eq!(row.len(), 7);
+            let omega = std::f64::consts::TAU * row[0];
+            let factor = 2. * 1.025;
+            let expected = [
+                -1. / (1000. * factor),
+                0.,
+                0.,
+                -omega * 1e-9 * factor,
+                0.,
+                omega * 1e-3 * factor,
+            ];
+            for (&value, expected) in row[1..].iter().zip(expected) {
+                close(value, expected);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nonlinear_passive_coefficients_are_not_silently_discarded() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.lib");
+    for input in [
+        ".model CM CAP(C=2 VC1=0.1)\n",
+        ".model LM IND(L=3 IL2={nonlinear})\n",
+    ] {
+        fs::write(&path, input)?;
+        assert!(
+            prepare_source(&path, InputFormat::PspiceLibrary).is_err(),
+            "{input}"
+        );
+    }
+    Ok(())
+}

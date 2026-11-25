@@ -54,7 +54,7 @@ pub(super) fn validate_base(card: &ModelCard) -> Result<()> {
 
 // Grouped input can itself contain a braced or quoted parameter expression.
 // Both denote an expression, not a literal string.
-fn expression(value: &str) -> &str {
+pub(super) fn expression(value: &str) -> &str {
     let trimmed = value.trim();
     trimmed
         .strip_prefix('{')
