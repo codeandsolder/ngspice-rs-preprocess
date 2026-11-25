@@ -1,0 +1,37 @@
+*#SIMETRIX
+Vsrc s 0 10
+.options initCondMode=2 icres=2
+Rca s cpa 10
+Rda cna 0 20
+Ca cpa cna 1m
+Rla s lpa 10
+La lpa 0 1m
+Rcb s cpb 10
+Rdb cnb 0 20
+Cb cpb cnb 1m BRANCH=0
+Rlb s lpb 10
+Lb lpb 0 1m BRANCH=0
+Rcc s cpc 10
+Rdc cnc 0 20
+Cc cpc cnc 1m BRANCH=1
+Rlc s lpc 10
+Lc lpc 0 1m BRANCH=1
+Rcd s cpd 10
+Rdd cnd 0 20
+Cd cpd cnd 1m IC=3
+Rld s lpd 10
+Ld lpd 0 1m IC=3
+Rce s cpe 10
+Rde cne 0 20
+Ce cpe cne 1m IC=3 BRANCH=0
+Rle s lpe 10
+Le lpe 0 1m IC=3 BRANCH=0
+Rcf s cpf 10
+Rdf cnf 0 20
+Cf cpf cnf 1m IC=3 BRANCH=1
+Rlf s lpf 10
+Lf lpf 0 1m IC=3 BRANCH=1
+.tran 1u 5u 0 100n
+.PRINT TRAN V(cpa) V(cna) V(cpb) V(cnb) V(cpc) V(cnc) V(cpd) V(cnd) V(cpe) V(cne) V(cpf) V(cnf)
+.PRINT TRAN V(lpa) V(lpb) V(lpc) V(lpd) V(lpe) V(lpf)
+.end

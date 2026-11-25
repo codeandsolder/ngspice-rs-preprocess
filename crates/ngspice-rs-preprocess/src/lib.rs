@@ -4,6 +4,7 @@
 mod dialect;
 
 use anyhow::{Context, Result, ensure};
+pub use model_normalize_ngspice::passive_ic;
 use model_normalize_ngspice::{
     NormalizationPass,
     linked_source::{LinkLimits, RootKind, SourceLinker},
@@ -205,6 +206,9 @@ pub struct PreparedBundle {
     /// Source declaration identities, before native primitive lowering or
     /// subcircuit specialization. Unused catalog declarations may be present.
     pub device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
+    /// Source-specific initialization policy; absent for native decks.
+    /// Consumers must bind it per instance and enclosing analysis.
+    pub initial_conditions: Option<passive_ic::InitialConditions>,
 }
 
 impl PreparedBundle {
@@ -293,6 +297,7 @@ fn native(
         companions: Vec::new(),
         normalization: normalized.model.passes,
         device_identities: Vec::new(),
+        initial_conditions: None,
     })
 }
 

@@ -1,0 +1,10 @@
+* IC interactions
+.options initCondMode=2 icres=2
+Vs s 0 10
+Rp s p 10
+Rn n 0 20
+C1 p n 1m IC=3
+C2 p n 2m IC=5
+.tran 1u 5u 0 100n
+.PRINT TRAN V(p) V(n)
+.end

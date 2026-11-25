@@ -1,0 +1,16 @@
+* sweep IC mode witness
+.options initCondMode=0 icres=2
+Vs s 0 10
+R1 s cp 10
+R2 cn 0 20
+C1 cp cn 1m IC=3
+R3 s lp 10
+L1 lp 0 1m IC=3
+R4 s p 10
+R5 n 0 20
+C2 p n 1m IC=3 BRANCH=0
+R6 s lq 10
+L2 lq 0 1m IC=3 BRANCH=1
+.dc Vs 10 12 1
+.PRINT DC V(cp) V(cn) V(lp) V(p) V(n) V(lq)
+.end

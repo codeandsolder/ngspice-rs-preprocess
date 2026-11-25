@@ -12,8 +12,9 @@ pub mod syntax;
 use syntax::{normalized_statement, parse_numeric, statement_tokens, validate_node};
 mod whole;
 pub use whole::{
-    SplitDeckTranslation, WholeModelTranslation, lower_simetrix_linked_runtime,
-    translate_simplis_deck, translate_simplis_deck_split, translate_simplis_expanded_library,
+    SplitDeckTranslation, WholeModelTranslation, capture_passive_initial_conditions,
+    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_deck_split,
+    translate_simplis_expanded_library,
 };
 
 /// One numeric point on a piecewise-linear characteristic.
