@@ -1,6 +1,6 @@
 //! Source-file language context, resolved before inclusion or specialization.
 //!
-//! See SIMetrix Simulator Reference, Netlist Format and Language Differences.
+//! See `SIMetrix` Simulator Reference, Netlist Format and Language Differences.
 //! Behavioral source language is selected by its implementation syntax;
 //! parameter expressions use the containing source's declared language.
 
@@ -200,7 +200,7 @@ pub(super) fn logical_source(input: &str, context: DialectContext) -> Result<Vec
     Ok(statements)
 }
 
-fn symbol_byte(byte: u8) -> bool {
+const fn symbol_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.')
 }
 
@@ -474,7 +474,7 @@ pub(super) fn lower_statement(
             .unwrap_or_default();
         let language = match (device, assignment.to_ascii_uppercase().as_str()) {
             (b'B', _) => SourceLanguage::Simetrix,
-            (b'E' | b'G' | b'F' | b'H', "VALUE") => SourceLanguage::Pspice,
+            (b'E'..=b'H', "VALUE") => SourceLanguage::Pspice,
             (b'E' | b'G', "VOL" | "CUR") => SourceLanguage::Hspice,
             _ => context.language,
         };
@@ -521,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn comments_respect_dialect_and_quoted_paths() -> Result<()> {
+    fn comments_respect_dialect_and_quoted_paths() {
         let hs =
             DialectContext::resolve("*#HSPICE", DialectContext::default(), SourceKind::Include);
         assert_eq!(
@@ -540,6 +540,5 @@ mod tests {
             DialectContext::default().active_prefix(".inc \"a;b.lib\" ; comment"),
             ".inc \"a;b.lib\" "
         );
-        Ok(())
     }
 }

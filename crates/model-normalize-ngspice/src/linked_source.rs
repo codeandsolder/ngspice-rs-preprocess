@@ -132,7 +132,7 @@ pub fn external_library_reference(text: &str) -> Result<Option<(String, String)>
     let [path, section] = args
         .try_into()
         .map_err(|_| anyhow::anyhow!("expected .lib file section"))?;
-    Ok(Some((path, section)))
+    Ok(Some([path, section].into()))
 }
 
 /// Select a named section from already projected, joined source statements.

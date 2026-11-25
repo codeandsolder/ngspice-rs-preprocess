@@ -81,7 +81,7 @@ impl ParsedLibrary {
         self.simulator
     }
 
-    /// Effective source language of a SIMetrix catalog resource.
+    /// Effective source language of a `SIMetrix` catalog resource.
     #[must_use = "the context determines inherited source semantics"]
     pub const fn dialect(&self) -> Option<crate::source_dialect::DialectContext> {
         self.dialect

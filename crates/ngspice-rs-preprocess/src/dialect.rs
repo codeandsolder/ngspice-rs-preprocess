@@ -271,7 +271,7 @@ impl InitExpansion<'_> {
     }
 }
 
-struct Catalog {
+struct ResolvedLibraries {
     catalog: SubcircuitCatalog,
     sources: BTreeMap<String, BTreeSet<String>>,
     device_identities: Vec<DeviceIdentity>,
@@ -283,7 +283,7 @@ fn catalog(
     cancellation: &Cancellation,
     session: &mut SourceSession,
     context: DialectContext,
-) -> Result<Catalog> {
+) -> Result<ResolvedLibraries> {
     let simulator = projection(request.format);
     let mut parsed_session = SourceSession::new(
         AdmissionConfig {
@@ -344,7 +344,7 @@ fn catalog(
             .or_default()
             .insert(origin);
     }
-    Ok(Catalog {
+    Ok(ResolvedLibraries {
         catalog,
         sources,
         device_identities,
@@ -419,7 +419,7 @@ fn linked(
     } else {
         (init.output, Vec::new())
     };
-    let Catalog {
+    let ResolvedLibraries {
         catalog,
         sources,
         device_identities: catalog_identities,
