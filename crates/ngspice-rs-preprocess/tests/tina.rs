@@ -174,3 +174,36 @@ fn tina_parameterized_table_preserves_instance_scope() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn shared_dialect_linking_and_renamed_device_origins_compose() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let deck = directory.path().join("main.cir");
+    let library = directory.path().join("cell.lib");
+    fs::write(
+        &deck,
+        b"TINA exported macro\n.lib cell.lib\nX1 a b c 0 CELL\n.end\n",
+    )?;
+    fs::write(&library, b"* plaintext macro\n.subckt CELL a b c n .param r=10\nS1 a b c n SM\n.model SM VSWITCH(VON=1 VOFF=0 RON=10 ROFF=1k)\nR1 a A__ps_S1 {r}\n.ends CELL\n")?;
+    let result = prepared(InputFormat::TinaDeck, &deck)?;
+    assert_eq!(result.device_identities.len(), 1);
+    let identity = &result.device_identities[0];
+    let library = library.canonicalize()?;
+    assert_eq!(identity.source, library.to_string_lossy());
+    assert_eq!(identity.scope, ["CELL"]);
+    assert_eq!(identity.declared, "S1");
+    assert_ne!(identity.linked.to_ascii_lowercase(), "a__ps_s1");
+    let Provenance::Native { lines } = &result.primary.provenance else {
+        anyhow::bail!("missing composed source map");
+    };
+    let output = std::str::from_utf8(&result.primary.bytes)?;
+    let (_, origin) = output
+        .lines()
+        .zip(lines)
+        .find(|(line, _)| line.starts_with(&format!("{} ", identity.linked)))
+        .context("missing linked switch")?;
+    assert_eq!(origin.source, library);
+    assert_eq!(origin.line, 3);
+    assert!(output.contains(".param r=10"));
+    Ok(())
+}

@@ -72,7 +72,7 @@ pub fn artifact(
     }
     Artifact::new(
         Descriptor {
-            family: "simetrix_diode_level1".into(),
+            family: super::MODEL_FAMILY.into(),
             fingerprint,
             abi: ABI_VERSION,
             equations,

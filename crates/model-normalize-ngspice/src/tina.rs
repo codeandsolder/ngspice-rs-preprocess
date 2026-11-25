@@ -5,7 +5,7 @@
 //! directly on a .SUBCKT header (e.g. TI ISO224X export).
 //! Separate that declaration without making it an overridable formal.
 
-use crate::{MappedNormalization, NormalizationPass, lexical, linked_source::RootKind};
+use crate::{NormalizationPass, lexical, linked_source::RootKind, pspice::PspiceNormalization};
 use anyhow::{Context, Result, ensure};
 
 /// A TINA source projection before the common SPICE normalization stage.
@@ -152,23 +152,28 @@ pub fn validate_plaintext(input: &[u8]) -> Result<()> {
 }
 
 /// Normalize an explicitly selected TINA plaintext SPICE export or macro
-/// through the common native normalization, retaining physical source lines.
+/// through the shared PSpice/native normalization, retaining physical source lines.
 ///
 /// # Errors
 /// Invalid or non-text source, malformed inline declarations or downstream
 /// normalization errors.
-pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<MappedNormalization> {
+pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<PspiceNormalization> {
     let projection = Projection::build(input, kind)?;
-    let mut result = crate::normalize_mapped(&projection.bytes, kind)?;
-    for line in &mut result.input_lines {
+    let mut result = crate::pspice::normalize_mapped(&projection.bytes, kind)?;
+    for line in result.mapped.input_lines.iter_mut().chain(
+        result
+            .renamed
+            .iter_mut()
+            .map(|device| &mut device.input_line),
+    ) {
         *line = *projection
             .lines
             .get(*line - 1)
             .context("missing TINA source line")?;
     }
     let mut passes = projection.passes;
-    passes.append(&mut result.model.passes);
-    result.model.passes = passes;
+    passes.append(&mut result.mapped.model.passes);
+    result.mapped.model.passes = passes;
     Ok(result)
 }
 
@@ -180,14 +185,17 @@ mod tests {
     fn local_parameters_preserve_title_comments_and_physical_provenance() -> Result<()> {
         let input = b".subckt title .param literal\r\n* .subckt comment .param nope\r\n.subckt one a b .PaRaM k={2 + 3}\r\n+ q=4\r\n.ends\r\n.subckt two a b\r\n+ .param k=2\r\n.ends\r\n.end\r\n";
         let result = normalize_mapped(input, RootKind::Deck)?;
-        let text = std::str::from_utf8(&result.model.bytes)?;
+        let text = std::str::from_utf8(&result.mapped.model.bytes)?;
         assert!(
             text.starts_with(".subckt title .param literal\r\n* .subckt comment .param nope\r\n")
         );
         assert!(text.contains(".subckt one a b \r\n.PaRaM k={2 + 3}\r\n+ q=4"));
         assert!(text.contains(".subckt two a b\r\n  .param k=2"));
-        assert_eq!(result.input_lines, [1, 2, 3, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(result.model.passes, [NormalizationPass::TinaInlineParam]);
+        assert_eq!(result.mapped.input_lines, [1, 2, 3, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            result.mapped.model.passes,
+            [NormalizationPass::TinaInlineParam]
+        );
         Ok(())
     }
 
@@ -195,7 +203,7 @@ mod tests {
     fn multiple_local_directives_compose_with_other_source_edits() -> Result<()> {
         let source = b".subckt cell a b .param r=20m .param l=1M\nL1 a b {l} Rser={r}\n.ends\n";
         let result = normalize_mapped(source, RootKind::Include)?;
-        let output = std::str::from_utf8(&result.model.bytes)?;
+        let output = std::str::from_utf8(&result.mapped.model.bytes)?;
         let expected = [
             (".subckt cell a b", 1),
             (".param r=20m", 1),
@@ -206,13 +214,13 @@ mod tests {
         ];
         assert_eq!(output.lines().count(), expected.len());
         for ((line, origin), (prefix, expected_origin)) in
-            output.lines().zip(&result.input_lines).zip(expected)
+            output.lines().zip(&result.mapped.input_lines).zip(expected)
         {
             assert!(line.starts_with(prefix), "{line}");
             assert_eq!(*origin, expected_origin);
         }
         assert_eq!(
-            result.model.passes,
+            result.mapped.model.passes,
             [
                 NormalizationPass::TinaInlineParam,
                 NormalizationPass::LtspiceInductorRser
@@ -225,8 +233,8 @@ mod tests {
     fn quoted_and_grouped_tokens_are_not_directives() -> Result<()> {
         let input = b".subckt a b c PARAMS: p={f('.param')}\n.ends\n";
         let result = normalize_mapped(input, RootKind::Include)?;
-        assert_eq!(result.model.bytes, input);
-        assert!(result.model.passes.is_empty());
+        assert_eq!(result.mapped.model.bytes, input);
+        assert!(result.mapped.model.passes.is_empty());
         assert!(normalize_mapped(b".subckt a b c .param\n", RootKind::Include).is_err());
         assert!(normalize_mapped(b"PK\x03\x04abc", RootKind::Include).is_err());
         Ok(())
