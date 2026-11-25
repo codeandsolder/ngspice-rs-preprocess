@@ -433,3 +433,35 @@ fn waveform_identity_and_native_passthrough() -> Result<()> {
     assert!(std::str::from_utf8(&native.primary.bytes)?.contains("PULSE(0 1 0 0 0 1u 2u)"));
     Ok(())
 }
+
+#[test]
+fn sub_ulp_phase_preserves_discontinuity_side_and_small_signed_delay() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let bundle = prepared(
+        dir.path(),
+        r"* tiny signed phase
+Vbefore a 0 PUL V1=0 V2=1 PERIOD=1 DRATIO=0.5 DELAY=1e-18 OFF_UNTIL_DELAY=NO
+Vafter b 0 PUL V1=0 V2=1 PERIOD=1 DRATIO=0.5 DELAY=-1e-18 OFF_UNTIL_DELAY=NO
+Vexact c 0 PUL V1=0 V2=1 PERIOD=1 DRATIO=0.5 DELAY=0 OFF_UNTIL_DELAY=NO
+Vregular d 0 SAW V1=0 V2=1 PERIOD=1 DELAY=0.125 OFF_UNTIL_DELAY=NO
+.end
+",
+        InputFormat::ExpandedDeck,
+    )?;
+    for (declaration, (origin, dc)) in
+        bundle
+            .waveforms
+            .iter()
+            .zip([(1e-18, 0.), (-1e-18, 1.), (0., 1.), (0.125, 0.875)])
+    {
+        let waveform = resolve(declaration)?;
+        let (_, repeat) = cycle(&waveform)?;
+        close(repeat.origin, origin, 0.)?;
+        close(waveform.dc, dc, 0.)?;
+        assert!(repeat.hold.is_none());
+    }
+    let reference = model_translate_simplis::translate_simplis_deck(b"* prefix\nV1 a 0 PUL V1=0 V2=1 PERIOD=1 DRATIO=0.5 DELAY=0.125 OFF_UNTIL_DELAY=NO\n.end\n")?;
+    let text = std::str::from_utf8(&reference.bytes)?;
+    assert!(text.contains("r=1.25000000000000000e-1 td=0."));
+    Ok(())
+}

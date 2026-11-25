@@ -7,8 +7,8 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::waveform::{
-    Forcing, Period, PreparedWaveform, PulseEdges, PulseSpec, ResolvedWaveform, Scalar, SineDelay,
-    SymbolicPoint, WaveformSpec,
+    Forcing, Knot, Period, PreparedWaveform, PulseEdges, PulseSpec, Repeat, ResolvedWaveform,
+    Scalar, SineDelay, SymbolicPoint, WaveformSpec,
 };
 use model_preprocess_simplis::{LinkedPreprocessedNetlist, parameter_assignments};
 use std::{collections::BTreeMap, fmt::Write as _};
@@ -248,6 +248,103 @@ fn parse(statement: &str) -> Result<Option<Parsed>> {
     }))
 }
 
+struct ReferencePwl {
+    knots: Vec<Knot>,
+    delay: f64,
+    repeat_at: Option<f64>,
+}
+
+impl ReferencePwl {
+    fn push(&mut self, knot: Knot) -> Result<()> {
+        ensure!(
+            knot.time.is_finite() && knot.time >= 0.,
+            "native PWL time shift overflows"
+        );
+        ensure!(
+            self.knots.last().is_none_or(|last| last.time < knot.time),
+            "native PWL cannot represent shifted knot times distinctly"
+        );
+        self.knots.push(knot);
+        Ok(())
+    }
+
+    fn build(knots: &[Knot], repeat: Option<Repeat>, dc: f64) -> Result<Self> {
+        let first = knots.first().context("missing waveform knots")?;
+        let Some(cycle) = repeat else {
+            let delay = first.time.min(0.);
+            let mut result = Self {
+                knots: Vec::new(),
+                delay,
+                repeat_at: None,
+            };
+            for knot in knots {
+                result.push(Knot {
+                    time: knot.time - delay,
+                    ..*knot
+                })?;
+            }
+            return Ok(result);
+        };
+        let prefix = cycle.hold.is_none() && cycle.origin > 0.;
+        let mut result = Self {
+            knots: Vec::new(),
+            delay: if prefix { 0. } else { cycle.origin },
+            repeat_at: Some(if prefix { cycle.origin } else { 0. }),
+        };
+        if prefix {
+            // Native PWL holds before TD. Emit the rest of the preceding
+            // cycle, then repeat from the actual positive boundary.
+            result.push(Knot {
+                time: 0.,
+                left: dc,
+                right: dc,
+            })?;
+            for knot in knots {
+                let time = cycle.origin + (knot.time - cycle.period);
+                if time > 0. {
+                    ensure!(time < cycle.origin, "native PWL prefix loses a knot");
+                    result.push(Knot { time, ..*knot })?;
+                }
+            }
+        }
+        let shift = if prefix { cycle.origin } else { 0. };
+        for (index, knot) in knots.iter().enumerate() {
+            let left = if index == 0 && !prefix {
+                cycle.hold.unwrap_or(knot.right)
+            } else {
+                knot.left
+            };
+            result.push(Knot {
+                time: knot.time + shift,
+                left,
+                ..*knot
+            })?;
+        }
+        result.push(Knot {
+            time: cycle.period + shift,
+            left: first.left,
+            right: first.left,
+        })?;
+        Ok(result)
+    }
+
+    fn write(&self, output: &mut String) -> Result<()> {
+        output.push_str(" PWL(");
+        for knot in &self.knots {
+            write!(output, " {:.17e} {:.17e}", knot.time, knot.left)?;
+            if knot.left.to_bits() != knot.right.to_bits() {
+                write!(output, " {:.17e} {:.17e}", knot.time, knot.right)?;
+            }
+        }
+        output.push(')');
+        if let Some(repeat) = self.repeat_at {
+            write!(output, " r={repeat:.17e}")?;
+        }
+        write!(output, " td={:.17e}", self.delay)?;
+        Ok(())
+    }
+}
+
 impl Parsed {
     fn declaration(&self, artifact: &str, scope: &[String]) -> PreparedWaveform {
         PreparedWaveform {
@@ -279,21 +376,11 @@ impl Parsed {
     fn strict_native_reference(resolved: &ResolvedWaveform) -> bool {
         match &resolved.forcing {
             Forcing::PiecewiseLinear { knots, repeat } => {
-                let shift = if repeat.is_some() {
-                    0.
-                } else {
-                    knots[0].time.min(0.)
-                };
-                knots.iter().enumerate().all(|(index, knot)| {
-                    let left = if index == 0 {
-                        repeat.map_or(knot.left, |cycle| cycle.hold.unwrap_or(knot.right))
-                    } else {
-                        knot.left
-                    };
-                    let time = knot.time - shift;
-                    time.is_finite()
-                        && (index == 0 || time > knots[index - 1].time - shift)
-                        && left.to_bits() == knot.right.to_bits()
+                ReferencePwl::build(knots, *repeat, resolved.dc).is_ok_and(|reference| {
+                    reference
+                        .knots
+                        .iter()
+                        .all(|knot| knot.left.to_bits() == knot.right.to_bits())
                 })
             }
             Forcing::Sine {
@@ -332,34 +419,7 @@ impl Parsed {
         )?;
         match &resolved.forcing {
             Forcing::PiecewiseLinear { knots, repeat } => {
-                output.push_str(" PWL(");
-                let origin = repeat.map_or_else(|| knots[0].time.min(0.), |cycle| cycle.origin);
-                for (index, knot) in knots.iter().enumerate() {
-                    let time = if repeat.is_some() {
-                        knot.time
-                    } else {
-                        knot.time - origin
-                    };
-                    ensure!(time.is_finite(), "native PWL time shift overflows");
-                    let left = if index == 0 {
-                        repeat.map_or(knot.left, |cycle| cycle.hold.unwrap_or(knot.right))
-                    } else {
-                        knot.left
-                    };
-                    write!(output, " {time:.17e} {left:.17e}")?;
-                    if left.to_bits() != knot.right.to_bits() {
-                        write!(output, " {time:.17e} {:.17e}", knot.right)?;
-                    }
-                }
-                if let Some(cycle) = repeat {
-                    write!(
-                        output,
-                        " {:.17e} {:.17e}) r=0 td={:.17e}",
-                        cycle.period, knots[0].left, cycle.origin
-                    )?;
-                } else {
-                    write!(output, ") td={origin:.17e}")?;
-                }
+                ReferencePwl::build(knots, *repeat, resolved.dc)?.write(&mut output)?;
             }
             Forcing::Sine {
                 offset,

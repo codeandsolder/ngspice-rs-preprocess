@@ -103,10 +103,15 @@ pub struct Knot {
     pub right: f64,
 }
 
+/// Periodic forcing timing.
+///
 /// One period begins at origin. The knots are strictly ordered in
 /// [0, period); the first is at zero. Interpolate from the last right
 /// ordinate to the first left ordinate at period. If hold is present,
 /// origin is the actual positive delay and forcing before origin is hold.
+/// Otherwise the cycle extends in both directions; origin is the nearest
+/// signed cycle boundary to zero. A positive ungated origin preserves a
+/// small delay which subtraction from the period would round away.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Repeat {
     pub origin: f64,
@@ -265,12 +270,15 @@ fn repeat(period: f64, delay: f64, hold: bool, first: f64) -> Repeat {
             hold: Some(first),
         }
     } else {
-        let phase = (-delay).rem_euclid(period);
-        // rem_euclid can round a tiny negative remainder to exactly period.
-        let phase = if phase >= period { 0. } else { phase };
+        let remainder = delay % period;
+        let origin = if remainder.abs() > period * 0.5 {
+            remainder - remainder.signum() * period
+        } else {
+            remainder
+        };
         Repeat {
             period,
-            origin: -phase,
+            origin: if origin == 0. { 0. } else { origin },
             hold: None,
         }
     }
@@ -422,18 +430,23 @@ fn affine(left: f64, right: f64, fraction: f64) -> f64 {
 fn startup_pwl(knots: &[Knot], repeat: Option<Repeat>) -> Result<f64> {
     let first = knots.first().context("empty resolved waveform")?;
     let last = knots.last().context("empty resolved waveform")?;
-    let time = if let Some(cycle) = repeat {
+    let (time, shift) = if let Some(cycle) = repeat {
         if let Some(hold) = cycle.hold {
             return Ok(hold);
         }
-        -cycle.origin
+        // Before a positive ungated origin, use the preceding cycle with
+        // its endpoint at zero. Forming period-origin loses tiny delays.
+        (
+            -cycle.origin,
+            if cycle.origin > 0. { -cycle.period } else { 0. },
+        )
     } else {
-        0.
+        (0., 0.)
     };
-    if time < first.time {
+    if time < first.time + shift {
         return Ok(first.left);
     }
-    let upper = knots.partition_point(|knot| knot.time <= time);
+    let upper = knots.partition_point(|knot| knot.time + shift <= time);
     let left = knots[upper - 1];
     let right = if let Some(right) = knots.get(upper) {
         *right
@@ -446,12 +459,16 @@ fn startup_pwl(knots: &[Knot], repeat: Option<Repeat>) -> Result<f64> {
     } else {
         return Ok(last.right);
     };
-    let span = right.time - left.time;
+    let left_time = left.time + shift;
+    let right_time = right.time + shift;
+    let span = right_time - left_time;
+    if shift < 0. {
+        return Ok(affine(right.left, left.right, (right_time - time) / span));
+    }
     let fraction = if span.is_finite() {
-        (time - left.time) / span
+        (time - left_time) / span
     } else {
-        // Finite opposite-sign endpoints may have a nonfinite difference.
-        (time * 0.5 - left.time * 0.5) / (right.time * 0.5 - left.time * 0.5)
+        left_time.mul_add(-0.5, time * 0.5) / left_time.mul_add(-0.5, right_time * 0.5)
     };
     Ok(affine(left.right, right.left, fraction))
 }
@@ -543,21 +560,20 @@ pub fn validate_artifact(
             control = true;
         } else if first.eq_ignore_ascii_case(".endc") {
             control = false;
-        } else if control {
-            continue;
-        } else if first.eq_ignore_ascii_case(".subckt") {
+        } else if !control && first.eq_ignore_ascii_case(".subckt") {
             scope.push(
                 fields
                     .next()
                     .context("missing emitted waveform scope")?
                     .to_ascii_lowercase(),
             );
-        } else if first.eq_ignore_ascii_case(".ends") {
+        } else if !control && first.eq_ignore_ascii_case(".ends") {
             ensure!(scope.pop().is_some(), "unmatched emitted .ends");
-        } else if first
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| matches!(byte.to_ascii_uppercase(), b'V' | b'I'))
+        } else if !control
+            && first
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| matches!(byte.to_ascii_uppercase(), b'V' | b'I'))
         {
             let key = (scope.clone(), first.to_ascii_lowercase());
             if let Some(seen) = expected.get_mut(&key) {

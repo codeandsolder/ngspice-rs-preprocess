@@ -304,7 +304,9 @@ periodic-operating-point idle flag. Native positional sources are unchanged.
 Named PUL (rectangular or trapezoidal), PWLS PUL, SAW, SIN and PWL share this
 contract. Periodic linear forcing stores one sorted cycle of unique knots with
 separate left and right values, an origin, a positive period and an optional
-pre-delay hold. The first knot is at zero, the endpoint is implicit and
+pre-delay hold. Ungated cycles extend both ways; the origin is the nearest
+signed cycle boundary to zero, avoiding loss of a small positive delay to
+period subtraction. The first knot is at zero, the endpoint is implicit and
 interpolation approaches its left value. Coincident edges collapse to their
 exterior limits, not artificial finite-duration ramps. DC startup uses the
 right-sided value except while the source is held. PWL may have signed times
