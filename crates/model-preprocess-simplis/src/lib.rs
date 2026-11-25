@@ -6,7 +6,10 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 mod hierarchy;
 pub mod source_dialect;
@@ -106,9 +109,12 @@ impl Value {
     }
 }
 
+type GlobalBindings = Arc<BTreeMap<String, Value>>;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Environment {
     values: BTreeMap<String, Value>,
+    globals: GlobalBindings,
     options: BTreeMap<String, Value>,
 }
 
@@ -125,12 +131,36 @@ impl Environment {
 
     #[must_use = "the returned value is the requested parameter binding"]
     pub fn get(&self, name: &str) -> Option<&Value> {
-        self.values.get(&name.to_ascii_uppercase())
+        let name = name.to_ascii_uppercase();
+        self.values.get(&name).or_else(|| self.globals.get(&name))
     }
 
     #[must_use = "the result reports whether the parameter is bound"]
     pub fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
+    }
+
+    fn ensure_local_name(&self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.globals.contains_key(&name.to_ascii_uppercase()),
+            "SIMPLIS parameter {name} is reserved by a global binding"
+        );
+        Ok(())
+    }
+
+    fn set_global(&mut self, name: &str, value: Value) -> Result<()> {
+        self.ensure_local_name(name)?;
+        let name = name.to_ascii_uppercase();
+        self.values.remove(&name);
+        Arc::make_mut(&mut self.globals).insert(name, value);
+        Ok(())
+    }
+
+    fn inherited(globals: GlobalBindings) -> Self {
+        Self {
+            globals,
+            ..Self::default()
+        }
     }
 
     pub fn set_option(&mut self, name: impl AsRef<str>, value: Value) {
@@ -145,7 +175,7 @@ impl Environment {
 
     #[must_use = "the result reports whether any bindings exist"]
     pub(crate) fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.options.is_empty()
+        self.values.is_empty() && self.globals.is_empty() && self.options.is_empty()
     }
 }
 
@@ -1280,7 +1310,12 @@ fn process_range(
         if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
             let (name, value) = parse_assignment(assignment, state.env)
                 .with_context(|| format!("SIMPLIS assignment at line {}", index + 1))?;
-            state.env.set(name, value);
+            if directive(line, "GLOBALVAR").is_some() {
+                state.env.set_global(&name, value)?;
+            } else {
+                state.env.ensure_local_name(&name)?;
+                state.env.set(name, value);
+            }
             *state.assigned_variables = state.assigned_variables.saturating_add(1);
             index = index.saturating_add(1);
             continue;
@@ -2175,6 +2210,7 @@ fn named_assignments(input: &str, init: bool) -> Result<Vec<(&str, &str)>> {
 fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
     let assignments = parameter_assignments(input)?;
     for (name, expression) in &assignments {
+        env.ensure_local_name(name)?;
         let value = eval_expression(expression, env)
             .with_context(|| format!("evaluating default for SIMPLIS parameter {name}"))?;
         env.set(name, value);
@@ -2278,6 +2314,7 @@ fn specialize_subcircuit_with_base_mode(
     let default_parameters = parse_parameter_list(parameter_text, &mut env)?;
     let mut overridden_parameters = 0usize;
     for (name, value) in &overrides.values {
+        env.ensure_local_name(name)?;
         env.values.insert(name.clone(), value.clone());
         overridden_parameters = overridden_parameters.saturating_add(1);
     }

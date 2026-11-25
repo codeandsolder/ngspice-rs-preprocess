@@ -1,6 +1,6 @@
 use super::{
-    Environment, decode_simplis_text, find_ascii_case_insensitive, parse_parameter_list,
-    preprocess_control_flow, specialize_subcircuit, specialize_subcircuit_control_flow_with_base,
+    Environment, GlobalBindings, decode_simplis_text, eval_expression, find_ascii_case_insensitive,
+    parameter_assignments, preprocess_control_flow, specialize_subcircuit_control_flow_with_base,
     specialize_subcircuit_with_base,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -1464,7 +1464,18 @@ fn logical_statements(lines: &[String]) -> Vec<String> {
 
 fn parse_overrides(input: &str) -> Result<Environment> {
     let mut environment = Environment::new();
-    parse_parameter_list(input, &mut environment)?;
+    // The caller has already substituted braced expressions at the X line.
+    // Do not allow later actuals to read earlier actual bindings.
+    let empty = Environment::new();
+    for (name, expression) in parameter_assignments(input)? {
+        let value = eval_expression(expression, &empty)
+            .with_context(|| format!("evaluating SIMPLIS actual {name}"))?;
+        ensure!(
+            !environment.contains(name),
+            "duplicate SIMPLIS actual {name}"
+        );
+        environment.set(name, value);
+    }
     Ok(environment)
 }
 
@@ -1473,6 +1484,7 @@ struct Pending {
     definition: Definition,
     generated_name: String,
     overrides: Environment,
+    inherited: GlobalBindings,
     local_key: Option<String>,
 }
 
@@ -1672,11 +1684,13 @@ fn resolve_definition(
 // A plain wrapper may call a parameterized or controlled helper several
 // levels down. Detect that reachability rather than only inspecting the
 // wrapper itself. The visited set also makes this query finite on cycles.
-fn definition_needs_expansion(
+type DefinitionIdentity = (Option<String>, String);
+
+fn plain_dependency_closure(
     definition: &Definition,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
-) -> Result<bool> {
+) -> Result<Option<BTreeSet<DefinitionIdentity>>> {
     let mut pending = vec![definition.clone()];
     let mut visited = BTreeSet::new();
     while let Some(current) = pending.pop() {
@@ -1687,7 +1701,7 @@ fn definition_needs_expansion(
             || current.owner_scope_id.is_some()
             || definition_uses_preprocessor(&current)
         {
-            return Ok(true);
+            return Ok(None);
         }
         let text = std::str::from_utf8(&current.bytes)?;
         let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
@@ -1696,7 +1710,7 @@ fn definition_needs_expansion(
                 continue;
             };
             if explicit_vars {
-                return Ok(true);
+                return Ok(None);
             }
             if let Some((child, _)) = resolve_definition(
                 model,
@@ -1709,15 +1723,16 @@ fn definition_needs_expansion(
             }
         }
     }
-    Ok(false)
+    Ok(Some(visited))
 }
 
 fn rewrite_call(
     statement: &str,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
-    next_id: &mut usize,
+    state: &mut FlatExpansion,
     caller: (Option<&str>, Option<&str>),
+    inherited: GlobalBindings,
 ) -> Result<Option<(String, Pending)>> {
     let Some((model, override_text, explicit_vars)) = call_target(statement)? else {
         return Ok(None);
@@ -1730,11 +1745,15 @@ fn rewrite_call(
         }
         return Ok(None);
     };
-    if !explicit_vars && !definition_needs_expansion(&definition, local, external)? {
+    if inherited.is_empty()
+        && !explicit_vars
+        && let Some(plain) = plain_dependency_closure(&definition, local, external)?
+    {
+        state.plain.extend(plain);
         return Ok(None);
     }
-    *next_id = next_id.saturating_add(1);
-    let generated_name = format!("{}${}", definition.name, *next_id);
+    state.next_id = state.next_id.saturating_add(1);
+    let generated_name = format!("{}${}", definition.name, state.next_id);
     let compile_time_vars = explicit_vars || definition.parameterized;
     let rewritten = replace_call_target(statement, model, &generated_name, compile_time_vars)?;
     let local_key = is_local.then(|| definition.scope_id.clone());
@@ -1748,6 +1767,7 @@ fn rewrite_call(
             } else {
                 Environment::new()
             },
+            inherited,
             local_key,
         },
     )))
@@ -1915,12 +1935,15 @@ fn emit_microchip_complementary_pwm(pending: &Pending, output: &mut String) -> R
     Ok(())
 }
 
+type SpecializationIdentity = (DefinitionIdentity, Environment, GlobalBindings);
+
 #[derive(Default)]
 struct FlatExpansion {
     next_id: usize,
     generated_subcircuits: usize,
     specialized_local: BTreeSet<String>,
-    active: Vec<(Option<String>, String, Environment)>,
+    plain: BTreeSet<DefinitionIdentity>,
+    active: Vec<SpecializationIdentity>,
 }
 
 fn emit_pending(
@@ -1936,9 +1959,12 @@ fn emit_pending(
         return Ok(());
     }
     let identity = (
-        pending.definition.source_id.clone(),
-        pending.definition.scope_id.clone(),
+        (
+            pending.definition.source_id.clone(),
+            pending.definition.scope_id.clone(),
+        ),
         pending.overrides.clone(),
+        pending.inherited.clone(),
     );
     ensure!(
         !state.active.contains(&identity),
@@ -1946,12 +1972,13 @@ fn emit_pending(
         pending.definition.name
     );
     state.active.push(identity);
+    let inherited = Environment::inherited(pending.inherited.clone());
     let specialized = if pending.definition.parameterized || !pending.overrides.is_empty() {
-        specialize_subcircuit(&pending.definition.bytes, &pending.overrides)
+        specialize_subcircuit_with_base(&pending.definition.bytes, &inherited, &pending.overrides)
     } else {
         specialize_subcircuit_control_flow_with_base(
             &pending.definition.bytes,
-            &Environment::new(),
+            &inherited,
             &pending.overrides,
         )
     }
@@ -1970,11 +1997,12 @@ fn emit_pending(
             &statement,
             local,
             external,
-            &mut state.next_id,
+            state,
             (
                 pending.definition.source_id.as_deref(),
                 Some(&pending.definition.scope_id),
             ),
+            specialized.environment.globals.clone(),
         )? {
             if let Some(key) = &child.local_key {
                 state.specialized_local.insert(key.clone());
@@ -2066,7 +2094,7 @@ pub fn preprocess_netlist(
         }
     }
 
-    let root_statements = preprocess_root_statements(&extracted.root_lines)?;
+    let (root_statements, globals) = preprocess_root_statements(&extracted.root_lines)?;
     let mut output_root = Vec::new();
     let mut pending = Vec::new();
     let mut end_statement = None;
@@ -2080,8 +2108,9 @@ pub fn preprocess_netlist(
             &statement,
             &local,
             external,
-            &mut state.next_id,
+            &mut state,
             (None, None),
+            globals.clone(),
         )? {
             if let Some(key) = &root_pending.local_key {
                 state.specialized_local.insert(key.clone());
@@ -2105,7 +2134,11 @@ pub fn preprocess_netlist(
         output.push('\n');
     }
     for definition in retained_local {
-        if state.specialized_local.contains(&definition.scope_id) {
+        if state.specialized_local.contains(&definition.scope_id)
+            && !state
+                .plain
+                .contains(&(definition.source_id.clone(), definition.scope_id.clone()))
+        {
             continue;
         }
         output.push_str(std::str::from_utf8(&definition.bytes)?);
@@ -2317,6 +2350,16 @@ fn instance_name(statement: &str) -> Option<String> {
         .then(|| first.to_ascii_uppercase())
 }
 
+fn stale_init_comments(children: &BTreeMap<String, InitTree>) -> impl Iterator<Item = String> + '_ {
+    children.iter().flat_map(|(name, stale)| {
+        let mut entries = Vec::new();
+        stale.flatten(name, &mut entries);
+        entries.into_iter().map(|entry| {
+            format!("* ngspice-rs-preprocess: ignored stale SIMPLIS .INIT snapshot entry {entry}")
+        })
+    })
+}
+
 fn annotate_unlinked_init(statement: &str, init: &InitTree) -> String {
     if init.is_empty() {
         return statement.to_owned();
@@ -2337,7 +2380,7 @@ struct LinkedUnit {
     definition: Definition,
     emitted_name: String,
     body: LinkedBody,
-    environment: Environment,
+    globals: GlobalBindings,
     runtime: Option<RuntimeScope>,
     init: InitTree,
 }
@@ -2413,6 +2456,7 @@ fn linked_specialization_name(
     definition: &Definition,
     specialized: Option<&[u8]>,
     overrides: &Environment,
+    globals: &GlobalBindings,
     init: &InitTree,
 ) -> String {
     let mut hasher = Sha256::new();
@@ -2430,6 +2474,18 @@ fn linked_specialization_name(
         for (name, value) in &overrides.values {
             hasher.update(name.as_bytes());
             hasher.update(*b"=");
+            update_value_hash(&mut hasher, value);
+            hasher.update([0xff]);
+        }
+    }
+    // A parent body may be byte-identical while its descendants use
+    // different promoted bindings. Include the completed global scope
+    // in the specialization identity, not just the rendered bytes.
+    if !globals.is_empty() {
+        hasher.update(b"descendant-globals\0");
+        for (name, value) in globals.iter() {
+            hasher.update(name.as_bytes());
+            hasher.update([0]);
             update_value_hash(&mut hasher, value);
             hasher.update([0xff]);
         }
@@ -2503,31 +2559,15 @@ fn definition_uses_preprocessor(definition: &Definition) -> bool {
         .any(is_preprocessor_control)
 }
 
-fn preprocess_root_statements(root_lines: &[String]) -> Result<Vec<String>> {
+fn preprocess_root_statements(root_lines: &[String]) -> Result<(Vec<String>, GlobalBindings)> {
     if !root_lines.iter().any(|line| is_preprocessor_control(line)) {
-        return Ok(logical_statements(root_lines));
+        return Ok((logical_statements(root_lines), GlobalBindings::default()));
     }
     let processed = preprocess_control_flow(root_lines.join("\n").as_bytes(), &Environment::new())
         .context("preprocessing root SIMPLIS controls")?;
     let text = std::str::from_utf8(&processed.bytes)?;
     let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
-    Ok(logical_statements(&lines))
-}
-
-fn definition_has_runtime_parameters(definition: &Definition) -> bool {
-    let text = String::from_utf8_lossy(&definition.bytes);
-    let mut header = String::new();
-    for (index, line) in text.lines().enumerate() {
-        if index != 0 && !line.trim_start().starts_with('+') {
-            break;
-        }
-        if !header.is_empty() {
-            header.push(' ');
-        }
-        let trimmed = line.trim_start();
-        header.push_str(trimmed.strip_prefix('+').unwrap_or(trimmed).trim());
-    }
-    find_ascii_case_insensitive(&header, " params:").is_some()
+    Ok((logical_statements(&lines), processed.environment.globals))
 }
 
 fn make_linked_unit(
@@ -2551,34 +2591,32 @@ fn make_linked_unit(
         if !init.is_empty() {
             bail!("SIMPLIS .INIT is not supported inside protected Microchip PWM replacement");
         }
-        let emitted_name = linked_specialization_name(&definition, None, &overrides, &init);
+        let emitted_name =
+            linked_specialization_name(&definition, None, &overrides, &inherited.globals, &init);
         return Ok(LinkedUnit {
             definition,
             emitted_name,
             body: LinkedBody::Microchip(overrides),
-            environment: inherited.clone(),
+            globals: inherited.globals.clone(),
             runtime: None,
             init,
         });
     }
 
     let scoped = definition.owner_scope_id.is_some();
-    let captures_environment = scoped
-        && !definition_has_runtime_parameters(&definition)
-        && (!inherited.is_empty() || !overrides.is_empty());
-    let needs_substitution = definition.parameterized || explicit_vars || captures_environment;
+    let needs_substitution = definition.parameterized || explicit_vars;
     let needs_control_flow = definition_uses_preprocessor(&definition);
-    let needs_preprocessing = needs_substitution || needs_control_flow;
-    let (bytes, environment) = if needs_preprocessing {
+    let needs_preprocessing = needs_substitution || needs_control_flow || !inherited.is_empty();
+    let (bytes, globals) = if needs_preprocessing {
         let specialized = if needs_substitution {
             specialize_subcircuit_with_base(&definition.bytes, inherited, &overrides)
         } else {
             specialize_subcircuit_control_flow_with_base(&definition.bytes, inherited, &overrides)
         }
         .with_context(|| format!("specializing SIMPLIS subcircuit {}", definition.name))?;
-        (specialized.bytes, specialized.environment)
+        (specialized.bytes, specialized.environment.globals)
     } else {
-        (definition.bytes.clone(), inherited.clone())
+        (definition.bytes.clone(), inherited.globals.clone())
     };
     let (bytes, init) = merge_local_init(&bytes, init)?;
     let (bytes, runtime) = if let Some(parent) = parent_runtime {
@@ -2598,7 +2636,7 @@ fn make_linked_unit(
     let specialized =
         needs_preprocessing || scoped || runtime.as_ref().is_some_and(RuntimeScope::has_bindings);
     let emitted_name = if specialized || !init.is_empty() {
-        linked_specialization_name(&definition, Some(&bytes), &overrides, &init)
+        linked_specialization_name(&definition, Some(&bytes), &overrides, &globals, &init)
     } else {
         linked_plain_name(&definition)?
     };
@@ -2606,17 +2644,17 @@ fn make_linked_unit(
         definition,
         emitted_name,
         body: LinkedBody::Netlist(bytes),
-        environment,
+        globals,
         runtime,
         init,
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LinkCaller<'a> {
     source: Option<&'a str>,
     scope: Option<&'a str>,
-    environment: &'a Environment,
+    globals: GlobalBindings,
     runtime: Option<&'a RuntimeScope>,
 }
 
@@ -2635,21 +2673,13 @@ fn link_call(
     else {
         bail!("unresolved SIMPLIS subcircuit {model} in linkable preprocessing");
     };
-    let inherits_lexically = caller.scope.is_some()
-        && definition.owner_scope_id.as_deref() == caller.scope
-        && definition.source_id.as_deref() == caller.source;
-    let empty = Environment::new();
-    let inherited = if inherits_lexically {
-        caller.environment
-    } else {
-        &empty
-    };
+    let inherited = Environment::inherited(caller.globals);
     let compile_time_vars = explicit_vars || definition.parameterized;
     let unit = make_linked_unit(
         definition,
         compile_time_vars,
         override_text,
-        inherited,
+        &inherited,
         init,
         caller.runtime,
         external,
@@ -2721,6 +2751,7 @@ fn emit_linked_unit(
             definition: unit.definition.clone(),
             generated_name: unit.emitted_name.clone(),
             overrides: overrides.clone(),
+            inherited: GlobalBindings::default(),
             local_key: None,
         };
         let builder = builders.entry(source_id.clone()).or_default();
@@ -2749,7 +2780,7 @@ fn emit_linked_unit(
             LinkCaller {
                 source: unit.definition.source_id.as_deref(),
                 scope: Some(&unit.definition.scope_id),
-                environment: &unit.environment,
+                globals: unit.globals.clone(),
                 runtime: unit.runtime.as_ref(),
             },
             child_init.clone(),
@@ -2773,15 +2804,7 @@ fn emit_linked_unit(
             rewritten_body.push(annotate_unlinked_init(&statement, &child_init));
         }
     }
-    for (name, stale) in init_children {
-        let mut entries = Vec::new();
-        stale.flatten(&name, &mut entries);
-        for entry in entries {
-            rewritten_body.push(format!(
-                "* ngspice-rs-preprocess: ignored stale SIMPLIS .INIT snapshot entry {entry}"
-            ));
-        }
-    }
+    rewritten_body.extend(stale_init_comments(&init_children));
 
     {
         let builder = builders.entry(source_id.clone()).or_default();
@@ -2962,7 +2985,7 @@ fn link_root_statements(
 ) -> Result<(String, Vec<LinkedUnit>, Option<String>)> {
     use std::fmt::Write as _;
 
-    let root_statements = preprocess_root_statements(root_lines)?;
+    let (root_statements, globals) = preprocess_root_statements(root_lines)?;
     let mut root_init = InitTree::default();
     for statement in &root_statements {
         if let Some(assignments) = parse_init_statement(statement)? {
@@ -2999,7 +3022,7 @@ fn link_root_statements(
             LinkCaller {
                 source: None,
                 scope: None,
-                environment: &Environment::new(),
+                globals: globals.clone(),
                 runtime,
             },
             child_init.clone(),
@@ -3022,15 +3045,8 @@ fn link_root_statements(
     for (name, value) in &root_init.local {
         writeln!(root_output, ".INIT {name}={value}")?;
     }
-    for (name, stale) in &root_init.children {
-        let mut entries = Vec::new();
-        stale.flatten(name, &mut entries);
-        for entry in entries {
-            writeln!(
-                root_output,
-                "* ngspice-rs-preprocess: ignored stale SIMPLIS .INIT snapshot entry {entry}"
-            )?;
-        }
+    for comment in stale_init_comments(&root_init.children) {
+        writeln!(root_output, "{comment}")?;
     }
     Ok((root_output, root_units, end_statement))
 }
@@ -3494,34 +3510,198 @@ R1 1 2 3
         Ok(())
     }
 
+    fn expand_scope_fixture(source: &[u8]) -> Result<[String; 2]> {
+        let catalog = SubcircuitCatalog::new();
+        let flat = preprocess_netlist(source, &catalog)?;
+        let linked = preprocess_netlist_linked(source, &catalog)?;
+        let mut combined = String::from_utf8(linked.root_bytes)?;
+        for library in linked.libraries {
+            combined.push_str(std::str::from_utf8(&library.bytes)?);
+        }
+        Ok([String::from_utf8(flat.bytes)?, combined])
+    }
+
     #[test]
-    fn linked_nested_helpers_are_lexically_scoped_and_capture_parent_parameters() -> Result<()> {
-        let source = br"X1 1 0 PARENT_A vars: A=3
-X2 2 0 PARENT_B vars: A=7
-.subckt PARENT_A 1 2 vars: A=1
+    fn nested_definitions_do_not_capture_parent_locals_or_formals() -> Result<()> {
+        let source = br"X1 1 0 PARENT vars: A=3
+.subckt PARENT 1 2 vars: A=1
+.VAR LOCAL=5
 XH 1 2 HELPER
 .subckt HELPER 1 2
 RA 1 2 {A}
+RL 1 2 {LOCAL}
 .ends HELPER
-.ends PARENT_A
-.subckt PARENT_B 1 2 vars: A=1
-XH 1 2 HELPER
-.subckt HELPER 1 2
-RB 1 2 {A*10}
-.ends HELPER
-.ends PARENT_B
+.ends PARENT
 .end
 ";
+        for output in expand_scope_fixture(source)? {
+            assert!(output.contains("RA 1 2 {A}"), "{output}");
+            assert!(output.contains("RL 1 2 {LOCAL}"), "{output}");
+            assert!(!output.contains("RA 1 2 3"));
+            assert!(!output.contains("RL 1 2 5"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_actuals_use_only_the_caller_bindings() -> Result<()> {
+        let source = br".VAR A=3
+X1 1 0 CHILD vars: A=7 B={A}
+.SUBCKT CHILD 1 2 vars: A=1 B=2
+RA 1 2 {A}
+RB 1 2 {B}
+.ENDS CHILD
+.END
+";
+        for output in expand_scope_fixture(source)? {
+            assert!(output.contains("RA 1 2 7"), "{output}");
+            assert!(output.contains("RB 1 2 3"), "{output}");
+        }
+        let missing = br"X1 1 0 CHILD vars: A=7 B={A}
+.SUBCKT CHILD 1 2 vars: A=1 B=2
+R1 1 2 {B}
+.ENDS CHILD
+.END
+";
+        let catalog = SubcircuitCatalog::new();
+        assert!(preprocess_netlist(missing, &catalog).is_err());
+        assert!(preprocess_netlist_linked(missing, &catalog).is_err());
+        assert!(parse_overrides("A=7 B=A").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn root_vars_are_local_and_explicit_globals_propagate_through_wrappers() -> Result<()> {
+        let local = br".VAR G=3
+X1 1 0 WRAP
+.SUBCKT WRAP 1 2
+XH 1 2 CHILD
+.ENDS WRAP
+.SUBCKT CHILD 1 2
+R1 1 2 {G}
+.ENDS CHILD
+.END
+";
+        for output in expand_scope_fixture(local)? {
+            assert!(output.contains("R1 1 2 {G}"), "{output}");
+        }
+        let global = String::from_utf8(local.to_vec())?.replace(".VAR G=3", ".GLOBALVAR G=3");
+        for output in expand_scope_fixture(global.as_bytes())? {
+            assert!(output.contains("R1 1 2 3"), "{output}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn promoted_globals_are_isolated_to_each_hierarchy_branch() -> Result<()> {
+        let source = br"X1 1 0 WRAP vars: N=3
+X2 2 0 WRAP vars: N=7
+.SUBCKT WRAP 1 2 vars: N=1
+.GLOBALVAR N={N}
+XH 1 2 CHILD
+.ENDS WRAP
+.SUBCKT CHILD 1 2
+R1 1 2 {N}
+.ENDS CHILD
+.END
+";
+        for output in expand_scope_fixture(source)? {
+            for value in [3, 7] {
+                assert!(output.contains(&format!("R1 1 2 {value}\n")), "{output}");
+            }
+        }
         let linked = preprocess_netlist_linked(source, &SubcircuitCatalog::new())?;
-        let combined = linked
-            .libraries
-            .iter()
-            .map(|library| std::str::from_utf8(&library.bytes))
-            .collect::<Result<Vec<_>, _>>()?
-            .join("\n");
-        assert!(combined.contains("RA 1 2 3"));
-        assert!(combined.contains("RB 1 2 70"));
-        assert_eq!(combined.matches(".subckt sr_HELPER_sp_").count(), 2);
+        assert_eq!(linked.stats.generated_subcircuits, 4);
+        let isolated = br"X1 1 0 WRAP
+X2 2 0 PLAIN
+.SUBCKT PLAIN 1 2
+XH 1 2 CHILD
+.ENDS PLAIN
+.SUBCKT WRAP 1 2
+.GLOBALVAR G=7
+XH 1 2 CHILD
+.ENDS WRAP
+.SUBCKT CHILD 1 2
+R1 1 2 {G}
+.ENDS CHILD
+.END
+";
+        for output in expand_scope_fixture(isolated)? {
+            assert!(output.contains("R1 1 2 7"), "{output}");
+            assert!(output.contains("R1 1 2 {G}"), "{output}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn global_bindings_follow_loop_generated_calls_and_continuations() -> Result<()> {
+        let source = br"X1 1 0 WRAP
+.SUBCKT WRAP 1 2
+.GLOBALVAR G=1
+.VAR I=1
+.WHILE {I<4}
+XH{I} 1 2 CHILD
++ vars: A={I+10}
+.VAR I={I+1}
+.ENDWHILE
+.ENDS WRAP
+.SUBCKT CHILD 1 2 vars: A=0
+R1 1 2 {G+A}
+.ENDS CHILD
+.END
+";
+        for output in expand_scope_fixture(source)? {
+            for value in [12, 13, 14] {
+                assert!(output.contains(&format!("R1 1 2 {value}\n")), "{output}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn descendants_see_completed_global_scope_even_for_earlier_calls() -> Result<()> {
+        let source = br"X1 1 0 WRAP
+.GLOBALVAR ROOT=3
+X2 2 0 WRAP
+.SUBCKT WRAP 1 2
+XH1 1 2 CHILD
+.GLOBALVAR PARENT=7
+XH2 1 2 CHILD
+.ENDS WRAP
+.SUBCKT CHILD 1 2
+R1 1 2 {ROOT+PARENT}
+.ENDS CHILD
+.END
+";
+        for output in expand_scope_fixture(source)? {
+            assert!(output.contains("R1 1 2 10"), "{output}");
+            assert!(!output.contains("{ROOT+PARENT}"), "{output}");
+        }
+        let linked = preprocess_netlist_linked(source, &SubcircuitCatalog::new())?;
+        assert_eq!(linked.stats.generated_subcircuits, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_global_names_are_reserved() -> Result<()> {
+        let catalog = SubcircuitCatalog::new();
+        for source in [
+            ".GLOBALVAR G=3\n.GLOBALVAR G=7\n.END\n",
+            ".GLOBALVAR G=3\n.VAR G=7\n.END\n",
+            ".GLOBALVAR G=3\nX1 1 0 CHILD\n.SUBCKT CHILD 1 2\n.VAR G=7\nR1 1 2 {G}\n.ENDS CHILD\n.END\n",
+            ".GLOBALVAR G=3\nX1 1 0 CHILD\n.SUBCKT CHILD 1 2 vars: G=7\nR1 1 2 {G}\n.ENDS CHILD\n.END\n",
+            ".GLOBALVAR G=3\nX1 1 0 CHILD vars: G=7\n.SUBCKT CHILD 1 2\nR1 1 2 {G}\n.ENDS CHILD\n.END\n",
+            ".GLOBALVAR G=3\nX1 1 0 CHILD\n.SUBCKT CHILD 1 2\n.GLOBALVAR G=7\nR1 1 2 {G}\n.ENDS CHILD\n.END\n",
+        ] {
+            assert!(
+                preprocess_netlist(source.as_bytes(), &catalog).is_err(),
+                "{source}"
+            );
+            assert!(
+                preprocess_netlist_linked(source.as_bytes(), &catalog).is_err(),
+                "{source}"
+            );
+        }
         Ok(())
     }
 
