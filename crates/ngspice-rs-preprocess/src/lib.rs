@@ -185,6 +185,9 @@ pub struct PreparedBundle {
     pub companions: Vec<Artifact>,
     /// Native compatibility normalization passes actually applied.
     pub normalization: Vec<NormalizationPass>,
+    /// Source declaration identities, before native primitive lowering or
+    /// subcircuit specialization. Unused catalog declarations may be present.
+    pub device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
 }
 
 impl PreparedBundle {
@@ -271,6 +274,7 @@ fn native(
         },
         companions: Vec::new(),
         normalization: normalized.model.passes,
+        device_identities: Vec::new(),
     })
 }
 

@@ -15,7 +15,7 @@ use std::{
 mod runtime_params;
 use runtime_params::RuntimeScope;
 
-const PARSED_LIBRARY_FORMAT_VERSION: u32 = 4;
+const PARSED_LIBRARY_FORMAT_VERSION: u32 = 5;
 
 fn lower_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -66,6 +66,8 @@ impl LibrarySimulator {
 pub struct ParsedLibrary {
     format_version: u32,
     simulator: LibrarySimulator,
+    dialect: Option<crate::source_dialect::DialectContext>,
+    device_identities: Vec<crate::source_dialect::DeviceIdentity>,
     source_id: String,
     source_name: String,
     support_lines: Vec<String>,
@@ -77,6 +79,18 @@ impl ParsedLibrary {
     #[must_use = "the result identifies the library projection"]
     pub const fn simulator(&self) -> LibrarySimulator {
         self.simulator
+    }
+
+    /// Effective source language of a SIMetrix catalog resource.
+    #[must_use = "the context determines inherited source semantics"]
+    pub const fn dialect(&self) -> Option<crate::source_dialect::DialectContext> {
+        self.dialect
+    }
+
+    /// Original declarations and linked tokens before specialization.
+    #[must_use = "the mapping retains source-level device identities"]
+    pub fn device_identities(&self) -> &[crate::source_dialect::DeviceIdentity] {
+        &self.device_identities
     }
 
     #[must_use = "the identity distinguishes the source library"]
@@ -124,6 +138,8 @@ impl ParsedLibrary {
         }
         let actual = parsed_library_digest(
             self.simulator,
+            self.dialect,
+            &self.device_identities,
             &self.support_lines,
             &self.aliases,
             &self.definitions,
@@ -678,7 +694,48 @@ pub fn parse_library_for_simulator(
     simulator: LibrarySimulator,
 ) -> Result<ParsedLibrary> {
     let source_name = source.into();
-    let selected_view = project_source(input, simulator)?;
+    if simulator == LibrarySimulator::Simetrix {
+        let (context, view) = project_simetrix_source(
+            input,
+            crate::source_dialect::DialectContext::default(),
+            crate::source_dialect::SourceKind::Include,
+        )?;
+        let view = lower_simetrix_source_view(
+            &view,
+            context,
+            crate::source_dialect::DEFAULT_PROJECTION_BYTES,
+        )?;
+        return parse_projected_library(source_name, &view, simulator, Some(context));
+    }
+    let view = project_source(input, simulator)?;
+    parse_projected_library(source_name, &view, simulator, None)
+}
+
+/// Parse a source whose file language and simulator projection were resolved.
+///
+/// # Errors
+/// Invalid subcircuit hierarchy or library declarations.
+pub fn parse_projected_library(
+    source_name: String,
+    selected_view: &str,
+    simulator: LibrarySimulator,
+    dialect: Option<crate::source_dialect::DialectContext>,
+) -> Result<ParsedLibrary> {
+    use crate::source_dialect::{ScopedStatement, resolve_device_identities};
+    let (selected_view, device_identities) = if let Some(context) = dialect {
+        let statements = selected_view
+            .lines()
+            .map(|text| ScopedStatement {
+                source: source_name.clone(),
+                context,
+                text: text.to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let resolved = resolve_device_identities(&statements)?;
+        (resolved.text, resolved.identities)
+    } else {
+        (selected_view.to_owned(), Vec::new())
+    };
     let parsed = extract_definitions(&selected_view)?;
     let (support_lines, aliases) = parse_library_root(&parsed.root_lines)?;
     let mut definitions = parsed.definitions;
@@ -686,10 +743,19 @@ pub fn parse_library_for_simulator(
         definition.source_id = None;
         definition.source_name = None;
     }
-    let source_id = parsed_library_digest(simulator, &support_lines, &aliases, &definitions);
+    let source_id = parsed_library_digest(
+        simulator,
+        dialect,
+        &device_identities,
+        &support_lines,
+        &aliases,
+        &definitions,
+    );
     Ok(ParsedLibrary {
         format_version: PARSED_LIBRARY_FORMAT_VERSION,
         simulator,
+        dialect,
+        device_identities,
         source_id,
         source_name,
         support_lines,
@@ -706,6 +772,47 @@ pub fn parse_library_for_simulator(
 pub fn project_source(input: &[u8], simulator: LibrarySimulator) -> Result<String> {
     let text = decode_simplis_text(input)?;
     select_library_view(&text, simulator)
+}
+
+/// Project one admitted source using its inherited file language, before
+/// linking it into the parent. The returned context is passed to children.
+///
+/// # Errors
+/// Invalid source encoding, simulator view, or source expression.
+pub fn project_simetrix_source(
+    input: &[u8],
+    inherited: crate::source_dialect::DialectContext,
+    kind: crate::source_dialect::SourceKind,
+) -> Result<(crate::source_dialect::DialectContext, String)> {
+    use crate::source_dialect::{DialectContext, logical_source};
+    let decoded = decode_simplis_text(input)?;
+    let context = DialectContext::resolve(&decoded, inherited, kind);
+    let stripped = logical_source(&decoded, context)?.join("\n");
+    let selected = select_library_view(&stripped, LibrarySimulator::Simetrix)?;
+    Ok((context, selected))
+}
+
+/// Lower expressions only after simulator and named-section selection.
+///
+/// # Errors
+/// Invalid expression syntax or exceeded output byte budget.
+pub fn lower_simetrix_source_view(
+    selected: &str,
+    context: crate::source_dialect::DialectContext,
+    limit: usize,
+) -> Result<String> {
+    use crate::source_dialect::lower_statement;
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    for statement in selected.lines() {
+        let lowered = lower_statement(statement, context, limit.saturating_sub(output.len()))?;
+        anyhow::ensure!(
+            lowered.len().saturating_add(1) <= limit.saturating_sub(output.len()),
+            "source dialect output byte budget exceeded"
+        );
+        writeln!(output, "{lowered}")?;
+    }
+    Ok(output)
 }
 
 fn select_library_view(input: &str, simulator: LibrarySimulator) -> Result<String> {
@@ -801,13 +908,39 @@ fn parse_library_root(root_lines: &[String]) -> Result<(Vec<String>, Vec<Alias>)
 
 fn parsed_library_digest(
     simulator: LibrarySimulator,
+    dialect: Option<crate::source_dialect::DialectContext>,
+    identities: &[crate::source_dialect::DeviceIdentity],
     support_lines: &[String],
     aliases: &[Alias],
     definitions: &[Definition],
 ) -> String {
     let semantic_digest = library_digest(support_lines, aliases, definitions);
     let mut hasher = Sha256::new();
-    hasher.update(b"ngspice-rs-preprocess-parsed-library-v1\0");
+    hasher.update(b"ngspice-rs-preprocess-parsed-library-v5\0");
+    if let Some(context) = dialect {
+        hasher.update([match context.language {
+            crate::source_dialect::SourceLanguage::Simetrix => 1,
+            crate::source_dialect::SourceLanguage::Hspice => 2,
+            crate::source_dialect::SourceLanguage::Pspice => 3,
+        }]);
+        hasher.update(context.separator.map_or(0, u32::from).to_be_bytes());
+    } else {
+        hasher.update([0]);
+    }
+    // Device display semantics affect the artifact identity but its original
+    // pathname must not: identical resources can be relocated.
+    for identity in identities {
+        for scope in &identity.scope {
+            hasher.update(scope.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([0xff]);
+        for name in [&identity.declared, &identity.displayed, &identity.linked] {
+            hasher.update(name.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([0xfe]);
+    }
     hasher.update(simulator.as_str().as_bytes());
     hasher.update([0]);
     hasher.update(semantic_digest.as_bytes());
@@ -1092,18 +1225,7 @@ struct Pending {
 /// Portion of a logical statement preceding an unquoted semicolon comment.
 #[must_use = "the active prefix excludes non-executable source text"]
 pub fn active_statement_prefix(statement: &str) -> &str {
-    let mut quote = false;
-    let mut brace_depth = 0usize;
-    for (index, character) in statement.char_indices() {
-        match character {
-            '\'' => quote = !quote,
-            '{' if !quote => brace_depth = brace_depth.saturating_add(1),
-            '}' if !quote => brace_depth = brace_depth.saturating_sub(1),
-            ';' if !quote && brace_depth == 0 => return &statement[..index],
-            _ => {}
-        }
-    }
-    statement
+    crate::source_dialect::active_prefix(statement, ';')
 }
 
 fn legacy_colon_call(trimmed: &str) -> Result<Option<(&str, &str, bool)>> {
