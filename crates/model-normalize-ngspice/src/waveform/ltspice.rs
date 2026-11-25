@@ -51,7 +51,7 @@ pub struct LtspiceSine {
 /// Source-specific declarations resolved by the generic prepared-waveform
 /// binder, not by a runtime compatibility-mode expression interpreter.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "shape", content = "fields", rename_all = "kebab-case")]
+#[serde(tag = "form", content = "fields", rename_all = "kebab-case")]
 pub enum LtspiceWaveform {
     Pulse(LtspicePulse),
     Pwl(LtspicePwl),
