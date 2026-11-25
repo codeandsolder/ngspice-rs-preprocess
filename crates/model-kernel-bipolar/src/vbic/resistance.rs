@@ -9,7 +9,11 @@
 //! The circuit solver owns topology reduction for zero-value resistances,
 //! nodal current injection, and accepted/trial state handling.
 
-use super::{parasitic, transport};
+use super::{
+    parasitic,
+    temperature::{self, Coefficient as C},
+    transport::{self, CheckedGradient, Gradient},
+};
 use crate::{
     EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
 };
@@ -58,6 +62,7 @@ pub struct Current1 {
     pub amperes: f64,
     /// Local dI/dV in siemens.
     pub siemens: f64,
+    pub d_temperature: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -69,6 +74,7 @@ pub struct Current3 {
     pub d_first: f64,
     /// Local derivative wrt second coupled voltage.
     pub d_second: f64,
+    pub d_temperature: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -88,15 +94,17 @@ pub struct Output {
 #[derive(Clone, Copy, Debug)]
 pub struct Prepared {
     p: Parameters,
-    vt: f64,
-    inverse_rcx: f64,
-    inverse_rci: f64,
-    inverse_rbx: f64,
-    inverse_rbi: f64,
-    inverse_re: f64,
-    inverse_rbp: f64,
-    inverse_rs: f64,
-    inverse_vo: f64,
+    vt: Gradient,
+    gamm: Gradient,
+    rci: Gradient,
+    inverse_rcx: Gradient,
+    inverse_rci: Gradient,
+    inverse_rbx: Gradient,
+    inverse_rbi: Gradient,
+    inverse_re: Gradient,
+    inverse_rbp: Gradient,
+    inverse_rs: Gradient,
+    inverse_vo: Gradient,
     inverse_hrcf: f64,
 }
 
@@ -121,26 +129,28 @@ impl Prepared {
         let reciprocal = |value: f64| if value == 0.0 { 0.0 } else { 1.0 / value };
         let result = Self {
             p,
-            vt: (1.380_662e-23 / 1.602_189e-19) * temperature.kelvin(),
-            inverse_rcx: reciprocal(p.rcx),
-            inverse_rci: reciprocal(p.rci),
-            inverse_rbx: reciprocal(p.rbx),
-            inverse_rbi: reciprocal(p.rbi),
-            inverse_re: reciprocal(p.re),
-            inverse_rbp: reciprocal(p.rbp),
-            inverse_rs: reciprocal(p.rs),
-            inverse_vo: reciprocal(p.vo),
+            vt: Gradient::constant(temperature::thermal_voltage(temperature)),
+            gamm: Gradient::constant(p.gamm),
+            rci: Gradient::constant(p.rci),
+            inverse_rcx: Gradient::constant(reciprocal(p.rcx)),
+            inverse_rci: Gradient::constant(reciprocal(p.rci)),
+            inverse_rbx: Gradient::constant(reciprocal(p.rbx)),
+            inverse_rbi: Gradient::constant(reciprocal(p.rbi)),
+            inverse_re: Gradient::constant(reciprocal(p.re)),
+            inverse_rbp: Gradient::constant(reciprocal(p.rbp)),
+            inverse_rs: Gradient::constant(reciprocal(p.rs)),
+            inverse_vo: Gradient::constant(reciprocal(p.vo)),
             inverse_hrcf: reciprocal(p.hrcf),
         };
         if ![
-            result.inverse_rcx,
-            result.inverse_rci,
-            result.inverse_rbx,
-            result.inverse_rbi,
-            result.inverse_re,
-            result.inverse_rbp,
-            result.inverse_rs,
-            result.inverse_vo,
+            result.inverse_rcx.value,
+            result.inverse_rci.value,
+            result.inverse_rbx.value,
+            result.inverse_rbi.value,
+            result.inverse_re.value,
+            result.inverse_rbp.value,
+            result.inverse_rs.value,
+            result.inverse_vo.value,
             result.inverse_hrcf,
         ]
         .iter()
@@ -149,6 +159,22 @@ impl Prepared {
             return Err(ModelError::InvalidParameter("resistance reciprocal"));
         }
         Ok(result)
+    }
+
+    pub(super) fn from_temperature(t: &temperature::Prepared) -> Result<Self, ModelError> {
+        let mut prepared = Self::new(t.resistance_parameters(), t.temperature())?;
+        prepared.vt = t.voltage_jet();
+        prepared.gamm = t.jet(C::Gamm);
+        prepared.rci = t.jet(C::Rci);
+        prepared.inverse_rcx = temperature::inverse_enabled(t.jet(C::Rcx));
+        prepared.inverse_rci = temperature::inverse_enabled(t.jet(C::Rci));
+        prepared.inverse_rbx = temperature::inverse_enabled(t.jet(C::Rbx));
+        prepared.inverse_rbi = temperature::inverse_enabled(t.jet(C::Rbi));
+        prepared.inverse_re = temperature::inverse_enabled(t.jet(C::Re));
+        prepared.inverse_rbp = temperature::inverse_enabled(t.jet(C::Rbp));
+        prepared.inverse_rs = temperature::inverse_enabled(t.jet(C::Rs));
+        prepared.inverse_vo = temperature::inverse_enabled(t.jet(C::Vo));
+        Ok(prepared)
     }
 
     /// Evaluates all seven branch currents and local first partial derivatives.
@@ -186,54 +212,31 @@ impl Prepared {
         {
             return Err(EvaluationError::InvalidPhysicalDomain);
         }
-        let base_scale = bias.vrbi * self.inverse_rbi;
-        let peripheral_scale = bias.vrbp * self.inverse_rbp;
+        let base = Gradient::new(
+            base_charge.value,
+            0.0,
+            base_charge.d_vbei,
+            base_charge.d_vbci,
+        )
+        .with_temperature(base_charge.d_temperature);
+        let peripheral = Gradient::new(
+            peripheral_charge.qb,
+            0.0,
+            peripheral_charge.qb_vbep,
+            peripheral_charge.qb_vbci,
+        )
+        .with_temperature(peripheral_charge.qb_temperature);
+        let irbi = Gradient::emitter(bias.vrbi) * self.inverse_rbi * base;
+        let irbp = Gradient::emitter(bias.vrbp) * self.inverse_rbp * peripheral;
         let result = Output {
-            ircx: linear(bias.vrcx, self.inverse_rcx),
+            ircx: linear(bias.vrcx, self.inverse_rcx)?,
             irci: self.epitaxial_current(bias.vrci, bias.vbci, bias.vbcx)?,
-            irbx: linear(bias.vrbx, self.inverse_rbx),
-            irbi: Current3 {
-                amperes: base_scale * base_charge.value,
-                d_resistor: self.inverse_rbi * base_charge.value,
-                d_first: base_scale * base_charge.d_vbei,
-                d_second: base_scale * base_charge.d_vbci,
-            },
-            ire: linear(bias.vre, self.inverse_re),
-            irbp: Current3 {
-                amperes: peripheral_scale * peripheral_charge.qb,
-                d_resistor: self.inverse_rbp * peripheral_charge.qb,
-                d_first: peripheral_scale * peripheral_charge.qb_vbep,
-                d_second: peripheral_scale * peripheral_charge.qb_vbci,
-            },
-            irs: linear(bias.vrs, self.inverse_rs),
+            irbx: linear(bias.vrbx, self.inverse_rbx)?,
+            irbi: nonlinear(irbi)?,
+            ire: linear(bias.vre, self.inverse_re)?,
+            irbp: nonlinear(irbp)?,
+            irs: linear(bias.vrs, self.inverse_rs)?,
         };
-        if ![
-            result.ircx.amperes,
-            result.ircx.siemens,
-            result.irci.amperes,
-            result.irci.d_resistor,
-            result.irci.d_first,
-            result.irci.d_second,
-            result.irbx.amperes,
-            result.irbx.siemens,
-            result.irbi.amperes,
-            result.irbi.d_resistor,
-            result.irbi.d_first,
-            result.irbi.d_second,
-            result.ire.amperes,
-            result.ire.siemens,
-            result.irbp.amperes,
-            result.irbp.d_resistor,
-            result.irbp.d_first,
-            result.irbp.d_second,
-            result.irs.amperes,
-            result.irs.siemens,
-        ]
-        .iter()
-        .all(|x| x.is_finite())
-        {
-            return Err(EvaluationError::NonFiniteResult);
-        }
         Ok(result)
     }
 
@@ -246,64 +249,23 @@ impl Prepared {
         if self.p.rci == 0.0 {
             return Ok(Current3::default());
         }
-        let p = self.p;
-        let vt = self.vt;
-        let (intrinsic_factor, intrinsic_slope) = self.collector_factor(collector_intrinsic);
-        let (external_factor, external_slope) = self.collector_factor(collector_external);
-        let intrinsic_phi = intrinsic_factor * intrinsic_slope / (intrinsic_factor + 1.0);
-        let external_phi = -external_factor * external_slope / (external_factor + 1.0);
-        let logarithm = intrinsic_factor.ln_1p() - external_factor.ln_1p();
-        let potential = intrinsic_factor - external_factor - logarithm;
-        let ohmic = self.inverse_rci * (vt.mul_add(potential, resistor_voltage));
-        let ohmic_resistor_slope = self.inverse_rci;
-        let ohmic_first_slope = self.inverse_rci * vt * intrinsic_phi;
-        let ohmic_second_slope = self.inverse_rci * vt * external_phi;
-
-        let voltage_ratio = self.inverse_vo * p.rci;
-        let regularizer = resistor_voltage.hypot(0.1);
-        let saturation_factor = 0.5 * self.inverse_vo * self.inverse_hrcf;
-        let denominator = saturation_factor.mul_add(regularizer, 1.0);
-        let numerator = voltage_ratio * ohmic;
-        let rolloff = numerator / denominator;
-        let rolloff_resistor_slope = voltage_ratio.mul_add(
-            ohmic_resistor_slope,
-            -(rolloff * saturation_factor * resistor_voltage / regularizer),
-        ) / denominator;
-        let rolloff_first_slope = voltage_ratio * ohmic_first_slope / denominator;
-        let rolloff_second_slope = voltage_ratio * ohmic_second_slope / denominator;
-        let norm = rolloff.hypot(1.0);
-        let norm_cubed = norm * norm * norm;
-        let derivative = |ohmic_slope: f64, rolloff_slope: f64| {
-            ohmic_slope / norm - ohmic * rolloff * rolloff_slope / norm_cubed
-        };
-        let result = Current3 {
-            amperes: ohmic / norm,
-            d_resistor: derivative(ohmic_resistor_slope, rolloff_resistor_slope),
-            d_first: derivative(ohmic_first_slope, rolloff_first_slope),
-            d_second: derivative(ohmic_second_slope, rolloff_second_slope),
-        };
-        if ![
-            result.amperes,
-            result.d_resistor,
-            result.d_first,
-            result.d_second,
-        ]
-        .iter()
-        .all(|x| x.is_finite())
-        {
-            return Err(EvaluationError::NonFiniteResult);
-        }
-        Ok(result)
+        let voltage = Gradient::emitter(resistor_voltage);
+        let intrinsic = self.collector_factor(Gradient::collector(collector_intrinsic))?;
+        let external = self.collector_factor(Gradient::charge(collector_external))?;
+        let potential = intrinsic - external - (intrinsic.ln_1p() - external.ln_1p());
+        let ohmic = self.inverse_rci * (self.vt * potential + voltage);
+        let regularizer = (voltage * voltage + 0.01).checked_sqrt()?;
+        let denominator = self.inverse_vo * (0.5 * self.inverse_hrcf) * regularizer + 1.0;
+        let rolloff = self.inverse_vo * self.rci * ohmic / denominator;
+        let norm = (rolloff * rolloff + 1.0).checked_sqrt()?;
+        nonlinear(ohmic / norm)
     }
 
-    fn collector_factor(&self, voltage: f64) -> (f64, f64) {
+    fn collector_factor(&self, voltage: Gradient) -> Result<Gradient, EvaluationError> {
         if self.p.gamm == 0.0 {
-            return (1.0, 0.0);
+            return Ok(Gradient::constant(1.0));
         }
-        let exponential = (voltage / self.vt).exp();
-        let factor = self.p.gamm.mul_add(exponential, 1.0).sqrt();
-        let slope = self.p.gamm * exponential / (2.0 * factor * self.vt);
-        (factor, slope)
+        (self.gamm * (voltage / self.vt).exp() + 1.0).checked_sqrt()
     }
 
     /// Evaluate identical prepared parameters over a borrowed bias batch.
@@ -323,9 +285,27 @@ impl Prepared {
     }
 }
 
-const fn linear(voltage: f64, conductance: f64) -> Current1 {
-    Current1 {
-        amperes: voltage * conductance,
-        siemens: conductance,
+fn linear(voltage: f64, conductance: Gradient) -> Result<Current1, EvaluationError> {
+    let value = Gradient::emitter(voltage) * conductance;
+    if !value.is_finite() {
+        return Err(EvaluationError::NonFiniteResult);
     }
+    Ok(Current1 {
+        amperes: value.value,
+        siemens: value.be,
+        d_temperature: value.temperature,
+    })
+}
+
+fn nonlinear(value: Gradient) -> Result<Current3, EvaluationError> {
+    if !value.is_finite() {
+        return Err(EvaluationError::NonFiniteResult);
+    }
+    Ok(Current3 {
+        amperes: value.value,
+        d_resistor: value.be,
+        d_first: value.bc,
+        d_second: value.hole,
+        d_temperature: value.temperature,
+    })
 }

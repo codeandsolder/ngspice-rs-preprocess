@@ -4,7 +4,8 @@
 //! physical charge in coulombs. Both feed the Early effect whether or not
 //! the physical CJE / CJC capacitance is nonzero.
 
-use super::transport::{Depletion, Gradient};
+use super::temperature::{self, Coefficient as C};
+use super::transport::{CheckedGradient, Depletion, Gradient};
 use crate::{EvaluationError, ModelError, validate_nonnegative, validate_positive};
 
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +29,8 @@ pub struct Parameters {
 #[derive(Clone, Copy, Debug)]
 pub struct Prepared {
     params: Parameters,
+    pe: Gradient,
+    pc: Gradient,
 }
 
 impl Prepared {
@@ -53,7 +56,11 @@ impl Prepared {
         if !parameters.fc.is_finite() || !(0.0..1.0).contains(&parameters.fc) {
             return Err(ModelError::InvalidParameter("fc"));
         }
-        Ok(Self { params: parameters })
+        Ok(Self {
+            params: parameters,
+            pe: Gradient::constant(parameters.pe),
+            pc: Gradient::constant(parameters.pc),
+        })
     }
 
     /// Evaluates normalized depletion charges, with their first derivatives.
@@ -69,20 +76,19 @@ impl Prepared {
             return Err(EvaluationError::NonFiniteBias);
         }
         let p = self.params;
-        let emitter = Gradient::new(emitter_bias, 1.0, 0.0);
-        let collector = Gradient::new(collector_bias, 0.0, 1.0);
-        let be = smooth_depletion(emitter, p.pe, p.me, p.fc, p.aje)?;
-        let bc = bc_depletion(collector, &p)?;
+        let emitter = Gradient::emitter(emitter_bias);
+        let collector = Gradient::collector(collector_bias);
+        let be = smooth_depletion(emitter, self.pe, p.me, p.fc, p.aje)?;
+        let bc = bc_depletion(collector, self.pc, &p)?;
         let output = Depletion {
             qdbe: be.value,
-            cbe: be.emitter_slope,
+            cbe: be.be,
             qdbc: bc.value,
-            cbc: bc.collector_slope,
+            cbc: bc.bc,
+            d_qdbe_temperature: be.temperature,
+            d_qdbc_temperature: bc.temperature,
         };
-        if ![output.qdbe, output.cbe, output.qdbc, output.cbc]
-            .iter()
-            .all(|x| x.is_finite())
-        {
+        if !be.is_finite() || !bc.is_finite() {
             return Err(EvaluationError::NonFiniteResult);
         }
         Ok(output)
@@ -90,8 +96,12 @@ impl Prepared {
 }
 
 /// Integral of the normalized abrupt depletion capacitance.
-fn integral(voltage: Gradient, potential: f64, grading: f64) -> Result<Gradient, EvaluationError> {
-    let ratio = (Gradient::constant(1.0) - voltage / potential).ln()?;
+fn integral(
+    voltage: Gradient,
+    potential: Gradient,
+    grading: f64,
+) -> Result<Gradient, EvaluationError> {
+    let ratio = (Gradient::constant(1.0) - voltage / potential).checked_ln()?;
     let exponent = 1.0 - grading;
     if exponent == 0.0 {
         Ok(ratio * -potential)
@@ -103,21 +113,23 @@ fn integral(voltage: Gradient, potential: f64, grading: f64) -> Result<Gradient,
 /// VBIC's abrupt transition at FC * P with quadratic continuation.
 fn hard_depletion(
     voltage: Gradient,
-    potential: f64,
+    potential: Gradient,
     grading: f64,
     fc: f64,
     vrt: f64,
 ) -> Result<Gradient, EvaluationError> {
-    if voltage.value > potential * fc {
+    if voltage.value > potential.value * fc {
         let crossing = potential * fc;
-        let excess = voltage - Gradient::constant(crossing);
+        let excess = voltage - crossing;
         let slope = (1.0 - fc).powf(-1.0 - grading);
         let tail = excess
-            * ((Gradient::constant(1.0 - fc) + excess * (0.5 * grading / potential)) * slope);
-        Ok(integral(Gradient::constant(crossing), potential, grading)? + tail)
+            * ((Gradient::constant(1.0 - fc)
+                + excess * (Gradient::constant(0.5 * grading) / potential))
+                * slope);
+        Ok(integral(crossing, potential, grading)? + tail)
     } else if vrt > 0.0 && voltage.value < -vrt {
         let crossing = -vrt;
-        let slope = (1.0 + vrt / potential).powf(-grading);
+        let slope = (Gradient::constant(vrt) / potential + 1.0).checked_powf(-grading)?;
         Ok(integral(Gradient::constant(crossing), potential, grading)?
             + (voltage - Gradient::constant(crossing)) * slope)
     } else {
@@ -128,7 +140,7 @@ fn hard_depletion(
 /// Smooth normalized charge at the FC continuation, VBIC AJE/AJC > 0.
 fn smooth_depletion(
     voltage: Gradient,
-    potential: f64,
+    potential: Gradient,
     grading: f64,
     fc: f64,
     smoothing: f64,
@@ -137,41 +149,45 @@ fn smooth_depletion(
         return hard_depletion(voltage, potential, grading, fc, 0.0);
     }
     let dv0 = -potential * fc;
-    let mv0 = dv0.hypot(2.0 * smoothing);
-    let vl0 = -0.5 * (dv0 + mv0);
-    let dv = voltage + Gradient::constant(dv0);
-    let mv = (dv * dv + Gradient::constant(4.0 * smoothing * smoothing)).sqrt()?;
-    let vl = (dv - mv) * 0.5 - Gradient::constant(dv0);
-    Ok(integral(vl, potential, grading)?
-        + (voltage - vl + Gradient::constant(vl0)) * (1.0 - fc).powf(-grading)
-        - integral(Gradient::constant(vl0), potential, grading)?)
+    let mv0 = (dv0 * dv0 + 4.0 * smoothing * smoothing).checked_sqrt()?;
+    let vl0 = (dv0 + mv0) * -0.5;
+    let dv = voltage + dv0;
+    let mv = (dv * dv + Gradient::constant(4.0 * smoothing * smoothing)).checked_sqrt()?;
+    let vl = (dv - mv) * 0.5 - dv0;
+    Ok(
+        integral(vl, potential, grading)? + (voltage - vl + vl0) * (1.0 - fc).powf(-grading)
+            - integral(vl0, potential, grading)?,
+    )
 }
 
 /// Full VBIC B-C two-ended smooth punch-through (AJC, ART and VPT > 0).
-fn double_smooth_depletion(voltage: Gradient, p: &Parameters) -> Result<Gradient, EvaluationError> {
-    let dv0 = -p.pc * p.fc;
-    let denominator = p.vrt - dv0;
-    let normalized =
-        |voltage: Gradient| (voltage * 2.0 + Gradient::constant(p.vrt + dv0)) / denominator;
+fn double_smooth_depletion(
+    voltage: Gradient,
+    pc: Gradient,
+    p: &Parameters,
+) -> Result<Gradient, EvaluationError> {
+    let dv0 = -pc * p.fc;
+    let denominator = Gradient::constant(p.vrt) - dv0;
+    let normalized = |voltage: Gradient| (voltage * 2.0 + (dv0 + p.vrt)) / denominator;
     let normalized_smoother = |vn: Gradient| -> Result<Gradient, EvaluationError> {
         let minus = vn - Gradient::constant(1.0);
         let plus = vn + Gradient::constant(1.0);
-        let left = (minus * minus + Gradient::constant(4.0 * p.ajc * p.ajc)).sqrt()?;
-        let right = (plus * plus + Gradient::constant(4.0 * p.art * p.art)).sqrt()?;
+        let left = (minus * minus + Gradient::constant(4.0 * p.ajc * p.ajc)).checked_sqrt()?;
+        let right = (plus * plus + Gradient::constant(4.0 * p.art * p.art)).checked_sqrt()?;
         Ok((vn * 2.0) / (left + right))
     };
     let bias_smoother = |voltage: Gradient| -> Result<Gradient, EvaluationError> {
         let vn = normalized_smoother(normalized(voltage))?;
-        Ok(vn * (denominator * 0.5) - Gradient::constant(p.vrt.midpoint(dv0)))
+        Ok(vn * (denominator * 0.5) - ((dv0 + p.vrt) * 0.5))
     };
     let vl0 = bias_smoother(Gradient::constant(0.0))?;
     let vl = bias_smoother(voltage)?;
     let vnl = normalized_smoother(normalized(voltage))?;
     let sel = (vnl + Gradient::constant(1.0)) * 0.5;
-    let crt = (1.0 + p.vrt / p.pc).powf(-p.mc);
-    let cmx = (1.0 + dv0 / p.pc).powf(-p.mc);
+    let crt = (Gradient::constant(p.vrt) / pc + 1.0).checked_powf(-p.mc)?;
+    let cmx = (1.0 - p.fc).powf(-p.mc);
     let slope = (Gradient::constant(1.0) - sel) * crt + sel * cmx;
-    Ok(integral(vl, p.pc, p.mc)? + (voltage - vl + vl0) * slope - integral(vl0, p.pc, p.mc)?)
+    Ok(integral(vl, pc, p.mc)? + (voltage - vl + vl0) * slope - integral(vl0, pc, p.mc)?)
 }
 
 /// VBIC substrate-collector depletion junction, with its independent
@@ -197,6 +213,7 @@ pub struct ExtendedBias {
 pub struct Normalized {
     pub volts: f64,
     pub derivative: f64,
+    pub d_temperature: f64,
 }
 
 /// All five normalized junction integrals used by VBIC physical charges.
@@ -214,6 +231,7 @@ pub struct ExtendedOutput {
 pub struct ExtendedPrepared {
     central: Prepared,
     substrate: SubstrateParameters,
+    ps: Gradient,
 }
 
 impl ExtendedPrepared {
@@ -229,7 +247,16 @@ impl ExtendedPrepared {
         Ok(Self {
             central: prepared,
             substrate,
+            ps: Gradient::constant(substrate.ps),
         })
+    }
+
+    pub(super) fn from_temperature(t: &temperature::Prepared) -> Result<Self, ModelError> {
+        let mut prepared = Self::new(t.depletion_parameters(), t.substrate_parameters())?;
+        prepared.central.pe = t.jet(C::Pe);
+        prepared.central.pc = t.jet(C::Pc);
+        prepared.ps = t.jet(C::Ps);
+        Ok(prepared)
     }
 
     /// # Errors
@@ -253,17 +280,20 @@ impl ExtendedPrepared {
             .central
             .evaluate(bias.emitter_intrinsic, bias.collector_intrinsic)?;
         let external_emitter = smooth_depletion(
-            Gradient::new(bias.emitter_external, 1.0, 0.0),
-            p.pe,
+            Gradient::emitter(bias.emitter_external),
+            self.central.pe,
             p.me,
             p.fc,
             p.aje,
         )?;
-        let peripheral_collector =
-            bc_depletion(Gradient::new(bias.collector_peripheral, 1.0, 0.0), &p)?;
+        let peripheral_collector = bc_depletion(
+            Gradient::emitter(bias.collector_peripheral),
+            self.central.pc,
+            &p,
+        )?;
         let substrate_collector = smooth_depletion(
-            Gradient::new(bias.substrate_collector, 1.0, 0.0),
-            s.ps,
+            Gradient::emitter(bias.substrate_collector),
+            self.ps,
             s.ms,
             p.fc,
             s.ajs,
@@ -272,27 +302,23 @@ impl ExtendedPrepared {
             intrinsic,
             external_emitter: Normalized {
                 volts: external_emitter.value,
-                derivative: external_emitter.emitter_slope,
+                derivative: external_emitter.be,
+                d_temperature: external_emitter.temperature,
             },
             peripheral_collector: Normalized {
                 volts: peripheral_collector.value,
-                derivative: peripheral_collector.emitter_slope,
+                derivative: peripheral_collector.be,
+                d_temperature: peripheral_collector.temperature,
             },
             substrate_collector: Normalized {
                 volts: substrate_collector.value,
-                derivative: substrate_collector.emitter_slope,
+                derivative: substrate_collector.be,
+                d_temperature: substrate_collector.temperature,
             },
         };
-        if ![
-            result.external_emitter.volts,
-            result.external_emitter.derivative,
-            result.peripheral_collector.volts,
-            result.peripheral_collector.derivative,
-            result.substrate_collector.volts,
-            result.substrate_collector.derivative,
-        ]
-        .iter()
-        .all(|v| v.is_finite())
+        if ![external_emitter, peripheral_collector, substrate_collector]
+            .into_iter()
+            .all(Gradient::is_finite)
         {
             return Err(EvaluationError::NonFiniteResult);
         }
@@ -300,12 +326,16 @@ impl ExtendedPrepared {
     }
 }
 
-fn bc_depletion(voltage: Gradient, p: &Parameters) -> Result<Gradient, EvaluationError> {
+fn bc_depletion(
+    voltage: Gradient,
+    pc: Gradient,
+    p: &Parameters,
+) -> Result<Gradient, EvaluationError> {
     if p.ajc > 0.0 && p.vrt > 0.0 && p.art > 0.0 {
-        double_smooth_depletion(voltage, p)
+        double_smooth_depletion(voltage, pc, p)
     } else if p.ajc > 0.0 {
-        smooth_depletion(voltage, p.pc, p.mc, p.fc, p.ajc)
+        smooth_depletion(voltage, pc, p.mc, p.fc, p.ajc)
     } else {
-        hard_depletion(voltage, p.pc, p.mc, p.fc, p.vrt)
+        hard_depletion(voltage, pc, p.mc, p.fc, p.vrt)
     }
 }
