@@ -1484,7 +1484,7 @@ pub fn active_statement_prefix(statement: &str) -> &str {
 
 /// Identify the assignment tail of a charge-defined capacitor, excluding comments.
 /// A capacitance value and a charge expression are distinct device forms.
-#[must_use]
+#[must_use = "the returned tail identifies the charge-defined capacitor law"]
 pub fn capacitor_charge_assignments(statement: &str) -> Option<&str> {
     let active = active_statement_prefix(statement).trim_start();
     let mut fields = active.split_whitespace();
