@@ -1,6 +1,6 @@
 use super::{
     Environment, decode_simplis_text, find_ascii_case_insensitive, parse_parameter_list,
-    specialize_subcircuit, specialize_subcircuit_control_flow_with_base,
+    preprocess_control_flow, specialize_subcircuit, specialize_subcircuit_control_flow_with_base,
     specialize_subcircuit_with_base,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -1462,37 +1462,85 @@ fn resolve_definition(
         .map(|definition| (definition.clone(), false)))
 }
 
+// A plain wrapper may call a parameterized or controlled helper several
+// levels down. Detect that reachability rather than only inspecting the
+// wrapper itself. The visited set also makes this query finite on cycles.
+fn definition_needs_expansion(
+    definition: &Definition,
+    local: &SubcircuitCatalog,
+    external: &SubcircuitCatalog,
+) -> Result<bool> {
+    let mut pending = vec![definition.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert((current.source_id.clone(), current.scope_id.clone())) {
+            continue;
+        }
+        if current.parameterized
+            || current.owner_scope_id.is_some()
+            || definition_uses_preprocessor(&current)
+        {
+            return Ok(true);
+        }
+        let text = std::str::from_utf8(&current.bytes)?;
+        let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+        for statement in logical_statements(&lines) {
+            let Some((model, _, explicit_vars)) = call_target(&statement)? else {
+                continue;
+            };
+            if explicit_vars {
+                return Ok(true);
+            }
+            if let Some((child, _)) = resolve_definition(
+                model,
+                local,
+                external,
+                current.source_id.as_deref(),
+                Some(&current.scope_id),
+            )? {
+                pending.push(child);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn rewrite_call(
     statement: &str,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
     next_id: &mut usize,
-    preferred_source: Option<&str>,
+    caller: (Option<&str>, Option<&str>),
 ) -> Result<Option<(String, Pending)>> {
     let Some((model, override_text, explicit_vars)) = call_target(statement)? else {
         return Ok(None);
     };
     let Some((definition, is_local)) =
-        resolve_definition(model, local, external, preferred_source, None)?
+        resolve_definition(model, local, external, caller.0, caller.1)?
     else {
         if explicit_vars {
             bail!("unresolved parameterized SIMPLIS subcircuit {model}");
         }
         return Ok(None);
     };
-    if !definition.parameterized && !explicit_vars {
+    if !explicit_vars && !definition_needs_expansion(&definition, local, external)? {
         return Ok(None);
     }
     *next_id = next_id.saturating_add(1);
     let generated_name = format!("{}${}", definition.name, *next_id);
-    let rewritten = replace_call_target(statement, model, &generated_name, true)?;
-    let local_key = is_local.then(|| definition.name.to_ascii_uppercase());
+    let compile_time_vars = explicit_vars || definition.parameterized;
+    let rewritten = replace_call_target(statement, model, &generated_name, compile_time_vars)?;
+    let local_key = is_local.then(|| definition.scope_id.clone());
     Ok(Some((
         rewritten,
         Pending {
             definition,
             generated_name,
-            overrides: parse_overrides(override_text)?,
+            overrides: if compile_time_vars {
+                parse_overrides(override_text)?
+            } else {
+                Environment::new()
+            },
             local_key,
         },
     )))
@@ -1660,27 +1708,52 @@ fn emit_microchip_complementary_pwm(pending: &Pending, output: &mut String) -> R
     Ok(())
 }
 
+#[derive(Default)]
+struct FlatExpansion {
+    next_id: usize,
+    generated_subcircuits: usize,
+    specialized_local: BTreeSet<String>,
+    active: Vec<(Option<String>, String, Environment)>,
+}
+
 fn emit_pending(
     pending: &Pending,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
-    next_id: &mut usize,
     output: &mut String,
-    generated_subcircuits: &mut usize,
-    specialized_local: &mut BTreeSet<String>,
+    state: &mut FlatExpansion,
 ) -> Result<()> {
     if is_microchip_complementary_pwm(pending) {
         emit_microchip_complementary_pwm(pending, output)?;
-        *generated_subcircuits = generated_subcircuits.saturating_add(1);
+        state.generated_subcircuits = state.generated_subcircuits.saturating_add(1);
         return Ok(());
     }
-    let specialized = specialize_subcircuit(&pending.definition.bytes, &pending.overrides)
-        .with_context(|| {
-            format!(
-                "specializing SIMPLIS subcircuit {}",
-                pending.definition.name
-            )
-        })?;
+    let identity = (
+        pending.definition.source_id.clone(),
+        pending.definition.scope_id.clone(),
+        pending.overrides.clone(),
+    );
+    ensure!(
+        !state.active.contains(&identity),
+        "recursive SIMPLIS specialization of {} with unchanged actuals",
+        pending.definition.name
+    );
+    state.active.push(identity);
+    let specialized = if pending.definition.parameterized || !pending.overrides.is_empty() {
+        specialize_subcircuit(&pending.definition.bytes, &pending.overrides)
+    } else {
+        specialize_subcircuit_control_flow_with_base(
+            &pending.definition.bytes,
+            &Environment::new(),
+            &pending.overrides,
+        )
+    }
+    .with_context(|| {
+        format!(
+            "specializing SIMPLIS subcircuit {}",
+            pending.definition.name
+        )
+    })?;
     let (header, body_lines) = rename_specialized(&specialized.bytes, &pending.generated_name)?;
     let body_statements = logical_statements(&body_lines);
     let mut rewritten_body = Vec::new();
@@ -1690,11 +1763,14 @@ fn emit_pending(
             &statement,
             local,
             external,
-            next_id,
-            pending.definition.source_id.as_deref(),
+            &mut state.next_id,
+            (
+                pending.definition.source_id.as_deref(),
+                Some(&pending.definition.scope_id),
+            ),
         )? {
             if let Some(key) = &child.local_key {
-                specialized_local.insert(key.clone());
+                state.specialized_local.insert(key.clone());
             }
             rewritten_body.push(rewritten);
             children.push(child);
@@ -1708,21 +1784,14 @@ fn emit_pending(
         output.push_str(&statement);
         output.push('\n');
     }
-    *generated_subcircuits = generated_subcircuits.saturating_add(1);
+    state.generated_subcircuits = state.generated_subcircuits.saturating_add(1);
     for child in children {
-        emit_pending(
-            &child,
-            local,
-            external,
-            next_id,
-            output,
-            generated_subcircuits,
-            specialized_local,
-        )?;
+        emit_pending(&child, local, external, output, state)?;
     }
     output.push_str(".ends ");
     output.push_str(&pending.generated_name);
     output.push_str("\n\n");
+    state.active.pop();
     Ok(())
 }
 
@@ -1769,13 +1838,17 @@ pub fn preprocess_netlist(
     external: &SubcircuitCatalog,
 ) -> Result<PreprocessedNetlist> {
     let text = decode_simplis_text(input)?;
-    let extracted = extract_definitions(&text)?;
+    let mut extracted = extract_definitions(&text)?;
+    let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
+    let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
+    assign_local_source(&mut extracted.definitions, &root_source_id, "<root>");
     let mut local = SubcircuitCatalog::new();
     let mut retained_local = Vec::new();
     let mut removed_local = 0usize;
     for definition in extracted.definitions {
         let parameterized = definition.parameterized;
-        let retained = (!parameterized).then(|| definition.clone());
+        let retained =
+            (!parameterized && definition.owner_scope_id.is_none()).then(|| definition.clone());
         if !insert_local_definition(&mut local, definition)? {
             continue;
         }
@@ -1786,22 +1859,25 @@ pub fn preprocess_netlist(
         }
     }
 
-    let root_statements = logical_statements(&extracted.root_lines);
+    let root_statements = preprocess_root_statements(&extracted.root_lines)?;
     let mut output_root = Vec::new();
     let mut pending = Vec::new();
     let mut end_statement = None;
-    let mut next_id = 0usize;
-    let mut specialized_local = BTreeSet::new();
+    let mut state = FlatExpansion::default();
     for statement in root_statements {
         if is_directive(&statement, "END") {
             end_statement = Some(statement);
             continue;
         }
-        if let Some((rewritten, root_pending)) =
-            rewrite_call(&statement, &local, external, &mut next_id, None)?
-        {
+        if let Some((rewritten, root_pending)) = rewrite_call(
+            &statement,
+            &local,
+            external,
+            &mut state.next_id,
+            (None, None),
+        )? {
             if let Some(key) = &root_pending.local_key {
-                specialized_local.insert(key.clone());
+                state.specialized_local.insert(key.clone());
             }
             output_root.push(rewritten);
             pending.push(root_pending);
@@ -1812,17 +1888,8 @@ pub fn preprocess_netlist(
 
     let root_specializations = pending.len();
     let mut generated = String::new();
-    let mut generated_subcircuits = 0usize;
     for root_pending in pending.into_iter().rev() {
-        emit_pending(
-            &root_pending,
-            &local,
-            external,
-            &mut next_id,
-            &mut generated,
-            &mut generated_subcircuits,
-            &mut specialized_local,
-        )?;
+        emit_pending(&root_pending, &local, external, &mut generated, &mut state)?;
     }
 
     let mut output = String::new();
@@ -1831,7 +1898,7 @@ pub fn preprocess_netlist(
         output.push('\n');
     }
     for definition in retained_local {
-        if specialized_local.contains(&definition.name.to_ascii_uppercase()) {
+        if state.specialized_local.contains(&definition.scope_id) {
             continue;
         }
         output.push_str(std::str::from_utf8(&definition.bytes)?);
@@ -1849,7 +1916,7 @@ pub fn preprocess_netlist(
         bytes: output.into_bytes(),
         stats: NetlistPreprocessStats {
             root_specializations,
-            generated_subcircuits,
+            generated_subcircuits: state.generated_subcircuits,
             local_parameterized_definitions_removed: removed_local,
         },
     })
@@ -2169,16 +2236,39 @@ fn replace_call_target(
     }
 }
 
-fn definition_uses_preprocessor(definition: &Definition) -> bool {
-    let text = String::from_utf8_lossy(&definition.bytes);
-    text.lines().any(|line| {
-        directive_name(line).is_some_and(|name| {
-            matches!(
-                name.to_ascii_uppercase().as_str(),
-                "VAR" | "GLOBALVAR" | "IF" | "ELSE" | "ENDIF" | "WHILE" | "ENDWHILE" | "ERROR"
-            )
-        })
+fn is_preprocessor_control(line: &str) -> bool {
+    directive_name(line).is_some_and(|name| {
+        matches!(
+            name.to_ascii_uppercase().as_str(),
+            "VAR"
+                | "GLOBALVAR"
+                | "IF"
+                | "ELSE"
+                | "ENDIF"
+                | "WHILE"
+                | "ENDWHILE"
+                | "FOR"
+                | "ENDFOR"
+                | "ERROR"
+        )
     })
+}
+
+fn definition_uses_preprocessor(definition: &Definition) -> bool {
+    String::from_utf8_lossy(&definition.bytes)
+        .lines()
+        .any(is_preprocessor_control)
+}
+
+fn preprocess_root_statements(root_lines: &[String]) -> Result<Vec<String>> {
+    if !root_lines.iter().any(|line| is_preprocessor_control(line)) {
+        return Ok(logical_statements(root_lines));
+    }
+    let processed = preprocess_control_flow(root_lines.join("\n").as_bytes(), &Environment::new())
+        .context("preprocessing root SIMPLIS controls")?;
+    let text = std::str::from_utf8(&processed.bytes)?;
+    let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+    Ok(logical_statements(&lines))
 }
 
 fn definition_has_runtime_parameters(definition: &Definition) -> bool {
@@ -2616,7 +2706,7 @@ fn link_root_statements(
 ) -> Result<(String, Vec<LinkedUnit>, Option<String>)> {
     use std::fmt::Write as _;
 
-    let root_statements = logical_statements(root_lines);
+    let root_statements = preprocess_root_statements(root_lines)?;
     let mut root_init = InitTree::default();
     for statement in &root_statements {
         if let Some(assignments) = parse_init_statement(statement)? {
@@ -2949,6 +3039,171 @@ R1 1 2 4
                 .to_string()
                 .contains("conflicting duplicate local SIMPLIS subcircuit HELPER")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_loop_specialization_passes_iteration_local_actuals() -> Result<()> {
+        let source = br"X1 1 0 OUTER vars: N=2
+X2 2 0 OUTER vars: N=3
+.subckt OUTER 1 2 vars: N=1
+.VAR I=0
+.WHILE {I<N} {N}
+XH{I} 1 2 HELPER vars: V={I+1}
+.VAR I={I+1}
+.ENDWHILE
+.subckt HELPER 1 2 vars: V=1
+.VAR J=0
+.WHILE {J<V} {V}
+R{J} 1 2 {V+J}
+.VAR J={J+1}
+.ENDWHILE
+.ends HELPER
+.ends OUTER
+.end
+";
+        let catalog = SubcircuitCatalog::new();
+        let linked = preprocess_netlist_linked(source, &catalog)?;
+        let mut text = std::str::from_utf8(&linked.root_bytes)?.to_owned();
+        for library in &linked.libraries {
+            text.push_str(std::str::from_utf8(&library.bytes)?);
+        }
+        let legacy = preprocess_netlist(source, &catalog)?;
+        for output in [&text, std::str::from_utf8(&legacy.bytes)?] {
+            let definitions = extract_definitions(output)?;
+            for (root, count) in [("X1", 2), ("X2", 3)] {
+                let statement = definitions
+                    .root_lines
+                    .iter()
+                    .find(|line| line.starts_with(root))
+                    .context("missing root call")?;
+                let (target, _, _) = call_target(statement)?.context("root target")?;
+                let parent = definitions
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.name == target)
+                    .context("parent definition")?;
+                let parent_text = std::str::from_utf8(&parent.bytes)?;
+                let child_calls = parent_text
+                    .lines()
+                    .filter(|line| line.starts_with("XH"))
+                    .collect::<Vec<_>>();
+                assert_eq!(child_calls.len(), count);
+                for (iteration, statement) in child_calls.into_iter().enumerate() {
+                    let (target, _, _) = call_target(statement)?.context("child target")?;
+                    let child = definitions
+                        .definitions
+                        .iter()
+                        .find(|definition| definition.name == target)
+                        .context("child definition")?;
+                    let body = std::str::from_utf8(&child.bytes)?;
+                    let resistors = body
+                        .lines()
+                        .filter(|line| line.starts_with('R'))
+                        .collect::<Vec<_>>();
+                    assert_eq!(resistors.len(), iteration + 1);
+                    for (index, resistor) in resistors.into_iter().enumerate() {
+                        assert_eq!(resistor, format!("R{index} 1 2 {}", iteration + index + 1));
+                    }
+                }
+            }
+            assert!(!output.contains(".WHILE"));
+            assert!(!output.contains(".VAR "));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plain_wrappers_reach_controlled_helpers() -> Result<()> {
+        let source = br"X1 1 0 TOP
+.subckt TOP 1 2
+XM 1 2 MIDDLE
+.ends TOP
+.subckt MIDDLE 1 2
+XH 1 2 HELPER
+.ends MIDDLE
+.subckt HELPER 1 2
+.VAR I=0
+.WHILE {I<2} 2
+R{I} 1 2 {I+1}
+.VAR I={I+1}
+.ENDWHILE
+.ends HELPER
+.end
+";
+        let catalog = SubcircuitCatalog::new();
+        let flat = preprocess_netlist(source, &catalog)?;
+        let flat_text = std::str::from_utf8(&flat.bytes)?;
+        assert_eq!(flat.stats.generated_subcircuits, 3);
+        assert!(flat_text.contains("R0 1 2 1"));
+        assert!(flat_text.contains("R1 1 2 2"));
+        assert!(!flat_text.contains(".WHILE"));
+        let linked = preprocess_netlist_linked(source, &catalog)?;
+        assert_eq!(linked.stats.generated_subcircuits, 3);
+        assert!(linked.libraries.iter().any(|library| {
+            std::str::from_utf8(&library.bytes)
+                .is_ok_and(|text| text.contains("R0 1 2 1") && text.contains("R1 1 2 2"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn recursive_controlled_wrapper_reports_cycle() -> Result<()> {
+        let source = br"X1 1 0 TOP
+.subckt TOP 1 2
+XM 1 2 HELPER
+.ends TOP
+.subckt HELPER 1 2
+.VAR I=0
+.WHILE {I<1} 1
+XT 1 2 TOP
+.VAR I={I+1}
+.ENDWHILE
+.ends HELPER
+.end
+";
+        let error = preprocess_netlist(source, &SubcircuitCatalog::new())
+            .err()
+            .context("expected recursive specialization error")?;
+        assert!(format!("{error:#}").contains("recursive SIMPLIS specialization"));
+        Ok(())
+    }
+
+    #[test]
+    fn root_and_plain_definition_loops_expand_without_losing_runtime_expressions() -> Result<()> {
+        let source = br".VAR I=0
+.WHILE {I<2} 2
+X{I} {I+1} 0 T
+.VAR I={I+1}
+.ENDWHILE
+.subckt T 1 2
+.VAR J=0
+.WHILE {J<2} 2
+R{J} 1 2 {J+1}
+.VAR J={J+1}
+.ENDWHILE
+B1 1 2 V={V(1)}
+.ends T
+.end
+";
+        let catalog = SubcircuitCatalog::new();
+        let linked = preprocess_netlist_linked(source, &catalog)?;
+        let root = std::str::from_utf8(&linked.root_bytes)?;
+        assert!(root.contains("X0 1 0 sr_T_sp_"));
+        assert!(root.contains("X1 2 0 sr_T_sp_"));
+        assert_eq!(linked.stats.generated_subcircuits, 1);
+        let body = std::str::from_utf8(&linked.libraries[0].bytes)?;
+        assert!(body.contains("R0 1 2 1"));
+        assert!(body.contains("R1 1 2 2"));
+        assert!(body.contains("B1 1 2 V={V(1)}"));
+        assert!(!body.contains(".WHILE"));
+        let legacy = preprocess_netlist(source, &catalog)?;
+        let text = std::str::from_utf8(&legacy.bytes)?;
+        assert!(text.contains("X0 1 0 T$1"));
+        assert!(text.contains("X1 2 0 T$2"));
+        assert!(text.contains("R0 1 2 1"));
+        assert!(text.contains("R1 1 2 2"));
+        assert!(!text.contains(".WHILE"));
         Ok(())
     }
 
