@@ -16,6 +16,8 @@ enum Token {
     Op(&'static str),
     Open,
     Close,
+    BraceOpen,
+    BraceClose,
     Comma,
     Question,
     Colon,
@@ -112,11 +114,37 @@ fn name_token(raw: &str, start: usize, dialect: Dialect) -> Result<(Token, usize
     Ok((token, cursor))
 }
 
-fn tokenize(raw: &str, dialect: Dialect) -> Result<Vec<Token>> {
+/// Runtime SPICE numeric literals use percent as an engineering suffix;
+/// the parameter language instead recognizes a remainder operator.
+fn percent_literal(raw: &str, start: usize, percent: usize) -> Result<(String, usize)> {
+    let bytes = raw.as_bytes();
+    let whole = &raw[start..percent];
+    let mut end = percent + 1;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    let fraction = &raw[percent + 1..end];
+    let number = if fraction.is_empty() {
+        while bytes.get(end).is_some_and(u8::is_ascii_alphabetic) {
+            end += 1;
+        }
+        format!("{:.17e}", parse_spice_constant(whole)? * 0.01)
+    } else {
+        ensure!(
+            whole.bytes().all(|byte| byte.is_ascii_digit()),
+            "fractional percent suffix requires an integer prefix"
+        );
+        format!("{whole}.{fraction}e-2")
+    };
+    Ok((number, end))
+}
+
+fn tokenize(raw: &str, dialect: Dialect, runtime: bool) -> Result<Vec<Token>> {
     ensure!(raw.is_ascii(), "non-ASCII ngspice parameter expression");
     let bytes = raw.as_bytes();
     let mut cursor = 0;
     let mut tokens = Vec::new();
+    let mut brace_depth = 0_usize;
     while let Some(&byte) = bytes.get(cursor) {
         ensure!(
             tokens.len() < MAX_TREE_NODES,
@@ -131,6 +159,16 @@ fn tokenize(raw: &str, dialect: Dialect) -> Result<Vec<Token>> {
             || (byte == b'.' && bytes.get(cursor + 1).is_some_and(u8::is_ascii_digit))
         {
             cursor = number_end(bytes, cursor);
+            if dialect == Dialect::Ltspice
+                && runtime
+                && brace_depth == 0
+                && bytes.get(cursor) == Some(&b'%')
+            {
+                let (number, end) = percent_literal(raw, start, cursor)?;
+                tokens.push(Token::SourceAtom(number));
+                cursor = end;
+                continue;
+            }
             let literal = &raw[start..cursor];
             let value = parse_spice_constant(literal)?;
             tokens.push(if dialect == Dialect::Ltspice {
@@ -165,8 +203,16 @@ fn tokenize(raw: &str, dialect: Dialect) -> Result<Vec<Token>> {
         tokens.push(match byte {
             b'(' => Token::Open,
             b')' => Token::Close,
-            b'{' if dialect == Dialect::Ltspice => Token::Open,
-            b'}' if dialect == Dialect::Ltspice => Token::Close,
+            b'{' if dialect == Dialect::Ltspice => {
+                brace_depth += 1;
+                Token::BraceOpen
+            }
+            b'}' if dialect == Dialect::Ltspice => {
+                brace_depth = brace_depth
+                    .checked_sub(1)
+                    .context("unmatched parameter brace")?;
+                Token::BraceClose
+            }
             b',' => Token::Comma,
             b'?' => Token::Question,
             b':' => Token::Colon,
@@ -174,6 +220,9 @@ fn tokenize(raw: &str, dialect: Dialect) -> Result<Vec<Token>> {
             b'-' => Token::Op("-"),
             b'*' => Token::Op("*"),
             b'/' => Token::Op("/"),
+            b'%' if dialect == Dialect::Ltspice && runtime && brace_depth == 0 => {
+                bail!("runtime LTspice percent suffix must follow a numeric literal")
+            }
             b'%' => Token::Op("%"),
             b'\\' => Token::Op("\\"),
             b'^' if dialect == Dialect::Ltspice => Token::Op("^"),
@@ -234,6 +283,7 @@ pub struct SpiceExpression(Expr);
 enum Expr {
     Number(f64),
     SourceAtom(String),
+    ParameterGroup(Box<Self>),
     Symbol(String),
     Unary(&'static str, Box<Self>),
     Binary(&'static str, Box<Self>, Box<Self>),
@@ -335,6 +385,11 @@ impl Parser {
                 self.expect(&Token::Close)?;
                 Ok(value)
             }
+            Token::BraceOpen => {
+                let value = self.expression(0, depth + 1)?;
+                self.expect(&Token::BraceClose)?;
+                Parsed::parent(Expr::ParameterGroup(Box::new(value.expr)), value.height)
+            }
             other => bail!("expected SPICE expression atom, got {other:?}"),
         }
     }
@@ -409,7 +464,7 @@ impl SpiceExpression {
             raw
         };
         let mut parser = Parser {
-            tokens: tokenize(inner, Dialect::Native)?,
+            tokens: tokenize(inner, Dialect::Native, false)?,
             offset: 0,
             dialect: Dialect::Native,
         };
@@ -447,9 +502,9 @@ impl SpiceExpression {
 /// Lower `LTspice` operator precedence and Boolean coercion before native
 /// function-name lowering. Numeric spellings and circuit probe names remain
 /// untouched. The ordinary native evaluator never receives source atoms.
-pub(crate) fn lower_ltspice(raw: &str) -> Result<String> {
+pub(crate) fn lower_ltspice(raw: &str, runtime: bool) -> Result<String> {
     let mut parser = Parser {
-        tokens: tokenize(raw, Dialect::Ltspice)?,
+        tokens: tokenize(raw, Dialect::Ltspice, runtime)?,
         offset: 0,
         dialect: Dialect::Ltspice,
     };
@@ -470,6 +525,11 @@ impl Expr {
         match self {
             Self::Number(value) => write!(out, "{value}")?,
             Self::SourceAtom(value) | Self::Symbol(value) => out.push_str(value),
+            Self::ParameterGroup(value) => {
+                out.push('{');
+                value.render_ltspice(out)?;
+                out.push('}');
+            }
             Self::Unary(op, child) => {
                 if *op == "!" {
                     out.push_str("inv(");
@@ -547,7 +607,7 @@ impl Expr {
     fn evaluate(&self, resolve: &mut impl SpiceExpressionContext) -> Result<f64> {
         let value = match self {
             Self::Number(value) => *value,
-            Self::SourceAtom(_) => {
+            Self::SourceAtom(_) | Self::ParameterGroup(_) => {
                 bail!("source-only expression cannot be evaluated as native numparam")
             }
             Self::Symbol(name) => resolve

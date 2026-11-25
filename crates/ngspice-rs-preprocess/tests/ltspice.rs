@@ -360,3 +360,69 @@ fn vendor_ac_slopes_preserve_interpolation_and_exponential_limiting() -> Result<
     }
     Ok(())
 }
+
+#[test]
+fn vendor_parameter_and_device_numeric_phases() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    // LTspice 24.0.12 OP: unbraced engineering percent, braced remainder,
+    // subcircuit argument remainder, and static intrinsic boundary values.
+    fs::write(&root, b"title\n.param p=3%2 q=-3%2 r=3.5%2\nVx x 0 1\nB1 a 0 V=3%2\nB2 b 0 V={3%2}\nB3 c 0 V={3%2}+3%2\nB4 d 0 V=3%25\nB5 e 0 V=3%\nB6 f 0 V=if(1,3%2,0)\nB7 g 0 V=sqrt(-4)+round(2.5)+round(-2.5)+int(-2.5)+u(0)\nB8 h 0 V=1==2<3\nB9 i 0 V=1<2==1\nVp pnode 0 {p}\nVq qnode 0 {q}\nVr rnode 0 {r}\n.subckt sub a b params: p=3%2\nR1 a b {p}\n.ends sub\nVdefault vd 0 1\nVexplicit ve 0 1\nX1 vd 0 sub\nX2 ve 0 sub p=3%2\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nop\nwrdata op.dat v(a) v(b) v(c) v(d) v(e) v(f) v(g) v(h) v(i) v(pnode) v(qnode) v(rnode) i(vdefault) i(vexplicit)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let rows = data(&dir.path().join("op.dat"))?;
+    let row = rows.first().context("missing OP")?;
+    let expected = [
+        0.032, 1., 1.032, 0.0325, 0.03, 0.032, -2., 1., 1., 1., -1., 1.5, -1., -1.,
+    ];
+    assert_eq!(row.len(), expected.len() + 1);
+    for (&actual, expected) in row[1..].iter().zip(expected) {
+        near(actual, expected)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn vendor_duplicate_table_knots_preserve_both_macro_evaluation_phases() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    // The same user function evaluates a leading duplicate knot differently
+    // in .param and behavioral contexts in LTspice 24.0.12.
+    fs::write(&root, b"title\n.options reltol=1e-10 abstol=1e-14 vntol=1e-12\n.func inner(x) {table(x,0,1,0,2,1,3)}\n.func outer(x) {inner(x)}\n.param p=outer(0) q=table(1,1,1,1,2,1,3)\nVx x 0 DC 0 AC 1\nVp pp 0 {p}\nVq qq 0 {q}\nB1 a 0 V=outer(v(x))\nB2 b 0 V={outer(0)}\nB3 c 0 V=table(v(x),0,1,0,2,1,3)\n.end\n")?;
+    let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".func __lt_param_INNER"));
+    assert!(text.contains(".func __lt_param_OUTER"));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing source mapping");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    let mut deck = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing terminator")?
+        .to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nop\nwrdata op.dat v(pp) v(qq) v(a) v(b) v(c)\nac lin 1 1 1\nwrdata ac.dat v(a) v(c)\nquit\n.endc\n.end\n");
+    native(dir.path(), &deck)?;
+    let rows = data(&dir.path().join("op.dat"))?;
+    let row = rows.first().context("missing OP")?;
+    assert_eq!(row.len(), 6);
+    for (&actual, expected) in row[1..].iter().zip([1., 1., 0., 1., 0.]) {
+        near(actual, expected)?;
+    }
+    let rows = data(&dir.path().join("ac.dat"))?;
+    let row = rows.first().context("missing AC")?;
+    assert_eq!(row.len(), 5);
+    for (&actual, expected) in row[1..].iter().zip([1e200, 0., 1e200, 0.]) {
+        near(actual, expected)?;
+    }
+    Ok(())
+}

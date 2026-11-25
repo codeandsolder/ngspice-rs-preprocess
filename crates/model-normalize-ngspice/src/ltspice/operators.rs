@@ -8,13 +8,16 @@ use anyhow::{Result, ensure};
 use std::ops::Range;
 
 fn needs_lowering(text: &[u8]) -> bool {
-    text.windows(2).any(|pair| pair == b"**")
-        || text
-            .iter()
-            .any(|byte| matches!(byte, b'^' | b'&' | b'|' | b'!' | b'~' | b'%' | b'?'))
+    text.windows(2).any(|pair| matches!(pair, b"**" | b"=="))
+        || text.iter().any(|byte| {
+            matches!(
+                byte,
+                b'^' | b'&' | b'|' | b'!' | b'~' | b'%' | b'?' | b'<' | b'>'
+            )
+        })
 }
 
-fn identifier(byte: u8) -> bool {
+const fn identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#' | b'.')
 }
 
@@ -69,7 +72,7 @@ fn trimmed_span(text: &[u8], span: Range<usize>) -> Range<usize> {
 /// A source field can contain a native waveform or flags alongside a
 /// braced parameter expression. Preserve that outer grammar and rewrite
 /// only complete balanced parameter groups where possible.
-fn braced_ranges(text: &[u8], span: Range<usize>) -> Result<Vec<Range<usize>>> {
+pub(super) fn braced_ranges(text: &[u8], span: Range<usize>) -> Result<Vec<Range<usize>>> {
     let mut groups = Vec::new();
     let mut balanced = lexical::Balanced::default();
     let mut begin = None;
@@ -93,6 +96,7 @@ fn rewrite_expression(
     statement: &lexical::Statement,
     span: Range<usize>,
     edits: &mut Vec<lexical::Edit>,
+    mut runtime: bool,
 ) -> Result<()> {
     let text = &statement.text;
     let mut span = trimmed_span(text, span);
@@ -101,9 +105,10 @@ fn rewrite_expression(
     }
     // Preserve outer parameter quoting rather than converting its evaluation
     // phase to ordinary runtime parentheses.
-    if (text[span.start] == b'{' && text[span.end - 1] == b'}')
-        || (text[span.start] == b'\'' && text[span.end - 1] == b'\'')
+    if matches!(text[span.start], b'{' | b'\'')
+        && braced_ranges(text, span.clone())?.as_slice() == [span.clone()]
     {
+        runtime = false;
         span.start += 1;
         span.end -= 1;
     }
@@ -111,7 +116,7 @@ fn rewrite_expression(
         return Ok(());
     }
     let raw = std::str::from_utf8(&text[span.clone()])?;
-    match lower_ltspice(raw) {
+    match lower_ltspice(raw, runtime) {
         Ok(lowered) => lexical::replace_span(statement, span, lowered.as_bytes(), edits),
         Err(error) => {
             let groups = braced_ranges(text, span.clone())?;
@@ -130,7 +135,7 @@ fn rewrite_expression(
                 statement.line
             );
             for group in groups {
-                rewrite_expression(statement, group, edits)?;
+                rewrite_expression(statement, group, edits, false)?;
             }
         }
     }
@@ -151,7 +156,9 @@ fn rewrite_card(
     }
     let lower = first.to_ascii_lowercase();
     match lower.as_slice() {
-        b".func" | b".if" | b".elseif" => rewrite_expression(statement, start..text.len(), edits),
+        b".func" | b".if" | b".elseif" => {
+            rewrite_expression(statement, start..text.len(), edits, false)
+        }
         b".model" => {
             // A parenthesized model parameter list is an assignment list,
             // not a function call.
@@ -166,13 +173,18 @@ fn rewrite_card(
                 (start, text.len())
             };
             for span in assignment_ranges(text, start, end)? {
-                rewrite_expression(statement, span, edits)?;
+                rewrite_expression(statement, span, edits, false)?;
             }
             Ok(())
         }
         _ => {
             for span in assignment_ranges(text, start, text.len())? {
-                rewrite_expression(statement, span, edits)?;
+                rewrite_expression(
+                    statement,
+                    span,
+                    edits,
+                    !lower.starts_with(b".") && !lower.starts_with(b"x"),
+                )?;
             }
             Ok(())
         }
@@ -199,4 +211,47 @@ pub(super) fn rewrite(body: &[u8]) -> Result<Option<Vec<u8>>> {
         }
     }
     Ok(lexical::apply_edits(body, edits))
+}
+
+/// Classify a table call by the containing evaluation phase. A behavioral
+/// brace group containing circuit probes or runtime symbols remains dynamic.
+/// Function definitions are macro bodies: the call site determines phase.
+pub(super) fn static_table(text: &[u8], start: usize, call: usize) -> Result<bool> {
+    let first = text
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or_default();
+    if [
+        b".param".as_slice(),
+        b".subckt",
+        b".model",
+        b".if",
+        b".elseif",
+    ]
+    .iter()
+    .any(|keyword| first.eq_ignore_ascii_case(keyword))
+        || first
+            .first()
+            .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x'))
+    {
+        return Ok(true);
+    }
+    if first.eq_ignore_ascii_case(b".func") {
+        return Ok(false);
+    }
+    for group in braced_ranges(text, start..text.len())? {
+        if group.contains(&call) {
+            let expression = &text[group];
+            let runtime = [b"v".as_slice(), b"i"]
+                .iter()
+                .any(|name| !lexical::function_names(expression, name, 0).is_empty())
+                || expression.split(|byte| !identifier(*byte)).any(|word| {
+                    [b"time".as_slice(), b"hertz", b"frequency", b"temper"]
+                        .iter()
+                        .any(|name| word.eq_ignore_ascii_case(name))
+                });
+            return Ok(!runtime);
+        }
+    }
+    Ok(false)
 }

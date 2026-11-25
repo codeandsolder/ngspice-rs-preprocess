@@ -236,17 +236,17 @@ pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
 
 /// Shared quote-aware delimiter tracking for logical source fields.
 #[derive(Default)]
-pub(crate) struct Balanced {
+pub struct Balanced {
     context: Context,
     stack: Vec<u8>,
 }
 
 impl Balanced {
-    pub(crate) fn top_level(&self) -> bool {
+    pub const fn top_level(&self) -> bool {
         self.context.quote.is_none() && self.stack.is_empty()
     }
 
-    pub(crate) fn advance(&mut self, byte: u8) -> Result<()> {
+    pub fn advance(&mut self, byte: u8) -> Result<()> {
         if self.context.quote.is_none() {
             match byte {
                 b'(' => self.stack.push(b')'),
@@ -263,7 +263,7 @@ impl Balanced {
         Ok(())
     }
 
-    pub(crate) fn finish(&self) -> Result<()> {
+    pub fn finish(&self) -> Result<()> {
         ensure!(self.top_level(), "unterminated expression or quote");
         Ok(())
     }
@@ -335,22 +335,37 @@ const fn identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.') || !byte.is_ascii()
 }
 
+/// Locate all function-like identifiers outside quoted literal text.
+pub fn function_calls(text: &[u8], start: usize) -> Vec<Range<usize>> {
+    let mut context = Context::default();
+    let mut matches = Vec::new();
+    let mut cursor = start;
+    while cursor < text.len() {
+        let begin = cursor;
+        if context.quote != Some(b'"')
+            && identifier_byte(text[cursor])
+            && (cursor == start || !identifier_byte(text[cursor - 1]))
+        {
+            while text.get(cursor).is_some_and(|byte| identifier_byte(*byte)) {
+                context.advance(text[cursor]);
+                cursor += 1;
+            }
+            if text[cursor..].trim_ascii_start().first() == Some(&b'(') {
+                matches.push(begin..cursor);
+            }
+        } else {
+            context.advance(text[cursor]);
+            cursor += 1;
+        }
+    }
+    matches
+}
+
 /// Locate function calls outside quoted literal text. Single-quoted arithmetic
 /// expressions are handled by the caller only on expression-bearing cards.
 pub fn function_names(text: &[u8], name: &[u8], start: usize) -> Vec<Range<usize>> {
-    let mut context = Context::default();
-    let mut matches = Vec::new();
-    for (index, &byte) in text.iter().enumerate().skip(start) {
-        if context.quote != Some(b'"')
-            && (index == start || !identifier_byte(text[index - 1]))
-            && text
-                .get(index..index + name.len())
-                .is_some_and(|word| word.eq_ignore_ascii_case(name))
-            && text[index + name.len()..].trim_ascii_start().first() == Some(&b'(')
-        {
-            matches.push(index..index + name.len());
-        }
-        context.advance(byte);
-    }
-    matches
+    function_calls(text, start)
+        .into_iter()
+        .filter(|span| text[span.clone()].eq_ignore_ascii_case(name))
+        .collect()
 }

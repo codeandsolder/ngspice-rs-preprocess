@@ -53,26 +53,31 @@ pub(super) fn point_count(text: &[u8], name: Range<usize>) -> Result<usize> {
 /// Emit a balanced binary search, including duplicate-knot selection.
 /// The endpoint checks precede the search, matching source behavior even
 /// for nonmonotone input. No sorting or approximation of the input table.
-fn segment(out: &mut String, first: usize, last: usize) -> std::fmt::Result {
+fn segment(out: &mut String, first: usize, last: usize, static_phase: bool) -> std::fmt::Result {
     if first == last {
         return write!(out, "b{first}");
     }
     if last - first == 1 {
+        let equal = if static_phase {
+            format!("b{first}")
+        } else {
+            format!("1e200*(x-a{first})")
+        };
         return write!(
             out,
-            "ternary_fcn(a{first}==a{last},b{first},b{first}+(b{last}-b{first})*((x-a{first})/(a{last}-a{first})))"
+            "ternary_fcn(a{first}==a{last},{equal},b{first}+(b{last}-b{first})*((x-a{first})/(a{last}-a{first})))"
         );
     }
     let mid = first.midpoint(last);
     write!(out, "ternary_fcn(x<=a{mid},")?;
-    segment(out, first, mid)?;
+    segment(out, first, mid, static_phase)?;
     out.push(',');
-    segment(out, mid, last)?;
+    segment(out, mid, last, static_phase)?;
     out.push(')');
     Ok(())
 }
 
-pub(super) fn definition(points: usize) -> Result<String> {
+pub(super) fn definition(points: usize, static_phase: bool) -> Result<String> {
     let mut out = String::from("(x");
     for index in 0..points {
         write!(&mut out, ",a{index},b{index}")?;
@@ -86,7 +91,7 @@ pub(super) fn definition(points: usize) -> Result<String> {
             &mut out,
             "ternary_fcn(x<a0,b0,ternary_fcn(x>a{last},b{last},"
         )?;
-        segment(&mut out, 0, last)?;
+        segment(&mut out, 0, last, static_phase)?;
         out.push_str("))");
     }
     out.push('}');

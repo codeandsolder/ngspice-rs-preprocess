@@ -3,6 +3,7 @@
 //! Preserve physical source mapping; generated helper definitions inherit the
 //! line of their first use. Native decks do not receive these dialect rewrites.
 
+mod functions;
 mod operators;
 mod table;
 
@@ -12,7 +13,7 @@ use crate::{
     source_identifiers,
 };
 use anyhow::{Context, Result, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const HELPERS: &[(&[u8], &str)] = &[
     (b"if", "(c,a,b) {ternary_fcn(c>0.5,a,b)}"),
@@ -27,6 +28,13 @@ const HELPERS: &[(&[u8], &str)] = &[
     ),
     (b"inv", "(x) {ternary_fcn(x>0.5,0,1)}"),
     (b"square", "(x) {x*x}"),
+    (b"sqrt", "(x) {sqrt(max(x,0))}"),
+    (
+        b"round",
+        "(x) {ternary_fcn(x<0,-floor(-x+0.5),floor(x+0.5))}",
+    ),
+    (b"int", "(x) {ternary_fcn(x<0,ceil(x),floor(x))}"),
+    (b"u", "(x) {ternary_fcn(x>0,1,0)}"),
     (
         b"mod",
         "(x,y) {x-y*ternary_fcn(x/y>=0,floor(x/y),ceil(x/y))}",
@@ -172,7 +180,7 @@ fn validate_expression(statement: &lexical::Statement, start: usize) -> Result<(
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Helper {
     Fixed(usize),
-    Table(usize),
+    Table(usize, bool),
 }
 
 impl Helper {
@@ -183,14 +191,17 @@ impl Helper {
                 base.extend_from_slice(HELPERS[index].0);
                 base
             }
-            Self::Table(points) => format!("__lt_table_{points}").into_bytes(),
+            Self::Table(points, static_phase) => {
+                let phase = if static_phase { "param" } else { "runtime" };
+                format!("__lt_table_{phase}_{points}").into_bytes()
+            }
         }
     }
 
     fn definition(self) -> Result<String> {
         match self {
             Self::Fixed(index) => Ok(HELPERS[index].1.to_owned()),
-            Self::Table(points) => table::definition(points),
+            Self::Table(points, static_phase) => table::definition(points, static_phase),
         }
     }
 }
@@ -211,6 +222,7 @@ fn rewrite_intrinsics(
     used: &mut std::collections::BTreeSet<Vec<u8>>,
     helpers: &mut HelperMap,
     edits: &mut Vec<Edit>,
+    static_macros: &BTreeSet<Vec<u8>>,
 ) -> Result<()> {
     let text = &statement.text;
     for (index, (name, _)) in HELPERS.iter().enumerate() {
@@ -224,10 +236,18 @@ fn rewrite_intrinsics(
             lexical::replace_span(statement, span, identifier, edits);
         }
     }
+    let static_macro = text
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case(b".func"))
+        && static_macros.contains(&text[functions::name(text)?].to_ascii_uppercase());
     for span in lexical::function_names(text, b"table", start) {
         let points = table::point_count(text, span.clone())?;
         let identifier = helper_identifier(
-            Helper::Table(points),
+            Helper::Table(
+                points,
+                static_macro || operators::static_table(text, start, span.start)?,
+            ),
             statement.line + title_lines,
             used,
             helpers,
@@ -255,7 +275,12 @@ fn helper_identifier<'a>(
     Ok(identifier)
 }
 
-fn plan_rewrites(bytes: &[u8], body: &[u8], title_lines: usize) -> Result<RewritePlan> {
+fn plan_rewrites(
+    bytes: &[u8],
+    body: &[u8],
+    title_lines: usize,
+    static_macros: &BTreeSet<Vec<u8>>,
+) -> Result<RewritePlan> {
     let mut used = source_identifiers(bytes);
     let mut edits = Vec::new();
     let mut helpers = HelperMap::new();
@@ -312,6 +337,7 @@ fn plan_rewrites(bytes: &[u8], body: &[u8], title_lines: usize) -> Result<Rewrit
             &mut used,
             &mut helpers,
             &mut edits,
+            static_macros,
         )?;
     }
     Ok(RewritePlan {
@@ -347,10 +373,26 @@ pub fn normalize(
         input.model.bytes.extend_from_slice(&lowered);
         input.model.passes.push(NormalizationPass::LtspiceOperators);
     }
+    let title_lines = usize::from(title != 0);
+    let mut static_macros = BTreeSet::new();
+    if let Some(specialization) = functions::specialize(
+        &input.model.bytes,
+        &input.model.bytes[title..],
+        &input.input_lines[title_lines..],
+    )? {
+        input.model.bytes.truncate(title);
+        input.model.bytes.extend_from_slice(&specialization.bytes);
+        input.input_lines.truncate(title_lines);
+        input.input_lines.extend(specialization.origins);
+        static_macros = specialization.static_macros;
+        input
+            .model
+            .passes
+            .push(NormalizationPass::LtspiceIntrinsics);
+    }
     let bytes = &input.model.bytes;
     let body = &bytes[title..];
-    let title_lines = usize::from(title != 0);
-    let plan = plan_rewrites(bytes, body, title_lines)?;
+    let plan = plan_rewrites(bytes, body, title_lines, &static_macros)?;
     let RewritePlan {
         edits,
         helpers,
@@ -394,7 +436,12 @@ pub fn normalize(
             .passes
             .push(NormalizationPass::LtspiceNoiselessResistor);
     }
-    if !helpers.is_empty() {
+    if !helpers.is_empty()
+        && !input
+            .model
+            .passes
+            .contains(&NormalizationPass::LtspiceIntrinsics)
+    {
         input
             .model
             .passes
