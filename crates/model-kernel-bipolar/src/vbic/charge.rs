@@ -6,12 +6,16 @@
 //! Outputs are **Coulombs** and analytic first derivatives in **Farads**;
 //! the solver performs circuit charge integration and accepted-step isolation.
 
-use super::{depletion, parasitic, transport};
+use super::{
+    depletion, parasitic,
+    temperature::{self, Coefficient as C},
+    transport,
+};
 use crate::{
     EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
 };
 
-use transport::Gradient;
+use transport::{CheckedGradient, Gradient};
 
 /// Prepared physical capacitances and transit-time coefficients.
 ///
@@ -67,6 +71,7 @@ pub struct Bias {
 pub struct Charge1 {
     pub coulombs: f64,
     pub farads: f64,
+    pub d_temperature: f64,
 }
 
 /// Physical charge and partial derivatives wrt two explicitly named biases.
@@ -76,6 +81,7 @@ pub struct Charge2 {
     pub coulombs: f64,
     pub primary_farads: f64,
     pub coupled_farads: f64,
+    pub d_temperature: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -109,7 +115,12 @@ pub struct Prepared {
     p: Parameters,
     inverse_vtf: f64,
     inverse_itf: f64,
-    vt: f64,
+    vt: Gradient,
+    gamm: Gradient,
+    cje: Gradient,
+    cjc: Gradient,
+    cjep: Gradient,
+    cjcp: Gradient,
     transport: transport::Prepared,
     parasitic: parasitic::Prepared,
     depletion: depletion::ExtendedPrepared,
@@ -155,11 +166,30 @@ impl Prepared {
             p,
             inverse_vtf: collector_voltage_reciprocal,
             inverse_itf: high_injection_reciprocal,
-            vt: (1.380_662e-23 / 1.602_189e-19) * temperature.kelvin(),
+            vt: Gradient::constant(temperature::thermal_voltage(temperature)),
+            gamm: Gradient::constant(p.gamm),
+            cje: Gradient::constant(p.cje),
+            cjc: Gradient::constant(p.cjc),
+            cjep: Gradient::constant(p.cjep),
+            cjcp: Gradient::constant(p.cjcp),
             transport: transport::Prepared::new(p.transport, temperature)?,
             parasitic: parasitic::Prepared::new(p.parasitic, temperature)?,
             depletion: depletion::ExtendedPrepared::new(p.depletion, p.substrate)?,
         })
+    }
+
+    pub(super) fn from_temperature(t: &temperature::Prepared) -> Result<Self, ModelError> {
+        let mut prepared = Self::new(&t.charge_parameters(), t.temperature())?;
+        prepared.vt = t.voltage_jet();
+        prepared.gamm = t.jet(C::Gamm);
+        prepared.cje = t.jet(C::Cje);
+        prepared.cjc = t.jet(C::Cjc);
+        prepared.cjep = t.jet(C::Cjep);
+        prepared.cjcp = t.jet(C::Cjcp);
+        prepared.transport = transport::Prepared::from_temperature(t)?;
+        prepared.parasitic = parasitic::Prepared::from_temperature(t)?;
+        prepared.depletion = depletion::ExtendedPrepared::from_temperature(t)?;
+        Ok(prepared)
     }
 
     /// Evaluates all eight VBIC charge outputs. No history is mutated.
@@ -206,10 +236,12 @@ impl Prepared {
         let forward = gradient(trans.forward);
         let reverse_injection = gradient(trans.ideal_reverse);
         let transit = self.forward_time(q1, injected, bias.vbci)?;
-        let emitter_depletion = Gradient::new(dep.intrinsic.qdbe, dep.intrinsic.cbe, 0.0);
-        let collector_depletion = Gradient::new(dep.intrinsic.qdbc, 0.0, dep.intrinsic.cbc);
-        let qbe = emitter_depletion * (p.cje * p.wbe) + transit * forward;
-        let qbc = collector_depletion * p.cjc
+        let emitter_depletion = Gradient::new(dep.intrinsic.qdbe, dep.intrinsic.cbe, 0.0, 0.0)
+            .with_temperature(dep.intrinsic.d_qdbe_temperature);
+        let collector_depletion = Gradient::new(dep.intrinsic.qdbc, 0.0, dep.intrinsic.cbc, 0.0)
+            .with_temperature(dep.intrinsic.d_qdbc_temperature);
+        let qbe = emitter_depletion * self.cje * p.wbe + transit * forward;
+        let qbc = collector_depletion * self.cjc
             + reverse_injection * p.tr
             + self.epitaxial_factor(bias.vbci, false)? * p.qco;
         let qbcx = self.epitaxial_factor(bias.vbcx, true)? * p.qco;
@@ -217,55 +249,31 @@ impl Prepared {
             para.ideal_forward,
             para.ideal_forward_vbep,
             para.ideal_forward_vbci,
-        );
-        let q_parasitic = Gradient::new(
-            dep.peripheral_collector.volts * p.cjep,
-            dep.peripheral_collector.derivative * p.cjep,
             0.0,
-        ) + ifp * p.tr;
-        let output = Output {
-            qbe: two(qbe),
-            qbex: one(
-                dep.external_emitter.volts * p.cje * (1.0 - p.wbe),
-                dep.external_emitter.derivative * p.cje * (1.0 - p.wbe),
-            ),
-            qbc: one(qbc.value, qbc.collector_slope),
-            qbcx: one(qbcx.value, qbcx.emitter_slope),
-            qbep: two(q_parasitic),
-            qbcp: one(
-                dep.substrate_collector
-                    .volts
-                    .mul_add(p.cjcp, bias.vbcp * p.ccso),
-                dep.substrate_collector.derivative.mul_add(p.cjcp, p.ccso),
-            ),
-            qbeo: one(bias.vbe * p.cbeo, p.cbeo),
-            qbco: one(bias.vbc * p.cbco, p.cbco),
-        };
-        if ![
-            output.qbe.coulombs,
-            output.qbe.primary_farads,
-            output.qbe.coupled_farads,
-            output.qbex.coulombs,
-            output.qbex.farads,
-            output.qbc.coulombs,
-            output.qbc.farads,
-            output.qbcx.coulombs,
-            output.qbcx.farads,
-            output.qbep.coulombs,
-            output.qbep.primary_farads,
-            output.qbep.coupled_farads,
-            output.qbcp.coulombs,
-            output.qbcp.farads,
-            output.qbeo.coulombs,
-            output.qbeo.farads,
-            output.qbco.coulombs,
-            output.qbco.farads,
-        ]
-        .iter()
-        .all(|v| v.is_finite())
+        )
+        .with_temperature(para.ideal_forward_temperature);
+        let qbep = depletion_gradient(dep.peripheral_collector) * self.cjep + ifp * p.tr;
+        let qbex = depletion_gradient(dep.external_emitter) * self.cje * (1.0 - p.wbe);
+        let qbcp = depletion_gradient(dep.substrate_collector) * self.cjcp
+            + Gradient::emitter(bias.vbcp) * p.ccso;
+        let qbeo = Gradient::emitter(bias.vbe) * p.cbeo;
+        let qbco = Gradient::emitter(bias.vbc) * p.cbco;
+        if ![qbe, qbc, qbcx, qbep, qbex, qbcp, qbeo, qbco]
+            .into_iter()
+            .all(Gradient::is_finite)
         {
             return Err(EvaluationError::NonFiniteResult);
         }
+        let output = Output {
+            qbe: two(qbe),
+            qbex: one(qbex, qbex.be),
+            qbc: one(qbc, qbc.bc),
+            qbcx: one(qbcx, qbcx.be),
+            qbep: two(qbep),
+            qbcp: one(qbcp, qbcp.be),
+            qbeo: one(qbeo, qbeo.be),
+            qbco: one(qbco, qbco.be),
+        };
         Ok(Physics {
             charge: output,
             transport: trans,
@@ -298,16 +306,14 @@ impl Prepared {
                 collector_bias * (self.inverse_vtf / 1.44),
                 0.0,
                 self.inverse_vtf / 1.44,
+                0.0,
             )
             .exp()
         };
         let forward_modulation =
             Gradient::constant(1.0) + bias_exponential * (p.xtf * sign) * active;
         let time = (Gradient::constant(1.0) + q1 * p.qtf) * forward_modulation * p.tf;
-        if ![time.value, time.emitter_slope, time.collector_slope]
-            .iter()
-            .all(|value| value.is_finite())
-        {
+        if !time.is_finite() {
             return Err(EvaluationError::NonFiniteResult);
         }
         Ok(time)
@@ -326,13 +332,12 @@ impl Prepared {
             // GAMM=0 at all finite bias; avoid spurious infinity*0.
             return Ok(Gradient::constant(1.0));
         }
-        let inverse_vt = 1.0 / self.vt;
         let driving = if first_axis {
-            Gradient::new(voltage * inverse_vt, inverse_vt, 0.0)
+            Gradient::emitter(voltage)
         } else {
-            Gradient::new(voltage * inverse_vt, 0.0, inverse_vt)
-        };
-        (Gradient::constant(1.0) + driving.exp() * self.p.gamm).sqrt()
+            Gradient::collector(voltage)
+        } / self.vt;
+        (Gradient::constant(1.0) + driving.exp() * self.gamm).checked_sqrt()
     }
 
     /// Evaluate a homogeneous batch into caller-owned outputs.
@@ -353,17 +358,26 @@ impl Prepared {
 }
 
 const fn gradient(g: transport::ValueAndGradient) -> Gradient {
-    Gradient::new(g.value, g.d_vbei, g.d_vbci)
+    Gradient::new(g.value, g.d_vbei, g.d_vbci, 0.0).with_temperature(g.d_temperature)
 }
 
 const fn two(g: Gradient) -> Charge2 {
     Charge2 {
         coulombs: g.value,
-        primary_farads: g.emitter_slope,
-        coupled_farads: g.collector_slope,
+        primary_farads: g.be,
+        coupled_farads: g.bc,
+        d_temperature: g.temperature,
     }
 }
 
-const fn one(coulombs: f64, farads: f64) -> Charge1 {
-    Charge1 { coulombs, farads }
+const fn one(g: Gradient, farads: f64) -> Charge1 {
+    Charge1 {
+        coulombs: g.value,
+        farads,
+        d_temperature: g.temperature,
+    }
+}
+
+const fn depletion_gradient(d: depletion::Normalized) -> Gradient {
+    Gradient::new(d.volts, d.derivative, 0.0, 0.0).with_temperature(d.d_temperature)
 }

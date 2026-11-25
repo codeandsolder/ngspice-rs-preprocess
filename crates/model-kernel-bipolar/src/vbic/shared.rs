@@ -49,6 +49,13 @@ fn equations(layout: Layout) -> Result<Vec<Equation>> {
             });
         }
     }
+    if let Some(row) = layout.thermal_row() {
+        slots[row] = Some(Equation {
+            name: "junction_temperature".into(),
+            kind: EquationKind::Thermal,
+            binding: Binding::Terminal,
+        });
+    }
     slots
         .into_iter()
         .map(|slot| slot.ok_or(Error::Shape("unbound VBIC row")))
@@ -57,7 +64,7 @@ fn equations(layout: Layout) -> Result<Vec<Equation>> {
 
 /// Create one stable physical artifact for the resolved nominal model.
 /// # Errors
-/// Unsupported thermal topology or invalid parameters/descriptor.
+/// Invalid parameters or descriptor.
 pub fn artifact(
     model: &binding::Model,
     ambient: Temperature,
@@ -139,12 +146,12 @@ impl Kernel for VbicKernel {
         frequency: f64,
         sink: &mut dyn Sink,
     ) -> Result<()> {
-        // Fixed-size stack storage for all possible electrical and phase rows.
+        // Fixed-size stack storage for all possible electrical, phase and thermal rows.
         let n = self.layout.count();
-        let mut current = [0.; 13];
-        let mut charge = [0.; 13];
-        let mut conductance = [0.; 169];
-        let mut capacitance = [0.; 169];
+        let mut current = [0.; 14];
+        let mut charge = [0.; 14];
+        let mut conductance = [0.; 196];
+        let mut capacitance = [0.; 196];
         let mut point = Point {
             current: &mut current[..n],
             charge: &mut charge[..n],

@@ -23,7 +23,12 @@ fn scalar(name: &str, value: f64) -> Assignment<'_> {
         value: Value::Scalar(value),
     }
 }
-fn model(polarity: &str, mask: u8, phase: bool) -> Result<binding::Model, binding::Error> {
+fn model(
+    polarity: &str,
+    mask: u8,
+    phase: bool,
+    heat: bool,
+) -> Result<binding::Model, binding::Error> {
     let mut values = vec![
         scalar("rci", 3.),
         scalar("rbi", 5.),
@@ -53,6 +58,25 @@ fn model(polarity: &str, mask: u8, phase: bool) -> Result<binding::Model, bindin
         scalar("hrcf", 0.5),
         scalar("td", if phase { 2e-12 } else { 0. }),
     ];
+    if heat {
+        values.extend([
+            scalar("rth", 200.),
+            scalar("cth", 2e-10),
+            scalar("xrcx", 0.8),
+            scalar("xrci", 1.2),
+            scalar("xrbx", 1.1),
+            scalar("xrbi", 0.9),
+            scalar("xrbp", 0.7),
+            scalar("xre", 0.5),
+            scalar("xrs", 1.0),
+            scalar("tnf", 0.001),
+            scalar("tavc", 0.002),
+            scalar("xikf", 0.7),
+            scalar("xvo", 0.5),
+            scalar("wbe", 0.6),
+            scalar("qco", 3e-16),
+        ]);
+    }
     for (index, (name, value)) in [("rcx", 2.), ("rbx", 4.), ("re", 1.), ("rs", 6.)]
         .into_iter()
         .enumerate()
@@ -86,64 +110,107 @@ fn initial(layout: Layout, sign: f64, bias: [f64; 4]) -> Vec<f64> {
     values
 }
 
+fn check_jacobian(p: &Prepared, x: &[f64], context: &str) -> TestResult {
+    let layout = p.layout();
+    let n = layout.count();
+    let mut buf = PointBuffer::new(n)?;
+    let mut above = PointBuffer::new(n)?;
+    let mut below = PointBuffer::new(n)?;
+    let mut expected = buf.point();
+    let _ = p.evaluate(x, &mut expected)?;
+    let electrical =
+        n - layout.phase_rows().map_or(0, |_| 2) - usize::from(layout.thermal_row().is_some());
+    close(expected.current[..electrical].iter().sum(), 0., 0., 1e-12);
+    close(expected.charge[..electrical].iter().sum(), 0., 0., 1e-22);
+    for col in 0..n {
+        // Richardson extrapolation controls truncation in the strongly
+        // nonlinear epitaxial resistance around its velocity-saturation knee.
+        let step = if Some(col) == layout.thermal_row() {
+            1e-3
+        } else {
+            1e-6
+        };
+        let mut coarse_i = vec![0.; n];
+        let mut coarse_q = vec![0.; n];
+        for (iteration, h) in [step, step * 0.5].into_iter().enumerate() {
+            let mut up = x.to_vec();
+            up[col] += h;
+            let mut down = x.to_vec();
+            down[col] -= h;
+            let mut u = above.point();
+            let mut d = below.point();
+            let _ = p.evaluate(&up, &mut u)?;
+            let _ = p.evaluate(&down, &mut d)?;
+            for row in 0..n {
+                let numeric_i = (u.current[row] - d.current[row]) / (2. * h);
+                let numeric_q = (u.charge[row] - d.charge[row]) / (2. * h);
+                if iteration == 0 {
+                    coarse_i[row] = numeric_i;
+                    coarse_q[row] = numeric_q;
+                    continue;
+                }
+                for (quantity, exact, numeric, absolute) in [
+                    (
+                        "G",
+                        expected.conductance[row * n + col],
+                        4.0_f64.mul_add(numeric_i, -coarse_i[row]) / 3.0,
+                        1e-8,
+                    ),
+                    (
+                        "C",
+                        expected.capacitance[row * n + col],
+                        4.0_f64.mul_add(numeric_q, -coarse_q[row]) / 3.0,
+                        1e-18,
+                    ),
+                ] {
+                    let limit = 3e-5_f64.mul_add(exact.abs().max(numeric.abs()), absolute);
+                    assert!(
+                        (exact - numeric).abs() <= limit,
+                        "{context} row={row} col={col} x={x:?} {quantity}={exact:.15e} finite_difference={numeric:.15e} limit={limit:.4e}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn every_electrical_topology_and_phase_jacobian() -> TestResult {
     for (polarity, sign) in [("npn", 1.), ("pnp", -1.)] {
         for mask in 0_u8..16 {
             for phase in [false, true] {
-                let m = model(polarity, mask, phase)?;
-                let p = Prepared::new(&m, instance()?, Temperature::new(300.15)?)?;
-                let layout = p.layout();
-                let n = layout.count();
-                assert_eq!(n, 7 + mask.count_ones() as usize + 2 * usize::from(phase));
-                for bias in [
-                    [1.2, 0.78, 0., -0.1],
-                    [0.1, 0.65, 0., -0.2],
-                    [0., -0.2, 0., -0.1],
-                ] {
-                    let mut x = initial(layout, sign, bias);
-                    for (i, v) in x.iter_mut().enumerate().skip(4) {
-                        *v += sign * (i as f64 - 6.) * 0.0001;
-                    }
-                    if let Some([a, b]) = layout.phase_rows() {
-                        x[a] = 1e-4;
-                        x[b] = 2e-4;
-                    }
-                    let mut buf = PointBuffer::new(n)?;
-                    let mut above = PointBuffer::new(n)?;
-                    let mut below = PointBuffer::new(n)?;
-                    let mut expected = buf.point();
-                    let _ = p.evaluate(&x, &mut expected)?;
-                    let electrical = n - 2 * usize::from(phase);
-                    close(expected.current[..electrical].iter().sum(), 0., 0., 1e-12);
-                    close(expected.charge[..electrical].iter().sum(), 0., 0., 1e-22);
-                    for col in 0..n {
-                        let h = 1e-6;
-                        let mut up = x.clone();
-                        up[col] += h;
-                        let mut down = x.clone();
-                        down[col] -= h;
-                        let mut u = above.point();
-                        let mut d = below.point();
-                        let _ = p.evaluate(&up, &mut u)?;
-                        let _ = p.evaluate(&down, &mut d)?;
-                        for row in 0..n {
-                            let exact = expected.conductance[row * n + col];
-                            let numeric = (u.current[row] - d.current[row]) / (2. * h);
-                            let limit = 3e-5 * exact.abs().max(numeric.abs()) + 1e-9;
-                            assert!(
-                                (exact - numeric).abs() <= limit,
-                                "polarity={polarity} mask={mask} phase={phase} bias={bias:?} row={row} col={col} x={x:?} g={exact:.15e} finite_difference={numeric:.15e} limit={limit:.4e}"
-                            );
-
-                            let exact = expected.capacitance[row * n + col];
-                            let numeric = (u.charge[row] - d.charge[row]) / (2. * h);
-                            let limit = 3e-5 * exact.abs().max(numeric.abs()) + 1e-18;
-                            assert!(
-                                (exact - numeric).abs() <= limit,
-                                "charge polarity={polarity} mask={mask} phase={phase} bias={bias:?} row={row} col={col} x={x:?} c={exact:.15e} finite_difference={numeric:.15e} limit={limit:.4e}"
-                            );
+                for heat in [false, true] {
+                    let m = model(polarity, mask, phase, heat)?;
+                    let p = Prepared::new(&m, instance()?, Temperature::new(300.15)?)?;
+                    let layout = p.layout();
+                    assert_eq!(
+                        layout.count(),
+                        7 + mask.count_ones() as usize + 2 * usize::from(phase) + usize::from(heat)
+                    );
+                    for bias in [
+                        [1.2, 0.78, 0., -0.1],
+                        [0.1, 0.65, 0., -0.2],
+                        [0., -0.2, 0., -0.1],
+                    ] {
+                        let mut x = initial(layout, sign, bias);
+                        for (i, v) in x.iter_mut().enumerate().skip(4) {
+                            *v += sign * (i as f64 - 6.) * 0.0001;
                         }
+                        if let Some([a, b]) = layout.phase_rows() {
+                            x[a] = 1e-4;
+                            x[b] = 2e-4;
+                        }
+                        if let Some(row) = layout.thermal_row() {
+                            x[row] = 343.15;
+                        }
+                        check_jacobian(
+                            &p,
+                            &x,
+                            &format!(
+                                "polarity={polarity} mask={mask} phase={phase} heat={heat} bias={bias:?}"
+                            ),
+                        )?;
                     }
                 }
             }
@@ -227,7 +294,7 @@ fn solve(p: &Prepared, mut x: Vec<f64>) -> Result<Vec<f64>, Box<dyn std::error::
 
 #[test]
 fn native_ngspice_operating_point() -> TestResult {
-    let m = model("npn", 15, false)?;
+    let m = model("npn", 15, false, false)?;
     let p = Prepared::new(&m, instance()?, Temperature::new(300.15)?)?;
     let x = solve(&p, initial(p.layout(), 1., [1.2, 0.78, 0., -0.1]))?;
     let mut buffer = PointBuffer::new(x.len())?;

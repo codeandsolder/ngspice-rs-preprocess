@@ -7,7 +7,7 @@
 //! those must be source-aware stages before device binding.
 
 use super::{avalanche, charge, depletion, noise, parasitic, resistance, transport};
-use crate::{ModelError, Temperature, validate_positive};
+use crate::{ModelError, Temperature, hicum2::transport::jet::Jet, validate_positive};
 
 /// All 108 VBIC temperature-preparation coefficients in source order.
 ///
@@ -193,6 +193,7 @@ pub struct Nominal {
 #[derive(Clone, Copy, Debug)]
 pub struct Prepared {
     values: [f64; COUNT],
+    slopes: [f64; COUNT],
     /// Temperature in kelvin including VBIC model local DTEMP.
     effective: Temperature,
 }
@@ -249,54 +250,61 @@ impl Nominal {
     /// Returns invalid temperature/parameter on a nonphysical profile or
     /// numerical singularity (for example emission coefficient <= 0).
     pub fn prepare(&self, ambient: Temperature) -> Result<Prepared, ModelError> {
-        let v = &self.values;
-        let ti = v[Coefficient::Tnom.index()] + 273.15;
-        let td = ambient.kelvin() + v[Coefficient::Dtemp.index()];
-        let effective = Temperature::new(td)?;
-        let rt = td / ti;
-        let dt = td - ti;
-        let vt = ELECTRICAL_K_OVER_Q * td;
-        let mut p = *v;
-
-        scale_resistive_coefficients(v, &mut p, rt);
-        scale_saturation_currents(v, &mut p, rt, vt);
-        scale_direct_coefficients(v, &mut p, dt);
-        scale_potentials(v, &mut p, rt, vt)?;
-        scale_capacitances(v, &mut p);
-        // Temperature-adjusted epitaxial doping and collector drift scale.
-        p[Coefficient::Gamm.index()] = v[Coefficient::Gamm.index()]
-            * rt.powf(v[Coefficient::Xis.index()])
-            * (v[Coefficient::Ea.index()] * (rt - 1.0) / vt).exp();
-        p[Coefficient::Vo.index()] =
-            v[Coefficient::Vo.index()] * rt.powf(v[Coefficient::Xvo.index()]);
-        p[Coefficient::Ebbe.index()] =
-            (-p[Coefficient::Vbbe.index()] / (p[Coefficient::Nbbe.index()] * vt)).exp();
-        p[Coefficient::Tnom.index()] = ambient.kelvin() - 273.15 + p[Coefficient::Dtemp.index()];
-
-        if !p.iter().all(|value| value.is_finite()) {
-            return Err(ModelError::InvalidParameter("VBIC transformed coefficient"));
-        }
-        if [
-            Coefficient::Pe,
-            Coefficient::Pc,
-            Coefficient::Ps,
-            Coefficient::Nf,
-            Coefficient::Nr,
-            Coefficient::Nbbe,
-        ]
-        .iter()
-        .any(|parameter| p[parameter.index()] <= 0.0)
-        {
-            return Err(ModelError::InvalidParameter("VBIC transformed denominator"));
-        }
-        Ok(Prepared {
-            values: p,
-            effective,
-        })
+        transform(
+            &self.values,
+            Temperature::new(ambient.kelvin() + self.value(Coefficient::Dtemp))?,
+        )
     }
 }
 
-fn scale_resistive_coefficients(v: &[f64; COUNT], p: &mut [f64; COUNT], rt: f64) {
+/// Apply the same temperature law for initial ambient preparation and the
+/// native evaluator's subsequent temperature rise from that prepared baseline.
+/// All transformations carry exact derivatives using the common first-order AD.
+fn transform(v: &[f64; COUNT], effective: Temperature) -> Result<Prepared, ModelError> {
+    let ti = v[Coefficient::Tnom.index()] + 273.15;
+    let td = Jet::thermal_constant(effective.kelvin(), 1.0);
+    let rt = td / ti;
+    let dt = td - ti;
+    let vt = td * ELECTRICAL_K_OVER_Q;
+    let mut p = v.map(Jet::constant);
+
+    scale_resistive_coefficients(v, &mut p, rt);
+    scale_saturation_currents(v, &mut p, rt, vt);
+    scale_direct_coefficients(v, &mut p, dt);
+    scale_potentials(v, &mut p, rt, vt)?;
+    scale_capacitances(v, &mut p);
+    p[Coefficient::Gamm.index()] = rt.powf(v[Coefficient::Xis.index()])
+        * ((rt - 1.0) / vt * v[Coefficient::Ea.index()]).exp()
+        * v[Coefficient::Gamm.index()];
+    p[Coefficient::Vo.index()] = rt.powf(v[Coefficient::Xvo.index()]) * v[Coefficient::Vo.index()];
+    p[Coefficient::Ebbe.index()] =
+        (-p[Coefficient::Vbbe.index()] / (p[Coefficient::Nbbe.index()] * vt)).exp();
+    p[Coefficient::Tnom.index()] = td - 273.15;
+
+    if !p.iter().all(|value| value.is_finite()) {
+        return Err(ModelError::InvalidParameter("VBIC transformed coefficient"));
+    }
+    if [
+        Coefficient::Pe,
+        Coefficient::Pc,
+        Coefficient::Ps,
+        Coefficient::Nf,
+        Coefficient::Nr,
+        Coefficient::Nbbe,
+    ]
+    .iter()
+    .any(|parameter| p[parameter.index()].value <= 0.0)
+    {
+        return Err(ModelError::InvalidParameter("VBIC transformed denominator"));
+    }
+    Ok(Prepared {
+        values: p.map(|coefficient| coefficient.value),
+        slopes: p.map(|coefficient| coefficient.temperature),
+        effective,
+    })
+}
+
+fn scale_resistive_coefficients(v: &[f64; COUNT], p: &mut [Jet; COUNT], rt: Jet) {
     // Eight temperature-scaled resistor and knee parameters.
     for (destination, exponent) in [
         (Coefficient::Ikf, Coefficient::Xikf),
@@ -308,11 +316,11 @@ fn scale_resistive_coefficients(v: &[f64; COUNT], p: &mut [f64; COUNT], rt: f64)
         (Coefficient::Rs, Coefficient::Xrs),
         (Coefficient::Rbp, Coefficient::Xrbp),
     ] {
-        p[destination.index()] = v[destination.index()] * rt.powf(v[exponent.index()]);
+        p[destination.index()] = rt.powf(v[exponent.index()]) * v[destination.index()];
     }
 }
 
-fn scale_saturation_currents(v: &[f64; COUNT], p: &mut [f64; COUNT], rt: f64, vt: f64) {
+fn scale_saturation_currents(v: &[f64; COUNT], p: &mut [Jet; COUNT], rt: Jet, vt: Jet) {
     // The reference deliberately uses NOMINAL ideality coefficients for
     // saturation scaling, then applies TNF to NF/NR. This is not a typo.
     for (destination, exponent, activation, ideality) in [
@@ -383,36 +391,32 @@ fn scale_saturation_currents(v: &[f64; COUNT], p: &mut [f64; COUNT], rt: f64, vt
             Coefficient::Ncnp,
         ),
     ] {
-        p[destination.index()] = v[destination.index()]
-            * (rt.powf(v[exponent.index()]) * (v[activation.index()] * (rt - 1.0) / vt).exp())
-                .powf(1.0 / v[ideality.index()]);
+        p[destination.index()] = (rt.powf(v[exponent.index()])
+            * ((rt - 1.0) / vt * v[activation.index()]).exp())
+        .powf(1.0 / v[ideality.index()])
+            * v[destination.index()];
     }
 }
 
-fn scale_direct_coefficients(v: &[f64; COUNT], p: &mut [f64; COUNT], dt: f64) {
-    p[Coefficient::Nf.index()] =
-        v[Coefficient::Nf.index()] * dt.mul_add(v[Coefficient::Tnf.index()], 1.0);
-    p[Coefficient::Nr.index()] =
-        v[Coefficient::Nr.index()] * dt.mul_add(v[Coefficient::Tnf.index()], 1.0);
-    p[Coefficient::Avc2.index()] =
-        v[Coefficient::Avc2.index()] * dt.mul_add(v[Coefficient::Tavc.index()], 1.0);
-    p[Coefficient::Vbbe.index()] = v[Coefficient::Vbbe.index()]
-        * dt.mul_add(
-            dt.mul_add(
-                v[Coefficient::Tvbbe2.index()],
-                v[Coefficient::Tvbbe1.index()],
-            ),
-            1.0,
-        );
-    p[Coefficient::Nbbe.index()] =
-        v[Coefficient::Nbbe.index()] * dt.mul_add(v[Coefficient::Tnbbe.index()], 1.0);
+fn scale_direct_coefficients(v: &[f64; COUNT], p: &mut [Jet; COUNT], dt: Jet) {
+    for (destination, coefficient) in [
+        (Coefficient::Nf, Coefficient::Tnf),
+        (Coefficient::Nr, Coefficient::Tnf),
+        (Coefficient::Avc2, Coefficient::Tavc),
+        (Coefficient::Nbbe, Coefficient::Tnbbe),
+    ] {
+        p[destination.index()] = (dt * v[coefficient.index()] + 1.0) * v[destination.index()];
+    }
+    p[Coefficient::Vbbe.index()] =
+        (dt * (dt * v[Coefficient::Tvbbe2.index()] + v[Coefficient::Tvbbe1.index()]) + 1.0)
+            * v[Coefficient::Vbbe.index()];
 }
 
 fn scale_potentials(
     v: &[f64; COUNT],
-    p: &mut [f64; COUNT],
-    rt: f64,
-    vt: f64,
+    p: &mut [Jet; COUNT],
+    rt: Jet,
+    vt: Jet,
 ) -> Result<(), ModelError> {
     for (destination, activation) in [
         (Coefficient::Pe, Coefficient::Eaie),
@@ -426,7 +430,7 @@ fn scale_potentials(
     Ok(())
 }
 
-fn scale_capacitances(v: &[f64; COUNT], p: &mut [f64; COUNT]) {
+fn scale_capacitances(v: &[f64; COUNT], p: &mut [Jet; COUNT]) {
     for (destination, nominal_potential, actual_potential, grading) in [
         (
             Coefficient::Cje,
@@ -453,33 +457,59 @@ fn scale_capacitances(v: &[f64; COUNT], p: &mut [f64; COUNT]) {
             Coefficient::Ms,
         ),
     ] {
-        p[destination.index()] = v[destination.index()]
-            * (v[nominal_potential.index()] / p[actual_potential.index()]).powf(v[grading.index()]);
+        p[destination.index()] = (Jet::constant(v[nominal_potential.index()])
+            / p[actual_potential.index()])
+        .powf(v[grading.index()])
+            * v[destination.index()];
     }
 }
 /// Reference VBIC potential mapping with numerically stable ln(2*sinh(x)).
 fn transformed_potential(
     nominal: f64,
     energy: f64,
-    ratio: f64,
-    vt: f64,
-) -> Result<f64, ModelError> {
-    let x = 0.5 * nominal * ratio / vt;
-    let log_sinh = x + (-(-2.0 * x).exp()).ln_1p();
-    let nominal_intrinsic = 2.0 * vt / ratio * log_sinh;
-    let actual_intrinsic = energy.mul_add(
-        -(ratio - 1.0),
-        nominal_intrinsic.mul_add(ratio, -3.0 * vt * ratio.ln()),
-    );
-    let root = (-actual_intrinsic / vt).exp().mul_add(4.0, 1.0).sqrt();
-    let result = (2.0 * vt).mul_add(root.midpoint(1.0).ln(), actual_intrinsic);
-    if !result.is_finite() || result <= 0.0 {
+    ratio: Jet,
+    vt: Jet,
+) -> Result<Jet, ModelError> {
+    let x = ratio / vt * (0.5 * nominal);
+    let log_sinh = x + (-(-x * 2.0).exp()).ln_1p();
+    let nominal_intrinsic = vt / ratio * log_sinh * 2.0;
+    let actual_intrinsic =
+        nominal_intrinsic * ratio - vt * ratio.ln() * 3.0 - (ratio - 1.0) * energy;
+    let root = ((-actual_intrinsic / vt).exp() * 4.0 + 1.0).sqrt();
+    let result = vt * 2.0 * ((root + 1.0) * 0.5).ln() + actual_intrinsic;
+    if !result.is_finite() || result.value <= 0.0 {
         return Err(ModelError::InvalidParameter("VBIC junction potential"));
     }
     Ok(result)
 }
 
 impl Prepared {
+    pub(super) fn jet(&self, coefficient: Coefficient) -> Jet {
+        Jet::thermal_constant(self.value(coefficient), self.slope(coefficient))
+    }
+
+    pub(super) fn voltage_jet(&self) -> Jet {
+        Jet::thermal_constant(thermal_voltage(self.effective), ELECTRICAL_K_OVER_Q)
+    }
+
+    /// Native second-stage transform: the initial instance temperature becomes
+    /// the new measurement reference and model DTEMP is not applied twice.
+    /// # Errors
+    /// Invalid effective temperature or transformed physical coefficients.
+    pub fn at_rise(&self, rise: f64) -> Result<Self, ModelError> {
+        transform(
+            &self.values,
+            Temperature::new(self.effective.kelvin() + rise)?,
+        )
+    }
+
+    /// Exact derivative of the transformed coefficient with respect to the
+    /// effective junction temperature, in coefficient units per kelvin.
+    #[must_use = "the slope contributes to the electrothermal Jacobian"]
+    pub const fn slope(&self, coefficient: Coefficient) -> f64 {
+        self.slopes[coefficient.index()]
+    }
+
     #[must_use = "the coefficient value is returned without modifying the parameter set"]
     pub const fn value(&self, parameter: Coefficient) -> f64 {
         self.values[parameter.index()]
@@ -627,5 +657,17 @@ impl Prepared {
             afn: self.value(Coefficient::Afn),
             bfn: self.value(Coefficient::Bfn),
         }
+    }
+}
+
+pub(super) fn thermal_voltage(temperature: Temperature) -> f64 {
+    ELECTRICAL_K_OVER_Q * temperature.kelvin()
+}
+
+pub(super) fn inverse_enabled(value: Jet) -> Jet {
+    if value.value == 0.0 {
+        Jet::constant(0.0)
+    } else {
+        Jet::constant(1.0) / value
     }
 }
