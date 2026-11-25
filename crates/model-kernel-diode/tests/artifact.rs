@@ -105,7 +105,7 @@ fn nodal_residual_storage_and_jacobians() -> Result<()> {
         let result = compiled.evaluate_noise(&candidate, &x, 1e3, &mut noise);
         if resistance < 0. {
             assert_eq!(result, Err(Error::Unsupported("negative RS noise")));
-            assert!(noise.0.is_empty());
+            assert_eq!(noise.0, []);
         } else {
             result?;
             let expected_noise = local.noise_density(expected.current, 1e3)?;

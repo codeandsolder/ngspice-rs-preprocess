@@ -14,7 +14,7 @@ use model_kernel_api::{
 
 use super::{Instance, ModelError, PreparedInstance, PreparedModel};
 
-/// Topology-specific SIMetrix level-1 diode kernel.
+/// Topology-specific `SIMetrix` level-1 diode kernel.
 #[derive(Debug)]
 pub struct DiodeKernel {
     model: PreparedModel,
@@ -30,7 +30,9 @@ fn domain(error: ModelError) -> Error {
 }
 
 /// Create an artifact for the topology and temperature-policy shape of a
-/// reference instance. Its numeric geometry, gmin and temperature overrides
+/// reference instance.
+///
+/// Its numeric geometry, gmin and temperature overrides
 /// become candidate slots. The caller supplies the semantic fingerprint,
 /// including the model, series-node presence and temperature-policy shape.
 ///
