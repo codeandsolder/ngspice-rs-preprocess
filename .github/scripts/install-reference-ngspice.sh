@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the exact signed Arch reference simulator without system changes.
+# Install the pinned ngspice 47 reference simulator without system changes.
 set -euo pipefail
 [[ $# == 1 && -n "$1" ]] || { echo "Usage: $0 NEW_DIRECTORY" >&2; exit 64; }
 destination=$(realpath -m -- "$1")
@@ -8,9 +8,6 @@ destination=$(realpath -m -- "$1")
 # ngspice's codemodel command does not handle quoted/whitespace-containing
 # filenames. Require a plain temporary installation path explicitly.
 [[ ! "$destination" =~ [[:space:][:cntrl:]] && "$destination" != *'"'* ]]
-package=ngspice-47-1-x86_64.pkg.tar.zst
-digest=4dfaa2ad51f6724b65482b71e300190a495d5c50b658bb42bec4b84559c210d9
-mkdir -- "$destination"
 complete=false
 cleanup() {
     if [[ "$complete" == false ]]; then rm -rf -- "$destination"; fi
@@ -18,6 +15,12 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [[ ! -f /etc/arch-release ]]; then
+    bash "$(dirname "$0")/install-reference-ngspice-source.sh" "$destination"
+else
+package=ngspice-47-1-x86_64.pkg.tar.zst
+digest=4dfaa2ad51f6724b65482b71e300190a495d5c50b658bb42bec4b84559c210d9
+mkdir -- "$destination"
 # Signed package was verified against Arch's official keyring before pinning.
 # The immutable digest authenticates the entire archive including XSPICE models.
 curl -fsSL --retry 3 --max-time 120 \
@@ -43,6 +46,7 @@ export SPICE_HELP_DIR="$SPICE_LIB_DIR/helpdir"
 exec "$root/usr/bin/ngspice" "$@"
 WRAPPER
 chmod +x "$destination/bin/ngspice"
+fi
 # The managed Linux hosts supply the ordinary ELF runtime libraries. Fail
 # explicitly instead of silently falling back to a system ngspice binary.
 version=$("$destination/bin/ngspice" --version)
