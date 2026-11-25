@@ -67,7 +67,7 @@ fn compare(source: &[u8], expected: impl Fn(&[f64])) -> Result<()> {
     let oracle = rows(&directory.path().join("oracle"), source, true)?;
     if let (Some(native), Some(oracle)) = (native, oracle) {
         assert_eq!(native.len(), oracle.len());
-        assert!(!native.is_empty());
+        assert_ne!(native, [] as [Vec<f64>; 0]);
         for (actual, reference) in native.iter().zip(oracle) {
             assert_eq!(actual.len(), reference.len());
             for (&value, expected) in actual.iter().zip(reference) {
@@ -116,9 +116,16 @@ quit
         let condition = if x < 0. { 10. } else { 20. };
         close(
             row[1],
-            x.clamp(-1., 3.) + x * x + x.signum() * x * x + step - 2. + condition,
+            (x.signum() * x).mul_add(x, x.mul_add(x, x.clamp(-1., 3.))) + step - 2. + condition,
         );
-        close(row[2], 2. * if x <= 0. { 5. + 3. * x } else { 5. + 5. * x });
+        close(
+            row[2],
+            2. * if x <= 0. {
+                3.0_f64.mul_add(x, 5.)
+            } else {
+                5.0_f64.mul_add(x, 5.)
+            },
+        );
     })
 }
 
@@ -150,7 +157,7 @@ quit
 ";
     compare(source, |row| {
         close(row[1], 1.5);
-        close(row[2], 66. + (65. + 273.15) * 8.6173303e-5);
+        close(row[2], (65.0_f64 + 273.15).mul_add(8.617_330_3e-5, 66.));
         close(row[3], row[2]);
     })
 }
@@ -210,7 +217,7 @@ quit
         assert!(row[1] < 0.);
         close(
             row[2],
-            -1. / (1000. * (1. + 0.01 * 38. + 0.0001 * 38. * 38.)),
+            -1. / (1000. * ((0.0001_f64 * 38.).mul_add(38., 0.01_f64.mul_add(38., 1.)))),
         );
         close(row[3], 7.);
     })
@@ -312,8 +319,8 @@ quit
 ";
     compare(source, |row| {
         let x = row[0].clamp(0., 1.);
-        let weight = x * x * (3. - 2. * x);
-        let resistance = (1000_f64.ln() + (10_f64.ln() - 1000_f64.ln()) * weight).exp();
+        let weight = x * x * (2.0_f64.mul_add(-x, 3.));
+        let resistance = ((10_f64.ln() - 1000_f64.ln()).mul_add(weight, 1000_f64.ln())).exp();
         close(row[1], 100. / (100. + resistance));
         // Evaluate the input loading in picoamps, not with a voltage-scale tolerance.
         close(row[2] * 1e12, -row[0]);
@@ -401,8 +408,8 @@ quit
         assert_eq!(values.len(), 9);
         for row in values {
             let x = row[0].clamp(0., 1.);
-            let weight = x * x * (3. - 2. * x);
-            let resistance = (1000_f64.ln() + (10_f64.ln() - 1000_f64.ln()) * weight).exp();
+            let weight = x * x * (2.0_f64.mul_add(-x, 3.));
+            let resistance = ((10_f64.ln() - 1000_f64.ln()).mul_add(weight, 1000_f64.ln())).exp();
             close(row[1], 100. / (100. + resistance));
             close(row[2], row[0]);
         }
@@ -523,7 +530,10 @@ quit
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), 6);
         for (&current, temperature) in rows[0][1..].iter().zip([25., 110., 35., 100., 40.]) {
-            close(current, -1. / (1000. * (1. + 0.001 * temperature)));
+            close(
+                current,
+                -1. / (1000. * (0.001_f64.mul_add(temperature, 1.))),
+            );
         }
     }
     Ok(())

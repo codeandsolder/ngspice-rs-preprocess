@@ -314,7 +314,8 @@ D1 p n same
     )?;
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
     let source = prepared_diode::linked_library(&bundle)?;
-    let topology = source.instantiate(Default::default())?;
+    let topology = source
+        .instantiate(model_normalize_ngspice::parameter_scope::topology::Limits::default())?;
     let models = source
         .models
         .iter()
