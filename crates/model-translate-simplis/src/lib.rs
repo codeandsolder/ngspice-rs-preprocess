@@ -12,15 +12,15 @@ pub mod syntax;
 use syntax::{normalized_statement, parse_numeric, statement_tokens, validate_node};
 mod whole;
 pub use whole::{
-    SplitDeckTranslation, WholeModelTranslation, capture_passive_initial_conditions,
-    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_deck_split,
-    translate_simplis_expanded_library,
+    SplitDeckTranslation, WholeModelTranslation, capture_artifact_initial_conditions,
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
+    translate_simplis_deck_split, translate_simplis_expanded_library,
 };
 
 /// One numeric point on a piecewise-linear characteristic.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
-    /// Independent voltage coordinate.
+    /// Independent voltage or current coordinate.
     pub voltage: f64,
     /// Dependent current or charge coordinate.
     pub value: f64,
@@ -36,6 +36,8 @@ pub enum TranslationKind {
     Ipwlr,
     /// SIMPLIS `PWLC` / `NON_LINEAR_CAP_V1` voltage/charge characteristic.
     ChargeCapacitor,
+    /// SIMPLIS `PWLL` current/flux-linkage characteristic.
+    FluxInductor,
     /// SIMPLIS voltage-controlled switch mapped to ngspice `SW`.
     VoltageControlledSwitch,
     /// SIMPLIS LEVEL=1 simple transistor switch.
@@ -241,17 +243,24 @@ fn strictly_increasing_values(points: &[Point]) -> bool {
 // charge state there can make the transient operating point singular.
 const EXPLICIT_CHARGE_STATE_MIN_SPAN_COULOMBS: f64 = 1.0e-9;
 
-fn write_inverse_charge_pwl(
+fn write_inverse_storage_pwl(
     output: &mut String,
     state_node: &str,
     points: &[Point],
-    charge_offset: f64,
-    charge_span: f64,
+    storage_offset: f64,
+    storage_span: f64,
 ) -> Result<()> {
     write!(output, "pwl(v({state_node})")?;
+    let mut previous = f64::NEG_INFINITY;
     for point in points {
+        let coordinate = (point.value - storage_offset) / storage_span;
+        anyhow::ensure!(
+            coordinate.is_finite() && coordinate > previous,
+            "normalized storage knots must be finite and strictly increasing"
+        );
+        previous = coordinate;
         output.push_str(", ");
-        write_number(output, (point.value - charge_offset) / charge_span)?;
+        write_number(output, coordinate)?;
         output.push_str(", ");
         write_number(output, point.voltage)?;
     }
@@ -259,7 +268,7 @@ fn write_inverse_charge_pwl(
     Ok(())
 }
 
-fn normalized_initial_charge(
+fn normalized_initial_storage(
     points: &[Point],
     voltage: f64,
     offset: f64,
@@ -304,7 +313,8 @@ fn normalized_initial_charge(
 /// # Errors
 ///
 /// Returns an error for invalid identifiers, fewer than two points, non-finite
-/// coordinates, or non-monotonic voltage coordinates.
+/// coordinates, non-monotonic voltage coordinates, or an initial condition
+/// on a non-invertible charge curve.
 pub fn translate_charge_capacitor(
     name: &str,
     node_p: &str,
@@ -326,14 +336,8 @@ pub fn translate_charge_capacitor(
     }
     let mut output = String::new();
     if strictly_increasing_values(points) {
-        let charge_min = points
-            .iter()
-            .map(|point| point.value)
-            .fold(f64::INFINITY, f64::min);
-        let charge_max = points
-            .iter()
-            .map(|point| point.value)
-            .fold(f64::NEG_INFINITY, f64::max);
+        let charge_min = points[0].value;
+        let charge_max = points[points.len() - 1].value;
         let charge_span = charge_max - charge_min;
         if initial_voltage.is_some() || charge_span >= EXPLICIT_CHARGE_STATE_MIN_SPAN_COULOMBS {
             anyhow::ensure!(
@@ -345,10 +349,10 @@ pub fn translate_charge_capacitor(
             let voltage_source = format!("B__{stem}_PWLC_V");
             writeln!(
                 output,
-                "* ngspice-rs-preprocess: explicit normalized charge state for large increasing SIMPLIS PWLC"
+                "* ngspice-rs-preprocess: explicit normalized charge state for SIMPLIS PWLC"
             )?;
             write!(output, "{voltage_source} {node_p} {node_n} V='")?;
-            write_inverse_charge_pwl(&mut output, &state_node, points, charge_min, charge_span)?;
+            write_inverse_storage_pwl(&mut output, &state_node, points, charge_min, charge_span)?;
             output.push_str("'\n");
             writeln!(
                 output,
@@ -357,7 +361,7 @@ pub fn translate_charge_capacitor(
             write!(output, "C__{stem}_PWLC_Q {state_node} 0 ")?;
             write_number(&mut output, charge_span)?;
             if let Some(voltage) = initial_voltage {
-                let charge = normalized_initial_charge(points, voltage, charge_min, charge_span)?;
+                let charge = normalized_initial_storage(points, voltage, charge_min, charge_span)?;
                 output.push_str(" IC=");
                 write_number(&mut output, charge)?;
             }
@@ -375,6 +379,61 @@ pub fn translate_charge_capacitor(
     Ok(Translation {
         bytes: output.into_bytes(),
         kind: TranslationKind::ChargeCapacitor,
+    })
+}
+
+/// Translate a SIMPLIS `PWLL` current/flux-linkage primitive.
+///
+/// The independent point coordinate is signed terminal current, and the
+/// dependent coordinate is flux linkage. A normalized storage capacitor
+/// integrates terminal voltage; the inverse characteristic determines
+/// branch current. The initial current is converted to flux exactly as
+/// PWLC converts initial voltage to charge.
+///
+/// # Errors
+/// Invalid identifiers, coordinates, nonpositive differential inductance,
+/// or a non-finite initial storage coordinate.
+pub fn translate_flux_inductor(
+    name: &str,
+    node_p: &str,
+    node_n: &str,
+    points: &[Point],
+    initial_current: Option<f64>,
+) -> Result<Translation> {
+    validate_name(name)?;
+    validate_node(node_p)?;
+    validate_node(node_n)?;
+    validate_points(points)?;
+    anyhow::ensure!(
+        strictly_increasing_values(points),
+        "PWLL requires positive differential inductance"
+    );
+    let offset = points[0].value;
+    let span = points[points.len() - 1].value - offset;
+    anyhow::ensure!(span.is_finite() && span > 0., "invalid PWLL flux span");
+    let stem = sanitized_name(name);
+    let state = format!("__{stem}_PWLL_FLUX");
+    let mut output = String::new();
+    write!(output, "B__{stem}_PWLL_I {node_p} {node_n} I='")?;
+    write_inverse_storage_pwl(&mut output, &state, points, offset, span)?;
+    output.push_str("'\n");
+    writeln!(
+        output,
+        "B__{stem}_PWLL_V {state} 0 I='-v({node_p},{node_n})'"
+    )?;
+    write!(output, "C__{stem}_PWLL_FLUX {state} 0 ")?;
+    write_number(&mut output, span)?;
+    if let Some(current) = initial_current {
+        output.push_str(" IC=");
+        write_number(
+            &mut output,
+            normalized_initial_storage(points, current, offset, span)?,
+        )?;
+    }
+    output.push('\n');
+    Ok(Translation {
+        bytes: output.into_bytes(),
+        kind: TranslationKind::FluxInductor,
     })
 }
 

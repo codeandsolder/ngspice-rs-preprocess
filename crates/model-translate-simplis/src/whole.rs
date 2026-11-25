@@ -1,6 +1,6 @@
 mod passive_ic;
 mod pwls;
-pub use passive_ic::capture_passive_initial_conditions;
+pub use passive_ic::{capture_artifact_initial_conditions, capture_passive_initial_conditions};
 mod simetrix_runtime;
 use super::{
     CodeModelRuntime, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateMode,
@@ -8,7 +8,7 @@ use super::{
     Point, Translation, TranslationKind, emit_digital_buffer, emit_logic_event, emit_logic_gate,
     emit_logic_output, indexed_points, integer_parameter, normalized_statement, numeric_parameter,
     parse_assignments, sanitized_name, statement_tokens, translate_charge_capacitor,
-    translate_ipwlr, translate_vpwlr, validate_node, write_number,
+    translate_flux_inductor, translate_ipwlr, translate_vpwlr, validate_node, write_number,
 };
 #[cfg(test)]
 use crate::syntax::logical_statements;
@@ -334,11 +334,12 @@ struct RawPwlModel {
 }
 
 #[derive(Clone, Debug)]
-struct RawChargeModel {
+struct RawReactiveModel {
     points: Vec<Point>,
+    kind: model_normalize_ngspice::passive_ic::PassiveKind,
 }
 
-fn raw_charge_model(statement: &str) -> Result<Option<(String, RawChargeModel)>> {
+fn raw_reactive_model(statement: &str) -> Result<Option<(String, RawReactiveModel)>> {
     let trimmed = statement.trim_start();
     if !trimmed
         .get(..6)
@@ -348,9 +349,15 @@ fn raw_charge_model(statement: &str) -> Result<Option<(String, RawChargeModel)>>
         return Ok(None);
     }
     let tokens = statement_tokens(&normalized_statement(statement))?;
-    if tokens.len() < 4 || !tokens[2].eq_ignore_ascii_case("PWLC") {
+    if tokens.len() < 4 {
         return Ok(None);
     }
+    use model_normalize_ngspice::passive_ic::PassiveKind;
+    let kind = match tokens[2].to_ascii_uppercase().as_str() {
+        "PWLC" => PassiveKind::Capacitor,
+        "PWLL" => PassiveKind::Inductor,
+        _ => return Ok(None),
+    };
     let parameters = parse_assignments(&tokens[3..])?;
     let segments = integer_parameter(&parameters, "NSEG")?;
     if segments == 0 {
@@ -360,39 +367,58 @@ fn raw_charge_model(statement: &str) -> Result<Option<(String, RawChargeModel)>>
         .with_context(|| format!("parsing SIMPLIS PWLC model {}", tokens[1]))?;
     Ok(Some((
         tokens[1].to_ascii_uppercase(),
-        RawChargeModel { points },
+        RawReactiveModel { points, kind },
     )))
 }
 
-fn translate_raw_charge_device(
+fn translate_raw_reactive_device(
     statement: &str,
-    models: &std::collections::BTreeMap<String, RawChargeModel>,
+    models: &std::collections::BTreeMap<String, RawReactiveModel>,
 ) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     let Some(name) = tokens.first() else {
         return Ok(None);
     };
-    if !name
-        .get(..2)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!C"))
-        || tokens.len() < 4
+    if !name.get(..2).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case("!C") || prefix.eq_ignore_ascii_case("!L")
+    }) || tokens.len() < 4
     {
         return Ok(None);
     }
     let Some(model) = models.get(&tokens[3].to_ascii_uppercase()) else {
         return Ok(None);
     };
+    use model_normalize_ngspice::passive_ic::PassiveKind;
+    let flux = name
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!L"));
+    anyhow::ensure!(
+        (model.kind == PassiveKind::Inductor) == flux,
+        "reactive device {name} has mismatched model type"
+    );
+    anyhow::ensure!(
+        model
+            .points
+            .windows(2)
+            .all(|pair| pair[1].value > pair[0].value),
+        "SIMPLIS reactive model requires positive differential storage"
+    );
     let parameters = parse_assignments(&tokens[4..])?;
     anyhow::ensure!(
         parameters.keys().all(|key| key == "IC"),
-        "unsupported PWLC instance parameter on {name}"
+        "unsupported reactive instance parameter on {name}"
     );
     let initial = parameters
         .get("IC")
         .map(|value| crate::parse_numeric(value))
         .transpose()?;
     let instance = name.trim_start_matches('!');
-    translate_charge_capacitor(instance, &tokens[1], &tokens[2], &model.points, initial).map(Some)
+    if model.kind == PassiveKind::Inductor {
+        translate_flux_inductor(instance, &tokens[1], &tokens[2], &model.points, initial).map(Some)
+    } else {
+        translate_charge_capacitor(instance, &tokens[1], &tokens[2], &model.points, initial)
+            .map(Some)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3987,21 +4013,55 @@ fn resolve_init_route(
     }))
 }
 
+fn merge_routed_initializations(items: &mut Vec<Item>, ancestor: Vec<String>) -> Result<()> {
+    let mut merged = std::collections::BTreeMap::new();
+    let mut retained = Vec::with_capacity(items.len());
+    for item in std::mem::take(items) {
+        if let Item::Statement(statement) = &item
+            && let Some(assignments) =
+                model_preprocess_simplis::parse_init_statement(&normalized_statement(statement))?
+        {
+            for (path, value) in assignments {
+                let name = path.join(".").to_ascii_uppercase();
+                anyhow::ensure!(
+                    merged.insert(name.clone(), value).is_none(),
+                    "duplicate SIMPLIS .INIT override for {name}"
+                );
+            }
+        } else {
+            retained.push(item);
+        }
+    }
+    for statement in ancestor {
+        for (path, value) in model_preprocess_simplis::parse_init_statement(&statement)?
+            .context("missing routed initialization")?
+        {
+            merged.insert(path.join(".").to_ascii_uppercase(), value);
+        }
+    }
+    retained.extend(
+        merged
+            .into_iter()
+            .map(|(name, value)| Item::Statement(format!(".INIT {name}={value}"))),
+    );
+    *items = retained;
+    Ok(())
+}
+
 fn apply_scoped_init_overrides(
     items: &mut [Item],
     scoped: &mut std::collections::BTreeMap<String, Vec<String>>,
-) {
+) -> Result<()> {
     for item in items {
         let Item::Subcircuit(block) = item else {
             continue;
         };
         if let Some(statements) = scoped.remove(&block.name.to_ascii_uppercase()) {
-            for statement in statements {
-                block.body.insert(0, Item::Statement(statement));
-            }
+            merge_routed_initializations(&mut block.body, statements)?;
         }
-        apply_scoped_init_overrides(&mut block.body, scoped);
+        apply_scoped_init_overrides(&mut block.body, scoped)?;
     }
+    Ok(())
 }
 
 fn apply_routed_init_overrides(items: &mut Vec<Item>, routed: Vec<RoutedInit>) -> Result<()> {
@@ -4019,7 +4079,7 @@ fn apply_routed_init_overrides(items: &mut Vec<Item>, routed: Vec<RoutedInit>) -
     for statement in root {
         items.insert(0, Item::Statement(statement));
     }
-    apply_scoped_init_overrides(items, &mut scoped);
+    apply_scoped_init_overrides(items, &mut scoped)?;
     if let Some(scope) = scoped.keys().next() {
         bail!("missing mutable SIMPLIS init scope {scope}");
     }
@@ -4405,7 +4465,7 @@ struct ScopeAnalysis {
     pwls_prefix: String,
     init: std::collections::BTreeMap<String, String>,
     pwl: std::collections::BTreeMap<String, RawPwlModel>,
-    charge: std::collections::BTreeMap<String, RawChargeModel>,
+    reactive: std::collections::BTreeMap<String, RawReactiveModel>,
     inductors: std::collections::BTreeMap<String, f64>,
     current_branches: std::collections::BTreeMap<String, String>,
     voltage_branches: std::collections::BTreeMap<String, (String, String)>,
@@ -4442,7 +4502,7 @@ impl ScopeAnalysis {
             pwls_prefix: pwls::scope_prefix(items, header),
             init: init_overrides(items)?,
             pwl: std::collections::BTreeMap::new(),
-            charge: std::collections::BTreeMap::new(),
+            reactive: std::collections::BTreeMap::new(),
             inductors: raw_inductor_values(items)?,
             current_branches: std::collections::BTreeMap::new(),
             voltage_branches: branch_voltage_nodes(items)?,
@@ -4475,10 +4535,10 @@ impl ScopeAnalysis {
             };
             self.collect_model_compatibility(statement, &name, &kind)?;
             match kind.as_str() {
-                "PWLC" => insert_unique_model(
-                    &mut self.charge,
-                    raw_charge_model(statement)?,
-                    "SIMPLIS PWLC model",
+                "PWLC" | "PWLL" => insert_unique_model(
+                    &mut self.reactive,
+                    raw_reactive_model(statement)?,
+                    "SIMPLIS reactive model",
                 )?,
                 "VPWLR" | "IPWLR" => insert_unique_model(
                     &mut self.pwl,
@@ -4800,7 +4860,7 @@ fn translate_deck_primitive(
     if let Some(value) = translate_raw_pwl_device(statement, &models.pwl)? {
         return Ok(Some(value));
     }
-    if let Some(value) = translate_raw_charge_device(statement, &models.charge)? {
+    if let Some(value) = translate_raw_reactive_device(statement, &models.reactive)? {
         return Ok(Some(value));
     }
     if let Some(value) = translate_raw_srff_device(statement, &models.srff)? {
@@ -5203,7 +5263,7 @@ fn emit_deck_statement(
         return Ok(());
     }
     if raw_pwl_model(statement)?.is_some()
-        || raw_charge_model(statement)?.is_some()
+        || raw_reactive_model(statement)?.is_some()
         || raw_comp_model(statement)?.is_some()
         || raw_adc_schmitt_model(statement)?.is_some()
         || raw_srff_model(statement)?.is_some()
