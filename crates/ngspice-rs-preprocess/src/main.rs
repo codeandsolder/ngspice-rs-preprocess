@@ -104,7 +104,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
             "--search" => request.search_paths.push(value.into()),
             "--device-config" => options.device_config = Some(value.into()),
             "--statistical-sample" => {
-                options.statistical_sample = Some(statistical_sample(&value)?)
+                options.statistical_sample = Some(statistical_sample(&value)?);
             }
             "--command" => command = Some(PathBuf::from(value)),
             "--command-arg" => command_args.push(value),
