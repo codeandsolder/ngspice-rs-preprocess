@@ -548,6 +548,7 @@ impl MappingTable {
         &self,
         line: &ScopedStatement,
         scope: &[String],
+        budget: &WorkBudget,
     ) -> Result<Option<ModelSelection>> {
         let text = line.text.trim_start();
         let Some((directive, remainder)) = text.split_once(char::is_whitespace) else {
@@ -568,7 +569,18 @@ impl MappingTable {
             .next()
             .unwrap_or_default()
             .to_ascii_uppercase();
-        if !known_family(&family) && !self.entries.keys().any(|key| key.model_type == family) {
+        if !known_family(&family)
+            && self
+                .entries
+                .range(
+                    ModelKey {
+                        model_type: family.clone(),
+                        level: 0,
+                    }..,
+                )
+                .next()
+                .is_none_or(|(key, _)| key.model_type != family)
+        {
             return Ok(None);
         }
         let card = parse_model_card(text, line.first_line, &["LEVEL", "VERSION", "VLEVEL"])?;
@@ -608,6 +620,11 @@ impl MappingTable {
         );
         let version = one(&card.parameters, "VERSION")?.map(str::to_owned);
         let effective_version = resolve_version(mapping.device, version.as_deref())?;
+        super::identity::charge_scope_copy(scope, budget)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            line.source.len().saturating_add(line.text.len()),
+        )?;
         Ok(Some(ModelSelection {
             source: line.source.clone(),
             scope: scope.to_vec(),
@@ -870,7 +887,7 @@ impl MappingTable {
                     }
                     ".MAP" => line.text = format!("* consumed {}", line.text),
                     ".MODEL" => {
-                        if let Some(selection) = self.select_card(&line, &scope)? {
+                        if let Some(selection) = self.select_card(&line, &scope, budget)? {
                             line.text = selection.lower().with_context(|| {
                                 format!("model {} in {}", selection.card.name, selection.source)
                             })?;

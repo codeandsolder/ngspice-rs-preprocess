@@ -740,10 +740,7 @@ fn resolve_deck(
         let mapped = mapping.apply(&statements, session.budget())?;
         let lowered =
             lower_scoped_statements(&mapped.statements, options.output_bytes, session.budget())?;
-        let resolved = resolve_device_identities(&lowered)?;
-        session
-            .budget()
-            .charge(super::Resource::EmittedBytes, resolved.text.len())?;
+        let resolved = resolve_device_identities(&lowered, session.budget())?;
         ensure!(
             resolved.text.len() <= options.output_bytes,
             "device identity expansion byte budget exceeded"

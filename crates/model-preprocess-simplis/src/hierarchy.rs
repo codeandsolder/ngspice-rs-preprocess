@@ -919,8 +919,7 @@ fn parse_scoped_parts(
         "incomplete admitted source graph"
     );
     let lowered = lower_scoped_statements(statements, limit, budget)?;
-    let resolved = resolve_device_identities(&lowered)?;
-    budget.charge(Resource::EmittedBytes, resolved.text.len())?;
+    let resolved = resolve_device_identities(&lowered, budget)?;
     anyhow::ensure!(
         resolved.text.len() <= limit,
         "device identity expansion byte budget exceeded"

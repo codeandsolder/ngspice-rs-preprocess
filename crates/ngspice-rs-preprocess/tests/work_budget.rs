@@ -369,3 +369,42 @@ fn model_configuration_and_deck_share_request_budget() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn device_identity_scope_copies_consume_shared_budget() -> Result<()> {
+    use model_preprocess_command::WorkBudget;
+    use model_preprocess_simplis::source_dialect::{
+        DialectContext, ScopedStatement, resolve_device_identities,
+    };
+    let name = "S".repeat(1024);
+    let mut lines = vec![format!(".subckt {name} a b")];
+    lines.extend((0..32).map(|i| format!("R{i} a b 1k")));
+    lines.push(format!(".ends {name}"));
+    let statements = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| ScopedStatement {
+            source: "source.net".into(),
+            context: DialectContext::default(),
+            first_line: i + 1,
+            last_line: i + 1,
+            text,
+        })
+        .collect::<Vec<_>>();
+    let budget = WorkBudget::new(
+        WorkLimits {
+            emitted_bytes: 8192,
+            ..WorkLimits::default()
+        },
+        Cancellation::default(),
+    );
+    let error = resolve_device_identities(&statements, &budget)
+        .err()
+        .context("identity metadata bypassed budget")?;
+    ensure!(format!("{error:#}").contains("EmittedBytes budget exceeded"));
+    ensure!(budget.check().is_err());
+    let resolved = resolve_device_identities(&statements, &WorkBudget::default())?;
+    assert_eq!(resolved.identities.len(), 32);
+    assert_eq!(resolved.identities[31].scope, vec![name]);
+    Ok(())
+}
