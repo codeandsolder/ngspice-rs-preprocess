@@ -9,16 +9,16 @@ use std::{
     process::{Command, Output},
 };
 
-fn source_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/xspice/fixtures/family")
-}
-fn expand(source: &Path, binding: &Path, dir: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_alb-logical-expand"))
-        .arg(source)
-        .arg(binding)
-        .arg(dir.join("lowered.cir"))
-        .arg(dir.join("generated.inc"))
-        .output()?)
+#[path = "support/family.rs"]
+mod harness;
+use harness::fixtures as source_dir;
+fn expand(source: &Path, config: &Path, dir: &Path) -> Result<Output> {
+    harness::run(
+        env!("CARGO_BIN_EXE_alb-logical-expand"),
+        &[source, config],
+        dir,
+        &["lowered.cir", "generated.inc"],
+    )
 }
 fn copy_binding(tmp: &Path, modifier: impl FnOnce(&mut Value)) -> Result<PathBuf> {
     let mut value: Value =
@@ -238,5 +238,23 @@ fn original_clocked_alb_discovery_and_native_bundle_wiring() -> Result<()> {
         );
         assert!(!temp.path().join("final.cir").exists());
     }
+    Ok(())
+}
+
+#[test]
+fn annotation_document_rejects_unknown_fields_before_lowering() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = copy_binding(temp.path(), |doc| {
+        doc["connections"][0]["direciton"] = json!("input");
+    })?;
+    let result = expand(
+        &source_dir().join("logical-original.cir"),
+        &config,
+        temp.path(),
+    )?;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unknown field"));
+    assert!(!temp.path().join("lowered.cir").exists());
+    assert!(!temp.path().join("generated.inc").exists());
     Ok(())
 }

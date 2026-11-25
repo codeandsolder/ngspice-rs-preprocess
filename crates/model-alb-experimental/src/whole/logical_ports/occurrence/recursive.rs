@@ -1,7 +1,7 @@
 //! Bottom-up instance signatures and scope-preserving lexical cloning.
 
 use super::super::super::Subcircuit;
-use super::super::{Call, normalized_statement, statement_tokens};
+use super::super::{Call, normalized_statement};
 use super::{
     DefinitionFamilyBoundary, FamilySpecialization, Graph, Item, LogicalCut,
     OccurrenceFamilyBoundary, Result, Signature, VariantKey, key, signature,
@@ -46,31 +46,6 @@ fn collect_annotations(entries: &[OccurrenceFamilyBoundary]) -> Result<Annotatio
     Ok(result)
 }
 
-fn collect_calls(graph: &Graph, items: &[Item], scope: &[String]) -> Result<Vec<Call>> {
-    let mut names = BTreeSet::new();
-    let mut calls = Vec::new();
-    for item in items {
-        let Item::Statement(statement) = item else {
-            continue;
-        };
-        let fields = statement_tokens(&normalized_statement(statement))?;
-        let Some(first) = fields.first() else {
-            continue;
-        };
-        if !first.starts_with(['X', 'x']) || first.len() <= 1 {
-            continue;
-        }
-        ensure!(
-            names.insert(key(first)),
-            "duplicate X instance name {first} in lexical scope {scope:?}"
-        );
-        if let Some(call) = graph.call(statement, scope)? {
-            calls.push(call);
-        }
-    }
-    Ok(calls)
-}
-
 fn build_occurrence(
     graph: &Graph,
     call: &Call,
@@ -86,18 +61,16 @@ fn build_occurrence(
         call.target
     );
     stack.push(call.target.clone());
-    let scope = graph
-        .scopes
-        .get(&call.target)
-        .context("missing original lexical X definition")?;
+    let index = graph.occurrences(&call.target)?;
+    index.check_unique_x_names(&call.target)?;
     let mut children = BTreeMap::new();
-    for child in collect_calls(graph, &scope.items, &call.target)? {
+    for child in index.calls() {
         let mut child_path = path.clone();
         let name = key(&child.name);
         child_path.push(name.clone());
         children.insert(
             name,
-            build_occurrence(graph, &child, child_path, annotations, seen, stack)?,
+            build_occurrence(graph, child, child_path, annotations, seen, stack)?,
         );
     }
     stack.pop();
@@ -142,18 +115,19 @@ fn build_occurrence(
 
 fn collect_occurrences(
     graph: &Graph,
-    items: &[Item],
     annotations: &Annotations,
 ) -> Result<BTreeMap<String, Occurrence>> {
     let mut roots = BTreeMap::new();
     let mut seen = BTreeSet::new();
-    for call in collect_calls(graph, items, &[])? {
+    let index = graph.occurrences(&[])?;
+    index.check_unique_x_names(&[])?;
+    for call in index.calls() {
         let name = key(&call.name);
         roots.insert(
             name.clone(),
             build_occurrence(
                 graph,
-                &call,
+                call,
                 vec![name],
                 annotations,
                 &mut seen,
@@ -346,7 +320,7 @@ impl Renderer<'_> {
                 .get(&child.definition)
                 .and_then(|variants| variants.get(variant))
                 .context("missing nested electrical specialization")?;
-            self.output.push_str(&rewrite_call(&call, target)?);
+            self.output.push_str(&rewrite_call(call, target)?);
         } else {
             self.output.push_str(statement);
         }
@@ -467,7 +441,7 @@ fn render_specialized(
                         .get(&node.definition)
                         .and_then(|variants| variants.get(variant))
                         .context("missing root specialized subcircuit")?;
-                    renderer.output.push_str(&rewrite_call(&call, target)?);
+                    renderer.output.push_str(&rewrite_call(call, target)?);
                 } else {
                     renderer.output.push_str(statement);
                 }
@@ -527,7 +501,7 @@ pub(super) fn run(
     lexical_connections: &[DefinitionFamilyBoundary],
 ) -> Result<FamilySpecialization> {
     let annotations = collect_annotations(occurrence_connections)?;
-    let roots = collect_occurrences(graph, items, &annotations)?;
+    let roots = collect_occurrences(graph, &annotations)?;
     let mut targeted = BTreeSet::new();
     for entries in annotations.values() {
         let first = entries.first().context("empty occurrence annotation")?;

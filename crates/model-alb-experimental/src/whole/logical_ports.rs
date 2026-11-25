@@ -121,6 +121,55 @@ struct Call {
     name: String,
 }
 
+/// One recognized source occurrence. The vector in each lexical index retains
+/// source order and repeated statements, independently of their lookup keys.
+enum SourceOccurrence {
+    Alb(LogicalInstance),
+    Call(Call),
+}
+
+#[derive(Default)]
+struct ScopeOccurrences {
+    ordered: Vec<SourceOccurrence>,
+    by_statement: BTreeMap<String, usize>,
+    // Preserve the specialization path's validation of all X names,
+    // including opaque calls with no locally resolved model.
+    duplicate_x_name: Option<String>,
+}
+
+impl ScopeOccurrences {
+    fn get(&self, statement: &str) -> Option<&SourceOccurrence> {
+        self.by_statement
+            .get(statement)
+            .and_then(|index| self.ordered.get(*index))
+    }
+
+    fn check_unique_x_names(&self, scope: &[String]) -> Result<()> {
+        if let Some(name) = &self.duplicate_x_name {
+            bail!("duplicate X instance name {name} in lexical scope {scope:?}");
+        }
+        Ok(())
+    }
+
+    fn calls(&self) -> impl Iterator<Item = &Call> {
+        self.ordered
+            .iter()
+            .filter_map(|occurrence| match occurrence {
+                SourceOccurrence::Call(call) => Some(call),
+                SourceOccurrence::Alb(_) => None,
+            })
+    }
+
+    fn albs(&self) -> impl Iterator<Item = &LogicalInstance> {
+        self.ordered
+            .iter()
+            .filter_map(|occurrence| match occurrence {
+                SourceOccurrence::Alb(alb) => Some(alb),
+                SourceOccurrence::Call(_) => None,
+            })
+    }
+}
+
 #[derive(Clone)]
 struct ResolvedAlbProducer {
     identity: AlbOutputProducer,
@@ -145,6 +194,7 @@ struct Graph {
     scopes: BTreeMap<Vec<String>, Scope>,
     models: Vec<CompiledSourceAlbModel>,
     globals: BTreeSet<String>,
+    occurrences: BTreeMap<Vec<String>, ScopeOccurrences>,
 }
 
 fn key(text: &str) -> String {
@@ -188,6 +238,111 @@ fn header(header: &str) -> Result<(Vec<String>, Vec<String>)> {
 }
 
 impl Graph {
+    /// The specialization-only path supplies no compiled ALB models and
+    /// indexes X calls without interpreting opaque A devices.
+    fn new(items: &[Item], models: Option<Vec<CompiledSourceAlbModel>>) -> Result<Self> {
+        let index_albs = models.is_some();
+        let mut graph = Self {
+            models: models.unwrap_or_default(),
+            ..Self::default()
+        };
+        graph.collect(items, &[], None)?;
+        for (path, owner) in &graph.scopes {
+            let mut index = ScopeOccurrences::default();
+            let mut x_names = BTreeSet::new();
+            for item in &owner.items {
+                let Item::Statement(statement) = item else {
+                    continue;
+                };
+                let normalized = normalized_statement(statement);
+                let fields = statement_tokens(&normalized)?;
+                if let Some(first) = fields.first()
+                    && first.starts_with(['X', 'x'])
+                    && first.len() > 1
+                    && !x_names.insert(key(first))
+                    && index.duplicate_x_name.is_none()
+                {
+                    index.duplicate_x_name = Some(first.clone());
+                }
+                let occurrence = if let Some(call) = graph.parse_call(statement, &fields, path)? {
+                    Some(SourceOccurrence::Call(call))
+                } else if index_albs {
+                    graph
+                        .parse_alb_instance(statement, &normalized, &fields, path)?
+                        .map(SourceOccurrence::Alb)
+                } else {
+                    None
+                };
+                if let Some(occurrence) = occurrence {
+                    index
+                        .by_statement
+                        .insert(statement.clone(), index.ordered.len());
+                    index.ordered.push(occurrence);
+                }
+            }
+            graph.occurrences.insert(path.clone(), index);
+        }
+        Ok(graph)
+    }
+
+    fn occurrences(&self, scope: &[String]) -> Result<&ScopeOccurrences> {
+        self.occurrences
+            .get(scope)
+            .context("missing lexical occurrence index")
+    }
+
+    fn call(&self, statement: &str, scope: &[String]) -> Result<Option<&Call>> {
+        Ok(match self.occurrences(scope)?.get(statement) {
+            Some(SourceOccurrence::Call(call)) => Some(call),
+            _ => None,
+        })
+    }
+
+    fn alb_instance(&self, statement: &str, scope: &[String]) -> Result<Option<&LogicalInstance>> {
+        Ok(match self.occurrences(scope)?.get(statement) {
+            Some(SourceOccurrence::Alb(alb)) => Some(alb),
+            _ => None,
+        })
+    }
+
+    /// Global alias allocation changes terminals, not lexical model binding.
+    /// Reproject the original parsed pins and append the implicit global
+    /// actuals in the same order as their new child formals.
+    fn rebind_global_occurrences(&mut self) -> Result<()> {
+        for (path, index) in &mut self.occurrences {
+            let owner = self.scopes.get(path).context("missing occurrence owner")?;
+            for occurrence in &mut index.ordered {
+                match occurrence {
+                    SourceOccurrence::Alb(alb) => {
+                        for node in alb.inputs.iter_mut().chain(&mut alb.outputs) {
+                            *node = owner.mapped_node(node);
+                        }
+                    }
+                    SourceOccurrence::Call(call) => {
+                        let child = self
+                            .scopes
+                            .get(&call.target)
+                            .context("missing occurrence child")?;
+                        ensure!(
+                            call.actual.len() + child.global_formals.len() == child.ports.len(),
+                            "indexed X occurrence arity changed before global projection"
+                        );
+                        for node in &mut call.actual {
+                            *node = owner.mapped_node(node);
+                        }
+                        call.actual.extend(
+                            child
+                                .global_formals
+                                .keys()
+                                .map(|node| owner.mapped_node(node)),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn collect(&mut self, items: &[Item], scope: &[String], header: Option<&str>) -> Result<()> {
         let (ports, suffix) = if let Some(head) = header {
             self::header(head)?
@@ -264,21 +419,25 @@ impl Graph {
         }
     }
 
-    fn call(&self, statement: &str, scope: &[String]) -> Result<Option<Call>> {
-        let fields = statement_tokens(&normalized_statement(statement))?;
+    fn parse_call(
+        &self,
+        statement: &str,
+        fields: &[String],
+        scope: &[String],
+    ) -> Result<Option<Call>> {
         let Some(instance) = fields.first() else {
             return Ok(None);
         };
         if !instance.starts_with(['X', 'x']) || instance.len() <= 1 {
             return Ok(None);
         }
-        let mut found = Vec::new();
+        let mut found = None;
         for (idx, token) in fields.iter().enumerate().skip(1) {
             let Some(target) = self.lookup_subckt(scope, token) else {
                 continue;
             };
             let model = self.scopes.get(&target).context("missing lexical subckt")?;
-            if idx != model.ports.len() - model.global_formals.len() + 1 {
+            if idx != model.ports.len() + 1 {
                 continue;
             }
             let suffix = &fields[idx + 1..];
@@ -289,32 +448,28 @@ impl Graph {
             }) {
                 continue;
             }
-            let owner = self
-                .scopes
-                .get(scope)
-                .context("missing original call scope")?;
-            let actual = fields[1..idx]
-                .iter()
-                .chain(model.global_formals.keys())
-                .map(|node| owner.mapped_node(node))
-                .collect();
-            found.push(Call {
+            let actual = fields[1..idx].iter().map(|node| key(node)).collect();
+            ensure!(
+                found.is_none(),
+                "ambiguous X instance model lookup in {statement}"
+            );
+            found = Some(Call {
                 target,
                 actual,
                 suffix: suffix.to_vec(),
                 name: instance.clone(),
             });
         }
-        match found.as_slice() {
-            [] => Ok(None),
-            [item] => Ok(Some(item.clone())),
-            _ => bail!("ambiguous X instance model lookup in {statement}"),
-        }
+        Ok(found)
     }
 
-    fn alb_instance(&self, statement: &str, scope: &[String]) -> Result<Option<LogicalInstance>> {
-        let normalized = normalized_statement(statement);
-        let fields = statement_tokens(&normalized)?;
+    fn parse_alb_instance(
+        &self,
+        statement: &str,
+        normalized: &str,
+        fields: &[String],
+        scope: &[String],
+    ) -> Result<Option<LogicalInstance>> {
         let Some(inst) = fields.first() else {
             return Ok(None);
         };
@@ -382,17 +537,13 @@ impl Graph {
             "ALB {inst} pin arity differs from compiled model {}",
             model.model_name
         );
-        let owner = self.scopes.get(scope).context("missing ALB source scope")?;
+        let [inputs, outputs] = ports
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("ALB {inst} requires two port vectors"))?;
         Ok(Some(LogicalInstance {
             name: inst.clone(),
-            inputs: ports[0]
-                .iter()
-                .map(|node| owner.mapped_node(node))
-                .collect(),
-            outputs: ports[1]
-                .iter()
-                .map(|node| owner.mapped_node(node))
-                .collect(),
+            inputs,
+            outputs,
             target,
         }))
     }
@@ -458,20 +609,15 @@ impl Graph {
         loop {
             let mut scalar_parents = BTreeSet::new();
             for (path, owner) in &self.scopes {
-                for item in &owner.items {
-                    if let Item::Statement(statement) = item
-                        && let Some(call) = self.call(statement, path)?
-                    {
-                        let child = self
-                            .scopes
-                            .get(&call.target)
-                            .context("missing scalar child")?;
-                        for (formal, actual) in child.ports.iter().zip(&call.actual) {
-                            if child.analog_cut_formals.contains(formal)
-                                && owner.ports.contains(actual)
-                            {
-                                scalar_parents.insert((path.clone(), actual.clone()));
-                            }
+                for call in self.occurrences(path)?.calls() {
+                    let child = self
+                        .scopes
+                        .get(&call.target)
+                        .context("missing scalar child")?;
+                    for (formal, actual) in child.ports.iter().zip(&call.actual) {
+                        if child.analog_cut_formals.contains(formal) && owner.ports.contains(actual)
+                        {
+                            scalar_parents.insert((path.clone(), actual.clone()));
                         }
                     }
                 }
@@ -593,50 +739,37 @@ impl Graph {
     }
 
     fn discover_roles(&mut self) -> Result<()> {
-        let scopes = self.scopes.keys().cloned().collect::<Vec<_>>();
-        for scope in &scopes {
-            let items = self
+        for (scope, index) in &self.occurrences {
+            let info = self
                 .scopes
-                .get(scope)
-                .context("missing scope")?
-                .items
-                .clone();
-            for item in items {
-                if let Item::Statement(statement) = item
-                    && let Some(alb) = self.alb_instance(&statement, scope)?
-                {
-                    let info = self
-                        .scopes
-                        .get_mut(scope)
-                        .context("missing mutable scope")?;
-                    info.digital
-                        .extend(alb.inputs.into_iter().chain(alb.outputs));
-                }
-            }
+                .get_mut(scope)
+                .context("missing mutable scope")?;
+            info.digital.extend(
+                index
+                    .albs()
+                    .flat_map(|alb| alb.inputs.iter().chain(&alb.outputs))
+                    .cloned(),
+            );
         }
         loop {
             let mut changes = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
-            for scope in &scopes {
+            for (scope, index) in &self.occurrences {
                 let info = self.scopes.get(scope).context("missing scope")?;
-                for item in &info.items {
-                    if let Item::Statement(stmt) = item
-                        && let Some(call) = self.call(stmt, scope)?
-                    {
-                        let child = self.scopes.get(&call.target).context("missing child")?;
-                        for (formal, actual) in child.ports.iter().zip(&call.actual) {
-                            if child.analog_cut_formals.contains(formal) {
-                                continue;
-                            }
-                            if info.digital.contains(actual) || child.digital.contains(formal) {
-                                changes
-                                    .entry(scope.clone())
-                                    .or_default()
-                                    .insert(actual.clone());
-                                changes
-                                    .entry(call.target.clone())
-                                    .or_default()
-                                    .insert(formal.clone());
-                            }
+                for call in index.calls() {
+                    let child = self.scopes.get(&call.target).context("missing child")?;
+                    for (formal, actual) in child.ports.iter().zip(&call.actual) {
+                        if child.analog_cut_formals.contains(formal) {
+                            continue;
+                        }
+                        if info.digital.contains(actual) || child.digital.contains(formal) {
+                            changes
+                                .entry(scope.clone())
+                                .or_default()
+                                .insert(actual.clone());
+                            changes
+                                .entry(call.target.clone())
+                                .or_default()
+                                .insert(formal.clone());
                         }
                     }
                 }
@@ -673,13 +806,9 @@ impl Graph {
             "recursive ALB pin hierarchy at {scope:?}"
         );
         stack.push(scope.to_vec());
-        let info = self.scopes.get(scope).context("missing ALB pin scope")?;
         let mut result = Vec::new();
-        for item in &info.items {
-            let Item::Statement(statement) = item else {
-                continue;
-            };
-            if let Some(alb) = self.alb_instance(statement, scope)? {
+        for occurrence in &self.occurrences(scope)?.ordered {
+            if let SourceOccurrence::Alb(alb) = occurrence {
                 let pins = match direction {
                     DigitalPinDirection::Input => &alb.inputs,
                     DigitalPinDirection::Output => &alb.outputs,
@@ -695,7 +824,7 @@ impl Graph {
                         });
                     }
                 }
-            } else if let Some(call) = self.call(statement, scope)? {
+            } else if let SourceOccurrence::Call(call) = occurrence {
                 let child = self
                     .scopes
                     .get(&call.target)
@@ -746,34 +875,19 @@ impl Graph {
     /// must not propagate down from arbitrary callers: a child that only
     /// senses a pin must remain an input even when its parent also drives it.
     fn discover_alb_roles(&mut self) -> Result<()> {
-        let scopes = self.scopes.keys().cloned().collect::<Vec<_>>();
-        for scope in &scopes {
-            let items = self
+        for (scope, index) in &self.occurrences {
+            let roles = &mut self
                 .scopes
-                .get(scope)
-                .context("missing scope")?
-                .items
-                .clone();
-            for item in items {
-                if let Item::Statement(statement) = item
-                    && let Some(alb) = self.alb_instance(&statement, scope)?
-                {
-                    let roles = &mut self
-                        .scopes
-                        .get_mut(scope)
-                        .context("missing ALB scope")?
-                        .alb_roles;
-                    for input in alb.inputs {
-                        roles
-                            .entry(input)
-                            .or_default()
-                            .insert(DigitalPinDirection::Input);
-                    }
-                    for output in alb.outputs {
-                        roles
-                            .entry(output)
-                            .or_default()
-                            .insert(DigitalPinDirection::Output);
+                .get_mut(scope)
+                .context("missing ALB scope")?
+                .alb_roles;
+            for alb in index.albs() {
+                for (nodes, direction) in [
+                    (&alb.inputs, DigitalPinDirection::Input),
+                    (&alb.outputs, DigitalPinDirection::Output),
+                ] {
+                    for node in nodes {
+                        roles.entry(node.clone()).or_default().insert(direction);
                     }
                 }
             }
@@ -781,25 +895,20 @@ impl Graph {
         loop {
             let mut changes =
                 BTreeMap::<Vec<String>, BTreeMap<String, BTreeSet<DigitalPinDirection>>>::new();
-            for scope in &scopes {
-                let parent = self.scopes.get(scope).context("missing parent")?;
-                for item in &parent.items {
-                    if let Item::Statement(statement) = item
-                        && let Some(call) = self.call(statement, scope)?
-                    {
-                        let child = self.scopes.get(&call.target).context("missing child")?;
-                        for (formal, actual) in child.ports.iter().zip(&call.actual) {
-                            if child.analog_cut_formals.contains(formal) {
-                                continue;
-                            }
-                            if let Some(directions) = child.alb_roles.get(formal) {
-                                changes
-                                    .entry(scope.clone())
-                                    .or_default()
-                                    .entry(actual.clone())
-                                    .or_default()
-                                    .extend(directions);
-                            }
+            for (scope, index) in &self.occurrences {
+                for call in index.calls() {
+                    let child = self.scopes.get(&call.target).context("missing child")?;
+                    for (formal, actual) in child.ports.iter().zip(&call.actual) {
+                        if child.analog_cut_formals.contains(formal) {
+                            continue;
+                        }
+                        if let Some(directions) = child.alb_roles.get(formal) {
+                            changes
+                                .entry(scope.clone())
+                                .or_default()
+                                .entry(actual.clone())
+                                .or_default()
+                                .extend(directions);
                         }
                     }
                 }
@@ -1448,7 +1557,7 @@ impl Graph {
             return Ok(());
         }
         if let Some(call) = self.call(statement, scope)? {
-            self.render_call(&call, ctx, output)?;
+            self.render_call(call, ctx, output)?;
             return Ok(());
         }
         if render_external_x(statement, ctx, info, physical, output)? {
@@ -1575,26 +1684,22 @@ fn plan_original_node_roles(
         !scope.ports.contains(&analog.to_owned()) || scope.analog_cut_formals.contains(analog),
         "bidirectional exported node {analog} has no analog-facing interface cut"
     );
-    for item in &scope.items {
-        if let Item::Statement(stmt) = item
-            && let Some(call) = graph.call(stmt, path)?
-        {
-            let child = graph
-                .scopes
-                .get(&call.target)
-                .context("missing child scope")?;
-            for (formal, actual) in child.ports.iter().zip(&call.actual) {
-                if actual == analog {
-                    if child.analog_cut_formals.contains(formal) {
-                        continue;
-                    }
-                    let directions = child.alb_roles.get(formal);
-                    ensure!(
-                        directions.is_some_and(|roles| roles.len() == 1),
-                        "bidirectional ALB node {analog} connects to ambiguous digital formal {formal} of {}; a single X port cannot represent both physical directions",
-                        call.name
-                    );
+    for call in graph.occurrences(path)?.calls() {
+        let child = graph
+            .scopes
+            .get(&call.target)
+            .context("missing child scope")?;
+        for (formal, actual) in child.ports.iter().zip(&call.actual) {
+            if actual == analog {
+                if child.analog_cut_formals.contains(formal) {
+                    continue;
                 }
+                let directions = child.alb_roles.get(formal);
+                ensure!(
+                    directions.is_some_and(|roles| roles.len() == 1),
+                    "bidirectional ALB node {analog} connects to ambiguous digital formal {formal} of {}; a single X port cannot represent both physical directions",
+                    call.name
+                );
             }
         }
     }
@@ -1666,21 +1771,9 @@ fn producer_slot(
     }
     let instance_name = &producer.identity.path[0];
     let formal = &producer.slot.1;
-    let info = graph
-        .scopes
-        .get(scope)
-        .context("missing producer parent scope")?;
-    let child = info
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Statement(statement) => Some(statement),
-            Item::Subcircuit(_) => None,
-        })
-        .map(|statement| graph.call(statement, scope))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
+    let child = graph
+        .occurrences(scope)?
+        .calls()
         .find(|call| key(&call.name) == *instance_name)
         .with_context(|| format!("missing selected X instance {instance_name} in {scope:?}"))?;
     let child_outputs = graph.producer_paths(&child.target, formal)?;
@@ -2119,12 +2212,7 @@ pub fn expand_logical_alb_source_with_opaque_x_interfaces(
         !models.is_empty(),
         "source has no compilable D_LOGIC_BLOCK models"
     );
-    let mut graph = Graph {
-        models,
-        scopes: BTreeMap::new(),
-        globals: BTreeSet::new(),
-    };
-    graph.collect(&items, &[], None)?;
+    let mut graph = Graph::new(&items, Some(models))?;
     let scopes = discovery::dependency_order(&graph)?;
     global_nodes::prepare(&mut graph, &scopes)?;
     graph.mark_native_external_digital(&external)?;
@@ -2174,4 +2262,100 @@ pub fn expand_logical_alb_source_with_opaque_x_interfaces(
         deck: output,
         library,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lexical_index_separates_pin_roles_from_connectivity_and_rebinds_globals() -> Result<()> {
+        let source = r#"
+.global shared
+Aroot [drive] [shared] DL
+.model DL d_logic_block input_load=2p out_res=40 out_delay=2n family="HC" def="out[0] = in[0];"
+Xone first WRAPPER
+Xtwo second WRAPPER
+Xpassive shared PASSIVE
+.subckt WRAPPER q
+Xinner q INNER
+.ends WRAPPER
+.subckt INNER q
+Ainner [shared] [q] DL
+.model DL d_logic_block input_load=3p out_res=50 out_delay=3n family="HC" def="out[0] = in[0];"
+.ends INNER
+.subckt PASSIVE p
+.ends PASSIVE
+.end
+"#;
+        let items = parse_items(source)?;
+        let models = compile_explicit_alb_source_models(source)?;
+        let mut graph = Graph::new(&items, Some(models))?;
+        let scopes = discovery::dependency_order(&graph)?;
+        let wrapper = vec!["WRAPPER".to_owned()];
+        let inner = vec!["INNER".to_owned()];
+        let passive = vec!["PASSIVE".to_owned()];
+
+        global_nodes::prepare(&mut graph, &scopes)?;
+        let inner_alias = graph.scopes[&inner].global_formals["SHARED"].clone();
+        let wrapper_alias = graph.scopes[&wrapper].global_formals["SHARED"].clone();
+        let root_calls = graph.occurrences(&[])?.calls().collect::<Vec<_>>();
+        assert_eq!(root_calls.len(), 3);
+        assert_eq!(root_calls[0].name.to_ascii_uppercase(), "XONE");
+        assert_eq!(root_calls[1].name.to_ascii_uppercase(), "XTWO");
+        assert_eq!(root_calls[0].actual, ["FIRST", "SHARED"]);
+        assert_eq!(root_calls[1].actual, ["SECOND", "SHARED"]);
+        let wrapper_call = graph
+            .occurrences(&wrapper)?
+            .calls()
+            .next()
+            .context("missing wrapper call")?;
+        assert_eq!(wrapper_call.actual, ["Q", wrapper_alias.as_str()]);
+        let child = graph
+            .occurrences(&inner)?
+            .albs()
+            .next()
+            .context("missing nested ALB")?;
+        assert_eq!(child.inputs, [inner_alias.as_str()]);
+        let root = graph
+            .occurrences(&[])?
+            .albs()
+            .next()
+            .context("missing root ALB")?;
+        assert_ne!(root.target, child.target);
+
+        graph.discover_alb_roles()?;
+        graph.discover_roles()?;
+        let root_roles = &graph.scopes[&Vec::<String>::new()].alb_roles["SHARED"];
+        assert_eq!(
+            root_roles,
+            &BTreeSet::from([DigitalPinDirection::Input, DigitalPinDirection::Output])
+        );
+        assert_eq!(
+            graph.scopes[&inner].alb_roles[&inner_alias],
+            BTreeSet::from([DigitalPinDirection::Input])
+        );
+        assert_eq!(
+            graph.scopes[&wrapper].alb_roles[&wrapper_alias],
+            BTreeSet::from([DigitalPinDirection::Input])
+        );
+        assert!(graph.scopes[&passive].digital.contains("P"));
+        assert!(!graph.scopes[&passive].alb_roles.contains_key("P"));
+
+        let inputs = graph.pin_paths(&[], "SHARED", DigitalPinDirection::Input, &mut Vec::new())?;
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].path, ["XONE", "XINNER", "AINNER"]);
+        assert_eq!(inputs[1].path, ["XTWO", "XINNER", "AINNER"]);
+        Ok(())
+    }
+
+    #[test]
+    fn specialization_index_detects_duplicate_opaque_x_names() -> Result<()> {
+        let items = parse_items("Xexternal a b unknown\nxEXTERNAL c d other\n.end\n")?;
+        let graph = Graph::new(&items, None)?;
+        let root = graph.occurrences(&[])?;
+        assert_eq!(root.calls().count(), 0);
+        assert!(root.check_unique_x_names(&[]).is_err());
+        Ok(())
+    }
 }

@@ -48,13 +48,16 @@ fn measurements(stdout: &str) -> BTreeMap<usize, f64> {
         .collect()
 }
 
-fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result<()> {
+fn measurement_control(checks: &[(String, f64, f64)]) -> Result<String> {
     let mut control = String::from("tran 10n 9u\n");
     for (index, (node, time, _)) in checks.iter().enumerate() {
         writeln!(control, "meas tran check{index} find v({node}) at={time}u")?;
     }
-    let stdout = run_native(runtime, source, &control)?;
-    let actual = measurements(&stdout);
+    Ok(control)
+}
+
+fn verify_measurements(stdout: &str, checks: &[(String, f64, f64)]) -> Result<()> {
+    let actual = measurements(stdout);
     for (index, (node, time, expected)) in checks.iter().enumerate() {
         let value = *actual
             .get(&index)
@@ -65,6 +68,11 @@ fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result
         );
     }
     Ok(())
+}
+
+fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result<()> {
+    let stdout = run_native(runtime, source, &measurement_control(checks)?)?;
+    verify_measurements(&stdout, checks)
 }
 
 fn loaded(high: bool) -> f64 {
@@ -992,6 +1000,203 @@ I2 rtn b PWL(0 -6 1u -6 4u 6 7u -6 9u -6)
     verify(runtime, source, &checks)
 }
 
+// Logical stimulus is independent of physical polarity. The initial high
+// clock must qualify in DC without creating a spurious triggering edge.
+const CLASSIC_TIMELINE: [(f64, bool, bool, bool); 18] = [
+    (0., false, false, true),
+    (0.4, false, false, false),
+    (0.6, true, false, false),
+    (1., true, false, true),
+    (1.5, false, false, true),
+    (2., false, false, false),
+    (2.5, true, true, false),
+    (3., true, true, true),
+    (3.5, false, true, true),
+    (4., false, true, false),
+    (4.5, true, false, false),
+    (5., true, false, true),
+    (5.5, true, true, true),
+    (6., true, true, false),
+    (6.5, false, false, false),
+    (7., false, false, true),
+    (7.5, true, true, true),
+    (8., false, false, false),
+];
+
+fn classic_stimulus(source: &mut String, logic: &str, negative: bool) -> Result<()> {
+    let rail = |value: bool| if value ^ negative { 5 } else { 0 };
+    for (column, name) in ["data", "reset", "clock"].into_iter().enumerate() {
+        write!(source, "V{name}{logic} {name}{logic} rtn PWL(")?;
+        let mut previous = 0;
+        for (index, &(time, data, reset, clock)) in CLASSIC_TIMELINE.iter().enumerate() {
+            let value = rail([data, reset, clock][column]);
+            if index == 0 {
+                write!(source, "0 {value}")?;
+            } else if value != previous {
+                write!(source, " {time}u {previous} {}u {value}", time + 0.04)?;
+            }
+            previous = value;
+        }
+        writeln!(source, " 9u {previous})")?;
+    }
+    Ok(())
+}
+
+struct ClassicCase<'a> {
+    kind: &'a str,
+    logic: &'a str,
+    negative: bool,
+    high: bool,
+    initial: bool,
+}
+
+impl ClassicCase<'_> {
+    fn id(&self) -> String {
+        format!(
+            "{}{}{}{}",
+            self.kind,
+            self.logic,
+            u8::from(self.high),
+            u8::from(self.initial)
+        )
+    }
+
+    fn emit(&self, source: &mut String) -> Result<()> {
+        let id = self.id();
+        let Self {
+            kind,
+            logic,
+            high,
+            initial,
+            ..
+        } = *self;
+        let selector = if kind == "LATCH" {
+            format!("ENABLE_LEVEL={}", u8::from(high))
+        } else if high {
+            "TRIG_COND=0_TO_1".to_owned()
+        } else {
+            "TRIG_COND=1_TO_0".to_owned()
+        };
+        writeln!(
+            source,
+            ".MODEL M{id} {kind} TH=2.5 HYSTWD=1 VOL=0.5 VOH=4.5 RIN=10Meg ROUT=10 LOGIC={logic} {selector}"
+        )?;
+        let complement = if kind == "LATCH" {
+            String::new()
+        } else {
+            format!(" qb{id}")
+        };
+        let reset = if matches!(kind, "CLK_SRFF" | "CLK_JKFF") {
+            format!(" reset{logic}")
+        } else {
+            String::new()
+        };
+        writeln!(
+            source,
+            "!D{id} q{id}{complement} rtn data{logic}{reset} clock{logic} M{id} IC={}",
+            u8::from(initial)
+        )?;
+        writeln!(source, "R{id} q{id} rtn 100")?;
+        if kind != "LATCH" {
+            writeln!(source, "RB{id} qb{id} rtn 100")?;
+        }
+        Ok(())
+    }
+
+    fn expected(&self, checks: &mut Vec<(String, f64, f64)>) -> (bool, Vec<(f64, bool)>) {
+        let id = self.id();
+        let Self {
+            kind,
+            negative,
+            high,
+            initial,
+            ..
+        } = *self;
+        let mut q = initial;
+        let mut old_clock = CLASSIC_TIMELINE[0].3;
+        let mut initial_q = q;
+        let mut events = Vec::new();
+        for (index, &(time, data, reset, clock)) in CLASSIC_TIMELINE.iter().enumerate() {
+            let previous = q;
+            if kind == "LATCH" {
+                if clock == high {
+                    q = data;
+                }
+            } else if index > 0 && old_clock != clock && clock == high {
+                q = match kind {
+                    "CLK_DFF" => data,
+                    "CLK_TFF" => q ^ data,
+                    "CLK_JKFF" if data && reset => !q,
+                    "CLK_SRFF" | "CLK_JKFF" if data != reset => data,
+                    _ => q,
+                };
+            }
+            old_clock = clock;
+            if index == 0 {
+                initial_q = q;
+            } else if q != previous {
+                // Both directed threshold crossings occur 24ns into
+                // the 40ns ramp. Use event time, not analog interpolation.
+                events.push(((time + 0.024) * 1e-6, q));
+            }
+            let sample = time + 0.15;
+            checks.push((format!("q{id}"), sample, loaded(q ^ negative)));
+            if kind != "LATCH" {
+                checks.push((format!("qb{id}"), sample, loaded(!q ^ negative)));
+            }
+        }
+        (initial_q, events)
+    }
+}
+
+fn classic_clocked_state_elements(runtime: &Path) -> Result<()> {
+    let mut source = String::from("Vref rtn 0 0.75\n");
+    let mut checks = Vec::new();
+    let mut initials = Vec::new();
+    let mut edges = Vec::new();
+    let mut print_states = String::from("eprint");
+    for (logic, negative) in [("POS", false), ("NEG", true)] {
+        classic_stimulus(&mut source, logic, negative)?;
+        for kind in ["CLK_SRFF", "CLK_JKFF", "CLK_DFF", "CLK_TFF", "LATCH"] {
+            for high in [false, true] {
+                for initial in [false, true] {
+                    let case = ClassicCase {
+                        kind,
+                        logic,
+                        negative,
+                        high,
+                        initial,
+                    };
+                    case.emit(&mut source)?;
+                    let (initial_q, expected) = case.expected(&mut checks);
+                    initials.push(initial_q);
+                    edges.push(expected);
+                    // Escaped device names encode underscores as _5F.
+                    let stem = case.id().replace('_', "_5F");
+                    write!(print_states, " __D{stem}_Q_STATE")?;
+                }
+            }
+        }
+    }
+    source.push_str(".end\n");
+    let mut control = String::from("set numdgt=17\n");
+    control.push_str(&measurement_control(&checks)?);
+    writeln!(control, "{print_states}")?;
+    let stdout = run_native(runtime, &source, &control)?;
+    verify_measurements(&stdout, &checks)?;
+    let initials: [bool; 40] = initials
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("incorrect classic state matrix width"))?;
+    let expected = edges.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    check_edges(&event_edges(&stdout, initials), &expected)?;
+    let count = edges.iter().map(Vec::len).sum::<usize>();
+    println!(
+        "Classic sequential state matrix: {} independent level checks, {count} exact digital transitions",
+        checks.len()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -1003,6 +1208,7 @@ fn main() -> Result<()> {
     );
     numbered_logic_all_arities_polarities_and_initial_states(&runtime)?;
     sr_latch_polarities_priorities_and_loaded_complements(&runtime)?;
+    classic_clocked_state_elements(&runtime)?;
     advanced_gate_receivers_ignore_output_initial_hint(&runtime)?;
     advanced_gate_vendor_boundaries_and_trailing_inversions(&runtime)?;
     advanced_latch_vendor_ambiguous_inputs(&runtime)?;
