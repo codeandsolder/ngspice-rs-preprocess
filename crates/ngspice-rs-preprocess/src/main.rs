@@ -15,7 +15,7 @@ use std::{
 
 const USAGE: &str = "\
 Usage: ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
-Formats: native-deck, native-library, simplis-deck, simetrix-deck,
+Formats: native-deck, native-library, qspice-deck, qspice-library, simplis-deck, simetrix-deck,
          expanded-deck, expanded-library, simplis-library, simetrix-library
 Options:
   --device-config PATH        Request-local SIMetrix device configuration

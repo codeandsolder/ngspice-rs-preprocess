@@ -16,6 +16,7 @@ pub mod model_card;
 pub mod param_expression;
 pub mod parameter_scope;
 pub mod passive_ic;
+pub mod qspice;
 pub mod vdmos_card;
 pub mod vdmos_ltspice;
 pub mod waveform;
@@ -50,6 +51,8 @@ static SIMPLIS_PREPROCESSOR_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub enum NormalizationPass {
     /// Replace Latin-1 or UTF-8 non-breaking spaces with ordinary spaces.
     NormalizeNbspWhitespace,
+    /// Lower qualified QSPICE plaintext syntax to native syntax.
+    QspiceSource,
     /// Expand `LTspice`'s `L ... Rser=` extension to an ideal inductor plus resistor.
     LtspiceInductorRser,
     /// Normalize controlled TABLE syntax and lower FREQ to native xfer models.

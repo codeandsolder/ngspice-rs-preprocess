@@ -41,6 +41,19 @@ impl LinkedSource {
 pub struct SourceLinker {
     /// Directories to search after the including file's containing directory.
     pub search_paths: Vec<PathBuf>,
+    /// Meaning of one-operand library references.
+    pub library_syntax: LibrarySyntax,
+}
+
+/// Dialect-specific interpretation of library references.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LibrarySyntax {
+    /// A single operand introduces a named section; references require a section.
+    #[default]
+    NamedSections,
+    /// A single operand references an entire file outside a selected section.
+    /// Two operands reference a named section in another file.
+    WholeFileOrSection,
 }
 
 /// Root source treatment. Included resources are always include-safe.
@@ -281,6 +294,18 @@ impl SourceLinker {
 
 impl LinkState<'_> {
     fn resolve(&self, path: &Path, parent: &Path) -> Result<PathBuf> {
+        // Source paths in whole-file library dialects commonly use Windows
+        // separators. Normalize relative paths without inventing a drive mapping.
+        let portable;
+        let path = if self.settings.library_syntax == LibrarySyntax::WholeFileOrSection {
+            portable = path
+                .to_str()
+                .context("non-UTF-8 resource path")?
+                .replace('\\', "/");
+            Path::new(&portable)
+        } else {
+            path
+        };
         let local = parent.parent().into_iter().map(|dir| dir.join(path));
         let candidates = local.chain(self.settings.search_paths.iter().map(|dir| dir.join(path)));
         for candidate in candidates {
@@ -370,6 +395,9 @@ impl LinkState<'_> {
         kind: RootKind,
     ) -> Result<()> {
         let path = &source.path;
+        if self.settings.library_syntax == LibrarySyntax::WholeFileOrSection {
+            crate::qspice::validate_resource(path, &source.bytes)?;
+        }
         crate::lexical::ensure_textual(&source.bytes)?;
         let (body, first_line) = if kind == RootKind::Deck {
             let title = source
@@ -388,6 +416,16 @@ impl LinkState<'_> {
             .split_inclusive(|byte| *byte == b'\n')
             .collect::<Vec<_>>();
         for record in records(body, first_line)? {
+            // Recognize non-ASCII device classes before decoding the statement;
+            // QSPICE netlists may use either ANSI or UTF-8 device prefixes.
+            if self.settings.library_syntax == LibrarySyntax::WholeFileOrSection
+                && record.logical.first().is_some_and(|byte| !byte.is_ascii())
+            {
+                if selection.selected() {
+                    crate::qspice::reject_special_device(path, record.line)?;
+                }
+                continue;
+            }
             let text = std::str::from_utf8(&record.logical).with_context(|| {
                 format!(
                     "{}:{}: invalid source encoding",
@@ -397,7 +435,15 @@ impl LinkState<'_> {
             })?;
             let control_start = directive(text, ".control").is_some();
             let control_end = directive(text, ".endc").is_some();
-            if !in_control && !control_start && !selection.observe(text, path, record.line)? {
+            if !in_control
+                && !control_start
+                && !selection.observe_with_syntax(
+                    text,
+                    path,
+                    record.line,
+                    self.settings.library_syntax,
+                )?
+            {
                 continue;
             }
             let selected = selection.selected();
@@ -449,12 +495,16 @@ impl LinkState<'_> {
             return self.expand(Path::new(&args[0]), path, None);
         }
         if let Some(args) = library_marker(text)? {
-            ensure!(
-                args.len() == 2,
-                "{}:{physical_line}: native .lib requires a file and section",
-                path.display()
-            );
-            return self.expand(Path::new(&args[0]), path, Some(&args[1]));
+            return match args.as_slice() {
+                [file, section] => self.expand(Path::new(file), path, Some(section)),
+                [file] if self.settings.library_syntax == LibrarySyntax::WholeFileOrSection => {
+                    self.expand(Path::new(file), path, None)
+                }
+                _ => bail!(
+                    "{}:{physical_line}: .lib requires a file and section in this dialect",
+                    path.display()
+                ),
+            };
         }
         if kind == RootKind::Include && text.eq_ignore_ascii_case(".end") {
             // An included terminator must not terminate the consuming deck.
@@ -487,8 +537,20 @@ impl<'a> SectionSelection<'a> {
 
     /// Return false for section boundary records; they are never emitted.
     fn observe(&mut self, text: &str, path: &Path, line: usize) -> Result<bool> {
+        self.observe_with_syntax(text, path, line, LibrarySyntax::NamedSections)
+    }
+
+    fn observe_with_syntax(
+        &mut self,
+        text: &str,
+        path: &Path,
+        line: usize,
+        syntax: LibrarySyntax,
+    ) -> Result<bool> {
         if let Some(args) = library_marker(text)?
             && args.len() == 1
+            && (syntax == LibrarySyntax::NamedSections
+                || (self.wanted.is_some() && self.active.is_none()))
         {
             ensure!(
                 self.active.is_none(),
@@ -699,6 +761,7 @@ mod tests {
         fs::write(&root,b"title\n.include part.inc\n.lib disabled\n.model invalid vdmos(vto=1)\n.endl disabled\n.model accepted vdmos (kp={scale})\n")?;
         let linked = SourceLinker {
             search_paths: vec![libs],
+            library_syntax: LibrarySyntax::NamedSections,
         }
         .link(&root)?;
         let library = ModelLibrary::parse(&linked.bytes)?;

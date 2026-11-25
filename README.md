@@ -35,12 +35,23 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | --- | --- | --- |
 | `native-deck` | Native-compatible circuit; link static includes and preserve title/analysis/terminator | `deck.cir` |
 | `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
+| `qspice-deck` | QSPICE plaintext circuit; link libraries and normalize qualified source semantics | `deck.cir` |
+| `qspice-library` | QSPICE plaintext models; include-safe native source | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
 | `expanded-library` | Lower already expanded dialect source as an include | `model.lib` |
 | `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
 | `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
+
+QSPICE source support is under qualification: whole-file and selected-section
+library references, source-relative paths, explicitly ideal passive branches
+and explicitly bounded transient windows are normalized with source provenance.
+Known unsupported compiled/specialized devices, idealized diode laws, smooth
+switch laws and implicit inductor parasitics produce source-located diagnostics.
+A successful source preparation does not establish equivalence of unqualified
+model defaults or expression semantics. Schematic, symbol and raw-result files
+are not plaintext netlists.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:
