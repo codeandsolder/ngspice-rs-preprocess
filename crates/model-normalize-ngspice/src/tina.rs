@@ -192,6 +192,36 @@ mod tests {
     }
 
     #[test]
+    fn multiple_local_directives_compose_with_other_source_edits() -> Result<()> {
+        let source = b".subckt cell a b .param r=20m .param l=1M\nL1 a b {l} Rser={r}\n.ends\n";
+        let result = normalize_mapped(source, RootKind::Include)?;
+        let output = std::str::from_utf8(&result.model.bytes)?;
+        let expected = [
+            (".subckt cell a b", 1),
+            (".param r=20m", 1),
+            (".param l=1M", 1),
+            ("R__L1_RSER", 2),
+            ("L1 ", 2),
+            (".ends", 3),
+        ];
+        assert_eq!(output.lines().count(), expected.len());
+        for ((line, origin), (prefix, expected_origin)) in
+            output.lines().zip(&result.input_lines).zip(expected)
+        {
+            assert!(line.starts_with(prefix), "{line}");
+            assert_eq!(*origin, expected_origin);
+        }
+        assert_eq!(
+            result.model.passes,
+            [
+                NormalizationPass::TinaInlineParam,
+                NormalizationPass::LtspiceInductorRser
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn quoted_and_grouped_tokens_are_not_directives() -> Result<()> {
         let input = b".subckt a b c PARAMS: p={f('.param')}\n.ends\n";
         let result = normalize_mapped(input, RootKind::Include)?;
