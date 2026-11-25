@@ -35,6 +35,8 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | --- | --- | --- |
 | `native-deck` | Native-compatible circuit; link static includes and preserve title/analysis/terminator | `deck.cir` |
 | `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
+| `hspice-deck` | Link standalone HSPICE sources and bind qualified parameter/model occurrences | `deck.cir` |
+| `hspice-library` | Compile a neutral HSPICE source graph for later deck binding | `library.json` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
@@ -96,6 +98,47 @@ instances in model scope, preserving explicit instance TEMP precedence.
 A different nominal temperature requires preparing the source again.
 Statistical analyses and conflicting or multiple analysis temperatures
 are rejected rather than approximated by the nominal translation.
+
+### Standalone HSPICE
+
+Select `hspice-deck` explicitly; no ngspice compatibility flag is required.
+Raw linked includes and named library sections inherit the including
+resource's lexical dialect, unless a local source header overrides it.
+The compiler preserves the admitted logical statement's physical source
+span, including continuation lines. A compiled HSPICE library is neutral
+source, not a prematurely lowered native include:
+
+```sh
+ngspice-rs-preprocess hspice-library devices.sp catalog --search ./models
+ngspice-rs-preprocess hspice-deck circuit.sp native --parsed-library catalog/library.json
+```
+
+Raw catalog members and compiled members use the same occurrence binding.
+The root deck owns `PARHIER`, `XMULT_IN_EXP`, temperature defaults and
+model-selection policies. Source parameter and model aliases preserve
+electrical terminal names, nested multiplier products, and source spans.
+Native output retains qualified OP, source DC, AC and single-interval
+transient commands. The supported model subset is nongeometric level-1
+junction diodes (including AREA/PJ, breakdown and depletion charge) and
+level-54 Berkeley BSIM4 versions 4.5.0, 4.6.4 and 4.7.0 with the qualified
+ACM=12 junction mode. Geometry bins use source-order, lexical model-family
+resolution and half-open length/width intervals, with XLREF/XWREF and
+WNFLAG, rather than native fuzzy bin matching. Version-specific parameter
+inventories reject unknown fields instead of allowing a native parser to
+ignore them.
+
+This is not blanket HSPICE equivalence. Other physical variants, source
+function hierarchy, non-HSPICE model cards inside an overridden resource,
+controlled transfer extensions, statistical or multi-interval analyses
+and unqualified output directives are diagnosed rather than guessed.
+See issues [#68](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/68),
+[#69](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/69),
+[#70](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/70)
+and the [typed analysis schedule work](https://github.com/codeandsolder/ngspice-rs-fast/issues/237).
+The focused HSPICE tests compare authored circuits with documented
+equations and independently selected native ngspice references; they
+do not use a global compatibility mode or claim proprietary simulator
+equivalence.
 
 ### Source model selection
 
