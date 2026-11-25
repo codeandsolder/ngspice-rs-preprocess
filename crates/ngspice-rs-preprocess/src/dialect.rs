@@ -578,7 +578,6 @@ fn linked(
         .map(|library| library.filename.as_str())
         .collect::<BTreeSet<_>>();
     let mut translated_root = translate_simplis_deck(&linked.root_bytes)?;
-    plan.append_native_options(&mut translated_root.bytes)?;
     if request.format == InputFormat::SimplisDeck {
         initial_conditions = Some(super::passive_ic::InitialConditions {
             mode: Some("1".to_owned()),
@@ -588,6 +587,7 @@ fn linked(
     if let Some(policy) = &mut initial_conditions {
         capture_artifact_initial_conditions(&mut translated_root.bytes, "deck.cir", policy)?;
     }
+    plan.append_native_options(&mut translated_root.bytes)?;
     check_closed_includes(&translated_root.bytes, &known)?;
     let mut remaining = options
         .output_bytes

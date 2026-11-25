@@ -869,9 +869,10 @@ pub fn render_projection(statements: &[crate::source_dialect::ProjectedStatement
     output
 }
 
-/// Project a resource with exact admitted physical source spans. Only a
-/// complete SIMetrix deck has a mandatory first-line title. Included files
-/// and SIMPLIS source streams retain their first electrical statement.
+/// Project a resource with exact admitted physical source spans.
+///
+/// Only a complete `SIMetrix` deck has a mandatory first-line title. Included
+/// files and SIMPLIS source streams retain their first electrical statement.
 /// # Errors
 /// Invalid source encoding, continuation, simulator view or source nesting.
 pub fn project_resource(

@@ -352,7 +352,9 @@ fn root_temperature(items: &[Item]) -> Result<f64> {
                         .to_owned(),
                 )
             }
-            Some(".OPTIONS" | ".OPTION") => super::simple_assignment_value(statement, "TEMP"),
+            Some(".OPTIONS" | ".OPTION" | ".OPT") => {
+                super::simple_assignment_value(statement, "TEMP")
+            }
             _ => None,
         };
         if let Some(value) = value {

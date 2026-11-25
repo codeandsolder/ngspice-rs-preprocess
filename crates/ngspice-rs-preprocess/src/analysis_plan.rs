@@ -98,7 +98,7 @@ pub enum Directive {
     Analysis {
         /// Analysis type.
         analysis: AnalysisKind,
-        /// Unevaluated arguments in the declared dialect.
+        /// Canonical native arguments for native requests; otherwise source operands.
         arguments: Vec<String>,
         /// Native transient UIC flag, removed from arguments.
         uic: bool,
@@ -207,6 +207,22 @@ impl AnalysisPlan {
         self.entries
             .iter()
             .filter(|entry| entry.disposition == Disposition::NativeRequest)
+    }
+
+    /// Validate execution without a dialect-specific binding implementation.
+    /// # Errors
+    /// The plan is a library, contains unsupported declarations, or requires binding.
+    pub fn validate_unbound_execution(&self) -> Result<()> {
+        self.validate_supported()?;
+        ensure!(
+            self.kind == PlanKind::Deck,
+            "library plan is not executable"
+        );
+        ensure!(
+            !self.requires_binding(),
+            "analysis plan requires explicit dialect binding"
+        );
+        Ok(())
     }
 
     /// Whether source-specific execution/output binding is required.
@@ -422,17 +438,13 @@ fn analysis_kind(name: &str) -> AnalysisKind {
 fn native_analysis_shape(kind: AnalysisKind, args: &[String]) -> bool {
     let sweep = |value: &str| matches!(value.to_ascii_uppercase().as_str(), "LIN" | "DEC" | "OCT");
     let scalar = |value: &str| {
-        value.starts_with('{')
-            || value.starts_with('\'')
-            || value
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.'))
+        model_translate_simplis::syntax::parse_numeric(value).is_ok()
+            || (value.starts_with('{') && value.ends_with('}'))
     };
     match kind {
         AnalysisKind::OperatingPoint => args.is_empty(),
         AnalysisKind::Transient => {
-            (2..=4).contains(&args.len()) && args.iter().all(|value| scalar(value))
+            (1..=4).contains(&args.len()) && args.iter().all(|value| scalar(value))
         }
         AnalysisKind::Ac => {
             args.len() == 4 && sweep(&args[0]) && args[1..].iter().all(|value| scalar(value))
@@ -451,6 +463,46 @@ fn native_analysis_shape(kind: AnalysisKind, args: &[String]) -> bool {
         AnalysisKind::TransferFunction => args.len() == 2,
         AnalysisKind::Pop | AnalysisKind::Other => false,
     }
+}
+
+/// SIMetrix defaults both output and maximum step to (stop-start)/50.
+/// Do not delegate omitted or zero steps to a different simulator's defaults.
+fn transient_arguments(args: &[String]) -> Option<Vec<String>> {
+    use model_translate_simplis::syntax::parse_numeric;
+    let number = |value: &str| parse_numeric(value).ok();
+    let (step, stop, start, maximum) = match args {
+        [stop] => (None, stop, None, None),
+        [step, stop, rest @ ..] => (Some(step), stop, rest.first(), rest.get(1)),
+        _ => return None,
+    };
+    let start_number = start.map_or(Some(0.0), |v| number(v))?;
+    let stop_number = number(stop)?;
+    if start_number < 0.0 || stop_number <= start_number {
+        return None;
+    }
+    let default = (stop_number - start_number) / 50.0;
+    let normalize_step = |value: Option<&String>| -> Option<String> {
+        match value {
+            Some(value) => {
+                let numeric = number(value)?;
+                if numeric < 0.0 {
+                    return None;
+                }
+                Some(if numeric == 0.0 {
+                    default.to_string()
+                } else {
+                    value.clone()
+                })
+            }
+            None => Some(default.to_string()),
+        }
+    };
+    Some(vec![
+        normalize_step(step)?,
+        stop.clone(),
+        start.cloned().unwrap_or_else(|| "0".to_owned()),
+        normalize_step(maximum)?,
+    ])
 }
 
 fn classify(
@@ -522,6 +574,16 @@ fn classify(
         Unsupported
     } else {
         match (dialect, analysis) {
+            (AnalysisDialect::Simetrix, AnalysisKind::Transient)
+                if native_analysis_shape(analysis, &args) =>
+            {
+                if let Some(native) = transient_arguments(&args) {
+                    args = native;
+                    NativeRequest
+                } else {
+                    RequiresBinding
+                }
+            }
             (AnalysisDialect::Simetrix, _) if native_analysis_shape(analysis, &args) => {
                 NativeRequest
             }

@@ -291,3 +291,29 @@ fn expanded_library_has_no_independent_executable_analysis() -> Result<()> {
     assert!(!text.ends_with(".end\n"));
     Ok(())
 }
+
+#[test]
+fn simetrix_transient_defaults_are_explicit_and_symbolic_requests_require_binding() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("deck.net");
+    fs::write(
+        &root,
+        b"title\nV1 a 0 1\nR1 a 0 1k\n.tran 50u\n.tran 0 100u 50u 0\n.tran 1u {stop}\n.end\n",
+    )?;
+    let prepared = prepare_path(&root, InputFormat::SimetrixDeck)?;
+    let plan = prepared.analysis_plan.as_ref().context("missing plan")?;
+    let requests = plan.native_requests().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let Directive::Analysis { arguments, .. } = &request.directive else {
+            anyhow::bail!("expected analysis");
+        };
+        assert_eq!(arguments.len(), 4);
+        for index in [0, 3] {
+            assert!((arguments[index].parse::<f64>()? - 1e-6).abs() < 1e-18);
+        }
+    }
+    assert_eq!(plan.entries[2].disposition, Disposition::RequiresBinding);
+    assert!(plan.validate_unbound_execution().is_err());
+    Ok(())
+}

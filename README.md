@@ -98,7 +98,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 4 includes
+counts, dependencies and provenance. Manifest version 5 includes
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
 `Artifact::required_code_models` and `PreparedBundle::required_code_models()`.
@@ -240,10 +240,45 @@ or capacitances, or requires unchanged internal current observations, select
 `Options::conditioning = ConditioningPolicy::Disabled` (CLI:
 `--conditioning disabled`). This leaves the original coordinates intact.
 
+### Original analysis intent
+
+A translated dialect deck is an electrical artifact, not an implicitly
+executable replica of the original netlist. Manifest v5 and
+`PreparedBundle::analysis_plan` carry an ordered analysis plan alongside
+the circuit, with explicit source dialect, title, lexical scope and
+declaration locations. Complete SIMetrix decks reserve their first
+physical line as the title; include files and raw SIMPLIS streams do not.
+
+Native-equivalent SIMetrix analyses are represented as requests with
+canonical arguments and a separate UIC flag. A static SIMetrix transient
+request materializes omitted or zero output and maximum steps using
+the SIMetrix default `(stop-start)/50`, rather than ngspice defaults.
+Symbolic transient timing requires explicit binding. Supported physical
+options are emitted in source order; initialization options are owned
+by the typed passive initialization policy. Unsupported options and
+operations, including periodic SIMPLIS analyses, remain visible in the
+plan. SIMPLIS transient and snapshot/output sampling semantics are
+not substituted with ordinary SPICE transient arguments.
+
+Output selectors and measurements retain source coordinates for binding
+against device identities and prepared current scalings. Control scripts
+are opaque unsupported declarations, never executed by preparation.
+Root statements have admitted physical source spans, including
+continuations and selected include sections; generated declarations use
+pre-lowering artifact locations, not fabricated original source lines.
+Include-only plans cannot be executed as complete decks.
+
+Consumers should call `validate_unbound_execution()` before running a
+plan without dialect-specific bindings. Consumers implementing additional
+bindings must inspect every declaration and option disposition and resolve
+source coordinates, initialization and sampling semantics before execution.
+`native_requests()` is a filtered view, not a validation or execution API.
+Native ngspice input retains its own native executable directives.
+
 ### Analysis-scoped passive initialization
 
 The SIMetrix deck policy is carried separately from ordinary electrical
-artifacts in `PreparedBundle::initial_conditions` and manifest v4.
+artifacts in `PreparedBundle::initial_conditions` and manifest v5.
 It retains source-specific `INITCONDMODE`, `ICRES`, per-device `IC`,
 `ICMODE`, and optional `BRANCH`, plus ordered node `.IC` hints. The
 source-only device and node IC fields are removed from the emitted
