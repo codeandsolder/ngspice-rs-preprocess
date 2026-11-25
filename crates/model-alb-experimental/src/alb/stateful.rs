@@ -319,27 +319,27 @@ impl StatefulProgram {
 impl StatefulEventEngine {
     /// Earliest uncanceled scheduled register transition. Consumers using an
     /// event-driven simulator should arrange the next wakeup at this time.
-    #[must_use]
+    #[must_use = "the next due time determines when the simulator must evaluate again"]
     pub fn next_due_time(&self) -> Option<f64> {
         self.events.next_due_time()
     }
 
-    #[must_use]
+    #[must_use = "the input width determines the required input vector size"]
     pub const fn input_width(&self) -> usize {
         self.input_bits.len()
     }
 
-    #[must_use]
+    #[must_use = "the output width determines the required output vector size"]
     pub const fn output_width(&self) -> usize {
         self.output.len()
     }
 
-    #[must_use]
+    #[must_use = "the returned bits describe the currently driven outputs"]
     pub fn output(&self) -> &[AlbDigitalBit] {
         &self.output
     }
 
-    #[must_use]
+    #[must_use = "the returned words describe the requested register state"]
     pub fn register_words(&self, name: &str) -> Option<&[u32]> {
         self.registers
             .iter()
