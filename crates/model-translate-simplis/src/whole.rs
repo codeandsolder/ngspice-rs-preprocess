@@ -1,7 +1,8 @@
 mod logical_ports;
 use super::{
-    AndSpec, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, Point, Translation,
-    TranslationKind, emit_digital_buffer, emit_logic_and, indexed_points, integer_parameter,
+    DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateSpec, LogicIo, LogicPolarity,
+    Point, Translation, TranslationKind, emit_digital_buffer, emit_logic_gate, emit_logic_memory,
+    emit_logic_output, emit_logic_receiver, indexed_points, integer_parameter,
     normalized_statement, numeric_parameter, parse_assignments, sanitized_name, statement_tokens,
     translate_charge_capacitor, translate_ipwlr, translate_vpwlr, validate_node, write_number,
 };
@@ -1405,17 +1406,10 @@ fn raw_srff_model(statement: &str) -> Result<Option<(String, RawSrffModel)>> {
     Ok(Some((tokens[1].to_ascii_uppercase(), model)))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RawNumberedLogicKind {
-    And,
-    Or,
-    Nand,
-    Nor,
-}
-
 #[derive(Clone, Debug)]
 struct RawNumberedLogicModel {
-    kind: RawNumberedLogicKind,
+    kind: LogicGateKind,
+    polarity: LogicPolarity,
     inputs: usize,
     rin: f64,
     rout: f64,
@@ -1426,13 +1420,13 @@ struct RawNumberedLogicModel {
     delay: f64,
 }
 
-fn numbered_logic_kind(token: &str) -> Option<(RawNumberedLogicKind, usize)> {
+fn numbered_logic_kind(token: &str) -> Option<(LogicGateKind, usize)> {
     let upper = token.to_ascii_uppercase();
     for (prefix, kind) in [
-        ("NAND", RawNumberedLogicKind::Nand),
-        ("NOR", RawNumberedLogicKind::Nor),
-        ("AND", RawNumberedLogicKind::And),
-        ("OR", RawNumberedLogicKind::Or),
+        ("NAND", LogicGateKind::Nand),
+        ("NOR", LogicGateKind::Nor),
+        ("AND", LogicGateKind::And),
+        ("OR", LogicGateKind::Or),
     ] {
         let Some(suffix) = upper.strip_prefix(prefix) else {
             continue;
@@ -1479,9 +1473,7 @@ fn raw_numbered_logic_model(statement: &str) -> Result<Option<(String, RawNumber
         || "POS".to_owned(),
         |value| value.trim_matches('\'').to_ascii_uppercase(),
     );
-    if logic != "POS" {
-        bail!("unsupported numbered SIMPLIS logic LOGIC={logic}");
-    }
+    let polarity = LogicPolarity::parse(&logic)?;
     if !(rin > 0.0 && rout > 0.0 && hystwd >= 0.0 && delay >= 0.0 && voh > vol) {
         bail!("invalid numbered SIMPLIS logic model {}", tokens[1]);
     }
@@ -1489,6 +1481,7 @@ fn raw_numbered_logic_model(statement: &str) -> Result<Option<(String, RawNumber
         tokens[1].to_ascii_uppercase(),
         RawNumberedLogicModel {
             kind,
+            polarity,
             inputs,
             rin,
             rout,
@@ -1501,99 +1494,6 @@ fn raw_numbered_logic_model(statement: &str) -> Result<Option<(String, RawNumber
     )))
 }
 
-fn numbered_logic_expression(kind: RawNumberedLogicKind, states: &[String]) -> String {
-    let and = states
-        .iter()
-        .map(|state| format!("v({state})"))
-        .collect::<Vec<_>>()
-        .join("*");
-    let or = format!(
-        "1-({})",
-        states
-            .iter()
-            .map(|state| format!("(1-v({state}))"))
-            .collect::<Vec<_>>()
-            .join("*")
-    );
-    match kind {
-        RawNumberedLogicKind::And => and,
-        RawNumberedLogicKind::Or => or,
-        RawNumberedLogicKind::Nand => format!("1-({and})"),
-        RawNumberedLogicKind::Nor => format!("1-({or})"),
-    }
-}
-
-fn emit_numbered_logic(
-    model: &RawNumberedLogicModel,
-    stem: &str,
-    out: &str,
-    rtn: &str,
-    inputs: &[String],
-) -> Result<Translation> {
-    if inputs.len() != model.inputs {
-        bail!(
-            "numbered SIMPLIS logic expected {} inputs, got {}",
-            model.inputs,
-            inputs.len()
-        );
-    }
-    let mut output = String::new();
-    let mut states = Vec::with_capacity(inputs.len());
-    for (index, input) in inputs.iter().enumerate() {
-        let number = index.saturating_add(1);
-        let state = format!("__{stem}_S{number}");
-        let diff = format!("__{stem}_D{number}");
-        let hyst_model = format!("__{stem}_H{number}");
-        write!(output, "R__{stem}_RIN{number} {input} {rtn} ")?;
-        write_number(&mut output, model.rin)?;
-        output.push('\n');
-        writeln!(output, "E__{stem}_D{number} {diff} 0 {input} {rtn} 1")?;
-        writeln!(output, "A__{stem}_H{number} {diff} {state} {hyst_model}")?;
-        write!(output, ".model {hyst_model} hyst(in_low=")?;
-        write_number(&mut output, model.threshold)?;
-        output.push_str(" in_high=");
-        write_number(&mut output, model.threshold)?;
-        output.push_str(" hyst=");
-        write_number(&mut output, model.hystwd / 2.0)?;
-        output.push_str(" out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)\n");
-        states.push(state);
-    }
-
-    let raw = format!("__{stem}_RAW");
-    writeln!(
-        output,
-        "B__{stem}_LOGIC {raw} 0 V='{}'",
-        numbered_logic_expression(model.kind, &states)
-    )?;
-    let logic = if model.delay == 0.0 {
-        raw
-    } else {
-        let delayed = format!("__{stem}_DELAYED");
-        let delay_model = format!("__{stem}_DELAY_M");
-        writeln!(output, "A__{stem}_DELAY {raw} {delayed} 0 {delay_model}")?;
-        write!(output, ".model {delay_model} delay(delay=")?;
-        write_number(&mut output, model.delay)?;
-        output.push_str(" buffer_size=2048)\n");
-        delayed
-    };
-    let out_int = format!("__{stem}_OUT_INT");
-    write!(output, "B__{stem}_OUTV {out_int} {rtn} V='")?;
-    write_number(&mut output, model.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, model.voh - model.vol)?;
-    writeln!(output, ")*v({logic})'")?;
-    write!(output, "R__{stem}_OUT {out_int} {out} ")?;
-    write_number(&mut output, model.rout)?;
-    output.push('\n');
-    Ok(Translation {
-        bytes: output.into_bytes(),
-        kind: match model.kind {
-            RawNumberedLogicKind::And | RawNumberedLogicKind::Nand => TranslationKind::AndGate,
-            RawNumberedLogicKind::Or | RawNumberedLogicKind::Nor => TranslationKind::OrGate,
-        },
-    })
-}
-
 fn translate_raw_numbered_logic_device(
     statement: &str,
     models: &std::collections::BTreeMap<String, RawNumberedLogicModel>,
@@ -1602,7 +1502,7 @@ fn translate_raw_numbered_logic_device(
     let Some(name) = tokens.first() else {
         return Ok(None);
     };
-    if !name.starts_with('!') || tokens.len() < 7 {
+    if !name.starts_with('!') || tokens.len() < 6 {
         return Ok(None);
     }
     let Some((model_index, model)) =
@@ -1636,10 +1536,29 @@ fn translate_raw_numbered_logic_device(
     } else {
         0
     };
-    if initial != 0 {
-        bail!("numbered SIMPLIS logic IC={initial} is not yet supported");
+    if initial > 1 {
+        bail!("numbered SIMPLIS logic IC={initial} must be 0 or 1");
     }
-    emit_numbered_logic(model, &sanitized_name(name), &out, &rtn, &inputs).map(Some)
+    emit_logic_gate(&LogicGateSpec {
+        kind: model.kind,
+        stem: sanitized_name(name),
+        out,
+        out_bar: None,
+        rtn,
+        inputs,
+        polarity: model.polarity,
+        initial: initial == 1,
+        io: LogicIo {
+            rin: model.rin,
+            rout: model.rout,
+            hystwd: model.hystwd,
+            vol: model.vol,
+            voh: model.voh,
+            delay: model.delay,
+            threshold: model.threshold,
+        },
+    })
+    .map(Some)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1770,103 +1689,44 @@ struct SrInput<'a> {
 
 fn emit_sr_hysteretic_input(
     output: &mut String,
-    model: &RawDigitalModel,
+    io: LogicIo,
     stem: &str,
     rtn: &str,
     spec: &SrInput<'_>,
+    polarity: LogicPolarity,
 ) -> Result<()> {
     write!(output, "R__{stem}_RIN_{} {} {rtn} ", spec.label, spec.input)?;
-    write_number(output, model.rin)?;
+    write_number(output, io.rin)?;
     output.push('\n');
     writeln!(
         output,
         "E__{stem}_{}_DIFF {} 0 {} {rtn} 1",
         spec.label, spec.diff, spec.input
     )?;
-    writeln!(
+    emit_logic_receiver(
         output,
-        "A__{stem}_{}_HYST {} {} {}",
-        spec.label, spec.diff, spec.state, spec.hyst_model
-    )?;
-    write!(output, ".model {} hyst(in_low=", spec.hyst_model)?;
-    write_number(output, model.threshold)?;
-    output.push_str(" in_high=");
-    write_number(output, model.threshold)?;
-    output.push_str(" hyst=");
-    write_number(output, model.hystwd / 2.0)?;
-    output.push_str(" out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)\n");
-    Ok(())
-}
-
-fn emit_sr_outputs(
-    output: &mut String,
-    model: &RawDigitalModel,
-    stem: &str,
-    out: &str,
-    out_bar: &str,
-    rtn: &str,
-    visible_state: &str,
-) -> Result<()> {
-    let out_int = format!("__{stem}_OUT_INT");
-    let out_bar_int = format!("__{stem}_OUTB_INT");
-    write!(output, "B__{stem}_OUTV {out_int} {rtn} V='")?;
-    write_number(output, model.vol)?;
-    output.push_str("+(");
-    write_number(output, model.voh - model.vol)?;
-    writeln!(output, ")*v({visible_state})'")?;
-    write!(output, "R__{stem}_OUT {out_int} {out} ")?;
-    write_number(output, model.rout)?;
-    output.push('\n');
-    write!(output, "B__{stem}_OUTBV {out_bar_int} {rtn} V='")?;
-    write_number(output, model.vol)?;
-    output.push_str("+(");
-    write_number(output, model.voh - model.vol)?;
-    writeln!(output, ")*(1-v({visible_state}))'")?;
-    write!(output, "R__{stem}_OUTB {out_bar_int} {out_bar} ")?;
-    write_number(output, model.rout)?;
-    output.push('\n');
-    Ok(())
+        io,
+        spec.diff,
+        spec.state,
+        spec.hyst_model,
+        polarity,
+        false,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SrBehavior {
     ResetDominant,
+    SetDominant,
     HoldWhenEqual,
 }
 
-fn write_sr_feedback(
-    output: &mut String,
-    behavior: SrBehavior,
-    set_state: &str,
-    reset_state: &str,
-    raw_state: &str,
-) {
-    match behavior {
-        SrBehavior::ResetDominant => {
-            output.push_str("2*v(");
-            output.push_str(set_state);
-            output.push_str(")-4*v(");
-            output.push_str(reset_state);
-            output.push_str(")+(2*v(");
-            output.push_str(raw_state);
-            output.push_str(")-1)");
-        }
-        SrBehavior::HoldWhenEqual => {
-            output.push_str("2*v(");
-            output.push_str(set_state);
-            output.push_str(")-2*v(");
-            output.push_str(reset_state);
-            output.push_str(")+(1-v(");
-            output.push_str(set_state);
-            output.push_str(")-v(");
-            output.push_str(reset_state);
-            output.push_str(")+2*v(");
-            output.push_str(set_state);
-            output.push_str(")*v(");
-            output.push_str(reset_state);
-            output.push_str("))*(2*v(");
-            output.push_str(raw_state);
-            output.push_str(")-1)");
+impl SrBehavior {
+    const fn weights(self) -> (u8, u8) {
+        match self {
+            Self::ResetDominant => (2, 4),
+            Self::SetDominant => (4, 2),
+            Self::HoldWhenEqual => (2, 2),
         }
     }
 }
@@ -1880,6 +1740,8 @@ struct SrStateSpec<'a> {
     inputs: &'a [String],
     initial: usize,
     behavior: SrBehavior,
+    input_polarity: LogicPolarity,
+    output_polarity: LogicPolarity,
     kind: TranslationKind,
 }
 
@@ -1892,6 +1754,8 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
         inputs,
         initial,
         behavior,
+        input_polarity,
+        output_polarity,
         kind,
     } = *spec;
     if inputs.len() != 2 || initial > 1 {
@@ -1911,6 +1775,15 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
     let set_model = format!("__{stem}_S_HYST_M");
     let reset_model = format!("__{stem}_R_HYST_M");
     let latch_model = format!("__{stem}_LATCH_HYST_M");
+    let io = LogicIo {
+        rin: model.rin,
+        rout: model.rout,
+        hystwd: model.hystwd,
+        vol: model.vol,
+        voh: model.voh,
+        delay: model.delay,
+        threshold: model.threshold,
+    };
     let mut output = String::new();
     for spec in [
         SrInput {
@@ -1928,21 +1801,22 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
             hyst_model: &reset_model,
         },
     ] {
-        emit_sr_hysteretic_input(&mut output, model, stem, rtn, &spec)?;
+        emit_sr_hysteretic_input(&mut output, io, stem, rtn, &spec, input_polarity)?;
     }
-    let initial_force = if initial == 0 { -3.0 } else { 3.0 };
-    write!(output, "B__{stem}_LATCH_IN {latch_input} 0 V='(time<=0 ? ")?;
-    write_number(&mut output, initial_force)?;
-    output.push_str(" : ");
-    write_sr_feedback(&mut output, behavior, &set_state, &reset_state, &raw_state);
-    output.push_str(")'\n");
-    writeln!(
-        output,
-        "A__{stem}_LATCH {latch_input} {raw_state} {latch_model}"
-    )?;
-    writeln!(
-        output,
-        ".model {latch_model} hyst(in_low=0 in_high=0 hyst=0 out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)"
+    let (set_weight, reset_weight) = behavior.weights();
+    let command = format!("{set_weight}*v({set_state})-{reset_weight}*v({reset_state})");
+    let command = if initial == 1 {
+        format!("-({command})")
+    } else {
+        command
+    };
+    writeln!(output, "B__{stem}_LATCH_IN {latch_input} 0 V='{command}'")?;
+    emit_logic_memory(
+        &mut output,
+        &latch_input,
+        &raw_state,
+        &latch_model,
+        initial == 1,
     )?;
     let visible_state = if model.delay == 0.0 {
         raw_state.clone()
@@ -1958,7 +1832,18 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
         output.push_str(" buffer_size=4096)\n");
         delayed
     };
-    emit_sr_outputs(&mut output, model, stem, out, out_bar, rtn, &visible_state)?;
+    let visible_state = if output_polarity.negative() {
+        let inverted = format!("__{stem}_VISIBLE");
+        writeln!(
+            output,
+            "B__{stem}_POLARITY {inverted} 0 V='1-v({visible_state})'"
+        )?;
+        inverted
+    } else {
+        visible_state
+    };
+    emit_logic_output(&mut output, io, stem, out, rtn, &visible_state, false)?;
+    emit_logic_output(&mut output, io, stem, out_bar, rtn, &visible_state, true)?;
     Ok(Translation {
         bytes: output.into_bytes(),
         kind,
@@ -1974,18 +1859,17 @@ fn emit_raw_sr_latch(
     inputs: &[String],
     initial: usize,
 ) -> Result<Translation> {
-    if model.set_reset_level != 1 {
-        bail!(
-            "raw SIMPLIS DIGITAL1 D_SRLATCH SET_RESET_LEVEL={} is not yet supported",
-            model.set_reset_level
-        );
-    }
-    if model.dominance != "R" {
-        bail!(
-            "raw SIMPLIS DIGITAL1 D_SRLATCH DOM={} is not yet supported",
-            model.dominance
-        );
-    }
+    let input_polarity = match model.set_reset_level {
+        0 => LogicPolarity::Negative,
+        1 => LogicPolarity::Positive,
+        other => bail!("invalid SIMPLIS DIGITAL1 D_SRLATCH SET_RESET_LEVEL={other}"),
+    };
+    let behavior = match model.dominance.as_str() {
+        "R" => SrBehavior::ResetDominant,
+        "S" => SrBehavior::SetDominant,
+        "NONE" => SrBehavior::HoldWhenEqual,
+        other => bail!("invalid SIMPLIS DIGITAL1 D_SRLATCH DOM={other}"),
+    };
     emit_sr_state(
         model,
         &SrStateSpec {
@@ -1995,7 +1879,9 @@ fn emit_raw_sr_latch(
             rtn,
             inputs,
             initial,
-            behavior: SrBehavior::ResetDominant,
+            behavior,
+            input_polarity,
+            output_polarity: LogicPolarity::Positive,
             kind: TranslationKind::SrLatch,
         },
     )
@@ -2037,7 +1923,7 @@ fn emit_raw_digital_model(
             if inputs.len() < 2 || model.num_inverted_inputs != 0 {
                 bail!("unsupported SIMPLIS DIGITAL1 logic input/inversion configuration");
             }
-            emit_logic_and(&AndSpec {
+            emit_logic_gate(&LogicGateSpec {
                 kind: match model.kind {
                     RawDigitalKind::And => LogicGateKind::And,
                     RawDigitalKind::Or => LogicGateKind::Or,
@@ -2045,16 +1931,20 @@ fn emit_raw_digital_model(
                 },
                 stem,
                 out,
-                out_bar,
+                out_bar: Some(out_bar),
                 rtn,
                 inputs,
-                rin: model.rin,
-                rout: model.rout,
-                hystwd: model.hystwd,
-                vol: model.vol,
-                voh: model.voh,
-                delay: model.delay,
-                threshold: model.threshold,
+                polarity: LogicPolarity::Positive,
+                initial: initial == Some(1),
+                io: LogicIo {
+                    rin: model.rin,
+                    rout: model.rout,
+                    hystwd: model.hystwd,
+                    vol: model.vol,
+                    voh: model.voh,
+                    delay: model.delay,
+                    threshold: model.threshold,
+                },
             })
         }
         RawDigitalKind::SrLatch => emit_raw_sr_latch(
@@ -2118,11 +2008,6 @@ fn translate_raw_digital_device(
     };
     if initial.is_some_and(|value| value > 1) {
         bail!("raw SIMPLIS DIGITAL1 IC must be 0 or 1");
-    }
-    if matches!(model.kind, RawDigitalKind::And | RawDigitalKind::Or)
-        && initial.is_some_and(|value| value != 0)
-    {
-        bail!("nonzero SIMPLIS DIGITAL1 logic IC is not yet supported");
     }
     let out = groups[0][0].clone();
     let out_bar = groups[0][1].clone();
@@ -3519,12 +3404,7 @@ fn translate_raw_srff_device(
     let Some(model) = models.get(&tokens[6].to_ascii_uppercase()) else {
         return Ok(None);
     };
-    if model.logic != "POS" {
-        bail!(
-            "raw SIMPLIS SRFF LOGIC={} is not yet supported",
-            model.logic
-        );
-    }
+    let polarity = LogicPolarity::parse(&model.logic)?;
     let parameters = parse_assignments(&tokens[7..])?;
     let initial = if parameters.contains_key("IC") {
         integer_parameter(&parameters, "IC")?
@@ -3555,6 +3435,8 @@ fn translate_raw_srff_device(
             inputs: &tokens[4..6],
             initial,
             behavior: SrBehavior::HoldWhenEqual,
+            input_polarity: polarity,
+            output_polarity: polarity,
             kind: TranslationKind::SrFlipFlop,
         },
     )
@@ -6925,15 +6807,15 @@ R3 z 0 1k
     }
 
     #[test]
-    fn raw_srlatch_other_dominance_remains_fail_closed() {
+    fn raw_srlatch_invalid_dominance_remains_fail_closed() {
         let source = br"A_SR %gnd_ref 0 [ q qb ] [ s r ] MODEL=MS IC=0
-.MODEL MS DIGITAL1 D_SRLATCH RIN=10Meg ROUT=10 TH=2.5 HYSTWD=1 VOL=0 VOH=5 OUT_DELAY=2p SET_RESET_LEVEL=1 DOM=S
+.MODEL MS DIGITAL1 D_SRLATCH RIN=10Meg ROUT=10 TH=2.5 HYSTWD=1 VOL=0 VOH=5 OUT_DELAY=2p SET_RESET_LEVEL=1 DOM=BAD
 .end
 ";
         let error = translate_simplis_deck(source)
             .err()
             .map(|value| value.to_string());
-        assert!(error.is_some_and(|value| value.contains("DOM=S")));
+        assert!(error.is_some_and(|value| value.contains("DOM=BAD")));
     }
 
     #[test]

@@ -813,16 +813,42 @@ fn emit_digital_buffer(spec: &DigitalBufferSpec) -> Result<Translation> {
 enum LogicGateKind {
     And,
     Or,
+    Nand,
+    Nor,
 }
 
-#[derive(Debug)]
-struct AndSpec {
-    kind: LogicGateKind,
-    stem: String,
-    out: String,
-    out_bar: String,
-    rtn: String,
-    inputs: Vec<String>,
+impl LogicGateKind {
+    const fn inverted(self) -> bool {
+        matches!(self, Self::Nand | Self::Nor)
+    }
+
+    const fn conjunction(self) -> bool {
+        matches!(self, Self::And | Self::Nand)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicPolarity {
+    Positive,
+    Negative,
+}
+
+impl LogicPolarity {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "POS" => Ok(Self::Positive),
+            "NEG" => Ok(Self::Negative),
+            _ => bail!("invalid SIMPLIS LOGIC={value}"),
+        }
+    }
+
+    const fn negative(self) -> bool {
+        matches!(self, Self::Negative)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicIo {
     rin: f64,
     rout: f64,
     hystwd: f64,
@@ -832,97 +858,178 @@ struct AndSpec {
     threshold: f64,
 }
 
-fn emit_logic_and(spec: &AndSpec) -> Result<Translation> {
+#[derive(Debug)]
+struct LogicGateSpec {
+    kind: LogicGateKind,
+    stem: String,
+    out: String,
+    out_bar: Option<String>,
+    rtn: String,
+    inputs: Vec<String>,
+    io: LogicIo,
+    polarity: LogicPolarity,
+    initial: bool,
+}
+
+/// Map the threshold band to a dimensionless set/reset/hold command.
+/// Reversing the command and output rails selects the initial hold state
+/// without overriding a definite input or introducing an artificial time step.
+fn emit_logic_receiver(
+    output: &mut String,
+    io: LogicIo,
+    diff: &str,
+    state: &str,
+    model: &str,
+    polarity: LogicPolarity,
+    initial: bool,
+) -> Result<()> {
+    let upper = io.threshold + io.hystwd / 2.0;
+    let lower = io.threshold - io.hystwd / 2.0;
+    if !upper.is_finite() || !lower.is_finite() {
+        bail!("SIMPLIS logic thresholds overflow");
+    }
+    let command = format!("{state}_CMD");
+    let reverse = polarity.negative() ^ initial;
+    let (high, low) = if reverse { (-1, 1) } else { (1, -1) };
+    writeln!(
+        output,
+        "B{model}_CMD {command} 0 V='(v({diff})>={upper:.17e} ? {high} : (v({diff})<={lower:.17e} ? {low} : 0))'"
+    )?;
+    emit_logic_memory(output, &command, state, model, initial)
+}
+
+/// The native hysteresis model retains its branch for a zero command.
+/// Its default branch is the lower rail, so the rails encode the initial bit.
+fn emit_logic_memory(
+    output: &mut String,
+    command: &str,
+    state: &str,
+    model: &str,
+    initial: bool,
+) -> Result<()> {
+    let low = u8::from(initial);
+    let high = 1 - low;
+    writeln!(output, "A{model} {command} {state} {model}")?;
+    writeln!(
+        output,
+        ".model {model} hyst(in_low=0 in_high=0 hyst=0.5 out_lower_limit={low} out_upper_limit={high} input_domain=0 fraction=false)"
+    )?;
+    Ok(())
+}
+
+fn emit_logic_output(
+    output: &mut String,
+    io: LogicIo,
+    stem: &str,
+    out: &str,
+    rtn: &str,
+    state: &str,
+    complement: bool,
+) -> Result<()> {
+    let suffix = if complement { "B" } else { "" };
+    let internal = format!("__{stem}_OUT{suffix}_INT");
+    let expression = if complement {
+        format!("(1-v({state}))")
+    } else {
+        format!("v({state})")
+    };
+    write!(output, "B__{stem}_OUT{suffix}V {internal} {rtn} V='")?;
+    write_number(output, io.vol)?;
+    output.push_str("+(");
+    write_number(output, io.voh - io.vol)?;
+    writeln!(output, ")*{expression}'")?;
+    write!(output, "R__{stem}_OUT{suffix} {internal} {out} ")?;
+    write_number(output, io.rout)?;
+    output.push('\n');
+    Ok(())
+}
+
+fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
     let mut output = String::new();
     let mut states = Vec::with_capacity(spec.inputs.len());
+    // For a monotone gate, assigning every undecided input this value
+    // satisfies the requested output whenever any assignment can do so.
+    let input_initial = spec.initial ^ spec.kind.inverted();
     for (index, input) in spec.inputs.iter().enumerate() {
         let number = index + 1;
         let state = format!("__{}_S{number}", spec.stem);
         let diff = format!("__{}_D{number}", spec.stem);
         let model = format!("__{}_H{number}", spec.stem);
         write!(output, "R__{}_RIN{number} {input} {} ", spec.stem, spec.rtn)?;
-        write_number(&mut output, spec.rin)?;
+        write_number(&mut output, spec.io.rin)?;
         output.push('\n');
         writeln!(
             output,
             "E__{}_D{number} {diff} 0 {input} {} 1",
             spec.stem, spec.rtn
         )?;
-        writeln!(output, "A__{}_H{number} {diff} {state} {model}", spec.stem)?;
-        write!(output, ".model {model} hyst(in_low=")?;
-        write_number(&mut output, spec.threshold)?;
-        output.push_str(" in_high=");
-        write_number(&mut output, spec.threshold)?;
-        output.push_str(" hyst=");
-        write_number(&mut output, spec.hystwd / 2.0)?;
-        output.push_str(" out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)\n");
+        emit_logic_receiver(
+            &mut output,
+            spec.io,
+            &diff,
+            &state,
+            &model,
+            spec.polarity,
+            input_initial,
+        )?;
         states.push(state);
     }
     let raw = format!("__{}_RAW", spec.stem);
-    write!(output, "B__{}_LOGIC {raw} 0 V='", spec.stem)?;
-    match spec.kind {
-        LogicGateKind::And => {
-            for (index, state) in states.iter().enumerate() {
-                if index != 0 {
-                    output.push('*');
-                }
-                write!(output, "v({state})")?;
+    let product = states
+        .iter()
+        .map(|state| {
+            if spec.kind.conjunction() {
+                format!("v({state})")
+            } else {
+                format!("(1-v({state}))")
             }
-        }
-        LogicGateKind::Or => {
-            output.push_str("1-(");
-            for (index, state) in states.iter().enumerate() {
-                if index != 0 {
-                    output.push('*');
-                }
-                write!(output, "(1-v({state}))")?;
-            }
-            output.push(')');
-        }
-    }
-    output.push_str("'\n");
-    let logic = if spec.delay == 0.0 {
+        })
+        .collect::<Vec<_>>()
+        .join("*");
+    let invert = !spec.kind.conjunction() ^ spec.kind.inverted() ^ spec.polarity.negative();
+    let expression = if invert {
+        format!("1-({product})")
+    } else {
+        product
+    };
+    writeln!(output, "B__{}_LOGIC {raw} 0 V='{expression}'", spec.stem)?;
+    let logic = if spec.io.delay == 0.0 {
         raw
     } else {
         let delayed = format!("__{}_DELAYED", spec.stem);
         let model = format!("__{}_DELAY_M", spec.stem);
         writeln!(output, "A__{}_DELAY {raw} {delayed} 0 {model}", spec.stem)?;
         write!(output, ".model {model} delay(delay=")?;
-        write_number(&mut output, spec.delay)?;
+        write_number(&mut output, spec.io.delay)?;
         output.push_str(" buffer_size=2048)\n");
         delayed
     };
-    let out_int = format!("__{}_OUT_INT", spec.stem);
-    let out_bar_int = format!("__{}_OUTB_INT", spec.stem);
-    write!(output, "B__{}_OUTV {out_int} {} V='", spec.stem, spec.rtn)?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*v({logic})'")?;
-    write!(output, "R__{}_OUT {out_int} {} ", spec.stem, spec.out)?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
-    write!(
-        output,
-        "B__{}_OUTBV {out_bar_int} {} V='",
-        spec.stem, spec.rtn
+    emit_logic_output(
+        &mut output,
+        spec.io,
+        &spec.stem,
+        &spec.out,
+        &spec.rtn,
+        &logic,
+        false,
     )?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*(1-v({logic}))'")?;
-    write!(
-        output,
-        "R__{}_OUTB {out_bar_int} {} ",
-        spec.stem, spec.out_bar
-    )?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
+    if let Some(out_bar) = &spec.out_bar {
+        emit_logic_output(
+            &mut output,
+            spec.io,
+            &spec.stem,
+            out_bar,
+            &spec.rtn,
+            &logic,
+            true,
+        )?;
+    }
     Ok(Translation {
         bytes: output.into_bytes(),
-        kind: match spec.kind {
-            LogicGateKind::And => TranslationKind::AndGate,
-            LogicGateKind::Or => TranslationKind::OrGate,
+        kind: if spec.kind.conjunction() {
+            TranslationKind::AndGate
+        } else {
+            TranslationKind::OrGate
         },
     })
 }
