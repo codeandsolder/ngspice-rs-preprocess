@@ -32,8 +32,14 @@ allocation or source parameter lookup is required.
 
 Other diode levels, unrecognized source parameters and nonrepresentable
 results are rejected rather than silently approximated. This is a
-physical kernel; solver integration is tracked separately (
-ngspice-rs-fast #189).
+physical kernel; circuit integration remains solver-owned.
+
+The `artifact` module implements `model-kernel-api` ABI version 3.
+It binds fixed terminal/series-resistor topology and independent numeric
+instance candidates, evaluates conservative current/charge residuals
+and both exact Jacobians, and emits each independent noise source at its
+actual physical terminals. A change in series-branch presence requires
+a new artifact; no hidden coordinate is silently shorted.
 
 ## Validation
 

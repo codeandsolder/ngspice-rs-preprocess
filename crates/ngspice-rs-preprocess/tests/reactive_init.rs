@@ -54,9 +54,9 @@ fn materialize_uic(dir: &Path, bundle: &PreparedBundle, control: &str) -> Result
                     && d.scope == scope
                     && d.device.eq_ignore_ascii_case(first)
             }) {
-                let resolved = device.resolve(analysis, defaults, resolver)?;
-                assert_eq!(resolved.bias, BiasConstraint::None);
-                let initial = resolved.storage_ic.context("missing storage IC")?;
+                let startup = device.resolve(analysis, defaults, resolver)?;
+                assert_eq!(startup.bias, BiasConstraint::None);
+                let initial = startup.storage_ic.context("missing storage IC")?;
                 writeln!(output, "{line} IC={initial:.17e}")?;
                 count += 1;
             } else if first.eq_ignore_ascii_case(".end")
@@ -115,9 +115,9 @@ fn run_native(dir: &Path, bundle: &PreparedBundle, control: &str) -> Result<Vec<
 // is 4 at zero voltage. The two capacitances are 2 and 4 respectively.
 fn physical_charge(voltage: f64) -> f64 {
     if voltage < 0. {
-        2. * voltage + 4.
+        2.0_f64.mul_add(voltage, 4.)
     } else {
-        4. * voltage + 4.
+        4.0_f64.mul_add(voltage, 4.)
     }
 }
 
@@ -164,9 +164,9 @@ XC p n CELL
                 evaluate_expression(expr, analysis, |s| bail!("{s}"))
             })?;
             assert_eq!(
-                resolved.bias,
+                startup.bias,
                 BiasConstraint::CapacitorHard {
-                    voltage: resolved.storage_ic.context("missing coordinate")?
+                    voltage: startup.storage_ic.context("missing coordinate")?
                 }
             );
         }
@@ -248,9 +248,9 @@ quit
     assert!(trace.len() > 8000);
     let flux = |current: f64| {
         if current < 0. {
-            2e-3 * current + 3e-3
+            2e-3_f64.mul_add(current, 3e-3)
         } else {
-            4e-3 * current + 3e-3
+            4e-3_f64.mul_add(current, 3e-3)
         }
     };
     for row in trace {
