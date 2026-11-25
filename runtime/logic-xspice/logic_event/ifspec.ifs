@@ -1,0 +1,24 @@
+NAME_TABLE:
+Spice_Model_Name:      preprocess_logic_event
+C_Function_Name:       cm_preprocess_logic_event
+Description:           "Event-timed binary gate or committed SR latch"
+
+PORT_TABLE:
+Port_Name:             in               out
+Description:           "logic inputs"   "logic output"
+Direction:             in               out
+Default_Type:          d                d
+Allowed_Types:         [d]              [d]
+Vector:                yes              no
+Vector_Bounds:         [2 -]            -
+Null_Allowed:          no               no
+
+PARAMETER_TABLE:
+Parameter_Name:        operation         delay             inertial        ic
+Description:           "operation enum"  "seconds"         "cancel pulse"  "initial latch state"
+Data_Type:             int               real              boolean         int
+Default_Value:         0                 0                 true            0
+Limits:                [0 6]             [0 -]             -               [0 1]
+Vector:                no                no                no              no
+Vector_Bounds:         -                 -                 -               -
+Null_Allowed:          yes               yes               yes             yes

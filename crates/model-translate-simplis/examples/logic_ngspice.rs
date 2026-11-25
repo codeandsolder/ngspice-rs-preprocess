@@ -1,33 +1,46 @@
-//! Native simulator checks of translated electrical logic, not vendor traces.
+//! Run the independent native-ngspice logic regression matrix with an explicit runtime path.
 use anyhow::{Context, Result, ensure};
 use model_translate_simplis::translate_simplis_deck;
-use std::{collections::BTreeMap, fmt::Write as _, process::Command};
+use std::{collections::BTreeMap, fmt::Write as _, path::Path, process::Command};
 
-fn verify(source: &str, checks: &[(String, f64, f64)]) -> Result<()> {
+fn run_native(runtime: &Path, source: &str, control: &str) -> Result<String> {
     let translated = translate_simplis_deck(source.as_bytes())?;
     let text = std::str::from_utf8(&translated.bytes)?;
     let mut deck = text
         .strip_suffix(".end\n")
         .context("missing deck terminator")?
         .to_owned();
-    deck.push_str(".control\ntran 10n 9u\n");
-    for (index, (node, time, _)) in checks.iter().enumerate() {
-        writeln!(deck, "meas tran check{index} find v({node}) at={time}u")?;
-    }
-    deck.push_str("quit\n.endc\n.end\n");
+    writeln!(deck, ".control\n{control}quit\n.endc\n.end")?;
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("logic.cir");
     std::fs::write(&path, deck)?;
+    std::fs::write(
+        temp.path().join(".spiceinit"),
+        format!("codemodel {}\n", runtime.display()),
+    )?;
     let output = Command::new("ngspice")
-        .args(["-b", "-n"])
+        .current_dir(temp.path())
+        .arg("-b")
         .arg(path)
         .output()?;
     let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
     ensure!(
-        output.status.success() && stdout.contains("ngspice-47 done"),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        output.status.success()
+            && stdout.contains("ngspice-47 done")
+            && !stderr.contains("Error:")
+            && !stderr.contains("timestep too small"),
+        "{stdout}\n{stderr}"
     );
+    Ok(stdout)
+}
+
+fn verify(runtime: &Path, source: &str, checks: &[(String, f64, f64)]) -> Result<()> {
+    let mut control = String::from("tran 10n 9u\n");
+    for (index, (node, time, _)) in checks.iter().enumerate() {
+        writeln!(control, "meas tran check{index} find v({node}) at={time}u")?;
+    }
+    let stdout = run_native(runtime, source, &control)?;
     let actual = stdout
         .lines()
         .filter_map(|line| {
@@ -58,9 +71,7 @@ fn loaded(high: bool) -> f64 {
     }
 }
 
-#[test]
-#[ignore = "requires installed ngspice 47 C reference"]
-fn numbered_logic_all_arities_polarities_and_initial_states() -> Result<()> {
+fn numbered_logic_all_arities_polarities_and_initial_states(runtime: &Path) -> Result<()> {
     let mut source = String::from("Vref rtn 0 0.75\n");
     // Initial ambiguous, then all low, all high, mixed, all ambiguous
     // (hold), all low. The second input crosses a different threshold.
@@ -113,12 +124,10 @@ fn numbered_logic_all_arities_polarities_and_initial_states() -> Result<()> {
         }
     }
     source.push_str(".end\n");
-    verify(&source, &checks)
+    verify(runtime, &source, &checks)
 }
 
-#[test]
-#[ignore = "requires installed ngspice 47 C reference"]
-fn sr_latch_polarities_priorities_and_loaded_complements() -> Result<()> {
+fn sr_latch_polarities_priorities_and_loaded_complements(runtime: &Path) -> Result<()> {
     let mut source = String::from("Vref rtn 0 0.75\n");
     // Inactive, set, hold, simultaneous assertion, hold, reset, hold.
     for (name, negative) in [("pos", false), ("neg", true)] {
@@ -182,12 +191,10 @@ fn sr_latch_polarities_priorities_and_loaded_complements() -> Result<()> {
         }
     }
     source.push_str(".end\n");
-    verify(&source, &checks)
+    verify(runtime, &source, &checks)
 }
 
-#[test]
-#[ignore = "requires installed ngspice 47 C reference"]
-fn advanced_gate_receivers_ignore_output_initial_hint() -> Result<()> {
+fn advanced_gate_receivers_ignore_output_initial_hint(runtime: &Path) -> Result<()> {
     let mut source = String::from("Vref rtn 0 0.75\nVa a rtn 2.5\nVlo lo rtn 0\nVhi hi rtn 5\n");
     let mut checks = Vec::new();
     for gate in ["D_AND", "D_OR"] {
@@ -210,12 +217,10 @@ fn advanced_gate_receivers_ignore_output_initial_hint() -> Result<()> {
         }
     }
     source.push_str(".end\n");
-    verify(&source, &checks)
+    verify(runtime, &source, &checks)
 }
 
-#[test]
-#[ignore = "requires installed ngspice 47 C reference"]
-fn advanced_gate_vendor_boundaries_and_trailing_inversions() -> Result<()> {
+fn advanced_gate_vendor_boundaries_and_trailing_inversions(runtime: &Path) -> Result<()> {
     // SIMPLIS 9.40.2 final-state sweeps: both IC hints produce the same
     // receiver state, and a receiver holds at either threshold equality.
     let mut source = String::from(
@@ -268,12 +273,10 @@ fn advanced_gate_vendor_boundaries_and_trailing_inversions() -> Result<()> {
         checks.push((format!("qb{id}"), time, loaded(!expected)));
     }
     source.push_str(".MODEL mboundary DIGITAL1 D_AND RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 OUT_DELAY=0 NUM_INVERTED_INPUTS=0\n.end\n");
-    verify(&source, &checks)
+    verify(runtime, &source, &checks)
 }
 
-#[test]
-#[ignore = "requires installed ngspice 47 C reference"]
-fn advanced_latch_vendor_ambiguous_inputs() -> Result<()> {
+fn advanced_latch_vendor_ambiguous_inputs(runtime: &Path) -> Result<()> {
     let mut source = String::from(
         "Vref rtn 0 0.75\nVa a rtn 2.5\nVlo lo rtn 0\nVhi hi rtn 5\nVu u rtn 3\nVl l rtn 2\n",
     );
@@ -315,15 +318,113 @@ fn advanced_latch_vendor_ambiguous_inputs() -> Result<()> {
         }
     }
     source.push_str(".end\n");
-    verify(&source, &checks)
+    verify(runtime, &source, &checks)
 }
 
-#[test]
-fn digital1_rejects_all_inverted_inputs() -> Result<()> {
-    let source = b"A1 %gnd_ref 0 [ q qb ] [ a b c ] MODEL=m IC=0\n.MODEL m DIGITAL1 D_AND RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 OUT_DELAY=10n NUM_INVERTED_INPUTS=3\n.end\n";
+/// Expected event times and output states from SIMPLIS 9.40.2's
+/// independently exported 100-ohm loaded traces and final-state sweeps.
+fn vendor_timing(runtime: &Path) -> Result<()> {
+    const BASE: &str = "Vref rtn 0 0.75
+V2 b rtn 5
+V3 c rtn 0
+!D1 t rtn a b M1 IC=0
+.MODEL M1 AND2 RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 DELAY=500n LOGIC=POS
+A2 %gnd_ref rtn [ i ib ] [ a b ] MODEL=M2 IC=0
+.MODEL M2 DIGITAL1 D_AND RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 OUT_DELAY=500n
+A3 %gnd_ref rtn [ l lb ] [ a c ] MODEL=M3 IC=0
+.MODEL M3 DIGITAL1 D_SRLATCH RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 OUT_DELAY=500n SET_RESET_LEVEL=1 DOM=NONE
+!D4 s sb rtn a c M4 IC=0
+.MODEL M4 SRFF RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 DELAY=500n LOGIC=POS
+Rt t rtn 100
+Ri i rtn 100
+Rib ib rtn 100
+Rl l rtn 100
+Rlb lb rtn 100
+Rs s rtn 100
+Rsb sb rtn 100
+.end
+";
+    for (fall, after, long) in [("1.19u", "1.2u", false), ("1.99u", "2u", true)] {
+        let source = format!("V1 a rtn PWL(0 0 1u 0 1.01u 5 {fall} 5 {after} 0 9u 0)\n{BASE}");
+        let mut checks = Vec::new();
+        for (time, values) in [
+            (1.3, [false, false, false, false]),
+            (1.65, [true, long, long, true]),
+            (1.85, [long, long, long, true]),
+            (2.6, [false, false, long, true]),
+        ] {
+            for (node, high) in ["t", "i", "l", "s"].into_iter().zip(values) {
+                checks.push((node.to_owned(), time, loaded(high)));
+                if node != "t" {
+                    checks.push((format!("{node}b"), time, loaded(!high)));
+                }
+            }
+        }
+        verify(runtime, &source, &checks)?;
+        // eprint exposes the event time directly; analog threshold measurement
+        // interpolates a discontinuity and is not a reliable timestamp.
+        let stdout = run_native(
+            runtime,
+            &source,
+            "tran 100n 2.6u\neprint ___D1_Q_STATE __A2_Q_STATE __A3_Q_STATE __D4_Q_STATE\n",
+        )?;
+        let mut previous = ["0s"; 4];
+        let mut edges = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for line in stdout.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 5 {
+                continue;
+            }
+            let Ok(time) = fields[0].parse::<f64>() else {
+                continue;
+            };
+            for (index, value) in fields[1..].iter().enumerate() {
+                if *value != previous[index] {
+                    edges[index].push((time, *value == "1s"));
+                    previous[index] = value;
+                }
+            }
+        }
+        let falling = if long { 2.496e-6 } else { 1.696e-6 };
+        let transport = [(1.506e-6, true), (falling, false)];
+        let set_only = [(1.506e-6, true)];
+        let expected: [&[(f64, bool)]; 4] = [
+            &transport,
+            if long { &transport } else { &[] },
+            if long { &set_only } else { &[] },
+            &set_only,
+        ];
+        for (actual, expected) in edges.iter().zip(expected) {
+            ensure!(
+                actual.len() == expected.len(),
+                "wrong event sequence: {edges:?}\n{stdout}"
+            );
+            for ((time, bit), (reference_time, reference_bit)) in actual.iter().zip(expected) {
+                ensure!(
+                    (time - reference_time).abs() < 1e-15 && bit == reference_bit,
+                    "event {time} {bit} != {reference_time} {reference_bit}; sequence={edges:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
+    ensure!(args.next().is_none(), "usage: logic_ngspice RUNTIME_CM");
+    let runtime = std::fs::canonicalize(model)?;
     ensure!(
-        translate_simplis_deck(source).is_err(),
-        "all-inverted gate accepted"
+        runtime.is_file() && !runtime.to_string_lossy().contains(char::is_whitespace),
+        "runtime must be a file with a whitespace-free absolute path"
     );
+    numbered_logic_all_arities_polarities_and_initial_states(&runtime)?;
+    sr_latch_polarities_priorities_and_loaded_complements(&runtime)?;
+    advanced_gate_receivers_ignore_output_initial_hint(&runtime)?;
+    advanced_gate_vendor_boundaries_and_trailing_inversions(&runtime)?;
+    advanced_latch_vendor_ambiguous_inputs(&runtime)?;
+    vendor_timing(&runtime)?;
+    println!("All native ngspice logic regressions passed");
     Ok(())
 }
