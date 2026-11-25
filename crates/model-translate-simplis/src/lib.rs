@@ -887,7 +887,7 @@ enum LogicGateMode {
 }
 
 impl LogicGateMode {
-    fn receiver(self, kind: LogicGateKind, index: usize, arity: usize) -> LogicReceiver {
+    const fn receiver(self, kind: LogicGateKind, index: usize, arity: usize) -> LogicReceiver {
         match self {
             // Every undecided input takes the state satisfying the suggested
             // classic output whenever possible.
