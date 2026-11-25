@@ -63,5 +63,6 @@ electrical expressions. Unresolved runtime expressions may still need
 validation by the downstream parser.
 
 `.FOR` and `.ENDFOR` are explicitly rejected when active; no supported
-source dialect has been established for them. Cumulative expansion
-budgets and full local/global parameter propagation are separate policies.
+source dialect has been established for them. Cumulative expansion uses shared `WorkBudget` counters from
+`model-preprocess-command`, distinct from the source-language loop limit.
+Full local/global parameter propagation is a separate policy.

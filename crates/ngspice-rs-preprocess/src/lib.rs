@@ -12,7 +12,8 @@ use model_normalize_ngspice::{
 };
 pub use model_normalize_ngspice::{passive_ic, waveform};
 pub use model_preprocess_command::{
-    AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, SourceSession,
+    AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, Resource,
+    SourceSession, WorkBudget, WorkLimits,
 };
 pub use model_preprocess_simplis::{LibrarySimulator, ParsedLibrary};
 pub use model_translate_simplis::CodeModelRuntime;
@@ -134,6 +135,8 @@ pub struct Options {
     pub admission: AdmissionConfig,
     /// Ceiling on linked intermediate bytes and combined final artifact bytes.
     pub output_bytes: usize,
+    /// Shared cumulative work ceilings across the entire request.
+    pub work: WorkLimits,
     /// Disable conditioning when the consumer adds artificial topology
     /// (such as global shunts) or requires unchanged internal current names.
     pub conditioning: ConditioningPolicy,
@@ -147,6 +150,7 @@ impl Default for Options {
         Self {
             admission: AdmissionConfig::default(),
             output_bytes: 128 * 1024 * 1024,
+            work: WorkLimits::default(),
             conditioning: ConditioningPolicy::default(),
             device_config: None,
         }
@@ -292,6 +296,9 @@ fn native(
     } else {
         source_resolver.link_admitted(root, kind, limits, session)?
     };
+    session
+        .budget()
+        .charge(Resource::ScannedBytes, linked.bytes.len())?;
     let (normalized, device_identities) = if pspice {
         let normalized = model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?;
         let identities = normalized
@@ -314,6 +321,9 @@ fn native(
     } else {
         (normalize_mapped(&linked.bytes, kind)?, Vec::new())
     };
+    session
+        .budget()
+        .charge(Resource::EmittedBytes, normalized.model.bytes.len())?;
     let lines = normalized
         .input_lines
         .into_iter()
@@ -397,7 +407,12 @@ pub fn prepare(
         "device configuration is only valid for SIMetrix decks"
     );
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
-    let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
+    let budget = WorkBudget::new(options.work, cancellation.clone());
+    let mut session = SourceSession::with_budget(
+        options.admission.clone(),
+        cancellation.clone(),
+        budget.clone(),
+    );
     let root = request.input.admit(&mut session)?;
     let mut result = match request.format {
         InputFormat::NativeDeck
@@ -409,7 +424,7 @@ pub fn prepare(
     if request.format == InputFormat::SimetrixDeck
         && options.conditioning == ConditioningPolicy::PrivateDifferentiators
     {
-        condition_generated_bundle(&mut result)?;
+        condition_generated_bundle(&mut result, &budget)?;
     }
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     for declaration in &result.waveforms {
@@ -421,8 +436,10 @@ pub fn prepare(
             declaration.artifact
         );
     }
+    budget.check()?;
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
+        budget.charge(Resource::EmittedBytes, artifact.bytes.len())?;
         waveform::validate_artifact(&result.waveforms, &artifact.filename, &artifact.bytes)?;
         remaining = remaining
             .checked_sub(artifact.bytes.len())
@@ -431,9 +448,9 @@ pub fn prepare(
     Ok(result)
 }
 
-fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
+fn condition_generated_bundle(bundle: &mut PreparedBundle, budget: &WorkBudget) -> Result<()> {
     use model_normalize_ngspice::conditioning::{
-        ConditioningInput, condition_private_differentiators,
+        ConditioningInput, condition_private_differentiators_with_budget,
     };
     let inputs = bundle
         .artifacts()
@@ -442,10 +459,11 @@ fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
             bytes: &artifact.bytes,
         })
         .collect::<Vec<_>>();
-    let outputs = condition_private_differentiators(
+    let outputs = condition_private_differentiators_with_budget(
         &inputs,
         bundle.initial_conditions.as_ref(),
         &bundle.waveforms,
+        budget,
     )?;
     let mut changed = false;
     for (artifact, output) in std::iter::once(&mut bundle.primary)

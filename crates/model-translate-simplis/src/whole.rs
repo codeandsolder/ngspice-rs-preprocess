@@ -26,6 +26,7 @@ use crate::syntax::{
 };
 use anyhow::{Context, Result, bail};
 use model_normalize_ngspice::passive_ic::PassiveKind;
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::Serialize;
 pub use simetrix_runtime::lower_simetrix_linked_runtime;
 use std::fmt::Write as _;
@@ -4682,6 +4683,23 @@ fn emit_deck_statement(
     output: &mut String,
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
+    budget: &WorkBudget,
+) -> Result<()> {
+    budget.charge(Resource::Statements, 1)?;
+    budget.charge(Resource::ScannedBytes, statement.len())?;
+    let start = output.len();
+    let previous = primitives.len();
+    emit_deck_statement_inner(statement, models, output, primitives, stripped_directives)?;
+    budget.charge(Resource::EmittedBytes, output.len() - start)?;
+    budget.charge(Resource::GeneratedNodes, primitives.len() - previous)
+}
+
+fn emit_deck_statement_inner(
+    statement: &str,
+    models: &ScopeAnalysis,
+    output: &mut String,
+    primitives: &mut Vec<TranslationKind>,
+    stripped_directives: &mut usize,
 ) -> Result<()> {
     let trimmed = statement.trim();
     if trimmed.is_empty() || trimmed.starts_with('*') {
@@ -4743,7 +4761,10 @@ fn numeric_tokens(text: &str) -> impl Iterator<Item = &str> {
         .filter(|token| !token.is_empty())
 }
 
-fn dead_numeric_subcircuit_calls(block: &Subcircuit) -> Result<std::collections::BTreeSet<String>> {
+fn dead_numeric_subcircuit_calls(
+    block: &Subcircuit,
+    budget: &WorkBudget,
+) -> Result<std::collections::BTreeSet<String>> {
     let header_tokens = statement_tokens(&normalized_statement(&block.header))?;
     let ports = header_tokens
         .iter()
@@ -4803,6 +4824,7 @@ fn dead_numeric_subcircuit_calls(block: &Subcircuit) -> Result<std::collections:
         {
             continue;
         }
+        budget.charge(Resource::ScannedBytes, joined.len())?;
         let instance_mentions = joined.matches(instance).count();
         if instance_mentions == 1 {
             dead.insert(statement.to_owned());
@@ -4818,6 +4840,7 @@ fn emit_deck_subcircuit_children(
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
     flattened_subcircuits: &mut usize,
+    budget: &WorkBudget,
 ) -> Result<()> {
     for item in &block.body {
         if let Item::Subcircuit(child) = item {
@@ -4828,6 +4851,7 @@ fn emit_deck_subcircuit_children(
                 primitives,
                 stripped_directives,
                 flattened_subcircuits,
+                budget,
             )
             .map_err(|error| anyhow::anyhow!("translating subcircuit {}: {error:#}", child.name))?;
         }
@@ -4925,8 +4949,11 @@ fn emit_deck_subcircuit(
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
     flattened_subcircuits: &mut usize,
+    budget: &WorkBudget,
 ) -> Result<()> {
-    let scope = parent.child(block)?;
+    let _depth = budget.enter()?;
+    budget.charge(Resource::GeneratedNodes, 1)?;
+    let scope = parent.child(block, budget)?;
     emit_deck_subcircuit_children(
         block,
         &scope,
@@ -4934,20 +4961,24 @@ fn emit_deck_subcircuit(
         primitives,
         stripped_directives,
         flattened_subcircuits,
+        budget,
     )?;
-    let dead_calls = dead_numeric_subcircuit_calls(block)?;
+    let dead_calls = dead_numeric_subcircuit_calls(block, budget)?;
     let repair_one_model_typo = repair_unambiguous_pspice_one_model_typo(&block.body)?;
     let models = ScopeAnalysis::analyze(&block.body, Some(&block.header), &scope)?;
     *flattened_subcircuits = flattened_subcircuits.saturating_add(1);
-    output.push_str(&repaired_simetrix_subcircuit_header(block)?);
+    let header = repaired_simetrix_subcircuit_header(block)?;
+    budget.charge(Resource::EmittedBytes, header.len().saturating_add(1))?;
+    output.push_str(&header);
     output.push('\n');
-    scope.emit_inherited(&block.body, output)?;
+    scope.emit_inherited(&block.body, output, budget)?;
     let mut embedded_file = false;
     for item in &block.body {
         if let Item::Statement(statement) = item {
             let file_directive = file_boundary(statement);
             if file_directive == Some(true) {
                 embedded_file = true;
+                budget.charge(Resource::EmittedBytes, 65)?;
                 writeln!(
                     output,
                     "* ngspice-rs-preprocess: omitted embedded SIMetrix logic file"
@@ -4963,6 +4994,7 @@ fn emit_deck_subcircuit(
                 continue;
             }
             if dead_calls.contains(statement) {
+                budget.charge(Resource::EmittedBytes, statement.len().saturating_add(57))?;
                 writeln!(
                     output,
                     "* ngspice-rs-preprocess: pruned disconnected instance {statement}"
@@ -4971,14 +5003,21 @@ fn emit_deck_subcircuit(
             }
             let repaired =
                 rewrite_unambiguous_pspice_one_model_typo(statement, repair_one_model_typo)?;
-            emit_deck_statement(&repaired, &models, output, primitives, stripped_directives)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "translating statement in subcircuit {}: {}: {error:#}",
-                        block.name,
-                        statement.trim()
-                    )
-                })?;
+            emit_deck_statement(
+                &repaired,
+                &models,
+                output,
+                primitives,
+                stripped_directives,
+                budget,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "translating statement in subcircuit {}: {}: {error:#}",
+                    block.name,
+                    statement.trim()
+                )
+            })?;
         }
     }
     if embedded_file {
@@ -4987,6 +5026,7 @@ fn emit_deck_subcircuit(
             block.name
         );
     }
+    budget.charge(Resource::EmittedBytes, block.name.len().saturating_add(8))?;
     writeln!(output, ".ends {}", block.name)?;
     output.push('\n');
     Ok(())
@@ -5020,13 +5060,32 @@ fn reject_experimental_models(items: &[Item]) -> Result<()> {
 /// Returns an error for malformed nesting, unsupported residual SIMPLIS syntax,
 /// protected content, or a primitive outside the implemented exact lowering set.
 pub fn translate_simplis_deck(input: &[u8]) -> Result<WholeModelTranslation> {
-    let items = vec![parse_deck_items(input)?];
-    let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
-    let scope = level17::Scope::global(&prefix, &items)?;
-    translate_deck_items(items.into_iter().next().context("missing deck")?, &scope)
+    translate_simplis_deck_with_budget(input, &WorkBudget::default())
 }
 
-fn parse_deck_items(input: &[u8]) -> Result<Vec<Item>> {
+/// Translate using the caller's cumulative preparation budget.
+/// # Errors
+/// Invalid electrical source, cancellation, or exhausted work allowance.
+pub fn translate_simplis_deck_with_budget(
+    input: &[u8],
+    budget: &WorkBudget,
+) -> Result<WholeModelTranslation> {
+    let items = vec![parse_deck_items(input, budget)?];
+    let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
+    let scope = level17::Scope::global(&prefix, &items, budget)?;
+    translate_deck_items(
+        items.into_iter().next().context("missing deck")?,
+        &scope,
+        budget,
+    )
+}
+
+fn parse_deck_items(input: &[u8], budget: &WorkBudget) -> Result<Vec<Item>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    budget.charge(
+        Resource::Statements,
+        input.split(|byte| *byte == b'\n').count(),
+    )?;
     let text =
         std::str::from_utf8(input).context("SIMPLIS deck translation requires UTF-8/ASCII")?;
     parse_items(text)
@@ -5040,6 +5099,7 @@ fn parse_deck_items(input: &[u8]) -> Result<Vec<Item>> {
 /// unsupported electrical semantics.
 pub fn translate_simplis_linked_netlist(
     linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
+    budget: &WorkBudget,
 ) -> Result<(WholeModelTranslation, Vec<WholeModelTranslation>)> {
     let items = std::iter::once(linked.root_bytes.as_slice())
         .chain(
@@ -5048,13 +5108,13 @@ pub fn translate_simplis_linked_netlist(
                 .iter()
                 .map(|library| library.bytes.as_slice()),
         )
-        .map(parse_deck_items)
+        .map(|bytes| parse_deck_items(bytes, budget))
         .collect::<Result<Vec<_>>>()?;
     let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
-    let scope = level17::Scope::global(&prefix, &items)?;
+    let scope = level17::Scope::global(&prefix, &items, budget)?;
     let mut translated = items
         .into_iter()
-        .map(|items| translate_deck_items(items, &scope));
+        .map(|items| translate_deck_items(items, &scope, budget));
     let root = translated.next().context("missing linked root")??;
     let libraries = translated
         .map(|result| include_safe(result?))
@@ -5065,6 +5125,7 @@ pub fn translate_simplis_linked_netlist(
 fn translate_deck_items(
     mut items: Vec<Item>,
     scope: &level17::Scope<'_>,
+    budget: &WorkBudget,
 ) -> Result<WholeModelTranslation> {
     reject_experimental_models(&items)?;
     distribute_root_init_overrides(&mut items)?;
@@ -5072,6 +5133,7 @@ fn translate_deck_items(
     let mut output = String::from(
         "* ngspice-rs-preprocess: translated expanded SIMPLIS deck to native ngspice\n",
     );
+    budget.charge(Resource::EmittedBytes, output.len())?;
     let mut primitives = Vec::new();
     let mut stripped_directives = 0usize;
     let mut flattened_subcircuits = 0usize;
@@ -5084,6 +5146,7 @@ fn translate_deck_items(
                 &mut primitives,
                 &mut stripped_directives,
                 &mut flattened_subcircuits,
+                budget,
             )
             .map_err(|error| anyhow::anyhow!("translating subcircuit {}: {error:#}", block.name))?,
             Item::Statement(statement) => emit_deck_statement(
@@ -5092,6 +5155,7 @@ fn translate_deck_items(
                 &mut output,
                 &mut primitives,
                 &mut stripped_directives,
+                budget,
             )
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -5107,14 +5171,14 @@ fn translate_deck_items(
     {
         // Load the library before parsing this deck, not from a .control
         // command after unresolved A-device models have already been read.
-        output.insert_str(
-            0,
-            "* Requires ngspice_preprocess_logic.cm loaded before parsing\n",
-        );
+        let banner = "* Requires ngspice_preprocess_logic.cm loaded before parsing\n";
+        budget.charge(Resource::EmittedBytes, banner.len())?;
+        output.insert_str(0, banner);
         vec![CodeModelRuntime::Logic]
     } else {
         Vec::new()
     };
+    budget.charge(Resource::EmittedBytes, 5)?;
     output.push_str(".end\n");
     reject_residual_simplis(&output)?;
     let bytes =
@@ -5140,7 +5204,17 @@ fn translate_deck_items(
 ///
 /// Returns the same semantic errors as [`translate_simplis_deck`].
 pub fn translate_simplis_expanded_library(input: &[u8]) -> Result<WholeModelTranslation> {
-    include_safe(translate_simplis_deck(input)?)
+    translate_simplis_expanded_library_with_budget(input, &WorkBudget::default())
+}
+
+/// Translate an include-safe library with shared cumulative work accounting.
+/// # Errors
+/// Invalid electrical source, cancellation, or exhausted work allowance.
+pub fn translate_simplis_expanded_library_with_budget(
+    input: &[u8],
+    budget: &WorkBudget,
+) -> Result<WholeModelTranslation> {
+    include_safe(translate_simplis_deck_with_budget(input, budget)?)
 }
 
 fn include_safe(mut translated: WholeModelTranslation) -> Result<WholeModelTranslation> {

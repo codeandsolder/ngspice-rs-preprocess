@@ -1,6 +1,7 @@
 //! Independent authored source witnesses measured with `SIMetrix` Elements
 //! 9.40d and replayed through the prepared native circuit.
 use anyhow::{Context, Result, ensure};
+use model_preprocess_command::WorkBudget;
 use model_translate_simplis::{translate_simplis_deck, translate_simplis_linked_netlist};
 use std::{fmt::Write as _, fs, process::Command};
 
@@ -352,7 +353,7 @@ fn level17_global_models_bind_across_linked_artifacts() -> Result<()> {
         }],
         stats: NetlistPreprocessStats { root_specializations: 0, generated_subcircuits: 1, local_parameterized_definitions_removed: 0 },
     };
-    let (root, libraries) = translate_simplis_linked_netlist(&linked)?;
+    let (root, libraries) = translate_simplis_linked_netlist(&linked, &WorkBudget::default())?;
     let lib = libraries.first().context("missing translated library")?;
     let actual = run_native(
         &root.bytes,
@@ -370,7 +371,7 @@ fn level17_global_models_bind_across_linked_artifacts() -> Result<()> {
         .bytes
         .extend_from_slice(b".model RootMos NMOS (LEVEL=1 VTO=0 KP=.1)\n");
     ensure!(
-        translate_simplis_linked_netlist(&ambiguous).is_err(),
+        translate_simplis_linked_netlist(&ambiguous, &WorkBudget::default()).is_err(),
         "conflicting global model accepted"
     );
     Ok(())

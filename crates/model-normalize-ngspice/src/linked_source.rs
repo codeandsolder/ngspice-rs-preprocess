@@ -5,7 +5,7 @@
 
 use crate::lexical::{normalize_nbsp, statements};
 use anyhow::{Context, Result, bail, ensure};
-use model_preprocess_command::{AdmittedSource, SourceSession};
+use model_preprocess_command::{AdmittedSource, Resource, SourceSession};
 use std::path::{Path, PathBuf};
 
 /// Physical source location corresponding to a linked output line.
@@ -340,6 +340,9 @@ impl LinkState<'_> {
             "linked output byte budget exceeded at {}:{physical_line}",
             path.display()
         );
+        self.admission
+            .budget()
+            .charge(Resource::EmittedBytes, text.len().saturating_add(extra))?;
         self.output.bytes.extend_from_slice(text);
         if extra != 0 {
             self.output.bytes.push(b'\n');
@@ -365,10 +368,6 @@ impl LinkState<'_> {
         kind: RootKind,
     ) -> Result<()> {
         let path = &source.path;
-        ensure!(
-            self.stack.len() < 128,
-            "ngspice source linking depth exceeded 128"
-        );
         let section_key = section.map(str::to_ascii_lowercase);
         ensure!(
             !self
@@ -379,6 +378,14 @@ impl LinkState<'_> {
             path.display(),
             section.map_or_else(String::new, |name| format!(" section {name}"))
         );
+        let budget = self.admission.budget().clone();
+        let _depth = budget.enter()?;
+        budget.charge(Resource::SourceVisits, 1)?;
+        budget.charge(Resource::ScannedBytes, source.bytes.len())?;
+        budget.charge(
+            Resource::Statements,
+            source.bytes.split_inclusive(|byte| *byte == b'\n').count(),
+        )?;
         self.stack.push((path.clone(), section_key));
         let result = self.expand_inner(source, section, kind);
         self.stack.pop();

@@ -18,15 +18,17 @@ use model_preprocess_simplis::source_dialect::{
     resolve_device_identities,
 };
 use model_preprocess_simplis::{
-    SubcircuitCatalog, lower_scoped_statements, parse_library_for_simulator, parse_scoped_library,
+    SubcircuitCatalog, lower_scoped_statements, parse_library_with_budget, parse_scoped_library,
     preprocess_netlist_linked, project_resource, source_include_target,
 };
 use model_translate_simplis::{
     WholeModelTranslation, capture_artifact_initial_conditions, capture_artifact_waveforms,
     capture_linked_waveforms, capture_passive_initial_conditions, lower_simetrix_linked_runtime,
-    translate_simplis_deck, translate_simplis_expanded_library, translate_simplis_linked_netlist,
+    translate_simplis_deck_with_budget, translate_simplis_expanded_library_with_budget,
+    translate_simplis_linked_netlist,
 };
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
@@ -168,6 +170,9 @@ impl<'a> SourceExpansion<'a> {
             bytes.len() <= self.limit.saturating_sub(self.output.len()),
             "source expansion byte budget exceeded"
         );
+        self.session
+            .budget()
+            .charge(super::Resource::EmittedBytes, bytes.len())?;
         self.output.extend_from_slice(bytes);
         Ok(())
     }
@@ -179,13 +184,20 @@ impl<'a> SourceExpansion<'a> {
         kind: SourceKind,
         section: Option<&str>,
     ) -> Result<DialectContext> {
-        ensure!(self.stack.len() < 128, "source include depth exceeded");
         let key = (source.path.clone(), section.map(str::to_ascii_lowercase));
         ensure!(
             !self.stack.contains(&key),
             "recursive source include {}",
             source.path.display()
         );
+        let budget = self.session.budget().clone();
+        let _depth = budget.enter()?;
+        budget.charge(super::Resource::SourceVisits, 1)?;
+        budget.charge(super::Resource::ScannedBytes, source.bytes.len())?;
+        budget.charge(
+            super::Resource::Statements,
+            source.bytes.split_inclusive(|byte| *byte == b'\n').count(),
+        )?;
         self.stack.push(key);
         self.sources.insert(display_path(&source.path));
         let result = self.expand_lines(source, inherited, kind, section);
@@ -212,13 +224,16 @@ impl<'a> SourceExpansion<'a> {
         Ok(None)
     }
 
-    fn expand_lines(
-        &mut self,
+    fn project_lines(
+        &self,
         source: &AdmittedSource,
         inherited: DialectContext,
         kind: SourceKind,
         section: Option<&str>,
-    ) -> Result<DialectContext> {
+    ) -> Result<(
+        DialectContext,
+        Vec<model_preprocess_simplis::source_dialect::ProjectedStatement>,
+    )> {
         let (context, mut projected) =
             project_resource(&source.bytes, inherited, kind, self.simulator)?;
         if let Some(section) = section {
@@ -235,6 +250,18 @@ impl<'a> SourceExpansion<'a> {
                 .filter_map(|(index, line)| selected.contains(&index).then_some(line))
                 .collect();
         }
+        Ok((context, projected))
+    }
+
+    fn expand_lines(
+        &mut self,
+        source: &AdmittedSource,
+        inherited: DialectContext,
+        kind: SourceKind,
+        section: Option<&str>,
+    ) -> Result<DialectContext> {
+        let (context, projected) = self.project_lines(source, inherited, kind, section)?;
+
         let mut embedded = false;
         let mut projected = projected.into_iter();
         while let Some(line) = projected.next() {
@@ -256,6 +283,17 @@ impl<'a> SourceExpansion<'a> {
                         .context("unmatched .ENDS in source expansion")?;
                 }
                 if self.capture_plan && self.scope_depth == 0 && analysis_plan::tracked(&name) {
+                    self.session
+                        .budget()
+                        .charge(super::Resource::GeneratedNodes, 1)?;
+                    self.session.budget().charge(
+                        super::Resource::EmittedBytes,
+                        source
+                            .path
+                            .as_os_str()
+                            .len()
+                            .saturating_add(line.text.len()),
+                    )?;
                     let mut declaration = SourceDeclaration {
                         origin: DirectiveOrigin::Source {
                             path: source.path.clone(),
@@ -267,6 +305,10 @@ impl<'a> SourceExpansion<'a> {
                     if name == ".CONTROL" {
                         let mut end = None;
                         for body in projected.by_ref() {
+                            self.session.budget().charge(
+                                super::Resource::EmittedBytes,
+                                body.text.len().saturating_add(1),
+                            )?;
                             declaration.text.push('\n');
                             declaration.text.push_str(&body.text);
                             if analysis_plan::command(&body.text) == ".ENDC" {
@@ -296,6 +338,7 @@ impl<'a> SourceExpansion<'a> {
                         .scope_depth
                         .checked_add(1)
                         .context("source scope depth overflow")?;
+                    self.session.budget().check_depth(self.scope_depth)?;
                 }
             }
             if kind == SourceKind::Include && name == ".END" && !embedded {
@@ -315,8 +358,16 @@ impl<'a> SourceExpansion<'a> {
         line: &str,
     ) -> Result<()> {
         if self.simulator == LibrarySimulator::Simetrix {
+            let source = display_path(&source.path);
+            self.session
+                .budget()
+                .charge(super::Resource::GeneratedNodes, 1)?;
+            self.session.budget().charge(
+                super::Resource::EmittedBytes,
+                source.len().saturating_add(line.len()),
+            )?;
             self.statements.push(ScopedStatement {
-                source: display_path(&source.path),
+                source,
                 context,
                 first_line: original.first_line,
                 last_line: original.last_line,
@@ -377,7 +428,12 @@ fn parse_admitted_library(
 ) -> Result<ParsedLibrary> {
     let origin = display_path(&source.path);
     if projection(request.format) != LibrarySimulator::Simetrix {
-        return parse_library_for_simulator(origin, &source.bytes, projection(request.format));
+        return parse_library_with_budget(
+            origin,
+            &source.bytes,
+            projection(request.format),
+            session.budget(),
+        );
     }
     let mut expansion = SourceExpansion::new(session, request, options);
     let dialect = expansion.expand(source, inherited, SourceKind::Include, None)?;
@@ -387,6 +443,7 @@ fn parse_admitted_library(
         dialect,
         &expansion.statements,
         options.output_bytes,
+        expansion.session.budget(),
     )
 }
 
@@ -397,40 +454,62 @@ struct ResolvedLibraries {
     model_selections: Vec<ModelSelection>,
 }
 
-fn catalog_members(
-    request: &Request,
+fn catalog_members<'a>(
+    request: &'a Request,
     options: &Options,
     cancellation: &Cancellation,
     session: &mut SourceSession,
     context: DialectContext,
-) -> Result<Vec<(ParsedLibrary, String)>> {
+) -> Result<Vec<(Cow<'a, ParsedLibrary>, String)>> {
     let simulator = projection(request.format);
-    let mut parsed_session = SourceSession::new(
+    let mut parsed_session = SourceSession::with_budget(
         AdmissionConfig {
             command: None,
             ..options.admission.clone()
         },
         cancellation.clone(),
+        session.budget().clone(),
     );
     let mut members = Vec::new();
+    let mut in_memory_sources = BTreeSet::new();
     for library in &request.libraries {
+        session.budget().charge(super::Resource::SourceVisits, 1)?;
+        session
+            .budget()
+            .charge(super::Resource::GeneratedNodes, 1)?;
         let (parsed, origin) = match library {
             LibraryInput::Source(input) => {
                 let admitted = input.admit(session)?;
                 let origin = display_path(&admitted.path);
                 (
-                    parse_admitted_library(&admitted, request, options, session, context)?,
+                    Cow::Owned(parse_admitted_library(
+                        &admitted, request, options, session, context,
+                    )?),
                     origin,
                 )
             }
             LibraryInput::ParsedFile(path) => {
                 let admitted = parsed_session.load(path)?;
+                session
+                    .budget()
+                    .charge(super::Resource::ScannedBytes, admitted.bytes.len())?;
+                session
+                    .budget()
+                    .charge(super::Resource::EmittedBytes, admitted.bytes.len())?;
                 (
-                    ParsedLibrary::from_json(&admitted.bytes)?,
+                    Cow::Owned(ParsedLibrary::from_json(&admitted.bytes)?),
                     display_path(&admitted.path),
                 )
             }
-            LibraryInput::Parsed(parsed) => (parsed.clone(), parsed.source_name().to_owned()),
+            LibraryInput::Parsed(parsed) => {
+                if in_memory_sources.insert(parsed.source_id()) {
+                    session.budget().charge(super::Resource::Sources, 1)?;
+                }
+                session
+                    .budget()
+                    .charge(super::Resource::EmittedBytes, parsed.source_name().len())?;
+                (Cow::Borrowed(parsed), parsed.source_name().to_owned())
+            }
         };
         ensure!(
             parsed.simulator() == simulator,
@@ -445,26 +524,32 @@ fn catalog_members(
 
 fn catalog(
     simulator: LibrarySimulator,
-    members: Vec<(ParsedLibrary, String)>,
+    members: Vec<(Cow<'_, ParsedLibrary>, String)>,
     mapping: Option<&MappingTable>,
     limit: usize,
+    budget: &super::WorkBudget,
 ) -> Result<ResolvedLibraries> {
-    let mut catalog = SubcircuitCatalog::for_simulator(simulator);
+    let mut catalog = SubcircuitCatalog::for_simulator(simulator).with_budget(budget.clone());
     let mut sources = BTreeMap::<String, BTreeSet<String>>::new();
     let mut device_identities = Vec::new();
     let mut model_selections = Vec::new();
     for (parsed, origin) in members {
         let parsed = if let Some(mapping) = mapping {
-            let (parsed, selections) = parsed.mapped(mapping, limit)?;
+            let (parsed, selections) = parsed.mapped(mapping, limit, budget)?;
             model_selections.extend(selections);
-            parsed
+            Cow::Owned(parsed)
         } else {
             parsed
         };
         catalog.add_parsed_library(&parsed)?;
-        device_identities.extend(parsed.device_identities().iter().cloned());
+        for identity in parsed.device_identities() {
+            device_identities.push(identity.clone_with_budget(budget)?);
+        }
         let origins = sources.entry(parsed.source_id().to_owned()).or_default();
-        origins.extend(parsed.source_names().iter().cloned());
+        for source in parsed.source_names() {
+            budget.charge(super::Resource::EmittedBytes, source.len())?;
+            origins.insert(source.clone());
+        }
         origins.insert(origin);
     }
     Ok(ResolvedLibraries {
@@ -495,7 +580,36 @@ fn check_closed_includes(bytes: &[u8], known: &BTreeSet<&str>) -> Result<()> {
     Ok(())
 }
 
-fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle> {
+fn expanded(
+    root: &AdmittedSource,
+    format: InputFormat,
+    budget: &super::WorkBudget,
+) -> Result<PreparedBundle> {
+    budget.charge(super::Resource::SourceVisits, 1)?;
+    budget.charge(super::Resource::ScannedBytes, root.bytes.len())?;
+    budget.charge(
+        super::Resource::Statements,
+        root.bytes.split_inclusive(|byte| *byte == b'\n').count(),
+    )?;
+    let mut depth = 0usize;
+    let mut embedded = false;
+    for line in std::str::from_utf8(&root.bytes)?.lines() {
+        if let Some(start) = model_translate_simplis::syntax::file_boundary(line) {
+            embedded = start;
+            continue;
+        }
+        if embedded {
+            continue;
+        }
+        match analysis_plan::command(line).as_str() {
+            ".SUBCKT" if line.split_ascii_whitespace().nth(1).is_some() => {
+                depth += 1;
+                budget.check_depth(depth)?;
+            }
+            ".ENDS" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
     let include = format == InputFormat::ExpandedLibrary;
     let mut plan = AnalysisPlan::new(
         AnalysisDialect::Expanded,
@@ -521,9 +635,9 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
         &mut waveforms,
     )?;
     let translated = if include {
-        translate_simplis_expanded_library(&source)?
+        translate_simplis_expanded_library_with_budget(&source, budget)?
     } else {
-        translate_simplis_deck(&source)?
+        translate_simplis_deck_with_budget(&source, budget)?
     };
     check_closed_includes(&translated.bytes, &BTreeSet::new())?;
     let artifact = generated(
@@ -548,6 +662,7 @@ fn translate_companions(
     root_sources: &BTreeSet<String>,
     initial_conditions: &mut Option<super::passive_ic::InitialConditions>,
     mut remaining: usize,
+    budget: &model_preprocess_command::WorkBudget,
 ) -> Result<(Vec<Artifact>, Vec<String>)> {
     let mut companions = Vec::new();
     let mut dependencies = Vec::new();
@@ -556,6 +671,7 @@ fn translate_companions(
         "linked translation count mismatch"
     );
     for (library, mut translated) in linked.libraries.iter().zip(translated_libraries) {
+        budget.charge(super::Resource::ScannedBytes, translated.bytes.len())?;
         if let Some(policy) = &mut *initial_conditions {
             capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
         }
@@ -638,17 +754,19 @@ fn resolve_deck(
     let members = catalog_members(request, options, cancellation, session, context)?;
     let mapping = if request.format == InputFormat::SimetrixDeck {
         let configuration = if let Some(path) = &options.device_config {
-            let mut config_session = SourceSession::new(
+            let mut config_session = SourceSession::with_budget(
                 AdmissionConfig {
                     command: None,
                     ..options.admission.clone()
                 },
                 cancellation.clone(),
+                session.budget().clone(),
             );
             let admitted = config_session.load(path)?;
             DeviceConfiguration::parse(
                 &display_path(&admitted.path),
                 std::str::from_utf8(&admitted.bytes)?,
+                session.budget(),
             )?
         } else {
             DeviceConfiguration::default()
@@ -659,29 +777,36 @@ fn resolve_deck(
         for (parsed, _) in &members {
             model_preprocess_simplis::source_dialect::model_mapping::validate_catalog_directives(
                 parsed.scoped_statements(),
+                session.budget(),
             )?;
         }
-        Some(MappingTable::resolve(&configuration, &statements)?)
+        Some(MappingTable::resolve(
+            &configuration,
+            &statements,
+            session.budget(),
+        )?)
     } else {
         None
     };
-    let (expanded_root, mut device_identities, mut model_selections) =
-        if let Some(mapping) = &mapping {
-            let mapped = mapping.apply(&statements)?;
-            let lowered = lower_scoped_statements(&mapped.statements, options.output_bytes)?;
-            let resolved = resolve_device_identities(&lowered)?;
-            ensure!(
-                resolved.text.len() <= options.output_bytes,
-                "device identity expansion byte budget exceeded"
-            );
-            (
-                resolved.text.into_bytes(),
-                resolved.identities,
-                mapped.selections,
-            )
-        } else {
-            (output, Vec::new(), Vec::new())
-        };
+    let (expanded_root, mut device_identities, mut model_selections) = if let Some(mapping) =
+        &mapping
+    {
+        let mapped = mapping.apply(&statements, session.budget())?;
+        let lowered =
+            lower_scoped_statements(&mapped.statements, options.output_bytes, session.budget())?;
+        let resolved = resolve_device_identities(&lowered, session.budget())?;
+        ensure!(
+            resolved.text.len() <= options.output_bytes,
+            "device identity expansion byte budget exceeded"
+        );
+        (
+            resolved.text.into_bytes(),
+            resolved.identities,
+            mapped.selections,
+        )
+    } else {
+        (output, Vec::new(), Vec::new())
+    };
     let ResolvedLibraries {
         catalog,
         sources,
@@ -692,6 +817,7 @@ fn resolve_deck(
         members,
         mapping.as_ref(),
         options.output_bytes,
+        session.budget(),
     )?;
     device_identities.extend(catalog_identities);
     model_selections.extend(catalog_selections);
@@ -741,7 +867,8 @@ fn linked(
         .iter()
         .map(|library| library.filename.as_str())
         .collect::<BTreeSet<_>>();
-    let (mut translated_root, translated_libraries) = translate_simplis_linked_netlist(&linked)?;
+    let (mut translated_root, translated_libraries) =
+        translate_simplis_linked_netlist(&linked, session.budget())?;
     if request.format == InputFormat::SimplisDeck {
         initial_conditions = Some(super::passive_ic::InitialConditions {
             mode: Some("1".to_owned()),
@@ -765,6 +892,7 @@ fn linked(
         &root_sources,
         &mut initial_conditions,
         remaining,
+        session.budget(),
     )?;
     let primary = generated(
         "deck.cir".to_owned(),
@@ -807,7 +935,9 @@ pub fn prepare(
         InputFormat::SimplisLibrary | InputFormat::SimetrixLibrary => {
             parse_root(root, request, options, session)
         }
-        InputFormat::ExpandedDeck | InputFormat::ExpandedLibrary => expanded(root, request.format),
+        InputFormat::ExpandedDeck | InputFormat::ExpandedLibrary => {
+            expanded(root, request.format, session.budget())
+        }
         InputFormat::SimplisDeck | InputFormat::SimetrixDeck => {
             linked(root, request, options, cancellation, session)
         }
