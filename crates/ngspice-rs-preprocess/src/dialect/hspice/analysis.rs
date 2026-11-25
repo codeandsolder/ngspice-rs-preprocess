@@ -71,3 +71,33 @@ pub fn lower(text: &str) -> Result<String> {
     }
     Ok(text.to_owned())
 }
+
+/// Ensure the requested sweep target is actually an independent source,
+/// rather than a parameter whose name happens to begin with V or I.
+pub fn validate_dc_sources(rows: &[(String, usize)]) -> Result<()> {
+    let mut sources = std::collections::BTreeSet::new();
+    let mut depth = 0_usize;
+    for (row, _) in rows.iter().skip(1) {
+        let name = command(row);
+        match name.as_str() {
+            ".SUBCKT" => depth += 1,
+            ".ENDS" => depth = depth.checked_sub(1).context("unmatched .ENDS")?,
+            _ if depth == 0 && name.starts_with(['V', 'I']) => {
+                sources.insert(name);
+            }
+            _ => (),
+        }
+    }
+    for (row, _) in rows.iter().skip(1) {
+        if command(row) == ".DC" {
+            for sweep in arguments(row)?.as_chunks::<4>().0 {
+                ensure!(
+                    sources.contains(&sweep[0].to_ascii_uppercase()),
+                    "HSPICE DC target {} is not a root independent source; parameter sweeps require explicit analysis binding",
+                    sweep[0]
+                );
+            }
+        }
+    }
+    Ok(())
+}

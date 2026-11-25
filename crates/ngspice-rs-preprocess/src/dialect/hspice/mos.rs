@@ -24,9 +24,9 @@ pub struct Options {
 }
 
 impl Options {
-    pub fn set(&mut self, name: &str, value: String) -> Result<()> {
+    pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
         let value = lower_spice_expression(
-            &value,
+            value,
             super::HSPICE,
             value.len().saturating_mul(8).saturating_add(128),
         )?;
@@ -54,12 +54,10 @@ impl Options {
 }
 
 fn flag(value: f64, field: &str) -> Result<bool> {
-    if value == 0. {
-        Ok(false)
-    } else if value == 1. {
-        Ok(true)
-    } else {
-        bail!("invalid HSPICE {field} selector {value}")
+    match value {
+        0. => Ok(false),
+        1. => Ok(true),
+        _ => bail!("invalid HSPICE {field} selector {value}"),
     }
 }
 
@@ -91,7 +89,7 @@ pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
     for field in &mut selection.card.parameters {
         field.name.make_ascii_uppercase();
         if field.name == "TREF" {
-            field.name = "TNOM".to_owned();
+            "TNOM".clone_into(&mut field.name);
         }
         ensure!(
             seen.insert(field.name.clone()),
@@ -106,7 +104,7 @@ pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
             // The documented ACM=12 mode uses the original Berkeley junction
             // and parasitic equations; CALCACM is inactive in this mode.
             "ACM" => ensure!(
-                parse_spice_constant(value)? == 12.,
+                matches!(parse_spice_constant(value)?, 12.),
                 "HSPICE BSIM4 ACM mode requires distinct junction kernel"
             ),
             "CALCACM" => {

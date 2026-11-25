@@ -1,5 +1,5 @@
 //! Input parameter names of the ngspice 47 Berkeley BSIM4 kernels.
-//! Derived from the IFparm declaration tables in bsim4v5/b4v5.c,
+//! Derived from the `IFparm` declaration tables in bsim4v5/b4v5.c,
 //! bsim4v6/b4v6.c and bsim4v7/b4v7.c (spicelib/devices).
 //! Bits 0, 1, 2 denote 4.5.0, 4.6.4, 4.7.0 respectively.
 pub const MODEL: &[(&str, u8)] = &[

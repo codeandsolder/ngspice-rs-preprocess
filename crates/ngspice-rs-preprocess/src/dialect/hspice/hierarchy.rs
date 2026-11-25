@@ -503,6 +503,7 @@ impl Binder<'_> {
         result.append(&mut root);
         result.append(&mut self.emitted_definitions);
         result.append(&mut ends);
+        super::analysis::validate_dc_sources(&result)?;
         mos::finish(&mut result, &self.pending_mos, mos_options)?;
         Ok(result)
     }

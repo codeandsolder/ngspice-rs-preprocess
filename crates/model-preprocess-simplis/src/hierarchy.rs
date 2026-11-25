@@ -829,7 +829,9 @@ pub fn parse_library_for_simulator(
 }
 
 /// Archive a linked standalone HSPICE source graph without caller-specific
-/// model selection or parameter binding. Reuse the parsed library identity
+/// model selection or parameter binding.
+///
+/// Reuse the parsed library identity
 /// and admitted source span contract; do not run SIMPLIS specialization.
 ///
 /// # Errors

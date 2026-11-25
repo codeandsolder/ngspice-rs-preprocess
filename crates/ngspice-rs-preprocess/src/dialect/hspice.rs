@@ -91,7 +91,8 @@ fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
                     &key,
                     field
                         .expression
-                        .or_else(|| (key == "WL").then(|| "1".to_owned()))
+                        .as_deref()
+                        .or_else(|| (key == "WL").then_some("1"))
                         .context("missing MOS option value")?,
                 )?;
                 continue;
@@ -159,6 +160,62 @@ fn lower_source(text: &str) -> Result<String> {
     Ok(text.to_owned())
 }
 
+/// Resolve the structural prefix of a dependent source. POLY dimensions
+/// and electrical control names are not parameter expressions.
+fn controlled_value_start(
+    text: &str,
+    ranges: &[std::ops::Range<usize>],
+    kind: u8,
+) -> Result<usize> {
+    let token = |index: usize| ranges.get(index).map_or("", |range| &text[range.clone()]);
+    let mode = token(3).to_ascii_uppercase();
+    if mode.starts_with("POLY(") || mode == "POLY" {
+        let (dimension, first) = if mode == "POLY" {
+            (token(4).trim_matches(['(', ')']), 5_usize)
+        } else {
+            (
+                mode.strip_prefix("POLY(")
+                    .and_then(|tail| tail.strip_suffix(')'))
+                    .context("invalid HSPICE POLY dimension")?,
+                4_usize,
+            )
+        };
+        let dimension = dimension
+            .parse::<usize>()
+            .context("HSPICE POLY requires a constant positive dimension")?;
+        ensure!(dimension > 0, "HSPICE POLY requires a positive dimension");
+        let controls = dimension
+            .checked_mul(if matches!(kind, b'E' | b'G') { 2 } else { 1 })
+            .and_then(|count| first.checked_add(count))
+            .context("HSPICE POLY control count overflow")?;
+        return Ok(ranges
+            .get(controls)
+            .context("HSPICE POLY lacks controls or coefficients")?
+            .start);
+    }
+    if mode == "VALUE" || mode == "VOL" || mode == "CUR" {
+        return Ok(ranges
+            .get(4)
+            .context("missing HSPICE controlled expression")?
+            .start);
+    }
+    ensure!(
+        ![
+            "TABLE", "LAPLACE", "FREQ", "VCR", "VCCAP", "CCCR", "CCCAP", "DELAY"
+        ]
+        .iter()
+        .any(|name| mode == *name
+            || mode.starts_with(&format!("{name}("))
+            || mode.starts_with(&format!("{name}{{"))),
+        "unqualified HSPICE controlled transfer {mode}"
+    );
+    let index = if matches!(kind, b'E' | b'G') { 5 } else { 4 };
+    Ok(ranges
+        .get(index)
+        .context("missing HSPICE controlled source coefficient")?
+        .start)
+}
+
 /// Identify electrical names before lowering values. In particular, a node
 /// named 1x is legal and is not a one-mega engineering literal.
 fn map_values(
@@ -169,7 +226,6 @@ fn map_values(
     let ranges = statement_token_spans(text)?;
     let command = analysis_plan::command(text);
     let start = |index: usize| ranges.get(index).map_or(text.len(), |range| range.start);
-    let token = |index: usize| ranges.get(index).map_or("", |range| &text[range.clone()]);
     let assignment_start = || {
         ranges
             .iter()
@@ -209,15 +265,8 @@ fn map_values(
             Some(b'X') => assignment_start(),
             Some(b'M') => start(6),
             Some(b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => start(3),
-            Some(b'E'..=b'H')
-                if ["VALUE", "VOL", "CUR", "TABLE", "POLY", "LAPLACE"]
-                    .iter()
-                    .any(|mode| token(3).eq_ignore_ascii_case(mode)) =>
-            {
-                start(3)
-            }
-            Some(b'E' | b'G') => start(5),
-            Some(b'D' | b'F' | b'H') => start(4),
+            Some(kind @ (b'E'..=b'H')) => controlled_value_start(text, &ranges, *kind)?,
+            Some(b'D') => start(4),
             _ => text.len(),
         },
     };

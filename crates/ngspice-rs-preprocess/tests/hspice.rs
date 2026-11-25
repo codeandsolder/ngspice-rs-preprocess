@@ -645,3 +645,43 @@ fn multiplier_and_expression_parameter_have_independent_semantics() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn polynomial_controls_are_not_scalar_parameters() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let text = numeric_deck(
+        dir.path(),
+        r#"Structural controls
+.option parhier=local
+V1 ctrl 0 2
+V2 ctrl2 0 3
+X1 ctrl ctrl2 result cell
+R1 result 0 1k
+.subckt cell a b out a=17 b=19 coefficient=2
+E1 out 0 VCVS POLY(2) a 0 b 0 1 coefficient 3 4 5 6
+.ends cell
+.end
+"#,
+        "op\nwrdata op.dat v(result)",
+    )?;
+    // 1 + 2*2 + 3*3 + 4*2^2 + 5*2*3 + 6*3^2
+    let row = &values(dir.path(), "op.dat")?[0];
+    ensure!((row[1] - 114.).abs() < 1e-10, "{row:?}\n{text}");
+    Ok(())
+}
+
+#[test]
+fn dc_sweep_target_must_be_an_independent_source() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("sweep.sp");
+    fs::write(
+        &root,
+        "Parameter sweep\n.param vgain=1\nV1 a 0 1\nR1 a 0 1k\n.dc vgain 1 2 1\n.end\n",
+    )?;
+    let error = compile(&root, InputFormat::HspiceDeck).expect_err("parameter sweep");
+    ensure!(
+        format!("{error:#}").contains("not a root independent source"),
+        "{error:#}"
+    );
+    Ok(())
+}
