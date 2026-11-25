@@ -26,13 +26,14 @@ static Digital_State_t receiver_value(double value, double low, double high,
 void cm_preprocess_logic_event(ARGS)
 {
     struct logic_event_state *state;
-    Digital_State_t desired, before;
+    Digital_State_t desired, before, old_clock;
     int op = PARAM(operation), inertial = PARAM(inertial);
     int i, size = PORT_SIZE(in);
     double delay = PARAM(delay), low = PARAM(low), high = PARAM(high);
     double earliest = TIME;
-    if (op >= 4 && size != 2) {
-        cm_message_send("preprocess_logic_event: latch requires exactly two inputs");
+    int required = op >= 7 && op <= 10 ? 3 : op >= 4 ? 2 : 0;
+    if (required && size != required) {
+        cm_message_send("preprocess_logic_event: invalid state element arity");
         OUTPUT_CHANGED(out) = FALSE;
         return;
     }
@@ -97,6 +98,7 @@ void cm_preprocess_logic_event(ARGS)
         }
     }
 
+    old_clock = state->receiver[size - 1].bit;
     for (i = 0; i < size; ++i) {
         struct receiver_sample *old = &state->receiver[i];
         old->voltage = INPUT(in[i]);
@@ -117,6 +119,32 @@ void cm_preprocess_logic_event(ARGS)
         }
         if (op >= 2)
             desired = desired == ONE ? ZERO : ONE;
+    } else if (op >= 7 && op <= 14) {
+        Digital_State_t clock = state->receiver[size - 1].bit;
+        Digital_State_t trigger = (op % 2) ? ONE : ZERO;
+        Digital_State_t data = state->receiver[0].bit;
+        desired = state->committed;
+        /* DC establishes receiver history but is never a clock edge.
+         * Evaluate all receivers before sampling data at the triggering edge. */
+        if (ANALYSIS != DC && old_clock != clock && clock == trigger) {
+            if (op <= 10) {
+                Digital_State_t reset = state->receiver[1].bit;
+                if (data == ONE && reset == ZERO)
+                    desired = ONE;
+                else if (data == ZERO && reset == ONE)
+                    desired = ZERO;
+                else if (op >= 9 && data == ONE && reset == ONE)
+                    desired = desired == ONE ? ZERO : ONE;
+            } else if (op <= 12) {
+                desired = data;
+            } else if (data == ONE) {
+                desired = desired == ONE ? ZERO : ONE;
+            }
+        }
+    } else if (op >= 15) {
+        Digital_State_t enable = state->receiver[1].bit;
+        desired = enable == (op == 15 ? ONE : ZERO) ?
+            state->receiver[0].bit : state->committed;
     } else {
         Digital_State_t set = state->receiver[0].bit;
         Digital_State_t reset = state->receiver[1].bit;

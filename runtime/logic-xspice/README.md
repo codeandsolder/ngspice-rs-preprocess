@@ -1,10 +1,10 @@
 # Event-based logic runtime for ngspice 47
 
 The SIMPLIS translator emits XSPICE models for numbered AND/OR/NAND/NOR
-gates, DIGITAL1 AND/OR and S-R latches, and classic SRFF. This runtime is
+gates, DIGITAL1 AND/OR and S-R latches, and classic SRFF, clocked SR/JK/D/T flip-flops and transparent latches. This runtime is
 independent of the experimental ALB runtime. Translation results advertise
 the required code-model library through `required_code_models`. The unified
-preparation API and version-2 JSON manifest report the per-artifact requirements
+preparation API and versioned JSON manifest report the per-artifact requirements
 and their bundle-wide union. A native engine can bind the same schemas to
 typed kernels rather than loading the C module. The module is the independent
 C ngspice reference backend; it does not by itself provide native-engine
@@ -46,6 +46,19 @@ resolution.
 
 The event-model operation identifiers are 0 AND, 1 OR, 2 NAND, 3 NOR,
 4 reset-dominant latch, 5 set-dominant latch, and 6 hold-on-equal latch.
+Operations 7/8 implement rising/falling clocked SR, 9/10 clocked JK,
+11/12 clocked D, 13/14 clocked T, and 15/16 high/low-enabled transparent
+data latch. Clock or enable is the final receiver. Clocked SR/JK take
+three inputs; D/T/latch take two. DC qualifies receiver history without
+clocking a flip-flop. A transparent latch follows its data during DC if
+enabled, otherwise retains IC. All receivers qualify before evaluating
+the state transition; the previous clock state and Q are stored in the
+rollback-aware event history. Complementary outputs share one state.
+Classic source models have no setup/hold or delay parameters; unsupported
+fields are rejected rather than approximated. Logical edge/enable sense
+is applied after the input inversion implied by source LOGIC.
+Reference: SIMPLIS simulator manual, "Device Models Used in Simplis",
+clocked logic gate and latch sections.
 
 The same event model accepts a single receiver for strict hysteretic
 SIMPLIS switch state. The open/closed initial hint is used only within the

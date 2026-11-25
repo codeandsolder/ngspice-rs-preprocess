@@ -90,7 +90,7 @@ impl ParsedLibrary {
     }
 
     /// Original projected declarations, before simulation-local mapping.
-    #[must_use = "the returned declarations are inputs to request-local model mapping"]
+    #[must_use]
     pub fn scoped_statements(&self) -> &[crate::source_dialect::ScopedStatement] {
         &self.scoped_statements
     }
@@ -1484,7 +1484,7 @@ pub fn active_statement_prefix(statement: &str) -> &str {
 
 /// Identify the assignment tail of a charge-defined capacitor, excluding comments.
 /// A capacitance value and a charge expression are distinct device forms.
-#[must_use = "the result distinguishes charge-defined from capacitance-defined devices"]
+#[must_use = "the returned tail identifies the charge-defined capacitor law"]
 pub fn capacitor_charge_assignments(statement: &str) -> Option<&str> {
     let active = active_statement_prefix(statement).trim_start();
     let mut fields = active.split_whitespace();

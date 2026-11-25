@@ -15,9 +15,10 @@ pub use logical_ports::{
     expand_logical_alb_source, expand_logical_alb_source_with_opaque_x_interfaces,
     specialize_family_occurrences, verify_external_code_models, verify_external_native_libraries,
 };
+use model_normalize_ngspice::model_card::{FieldSpan, ModelTermination, statement_field_spans};
 use model_translate_simplis::syntax::{
     Item, Subcircuit, electrical_statements, embedded_files, file_boundary, logical_statements,
-    model_header, normalized_statement, simple_assignment_value, statement_tokens,
+    model_header, normalized_statement, statement_tokens,
 };
 use std::fmt::Write as _;
 
@@ -50,83 +51,31 @@ fn embedded_alb_files(items: &[Item]) -> Result<std::collections::BTreeMap<Strin
         .collect())
 }
 
-fn quoted_assignment_value(statement: &str, name: &str) -> Result<Option<String>> {
-    let normalized = normalized_statement(statement);
-    let upper = normalized.to_ascii_uppercase();
-    let needle = name.to_ascii_uppercase();
-    let mut offset = 0usize;
-    while let Some(found) = upper[offset..].find(&needle) {
-        let start = offset + found;
-        let boundary = start == 0
-            || upper.as_bytes()[start - 1].is_ascii_whitespace()
-            || matches!(upper.as_bytes()[start - 1], b'(' | b',');
-        let mut cursor = start + needle.len();
-        if !boundary
-            || upper
-                .as_bytes()
-                .get(cursor)
-                .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
-        {
-            offset = cursor;
-            continue;
-        }
-        while upper
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            cursor += 1;
-        }
-        if upper.as_bytes().get(cursor) != Some(&b'=') {
-            offset = cursor;
-            continue;
-        }
-        cursor += 1;
-        while upper
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            cursor += 1;
-        }
-        let quote = normalized
-            .as_bytes()
-            .get(cursor)
-            .copied()
-            .filter(|byte| matches!(*byte, b'\'' | b'"'))
-            .with_context(|| format!("SIMetrix model parameter {name} must be quoted"))?;
-        cursor += 1;
-        let value_start = cursor;
-        while let Some(byte) = normalized.as_bytes().get(cursor).copied() {
-            if byte == quote {
-                return Ok(Some(normalized[value_start..cursor].to_owned()));
-            }
-            cursor += 1;
-        }
-        bail!("unterminated quoted SIMetrix model parameter {name}");
-    }
-    Ok(None)
+struct AlbFields<'a> {
+    statement: &'a str,
+    fields: Vec<FieldSpan>,
 }
 
-fn simple_assignment_or_positional_value(statement: &str, name: &str) -> Result<Option<String>> {
-    if let Some(value) = simple_assignment_value(statement, name) {
-        return Ok(Some(value));
+impl<'a> AlbFields<'a> {
+    fn parse(statement: &'a str, termination: ModelTermination) -> Result<Self> {
+        Ok(Self {
+            statement,
+            fields: statement_field_spans(statement, &["FILE", "USER"], termination)?,
+        })
     }
-    let normalized = normalized_statement(statement);
-    let tokens = statement_tokens(&normalized)?;
-    let Some(index) = tokens
-        .iter()
-        .position(|token| token.eq_ignore_ascii_case(name))
-    else {
-        return Ok(None);
-    };
-    let value = match tokens.get(index.saturating_add(1)).map(String::as_str) {
-        Some("=") => tokens.get(index.saturating_add(2)),
-        Some(value) if !value.starts_with('=') => tokens.get(index.saturating_add(1)),
-        Some(_) | None => None,
+
+    fn field(&self, name: &str) -> Option<&FieldSpan> {
+        self.fields.iter().find(|field| {
+            self.statement[field.name.clone()].eq_ignore_ascii_case(name) && field.value.is_some()
+        })
     }
-    .with_context(|| format!("missing value after SIMetrix model parameter {name}"))?;
-    Ok(Some(value.clone()))
+
+    fn value(&self, name: &str) -> Option<&'a str> {
+        self.field(name)?
+            .value
+            .as_ref()
+            .map(|span| &self.statement[span.clone()])
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -296,71 +245,22 @@ struct AlbModel {
     semantics: AlbModelSemantics,
 }
 
-fn optional_numeric_assignment(statement: &str, name: &str) -> Result<Option<f64>> {
-    simple_assignment_value(statement, name)
-        .map(|value| crate::parse_numeric(&value))
+fn optional_numeric_assignment(fields: &AlbFields<'_>, name: &str) -> Result<Option<f64>> {
+    fields
+        .value(name)
+        .map(crate::parse_numeric)
         .transpose()
         .with_context(|| format!("parsing SIMetrix ALB model parameter {name}"))
 }
 
-fn bracketed_assignment_value(statement: &str, name: &str) -> Result<Option<String>> {
-    let normalized = normalized_statement(statement);
-    let upper = normalized.to_ascii_uppercase();
-    let needle = name.to_ascii_uppercase();
-    let mut offset = 0usize;
-    while let Some(found) = upper[offset..].find(&needle) {
-        let start = offset + found;
-        let boundary = start == 0
-            || upper.as_bytes()[start - 1].is_ascii_whitespace()
-            || matches!(upper.as_bytes()[start - 1], b'(' | b',');
-        let mut cursor = start + needle.len();
-        if !boundary
-            || upper
-                .as_bytes()
-                .get(cursor)
-                .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
-        {
-            offset = cursor;
-            continue;
-        }
-        while upper
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            cursor += 1;
-        }
-        if upper.as_bytes().get(cursor) == Some(&b'=') {
-            cursor += 1;
-            while upper
-                .as_bytes()
-                .get(cursor)
-                .is_some_and(u8::is_ascii_whitespace)
-            {
-                cursor += 1;
-            }
-        }
-        if normalized.as_bytes().get(cursor) != Some(&b'[') {
-            offset = cursor;
-            continue;
-        }
-        let value_start = cursor + 1;
-        cursor = value_start;
-        while let Some(byte) = normalized.as_bytes().get(cursor).copied() {
-            if byte == b']' {
-                return Ok(Some(normalized[value_start..cursor].to_owned()));
-            }
-            cursor += 1;
-        }
-        bail!("unterminated bracketed SIMetrix model parameter {name}");
-    }
-    Ok(None)
-}
-
-fn numeric_vector_assignment(statement: &str, name: &str) -> Result<Vec<f64>> {
-    let Some(value) = bracketed_assignment_value(statement, name)? else {
+fn numeric_vector_assignment(fields: &AlbFields<'_>, name: &str) -> Result<Vec<f64>> {
+    let Some(value) = fields.value(name) else {
         return Ok(Vec::new());
     };
+    let value = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .with_context(|| format!("SIMetrix model parameter {name} requires a bracketed vector"))?;
     let mut output = Vec::new();
     for group in value.split(',') {
         let mut found = false;
@@ -378,32 +278,45 @@ fn numeric_vector_assignment(statement: &str, name: &str) -> Result<Vec<f64>> {
     Ok(output)
 }
 
-fn optional_family_assignment(statement: &str, name: &str) -> Result<Option<String>> {
-    quoted_assignment_value(statement, name)
-        .map(|value| value.map(|value| value.to_ascii_uppercase()))
+fn optional_family_assignment(fields: &AlbFields<'_>, name: &str) -> Result<Option<String>> {
+    fields
+        .value(name)
+        .map(|value| {
+            let quote = value
+                .chars()
+                .next()
+                .filter(|character| matches!(character, '\'' | '"'))
+                .with_context(|| format!("SIMetrix model parameter {name} must be quoted"))?;
+            let text = value
+                .strip_prefix(quote)
+                .and_then(|tail| tail.strip_suffix(quote))
+                .with_context(|| format!("SIMetrix model parameter {name} must be quoted"))?;
+            Ok(text.to_ascii_uppercase())
+        })
+        .transpose()
 }
 
-fn alb_model_semantics(statement: &str) -> Result<AlbModelSemantics> {
-    let out_res = optional_numeric_assignment(statement, "OUT_RES")?;
+fn alb_model_semantics(fields: &AlbFields<'_>) -> Result<AlbModelSemantics> {
+    let out_res = optional_numeric_assignment(fields, "OUT_RES")?;
     let semantics = AlbModelSemantics {
-        input_load: optional_numeric_assignment(statement, "INPUT_LOAD")?,
-        out_res_pos: optional_numeric_assignment(statement, "OUT_RES_POS")?.or(out_res),
-        out_res_neg: optional_numeric_assignment(statement, "OUT_RES_NEG")?.or(out_res),
-        out_delay: optional_numeric_assignment(statement, "OUT_DELAY")?,
-        reg_delay: optional_numeric_assignment(statement, "REG_DELAY")?,
-        setup_time: optional_numeric_assignment(statement, "SETUP_TIME")?,
-        hold_time: optional_numeric_assignment(statement, "HOLD_TIME")?,
-        min_clock: optional_numeric_assignment(statement, "MIN_CLOCK")?,
-        user: numeric_vector_assignment(statement, "USER")?,
-        user_scale: optional_numeric_assignment(statement, "USER_SCALE")?,
-        family: optional_family_assignment(statement, "FAMILY")?,
-        in_family: optional_family_assignment(statement, "IN_FAMILY")?,
-        out_family: optional_family_assignment(statement, "OUT_FAMILY")?,
-        min_sink: optional_numeric_assignment(statement, "MIN_SINK")?,
-        max_source: optional_numeric_assignment(statement, "MAX_SOURCE")?,
-        sink_current: optional_numeric_assignment(statement, "SINK_CURRENT")?,
-        source_current: optional_numeric_assignment(statement, "SOURCE_CURRENT")?,
-        supply_v: optional_numeric_assignment(statement, "VSUPPLY")?,
+        input_load: optional_numeric_assignment(fields, "INPUT_LOAD")?,
+        out_res_pos: optional_numeric_assignment(fields, "OUT_RES_POS")?.or(out_res),
+        out_res_neg: optional_numeric_assignment(fields, "OUT_RES_NEG")?.or(out_res),
+        out_delay: optional_numeric_assignment(fields, "OUT_DELAY")?,
+        reg_delay: optional_numeric_assignment(fields, "REG_DELAY")?,
+        setup_time: optional_numeric_assignment(fields, "SETUP_TIME")?,
+        hold_time: optional_numeric_assignment(fields, "HOLD_TIME")?,
+        min_clock: optional_numeric_assignment(fields, "MIN_CLOCK")?,
+        user: numeric_vector_assignment(fields, "USER")?,
+        user_scale: optional_numeric_assignment(fields, "USER_SCALE")?,
+        family: optional_family_assignment(fields, "FAMILY")?,
+        in_family: optional_family_assignment(fields, "IN_FAMILY")?,
+        out_family: optional_family_assignment(fields, "OUT_FAMILY")?,
+        min_sink: optional_numeric_assignment(fields, "MIN_SINK")?,
+        max_source: optional_numeric_assignment(fields, "MAX_SOURCE")?,
+        sink_current: optional_numeric_assignment(fields, "SINK_CURRENT")?,
+        source_current: optional_numeric_assignment(fields, "SOURCE_CURRENT")?,
+        supply_v: optional_numeric_assignment(fields, "VSUPPLY")?,
     };
     for (name, value) in [
         ("REG_DELAY", semantics.effective_reg_delay()),
@@ -444,14 +357,23 @@ fn alb_model_definition(
     let parameters = inline.as_ref().map_or(normalized.as_str(), |definition| {
         &normalized[..definition.parameter_end]
     });
+    let termination = if inline.is_some() {
+        ModelTermination::DialectPrefix
+    } else {
+        ModelTermination::Complete
+    };
+    let fields = AlbFields::parse(parameters, termination)?;
     // FILE before DEF must resolve even though the inline body takes
     // precedence. A FILE after DEF is outside the effective parameter list.
-    let file_body = simple_assignment_or_positional_value(parameters, "FILE")?
+    let file_body = fields
+        .value("FILE")
         .map(|file| {
             let file = file.trim_matches(['\'', '"']).to_ascii_uppercase();
             let exact = files.get(&file);
             let legacy_prefixed = (exact.is_none()
-                && simple_assignment_value(parameters, "FILE").is_none()
+                && fields
+                    .field("FILE")
+                    .is_some_and(|field| !field.explicit_equals)
                 && !file.starts_with('_'))
             .then(|| format!("_{file}"))
             .and_then(|candidate| files.get(&candidate));
@@ -479,7 +401,7 @@ fn alb_model_definition(
             format!("SIMetrix D_LOGIC_BLOCK model {name} has neither FILE nor DEF")
         })?
     };
-    let semantics = alb_model_semantics(parameters)
+    let semantics = alb_model_semantics(&fields)
         .with_context(|| format!("parsing SIMetrix ALB model semantics for {name}"))?;
     Ok(Some((name, body, semantics)))
 }
@@ -564,17 +486,16 @@ fn original_alb_instance_signature(statement: &str) -> Result<Option<(String, Op
         .or_else(|| model.strip_prefix("model="))
         .unwrap_or(model);
     let device = if let Some(tail) = tail {
-        bracketed_assignment_value(tail, "USER")?
-            .with_context(|| format!("unsupported original A-device parameters {tail}"))?;
-        let trailing = tail
-            .split_once(']')
-            .map(|(_, trailing)| trailing.trim())
-            .context("original A-device USER vector has no closing bracket")?;
+        let fields = AlbFields::parse(tail, ModelTermination::Complete)?;
         ensure!(
-            trailing.is_empty(),
-            "unsupported original A-device trailing parameters {trailing}"
+            fields.value("USER").is_some(),
+            "unsupported original A-device parameters {tail}"
         );
-        Some(numeric_vector_assignment(tail, "USER")?)
+        ensure!(
+            fields.fields.len() == 1,
+            "unsupported original A-device trailing parameters {tail}"
+        );
+        Some(numeric_vector_assignment(&fields, "USER")?)
     } else {
         None
     };
@@ -830,6 +751,10 @@ mod tests {
             Ok(reports) => reports.join("\n"),
             Err(error) => error.to_string(),
         })
+    }
+
+    fn parse_semantics(statement: &str) -> Result<AlbModelSemantics> {
+        alb_model_semantics(&AlbFields::parse(statement, ModelTermination::Complete)?)
     }
 
     #[test]
@@ -1176,7 +1101,7 @@ Y = A==3 ;
 
     #[test]
     fn parses_common_alb_model_semantics_and_reports_exactness_blockers() -> Result<()> {
-        let model = alb_model_semantics(
+        let model = parse_semantics(
             r#".model DL d_logic_block file=logic user=[5n, 0, 7n, 5n] input_load=4.5p out_res=40 out_delay=12.4n family="HC""#,
         )?;
         assert_eq!(model.input_load, Some(4.5e-12));
@@ -1212,11 +1137,11 @@ Y = A==3 ;
 
     #[test]
     fn alb_model_semantics_accept_legacy_bare_user_vector() -> Result<()> {
-        let semantics = alb_model_semantics(
+        let semantics = parse_semantics(
             r#".model DL d_logic_block file=logic user [1.4n, 7.4n, 1n, 1.4n] family="HC""#,
         )?;
         assert_eq!(semantics.user.len(), 4);
-        let spaced = alb_model_semantics(
+        let spaced = parse_semantics(
             r#".model DL d_logic_block file=logic user=[1.4n 7.4n, 1n 1.4n] family="HC""#,
         )?;
         assert_eq!(spaced.user, semantics.user);
@@ -1227,7 +1152,7 @@ Y = A==3 ;
 
     #[test]
     fn alb_model_semantics_apply_documented_defaults_and_family_precedence() -> Result<()> {
-        let defaulted = alb_model_semantics(".model DL d_logic_block file=logic")?;
+        let defaulted = parse_semantics(".model DL d_logic_block file=logic")?;
         assert_eq!(defaulted.effective_input_load(), 1.0e-12);
         assert_eq!(defaulted.effective_out_res_pos(), 100.0);
         assert_eq!(defaulted.effective_out_res_neg(), 100.0);
@@ -1240,7 +1165,7 @@ Y = A==3 ;
                 .contains(&"load-dependent output delay")
         );
 
-        let overridden = alb_model_semantics(
+        let overridden = parse_semantics(
             r#".model DL d_logic_block file=logic family="HC" in_family="LS" out_res=-1000 out_res_pos=4"#,
         )?;
         assert_eq!(overridden.effective_families(), ("LS", "HC"));
