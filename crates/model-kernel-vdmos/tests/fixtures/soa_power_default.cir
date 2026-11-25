@@ -1,0 +1,12 @@
+* SOA power_default reference
+Vd d 0 1
+Vg g 0 5
+M1 d g 0 test
+.model test VDMOS (vto=3 kp=2 pd_max=1 tnom=27 phi=0.7)
+.temp 77
+.control
+set numdgt=17
+op
+print @m1[id] @m1[idio] @test[phi] @test[pd_max]
+.endc
+.end

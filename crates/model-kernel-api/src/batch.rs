@@ -39,12 +39,12 @@ impl BatchOutput {
         })
     }
 
-    #[must_use]
+    #[must_use = "the lane count determines the batch shape"]
     pub const fn lanes(&self) -> usize {
         self.lanes
     }
 
-    #[must_use]
+    #[must_use = "the coordinate width determines the batch shape"]
     pub const fn width(&self) -> usize {
         self.width
     }

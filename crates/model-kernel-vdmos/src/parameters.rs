@@ -8,8 +8,8 @@ use super::{Breakdown, Model, ModelError, Polarity, PreparedModel, QuasiSaturati
 pub enum ParameterError {
     /// The source field is not recognized as a ngspice 47 VDMOS parameter.
     Unknown(String),
-    /// A recognized field requires physics or an observation law not yet ported.
-    Unsupported(String),
+    /// A read-only model query cannot be supplied as an input field.
+    ReadOnly(String),
     /// A pair/group of parameters must be specified together.
     Incomplete(&'static str),
     /// The compiled typed model failed its semantic validation.
@@ -20,7 +20,7 @@ impl std::fmt::Display for ParameterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown(name) => write!(f, "unknown VDMOS parameter: {name}"),
-            Self::Unsupported(name) => write!(f, "VDMOS parameter not implemented: {name}"),
+            Self::ReadOnly(name) => write!(f, "VDMOS parameter is read-only: {name}"),
             Self::Incomplete(name) => write!(f, "incomplete VDMOS parameter group: {name}"),
             Self::Invalid(error) => error.fmt(f),
         }
@@ -40,12 +40,12 @@ impl From<ModelError> for ParameterError {
 /// The caller is responsible for parsing `.model` grammar and resolving SPICE
 /// numeric suffixes/expressions. This function owns the ngspice 47 parameter
 /// **meanings**, aliases, temperature units and grouped-parameter activation.
-/// Fields are case-insensitive. Explicit unknown or unsupported parameters
+/// Fields are case-insensitive. Explicit unknown or read-only parameters
 /// fail instead of losing their physical effects silently.
 ///
 /// # Errors
 ///
-/// Rejects unknown, unsupported, incomplete or physically invalid parameters.
+/// Rejects unknown, read-only, incomplete or physically invalid parameters.
 pub fn compile_ngspice<'a>(
     polarity: Polarity,
     parameters: impl IntoIterator<Item = (&'a str, f64)>,
@@ -59,7 +59,15 @@ pub fn compile_ngspice<'a>(
             )));
         }
         let name = original.to_ascii_lowercase();
-        if grouped.set(&name, value)
+        if name == "tnom" {
+            model.soa.tnom_given = true;
+        }
+        if name == "phi" {
+            model.phi = value;
+            continue;
+        }
+        if model.soa.set(&name, value)
+            || grouped.set(&name, value)
             || set_channel(&mut model, &name, value)
             || set_gate(&mut model, &name, value)
             || set_diode(&mut model, &name, value)
@@ -68,8 +76,8 @@ pub fn compile_ngspice<'a>(
         {
             continue;
         }
-        if is_known_unsupported(&name) {
-            return Err(ParameterError::Unsupported(original.to_owned()));
+        if name == "type" {
+            return Err(ParameterError::ReadOnly(original.to_owned()));
         }
         return Err(ParameterError::Unknown(original.to_owned()));
     }
@@ -236,16 +244,4 @@ fn set_thermal_and_noise(model: &mut Model, name: &str, value: f64) -> bool {
         value
     };
     true
-}
-
-fn is_known_unsupported(name: &str) -> bool {
-    matches!(
-        name,
-        // PHI is only used by ngspice's .disto coefficient setup and is not
-        // part of the supported current/charge/noise/thermal runtime laws.
-        "phi" | "type" |
-        // SOA annotations need their own caller-visible enforcement policy.
-        "vgs_max" | "vgd_max" | "vds_max" | "vgsr_max" | "vgdr_max" |
-        "pd_max" | "id_max" | "idr_max" | "te_max" | "rth_ext" | "derating"
-    )
 }
