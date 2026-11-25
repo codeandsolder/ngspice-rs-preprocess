@@ -1,4 +1,4 @@
-//! Explicit LTspice source admission and native numerical lowering.
+//! Explicit `LTspice` source admission and native numerical lowering.
 use anyhow::{Context, Result, ensure};
 use ngspice_rs_preprocess::{
     Cancellation, InputFormat, Options, Provenance, Request, SourceInput, prepare,
@@ -93,6 +93,10 @@ fn rejects_ambiguous_flags_and_shadowed_intrinsics() -> Result<()> {
         "R1 a 0 1k noisy=1 noiseless",
         ".func limit(x,y,z) {x}",
         ".backanno unexpected",
+        ".model ideal D(Ron=0.1 Roff=1Meg)",
+        ".func min(x,y) {x}",
+        "B1 y 0 V=table(v(x),0,0,1,1)",
+        "B1 y 0 V=limit(random(time),0,1)",
     ] {
         fs::write(&root, format!("title\n{body}\n.end\n"))?;
         assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{body}");

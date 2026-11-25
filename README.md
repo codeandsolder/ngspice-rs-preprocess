@@ -35,12 +35,16 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | --- | --- | --- |
 | `native-deck` | Native-compatible circuit; link static includes and preserve title/analysis/terminator | `deck.cir` |
 | `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
+| `ltspice-deck` | Explicit LTspice source normalization (partial dialect coverage) | `deck.cir` |
+| `ltspice-library` | Explicit LTspice library normalization (partial dialect coverage) | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
 | `expanded-library` | Lower already expanded dialect source as an include | `model.lib` |
 | `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
 | `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
+
+The LTspice formats normalize whole-file library imports, relative Windows-style paths, `noiseless` resistor flags, `.backanno`, and selected scalar intrinsics. They do not yet provide complete LTspice semantic compatibility: idealized diode models and known unsupported intrinsic functions are diagnosed; Boolean operators, other device extensions and analysis semantics still require dedicated translation. Do not assume successful normalization establishes equivalence for arbitrary LTspice decks.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:

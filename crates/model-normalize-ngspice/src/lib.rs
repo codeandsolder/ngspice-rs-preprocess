@@ -52,9 +52,9 @@ pub enum NormalizationPass {
     NormalizeNbspWhitespace,
     /// Expand `LTspice`'s `L ... Rser=` extension to an ideal inductor plus resistor.
     LtspiceInductorRser,
-    /// Comment the schematic-only LTspice backannotation directive.
+    /// Comment the schematic-only `LTspice` backannotation directive.
     LtspiceBackannotation,
-    /// Disable native resistor noise for the explicit LTspice flag.
+    /// Disable native resistor noise for the explicit `LTspice` flag.
     LtspiceNoiselessResistor,
     /// Translate source-specific scalar intrinsic functions.
     LtspiceIntrinsics,

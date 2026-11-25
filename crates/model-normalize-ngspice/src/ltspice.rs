@@ -1,4 +1,4 @@
-//! Source-specific LTspice normalization, before native execution.
+//! Source-specific `LTspice` normalization, before native execution.
 //!
 //! Preserve physical source mapping; generated helper definitions inherit the
 //! line of their first use. Native decks do not receive these dialect rewrites.
@@ -69,34 +69,119 @@ fn reject_shadowed_helpers(statement: &lexical::Statement) -> Result<()> {
     ensure!(
         !HELPERS
             .iter()
-            .any(|(helper, _)| name.eq_ignore_ascii_case(helper)),
+            .any(|(helper, _)| name.eq_ignore_ascii_case(helper))
+            && ![
+                b"abs".as_slice(),
+                b"pow",
+                b"min",
+                b"max",
+                b"sgn",
+                b"ternary_fcn"
+            ]
+            .iter()
+            .any(|native| name.eq_ignore_ascii_case(native)),
         "line {}: LTspice function definition shadows a dialect intrinsic",
         statement.line
     );
     Ok(())
 }
 
-/// Apply documented source-specific rewrites to a linked and normalized
-/// artifact, retaining the composed physical line map.
-///
-/// # Errors
-/// Malformed statements, conflicting flags, or ambiguous intrinsic definitions.
-pub fn normalize(
-    mut input: MappedNormalization,
-    kind: crate::linked_source::RootKind,
-) -> Result<MappedNormalization> {
-    let bytes = &input.model.bytes;
-    let title = if kind == crate::linked_source::RootKind::Deck {
-        bytes
-            .split_inclusive(|byte| *byte == b'\n')
-            .next()
-            .context("missing LTspice title")?
-            .len()
-    } else {
-        0
-    };
-    let body = &bytes[title..];
-    let title_lines = usize::from(title != 0);
+/// Reject known model forms whose native counterpart has different physics.
+fn validate_model(statement: &lexical::Statement) -> Result<()> {
+    for model in crate::model_card::parse_model_cards(&statement.text)? {
+        if !model.family.eq_ignore_ascii_case("d") {
+            continue;
+        }
+        for field in &model.parameters {
+            ensure!(
+                ![
+                    "ron",
+                    "roff",
+                    "rrev",
+                    "vfwd",
+                    "vrev",
+                    "epsilon",
+                    "revepsilon",
+                    "ilimit",
+                    "revilimit"
+                ]
+                .iter()
+                .any(|name| field.name.eq_ignore_ascii_case(name)),
+                "line {}: LTspice idealized diode parameter {} requires typed model lowering",
+                statement.line,
+                field.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_expression(statement: &lexical::Statement, start: usize) -> Result<()> {
+    for name in [
+        b"table".as_slice(),
+        b"uplim",
+        b"dnlim",
+        b"idt",
+        b"idtmod",
+        b"ddt",
+        b"delay",
+        b"absdelay",
+        b"white",
+        b"random",
+        b"rand",
+        b"gauss",
+        b"flat",
+    ] {
+        ensure!(
+            lexical::function_names(&statement.text, name, start).is_empty(),
+            "line {}: LTspice function {} requires dialect-specific lowering",
+            statement.line,
+            String::from_utf8_lossy(name)
+        );
+    }
+    Ok(())
+}
+
+struct RewritePlan {
+    edits: Vec<Edit>,
+    helpers: BTreeMap<usize, (Vec<u8>, usize)>,
+    flags_changed: bool,
+    annotation_changed: bool,
+}
+
+fn rewrite_intrinsics(
+    statement: &lexical::Statement,
+    start: usize,
+    title_lines: usize,
+    used: &mut std::collections::BTreeSet<Vec<u8>>,
+    helpers: &mut BTreeMap<usize, (Vec<u8>, usize)>,
+    edits: &mut Vec<Edit>,
+) -> Result<()> {
+    let text = &statement.text;
+    for (index, (name, _)) in HELPERS.iter().enumerate() {
+        let spans = lexical::function_names(text, name, start);
+        if spans.is_empty() {
+            continue;
+        }
+        let (identifier, _) = if let Some(helper) = helpers.get(&index) {
+            helper
+        } else {
+            let mut base = b"__lt_intrinsic_".to_vec();
+            base.extend_from_slice(name);
+            let identifier =
+                fresh_identifier(used, &base).context("LTspice intrinsic identifier overflow")?;
+            helpers
+                .entry(index)
+                .or_insert((identifier, statement.line + title_lines))
+        };
+        for span in spans {
+            lexical::replace_span(statement, span, identifier, edits);
+        }
+    }
+    Ok(())
+}
+
+fn plan_rewrites(bytes: &[u8], body: &[u8], title_lines: usize) -> Result<RewritePlan> {
     let mut used = source_identifiers(bytes);
     let mut edits = Vec::new();
     let mut helpers = BTreeMap::<usize, (Vec<u8>, usize)>::new();
@@ -139,30 +224,58 @@ pub fn normalize(
         if first.eq_ignore_ascii_case(b".func") {
             reject_shadowed_helpers(&statement)?;
         }
+        if first.eq_ignore_ascii_case(b".model") {
+            validate_model(&statement)?;
+        }
         let Some(start) = expression_start(text, first)? else {
             continue;
         };
-        for (index, (name, _)) in HELPERS.iter().enumerate() {
-            let spans = lexical::function_names(text, name, start);
-            if spans.is_empty() {
-                continue;
-            }
-            let (identifier, _) = if let Some(helper) = helpers.get(&index) {
-                helper
-            } else {
-                let mut base = b"__lt_intrinsic_".to_vec();
-                base.extend_from_slice(name);
-                let identifier = fresh_identifier(&mut used, &base)
-                    .context("LTspice intrinsic identifier overflow")?;
-                helpers
-                    .entry(index)
-                    .or_insert((identifier, statement.line + title_lines))
-            };
-            for span in spans {
-                lexical::replace_span(&statement, span, identifier, &mut edits);
-            }
-        }
+        validate_expression(&statement, start)?;
+        rewrite_intrinsics(
+            &statement,
+            start,
+            title_lines,
+            &mut used,
+            &mut helpers,
+            &mut edits,
+        )?;
     }
+    Ok(RewritePlan {
+        edits,
+        helpers,
+        flags_changed,
+        annotation_changed,
+    })
+}
+
+/// Apply documented source-specific rewrites to a linked and normalized
+/// artifact, retaining the composed physical line map.
+///
+/// # Errors
+/// Malformed statements, conflicting flags, or ambiguous intrinsic definitions.
+pub fn normalize(
+    mut input: MappedNormalization,
+    kind: crate::linked_source::RootKind,
+) -> Result<MappedNormalization> {
+    let bytes = &input.model.bytes;
+    let title = if kind == crate::linked_source::RootKind::Deck {
+        bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .next()
+            .context("missing LTspice title")?
+            .len()
+    } else {
+        0
+    };
+    let body = &bytes[title..];
+    let title_lines = usize::from(title != 0);
+    let plan = plan_rewrites(bytes, body, title_lines)?;
+    let RewritePlan {
+        edits,
+        helpers,
+        flags_changed,
+        annotation_changed,
+    } = plan;
     let Some(rewritten) = lexical::apply_edits(body, edits) else {
         return Ok(input);
     };

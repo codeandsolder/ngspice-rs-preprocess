@@ -30,9 +30,9 @@ pub enum InputFormat {
     NativeDeck,
     /// Native-compatible library; emit include-safe text.
     NativeLibrary,
-    /// Complete LTspice source deck, emitted in native syntax.
+    /// Complete `LTspice` source deck, emitted in native syntax.
     LtspiceDeck,
-    /// LTspice source library, emitted as include-safe native syntax.
+    /// `LTspice` source library, emitted as include-safe native syntax.
     LtspiceLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,

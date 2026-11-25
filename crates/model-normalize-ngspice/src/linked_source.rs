@@ -51,7 +51,7 @@ pub enum LibrarySyntax {
     /// Native SPICE .lib section boundary.
     #[default]
     NamedSections,
-    /// LTspice whole-file .lib reference; named sections remain supported.
+    /// `LTspice` whole-file .lib reference; named sections remain supported.
     Ltspice,
 }
 
