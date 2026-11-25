@@ -1,6 +1,6 @@
 //! Separate model measurement temperature from device operating temperature.
 //!
-//! Cadence PSpice Application Note, "Improve Simulation Accuracy When Using
+//! Cadence `PSpice` Application Note, "Improve Simulation Accuracy When Using
 //! Passive Components", temperature attributes: absolute, circuit-relative,
 //! and AKO-relative to the inherited absolute temperature.
 

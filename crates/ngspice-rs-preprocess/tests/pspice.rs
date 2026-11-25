@@ -80,7 +80,7 @@ fn compare(source: &[u8], expected: impl Fn(&[f64])) -> Result<()> {
 }
 
 fn close(actual: f64, expected: f64) {
-    let tolerance = 2e-7 * expected.abs().max(1.0);
+    let tolerance = 2e-7 * expected.abs().max(1e-6);
     assert!(
         (actual - expected).abs() <= tolerance,
         "{actual} != {expected}"
@@ -315,7 +315,8 @@ quit
         let weight = x * x * (3. - 2. * x);
         let resistance = (1000_f64.ln() + (10_f64.ln() - 1000_f64.ln()) * weight).exp();
         close(row[1], 100. / (100. + resistance));
-        close(row[2], -row[0] / 1e12);
+        // Evaluate the input loading in picoamps, not with a voltage-scale tolerance.
+        close(row[2] * 1e12, -row[0]);
     })
 }
 
@@ -369,7 +370,7 @@ fn switch_identity_tracks_source_scope_and_collision_free_native_name() -> Resul
 }
 
 #[test]
-fn continuous_current_switch_matches_clamped_log_linear_law() -> Result<()> {
+fn continuous_current_switch_matches_vendor_cubic_log_resistance() -> Result<()> {
     let source = br"PSpice current switch
 I1 0 c -1
 V1 c 0 0
@@ -386,12 +387,33 @@ quit
 .endc
 .end
 ";
-    compare(source, |row| {
-        let x = row[0].clamp(0., 1.);
-        let resistance = (1000_f64.ln() + (10_f64.ln() - 1000_f64.ln()) * x).exp();
-        close(row[1], 100. / (100. + resistance));
-        close(row[2], row[0]);
-    })
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    // The C compatibility frontend substitutes aswitch (log-linear),
+    // whereas the vendor specifies the cubic law for current control.
+    if let Some(values) = rows(
+        &directory.path().join("native"),
+        &prepared.primary.bytes,
+        false,
+    )? {
+        assert_eq!(values.len(), 9);
+        for row in values {
+            let x = row[0].clamp(0., 1.);
+            let weight = x * x * (3. - 2. * x);
+            let resistance = (1000_f64.ln() + (10_f64.ln() - 1000_f64.ln()) * weight).exp();
+            close(row[1], 100. / (100. + resistance));
+            close(row[2], row[0]);
+        }
+    }
+    let identity = prepared
+        .device_identities
+        .first()
+        .context("missing current switch identity")?;
+    assert_eq!(identity.declared, "W1");
+    assert!(identity.linked.starts_with('A'));
+    Ok(())
 }
 
 #[test]
@@ -658,6 +680,50 @@ fn nonlinear_passive_coefficients_are_not_silently_discarded() -> Result<()> {
             prepare_source(&path, InputFormat::PspiceLibrary).is_err(),
             "{input}"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn switch_control_loading_and_gmin_builtin_follow_circuit_option() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    let source = br"Switch control loading
+.options gmin=1e-9
+V1 a 0 1
+V2 b 0 1
+V3 supply 0 1
+S1 supply out a 0 THRESHOLD
+S2 supply out2 b 0 CONTINUOUS
+R1 out 0 100
+R2 out2 0 100
+.model THRESHOLD VSWITCH(VT=0.5 VH=0 TD=0 RON=10 ROFF=1000)
+.model CONTINUOUS VSWITCH(RON=10 ROFF=1000)
+E1 report 0 VALUE={1e9*GMIN}
+R3 report 0 1k
+.control
+set wr_singlescale
+set wr_vecnames
+op
+wrdata response.dat i(v1) i(v2) v(out) v(out2) v(report)
+quit
+.endc
+.end
+";
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    if let Some(values) = rows(
+        &directory.path().join("native"),
+        &prepared.primary.bytes,
+        false,
+    )? {
+        assert_eq!(values.len(), 1);
+        let row = &values[0];
+        close(row[1] * 1e9, -1.);
+        close(row[2] * 1e9, -1.);
+        close(row[3], 100. / 110.);
+        close(row[4], 100. / 110.);
+        close(row[5], 1.);
     }
     Ok(())
 }

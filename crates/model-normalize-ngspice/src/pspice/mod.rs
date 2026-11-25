@@ -18,6 +18,7 @@ use std::{
 
 mod instances;
 mod nodes;
+mod options;
 mod passive;
 mod scope;
 mod temperature;
@@ -50,12 +51,13 @@ struct Functions {
     identifiers: BTreeSet<Vec<u8>>,
     passives: passive::PassiveModels,
     temperature: bool,
-    gmin: bool,
+    uses_gmin: bool,
+    options: options::GlobalOptions,
     renamed: Vec<RenamedDevice>,
 }
 
 impl Functions {
-    fn new(input: &[u8], scopes: Scopes) -> Result<Self> {
+    fn new(input: &[u8], scopes: Scopes, options: options::GlobalOptions) -> Result<Self> {
         let mut identifiers = crate::source_identifiers(input);
         let mut names = BTreeMap::new();
         for (name, _) in FUNCTIONS {
@@ -78,9 +80,17 @@ impl Functions {
             identifiers,
             passives,
             temperature: false,
-            gmin: false,
+            uses_gmin: false,
+            options,
             renamed: Vec::new(),
         })
+    }
+
+    fn allocate(&mut self, base: &str) -> Result<String> {
+        Ok(String::from_utf8(
+            crate::fresh_identifier(&mut self.identifiers, base.as_bytes())
+                .context("PSpice generated identifier overflow")?,
+        )?)
     }
 
     fn definitions(&self) -> Result<String> {
@@ -95,8 +105,8 @@ impl Functions {
             result.push_str(TEMPERATURE_PARAMS);
             result.push('\n');
         }
-        if self.gmin {
-            result.push_str(".param gmin=1e-12\n");
+        if self.uses_gmin {
+            writeln!(result, ".param gmin={:e}", self.options.gmin)?;
         }
         Ok(result)
     }
@@ -149,7 +159,7 @@ impl Functions {
         } else {
             self.temperature |=
                 name.eq_ignore_ascii_case("temp") || name.eq_ignore_ascii_case("vt");
-            self.gmin |= name.eq_ignore_ascii_case("gmin");
+            self.uses_gmin |= name.eq_ignore_ascii_case("gmin");
         }
         output.extend_from_slice(name.as_bytes());
         Ok(end)
@@ -271,12 +281,13 @@ impl SwitchLaw {
         } else {
             ("it", "ih", "ion", "ioff")
         };
-        let discrete =
-            parameter(card, threshold).is_some() || parameter(card, hysteresis).is_some();
+        let discrete = parameter(card, threshold).is_some()
+            || parameter(card, hysteresis).is_some()
+            || parameter(card, "td").is_some();
         let continuous = parameter(card, on).is_some() || parameter(card, off).is_some();
         ensure!(
-            discrete != continuous,
-            "PSpice switch must select exactly one threshold or continuous law"
+            !(discrete && continuous),
+            "PSpice switch cannot mix threshold and continuous laws"
         );
         let allowed = if discrete {
             [threshold, hysteresis, "ron", "roff"]
@@ -284,6 +295,16 @@ impl SwitchLaw {
             [on, off, "ron", "roff"]
         };
         for field in &card.parameters {
+            if discrete && field.name.eq_ignore_ascii_case("td") {
+                ensure!(
+                    field.expression.as_deref().is_some_and(|value| matches!(
+                        parse_spice_constant(temperature::expression(value)),
+                        Ok(0.0)
+                    )),
+                    "PSpice nonzero threshold-switch delay requires a timed switch kernel"
+                );
+                continue;
+            }
             ensure!(
                 allowed
                     .iter()
@@ -301,7 +322,7 @@ impl SwitchLaw {
         }))
     }
 
-    fn lower_model(self, card: &mut ModelCard) -> Result<()> {
+    fn lower_model(self, card: &mut ModelCard, control_conductance: f64) -> Result<()> {
         match self {
             Self::ThresholdVoltage | Self::ThresholdCurrent => {
                 let (native, threshold, hysteresis) = if matches!(self, Self::ThresholdVoltage) {
@@ -310,6 +331,8 @@ impl SwitchLaw {
                     ("CSW", "it", "ih")
                 };
                 native.clone_into(&mut card.family);
+                card.parameters
+                    .retain(|field| !field.name.eq_ignore_ascii_case("td"));
                 for (name, value) in [
                     (threshold, "0"),
                     (hysteresis, "0"),
@@ -320,12 +343,15 @@ impl SwitchLaw {
                 }
             }
             Self::ContinuousVoltage | Self::ContinuousCurrent => {
-                let (native, on, off) = if matches!(self, Self::ContinuousVoltage) {
-                    ("pswitch", "von", "voff")
+                let (on, off) = if matches!(self, Self::ContinuousVoltage) {
+                    ("von", "voff")
                 } else {
-                    ("aswitch", "ion", "ioff")
+                    ("ion", "ioff")
                 };
-                native.clone_into(&mut card.family);
+                // PSpice specifies cubic log-resistance interpolation for
+                // both voltage and current control. Native aswitch is linear
+                // in log(R), so it is not the correct current-control law.
+                "pswitch".clone_into(&mut card.family);
                 for (from, to) in [
                     (on, "cntl_on"),
                     (off, "cntl_off"),
@@ -343,15 +369,22 @@ impl SwitchLaw {
                 ] {
                     default_parameter(card, name, value)?;
                 }
-                if matches!(self, Self::ContinuousCurrent) {
-                    set_parameter(card, "limit", "true")?;
-                }
+                set_parameter(
+                    card,
+                    "r_cntl_in",
+                    &format!("{:e}", control_conductance.recip()),
+                )?;
             }
         }
         Ok(())
     }
 
-    fn lower_instance(self, fields: &[&str], functions: &mut Functions) -> Result<Option<String>> {
+    fn lower_instance(
+        self,
+        fields: &[&str],
+        functions: &mut Functions,
+    ) -> Result<Option<SwitchEmission>> {
+        let mut prefix = String::new();
         let (model_index, input) = match self {
             Self::ThresholdVoltage | Self::ThresholdCurrent => return Ok(None),
             Self::ContinuousVoltage => {
@@ -366,19 +399,31 @@ impl SwitchLaw {
                     fields.len() == 5 && fields[0].starts_with(['w', 'W']),
                     "invalid continuous current switch instance"
                 );
-                (4, format!("%vnam({})", fields[3]))
+                // A unity-transresistance CCVS reads the original voltage
+                // source's branch current without loading that branch.
+                // Its private output drives the cubic switch control port.
+                let sensor = functions.allocate(&format!("H__ps_{}", fields[0]))?;
+                let control = functions.allocate(&format!("__ps_ctrl_{}", fields[0]))?;
+                writeln!(prefix, "{sensor} {control} 0 {} 1", fields[3])?;
+                (4, format!("%gd({control} 0)"))
             }
         };
-        let base = format!("A__ps_{}", fields[0]);
-        let name = String::from_utf8(
-            crate::fresh_identifier(&mut functions.identifiers, base.as_bytes())
-                .context("PSpice switch identifier overflow")?,
-        )?;
-        Ok(Some(format!(
+        let name = functions.allocate(&format!("A__ps_{}", fields[0]))?;
+        write!(
+            prefix,
             "{name} {input} %gd({} {}) {}",
             fields[1], fields[2], fields[model_index]
-        )))
+        )?;
+        Ok(Some(SwitchEmission {
+            text: prefix,
+            linked: name,
+        }))
     }
+}
+
+struct SwitchEmission {
+    text: String,
+    linked: String,
 }
 
 fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result<String> {
@@ -405,6 +450,19 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
     let Some(law) = SwitchLaw::from_model(&model)? else {
         return Ok(text.to_owned());
     };
+    if matches!(law, SwitchLaw::ThresholdVoltage) {
+        let [declared, _, _, positive, negative, _, ..] = fields.as_slice() else {
+            bail!("invalid threshold voltage switch instance");
+        };
+        // Native SW has no control-port loading. Add the documented
+        // numerical shunt as a noiseless linear conductance; leave the
+        // original switch identity and state flags intact.
+        let shunt = functions.allocate(&format!("G__ps_{declared}"))?;
+        return Ok(format!(
+            "{shunt} {positive} {negative} {positive} {negative} {:e}\n{text}",
+            functions.options.gmin
+        ));
+    }
     // Do not drop source instance assignments while changing its designator.
     if matches!(
         law,
@@ -424,13 +482,9 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
         input_line: line,
         scope: functions.scopes.path(functions.scope).to_vec(),
         declared: fields[0].to_owned(),
-        linked: rewritten
-            .split_ascii_whitespace()
-            .next()
-            .context("missing lowered switch name")?
-            .to_owned(),
+        linked: rewritten.linked,
     });
-    Ok(rewritten)
+    Ok(rewritten.text)
 }
 
 fn model(line: usize, functions: &mut Functions) -> Result<String> {
@@ -480,7 +534,7 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
         set_parameter(&mut card, "subs", "-1")?;
     }
     if let Some(switch) = SwitchLaw::from_model(&card)? {
-        switch.lower_model(&mut card)?;
+        switch.lower_model(&mut card, functions.options.gmin)?;
     }
     let multiplier = functions.passives.lower_model(line, &mut card);
     let mut output = String::new();
@@ -554,15 +608,13 @@ struct LoweredBody {
     renamed: Vec<RenamedDevice>,
 }
 
-fn lower_body(body: &[u8]) -> Result<LoweredBody> {
-    let statements = lexical::statements(body)?;
-    let scopes = Scopes::collect(&statements)?;
-    let mut functions = Functions::new(body, scopes)?;
-    let mut edits: Vec<Edit> = Vec::new();
-    let mut inserted = BTreeMap::<usize, usize>::new();
+fn rewrite_statements(
+    statements: &[lexical::Statement],
+    functions: &mut Functions,
+) -> Result<Vec<String>> {
     let mut rewritten_statements = Vec::with_capacity(statements.len());
     let mut in_control = false;
-    for statement in &statements {
+    for statement in statements {
         let text = std::str::from_utf8(&statement.text).context("PSpice source is not UTF-8")?;
         let first = text.split_ascii_whitespace().next().unwrap_or_default();
         if first.eq_ignore_ascii_case(".control") {
@@ -588,7 +640,7 @@ fn lower_body(body: &[u8]) -> Result<LoweredBody> {
                 functions
                     .passives
                     .rewrite_instance(&text, functions.scope, &functions.scopes)?;
-            let rewritten = rewrite(&text, statement.line, &mut functions)
+            let rewritten = rewrite(&text, statement.line, functions)
                 .with_context(|| format!("PSpice source line {}", statement.line))?;
             if first.eq_ignore_ascii_case(".model") {
                 rewritten_statements.push(rewritten);
@@ -601,10 +653,21 @@ fn lower_body(body: &[u8]) -> Result<LoweredBody> {
                 false,
                 |node| functions.scopes.hierarchical_ground(functions.scope, node),
             )?;
-            switch_instance(&rewritten, statement.line, &mut functions)?
+            switch_instance(&rewritten, statement.line, functions)?
         };
         rewritten_statements.push(rewritten);
     }
+    Ok(rewritten_statements)
+}
+
+fn lower_body(body: &[u8]) -> Result<LoweredBody> {
+    let statements = lexical::statements(body)?;
+    let scopes = Scopes::collect(&statements)?;
+    let options = options::GlobalOptions::collect(&statements)?;
+    let mut functions = Functions::new(body, scopes, options)?;
+    let rewritten_statements = rewrite_statements(&statements, &mut functions)?;
+    let mut edits: Vec<Edit> = Vec::new();
+    let mut inserted = BTreeMap::<usize, usize>::new();
     for (statement, mut rewritten) in statements.iter().zip(rewritten_statements) {
         if functions.temperature
             && statement

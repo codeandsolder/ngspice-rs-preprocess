@@ -1,4 +1,4 @@
-//! PSpice passive model multipliers are dimensionless, not native model
+//! `PSpice` passive model multipliers are dimensionless, not native model
 //! default component values. A generated parameter in the declaration's
 //! scope preserves the multiplier's binding across individual occurrences.
 
