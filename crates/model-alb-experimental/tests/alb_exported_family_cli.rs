@@ -3,31 +3,31 @@
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::{Command, Output},
-};
+use std::{fs, path::Path, process::Output};
 
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime/xspice/fixtures/family")
+#[path = "support/family.rs"]
+mod harness;
+use harness::fixtures;
+fn expand(source: &Path, config: &Path, dir: &Path) -> Result<Output> {
+    harness::run(
+        env!("CARGO_BIN_EXE_alb-logical-expand"),
+        &[source, config],
+        dir,
+        &["lowered.cir", "generated.inc"],
+    )
 }
-fn expand(src: &Path, cfg: &Path, output: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_alb-logical-expand"))
-        .arg(src)
-        .arg(cfg)
-        .arg(output.join("lowered.cir"))
-        .arg(output.join("generated.inc"))
-        .output()?)
-}
-fn autowire(cfg: &Path, output: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_alb-family-autowire"))
-        .arg(output.join("lowered.cir"))
-        .arg(output.join("generated.inc"))
-        .arg(cfg)
-        .arg(fixtures().join("auto-models.json"))
-        .arg(output.join("circuit.cir"))
-        .output()?)
+fn autowire(config: &Path, dir: &Path) -> Result<Output> {
+    harness::run(
+        env!("CARGO_BIN_EXE_alb-family-autowire"),
+        &[
+            &dir.join("lowered.cir"),
+            &dir.join("generated.inc"),
+            config,
+            &fixtures().join("auto-models.json"),
+        ],
+        dir,
+        &["circuit.cir"],
+    )
 }
 
 #[test]

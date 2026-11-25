@@ -68,7 +68,7 @@ pub struct Capabilities {
 pub struct StructureKey(pub u8);
 
 impl StructureKey {
-    #[must_use]
+    #[must_use = "the returned key identifies the structural topology"]
     pub const fn from_layout(layout: nodal::Layout) -> Self {
         let topology = layout.topology();
         let mut mask = 0u8;
@@ -176,12 +176,12 @@ impl Model {
             .map_err(ArtifactError::Model)
     }
 
-    #[must_use]
+    #[must_use = "the returned identity identifies the artifact or instance"]
     pub const fn identity(&self) -> SemanticDigest {
         self.digest
     }
 
-    #[must_use]
+    #[must_use = "the result distinguishes absent from recorded source provenance"]
     pub const fn provenance(&self) -> Option<Provenance> {
         self.provenance
     }
@@ -226,27 +226,27 @@ pub struct Instance {
 }
 
 impl Instance {
-    #[must_use]
+    #[must_use = "the returned identity identifies the artifact or instance"]
     pub const fn identity(&self) -> InstanceIdentity {
         self.identity
     }
 
-    #[must_use]
+    #[must_use = "the returned layout determines the allocation and stamping of unknowns"]
     pub const fn layout(&self) -> nodal::Layout {
         self.layout
     }
 
-    #[must_use]
+    #[must_use = "the returned voltages initialize the device state"]
     pub const fn initial_voltages(&self) -> instance::InitialVoltages {
         self.bound.initial
     }
 
-    #[must_use]
+    #[must_use = "the flag controls initial device conduction"]
     pub const fn off(&self) -> bool {
         self.bound.off
     }
 
-    #[must_use]
+    #[must_use = "the returned capabilities determine solver integration"]
     pub const fn capabilities(&self) -> Capabilities {
         Capabilities {
             local: LocalPhysics::CurrentsChargesNoise,
@@ -299,7 +299,7 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    #[must_use]
+    #[must_use = "the returned layout determines the allocation and stamping of unknowns"]
     pub const fn layout(&self) -> nodal::Layout {
         self.layout
     }

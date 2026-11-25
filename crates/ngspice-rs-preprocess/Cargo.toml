@@ -23,3 +23,6 @@ model-translate-simplis = { path = "../model-translate-simplis" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+model-kernel-diode = { path = "../model-kernel-diode" }

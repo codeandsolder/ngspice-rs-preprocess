@@ -72,6 +72,7 @@ struct LinkState<'a> {
     admission: &'a mut SourceSession,
     limits: LinkLimits,
     stack: Vec<(PathBuf, Option<String>)>,
+    pspice: bool,
     output: LinkedSource,
 }
 
@@ -264,11 +265,38 @@ impl SourceLinker {
         limits: LinkLimits,
         admission: &mut SourceSession,
     ) -> Result<LinkedSource> {
+        self.link_admitted_mode(source, kind, limits, admission, false)
+    }
+
+    /// Link a `PSpice` deck or library. A one-operand .LIB is a whole-file
+    /// import; two operands retain explicit named-section semantics.
+    ///
+    /// # Errors
+    /// Invalid source, unresolved references, cycles or exhausted budget.
+    pub fn link_pspice_admitted(
+        &self,
+        source: &AdmittedSource,
+        kind: RootKind,
+        limits: LinkLimits,
+        admission: &mut SourceSession,
+    ) -> Result<LinkedSource> {
+        self.link_admitted_mode(source, kind, limits, admission, true)
+    }
+
+    fn link_admitted_mode(
+        &self,
+        source: &AdmittedSource,
+        kind: RootKind,
+        limits: LinkLimits,
+        admission: &mut SourceSession,
+        pspice: bool,
+    ) -> Result<LinkedSource> {
         let mut state = LinkState {
             settings: self,
             admission,
             limits,
             stack: Vec::new(),
+            pspice,
             output: LinkedSource {
                 bytes: Vec::new(),
                 origins: Vec::new(),
@@ -382,6 +410,36 @@ impl LinkState<'_> {
         } else {
             (&source.bytes[..], 1)
         };
+        if self.pspice {
+            let mut lines = body.split_inclusive(|byte| *byte == b'\n');
+            let first = lines.next().unwrap_or_default().trim_ascii();
+            let second = lines.next().unwrap_or_default().trim_ascii();
+            let header =
+                if kind == RootKind::Include && (first.is_empty() || first.starts_with(b"*")) {
+                    [first, second]
+                        .into_iter()
+                        .find(|line| line.starts_with(b"*#"))
+                        .unwrap_or_default()
+                } else {
+                    first
+                };
+            let declaration = header
+                .split(u8::is_ascii_whitespace)
+                .next()
+                .unwrap_or_default();
+            ensure!(
+                ![
+                    b"*#SIMETRIX".as_slice(),
+                    b"*#HSPICE",
+                    b"*#LTSPICE",
+                    b"*#NATIVE"
+                ]
+                .iter()
+                .any(|name| declaration.eq_ignore_ascii_case(name)),
+                "{}: explicit foreign source dialect in standalone PSpice graph",
+                path.display()
+            );
+        }
         let mut selection = SectionSelection::new(section);
         let mut in_control = false;
         let physical = body
@@ -397,7 +455,16 @@ impl LinkState<'_> {
             })?;
             let control_start = directive(text, ".control").is_some();
             let control_end = directive(text, ".endc").is_some();
-            if !in_control && !control_start && !selection.observe(text, path, record.line)? {
+            let whole_library = self.pspice
+                && !in_control
+                && !control_start
+                && (section.is_none() || selection.active.is_some())
+                && library_marker(text)?.is_some_and(|args| args.len() == 1);
+            if !in_control
+                && !control_start
+                && !whole_library
+                && !selection.observe(text, path, record.line)?
+            {
                 continue;
             }
             let selected = selection.selected();
@@ -446,15 +513,30 @@ impl LinkState<'_> {
                 "{}:{physical_line}: .include requires one pathname",
                 path.display()
             );
-            return self.expand(Path::new(&args[0]), path, None);
+            let filename = if self.pspice {
+                args[0].replace('\\', "/")
+            } else {
+                args[0].clone()
+            };
+            return self.expand(Path::new(&filename), path, None);
         }
         if let Some(args) = library_marker(text)? {
+            if self.pspice
+                && let [filename] = args.as_slice()
+            {
+                return self.expand(Path::new(&filename.replace('\\', "/")), path, None);
+            }
             ensure!(
                 args.len() == 2,
                 "{}:{physical_line}: native .lib requires a file and section",
                 path.display()
             );
-            return self.expand(Path::new(&args[0]), path, Some(&args[1]));
+            let filename = if self.pspice {
+                args[0].replace('\\', "/")
+            } else {
+                args[0].clone()
+            };
+            return self.expand(Path::new(&filename), path, Some(&args[1]));
         }
         if kind == RootKind::Include && text.eq_ignore_ascii_case(".end") {
             // An included terminator must not terminate the consuming deck.

@@ -9,9 +9,7 @@ use serde::Serialize;
 use std::fmt::Write as _;
 
 pub mod syntax;
-use syntax::{
-    model_statement_tokens, normalized_statement, parse_numeric, statement_tokens, validate_node,
-};
+use syntax::{normalized_statement, parse_numeric, statement_tokens, validate_node};
 mod digital_output;
 use digital_output::{OutputDrive, OutputPins, OutputSignal, OutputStage, emit_logic_voltage};
 mod whole;

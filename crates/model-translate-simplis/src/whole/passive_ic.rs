@@ -1,6 +1,6 @@
 //! Capture source initialization at the linked-definition boundary.
 
-use super::{Item, parse_items, render_native_subcircuit};
+use super::{Item, capture_artifact_items};
 use anyhow::Result;
 use model_normalize_ngspice::passive_ic::{InitialConditions, capture_statement};
 use model_preprocess_simplis::LinkedPreprocessedNetlist;
@@ -128,19 +128,9 @@ pub fn capture_artifact_initial_conditions(
     filename: &str,
     conditions: &mut InitialConditions,
 ) -> Result<()> {
-    let mut items = parse_items(std::str::from_utf8(bytes)?)?;
-    if !capture_items(&mut items, filename, &[], conditions)? {
-        return Ok(());
-    }
-    let mut output = String::new();
-    for item in items {
-        match item {
-            Item::Statement(statement) => writeln!(output, "{statement}")?,
-            Item::Subcircuit(block) => render_native_subcircuit(&block, &mut output)?,
-        }
-    }
-    *bytes = output.into_bytes();
-    Ok(())
+    capture_artifact_items(bytes, |items| {
+        capture_items(items, filename, &[], conditions)
+    })
 }
 
 /// Remove source-only IC annotations from the linked electrical text and

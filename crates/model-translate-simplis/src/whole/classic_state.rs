@@ -1,19 +1,25 @@
 //! Classic SR and clocked state-element grammar.
 
-use super::{StateElementSpec, WhitespaceProbe, emit_state_element, escaped_device_stem};
+use super::{StateElementSpec, emit_state_element, escaped_device_stem};
 use crate::{
     LogicIo, LogicOperation, LogicPolarity, LogicReceiver, LogicTiming, OutputPins, Translation,
     TranslationKind, integer_parameter, normalized_statement, numeric_parameter, statement_tokens,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use model_normalize_ngspice::model_card::{ModelCard, ModelParameter, parse_parameter_fields};
 
-fn state_assignments(tokens: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
-    let text = tokens.join(" ");
+fn state_assignments(
+    fields: &[ModelParameter],
+) -> Result<std::collections::BTreeMap<String, String>> {
     let mut result = std::collections::BTreeMap::new();
-    for (name, value) in model_preprocess_simplis::parameter_assignments(&text)? {
-        let name = name.to_ascii_uppercase();
+    for field in fields {
+        let value = field
+            .expression
+            .as_ref()
+            .with_context(|| format!("state parameter {} requires a value", field.name))?;
+        let name = field.name.to_ascii_uppercase();
         anyhow::ensure!(
-            result.insert(name.clone(), value.to_owned()).is_none(),
+            result.insert(name.clone(), value.clone()).is_none(),
             "duplicate state parameter {name}"
         );
     }
@@ -96,23 +102,11 @@ pub(super) struct ClassicStateModel {
     delay: f64,
 }
 
-pub(super) fn classic_state_model(statement: &str) -> Result<Option<(String, ClassicStateModel)>> {
-    let trimmed = statement.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".MODEL"))
-        || !trimmed.get(6..7).is_some_and(str::is_empty_or_whitespace)
-    {
-        return Ok(None);
-    }
-    let tokens = statement_tokens(&normalized_statement(statement))?;
-    let Some(kind) = tokens
-        .get(2)
-        .and_then(|name| ClassicStateKind::parse(&name.to_ascii_uppercase()))
-    else {
+pub(super) fn classic_state_model(card: &ModelCard) -> Result<Option<(String, ClassicStateModel)>> {
+    let Some(kind) = ClassicStateKind::parse(&card.family.to_ascii_uppercase()) else {
         return Ok(None);
     };
-    let parameters = state_assignments(&tokens[3..])?;
+    let parameters = state_assignments(&card.parameters)?;
     let rising = match kind {
         ClassicStateKind::Sr => true,
         ClassicStateKind::Latch => match integer_parameter(&parameters, "ENABLE_LEVEL")? {
@@ -185,9 +179,9 @@ pub(super) fn classic_state_model(statement: &str) -> Result<Option<(String, Cla
         && model.delay >= 0.0
         && model.voh > model.vol)
     {
-        bail!("invalid SIMPLIS state model {}", tokens[1]);
+        bail!("invalid SIMPLIS state model {}", card.name);
     }
-    Ok(Some((tokens[1].to_ascii_uppercase(), model)))
+    Ok(Some((card.name.to_ascii_uppercase(), model)))
 }
 
 pub(super) fn translate_classic_state_device(
@@ -236,7 +230,10 @@ pub(super) fn translate_classic_state_device(
         tokens[0]
     );
     let polarity = model.polarity;
-    let parameters = state_assignments(&tokens[assignment..])?;
+    let parameters = state_assignments(&parse_parameter_fields(
+        &tokens[assignment..].join(" "),
+        &[],
+    )?)?;
     anyhow::ensure!(
         parameters.keys().all(|key| key == "IC"),
         "unsupported classic state instance parameter"

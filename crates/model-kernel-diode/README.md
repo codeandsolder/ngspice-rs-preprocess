@@ -2,6 +2,11 @@
 
 This crate implements independently measured SIMetrix Elements 9.40d level-1
 diode physics. It is not a replacement for the ngspice diode dialect.
+Source preparation identifies this kernel with the explicit model family
+`simetrix_diode_level1`, also used by its artifact descriptor. The
+shared `SOURCE_PARAMETERS` vocabulary drives positional source parsing
+and numeric model compilation, so a marked declaration cannot silently
+select ordinary native diode physics.
 
 `compile_simetrix` accepts normalized numeric source parameters, validates
 their domain, and returns an immutable model. `bind` resolves instance
