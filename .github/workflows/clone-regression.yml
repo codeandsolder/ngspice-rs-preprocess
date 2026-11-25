@@ -3,7 +3,7 @@ name: Duplicate-code regression
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, refactor/architecture-campaign]
   merge_group:
 
 concurrency:
