@@ -12,11 +12,13 @@ mod hierarchy;
 pub use hierarchy::{
     LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
     ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, linked_library_filename,
-    parse_init_target_path, parse_library, parse_library_for_simulator, preprocess_netlist,
-    preprocess_netlist_linked,
+    parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
+    preprocess_netlist, preprocess_netlist_file, preprocess_netlist_linked,
+    preprocess_netlist_linked_file, project_source, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
+    anyhow::ensure!(!input.contains(&0), "SIMPLIS source contains a NUL byte");
     if let Ok(text) = std::str::from_utf8(input) {
         return Ok(text.to_owned());
     }
@@ -94,7 +96,7 @@ pub struct Environment {
 }
 
 impl Environment {
-    #[must_use]
+    #[must_use = "the returned environment owns parameter and option bindings"]
     pub fn new() -> Self {
         Self::default()
     }
@@ -104,12 +106,12 @@ impl Environment {
             .insert(name.as_ref().to_ascii_uppercase(), value);
     }
 
-    #[must_use]
+    #[must_use = "the returned value is the requested parameter binding"]
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.get(&name.to_ascii_uppercase())
     }
 
-    #[must_use]
+    #[must_use = "the result reports whether the parameter is bound"]
     pub fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
     }
@@ -119,12 +121,12 @@ impl Environment {
             .insert(name.as_ref().to_ascii_uppercase(), value);
     }
 
-    #[must_use]
+    #[must_use = "the returned value is the requested option binding"]
     pub fn get_option(&self, name: &str) -> Option<&Value> {
         self.options.get(&name.to_ascii_uppercase())
     }
 
-    #[must_use]
+    #[must_use = "the result reports whether any bindings exist"]
     pub(crate) fn is_empty(&self) -> bool {
         self.values.is_empty() && self.options.is_empty()
     }
@@ -1529,10 +1531,10 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
+fn parameter_assignments(input: &str) -> Result<Vec<(&str, &str)>> {
     let bytes = input.as_bytes();
     let mut offset = 0usize;
-    let mut count = 0usize;
+    let mut assignments = Vec::new();
     while offset < bytes.len() {
         while bytes
             .get(offset)
@@ -1615,12 +1617,19 @@ fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
         if expression.is_empty() {
             bail!("SIMPLIS parameter {name} has an empty value");
         }
+        assignments.push((name, expression));
+    }
+    Ok(assignments)
+}
+
+fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
+    let assignments = parameter_assignments(input)?;
+    for (name, expression) in &assignments {
         let value = eval_expression(expression, env)
             .with_context(|| format!("evaluating default for SIMPLIS parameter {name}"))?;
         env.set(name, value);
-        count = count.saturating_add(1);
     }
-    Ok(count)
+    Ok(assignments.len())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

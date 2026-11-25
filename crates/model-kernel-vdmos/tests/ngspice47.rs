@@ -855,11 +855,11 @@ fn all_native_c_oracle_cards_compile_from_plaintext() -> Result<()> {
 
 #[test]
 #[ignore = "requires installed ngspice 47 C reference"]
-fn irf7220_reversed_cgd_endpoints_match_ngspice47() -> Result<()> {
-    let model = prepared_from_fixture(Polarity::P, "vendor_irf7220.cir")?;
+fn synthetic_reversed_cgd_endpoints_match_ngspice47() -> Result<()> {
+    let model = prepared_from_fixture(Polarity::P, "reversed_cgd.cir")?;
     let device = model.bind(Instance::default())?;
     if model.parameters().gate.cgdmax >= model.parameters().gate.cgdmin {
-        return Err("IRF7220 reversed Cgd regression fixture lost its special case".into());
+        return Err("Synthetic reversed Cgd regression fixture lost its special case".into());
     }
     for [
         source_vds,
@@ -867,12 +867,12 @@ fn irf7220_reversed_cgd_endpoints_match_ngspice47() -> Result<()> {
         cap_c,
         intrinsic_vds,
         intrinsic_vgs,
-    ] in oracle_table::<5>("vendor_irf7220.cir", 11)?
+    ] in oracle_table::<5>("reversed_cgd.cir", 11)?
     {
         if (source_vds - observed_vds).abs() > 1e-12 {
             return Err("Vds source mismatch".into());
         }
-        // This catalog card has nonzero ohmic series resistance, and its
+        // This synthetic card has nonzero ohmic series resistance, and its
         // P-channel diode is forward biased in the positive Vds half-sweep.
         // C reports polarity-normalized *intrinsic* device terminal voltages.
         // Compare the capacitive constitutive law at those biases, not at
@@ -886,7 +886,7 @@ fn irf7220_reversed_cgd_endpoints_match_ngspice47() -> Result<()> {
         let calculated = evaluated.qgd.d_voltage;
         if (calculated - cap_c).abs() > 2e-6_f64.mul_add(cap_c.abs(), 5e-15) {
             return Err(format!(
-                "IRF7220 Vds={source_vds}: Rust Cgd {calculated:e}, ngspice47 {cap_c:e}"
+                "Synthetic PMOS Vds={source_vds}: Rust Cgd {calculated:e}, ngspice47 {cap_c:e}"
             )
             .into());
         }

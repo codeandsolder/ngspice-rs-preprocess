@@ -8080,11 +8080,15 @@ X$U2 top out bot inp 0 pinnames: TOP VOUT BOT IN RTN ngspice_preprocess_init: SW
 
     #[test]
     fn comments_bare_vendor_spice_macro_model_banner() -> Result<()> {
-        let source = b"ADA4700 SPICE Macro-model\nR1 a 0 1k\n.end\n";
+        let source = b"SYNTHETIC SPICE Macro-model\nR1 a 0 1k\n.end\n";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("* ADA4700 SPICE Macro-model"));
-        assert!(!text.lines().any(|line| line == "ADA4700 SPICE Macro-model"));
+        assert!(text.contains("* SYNTHETIC SPICE Macro-model"));
+        assert!(
+            !text
+                .lines()
+                .any(|line| line == "SYNTHETIC SPICE Macro-model")
+        );
         Ok(())
     }
 
@@ -8105,11 +8109,11 @@ L1 b 0 1u IC=3 BRANCH=0
 
     #[test]
     fn translates_simetrix_level17_discrete_mosfet() -> Result<()> {
-        let source = br".subckt IRF820 D G S
-.model mosfet NMOS( LEVEL=17 VTO=3.81 RS=0.06816 KP=2.149 RD=2.3567 TC1RD=0.0127 RG=15 IS=1e-36 LIMIT(VDS)=(*, 500)
-+ CGDMAX=1.00E-09 CGDMIN=1.06E-11 XG2CGD=0.5 XG1CGD=0.1 CBD=6.97E-11 VTCGD=0)
+        let source = br".subckt SYNTHETIC_LEVEL17 D G S
+.model mosfet NMOS( LEVEL=17 VTO=3.5 RS=0.125 KP=3 RD=1.75 TC1RD=0.015625 RG=10 IS=1e-35 LIMIT(VDS)=(*, 400)
++ CGDMAX=2.00E-09 CGDMIN=2.00E-11 XG2CGD=0.75 XG1CGD=0.125 CBD=8.00E-11 VTCGD=0)
 M1 D G S S mosfet
-.ends IRF820
+.ends SYNTHETIC_LEVEL17
 .end
 ";
         let translated = translate_simplis_deck(source)?;
@@ -8120,11 +8124,11 @@ M1 D G S S mosfet
         );
         assert!(text.contains(".model __L17_MOSFET NMOS(level=1"));
         assert!(text.contains("R__M1_RD D __M1_DINT"));
-        assert!(text.contains("tc1=1.26999999999999995e-2"));
+        assert!(text.contains("tc1=1.56250000000000000e-2"));
         assert!(text.contains("R__M1_RG G __M1_GINT"));
         assert!(text.contains("M1 __M1_DINT __M1_GINT S S __L17_mosfet L=1 W=1"));
         assert!(text.contains("C__M1_CGD __M1_GINT __M1_DINT Q='"));
-        assert!(text.contains("omitted SIMetrix LEVEL=17 LIMIT(VDS)=(*, 500) SOA annotation"));
+        assert!(text.contains("omitted SIMetrix LEVEL=17 LIMIT(VDS)=(*, 400) SOA annotation"));
         assert!(!text.contains(".model mosfet NMOS( LEVEL=17"));
         assert!(!text.contains("CGDMAX="));
         Ok(())

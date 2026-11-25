@@ -1,0 +1,10 @@
+* default references later formal
+.param r=5k
+V1 a 0 10
+X1 a x helper
+R1 x 0 1k
+.subckt helper p n params: q={2*r} r=2k
+R1 p n {q}
+.ends
+.op
+.end

@@ -96,23 +96,23 @@ pub struct KnownTruthTable {
 }
 
 impl KnownTruthTable {
-    #[must_use]
+    #[must_use = "the width determines the truth-table input shape"]
     pub const fn input_width(&self) -> usize {
         self.input_width
     }
 
-    #[must_use]
+    #[must_use = "the width determines the truth-table output shape"]
     pub const fn output_width(&self) -> usize {
         self.output_width
     }
 
     #[cfg(test)]
-    #[must_use]
+    #[must_use = "the returned slice contains the truth-table values"]
     pub fn rows(&self) -> &[u32] {
         &self.rows
     }
 
-    #[must_use]
+    #[must_use = "the count identifies delayed output width"]
     pub const fn delayed_output_bits(&self) -> usize {
         self.delayed_output_bits
     }
@@ -154,7 +154,7 @@ impl KnownTruthTable {
     }
 
     /// Encode the known-input truth table in ngspice `d_genlut` output-major order.
-    #[must_use]
+    #[must_use = "the returned encoding is needed to emit the truth table"]
     pub fn d_genlut_values(&self) -> String {
         let mut values = String::with_capacity(self.rows.len().saturating_mul(self.output_width));
         for output in 0..self.output_width {
@@ -413,7 +413,7 @@ pub struct KnownTimedLutSet {
 }
 
 impl KnownTimedLutSet {
-    #[must_use]
+    #[must_use = "the returned text contains the structure report"]
     pub fn structural_summary(&self) -> String {
         let mut all = self.stages.iter().chain(&self.outputs);
         let first = all.next();
@@ -444,7 +444,7 @@ impl KnownTimedLutSet {
     }
 
     /// Return the ordered source map for one timed stage bit.
-    #[must_use]
+    #[must_use = "the returned mapping describes a stage bit"]
     pub fn stage_bit_sources(&self, name: &str, bit: usize) -> Option<&[KnownLutSourceBit]> {
         self.stages
             .iter()
@@ -453,7 +453,7 @@ impl KnownTimedLutSet {
     }
 
     /// Return the ordered source map for one output bit.
-    #[must_use]
+    #[must_use = "the returned mapping describes an output bit"]
     pub fn output_bit_sources(&self, name: &str, bit: usize) -> Option<&[KnownLutSourceBit]> {
         self.outputs
             .iter()

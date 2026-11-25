@@ -7,9 +7,144 @@ The workspace contains the ngspice normalizer, SIMPLIS source preprocessor and
 translator, and VDMOS prepared numerical kernel. The ALB/XSPICE runtime is
 experimental; unsupported source semantics remain explicit errors.
 
-The simulator owns numerical circuit orchestration. An optional external
-command will allow callers to supply a source transformation before
-normalization. Ordinary plaintext inputs need no external command.
+The simulator owns numerical circuit orchestration. Source admission is
+handled by `model-preprocess-command` before normalization, linking or model
+preparation. The default does not launch any external process.
+
+## Unified library and CLI
+
+Use the `ngspice-rs-preprocess` package for source preparation. The library
+entry point `prepare(&Request, &Options, &Cancellation)` returns a
+`PreparedBundle` with exact artifact bytes, companion identities and
+provenance. It does not create files or execute a numerical analysis.
+`SourceInput::File` and `SourceInput::Bytes` both carry an original path;
+in-memory sources require an existing parent directory. Each call owns one
+source-admission session. A frontend that already has a native parser can
+instead use the re-exported `SourceSession` for admission alone.
+
+The CLI invokes the same function:
+
+```text
+ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
+```
+
+| Format | Meaning | Primary artifact |
+| --- | --- | --- |
+| `native-deck` | Native-compatible circuit; link static includes and preserve title/analysis/terminator | `deck.cir` |
+| `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
+| `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
+| `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
+| `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
+| `expanded-library` | Lower already expanded dialect source as an include | `model.lib` |
+| `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
+| `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
+
+No extension-based format guessing or implicit transformation is performed.
+For example:
+
+```sh
+ngspice-rs-preprocess native-deck input.cir prepared --search ./models
+ngspice-rs-preprocess simplis-library parts.lb compiled
+ngspice-rs-preprocess simplis-deck circuit.net translated --parsed-library compiled/library.json
+ngspice-rs-preprocess native-library model.lib normalized \
+  --command /absolute/path/to/adapter --command-arg --mode --command-arg raw
+```
+
+Use repeatable `--library PATH` for raw catalog members, or
+`--parsed-library PATH` for previously compiled JSON artifacts. Explicit
+library path suffixes take priority over a unique portable basename;
+ambiguous includes fail. Content-equivalent library aliases retain all
+source names. A compiled artifact is never passed to the source command.
+Recursive relative `.init` resources are admitted in the same session and
+only in the selected simulator projection. Missing, ambiguous and
+recursive resources are errors. Dialect translation emits only the native
+electrical circuit and known generated libraries; attach the desired
+analysis separately. Residual external includes are rejected rather than
+silently referring to the original working directory. Experimental ALB
+compilation remains an explicit specialized workflow, not an automatic
+fallback from the unified entry point.
+
+Native linking preserves physical source lines, comments, continuations,
+scope boundaries and the root title. Static `.include`, `.inc` and named
+`.lib path section` resources are resolved relative to their containing
+source, followed by explicitly supplied search paths. Included standalone
+`.end` directives become comments; a complete deck retains its own
+terminator. Control-language commands are preserved, not executed or
+interpreted as static source includes. Dynamic resources in control
+commands still require their original runtime context.
+
+The CLI publishes the complete artifact directory only after successful
+preparation, using a temporary sibling directory and a rename. The parent
+directory must already exist; the output directory must not exist. A
+versioned `manifest.json` records format, primary filename, artifact byte
+counts, dependencies and provenance. On Linux publication uses a
+no-replacement rename. Native line maps are exact at the admitted-source
+boundary, including synthetic elements created during compatibility
+normalization. Generated dialect artifacts retain source identities and
+dependencies, but no invented one-to-one output line mapping. Native
+library callers receive exact source path values; the JSON manifest uses
+their display spellings.
+
+The combined artifact/intermediate-link byte limit defaults to 128 MiB and
+is configurable with `--max-output-bytes`. Per-source and command limits are
+available with `--max-input-bytes`, `--max-command-output-bytes`,
+`--max-diagnostic-bytes`, and `--timeout-ms`. These do not replace the
+separate cumulative evaluation and hierarchy work limits.
+
+## Optional external source command
+
+Configure one `AdmissionConfig` and share a `SourceSession` across the whole
+source graph. A `CommandConfig` contains an absolute executable pathname,
+literal arguments, and an optional absolute working directory. No shell,
+argument interpolation or executable PATH search is performed by source
+admission. An adapter receives:
+
+- The configured argument vector, followed by the canonical original source
+  pathname as one additional argument. A virtual in-memory source must also
+  supply an explicit origin pathname, with an existing parent directory.
+- The exact original source bytes on standard input, followed by EOF.
+- The original source's containing directory as its working directory unless
+  the caller explicitly overrides it. The environment is inherited; the
+  protocol does not require any environment variables.
+
+On exit zero, standard output is the full replacement byte stream (including
+an intentionally empty result). Standard error is diagnostic only. A nonzero
+exit, launch/I/O error, timeout, exceeded byte limit or cancellation rejects
+the source; no partial output enters the parser. The adapter is trusted code
+with the caller's normal permissions, not a sandbox. It must complete its
+work before returning and must not leave persistent descendants.
+
+Default admission ceilings are 64 MiB of original input per source, 128 MiB
+of stdout and 64 KiB of stderr per invocation, and a 30-second process
+deadline. The child receives an anonymous input snapshot (memory-backed on
+Linux, temporary file elsewhere), and both output streams are drained
+concurrently. Adapters may consume all, some or none of stdin. The deadline
+covers staging the input and waiting for the process to exit after its pipes
+close.
+Cancellation uses a shared `Cancellation` token. On Unix, failed invocations
+terminate the child process group; on Windows, the direct child is terminated.
+Cleanup is separately bounded to five seconds. Ordinary filesystem reads
+are synchronous and may block at the OS/filesystem level. Cumulative graph
+budgets are a separate preprocessing policy.
+
+`SourceLinker::link_with_session` applies the same session to the root,
+relative includes and named library sections. SIMPLIS callers use
+`parse_library_file`, `SubcircuitCatalog::add_library_file`, and
+`preprocess_netlist_file` or `preprocess_netlist_linked_file`. Byte-oriented
+parsers accept already-admitted data. Previously compiled library artifacts
+are not raw sources and do not pass through the command.
+
+Identity is the canonical source pathname, not a hash of its bytes: equal
+contents in different directories can have different relative dependencies.
+Repeated references, including symlink aliases and different sections of one
+file, reuse the first snapshot. Failed admissions are cached as failures, too;
+a fresh session is required to retry. The source origin path is preserved,
+and line numbers refer to the admitted text (a generic adapter cannot
+reconstruct a physical line mapping if it changes the number of lines).
+
+The optional ngspice reference validator uses the same bounded process-capture
+implementation, with 4 MiB limits for each output stream and the configured
+timeout per attempt. It no longer waits on a child before draining its pipes.
 
 See per-crate documentation and upstream notices for model-specific
 provenance, supported formats and reproducible reference validation.

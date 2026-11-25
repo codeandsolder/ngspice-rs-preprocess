@@ -3,13 +3,16 @@ name = "model-kernel-vdmos"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "MIT AND BSD-3-Clause"
 repository.workspace = true
 publish.workspace = true
 description = "Prepared ngspice 47 VDMOS channel, charge, diode and electrothermal device laws"
 
 [lints]
 workspace = true
+
+[dependencies]
+model-kernel-api = { path = "../model-kernel-api" }
 
 [dev-dependencies]
 model-normalize-ngspice = { path = "../model-normalize-ngspice" }

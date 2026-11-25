@@ -9,18 +9,11 @@ pub mod vdmos_card;
 pub mod vdmos_ltspice;
 
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::{Cancellation, ProcessLimits, capture};
 use regex::bytes::Regex;
 use serde::Serialize;
-use std::{
-    collections::BTreeSet,
-    fs,
-    io::Write,
-    process::{Command, Stdio},
-    sync::LazyLock,
-    time::Duration,
-};
+use std::{collections::BTreeSet, fs, io::Write, path::Path, sync::LazyLock, time::Duration};
 use tempfile::TempDir;
-use wait_timeout::ChildExt;
 
 static NGSPICE_ERROR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?im)^(?:fatal|error)[: ]")
@@ -86,7 +79,7 @@ pub struct ValidationResult {
 }
 
 /// Return true when the bytes contain strong SIMPLIS-only syntax.
-#[must_use]
+#[must_use = "the result determines whether SIMPLIS handling is required"]
 pub fn looks_like_simplis(input: &[u8]) -> bool {
     SIMPLIS_MODEL_RE.is_match(input)
         || SIMPLIS_DEVICE_RE.is_match(input)
@@ -170,7 +163,10 @@ fn rser_assignment(
     Ok(rser)
 }
 
-fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
+fn rewrite_ltspice_inductor_rser(
+    input: &[u8],
+    inserted_lines: &mut Vec<usize>,
+) -> Result<Option<Vec<u8>>> {
     use lexical::{apply_edits, replace_span, statements, tokens};
     if !input
         .windows(4)
@@ -234,6 +230,7 @@ fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
         line.pop();
         line.extend_from_slice(if ending.is_empty() { b"\n" } else { ending });
         edits.push((statement.start..statement.start, line));
+        inserted_lines.push(statement.line);
         replace_span(&statement, fields[1].clone(), &internal, &mut edits);
         // Remove preceding horizontal separation on the same logical line.
         // If the separator is synthetic its source range is empty.
@@ -477,6 +474,76 @@ fn apply_optional<F>(
 /// Returns an error for binary input or source identified as SIMPLIS, which requires
 /// semantic translation rather than syntax normalization.
 pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
+    normalize_body(input, true, &mut Vec::new())
+}
+
+/// Normalized bytes and one original input line for each emitted physical line.
+#[derive(Debug, Clone)]
+pub struct MappedNormalization {
+    /// Normalized artifact and applied passes.
+    pub model: NormalizedModel,
+    /// 1-based physical input lines; synthetic elements inherit the source line.
+    pub input_lines: Vec<usize>,
+}
+
+/// Normalize either an include or a complete deck, preserving the deck title
+/// and terminator. Every output line maps to its originating input line.
+///
+/// # Errors
+///
+/// Invalid source, unsupported dialect, malformed compatibility syntax, or
+/// inconsistent source mapping.
+pub fn normalize_mapped(
+    input: &[u8],
+    kind: linked_source::RootKind,
+) -> Result<MappedNormalization> {
+    ensure_textual(input)?;
+    let (title, body) = if kind == linked_source::RootKind::Deck {
+        let title = input
+            .split_inclusive(|byte| *byte == b'\n')
+            .next()
+            .context("native deck has no title line")?;
+        (title, &input[title.len()..])
+    } else {
+        (&[][..], input)
+    };
+    let mut inserted = Vec::new();
+    let mut model = normalize_body(
+        body,
+        kind == linked_source::RootKind::Include,
+        &mut inserted,
+    )?;
+    let title_lines = usize::from(!title.is_empty());
+    let mut input_lines = Vec::new();
+    if title_lines != 0 {
+        input_lines.push(1);
+        let mut bytes = Vec::with_capacity(title.len() + model.bytes.len());
+        bytes.extend_from_slice(title);
+        bytes.extend_from_slice(&model.bytes);
+        model.bytes = bytes;
+    }
+    let mut inserted = inserted.into_iter().peekable();
+    for (index, _) in body.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line = index + 1;
+        while inserted.peek() == Some(&line) {
+            input_lines.push(line + title_lines);
+            inserted.next();
+        }
+        input_lines.push(line + title_lines);
+    }
+    anyhow::ensure!(
+        inserted.next().is_none()
+            && input_lines.len() == model.bytes.split_inclusive(|byte| *byte == b'\n').count(),
+        "normalization source mapping is inconsistent"
+    );
+    Ok(MappedNormalization { model, input_lines })
+}
+
+fn normalize_body(
+    input: &[u8],
+    strip_end: bool,
+    inserted_lines: &mut Vec<usize>,
+) -> Result<NormalizedModel> {
     ensure_textual(input)?;
     if looks_like_simplis(input) {
         bail!("SIMPLIS source requires translation, not ngspice normalization");
@@ -490,7 +557,7 @@ pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
         NormalizationPass::NormalizeNbspWhitespace,
         normalize_nbsp,
     );
-    if let Some(rewritten) = rewrite_ltspice_inductor_rser(&bytes)? {
+    if let Some(rewritten) = rewrite_ltspice_inductor_rser(&bytes, inserted_lines)? {
         bytes = rewritten;
         passes.push(NormalizationPass::LtspiceInductorRser);
     }
@@ -502,7 +569,7 @@ pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
         bytes = rewritten;
         passes.push(NormalizationPass::PspicePositionalParams);
     }
-    if let Some(rewritten) = strip_standalone_end(&bytes)? {
+    if strip_end && let Some(rewritten) = strip_standalone_end(&bytes)? {
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
@@ -521,6 +588,12 @@ fn ngspice_once(
     } else {
         ".lib"
     };
+    anyhow::ensure!(
+        suffix[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "invalid model suffix"
+    );
     let model_name = format!("model{suffix}");
     fs::write(temp.path().join(&model_name), data)?;
     if mode == CompatibilityMode::Pspice {
@@ -532,23 +605,19 @@ fn ngspice_once(
             ".title normalized-model-parse-check\n.include \"{model_name}\"\nV__MODEL_CHECK ncheck 0 1\nR__MODEL_CHECK ncheck 0 1k\n.op\n.end\n"
         ),
     )?;
-    let mut child = Command::new("ngspice")
-        .args(["-b", "deck.cir"])
-        .current_dir(temp.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("starting ngspice")?;
-    if child.wait_timeout(timeout)?.is_none() {
-        child.kill().context("killing timed-out ngspice")?;
-        let _ = child.wait();
-        return Ok(ValidationResult {
-            ok: false,
-            mode: None,
-            detail: "ngspice parse timeout".to_owned(),
-        });
-    }
-    let output = child.wait_with_output()?;
+    let output = capture(
+        Path::new("ngspice"),
+        temp.path(),
+        &["-b".into(), "deck.cir".into()],
+        &[],
+        ProcessLimits {
+            timeout,
+            output_bytes: 4 * 1024 * 1024,
+            diagnostic_bytes: 4 * 1024 * 1024,
+        },
+        &Cancellation::default(),
+    )
+    .context("running bounded ngspice validation")?;
     let combined = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -619,6 +688,7 @@ pub fn normalize_and_validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn rewrites_only_targeted_syntax() -> Result<()> {
@@ -697,7 +767,7 @@ mod tests {
         let input = b"* header\n  R1 a b 1k\n\tL1 a b 2u\n  C1 b 0 10p\n";
         let normalized = normalize_ngspice(input)?;
         assert_eq!(normalized.bytes, input);
-        assert!(normalized.passes.is_empty());
+        assert_eq!(normalized.passes, [] as [NormalizationPass; 0]);
         Ok(())
     }
 
@@ -802,7 +872,7 @@ mod tests {
                 bail!("unexpected AC result: {line}");
             };
             let reactance = std::f64::consts::TAU * frequency * inductance;
-            let denominator = resistance * resistance + reactance * reactance;
+            let denominator = reactance.mul_add(reactance, resistance * resistance);
             assert!((real + resistance / denominator).abs() < 1e-10);
             assert!((imaginary - reactance / denominator).abs() < 1e-10);
         }

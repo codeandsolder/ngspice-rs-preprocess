@@ -1,0 +1,16 @@
+Synthetic PMOS reversed Cgd endpoint verification
+* Independently chosen parameters; nonzero series resistance exercises intrinsic bias comparison.
+.options gmin=1e-20
+Vg g 0 0
+Vd d 0 0
+M1 d g 0 dut
+.model dut VDMOS (PCHAN Vto=-1.2 Kp=20 Rg=1.5 Rd=12m Rs=8m Rb=9m
++ Cgdmin=6n Cgdmax=2n Cgs=3n Cjo=700p Is=10p)
+.control
+set width=200
+save v(d) @m1[cgd] @m1[vds] @m1[vgs]
+dc Vd -5 5 1
+print v(d) @m1[cgd] @m1[vds] @m1[vgs]
+quit
+.endc
+.end

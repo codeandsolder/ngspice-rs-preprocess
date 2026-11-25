@@ -134,9 +134,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "model-kernel-api"
+version = "0.1.0"
+
+[[package]]
 name = "model-kernel-vdmos"
 version = "0.1.0"
 dependencies = [
+ "model-kernel-api",
  "model-normalize-ngspice",
 ]
 
@@ -145,10 +150,21 @@ name = "model-normalize-ngspice"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-preprocess-command",
  "regex",
  "serde",
  "tempfile",
- "wait-timeout",
+]
+
+[[package]]
+name = "model-preprocess-command"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rustix",
+ "subprocess",
+ "tempfile",
 ]
 
 [[package]]
@@ -156,9 +172,11 @@ name = "model-preprocess-simplis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-preprocess-command",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -171,6 +189,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "model-preprocess-simplis",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "ngspice-rs-preprocess"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "model-normalize-ngspice",
+ "model-preprocess-command",
+ "model-preprocess-simplis",
+ "model-translate-simplis",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -303,6 +336,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "subprocess"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357bfac1d7af31600c3d45744ac453a4a25fc0f8b2ebe22db07d147745711cff"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "syn"
 version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -337,15 +380,6 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "windows-link"

@@ -83,17 +83,17 @@ impl XspiceTimedPlan {
             bits,
         })
     }
-    #[must_use]
+    #[must_use = "the width determines the XSPICE input pin count"]
     pub const fn input_width(&self) -> usize {
         self.input_width
     }
 
-    #[must_use]
+    #[must_use = "the width determines the XSPICE output pin count"]
     pub const fn output_width(&self) -> usize {
         self.output_width
     }
 
-    #[must_use]
+    #[must_use = "the returned slice contains timed bit definitions"]
     pub fn bits(&self) -> &[XspiceTimedBit] {
         &self.bits
     }

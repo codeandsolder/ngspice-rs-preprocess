@@ -1,0 +1,9 @@
+* unused actual
+V1 a 0 10
+X1 a x helper params: r=2k
+R1 x 0 1k
+.subckt helper p n
+R1 p n 1k
+.ends
+.op
+.end
