@@ -158,17 +158,31 @@ fn pwl(fields: &mut Fields) -> Result<WaveformSpec> {
     Ok(WaveformSpec::PiecewiseLinear { segments, points })
 }
 
-struct Parsed {
-    name: String,
-    positive: String,
-    negative: String,
-    spec: WaveformSpec,
+pub(super) struct Parsed {
+    pub(super) name: String,
+    pub(super) positive: String,
+    pub(super) negative: String,
+    pub(super) spec: WaveformSpec,
     idle_in_pop: Scalar,
     kind: TranslationKind,
     pwls: bool,
 }
 
 fn parse(statement: &str) -> Result<Option<Parsed>> {
+    // Avoid parsing unrelated device/model expressions merely to discover
+    // that they are not named independent-source waveforms.
+    let mut words = statement.split_ascii_whitespace();
+    if !words.next().is_some_and(|name| {
+        name.as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte.to_ascii_uppercase(), b'V' | b'I'))
+    }) || !words.nth(2).is_some_and(|shape| {
+        ["PUL", "SAW", "PWL", "SIN", "PWLS"]
+            .iter()
+            .any(|name| shape.eq_ignore_ascii_case(name))
+    }) {
+        return Ok(None);
+    }
     let normalized = normalized_statement(statement);
     let tokens = statement_tokens(&normalized)?;
     let [name, positive, negative, shape, rest @ ..] = tokens.as_slice() else {
@@ -209,10 +223,11 @@ fn parse(statement: &str) -> Result<Option<Parsed>> {
     } else {
         Fields::parse(rest)?
     };
-    let idle_in_pop = if pwls {
-        "0".to_owned()
-    } else {
-        fields.flag("IDLE_IN_POP", "0")?
+    let idle_in_pop = match shape.as_str() {
+        "PWLS" => "0".to_owned(),
+        // Aperiodic PWL is always idle in the source periodic analysis.
+        "PWL" => "1".to_owned(),
+        _ => fields.flag("IDLE_IN_POP", "0")?,
     };
     let (spec, kind) = match shape.as_str() {
         "PUL" | "PWLS" => (pulse(&mut fields, pwls)?, TranslationKind::PulseSource),
@@ -261,6 +276,53 @@ impl Parsed {
         }
     }
 
+    fn strict_native_reference(resolved: &ResolvedWaveform) -> bool {
+        match &resolved.forcing {
+            Forcing::PiecewiseLinear { knots, repeat } => {
+                let shift = if repeat.is_some() {
+                    0.
+                } else {
+                    knots[0].time.min(0.)
+                };
+                knots.iter().enumerate().all(|(index, knot)| {
+                    let left = if index == 0 {
+                        repeat.map_or(knot.left, |cycle| cycle.hold.unwrap_or(knot.right))
+                    } else {
+                        knot.left
+                    };
+                    let time = knot.time - shift;
+                    time.is_finite()
+                        && (index == 0 || time > knots[index - 1].time - shift)
+                        && left.to_bits() == knot.right.to_bits()
+                })
+            }
+            Forcing::Sine {
+                damping,
+                frequency,
+                delay,
+                amplitude,
+                hold_before_delay,
+                ..
+            } => {
+                let elapsed = if *hold_before_delay && *delay > 0. {
+                    0.
+                } else {
+                    -delay
+                };
+                *damping >= 0.
+                    && (elapsed * frequency).is_finite()
+                    && (*amplitude == 0. || (amplitude * (-damping * elapsed).exp()).is_finite())
+            }
+        }
+    }
+
+    fn placeholder(&self, dc: f64) -> String {
+        format!(
+            "* mandatory prepared waveform binding for {}\n{} {} {} DC {dc:.17e}",
+            self.name, self.name, self.positive, self.negative
+        )
+    }
+
     fn write_reference(&self, resolved: &ResolvedWaveform) -> Result<String> {
         let mut output = String::new();
         write!(
@@ -278,6 +340,7 @@ impl Parsed {
                     } else {
                         knot.time - origin
                     };
+                    ensure!(time.is_finite(), "native PWL time shift overflows");
                     let left = if index == 0 {
                         repeat.map_or(knot.left, |cycle| cycle.hold.unwrap_or(knot.right))
                     } else {
@@ -309,7 +372,11 @@ impl Parsed {
                 let gated = *hold_before_delay && *delay > 0.;
                 let shift = if gated { *delay } else { 0. };
                 let elapsed = shift - delay;
-                let peak = amplitude * (-damping * elapsed).exp();
+                let peak = if *amplitude == 0. {
+                    0.
+                } else {
+                    amplitude * (-damping * elapsed).exp()
+                };
                 let phase = (elapsed * frequency).rem_euclid(1.) * 360.;
                 ensure!(
                     peak.is_finite() && phase.is_finite(),
@@ -328,12 +395,12 @@ impl Parsed {
 
 /// Low-level native reference lowering. Symbolic named sources require
 /// the unified prepared bundle, not an unresolved numeric approximation.
-pub(super) fn translate(statement: &str) -> Result<Option<Translation>> {
+pub(super) fn translate(statement: &str, scope: &str) -> Result<Option<Translation>> {
     let Some(parsed) = parse(statement)? else {
         return Ok(None);
     };
     if parsed.pwls {
-        return Ok(None);
+        return super::pwls::translate(&parsed, scope).map(Some);
     }
     let resolved = parsed
         .constant()?
@@ -375,22 +442,18 @@ fn capture_items(
                     let resolved = parsed.constant()?;
                     output.push(parsed.declaration(artifact, scope));
                     if !parsed.pwls {
-                        *statement = if let Some(resolved) = resolved {
-                            parsed.write_reference(&resolved)?.trim_end().to_owned()
-                        } else {
-                            // This independent source retains its MNA row and
-                            // name. The mandatory manifest replaces its forcing
-                            // after elaborating the occurrence's parameters.
-                            format!(
-                                "{} {} {} DC 0",
-                                parsed.name, parsed.positive, parsed.negative
-                            )
+                        *statement = match resolved {
+                            Some(resolved) if Parsed::strict_native_reference(&resolved) => {
+                                parsed.write_reference(&resolved)?.trim_end().to_owned()
+                            }
+                            Some(resolved) => parsed.placeholder(resolved.dc),
+                            None => parsed.placeholder(0.),
                         };
                         changed = true;
                     }
                 }
             }
-            Item::Subcircuit(block) => {
+            Item::Subcircuit(block) if !embedded && !control => {
                 changed |= capture_items(
                     &mut block.body,
                     artifact,
@@ -398,6 +461,7 @@ fn capture_items(
                     output,
                 )?;
             }
+            Item::Subcircuit(_) => {}
         }
     }
     Ok(changed)
@@ -405,8 +469,9 @@ fn capture_items(
 
 /// Capture source waveforms after hierarchy linkage. Retain independent
 /// source names and terminals in the native electrical artifact. Static
-/// raw declarations also have a native reference representation; symbolic
-/// raw declarations require the typed binding before any solve.
+/// raw declarations with strictly increasing native knots also have a
+/// reference representation. Exact discontinuities and symbolic raw
+/// declarations retain a DC-only row until the mandatory typed binding.
 ///
 /// # Errors
 /// Invalid source grammar, static domain errors or malformed scope.

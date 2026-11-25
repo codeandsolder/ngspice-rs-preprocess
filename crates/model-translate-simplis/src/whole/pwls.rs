@@ -3,15 +3,14 @@
 //! Native repeated PWL preserves both source identity and breakpoint scheduling.
 //! Static expressions are folded when possible, otherwise scoped parameters
 //! retain the native netlist's normal instance binding semantics.
-use super::{Item, lower_simetrix_behavioral_expression, source_kind};
-use crate::{
-    Translation, TranslationKind, normalized_statement, statement_tokens, validate_name,
-    validate_node,
-};
+use super::{Item, lower_simetrix_behavioral_expression, waveforms::Parsed};
+use crate::{Translation, TranslationKind};
 use anyhow::{Context, Result, bail, ensure};
-use model_normalize_ngspice::param_expression::{SpiceExpression, SpiceExpressionContext};
-use model_preprocess_simplis::parameter_assignments;
-use std::{collections::BTreeMap, fmt::Write as _};
+use model_normalize_ngspice::{
+    param_expression::{SpiceExpression, SpiceExpressionContext},
+    waveform::{Period, PulseEdges, PulseSpec, WaveformSpec},
+};
+use std::fmt::Write as _;
 
 pub(super) fn scope_prefix(items: &[Item], header: Option<&str>) -> String {
     let mut occupied = header.unwrap_or_default().to_ascii_lowercase();
@@ -67,7 +66,9 @@ pub(super) fn expression_text(text: &str) -> Result<String> {
         .strip_prefix('{')
         .and_then(|rest| rest.strip_suffix('}'))
         .unwrap_or(text);
-    lower_simetrix_behavioral_expression(inner)
+    let text = lower_simetrix_behavioral_expression(inner)?;
+    SpiceExpression::parse(&text)?;
+    Ok(text)
 }
 
 struct Scalar {
@@ -114,40 +115,6 @@ impl Parameters {
     }
 }
 
-fn parameter(fields: &BTreeMap<String, String>, name: &str, default: &str) -> Result<String> {
-    expression_text(fields.get(name).map_or(default, String::as_str))
-}
-
-fn parse_fields(tokens: &[String]) -> Result<BTreeMap<String, String>> {
-    let (end, body) = tokens.split_last().context("PWLS PUL requires END")?;
-    ensure!(end.eq_ignore_ascii_case("END"), "PWLS PUL requires END");
-    let text = body.join(" ");
-    let mut fields = BTreeMap::new();
-    for (key, value) in parameter_assignments(&text)? {
-        let key = key.to_ascii_uppercase();
-        ensure!(
-            matches!(
-                key.as_str(),
-                "V1" | "V2"
-                    | "FREQ"
-                    | "PERIOD"
-                    | "RISE"
-                    | "FALL"
-                    | "WIDTH"
-                    | "DELAY"
-                    | "OFF_UNTIL_DELAY"
-            ),
-            "unsupported PWLS PUL parameter {key}"
-        );
-        ensure!(
-            !fields.contains_key(&key),
-            "duplicate PWLS PUL parameter {key}"
-        );
-        fields.insert(key, value.to_owned());
-    }
-    Ok(fields)
-}
-
 struct Pulse {
     low: Scalar,
     high: Scalar,
@@ -160,45 +127,46 @@ struct Pulse {
 }
 
 impl Pulse {
-    fn prepare(fields: &BTreeMap<String, String>, params: &mut Parameters) -> Result<Self> {
-        let low = params.define("v1", &parameter(fields, "V1", "1")?)?;
-        let high = params.define("v2", &parameter(fields, "V2", "-1")?)?;
-        ensure!(
-            !(fields.contains_key("FREQ") && fields.contains_key("PERIOD")),
-            "PWLS PUL FREQ and PERIOD are mutually exclusive"
-        );
-        let period = if let Some(period) = fields.get("PERIOD") {
-            params.define("period", &expression_text(period)?)?
-        } else {
-            let frequency = params.define("freq", &parameter(fields, "FREQ", "0")?)?;
-            ensure!(
-                frequency.value.is_none_or(|value| value > 0.0),
-                "PWLS PUL frequency must be positive"
-            );
-            params.define("period", &format!("1/({frequency})"))?
+    fn prepare(spec: &PulseSpec, params: &mut Parameters) -> Result<Self> {
+        let low = params.define("v1", &spec.first)?;
+        let high = params.define("v2", &spec.second)?;
+        let period = match &spec.period {
+            Period::Seconds(period) => params.define("period", period)?,
+            Period::Frequency(freq) => {
+                let frequency = params.define("freq", freq)?;
+                ensure!(
+                    frequency.value.is_none_or(|value| value > 0.),
+                    "PWLS PUL frequency must be positive"
+                );
+                params.define("period", &format!("1/({frequency})"))?
+            }
         };
         ensure!(
-            period.value.is_none_or(|value| value > 0.0),
+            period.value.is_none_or(|value| value > 0.),
             "PWLS PUL period must be positive"
         );
-        let rise = params.define(
-            "rise",
-            &parameter(fields, "RISE", &format!("{period}/1000"))?,
-        )?;
-        let fall = params.define("fall", &parameter(fields, "FALL", &rise.text)?)?;
+        let PulseEdges::Trapezoidal {
+            rise, width, fall, ..
+        } = &spec.edges
+        else {
+            bail!("PWLS requires trapezoidal pulse edges")
+        };
+        let rise = params.define("rise", rise.as_deref().unwrap_or(&format!("{period}/1000")))?;
+        let fall = params.define("fall", fall.as_deref().unwrap_or(&rise.text))?;
         let width = params.define(
             "width",
-            &parameter(fields, "WIDTH", &format!("({period}-{rise}-{fall})/2"))?,
+            width
+                .as_deref()
+                .unwrap_or(&format!("({period}-{rise}-{fall})/2")),
         )?;
-        let delay = params.define("delay", &parameter(fields, "DELAY", "0")?)?;
-        let off = params.define("off", &parameter(fields, "OFF_UNTIL_DELAY", "1")?)?;
+        let delay = params.define("delay", &spec.delay)?;
+        let off = params.define("off", &spec.hold_before_delay)?;
         ensure!(
-            rise.value.is_none_or(|value| value > 0.0)
-                && fall.value.is_none_or(|value| value > 0.0),
+            rise.value.is_none_or(|value| value > 0.) && fall.value.is_none_or(|value| value > 0.),
             "PWLS PUL rise and fall must be positive"
         );
         ensure!(
-            width.value.is_none_or(|value| value >= 0.0),
+            width.value.is_none_or(|value| value >= 0.),
             "PWLS PUL width must be nonnegative"
         );
         Ok(Self {
@@ -296,32 +264,12 @@ impl Pulse {
     }
 }
 
-pub(super) fn translate(statement: &str, scope: &str) -> Result<Option<Translation>> {
-    let normalized = normalized_statement(statement);
-    let tokens = statement_tokens(&normalized)?;
-    let [name, positive, negative, kind, shape, rest @ ..] = tokens.as_slice() else {
-        return Ok(None);
+pub(super) fn translate(parsed: &Parsed, scope: &str) -> Result<Translation> {
+    let WaveformSpec::Pulse(spec) = &parsed.spec else {
+        bail!("PWLS requires pulse forcing")
     };
-    if !name
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| matches!(byte.to_ascii_uppercase(), b'V' | b'I'))
-        || !kind.eq_ignore_ascii_case("PWLS")
-    {
-        return Ok(None);
-    }
-    // Only independent source devices have this waveform grammar.
-    source_kind(name)?;
-    ensure!(
-        shape.eq_ignore_ascii_case("PUL"),
-        "unsupported SIMetrix PWLS waveform {shape}"
-    );
-    validate_name(name)?;
-    validate_node(positive)?;
-    validate_node(negative)?;
-    let fields = parse_fields(rest)?;
     let mut prefix = scope.to_owned();
-    for byte in name.bytes() {
+    for byte in parsed.name.bytes() {
         write!(prefix, "{:02x}", byte.to_ascii_lowercase())?;
     }
     prefix.push('_');
@@ -329,12 +277,17 @@ pub(super) fn translate(statement: &str, scope: &str) -> Result<Option<Translati
         prefix,
         output: String::new(),
     };
-    let pulse = Pulse::prepare(&fields, &mut params)?;
-    pulse.emit(name, positive, negative, &mut params)?;
-    Ok(Some(Translation {
+    let pulse = Pulse::prepare(spec, &mut params)?;
+    pulse.emit(
+        &parsed.name,
+        &parsed.positive,
+        &parsed.negative,
+        &mut params,
+    )?;
+    Ok(Translation {
         bytes: params.output.into_bytes(),
         kind: TranslationKind::PulseSource,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -342,7 +295,8 @@ mod tests {
     use super::*;
 
     fn lower(source: &str) -> Result<String> {
-        let result = translate(source, "pulse_test_")?.context("missing translation")?;
+        let result = super::super::waveforms::translate(source, "pulse_test_")?
+            .context("missing translation")?;
         assert_eq!(result.kind, TranslationKind::PulseSource);
         Ok(String::from_utf8(result.bytes)?)
     }

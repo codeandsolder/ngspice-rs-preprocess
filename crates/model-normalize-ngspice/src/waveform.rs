@@ -17,7 +17,8 @@ pub struct PreparedWaveform {
     pub scope: Vec<String>,
     pub source: String,
     pub spec: WaveformSpec,
-    /// Whether periodic-operating-point analysis must freeze this source.
+    /// Freeze at the startup value during source periodic operating point
+    /// and its associated AC analysis.
     pub idle_in_pop: Scalar,
 }
 
@@ -188,7 +189,12 @@ impl PulseEdges {
                     duty > 0. && duty < 1.,
                     "rectangular pulse duty ratio must lie in (0,1)"
                 );
-                Ok([0., period * duty, 0.])
+                let width = period * duty;
+                ensure!(
+                    width > 0. && width < period,
+                    "rectangular pulse width cannot be resolved in its period"
+                );
+                Ok([0., width, 0.])
             }
             Self::Trapezoidal {
                 rise,
@@ -282,9 +288,17 @@ fn pulse_forcing(
     let [rise, width, fall] = spec.edges.resolve(period, resolve)?;
     let high_end = rise + width;
     let end = high_end + fall;
+    // At a full-period boundary two rounded additions can produce one
+    // final ULP beyond the period. Never insert an artificial idle edge.
     ensure!(
-        end.is_finite() && end <= period,
+        rise <= period && end.is_finite() && end <= period.next_up(),
         "pulse rise, width and fall exceed period"
+    );
+    let end = end.min(period);
+    let high_end = high_end.min(period);
+    ensure!(
+        (width <= 0. || high_end > rise) && (fall <= 0. || end > high_end),
+        "pulse duration is smaller than a representable interval"
     );
     let knots = if end == 0. {
         vec![Knot {
@@ -314,10 +328,9 @@ fn pwl_forcing(
 ) -> Result<Forcing> {
     let count = scalar(segments, resolve)?;
     // Compare exact structural arity, not a truncating float->int cast.
+    let declared = u32::try_from(points.len().saturating_sub(1)).context("too many PWL points")?;
     ensure!(
-        count >= 1.
-            && count.fract() == 0.
-            && count.to_string() == points.len().saturating_sub(1).to_string(),
+        declared > 0 && count.to_bits() == f64::from(declared).to_bits(),
         "PWL segment count does not match its point declarations"
     );
     let points = points
@@ -433,11 +446,14 @@ fn startup_pwl(knots: &[Knot], repeat: Option<Repeat>) -> Result<f64> {
     } else {
         return Ok(last.right);
     };
-    Ok(affine(
-        left.right,
-        right.left,
-        (time - left.time) / (right.time - left.time),
-    ))
+    let span = right.time - left.time;
+    let fraction = if span.is_finite() {
+        (time - left.time) / span
+    } else {
+        // Finite opposite-sign endpoints may have a nonfinite difference.
+        (time * 0.5 - left.time * 0.5) / (right.time * 0.5 - left.time * 0.5)
+    };
+    Ok(affine(left.right, right.left, fraction))
 }
 
 impl Forcing {
@@ -445,7 +461,7 @@ impl Forcing {
     ///
     /// # Errors
     /// Invalid resolved knots or a nonfinite startup value.
-    pub fn startup(&self) -> Result<f64> {
+    fn startup(&self) -> Result<f64> {
         let value = match self {
             Self::PiecewiseLinear { knots, repeat } => startup_pwl(knots, *repeat)?,
             Self::Sine {
@@ -456,7 +472,7 @@ impl Forcing {
                 damping,
                 hold_before_delay,
             } => {
-                if *hold_before_delay && *delay > 0. {
+                if *amplitude == 0. || (*hold_before_delay && *delay > 0.) {
                     *offset
                 } else {
                     let phase = (-(delay * frequency)).rem_euclid(1.) * std::f64::consts::TAU;
@@ -487,4 +503,74 @@ impl PreparedWaveform {
             idle_in_pop,
         })
     }
+}
+
+/// Verify that every source declaration binds exactly one emitted independent
+/// source in its recorded artifact and lexical definition scope.
+///
+/// # Errors
+/// Duplicate metadata, missing source, or ambiguous emitted source identity.
+pub fn validate_artifact(
+    declarations: &[PreparedWaveform],
+    artifact: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    let mut expected = BTreeMap::new();
+    for declaration in declarations.iter().filter(|item| item.artifact == artifact) {
+        let scope = declaration
+            .scope
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let key = (scope, declaration.source.to_ascii_lowercase());
+        ensure!(
+            expected.insert(key, false).is_none(),
+            "duplicate waveform declaration {}",
+            declaration.source
+        );
+    }
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let mut scope = Vec::new();
+    let mut control = false;
+    for statement in crate::lexical::statements(bytes)? {
+        let text = std::str::from_utf8(&statement.text)?;
+        let mut fields = text.split_ascii_whitespace();
+        let Some(first) = fields.next() else { continue };
+        if first.eq_ignore_ascii_case(".control") {
+            control = true;
+        } else if first.eq_ignore_ascii_case(".endc") {
+            control = false;
+        } else if control {
+            continue;
+        } else if first.eq_ignore_ascii_case(".subckt") {
+            scope.push(
+                fields
+                    .next()
+                    .context("missing emitted waveform scope")?
+                    .to_ascii_lowercase(),
+            );
+        } else if first.eq_ignore_ascii_case(".ends") {
+            ensure!(scope.pop().is_some(), "unmatched emitted .ends");
+        } else if first
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte.to_ascii_uppercase(), b'V' | b'I'))
+        {
+            let key = (scope.clone(), first.to_ascii_lowercase());
+            if let Some(seen) = expected.get_mut(&key) {
+                ensure!(!*seen, "ambiguous waveform source {first} in {scope:?}");
+                *seen = true;
+            }
+        }
+    }
+    for ((scope, source), seen) in expected {
+        ensure!(
+            seen,
+            "missing emitted waveform source {source} in {scope:?} ({artifact})"
+        );
+    }
+    Ok(())
 }

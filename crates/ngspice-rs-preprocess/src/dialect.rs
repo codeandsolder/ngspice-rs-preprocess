@@ -16,8 +16,9 @@ use model_preprocess_simplis::{
     source_include_target,
 };
 use model_translate_simplis::{
-    capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms, capture_passive_initial_conditions,
-    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_expanded_library,
+    capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
+    translate_simplis_expanded_library,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},

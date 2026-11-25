@@ -400,7 +400,7 @@ fn typed_bias_paths_disqualify_only_affected_private_loops() -> Result<()> {
     for declaration in ["Cstate aux b 1 IC=2 BRANCH=1", ".ic V(aux)=2"] {
         let mut policy = InitialConditions::default();
         let _ = capture_statement(&mut policy, "model.lib", &["cell1".to_owned()], declaration)?;
-        let result = condition_private_differentiators(&inputs, Some(&policy))?;
+        let result = condition_private_differentiators(&inputs, Some(&policy), &[])?;
         let scales = &result[1].scalings;
         assert_eq!(scales.len(), 1, "{declaration}");
         assert_eq!(scales[0].scope, ["cell2"]);
