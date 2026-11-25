@@ -31,9 +31,8 @@ fn capture_items(
                 }
             }
             Item::Subcircuit(block) => {
-                scope.push(block.name.clone());
-                capture_items(&mut block.body, artifact, scope, conditions)?;
-                scope.pop();
+                let mut emitted_scope = vec![block.name.clone()];
+                capture_items(&mut block.body, artifact, &mut emitted_scope, conditions)?;
             }
         }
     }

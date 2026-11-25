@@ -298,9 +298,9 @@ pub fn evaluate_expression(
 }
 
 /// Parse one logical source statement in its already linked lexical scope.
-/// Returns a statement with the source-only passive fields removed, leaving
-/// the native storage IC in place. The returned policy is authoritative for
-/// source-specific initialization, including node hints.
+/// Returns a statement with all source-specific passive IC fields removed.
+/// The typed policy owns both storage IC and node hints; native IC semantics
+/// must not also be applied.
 ///
 /// # Errors
 /// Malformed/duplicate fields or invalid scalar syntax.
@@ -311,6 +311,18 @@ pub fn capture_statement(
     statement: &str,
 ) -> Result<String> {
     use crate::lexical;
+    let Some(first) = statement.split_whitespace().next() else {
+        return Ok(statement.to_owned());
+    };
+    if !matches!(
+        first.as_bytes().first().map(u8::to_ascii_uppercase),
+        Some(b'C' | b'L')
+    ) && ![".ic", ".option", ".options"]
+        .iter()
+        .any(|name| first.eq_ignore_ascii_case(name))
+    {
+        return Ok(statement.to_owned());
+    }
     let active = lexical::statements(statement.as_bytes())?;
     let [logical] = active.as_slice() else {
         return Ok(statement.to_owned());
@@ -328,8 +340,12 @@ pub fn capture_statement(
         return capture_nodes(conditions, artifact, scope, &fields[1..]);
     }
     if first.eq_ignore_ascii_case(".options") || first.eq_ignore_ascii_case(".option") {
-        capture_options(conditions, scope, &fields[1..])?;
-        return Ok(statement.to_owned());
+        let retained = capture_options(conditions, scope, &fields[1..])?;
+        return Ok(if retained.is_empty() {
+            "* source initialization options recorded in typed policy".to_owned()
+        } else {
+            format!("{first} {}", retained.join(" "))
+        });
     }
     let kind = match first.as_bytes().first().map(u8::to_ascii_uppercase) {
         Some(b'C') => PassiveKind::Capacitor,
@@ -342,6 +358,15 @@ pub fn capture_statement(
     let mut retained = fields.iter().take(3).copied().collect::<Vec<_>>();
     let mut i = 3;
     while let Some(field) = fields.get(i) {
+        if fields.get(i + 1) != Some(&"=") {
+            // A positional model name can itself be IC or BRANCH.
+            retained.push(field);
+            i += 1;
+            continue;
+        }
+        let value = fields
+            .get(i + 2)
+            .context("missing passive assignment value")?;
         let slot = if field.eq_ignore_ascii_case("IC") {
             Some(&mut target)
         } else if field.eq_ignore_ascii_case("BRANCH") {
@@ -352,20 +377,12 @@ pub fn capture_statement(
             None
         };
         if let Some(slot) = slot {
-            ensure!(
-                fields.get(i + 1) == Some(&"="),
-                "{first}: {field} requires an assignment"
-            );
-            let value = fields
-                .get(i + 2)
-                .context("missing passive initialization value")?;
             let value = normalized_scalar(value)?;
             ensure!(slot.replace(value).is_none(), "{first}: duplicate {field}");
-            i += 3;
         } else {
-            retained.push(field);
-            i += 1;
+            retained.extend([*field, "=", *value]);
         }
+        i += 3;
     }
     if target.is_none() && branch.is_none() && mode.is_none() {
         return Ok(statement.to_owned());
@@ -415,11 +432,12 @@ fn normalized_scalar(raw: &str) -> Result<String> {
     Ok(output)
 }
 
-fn capture_options(
+fn capture_options<'a>(
     conditions: &mut InitialConditions,
     scope: &[String],
-    fields: &[&str],
-) -> Result<()> {
+    fields: &[&'a str],
+) -> Result<Vec<&'a str>> {
+    let mut retained = Vec::new();
     let mut i = 0;
     while let Some(field) = fields.get(i) {
         let slot = if field.eq_ignore_ascii_case("INITCONDMODE") {
@@ -441,12 +459,18 @@ fn capture_options(
             *slot = Some(normalized_scalar(value)?);
             i += 3;
         } else if fields.get(i + 1) == Some(&"=") {
+            retained.extend([
+                *field,
+                "=",
+                *fields.get(i + 2).context("missing option value")?,
+            ]);
             i += 3;
         } else {
+            retained.push(field);
             i += 1;
         }
     }
-    Ok(())
+    Ok(retained)
 }
 
 fn capture_nodes(

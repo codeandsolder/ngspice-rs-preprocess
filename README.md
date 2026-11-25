@@ -239,3 +239,29 @@ that is simulated. When a downstream analysis adds global shunt conductances
 or capacitances, or requires unchanged internal current observations, select
 `Options::conditioning = ConditioningPolicy::Disabled` (CLI:
 `--conditioning disabled`). This leaves the original coordinates intact.
+
+### Analysis-scoped passive initialization
+
+The SIMetrix deck policy is carried separately from ordinary electrical
+artifacts in `PreparedBundle::initial_conditions` and manifest v4.
+It retains source-specific `INITCONDMODE`, `ICRES`, per-device `IC`,
+`ICMODE`, and optional `BRANCH`, plus ordered node `.IC` hints. The
+source-only device and node IC fields are removed from the emitted
+electrical cards: consumers must not apply native ngspice IC rules as
+well as this policy.
+
+Resolve the deck defaults and each declaration's expressions for the
+actual elaborated occurrence and enclosing analysis, including
+the predefined `ANALYSIS` value. A declaration may be instantiated
+repeatedly with different local parameter bindings. `BiasConstraint`
+describes exact hard or finite soft forcing only for the bias solve;
+the solver owns the row allocation, convergence retries, and ordinary
+storage initialization. During UIC only storage IC and node hints
+participate. In AC, ordinary small-signal storage stamps replace the
+bias constraints. Conflicting ideal constraints must remain singular.
+
+This policy selects the measured SIMetrix Elements GUI defaults
+(mode 2, ICRES=2 mOhm) when no explicit option overrides them.
+Do not simulate the electrical text alone if this policy contains
+initialization declarations. Native decks have no source-specific
+initialization policy and retain their normal IC semantics.
