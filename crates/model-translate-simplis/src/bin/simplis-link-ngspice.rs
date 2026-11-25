@@ -3,7 +3,8 @@ use model_preprocess_simplis::{
     LibrarySimulator, ParsedLibrary, SubcircuitCatalog, preprocess_netlist_linked,
 };
 use model_translate_simplis::{
-    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_expanded_library,
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
+    translate_simplis_expanded_library,
 };
 use std::{
     env, fs,
@@ -169,6 +170,12 @@ fn main() -> Result<()> {
     let mut linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
     if simulator == LibrarySimulator::Simetrix {
         lower_simetrix_linked_runtime(&mut linked)?;
+        let initialization = capture_passive_initial_conditions(&mut linked)?;
+        if !initialization.devices.is_empty() || !initialization.nodes.is_empty() {
+            bail!(
+                "source-specific initial conditions require ngspice-rs-preprocess simetrix-deck and its typed initialization manifest"
+            );
+        }
     }
     let translated_root = translate_simplis_deck(&linked.root_bytes)?;
     let output_dir = output_root

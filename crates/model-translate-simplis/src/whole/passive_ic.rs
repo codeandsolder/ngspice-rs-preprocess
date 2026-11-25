@@ -31,7 +31,12 @@ fn capture_items(
                 }
             }
             Item::Subcircuit(block) => {
-                capture_items(&mut block.body, artifact, &[block.name.clone()], conditions)?;
+                capture_items(
+                    &mut block.body,
+                    artifact,
+                    std::slice::from_ref(&block.name),
+                    conditions,
+                )?;
             }
         }
     }

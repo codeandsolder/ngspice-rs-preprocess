@@ -5084,10 +5084,13 @@ fn sanitize_native_passive(statement: &str) -> Result<String> {
     while index < tokens.len() {
         let token = &tokens[index];
         let key = token.split_once('=').map_or(token.as_str(), |(key, _)| key);
-        if key.eq_ignore_ascii_case("BRANCH") || key.eq_ignore_ascii_case("ICMODE") {
-            changed = true;
-            index += 1;
-            continue;
+        if index >= 3
+            && token.contains('=')
+            && (key.eq_ignore_ascii_case("BRANCH") || key.eq_ignore_ascii_case("ICMODE"))
+        {
+            bail!(
+                "unbound source initialization field {key} on {name}; prepare the source-specific initialization policy before native translation"
+            );
         }
 
         if kind == Some(b'R') && key.eq_ignore_ascii_case("TC") {
@@ -7003,17 +7006,31 @@ X$U2 top out bot inp 0 pinnames: TOP VOUT BOT IN RTN ngspice_preprocess_init: SW
     }
 
     #[test]
-    fn strips_legacy_passive_analysis_metadata_but_keeps_ic() -> Result<()> {
-        let source = br"C1 a 0 10n IC=2 BRANCH={IF(ANALYSIS=2,1,0)} ICMODE=0
-L1 b 0 1u IC=3 BRANCH=0
+    fn rejects_unbound_source_initialization_but_keeps_native_ic() -> Result<()> {
+        for source in [
+            br"C1 a 0 10n IC=2 BRANCH={IF(ANALYSIS=2,1,0)} ICMODE=0
 .end
-";
-        let translated = translate_simplis_deck(source)?;
+"
+            .as_slice(),
+            b"L1 b 0 1u IC=3 BRANCH=0
+.end
+"
+            .as_slice(),
+        ] {
+            let error = translate_simplis_deck(source)
+                .err()
+                .context("source initialization silently lost")?;
+            assert!(format!("{error:#}").contains("unbound source initialization"));
+        }
+        let translated = translate_simplis_deck(
+            b"C1 a 0 10n IC=2
+L1 b 0 1u IC=3
+.end
+",
+        )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("C1 a 0 10n IC=2"));
         assert!(text.contains("L1 b 0 1u IC=3"));
-        assert!(!text.contains("BRANCH="));
-        assert!(!text.contains("ICMODE="));
         Ok(())
     }
 
