@@ -3,7 +3,7 @@
 //! Production `D_LOGIC_BLOCK` translation is not enabled.
 
 use anyhow::{Context, Result, bail, ensure};
-use model_translate_simplis::{
+use model_alb_experimental::{
     AlbOutputProducer, AnalogBridgeKind, AnalogDigitalConnection, BridgeCatalog, BridgeModel,
     DigitalPinDirection, LogicFamily, LogicFamilyAssignment, NativeFamilySpecification,
     OccurrenceFamilyBoundary, ScopedAnalogDigitalConnection, materialize_scoped_family_bridges,

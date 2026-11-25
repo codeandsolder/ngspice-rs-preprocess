@@ -143,7 +143,7 @@ supported.
     CARGO_BUILD_EPHEMERAL_INTERMEDIATES=false \
       RUSTC_WRAPPER=/usr/local/libexec/sccache-client \
       CARGO_TARGET_DIR=/path/to/build/preprocess/target \
-      cargo build --locked -p model-translate-simplis --bin alb-xspice-compile
+      cargo build --locked -p model-alb-experimental --bin alb-xspice-compile
 
     /path/to/build/preprocess/target/debug/alb-xspice-compile \
       runtime/xspice/fixtures/timed-enable.alb \
@@ -398,7 +398,7 @@ because the family-specific SIMetrix scaling equation is not verified.
 From the repository root, using the synthetic, deliberately non-vendor
 fixtures:
 
-    cargo run --locked -p model-translate-simplis \
+    cargo run --locked -p model-alb-experimental \
       --bin alb-family-resolve -- \
       runtime/xspice/fixtures/family/compat-synthetic.txt \
       runtime/xspice/fixtures/family/plan-synthetic.json \
@@ -460,13 +460,13 @@ Only the documented electrical quantities are supply-scaled:
 
 Example using solely synthetic, non-vendor fixtures:
 
-    cargo run --locked -p model-translate-simplis \
+    cargo run --locked -p model-alb-experimental \
       --bin alb-family-resolve -- \
       runtime/xspice/fixtures/family/compat-synthetic.txt \
       runtime/xspice/fixtures/family/buffer-plan-3v3.json \
       /path/to/resolved.json
 
-    cargo run --locked -p model-translate-simplis \
+    cargo run --locked -p model-alb-experimental \
       --bin alb-family-materialize -- \
       /path/to/resolved.json \
       runtime/xspice/fixtures/family/buffer-native.json \
@@ -522,13 +522,13 @@ Independent outputs are not merged.
 Run from the source repository (use the repository-pinned nightly and
 configured sccache wrapper for actual builds):
 
-    cargo run --locked -p model-translate-simplis \
+    cargo run --locked -p model-alb-experimental \
       --bin alb-xspice-compile -- \
       runtime/xspice/fixtures/bundle-buffer.alb \
       runtime/xspice/fixtures/family/buffer-40r.json \
       /path/to/generated.inc ALB_BUFFER
 
-    cargo run --locked -p model-translate-simplis \
+    cargo run --locked -p model-alb-experimental \
       --bin alb-family-autowire -- \
       runtime/xspice/fixtures/family/auto-nested.cir \
       /path/to/generated.inc \
@@ -601,13 +601,13 @@ the digital net fail closed rather than becoming fictitious bridges.
 
 For a full original-source pipeline using the synthetic fixtures:
 
-    cargo run --locked -p model-translate-simplis \
+    cargo run --locked -p model-alb-experimental \
       --bin alb-logical-expand -- \
       runtime/xspice/fixtures/family/logical-original.cir \
       runtime/xspice/fixtures/family/auto-bindings-3v3.json \
       /path/to/lowered.cir /path/to/generated.inc
 
-    cargo run --locked -p model-translate-simplis \
+    cargo run --locked -p model-alb-experimental \
       --bin alb-family-autowire -- \
       /path/to/lowered.cir /path/to/generated.inc \
       runtime/xspice/fixtures/family/auto-bindings-3v3.json \

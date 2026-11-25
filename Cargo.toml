@@ -1,5 +1,16 @@
 [workspace]
 members = [
+    "crates/model-alb-experimental",
+    "crates/model-kernel-api",
+    "crates/model-kernel-vdmos",
+    "crates/model-normalize-ngspice",
+    "crates/model-preprocess-simplis",
+    "crates/model-preprocess-command",
+    "crates/model-translate-simplis",
+    "crates/model-touchstone",
+    "crates/ngspice-rs-preprocess",
+]
+default-members = [
     "crates/model-kernel-api",
     "crates/model-kernel-vdmos",
     "crates/model-normalize-ngspice",

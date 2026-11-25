@@ -2,7 +2,7 @@
 //! verified family-resolution plan, explicit model data, and digital wiring.
 
 use anyhow::{Context, Result, bail};
-use model_translate_simplis::{
+use model_alb_experimental::{
     AnalogBridgeKind, LogicFamily, NativeFamilySpecification, PlannedAnalogBridge,
     render_native_family_bridges,
 };
