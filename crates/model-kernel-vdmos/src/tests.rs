@@ -860,12 +860,14 @@ fn source_parameters_compile_aliases_and_physical_groups() -> Result<(), ModelEr
 
 #[test]
 fn source_parameter_compiler_never_silently_drops_modes() {
-    for unsupported in ["PHI", "VGS_MAX", "PD_MAX", "DERATING", "TYPE"] {
-        assert!(matches!(
-            compile_ngspice(Polarity::N, [(unsupported, 1.0)]),
-            Err(ParameterError::Unsupported(_))
-        ));
-    }
+    assert!(matches!(
+        compile_ngspice(Polarity::N, [("TYPE", 1.0)]),
+        Err(ParameterError::ReadOnly(_))
+    ));
+    assert!(matches!(
+        compile_ngspice(Polarity::N, [("PHI", 0.0)]),
+        Err(ParameterError::Invalid(_))
+    ));
     for unknown in ["SUBSLOPE", "IOPSPICE", "BSIMLEVEL"] {
         assert!(matches!(
             compile_ngspice(Polarity::N, [(unknown, 2.0)]),

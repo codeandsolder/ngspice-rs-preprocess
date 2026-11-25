@@ -94,6 +94,10 @@ pub fn vdmos_resolved(
             }
             continue;
         }
+        ensure!(
+            !param.name.eq_ignore_ascii_case("type"),
+            "VDMOS TYPE is a read-only polarity query"
+        );
         let expression = param
             .expression
             .as_deref()
@@ -161,6 +165,7 @@ mod tests {
             ),
             (".model x vdmos (Kp={multiplier * 4})", "not a scalar"),
             (".model x vdmos (PCHAN=2 Kp=2)", "0 or 1"),
+            (".model x vdmos (TYPE=vdmosp)", "read-only"),
         ] {
             let cards = parse_model_cards(source.as_bytes())?;
             let Err(error) = vdmos_literals(&cards[0]) else {
