@@ -317,3 +317,27 @@ fn simetrix_transient_defaults_are_explicit_and_symbolic_requests_require_bindin
     assert!(plan.validate_unbound_execution().is_err());
     Ok(())
 }
+
+#[test]
+fn named_analysis_coordinates_are_not_mistaken_for_native_devices() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("deck.net");
+    fs::write(&root, b"title\n*#SIMETRIX SEP=: \nV:drive a 0 1\nR1 a 0 1k\n.dc drive 0 2 1\n.noise V(a) drive dec 10 1 100\n.tf V(a) drive\n.op\n.end\n")?;
+    let prepared = prepare_path(&root, InputFormat::SimetrixDeck)?;
+    let plan = prepared.analysis_plan.as_ref().context("missing plan")?;
+    assert_eq!(plan.entries.len(), 4);
+    assert!(
+        plan.entries[..3]
+            .iter()
+            .all(|entry| entry.disposition == Disposition::RequiresBinding)
+    );
+    assert_eq!(plan.native_requests().count(), 1);
+    assert!(plan.validate_unbound_execution().is_err());
+    assert!(
+        prepared
+            .device_identities
+            .iter()
+            .any(|identity| identity.displayed == "drive" && identity.linked != "drive")
+    );
+    Ok(())
+}

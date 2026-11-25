@@ -260,8 +260,9 @@ operations, including periodic SIMPLIS analyses, remain visible in the
 plan. SIMPLIS transient and snapshot/output sampling semantics are
 not substituted with ordinary SPICE transient arguments.
 
-Output selectors and measurements retain source coordinates for binding
-against device identities and prepared current scalings. Control scripts
+Named sweep stimuli, noise and transfer-function probes, output selectors
+and measurements retain source coordinates for binding against device
+identities and prepared current scalings. Control scripts
 are opaque unsupported declarations, never executed by preparation.
 Root statements have admitted physical source spans, including
 continuations and selected include sections; generated declarations use

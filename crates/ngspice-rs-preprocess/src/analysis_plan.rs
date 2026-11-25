@@ -585,7 +585,17 @@ fn classify(
                 })
             }
             (AnalysisDialect::Simetrix, _) if native_analysis_shape(analysis, &args) => {
-                NativeRequest
+                if matches!(
+                    analysis,
+                    AnalysisKind::DcSweep | AnalysisKind::Noise | AnalysisKind::TransferFunction
+                ) || args.iter().any(|arg| arg.starts_with('{'))
+                {
+                    // Named sweep stimuli and probes belong to the original
+                    // device namespace, which may differ after primitive lowering.
+                    RequiresBinding
+                } else {
+                    NativeRequest
+                }
             }
             (AnalysisDialect::Simplis, AnalysisKind::Transient) if args.len() == 2 => {
                 RequiresBinding
