@@ -29,6 +29,16 @@ Options:
   --max-diagnostic-bytes N
   --timeout-ms N              Per-command deadline in milliseconds
   --max-output-bytes N        Combined artifact bytes ceiling
+  --max-work-input-bytes N    Cumulative original input
+  --max-work-admitted-bytes N Cumulative admitted snapshots
+  --max-work-sources N        Distinct admitted source identities
+  --max-work-source-visits N  Includes and library visits (including cached)
+  --max-work-scanned-bytes N  Cumulative scanned bytes
+  --max-work-statements N     Cumulative statement visits
+  --max-work-evaluation-steps N
+  --max-work-generated-nodes N
+  --max-work-emitted-bytes N  Intermediate and final emission
+  --max-work-depth N          Recursive depth (maximum 64)
   --conditioning MODE         private-differentiators (default) or disabled
 The output directory must not already exist.
 ";
@@ -44,6 +54,28 @@ fn numeric(value: &OsStr) -> Result<usize> {
         .to_str()
         .context("numeric option is not UTF-8")?
         .parse()?)
+}
+
+fn work_option(
+    name: &str,
+    value: &OsStr,
+    work: &mut ngspice_rs_preprocess::WorkLimits,
+) -> Result<()> {
+    let slot = match name {
+        "--max-work-input-bytes" => &mut work.input_bytes,
+        "--max-work-admitted-bytes" => &mut work.admitted_bytes,
+        "--max-work-sources" => &mut work.sources,
+        "--max-work-source-visits" => &mut work.source_visits,
+        "--max-work-scanned-bytes" => &mut work.scanned_bytes,
+        "--max-work-statements" => &mut work.statements,
+        "--max-work-evaluation-steps" => &mut work.evaluation_steps,
+        "--max-work-generated-nodes" => &mut work.generated_nodes,
+        "--max-work-emitted-bytes" => &mut work.emitted_bytes,
+        "--max-work-depth" => &mut work.depth,
+        _ => bail!("unknown work option {name}"),
+    };
+    *slot = numeric(value)?;
+    Ok(())
 }
 
 fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>> {
@@ -79,6 +111,10 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
         let value = args
             .next()
             .with_context(|| format!("missing value for {name}"))?;
+        if name.starts_with("--max-work-") {
+            work_option(name, &value, &mut options.work)?;
+            continue;
+        }
         match name {
             "--library" => request
                 .libraries

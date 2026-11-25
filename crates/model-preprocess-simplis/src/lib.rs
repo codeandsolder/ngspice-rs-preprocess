@@ -5,6 +5,7 @@
 //! fail closed instead of being approximated.
 
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,9 +16,10 @@ pub use hierarchy::{
     ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, active_statement_prefix,
     capacitor_charge_assignments, linked_library_filename, lower_simetrix_source_view,
     parse_init_statement, parse_init_target_path, parse_library, parse_library_file,
-    parse_library_for_simulator, parse_scoped_library, preprocess_netlist, preprocess_netlist_file,
-    preprocess_netlist_linked, preprocess_netlist_linked_file, project_resource,
-    project_simetrix_source, project_source, render_projection, source_include_target,
+    parse_library_for_simulator, parse_library_with_budget, parse_scoped_library,
+    preprocess_netlist, preprocess_netlist_file, preprocess_netlist_linked,
+    preprocess_netlist_linked_file, project_resource, project_simetrix_source, project_source,
+    render_projection, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
@@ -65,6 +67,27 @@ enum ScalarType {
 }
 
 impl Value {
+    fn charge_copy(&self, budget: &WorkBudget) -> Result<()> {
+        let _depth = budget.enter()?;
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        match self {
+            Self::Number(_) => Ok(()),
+            Self::Text(text) => budget.charge(Resource::EmittedBytes, text.len()),
+            Self::Vector(values) => {
+                budget.charge(Resource::GeneratedNodes, values.len())?;
+                for value in values {
+                    value.charge_copy(budget)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn charged_render(&self, budget: &WorkBudget) -> Result<String> {
+        self.charge_copy(budget)?;
+        self.render()
+    }
+
     // In the reference expression language, scalar and vector are shapes,
     // not distinct element types. Empty vectors have no inspectable type.
     fn scalar_type(&self) -> Result<Option<ScalarType>> {
@@ -105,16 +128,39 @@ impl Value {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Environment {
     values: BTreeMap<String, Value>,
     options: BTreeMap<String, Value>,
+    budget: WorkBudget,
+}
+
+impl PartialEq for Environment {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values && self.options == other.options
+    }
 }
 
 impl Environment {
     #[must_use = "the returned environment owns parameter and option bindings"]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create bindings that participate in a caller's cumulative budget.
+    #[must_use]
+    pub fn with_budget(budget: WorkBudget) -> Self {
+        Self {
+            budget,
+            ..Self::default()
+        }
+    }
+
+    fn charged_clone(&self) -> Result<Self> {
+        for value in self.values.values().chain(self.options.values()) {
+            value.charge_copy(&self.budget)?;
+        }
+        Ok(self.clone())
     }
 
     pub fn set(&mut self, name: impl AsRef<str>, value: Value) {
@@ -375,6 +421,9 @@ impl<'a> Evaluation<'a> {
     }
 
     fn expression(self, input: &str) -> Result<Value> {
+        self.env
+            .budget
+            .charge(Resource::EvaluationSteps, input.len().max(1))?;
         let trimmed = input.trim();
         let inner = if trimmed.starts_with('{') && trimmed.ends_with('}') {
             &trimmed[1..trimmed.len().saturating_sub(1)]
@@ -508,7 +557,13 @@ impl<'a> Parser<'a> {
         while self.current() == &Token::Amp {
             self.bump();
             let right = self.parse_add()?;
-            left = Value::Text(format!("{}{}", left.render()?, right.render()?));
+            let left_text = left.charged_render(&self.eval.env.budget)?;
+            let right_text = right.charged_render(&self.eval.env.budget)?;
+            self.eval.env.budget.charge(
+                Resource::EmittedBytes,
+                left_text.len().saturating_add(right_text.len()),
+            )?;
+            left = Value::Text(left_text + &right_text);
         }
         Ok(left)
     }
@@ -550,6 +605,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Value> {
+        let _depth = self.eval.env.budget.enter()?;
         match self.current() {
             Token::Plus => {
                 self.bump();
@@ -623,11 +679,13 @@ impl<'a> Parser<'a> {
                 } else if name.eq_ignore_ascii_case("PI") {
                     Ok(Value::Number(std::f64::consts::PI))
                 } else {
-                    self.eval
+                    let value = self
+                        .eval
                         .env
                         .get(&name)
-                        .cloned()
-                        .with_context(|| format!("undefined SIMPLIS variable {name}"))
+                        .with_context(|| format!("undefined SIMPLIS variable {name}"))?;
+                    value.charge_copy(&self.eval.env.budget)?;
+                    Ok(value.clone())
                 }
             }
             Token::LParen => {
@@ -642,6 +700,7 @@ impl<'a> Parser<'a> {
                 let mut values = Vec::new();
                 if self.current() != &Token::RBracket {
                     loop {
+                        self.eval.env.budget.charge(Resource::GeneratedNodes, 1)?;
                         values.push(self.parse_or()?);
                         if self.current() != &Token::Comma {
                             break;
@@ -704,8 +763,10 @@ impl<'a> Parser<'a> {
                     "IFF arguments 2 and 3 must be of the same type"
                 );
                 if self.eval.truthy(&args[0])? {
+                    args[1].charge_copy(&self.eval.env.budget)?;
                     Ok(args[1].clone())
                 } else {
+                    args[2].charge_copy(&self.eval.env.budget)?;
                     Ok(args[2].clone())
                 }
             }
@@ -720,7 +781,7 @@ impl<'a> Parser<'a> {
             "SEARCH" => search_function(name, &args),
             "GETOPTION" => get_option_function(name, &args, self.eval.env),
             "FORMATNUMBER" => format_number_function(name, &args, self.eval),
-            "SUBSTSTRING" => subst_string_function(name, &args),
+            "SUBSTSTRING" => subst_string_function(name, &args, &self.eval.env.budget),
             _ => bail!("unsupported SIMPLIS function {name}"),
         }
     }
@@ -785,7 +846,7 @@ fn format_engineering(value: f64, significant_digits: u32) -> Result<String> {
     Ok(format!("{rendered}{suffix}"))
 }
 
-fn subst_string_function(name: &str, args: &[Value]) -> Result<Value> {
+fn subst_string_function(name: &str, args: &[Value], budget: &WorkBudget) -> Result<Value> {
     if args.len() != 4 {
         bail!("{name} requires exactly four arguments");
     }
@@ -804,6 +865,12 @@ fn subst_string_function(name: &str, args: &[Value]) -> Result<Value> {
     if !mode.eq_ignore_ascii_case("all") {
         bail!("{name} currently supports only mode 'all'");
     }
+    let matches = input.matches(needle).count();
+    let length = input
+        .len()
+        .saturating_sub(matches.saturating_mul(needle.len()))
+        .saturating_add(matches.saturating_mul(replacement.len()));
+    budget.charge(Resource::EmittedBytes, length)?;
     Ok(Value::Text(input.replace(needle, replacement)))
 }
 
@@ -844,6 +911,11 @@ fn vector_add_sub(left: Value, right: Value, add: bool, eval: Evaluation<'_>) ->
         Ok(value)
     }
 
+    let elements = match (&left, &right) {
+        (Value::Vector(values), _) | (_, Value::Vector(values)) => values.len(),
+        _ => 0,
+    };
+    eval.env.budget.charge(Resource::GeneratedNodes, elements)?;
     match (left, right) {
         (Value::Vector(left), right @ (Value::Number(_) | Value::Text(_))) => {
             let right = eval.number(&right)?;
@@ -895,6 +967,9 @@ fn vector_function(name: &str, args: &[Value], eval: Evaluation<'_>) -> Result<V
     let length: u32 = format!("{length:.0}")
         .parse()
         .context("SIMPLIS Vector length does not fit u32")?;
+    eval.env
+        .budget
+        .charge(Resource::GeneratedNodes, usize::try_from(length)?)?;
     let values = (0..length)
         .map(|index| Value::Number(f64::from(index)))
         .collect();
@@ -946,7 +1021,9 @@ fn unary_numeric(
 /// Returns an error for unsupported syntax/functions, undefined variables, type
 /// mismatches, non-finite arithmetic, or invalid vector access.
 pub fn eval_expression(input: &str, env: &Environment) -> Result<Value> {
-    Evaluation::new(env).expression(input)
+    let result = Evaluation::new(env).expression(input);
+    env.budget.check()?;
+    result
 }
 
 fn directive<'a>(line: &'a str, name: &str) -> Option<&'a str> {
@@ -1050,14 +1127,19 @@ fn substitute_line(line: &str, env: &Environment, mode: Substitution) -> Result<
         } else {
             match eval_expression(&line[start..=end], env) {
                 Ok(value) => {
-                    output.push_str(&value.render()?);
+                    let value = value.charged_render(&env.budget)?;
+                    env.budget.charge(Resource::EmittedBytes, value.len())?;
+                    output.push_str(&value);
                     substitutions = substitutions.saturating_add(1);
                 }
                 // A plain definition may carry runtime electrical
                 // expressions. The source preprocessor expands its
                 // known compile-time expressions while preserving
                 // expressions outside that environment.
-                Err(_) if mode == Substitution::Known => output.push_str(&line[start..=end]),
+                Err(_) if mode == Substitution::Known => {
+                    env.budget.check()?;
+                    output.push_str(&line[start..=end]);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1109,6 +1191,7 @@ fn while_limit(expression: Option<&str>, env: &Environment) -> Result<usize> {
         // The source tool falls back to its default for unresolved
         // names, invalid expressions and nonnumeric values (including
         // quoted numeric strings).
+        env.budget.check()?;
         return Ok(DEFAULT_WHILE_ITERATIONS);
     };
     anyhow::ensure!(
@@ -1198,6 +1281,7 @@ fn process_while(
     let mut limit = None;
     let mut iterations = 0usize;
     loop {
+        state.env.budget.charge(Resource::Statements, 1)?;
         let active = eval_expression(condition, state.env)
             .and_then(|value| Evaluation::new(state.env).truthy(&value))
             .with_context(|| format!("SIMPLIS .WHILE condition at line {line}"))?;
@@ -1237,11 +1321,21 @@ fn process_range(
     end: usize,
     state: &mut PreprocessState<'_>,
 ) -> Result<()> {
+    let _depth = state.env.budget.enter()?;
     let mut index = start;
     while index < end {
         let line = lines[index];
+        state.env.budget.charge(Resource::Statements, 1)?;
+        state
+            .env
+            .budget
+            .charge(Resource::ScannedBytes, line.len())?;
         if let Some(condition) = directive(line, "IF") {
             let (else_index, endif_index) = find_if_bounds(lines, index, end)?;
+            state
+                .env
+                .budget
+                .charge(Resource::Statements, endif_index - index)?;
             let active = Evaluation::new(state.env)
                 .truthy(&eval_expression(unwrap_then(condition), state.env)?)?;
             *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
@@ -1263,6 +1357,10 @@ fn process_range(
         }
         if let Some(header) = directive(line, "WHILE") {
             let endwhile_index = find_while_end(lines, index, end)?;
+            state
+                .env
+                .budget
+                .charge(Resource::Statements, endwhile_index - index)?;
             process_while(lines, index, endwhile_index, header, state)?;
             index = endwhile_index.saturating_add(1);
             continue;
@@ -1271,6 +1369,10 @@ fn process_range(
             bail!("unexpected SIMPLIS .ENDWHILE at line {}", index + 1);
         }
         if line.trim_start().starts_with('*') {
+            state
+                .env
+                .budget
+                .charge(Resource::EmittedBytes, line.len().saturating_add(1))?;
             state.output.push_str(line);
             state.output.push('\n');
             index = index.saturating_add(1);
@@ -1314,6 +1416,10 @@ fn process_range(
         let (rendered, count) = substitute_line(line, state.env, mode)
             .with_context(|| format!("SIMPLIS substitution at line {}", index + 1))?;
         *state.substituted_expressions = state.substituted_expressions.saturating_add(count);
+        state
+            .env
+            .budget
+            .charge(Resource::EmittedBytes, rendered.len().saturating_add(1))?;
         state.output.push_str(&rendered);
         state.output.push('\n');
         index = index.saturating_add(1);
@@ -1345,9 +1451,10 @@ fn run_preprocess_body(
     evaluate_parameters: bool,
     parameter_names: &mut BTreeSet<String>,
 ) -> Result<Preprocessed> {
+    initial.budget.charge(Resource::ScannedBytes, input.len())?;
     let text = decode_simplis_text(input)?;
     let lines = text.lines().collect::<Vec<_>>();
-    let mut env = initial.clone();
+    let mut env = initial.charged_clone()?;
     let mut output = String::new();
     let mut assigned_variables = 0usize;
     let mut evaluated_conditionals = 0usize;
@@ -1408,7 +1515,7 @@ fn preprocess_body_with_mode(
         true,
         &mut discovered_names,
     )?;
-    let mut seeded = initial.clone();
+    let mut seeded = initial.charged_clone()?;
     for name in discovered_names {
         let value = discovery
             .environment
@@ -2210,7 +2317,11 @@ pub fn specialize_subcircuit(
     input: &[u8],
     overrides: &Environment,
 ) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base(input, &Environment::new(), overrides)
+    specialize_subcircuit_with_base(
+        input,
+        &Environment::with_budget(overrides.budget.clone()),
+        overrides,
+    )
 }
 
 fn specialize_subcircuit_with_base(
@@ -2235,6 +2346,9 @@ fn specialize_subcircuit_with_base_mode(
     overrides: &Environment,
     substitute_active_lines: bool,
 ) -> Result<SpecializedSubcircuit> {
+    inherited
+        .budget
+        .charge(Resource::ScannedBytes, input.len())?;
     let text = decode_simplis_text(input)?;
     let lines: Vec<&str> = text.lines().collect();
     let first = lines
@@ -2272,7 +2386,7 @@ fn specialize_subcircuit_with_base_mode(
         bail!("SIMPLIS .SUBCKT {name} has no external nodes");
     }
 
-    let mut env = inherited.clone();
+    let mut env = inherited.charged_clone()?;
     env.options.extend(overrides.options.clone());
     let default_parameters = parse_parameter_list(parameter_text, &mut env)?;
     let mut overridden_parameters = 0usize;

@@ -517,6 +517,7 @@ pub fn parse_items(input: &str) -> Result<Vec<Item>> {
                 .get(7..8)
                 .is_some_and(|value| value.as_bytes().iter().all(u8::is_ascii_whitespace))
         {
+            anyhow::ensure!(stack.len() < 64, "translation subcircuit depth exceeded 64");
             let name = subcircuit_name(&statement)?;
             stack.push(Subcircuit {
                 header: statement,

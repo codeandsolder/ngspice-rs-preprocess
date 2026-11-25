@@ -12,7 +12,8 @@ use model_normalize_ngspice::{
 };
 pub use model_normalize_ngspice::{passive_ic, waveform};
 pub use model_preprocess_command::{
-    AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, SourceSession,
+    AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, Resource,
+    SourceSession, WorkBudget, WorkLimits,
 };
 pub use model_preprocess_simplis::{LibrarySimulator, ParsedLibrary};
 pub use model_translate_simplis::CodeModelRuntime;
@@ -128,6 +129,8 @@ pub struct Options {
     pub admission: AdmissionConfig,
     /// Ceiling on linked intermediate bytes and combined final artifact bytes.
     pub output_bytes: usize,
+    /// Shared cumulative work ceilings across the entire request.
+    pub work: WorkLimits,
     /// Disable conditioning when the consumer adds artificial topology
     /// (such as global shunts) or requires unchanged internal current names.
     pub conditioning: ConditioningPolicy,
@@ -138,6 +141,7 @@ impl Default for Options {
         Self {
             admission: AdmissionConfig::default(),
             output_bytes: 128 * 1024 * 1024,
+            work: WorkLimits::default(),
             conditioning: ConditioningPolicy::default(),
         }
     }
@@ -348,7 +352,12 @@ pub fn prepare(
 ) -> Result<PreparedBundle> {
     validate_request(request)?;
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
-    let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
+    let budget = WorkBudget::new(options.work, cancellation.clone());
+    let mut session = SourceSession::with_budget(
+        options.admission.clone(),
+        cancellation.clone(),
+        budget.clone(),
+    );
     let root = request.input.admit(&mut session)?;
     let mut result = match request.format {
         InputFormat::NativeDeck | InputFormat::NativeLibrary => {
@@ -371,6 +380,7 @@ pub fn prepare(
             declaration.artifact
         );
     }
+    budget.check()?;
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
         waveform::validate_artifact(&result.waveforms, &artifact.filename, &artifact.bytes)?;

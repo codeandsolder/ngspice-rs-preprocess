@@ -5,6 +5,7 @@ use super::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::SourceSession;
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -188,6 +189,7 @@ pub struct SubcircuitCatalog {
     aliases: BTreeMap<String, Vec<AliasBinding>>,
     sources: BTreeMap<String, SourceMetadata>,
     next_anonymous_source: usize,
+    budget: WorkBudget,
 }
 
 /// Parse a static dialect include path, with literal Windows separators.
@@ -261,6 +263,13 @@ impl SubcircuitCatalog {
         }
     }
 
+    /// Use the same counters as source admission and all other graph stages.
+    #[must_use]
+    pub fn with_budget(mut self, budget: WorkBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
     /// Add standalone `.SUBCKT` definitions from one anonymous library source.
     ///
     /// # Errors
@@ -296,7 +305,7 @@ impl SubcircuitCatalog {
         input: &[u8],
         simulator: LibrarySimulator,
     ) -> Result<usize> {
-        let parsed = parse_library_for_simulator(source, input, simulator)?;
+        let parsed = parse_library_with_budget(source, input, simulator, &self.budget)?;
         self.add_parsed_library(&parsed)
     }
 
@@ -321,6 +330,17 @@ impl SubcircuitCatalog {
     ///
     /// Returns an error if the parsed artifact fails its integrity/version check.
     pub fn add_parsed_library(&mut self, parsed: &ParsedLibrary) -> Result<usize> {
+        self.budget.charge(Resource::SourceVisits, 1)?;
+        self.budget
+            .charge(Resource::GeneratedNodes, parsed.definitions.len())?;
+        for definition in &parsed.definitions {
+            self.budget
+                .charge(Resource::ScannedBytes, definition.bytes.len())?;
+        }
+        for line in &parsed.support_lines {
+            self.budget.charge(Resource::ScannedBytes, line.len())?;
+            self.budget.charge(Resource::Statements, 1)?;
+        }
         parsed.validate()?;
         if let Some(existing) = self.simulator {
             if existing != parsed.simulator {
@@ -690,7 +710,12 @@ pub fn parse_library_file(
     admission: &mut SourceSession,
 ) -> Result<ParsedLibrary> {
     let source = admission.load(path)?;
-    parse_library_for_simulator(source.path.to_string_lossy(), &source.bytes, simulator)
+    parse_library_with_budget(
+        source.path.to_string_lossy(),
+        &source.bytes,
+        simulator,
+        admission.budget(),
+    )
 }
 
 /// Parse one library using an explicit simulator projection.
@@ -708,6 +733,24 @@ pub fn parse_library_for_simulator(
     input: &[u8],
     simulator: LibrarySimulator,
 ) -> Result<ParsedLibrary> {
+    parse_library_with_budget(source, input, simulator, &WorkBudget::default())
+}
+
+/// Parse a library with the caller's cumulative preparation counters.
+/// # Errors
+/// Malformed library source or exhausted preprocessing budget.
+pub fn parse_library_with_budget(
+    source: impl Into<String>,
+    input: &[u8],
+    simulator: LibrarySimulator,
+    budget: &WorkBudget,
+) -> Result<ParsedLibrary> {
+    budget.charge(Resource::SourceVisits, 1)?;
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    budget.charge(
+        Resource::Statements,
+        input.split_inclusive(|byte| *byte == b'\n').count(),
+    )?;
     let source_name = source.into();
     if simulator == LibrarySimulator::Simetrix {
         let (context, view) = project_simetrix_source(
@@ -718,12 +761,15 @@ pub fn parse_library_for_simulator(
         let view = lower_simetrix_source_view(
             &view,
             context,
-            crate::source_dialect::DEFAULT_PROJECTION_BYTES,
+            crate::source_dialect::DEFAULT_PROJECTION_BYTES
+                .min(budget.remaining(Resource::EmittedBytes)?),
         )?;
-        return parse_projected_library(source_name, &view, simulator, Some(context));
+        budget.charge(Resource::EmittedBytes, view.len())?;
+        return parse_projected_library(source_name, &view, simulator, Some(context), budget);
     }
     let view = project_source(input, simulator)?;
-    parse_projected_library(source_name, &view, simulator, None)
+    budget.charge(Resource::EmittedBytes, view.len())?;
+    parse_projected_library(source_name, &view, simulator, None, budget)
 }
 
 /// Parse an admitted, scoped source graph whose individual resources have
@@ -737,6 +783,7 @@ pub fn parse_scoped_library(
     dialect: crate::source_dialect::DialectContext,
     statements: &[crate::source_dialect::ScopedStatement],
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<ParsedLibrary> {
     use crate::source_dialect::resolve_device_identities;
     anyhow::ensure!(
@@ -746,7 +793,12 @@ pub fn parse_scoped_library(
                 .all(|line| source_names.contains(&line.source)),
         "incomplete admitted source graph"
     );
+    budget.charge(Resource::Statements, statements.len())?;
+    for line in statements {
+        budget.charge(Resource::ScannedBytes, line.text.len())?;
+    }
     let resolved = resolve_device_identities(statements)?;
+    budget.charge(Resource::EmittedBytes, resolved.text.len())?;
     anyhow::ensure!(
         resolved.text.len() <= limit,
         "device identity expansion byte budget exceeded"
@@ -758,6 +810,7 @@ pub fn parse_scoped_library(
         LibrarySimulator::Simetrix,
         Some(dialect),
         resolved.identities,
+        budget,
     )
 }
 
@@ -766,6 +819,7 @@ fn parse_projected_library(
     selected_view: &str,
     simulator: LibrarySimulator,
     dialect: Option<crate::source_dialect::DialectContext>,
+    budget: &WorkBudget,
 ) -> Result<ParsedLibrary> {
     use crate::source_dialect::{DEFAULT_PROJECTION_BYTES, ScopedStatement};
     let sources = BTreeSet::from([source_name.clone()]);
@@ -784,6 +838,7 @@ fn parse_projected_library(
             context,
             &statements,
             DEFAULT_PROJECTION_BYTES,
+            budget,
         );
     }
     parse_library_parts(
@@ -793,6 +848,7 @@ fn parse_projected_library(
         simulator,
         None,
         Vec::new(),
+        budget,
     )
 }
 
@@ -803,8 +859,9 @@ fn parse_library_parts(
     simulator: LibrarySimulator,
     dialect: Option<crate::source_dialect::DialectContext>,
     device_identities: Vec<crate::source_dialect::DeviceIdentity>,
+    budget: &WorkBudget,
 ) -> Result<ParsedLibrary> {
-    let parsed = extract_definitions(selected_view)?;
+    let parsed = extract_definitions_scoped(selected_view, None, budget)?;
     let (support_lines, aliases) = parse_library_root(&parsed.root_lines)?;
     let mut definitions = parsed.definitions;
     for definition in &mut definitions {
@@ -1253,11 +1310,19 @@ fn collapse_continuations(input: &str) -> String {
     output
 }
 
+#[cfg(test)]
 fn extract_definitions(input: &str) -> Result<Extracted> {
-    extract_definitions_scoped(input, None)
+    extract_definitions_scoped(input, None, &WorkBudget::default())
 }
 
-fn extract_definitions_scoped(input: &str, owner_scope_id: Option<&str>) -> Result<Extracted> {
+fn extract_definitions_scoped(
+    input: &str,
+    owner_scope_id: Option<&str>,
+    budget: &WorkBudget,
+) -> Result<Extracted> {
+    let _depth = budget.enter()?;
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    budget.charge(Resource::Statements, input.lines().count())?;
     let lines: Vec<&str> = input.lines().collect();
     let mut root_lines = Vec::new();
     let mut definitions = Vec::new();
@@ -1288,6 +1353,7 @@ fn extract_definitions_scoped(input: &str, owner_scope_id: Option<&str>) -> Resu
                 .with_context(|| format!("unterminated SIMPLIS .SUBCKT at line {}", start + 1))?;
             if is_subcircuit_header(line) {
                 depth = depth.saturating_add(1);
+                budget.check_depth(depth)?;
             } else if is_directive(line, "ENDS") {
                 depth = depth.checked_sub(1).context("unmatched SIMPLIS .ENDS")?;
                 if depth == 0 {
@@ -1313,7 +1379,8 @@ fn extract_definitions_scoped(input: &str, owner_scope_id: Option<&str>) -> Resu
             nested_text.push_str(line);
             nested_text.push('\n');
         }
-        let nested = extract_definitions_scoped(&nested_text, Some(&scope_id))?;
+        let nested = extract_definitions_scoped(&nested_text, Some(&scope_id), budget)?;
+        budget.charge(Resource::GeneratedNodes, 1)?;
 
         let mut raw = String::new();
         for line in &lines[start..header_end] {
@@ -1363,8 +1430,8 @@ fn logical_statements(lines: &[String]) -> Vec<String> {
     statements
 }
 
-fn parse_overrides(input: &str) -> Result<Environment> {
-    let mut environment = Environment::new();
+fn parse_overrides(input: &str, budget: &WorkBudget) -> Result<Environment> {
+    let mut environment = Environment::with_budget(budget.clone());
     parse_parameter_list(input, &mut environment)?;
     Ok(environment)
 }
@@ -1581,6 +1648,10 @@ fn definition_needs_expansion(
     let mut pending = vec![definition.clone()];
     let mut visited = BTreeSet::new();
     while let Some(current) = pending.pop() {
+        external
+            .budget
+            .charge(Resource::ScannedBytes, current.bytes.len())?;
+        external.budget.charge(Resource::EvaluationSteps, 1)?;
         if !visited.insert((current.source_id.clone(), current.scope_id.clone())) {
             continue;
         }
@@ -1634,6 +1705,10 @@ fn rewrite_call(
     if !explicit_vars && !definition_needs_expansion(&definition, local, external)? {
         return Ok(None);
     }
+    external.budget.charge(Resource::GeneratedNodes, 1)?;
+    external
+        .budget
+        .charge(Resource::ScannedBytes, definition.bytes.len())?;
     *next_id = next_id.saturating_add(1);
     let generated_name = format!("{}${}", definition.name, *next_id);
     let compile_time_vars = explicit_vars || definition.parameterized;
@@ -1645,9 +1720,9 @@ fn rewrite_call(
             definition,
             generated_name,
             overrides: if compile_time_vars {
-                parse_overrides(override_text)?
+                parse_overrides(override_text, &external.budget)?
             } else {
-                Environment::new()
+                Environment::with_budget(external.budget.clone())
             },
             local_key,
         },
@@ -1831,6 +1906,7 @@ fn emit_pending(
     output: &mut String,
     state: &mut FlatExpansion,
 ) -> Result<()> {
+    let _depth = external.budget.enter()?;
     if is_microchip_complementary_pwm(pending) {
         emit_microchip_complementary_pwm(pending, output)?;
         state.generated_subcircuits = state.generated_subcircuits.saturating_add(1);
@@ -1852,7 +1928,7 @@ fn emit_pending(
     } else {
         specialize_subcircuit_control_flow_with_base(
             &pending.definition.bytes,
-            &Environment::new(),
+            &Environment::with_budget(external.budget.clone()),
             &pending.overrides,
         )
     }
@@ -1946,11 +2022,11 @@ pub fn preprocess_netlist(
     external: &SubcircuitCatalog,
 ) -> Result<PreprocessedNetlist> {
     let text = decode_simplis_text(input)?;
-    let mut extracted = extract_definitions(&text)?;
+    let mut extracted = extract_definitions_scoped(&text, None, &external.budget)?;
     let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
     let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
     assign_local_source(&mut extracted.definitions, &root_source_id, "<root>");
-    let mut local = SubcircuitCatalog::new();
+    let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
     let mut retained_local = Vec::new();
     let mut removed_local = 0usize;
     for definition in extracted.definitions {
@@ -1967,7 +2043,7 @@ pub fn preprocess_netlist(
         }
     }
 
-    let root_statements = preprocess_root_statements(&extracted.root_lines)?;
+    let root_statements = preprocess_root_statements(&extracted.root_lines, &external.budget)?;
     let mut output_root = Vec::new();
     let mut pending = Vec::new();
     let mut end_statement = None;
@@ -2124,6 +2200,10 @@ pub fn parse_init_target_path(name: &str) -> Result<Vec<String>> {
     } else {
         target
     };
+    anyhow::ensure!(
+        target.split('.').count() <= 64,
+        "SIMPLIS .INIT hierarchy depth exceeded"
+    );
     let path = target
         .split('.')
         .map(str::trim)
@@ -2175,7 +2255,11 @@ pub fn parse_init_statement(statement: &str) -> Result<Option<Vec<InitAssignment
         .map(Some)
 }
 
-fn merge_local_init(bytes: &[u8], inherited: InitTree) -> Result<(Vec<u8>, InitTree)> {
+fn merge_local_init(
+    bytes: &[u8],
+    inherited: InitTree,
+    budget: &WorkBudget,
+) -> Result<(Vec<u8>, InitTree)> {
     use std::fmt::Write as _;
     let text = std::str::from_utf8(bytes)?;
     let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
@@ -2184,6 +2268,7 @@ fn merge_local_init(bytes: &[u8], inherited: InitTree) -> Result<(Vec<u8>, InitT
     for statement in logical_statements(&lines) {
         if let Some(assignments) = parse_init_statement(&statement)? {
             for (path, value) in assignments {
+                budget.check_depth(path.len())?;
                 local.insert(&path, value)?;
             }
         } else {
@@ -2404,12 +2489,15 @@ fn definition_uses_preprocessor(definition: &Definition) -> bool {
         .any(is_preprocessor_control)
 }
 
-fn preprocess_root_statements(root_lines: &[String]) -> Result<Vec<String>> {
+fn preprocess_root_statements(root_lines: &[String], budget: &WorkBudget) -> Result<Vec<String>> {
     if !root_lines.iter().any(|line| is_preprocessor_control(line)) {
         return Ok(logical_statements(root_lines));
     }
-    let processed = preprocess_control_flow(root_lines.join("\n").as_bytes(), &Environment::new())
-        .context("preprocessing root SIMPLIS controls")?;
+    let processed = preprocess_control_flow(
+        root_lines.join("\n").as_bytes(),
+        &Environment::with_budget(budget.clone()),
+    )
+    .context("preprocessing root SIMPLIS controls")?;
     let text = std::str::from_utf8(&processed.bytes)?;
     let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
     Ok(logical_statements(&lines))
@@ -2441,10 +2529,14 @@ fn make_linked_unit(
     external: &SubcircuitCatalog,
 ) -> Result<LinkedUnit> {
     let overrides = if explicit_vars {
-        parse_overrides(override_text)?
+        parse_overrides(override_text, &external.budget)?
     } else {
-        Environment::new()
+        Environment::with_budget(external.budget.clone())
     };
+    external.budget.charge(Resource::GeneratedNodes, 1)?;
+    external
+        .budget
+        .charge(Resource::ScannedBytes, definition.bytes.len())?;
     let protected_pwm = definition.name.eq_ignore_ascii_case("Complemetary_PWM")
         && String::from_utf8_lossy(&definition.bytes)
             .contains("MICROCHIP COMPLEMENTARY_PWM Encryption");
@@ -2457,7 +2549,7 @@ fn make_linked_unit(
             definition,
             emitted_name,
             body: LinkedBody::Microchip(overrides),
-            environment: inherited.clone(),
+            environment: inherited.charged_clone()?,
             runtime: None,
             init,
         });
@@ -2479,9 +2571,12 @@ fn make_linked_unit(
         .with_context(|| format!("specializing SIMPLIS subcircuit {}", definition.name))?;
         (specialized.bytes, specialized.environment)
     } else {
-        (definition.bytes.clone(), inherited.clone())
+        (definition.bytes.clone(), inherited.charged_clone()?)
     };
-    let (bytes, init) = merge_local_init(&bytes, init)?;
+    external
+        .budget
+        .charge(Resource::EmittedBytes, bytes.len())?;
+    let (bytes, init) = merge_local_init(&bytes, init, &external.budget)?;
     let (bytes, runtime) = if let Some(parent) = parent_runtime {
         let actuals = if explicit_vars { "" } else { override_text };
         let (prepared, mut runtime) = RuntimeScope::prepare(&bytes, &definition.scope_id, actuals)
@@ -2539,7 +2634,7 @@ fn link_call(
     let inherits_lexically = caller.scope.is_some()
         && definition.owner_scope_id.as_deref() == caller.scope
         && definition.source_id.as_deref() == caller.source;
-    let empty = Environment::new();
+    let empty = Environment::with_budget(external.budget.clone());
     let inherited = if inherits_lexically {
         caller.environment
     } else {
@@ -2609,6 +2704,7 @@ fn emit_linked_unit(
     seen: &mut BTreeSet<(String, String)>,
     generated_subcircuits: &mut usize,
 ) -> Result<()> {
+    let _depth = external.budget.enter()?;
     let (source_id, source_name) = linked_source(unit)?;
     let source_id = source_id.to_owned();
     let source_name = source_name.to_owned();
@@ -2688,9 +2784,15 @@ fn emit_linked_unit(
         let builder = builders.entry(source_id.clone()).or_default();
         initialize_linked_builder(builder, &source_id, &source_name, external)?;
         builder.dependencies.extend(dependencies);
+        external
+            .budget
+            .charge(Resource::EmittedBytes, header.len().saturating_add(1))?;
         builder.output.push_str(&header);
         builder.output.push('\n');
         for statement in rewritten_body {
+            external
+                .budget
+                .charge(Resource::EmittedBytes, statement.len().saturating_add(1))?;
             builder.output.push_str(&statement);
             builder.output.push('\n');
         }
@@ -2863,11 +2965,12 @@ fn link_root_statements(
 ) -> Result<(String, Vec<LinkedUnit>, Option<String>)> {
     use std::fmt::Write as _;
 
-    let root_statements = preprocess_root_statements(root_lines)?;
+    let root_statements = preprocess_root_statements(root_lines, &external.budget)?;
     let mut root_init = InitTree::default();
     for statement in &root_statements {
         if let Some(assignments) = parse_init_statement(statement)? {
             for (path, value) in assignments {
+                external.budget.check_depth(path.len())?;
                 root_init.insert(&path, value)?;
             }
         }
@@ -2905,6 +3008,9 @@ fn link_root_statements(
             },
             child_init.clone(),
         )? {
+            external
+                .budget
+                .charge(Resource::EmittedBytes, rewritten.len().saturating_add(1))?;
             root_output.push_str(&rewritten);
             root_output.push('\n');
             root_units.push(unit);
@@ -2915,7 +3021,11 @@ fn link_root_statements(
                 })?,
                 None => statement,
             };
-            root_output.push_str(&annotate_unlinked_init(&statement, &child_init));
+            let annotated = annotate_unlinked_init(&statement, &child_init);
+            external
+                .budget
+                .charge(Resource::EmittedBytes, annotated.len().saturating_add(1))?;
+            root_output.push_str(&annotated);
             root_output.push('\n');
         }
     }
@@ -3019,12 +3129,12 @@ pub fn preprocess_netlist_linked(
     use std::fmt::Write as _;
 
     let text = decode_simplis_text(input)?;
-    let mut extracted = extract_definitions(&text)?;
+    let mut extracted = extract_definitions_scoped(&text, None, &external.budget)?;
     let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
     let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
     assign_local_source(&mut extracted.definitions, &root_source_id, "<root>");
 
-    let mut local = SubcircuitCatalog::new();
+    let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
     for definition in &extracted.definitions {
         insert_local_definition(&mut local, definition.clone())?;
     }
@@ -3075,9 +3185,15 @@ pub fn preprocess_netlist_linked(
     for (source_id, builder) in builders {
         let mut output = String::new();
         for statement in &builder.support_lines {
+            external
+                .budget
+                .charge(Resource::EmittedBytes, statement.len().saturating_add(1))?;
             output.push_str(statement);
             output.push('\n');
         }
+        external
+            .budget
+            .charge(Resource::EmittedBytes, builder.output.len())?;
         output.push_str(&builder.output);
         libraries.push(LinkedGeneratedLibrary {
             filename: linked_library_filename(&source_id),
@@ -3093,6 +3209,7 @@ pub fn preprocess_netlist_linked(
         .iter()
         .filter(|definition| definition.parameterized)
         .count();
+    external.budget.check()?;
     Ok(LinkedPreprocessedNetlist {
         root_bytes: root_output.into_bytes(),
         libraries,
@@ -4243,7 +4360,7 @@ RB 1 2 {V}
             assert_eq!(model, "MODEL");
             assert!(!vars);
             assert_eq!(
-                parse_overrides(actuals)?.get("R"),
+                parse_overrides(actuals, &WorkBudget::default())?.get("R"),
                 Some(&crate::Value::Number(2000.0))
             );
             let rewritten = replace_call_target(call, model, "generated", false)?;
