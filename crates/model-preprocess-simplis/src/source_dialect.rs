@@ -170,31 +170,83 @@ pub(super) fn active_prefix(line: &str, marker: char) -> &str {
     CommentState::default().prefix(line, marker)
 }
 
+/// A projected source statement with its admitted physical source span.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedStatement {
+    /// Joined active source text, or a retained comment.
+    pub text: String,
+    /// First one-based physical source line.
+    pub first_line: usize,
+    /// Last one-based physical source line, including continuations.
+    pub last_line: usize,
+}
+
+/// Embedded file and command blocks are opaque to electrical projection.
+pub(super) fn opaque_block_boundary(statement: &str) -> Option<bool> {
+    let first = statement.split_ascii_whitespace().next()?;
+    if first.eq_ignore_ascii_case(".file") || first.eq_ignore_ascii_case(".control") {
+        Some(true)
+    } else if first.eq_ignore_ascii_case(".endf") || first.eq_ignore_ascii_case(".endc") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Join physical continuation lines after stripping source-specific comments.
 /// Quoting and brace state persists across continuation boundaries.
-pub(super) fn logical_source(input: &str, context: DialectContext) -> Result<Vec<String>> {
-    let mut statements = Vec::<String>::new();
+pub(super) fn logical_source(
+    input: &str,
+    context: DialectContext,
+) -> Result<Vec<ProjectedStatement>> {
+    let mut statements = Vec::<ProjectedStatement>::new();
     let mut active = None;
     let mut state = CommentState::default();
+    let mut opaque = false;
     let marker = if context.language == SourceLanguage::Hspice {
         '$'
     } else {
         ';'
     };
-    for line in input.lines() {
+    for (index, line) in input.lines().enumerate() {
+        let line_number = index + 1;
+        let boundary = opaque_block_boundary(line);
+        if opaque || boundary.is_some() {
+            if let Some(start) = boundary {
+                opaque = start;
+            }
+            statements.push(ProjectedStatement {
+                text: line.to_owned(),
+                first_line: line_number,
+                last_line: line_number,
+            });
+            active = None;
+            continue;
+        }
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('*') {
-            statements.push(line.to_owned());
+            statements.push(ProjectedStatement {
+                text: line.to_owned(),
+                first_line: line_number,
+                last_line: line_number,
+            });
             continue;
         }
         if let Some(tail) = trimmed.strip_prefix('+') {
             let index: usize = active.context("orphan source continuation")?;
-            statements[index].push(' ');
-            statements[index].push_str(state.prefix(tail.trim_start(), marker));
+            statements[index].text.push(' ');
+            statements[index]
+                .text
+                .push_str(state.prefix(tail.trim_start(), marker));
+            statements[index].last_line = line_number;
         } else {
             state = CommentState::default();
             active = Some(statements.len());
-            statements.push(state.prefix(line, marker).to_owned());
+            statements.push(ProjectedStatement {
+                text: state.prefix(line, marker).to_owned(),
+                first_line: line_number,
+                last_line: line_number,
+            });
         }
     }
     Ok(statements)

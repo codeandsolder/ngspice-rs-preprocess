@@ -189,7 +189,7 @@ fn expanded_dialect_requires_no_unresolved_external_includes() -> Result<()> {
 fn simulator_projection_is_selected_before_loading_init_snapshots() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.net");
-    fs::write(&root, b".SIMULATOR SIMPLIS\n.include absent.init\nR1 a 0 1\n.SIMULATOR SIMETRIX\nR1 a 0 47\n.SIMULATOR DEFAULT\n.end\n")?;
+    fs::write(&root, b"* simulator selection\n.SIMULATOR SIMPLIS\n.include absent.init\nR1 a 0 1\n.SIMULATOR SIMETRIX\nR1 a 0 47\n.SIMULATOR DEFAULT\n.end\n")?;
     let prepared = prepare_default(&request(InputFormat::SimetrixDeck, &root))?;
     assert!(std::str::from_utf8(&prepared.primary.bytes)?.contains("R1 a 0 47"));
     assert!(prepare_default(&request(InputFormat::SimplisDeck, &root)).is_err());

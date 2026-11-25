@@ -853,12 +853,70 @@ pub fn project_simetrix_source(
     inherited: crate::source_dialect::DialectContext,
     kind: crate::source_dialect::SourceKind,
 ) -> Result<(crate::source_dialect::DialectContext, String)> {
-    use crate::source_dialect::{DialectContext, logical_source};
-    let decoded = decode_simplis_text(input)?;
-    let context = DialectContext::resolve(&decoded, inherited, kind);
-    let stripped = logical_source(&decoded, context)?.join("\n");
-    let selected = select_library_view(&stripped, LibrarySimulator::Simetrix)?;
-    Ok((context, selected))
+    let (context, statements) =
+        project_resource(input, inherited, kind, LibrarySimulator::Simetrix)?;
+    Ok((context, render_projection(&statements)))
+}
+
+/// Render mapped statements without altering their logical boundaries.
+#[must_use = "the result is the selected source text"]
+pub fn render_projection(statements: &[crate::source_dialect::ProjectedStatement]) -> String {
+    let mut output = String::new();
+    for statement in statements {
+        output.push_str(&statement.text);
+        output.push('\n');
+    }
+    output
+}
+
+/// Project a resource with exact admitted physical source spans. Only a
+/// complete SIMetrix deck has a mandatory first-line title. Included files
+/// and SIMPLIS source streams retain their first electrical statement.
+/// # Errors
+/// Invalid source encoding, continuation, simulator view or source nesting.
+pub fn project_resource(
+    input: &[u8],
+    inherited: crate::source_dialect::DialectContext,
+    kind: crate::source_dialect::SourceKind,
+    simulator: LibrarySimulator,
+) -> Result<(
+    crate::source_dialect::DialectContext,
+    Vec<crate::source_dialect::ProjectedStatement>,
+)> {
+    use crate::source_dialect::{DialectContext, SourceKind, logical_source};
+    let decoded = if kind == SourceKind::Deck && simulator == LibrarySimulator::Simetrix {
+        // A title is data, even when it looks like a directive or a device.
+        let mut protected = Vec::with_capacity(input.len().saturating_add(2));
+        let first = input
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii_start();
+        if !first.starts_with(b"*") || first.starts_with(b"*#") {
+            protected.extend_from_slice(b"* ");
+        }
+        protected.extend_from_slice(input);
+        decode_simplis_text(&protected)?
+    } else {
+        decode_simplis_text(input)?
+    };
+    let context = if simulator == LibrarySimulator::Simetrix {
+        DialectContext::resolve(&decoded, inherited, kind)
+    } else {
+        inherited
+    };
+    let statements = logical_source(&decoded, context)?;
+    let selected =
+        selected_library_lines(statements.iter().map(|line| line.text.as_str()), simulator)?;
+    let selected = selected.into_iter().collect::<BTreeSet<_>>();
+    Ok((
+        context,
+        statements
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, line)| selected.contains(&i).then_some(line))
+            .collect(),
+    ))
 }
 
 /// Lower expressions only after simulator and named-section selection.
@@ -870,11 +928,20 @@ pub fn lower_simetrix_source_view(
     context: crate::source_dialect::DialectContext,
     limit: usize,
 ) -> Result<String> {
-    use crate::source_dialect::lower_statement;
+    use crate::source_dialect::{lower_statement, opaque_block_boundary};
     use std::fmt::Write as _;
     let mut output = String::new();
+    let mut opaque = false;
     for statement in selected.lines() {
-        let lowered = lower_statement(statement, context, limit.saturating_sub(output.len()))?;
+        let boundary = opaque_block_boundary(statement);
+        let lowered = if opaque || boundary.is_some() {
+            statement.to_owned()
+        } else {
+            lower_statement(statement, context, limit.saturating_sub(output.len()))?
+        };
+        if let Some(start) = boundary {
+            opaque = start;
+        }
         anyhow::ensure!(
             lowered.len().saturating_add(1) <= limit.saturating_sub(output.len()),
             "source dialect output byte budget exceeded"
@@ -885,11 +952,36 @@ pub fn lower_simetrix_source_view(
 }
 
 fn select_library_view(input: &str, simulator: LibrarySimulator) -> Result<String> {
-    let target = simulator.as_str().to_ascii_uppercase();
+    let selected = selected_library_lines(input.lines(), simulator)?;
+    let lines = input.lines().collect::<Vec<_>>();
     let mut output = String::new();
+    for index in selected {
+        output.push_str(lines[index]);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn selected_library_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    simulator: LibrarySimulator,
+) -> Result<Vec<usize>> {
+    let target = simulator.as_str().to_ascii_uppercase();
+    let mut output = Vec::new();
     let mut enabled = true;
     let mut subcircuit_depth = 0usize;
-    for (line_index, line) in input.lines().enumerate() {
+    let mut opaque = false;
+    for (line_index, line) in lines.enumerate() {
+        let boundary = crate::source_dialect::opaque_block_boundary(line);
+        if opaque || boundary.is_some() {
+            if let Some(start) = boundary {
+                opaque = start;
+            }
+            if enabled {
+                output.push(line_index);
+            }
+            continue;
+        }
         if is_directive(line, "SIMULATOR") {
             if subcircuit_depth != 0 {
                 bail!(
@@ -925,8 +1017,7 @@ fn select_library_view(input: &str, simulator: LibrarySimulator) -> Result<Strin
             subcircuit_depth -= 1;
         }
         if enabled {
-            output.push_str(line);
-            output.push('\n');
+            output.push(line_index);
         }
     }
     if subcircuit_depth != 0 {
