@@ -14,7 +14,7 @@ use model_preprocess_simplis::{
     lower_spice_expression,
     source_dialect::{
         DialectContext, ScopedStatement, SourceLanguage,
-        model_mapping::{MappingTable, ModelSelection},
+        model_mapping::{Device, MappingTable, ModelSelection},
     },
 };
 use std::{collections::BTreeSet, fmt::Write as _};
@@ -78,6 +78,19 @@ pub fn lower(
     );
     let selection = MappingTable::select_standalone_hspice(statement, scope)?;
     let mut selected = selection.clone();
+    if selected.mapping.device == Device::Bsim4 {
+        super::mos::qualify_model(&mut selected)?;
+        let native = selected.lower()?;
+        let card = parse_model_card(&native, statement.first_line, &[])?;
+        let text = render(&card, &card.name, |value| {
+            lower_spice_expression(value, statement.context, limit)
+        })?;
+        ensure!(
+            text.len() <= limit,
+            "HSPICE model expansion byte budget exceeded"
+        );
+        return Ok((text, selection));
+    }
     let mut seen = BTreeSet::new();
     for parameter in &mut selected.card.parameters {
         parameter.name = canonical(&parameter.name)?.to_owned();
@@ -140,6 +153,10 @@ pub fn resolve_breakdown(bytes: &[u8], kind: RootKind, limit: usize) -> Result<V
             continue;
         }
         let mut card = parse_model_card(line, index + 1, &[])?;
+        if !card.family.eq_ignore_ascii_case("D") {
+            writeln!(output, "{line}")?;
+            continue;
+        }
         if let Some(position) = card
             .parameters
             .iter()

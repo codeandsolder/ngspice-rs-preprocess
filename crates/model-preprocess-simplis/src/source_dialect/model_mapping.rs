@@ -536,12 +536,22 @@ impl MappingTable {
         let mut selection = table
             .select_card(line, scope)?
             .context("HSPICE model has no qualified native mapping")?;
+        let diode = selection.mapping.device == Device::Diode3
+            && selection.mapping.key.model_type == "D"
+            && selection.mapping.key.level <= 1
+            && selection.declared_version.is_none();
+        let bsim4 = selection.mapping.device == Device::Bsim4
+            && selection.mapping.key.level == 54
+            && matches!(
+                selection
+                    .declared_version
+                    .as_deref()
+                    .map(|v| v.trim_matches(['\'', '"'])),
+                Some("4.5" | "4.50" | "4.5.0" | "4.64" | "4.6.4" | "4.7" | "4.70" | "4.7.0")
+            );
         ensure!(
-            selection.mapping.device == Device::Diode3
-                && selection.mapping.key.model_type == "D"
-                && selection.mapping.key.level <= 1
-                && selection.declared_version.is_none(),
-            "HSPICE model {} has no qualified native mapping",
+            diode || bsim4,
+            "HSPICE model {} has no qualified native mapping (BSIM4 requires an exact supported VERSION)",
             selection.card.name
         );
         selection.mapping.origin = SelectionOrigin::StandaloneHspice;

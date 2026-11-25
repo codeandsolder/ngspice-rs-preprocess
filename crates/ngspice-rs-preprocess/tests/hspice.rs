@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use ngspice_rs_preprocess::{
-    Cancellation, InputFormat, Options, PreparedBundle, Provenance, Request, SourceInput, prepare,
+    Cancellation, InputFormat, LibraryInput, LibrarySimulator, Options, ParsedLibrary,
+    PreparedBundle, Provenance, Request, SourceInput, prepare,
 };
 use std::{fs, path::Path, process::Command};
 
@@ -99,18 +100,59 @@ fn linked_hspice_resource_spans_and_language_overrides() -> Result<()> {
 }
 
 #[test]
-fn standalone_library_keeps_first_statement_without_deck_defaults() -> Result<()> {
+fn standalone_library_keeps_neutral_source_and_binds_in_consuming_deck() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let root = dir.path().join("lib.sp");
+    let lib = dir.path().join("lib.sp");
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("child.sp");
+    fs::write(
+        &lib,
+        ".param gain='LOG(100)'\n.inc child.sp\n.subckt test in out scale=1\nE1 out 0 VCVS in 0 'gain*scale'\n.ends test\n",
+    )?;
+    fs::write(&child, "*#PSPICE\n.param other={PWR(-2,2)}\n")?;
     fs::write(
         &root,
-        ".param gain='LOG(100)'\n.subckt test in out\nE1 out 0 VCVS in 0 2\n.ends test\n",
+        "Catalog consumption\n.option parhier=local\nV1 in 0 1\nX1 in out test scale=2\nR1 out 0 1k\n.end\n",
     )?;
-    let bundle = compile(&root, InputFormat::HspiceLibrary)?;
-    let text = std::str::from_utf8(&bundle.primary.bytes)?;
-    assert!(text.starts_with(".param gain={ln(100)}\n"), "{text}");
-    assert!(!text.contains("VCVS"), "{text}");
-    assert!(!text.contains("TNOM") && !text.contains(".temp"), "{text}");
+    let bundle = compile(&lib, InputFormat::HspiceLibrary)?;
+    let parsed = ParsedLibrary::from_json(&bundle.primary.bytes)?;
+    assert_eq!(parsed.simulator(), LibrarySimulator::Hspice);
+    assert_eq!(parsed.definitions(), 1);
+    assert_eq!(parsed.scoped_statements()[0].text, ".param gain='LOG(100)'");
+    let raw_request = Request {
+        format: InputFormat::HspiceDeck,
+        input: SourceInput::File(root.clone()),
+        libraries: vec![LibraryInput::Source(SourceInput::File(lib.clone()))],
+        search_paths: Vec::new(),
+    };
+    let raw = prepare(&raw_request, &Options::default(), &Cancellation::default())?;
+    fs::remove_file(lib)?;
+    fs::remove_file(child)?;
+    let cached_request = Request {
+        libraries: vec![LibraryInput::Parsed(parsed)],
+        ..raw_request
+    };
+    let cached = prepare(
+        &cached_request,
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    assert_eq!(raw.primary.bytes, cached.primary.bytes);
+    let text = std::str::from_utf8(&cached.primary.bytes)?;
+    measure_native(dir.path(), text, "op\nwrdata op.dat v(out)")?;
+    let actual = values(dir.path(), "op.dat")?[0][1];
+    ensure!(
+        (actual - 2. * 100_f64.ln()).abs() < 1e-10,
+        "{actual} {text}"
+    );
+    let Provenance::Native { lines } = &cached.primary.provenance else {
+        anyhow::bail!("missing native spans");
+    };
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.source.ends_with("child.sp") && line.line == 2)
+    );
     Ok(())
 }
 
@@ -150,6 +192,11 @@ fn numeric_deck(path: &Path, source: &str, script: &str) -> Result<String> {
     fs::write(&root, source)?;
     let bundle = compile(&root, InputFormat::HspiceDeck)?;
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    measure_native(path, text, script)?;
+    Ok(text.to_owned())
+}
+
+fn measure_native(path: &Path, text: &str, script: &str) -> Result<()> {
     let deck = text.strip_suffix(".end\n").context("missing terminator")?;
     fs::write(
         path.join("run.cir"),
@@ -168,7 +215,7 @@ fn numeric_deck(path: &Path, source: &str, script: &str) -> Result<String> {
         result.status.success() && !log.to_ascii_lowercase().contains("error:"),
         "{log}\n{text}"
     );
-    Ok(text.to_owned())
+    Ok(())
 }
 
 fn values(path: &Path, file: &str) -> Result<Vec<Vec<f64>>> {
@@ -411,5 +458,171 @@ D1 p n dm
     let row = &values(dir.path(), "op.dat")?[0];
     ensure!(row[1].abs() < 1e-9, "{row:?}\n{text}");
     ensure!((row[2] - 100e-6).abs() < 2e-7, "{row:?}\n{text}");
+    Ok(())
+}
+
+#[test]
+fn bsim4_occurrence_bins_match_independent_native_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let reference = tempfile::tempdir()?;
+    // HSPICE MOS reference J-2014.09, chapter 1: half-open geometry,
+    // first matching declaration, per-finger W by default, lexical fallback.
+    let source = r#"MOS bins
+.option parhier=local
+.param edge=1u
+Vg g 0 dc 1 ac 1
+Va a 0 0.8
+Vb b 0 0.8
+Vc c 0 0.8
+Vd d 0 0.8
+Ve e 0 0.8
+Vf f 0 0.8
+X1 a g cell ww=2u ll=edge
+X2 b g cell ww=2u ll=0.9u
+X3 c g cell ww=6u ll=edge
+M4 d g 0 0 n W=2u L=edge NF=2 WNFLAG=0
+M5 e g 0 0 n.early L=0.9u W=2u NF=2
+M6 f g 0 0 n L=0.9u W=2u NF=2
+.subckt cell d g ww=1u ll=1u
+.model n.local NMOS LEVEL=54 VERSION=4.7 VTH0=0.6 LMIN=0.5u LMAX=1u WMIN=0.5u WMAX=2u
+M1 d g 0 0 n L=ll W=ww NF=2
+.ends cell
+.model n.early NMOS LEVEL=54 VERSION=4.7.0 VTH0=0.35 LMIN=0.5u LMAX=edge WMIN=0.5u WMAX=2u
+.model n.next NMOS LEVEL=54 VERSION=4.7.0 VTH0=0.45 LMIN=edge LMAX=2u WMIN=0.5u WMAX=2u
+.model n.wide NMOS LEVEL=54 VERSION=4.7.0 VTH0=0.55 LMIN=0.5u LMAX=2u WMIN=2u WMAX=4u
+.model n.overlap NMOS LEVEL=54 VERSION=4.7.0 VTH0=0.8 LMIN=0.5u LMAX=2u WMIN=0.5u WMAX=4u
+.end
+"#;
+    let script = "dc Vg 0.5 1.5 0.1\nwrdata dc.dat i(va) i(vb) i(vc) i(vd) i(ve) i(vf)\nop\nac lin 2 1k 1meg\nwrdata ac.dat i(va) i(vb) i(vc) i(vd) i(ve) i(vf)";
+    let text = numeric_deck(dir.path(), source, script)?;
+    let expected = r#"Explicit model selection
+.options TNOM=25
+.temp 25
+Vg g 0 dc 1 ac 1
+Va a 0 0.8
+Vb b 0 0.8
+Vc c 0 0.8
+Vd d 0 0.8
+Ve e 0 0.8
+Vf f 0 0.8
+Ma a g 0 0 next W=2u L=1u NF=2
+Mb b g 0 0 local W=2u L=0.9u NF=2
+Mc c g 0 0 wide W=6u L=1u NF=2
+Md d g 0 0 wide W=2u L=1u NF=2
+Me e g 0 0 early W=2u L=0.9u NF=2
+Mf f g 0 0 early W=2u L=0.9u NF=2
+.model local NMOS LEVEL=14 VERSION=4.70 VTH0=0.6
+.model early NMOS LEVEL=14 VERSION=4.70 VTH0=0.35
+.model next NMOS LEVEL=14 VERSION=4.70 VTH0=0.45
+.model wide NMOS LEVEL=14 VERSION=4.70 VTH0=0.55
+.end
+"#;
+    measure_native(reference.path(), expected, script)?;
+    for file in ["dc.dat", "ac.dat"] {
+        let actual = values(dir.path(), file)?;
+        let reference = values(reference.path(), file)?;
+        assert_eq!(actual.len(), reference.len());
+        for (actual, expected) in actual.iter().zip(reference) {
+            assert_eq!(actual.len(), expected.len());
+            for (&a, e) in actual.iter().zip(expected) {
+                ensure!(
+                    (a - e).abs() <= e.abs() * 1e-7 + 1e-13,
+                    "{file}: {a:e} != {e:e}\n{text}"
+                );
+            }
+        }
+    }
+    assert!(!text.contains("LMIN") && !text.contains("WMIN"), "{text}");
+    Ok(())
+}
+
+#[test]
+fn bsim4_reference_offsets_and_global_finger_option() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let text = numeric_deck(
+        dir.path(),
+        r#"MOS offset bins
+.option WNFLAG=0 DEFL=0.9u DEFW=2u
+Vg g 0 1
+Vd d 0 0.8
+M1 d g 0 0 n NF=2
+.model n.low NMOS LEVEL=54 VERSION=4.64 VTH0=0.25 LMIN=0.5u LMAX=1u WMIN=1u WMAX=3u XL=0.1u XLREF=0
+.model n.high NMOS LEVEL=54 VERSION=4.64 VTH0=0.6 LMIN=1u LMAX=2u WMIN=1u WMAX=3u XL=0.1u XLREF=0
+.end
+"#,
+        "op\nwrdata op.dat i(vd)",
+    )?;
+    let expected = tempfile::tempdir()?;
+    measure_native(
+        expected.path(),
+        r#"Selected upper bin
+.options TNOM=25
+.temp 25
+Vg g 0 1
+Vd d 0 0.8
+M1 d g 0 0 selected L=0.9u W=2u NF=2
+.model selected NMOS LEVEL=14 VERSION=4.64 VTH0=0.6 XL=0.1u
+.end
+"#,
+        "op\nwrdata op.dat i(vd)",
+    )?;
+    let a = values(dir.path(), "op.dat")?[0][1];
+    let e = values(expected.path(), "op.dat")?[0][1];
+    ensure!(
+        (a - e).abs() <= e.abs() * 1e-7 + 1e-13,
+        "{a:e} != {e:e}\n{text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bsim4_unqualified_versions_parameters_and_bin_gaps_reject() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("mos.sp");
+    for (model, instance, expected) in [
+        ("LEVEL=54", "L=1u W=2u", "exact supported VERSION"),
+        (
+            "LEVEL=54 VERSION=4.6.3",
+            "L=1u W=2u",
+            "exact supported VERSION",
+        ),
+        (
+            "LEVEL=54 VERSION=4.7 ACM=2",
+            "L=1u W=2u",
+            "distinct junction kernel",
+        ),
+        (
+            "LEVEL=54 VERSION=4.7 HSPICEONLY=1",
+            "L=1u W=2u",
+            "unqualified HSPICE BSIM4 model parameter",
+        ),
+        (
+            "LEVEL=54 VERSION=4.7 LMIN=1u LMAX=2u WMIN=1u WMAX=3u",
+            "L=2u W=2u",
+            "no HSPICE MOS bin",
+        ),
+        (
+            "LEVEL=54 VERSION=4.7 LMIN=1u LMAX=2u WMIN=1u WMAX=3u",
+            "L=1u W=2u WNFLAG=2",
+            "invalid HSPICE WNFLAG",
+        ),
+        (
+            "LEVEL=54 VERSION=4.7 LMIN=1u LMAX=2u WMIN=1u WMAX=3u",
+            "L=1u W=2u HSPICEONLY=3",
+            "unqualified HSPICE BSIM4 instance parameter",
+        ),
+    ] {
+        fs::write(
+            &root,
+            format!(
+                "MOS rejection\nV1 d 0 1\nM1 d d 0 0 n {instance}\n.model n.1 NMOS ({model})\n.end\n"
+            ),
+        )?;
+        let error = compile(&root, InputFormat::HspiceDeck).expect_err("unqualified MOS semantics");
+        ensure!(
+            format!("{error:#}").contains(expected),
+            "{model} {instance}: {error:#}"
+        );
+    }
     Ok(())
 }

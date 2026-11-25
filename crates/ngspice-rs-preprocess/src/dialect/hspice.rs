@@ -3,7 +3,7 @@
 //! compatibility flag is set by this producer.
 use super::{SourceExpansion, analysis_plan};
 use crate::{
-    AdmittedSource, InputFormat, Options, PreparedBundle, Request, SourceSession, native_bundle,
+    AdmittedSource, Cancellation, Options, PreparedBundle, Request, SourceSession, native_bundle,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
@@ -16,10 +16,12 @@ use model_preprocess_simplis::{
 use std::fmt::Write as _;
 
 mod analysis;
+mod bsim4_catalog;
 mod hierarchy;
 mod models;
+mod mos;
 
-const HSPICE: DialectContext = DialectContext {
+pub(super) const HSPICE: DialectContext = DialectContext {
     language: SourceLanguage::Hspice,
     separator: None,
 };
@@ -30,7 +32,7 @@ struct DeckOptions {
     temperature: bool,
     depth: usize,
     parhier: Option<hierarchy::Precedence>,
-    deck: bool,
+    mos: mos::Options,
 }
 
 fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
@@ -63,6 +65,17 @@ fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
                 continue;
             }
             "DCAP" => continue,
+            "WNFLAG" | "WL" | "DEFL" | "DEFW" | "DEFAD" | "DEFAS" | "DEFNRD" | "DEFNRS"
+            | "DEFPD" | "DEFPS" => {
+                state.mos.set(
+                    &key,
+                    field
+                        .expression
+                        .or_else(|| (key == "WL").then(|| "1".to_owned()))
+                        .context("missing MOS option value")?,
+                )?;
+                continue;
+            }
             "TNOM" => state.nominal_temperature = true,
             "TEMP" => state.temperature = true,
             "ABSTOL" | "VNTOL" | "RELTOL" | "GMIN" | "ITL1" | "ITL2" | "ITL4" | "CHGTOL" => (),
@@ -174,6 +187,7 @@ fn map_values(
         _ if command.starts_with('.') => return Ok(text.to_owned()),
         _ => match command.as_bytes().first() {
             Some(b'X') => assignment_start(),
+            Some(b'M') => start(6),
             Some(b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => start(3),
             Some(b'E'..=b'H')
                 if ["VALUE", "VOL", "CUR", "TABLE", "POLY", "LAPLACE"]
@@ -209,21 +223,13 @@ fn lower_card(
     let command = analysis_plan::command(text);
     let hspice = context.language == SourceLanguage::Hspice;
     let fields = statement_token_spans(text)?;
-    let assignment = fields.iter().any(|field| &text[field.clone()] == "=");
-    // An independently emitted include cannot resolve dynamic caller
-    // precedence. A complete deck binds these declarations after linking.
     if command == ".SUBCKT" {
-        ensure!(
-            state.deck || !assignment,
-            "HSPICE library formals require a consuming deck for hierarchy lowering"
-        );
         state.depth += 1;
     } else if command == ".ENDS" {
         state.depth = state.depth.checked_sub(1).context("unmatched .ENDS")?;
     }
     if state.depth > 0
         && (matches!(command.as_str(), ".FUNC" | ".OPTION" | ".OPTIONS" | ".OPT")
-            || (!state.deck && command == ".PARAM")
             || matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN" | ".TEMP"))
     {
         bail!("HSPICE scoped parameters/options require hierarchy lowering");
@@ -233,7 +239,18 @@ fn lower_card(
         ensure!(
             matches!(
                 kind,
-                b'R' | b'C' | b'L' | b'V' | b'I' | b'E' | b'G' | b'F' | b'H' | b'B' | b'X' | b'D'
+                b'R' | b'C'
+                    | b'L'
+                    | b'V'
+                    | b'I'
+                    | b'E'
+                    | b'G'
+                    | b'F'
+                    | b'H'
+                    | b'B'
+                    | b'X'
+                    | b'D'
+                    | b'M'
             ),
             "HSPICE device {command} requires qualified model/device lowering"
         );
@@ -247,12 +264,6 @@ fn lower_card(
                     "geometric or thermal HSPICE diode instance is not qualified"
                 );
             }
-        }
-        if kind == b'X' {
-            ensure!(
-                state.deck || !assignment,
-                "HSPICE library actuals/multipliers require a consuming deck for hierarchy lowering"
-            );
         }
     }
     let mut source = match command.as_str() {
@@ -275,10 +286,6 @@ fn lower_card(
         lower_spice_expression(value, context, remaining)
     })?;
     if matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN") {
-        ensure!(
-            state.deck,
-            "analysis directive in standalone HSPICE library"
-        );
         source = analysis::lower(&source)?;
     }
     Ok(source)
@@ -327,20 +334,16 @@ type LoweredExpansion = (
 fn lower_expansion(
     statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
     input_origins: Vec<crate::OriginLine>,
-    deck: bool,
     limit: usize,
 ) -> Result<LoweredExpansion> {
-    let dcap = depletion_mode(&statements[usize::from(deck)..])?;
+    let dcap = depletion_mode(statements.get(1..).context("missing HSPICE deck title")?)?;
     let mut selections = Vec::new();
     let mut scope = Vec::new();
     let mut bytes = Vec::new();
     let mut origins = Vec::new();
-    let mut state = DeckOptions {
-        deck,
-        ..DeckOptions::default()
-    };
+    let mut state = DeckOptions::default();
     for (index, (statement, origin)) in statements.iter().zip(input_origins).enumerate() {
-        let text = if deck && index == 0 {
+        let text = if index == 0 {
             // Native ngspice may expand resource directives before discarding
             // the title. Protect the title without changing its source span.
             if statement.text.trim_start().starts_with('.') {
@@ -394,40 +397,72 @@ fn lower_expansion(
     Ok((bytes, origins, selections, state))
 }
 
+fn add_catalog(
+    statements: &mut Vec<model_preprocess_simplis::source_dialect::ScopedStatement>,
+    origins: &mut Vec<crate::OriginLine>,
+    members: Vec<(crate::ParsedLibrary, String)>,
+    limit: usize,
+) -> Result<()> {
+    let mut linked = Vec::new();
+    let mut linked_origins = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut size = statements
+        .iter()
+        .map(|statement| statement.text.len().saturating_add(1))
+        .sum::<usize>();
+    for (member, _) in members {
+        if !seen.insert(member.source_id().to_owned()) {
+            continue;
+        }
+        for statement in member.scoped_statements() {
+            size = size.saturating_add(statement.text.len()).saturating_add(1);
+            ensure!(
+                size <= limit,
+                "HSPICE catalog expansion byte budget exceeded"
+            );
+            linked_origins.push(crate::OriginLine {
+                source: std::path::PathBuf::from(&statement.source),
+                line: statement.first_line,
+                last_line: statement.last_line,
+            });
+            linked.push(statement.clone());
+        }
+    }
+    // Catalog support declarations precede root declarations. Explicit root
+    // parameter declarations therefore retain last-definition precedence.
+    ensure!(
+        !statements.is_empty() && !origins.is_empty(),
+        "missing HSPICE deck title"
+    );
+    statements.splice(1..1, linked);
+    origins.splice(1..1, linked_origins);
+    Ok(())
+}
+
 pub(super) fn prepare(
     root: &AdmittedSource,
     request: &Request,
     options: &Options,
+    cancellation: &Cancellation,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let deck = request.format == InputFormat::HspiceDeck;
-    let kind = if deck {
-        RootKind::Deck
-    } else {
-        RootKind::Include
-    };
     let mut expansion = SourceExpansion::new(session, request, options);
-    expansion.expand(
-        root,
-        HSPICE,
-        if deck {
-            SourceKind::Deck
-        } else {
-            SourceKind::Include
-        },
-        None,
-    )?;
-    let (mut bytes, mut origins, selections, state) = lower_expansion(
-        &expansion.statements,
-        expansion.origins,
-        deck,
-        options.output_bytes,
-    )?;
-    if deck {
+    let context = expansion.expand(root, HSPICE, SourceKind::Deck, None)?;
+    let SourceExpansion {
+        mut statements,
+        mut origins,
+        ..
+    } = expansion;
+    let members = super::catalog_members(request, options, cancellation, session, context)?;
+    add_catalog(&mut statements, &mut origins, members, options.output_bytes)?;
+    let (mut bytes, mut origins, selections, state) =
+        lower_expansion(&statements, origins, options.output_bytes)?;
+    {
         (bytes, origins) = hierarchy::bind(
             &bytes,
             &origins,
             state.parhier.unwrap_or_default(),
+            &state.mos,
             options.output_bytes,
         )?;
 
@@ -458,8 +493,14 @@ pub(super) fn prepare(
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
     }
-    bytes = models::resolve_breakdown(&bytes, kind, options.output_bytes)?;
-    let mut bundle = native_bundle(root.path.clone(), request.format, kind, &bytes, &origins)?;
+    bytes = models::resolve_breakdown(&bytes, RootKind::Deck, options.output_bytes)?;
+    let mut bundle = native_bundle(
+        root.path.clone(),
+        request.format,
+        RootKind::Deck,
+        &bytes,
+        &origins,
+    )?;
     bundle.model_selections = selections;
     Ok(bundle)
 }

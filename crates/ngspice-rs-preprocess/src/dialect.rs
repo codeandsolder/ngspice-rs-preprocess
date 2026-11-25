@@ -19,7 +19,8 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_scoped_statements, parse_library_for_simulator, parse_scoped_library,
-    preprocess_netlist_linked, project_resource, project_spice_resource, source_include_target,
+    parse_standalone_library, preprocess_netlist_linked, project_resource, project_spice_resource,
+    source_include_target,
 };
 use model_translate_simplis::{
     capture_artifact_initial_conditions, capture_artifact_waveforms, capture_linked_waveforms,
@@ -34,7 +35,9 @@ use std::{
 mod hspice;
 
 const fn projection(format: InputFormat) -> LibrarySimulator {
-    if matches!(
+    if format.is_hspice() {
+        LibrarySimulator::Hspice
+    } else if matches!(
         format,
         InputFormat::SimetrixDeck | InputFormat::SimetrixLibrary
     ) {
@@ -88,8 +91,12 @@ fn parse_root(
     options: &Options,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let parsed =
-        parse_admitted_library(root, request, options, session, DialectContext::default())?;
+    let inherited = if request.format.is_hspice() {
+        hspice::HSPICE
+    } else {
+        DialectContext::default()
+    };
+    let parsed = parse_admitted_library(root, request, options, session, inherited)?;
     let artifact = generated(
         "library.json".to_owned(),
         parsed.to_json()?,
@@ -410,11 +417,14 @@ fn parse_admitted_library(
     inherited: DialectContext,
 ) -> Result<ParsedLibrary> {
     let origin = display_path(&source.path);
-    if projection(request.format) != LibrarySimulator::Simetrix {
+    if projection(request.format) == LibrarySimulator::Simplis {
         return parse_library_for_simulator(origin, &source.bytes, projection(request.format));
     }
     let mut expansion = SourceExpansion::new(session, request, options);
     let dialect = expansion.expand(source, inherited, SourceKind::Include, None)?;
+    if request.format.is_hspice() {
+        return parse_standalone_library(origin, expansion.sources, dialect, expansion.statements);
+    }
     parse_scoped_library(
         origin,
         expansion.sources,
@@ -834,16 +844,14 @@ pub fn prepare(
         "dialect source contains a NUL byte"
     );
     match request.format {
-        InputFormat::SimplisLibrary | InputFormat::SimetrixLibrary => {
+        InputFormat::SimplisLibrary | InputFormat::SimetrixLibrary | InputFormat::HspiceLibrary => {
             parse_root(root, request, options, session)
         }
         InputFormat::ExpandedDeck | InputFormat::ExpandedLibrary => expanded(root, request.format),
         InputFormat::SimplisDeck | InputFormat::SimetrixDeck => {
             linked(root, request, options, cancellation, session)
         }
-        InputFormat::HspiceDeck | InputFormat::HspiceLibrary => {
-            hspice::prepare(root, request, options, session)
-        }
+        InputFormat::HspiceDeck => hspice::prepare(root, request, options, cancellation, session),
         InputFormat::NativeDeck | InputFormat::NativeLibrary => {
             bail!("native input is not a dialect translation request")
         }

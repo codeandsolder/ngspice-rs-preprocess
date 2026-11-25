@@ -1,7 +1,7 @@
 //! Explicit HSPICE occurrence bindings. Symbolic aliases avoid evaluating
 //! parameters at preparation time, so native analysis still owns expressions.
 //! Electrical instance names and terminal identities are never flattened.
-use super::{analysis_plan, map_values, models};
+use super::{analysis_plan, map_values, models, mos};
 use crate::OriginLine;
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
@@ -167,7 +167,10 @@ fn multiplier_card(text: &str, factor: Option<&str>) -> Result<String> {
         return Ok(text.to_owned());
     }
     ensure!(
-        matches!(device, b'R' | b'C' | b'L' | b'I' | b'G' | b'F' | b'D') || current_behavioral,
+        matches!(
+            device,
+            b'R' | b'C' | b'L' | b'I' | b'G' | b'F' | b'D' | b'M'
+        ) || current_behavioral,
         "unqualified multiplier on HSPICE device {command}"
     );
     let mut explicit = None;
@@ -196,6 +199,33 @@ fn multiplier_card(text: &str, factor: Option<&str>) -> Result<String> {
     Ok(out)
 }
 
+#[derive(Default)]
+struct ModelFrame {
+    exact: Names,
+    bins: BTreeMap<String, Vec<String>>,
+}
+
+impl ModelFrame {
+    fn insert(&mut self, name: String, alias: String, mos: bool) -> Result<()> {
+        ensure!(
+            !self.exact.contains_key(&name),
+            "duplicate HSPICE model {name}"
+        );
+        if mos && let Some((base, extension)) = name.split_once('.') {
+            ensure!(
+                !base.is_empty() && !extension.is_empty(),
+                "invalid HSPICE bin name {name}"
+            );
+            self.bins
+                .entry(base.to_owned())
+                .or_default()
+                .push(alias.clone());
+        }
+        self.exact.insert(name, alias);
+        Ok(())
+    }
+}
+
 struct Binder<'a> {
     source: &'a ModelLibrary,
     index: SubcircuitIndex,
@@ -205,7 +235,8 @@ struct Binder<'a> {
     prefix: String,
     serial: usize,
     active: Vec<usize>,
-    model_frames: Vec<(usize, Names)>,
+    model_frames: Vec<(usize, ModelFrame)>,
+    pending_mos: BTreeMap<String, mos::Pending>,
     parameters: Rows,
     emitted_definitions: Rows,
     emitted_bytes: usize,
@@ -258,24 +289,19 @@ impl Binder<'_> {
     }
 
     fn enter_models(&mut self, scope: usize, names: &Names) -> Result<()> {
-        let mut aliases = Names::new();
+        let mut aliases = ModelFrame::default();
         for line in self.definitions[scope].body.clone() {
             if analysis_plan::command(self.lines[line]) != ".MODEL" {
                 continue;
             }
             let card = parse_model_card(self.lines[line], line + 1, &[])?;
-            let alias = if scope == 0 {
+            let mos = matches!(card.family.to_ascii_uppercase().as_str(), "NMOS" | "PMOS");
+            let alias = if scope == 0 && !mos {
                 card.name.clone()
             } else {
                 self.fresh('d')?
             };
-            ensure!(
-                aliases
-                    .insert(card.name.to_ascii_uppercase(), alias.clone())
-                    .is_none(),
-                "duplicate HSPICE model {}",
-                card.name
-            );
+            aliases.insert(card.name.to_ascii_uppercase(), alias.clone(), mos)?;
             let text = models::render(&card, &alias, |value| {
                 rewrite_parameter_symbols(value, names, false)
             })?;
@@ -286,26 +312,60 @@ impl Binder<'_> {
         Ok(())
     }
 
-    fn model_reference(&self, mut scope: usize, text: &str) -> Result<String> {
-        let spans = statement_token_spans(text)?;
-        let range = spans.get(3).context("missing HSPICE diode model name")?;
-        let model = text[range.clone()].to_ascii_uppercase();
+    fn candidates(&self, mut scope: usize, model: &str, mos: bool) -> Result<Vec<mos::Candidate>> {
+        let mut candidates = Vec::new();
         loop {
-            let aliases = self
+            let (_, aliases) = self
                 .model_frames
                 .iter()
                 .rev()
                 .find(|(id, _)| *id == scope)
                 .context("inactive lexical HSPICE model scope")?;
-            if let Some(alias) = aliases.1.get(&model) {
-                let mut output = text.to_owned();
-                output.replace_range(range.clone(), alias);
-                return Ok(output);
+            if let Some(alias) = aliases.exact.get(model) {
+                candidates.push(mos::Candidate {
+                    alias: alias.clone(),
+                    exact: true,
+                });
+                break;
             }
-            scope = self.source.scopes[scope]
-                .parent
-                .with_context(|| format!("unknown HSPICE diode model {model}"))?;
+            if mos && let Some(bins) = aliases.bins.get(model) {
+                candidates.extend(bins.iter().map(|alias| mos::Candidate {
+                    alias: alias.clone(),
+                    exact: false,
+                }));
+            }
+            let Some(parent) = self.source.scopes[scope].parent else {
+                break;
+            };
+            scope = parent;
         }
+        Ok(candidates)
+    }
+
+    fn model_reference(&mut self, scope: usize, text: &str, mos: bool) -> Result<String> {
+        let spans = statement_token_spans(text)?;
+        let range = spans
+            .get(if mos { 5 } else { 3 })
+            .context("missing HSPICE device model name")?;
+        let model = text[range.clone()].to_ascii_uppercase();
+        let candidates = self.candidates(scope, &model, mos)?;
+        ensure!(!candidates.is_empty(), "unknown HSPICE model {model}");
+        let replacement = if mos {
+            let marker = self.fresh('b')?;
+            self.pending_mos.insert(
+                marker.clone(),
+                mos::Pending {
+                    source_name: model,
+                    candidates,
+                },
+            );
+            marker
+        } else {
+            candidates[0].alias.clone()
+        };
+        let mut output = text.to_owned();
+        output.replace_range(range.clone(), &replacement);
+        Ok(output)
     }
 
     fn call(
@@ -406,15 +466,15 @@ impl Binder<'_> {
             return Ok(text.to_owned());
         }
         let bound = bind_values(text, names, self.limit)?;
-        let bound = if command.starts_with('D') {
-            self.model_reference(owner, &bound)?
+        let bound = if command.starts_with(['D', 'M']) {
+            self.model_reference(owner, &bound, command.starts_with('M'))?
         } else {
             bound
         };
         multiplier_card(&bound, multiplier)
     }
 
-    fn finish(mut self) -> Result<Rows> {
+    fn finish(mut self, mos_options: &mos::Options) -> Result<Rows> {
         let title = self.account(self.lines[0].to_owned(), 0)?;
         let names = self.definitions[0]
             .parameters
@@ -441,6 +501,7 @@ impl Binder<'_> {
         result.append(&mut root);
         result.append(&mut self.emitted_definitions);
         result.append(&mut ends);
+        mos::finish(&mut result, &self.pending_mos, mos_options)?;
         Ok(result)
     }
 }
@@ -449,6 +510,7 @@ pub fn bind(
     bytes: &[u8],
     origins: &[OriginLine],
     precedence: Precedence,
+    mos_options: &mos::Options,
     limit: usize,
 ) -> Result<(Vec<u8>, Vec<OriginLine>)> {
     let text = std::str::from_utf8(bytes)?;
@@ -491,15 +553,20 @@ pub fn bind(
         serial: 0,
         active: Vec::new(),
         model_frames: Vec::new(),
+        pending_mos: BTreeMap::new(),
         parameters: Vec::new(),
         emitted_definitions: Vec::new(),
         emitted_bytes: 0,
         limit,
     };
-    let rows = binder.finish()?;
+    let rows = binder.finish(mos_options)?;
     let mut output = Vec::new();
     let mut mapped = Vec::new();
     for (text, line) in rows {
+        ensure!(
+            output.len().saturating_add(text.len()).saturating_add(1) <= limit,
+            "HSPICE occurrence output byte budget exceeded"
+        );
         output.extend_from_slice(text.as_bytes());
         output.push(b'\n');
         mapped.push(

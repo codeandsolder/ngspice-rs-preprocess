@@ -32,7 +32,7 @@ pub enum InputFormat {
     NativeLibrary,
     /// Standalone HSPICE deck lowered to native SPICE.
     HspiceDeck,
-    /// Standalone HSPICE library lowered to include-safe native SPICE.
+    /// Parse a standalone HSPICE source library to a validated JSON artifact.
     HspiceLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,
@@ -115,7 +115,7 @@ pub struct Request {
     pub format: InputFormat,
     /// Root source.
     pub input: SourceInput,
-    /// Explicit catalog members (only for SIMPLIS/SIMetrix source decks).
+    /// Explicit catalog members for source decks.
     pub libraries: Vec<LibraryInput>,
     /// Directories searched after the containing directory for source includes.
     pub search_paths: Vec<PathBuf>,
@@ -355,9 +355,9 @@ fn validate_request(request: &Request) -> Result<()> {
         request.libraries.is_empty()
             || matches!(
                 request.format,
-                InputFormat::SimplisDeck | InputFormat::SimetrixDeck
+                InputFormat::SimplisDeck | InputFormat::SimetrixDeck | InputFormat::HspiceDeck
             ),
-        "catalog libraries require simplis-deck or simetrix-deck"
+        "catalog libraries require a source deck format"
     );
     ensure!(
         request.search_paths.is_empty()

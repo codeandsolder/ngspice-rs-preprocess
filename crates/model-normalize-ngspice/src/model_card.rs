@@ -143,7 +143,10 @@ pub fn positional_prefix(input: &str) -> (Vec<(&str, usize)>, &str) {
 }
 
 /// Named scalar/flag parameters of an already identified MOS instance.
-pub(crate) fn instance_fields(input: &str) -> Result<Vec<ModelParameter>> {
+///
+/// # Errors
+/// Invalid field syntax or malformed expression.
+pub fn instance_fields(input: &str) -> Result<Vec<ModelParameter>> {
     let mut source = Source {
         text: input,
         offset: 0,
