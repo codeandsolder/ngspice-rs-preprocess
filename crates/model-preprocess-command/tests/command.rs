@@ -222,3 +222,22 @@ fn adapter_may_exit_without_reading_large_input() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn virtual_and_removed_sources_resolve_to_admitted_snapshots() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let virtual_path = dir.path().join("virtual.cir");
+    let mut session =
+        SourceSession::new(settings("printf x >> calls; cat"), Cancellation::default());
+    assert!(session.load(&virtual_path).is_err());
+    let first = session.admit_bytes(&virtual_path, Arc::from(&b"virtual"[..]))?;
+    let second = session.load(&virtual_path)?;
+    assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
+    let disk_path = dir.path().join("disk.cir");
+    fs::write(&disk_path, b"disk")?;
+    let disk = session.load(&disk_path)?;
+    fs::remove_file(&disk_path)?;
+    assert!(Arc::ptr_eq(&disk.bytes, &session.load(&disk_path)?.bytes));
+    assert_eq!(fs::read(dir.path().join("calls"))?, b"xx");
+    Ok(())
+}

@@ -163,7 +163,10 @@ fn rser_assignment(
     Ok(rser)
 }
 
-fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
+fn rewrite_ltspice_inductor_rser(
+    input: &[u8],
+    inserted_lines: &mut Vec<usize>,
+) -> Result<Option<Vec<u8>>> {
     use lexical::{apply_edits, replace_span, statements, tokens};
     if !input
         .windows(4)
@@ -227,6 +230,7 @@ fn rewrite_ltspice_inductor_rser(input: &[u8]) -> Result<Option<Vec<u8>>> {
         line.pop();
         line.extend_from_slice(if ending.is_empty() { b"\n" } else { ending });
         edits.push((statement.start..statement.start, line));
+        inserted_lines.push(statement.line);
         replace_span(&statement, fields[1].clone(), &internal, &mut edits);
         // Remove preceding horizontal separation on the same logical line.
         // If the separator is synthetic its source range is empty.
@@ -470,6 +474,76 @@ fn apply_optional<F>(
 /// Returns an error for binary input or source identified as SIMPLIS, which requires
 /// semantic translation rather than syntax normalization.
 pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
+    normalize_body(input, true, &mut Vec::new())
+}
+
+/// Normalized bytes and one original input line for each emitted physical line.
+#[derive(Debug, Clone)]
+pub struct MappedNormalization {
+    /// Normalized artifact and applied passes.
+    pub model: NormalizedModel,
+    /// 1-based physical input lines; synthetic elements inherit the source line.
+    pub input_lines: Vec<usize>,
+}
+
+/// Normalize either an include or a complete deck, preserving the deck title
+/// and terminator. Every output line maps to its originating input line.
+///
+/// # Errors
+///
+/// Invalid source, unsupported dialect, malformed compatibility syntax, or
+/// inconsistent source mapping.
+pub fn normalize_mapped(
+    input: &[u8],
+    kind: linked_source::RootKind,
+) -> Result<MappedNormalization> {
+    ensure_textual(input)?;
+    let (title, body) = if kind == linked_source::RootKind::Deck {
+        let title = input
+            .split_inclusive(|byte| *byte == b'\n')
+            .next()
+            .context("native deck has no title line")?;
+        (title, &input[title.len()..])
+    } else {
+        (&[][..], input)
+    };
+    let mut inserted = Vec::new();
+    let mut model = normalize_body(
+        body,
+        kind == linked_source::RootKind::Include,
+        &mut inserted,
+    )?;
+    let title_lines = usize::from(!title.is_empty());
+    let mut input_lines = Vec::new();
+    if title_lines != 0 {
+        input_lines.push(1);
+        let mut bytes = Vec::with_capacity(title.len() + model.bytes.len());
+        bytes.extend_from_slice(title);
+        bytes.extend_from_slice(&model.bytes);
+        model.bytes = bytes;
+    }
+    let mut inserted = inserted.into_iter().peekable();
+    for (index, _) in body.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line = index + 1;
+        while inserted.peek() == Some(&line) {
+            input_lines.push(line + title_lines);
+            inserted.next();
+        }
+        input_lines.push(line + title_lines);
+    }
+    anyhow::ensure!(
+        inserted.next().is_none()
+            && input_lines.len() == model.bytes.split_inclusive(|byte| *byte == b'\n').count(),
+        "normalization source mapping is inconsistent"
+    );
+    Ok(MappedNormalization { model, input_lines })
+}
+
+fn normalize_body(
+    input: &[u8],
+    strip_end: bool,
+    inserted_lines: &mut Vec<usize>,
+) -> Result<NormalizedModel> {
     ensure_textual(input)?;
     if looks_like_simplis(input) {
         bail!("SIMPLIS source requires translation, not ngspice normalization");
@@ -483,7 +557,7 @@ pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
         NormalizationPass::NormalizeNbspWhitespace,
         normalize_nbsp,
     );
-    if let Some(rewritten) = rewrite_ltspice_inductor_rser(&bytes)? {
+    if let Some(rewritten) = rewrite_ltspice_inductor_rser(&bytes, inserted_lines)? {
         bytes = rewritten;
         passes.push(NormalizationPass::LtspiceInductorRser);
     }
@@ -495,7 +569,7 @@ pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
         bytes = rewritten;
         passes.push(NormalizationPass::PspicePositionalParams);
     }
-    if let Some(rewritten) = strip_standalone_end(&bytes)? {
+    if strip_end && let Some(rewritten) = strip_standalone_end(&bytes)? {
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }

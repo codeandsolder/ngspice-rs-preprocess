@@ -1,27 +1,27 @@
 //! Source-file linking for native ngspice `.include` and named `.lib` sections.
 //!
 //! This source-only stage expands library resources before `.param`/`.model`
-//! parsing. Each output logical line retains its original file and line.
+//! parsing. Each output physical line retains its original file and line.
 
-use crate::model_card::logical_statements;
+use crate::lexical::{normalize_nbsp, statements};
 use anyhow::{Context, Result, bail, ensure};
-use model_preprocess_command::SourceSession;
+use model_preprocess_command::{AdmittedSource, SourceSession};
 use std::path::{Path, PathBuf};
 
-/// Physical source location corresponding to a linked logical statement.
+/// Physical source location corresponding to a linked output line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceOrigin {
     /// Canonical input path whose bytes contained this statement.
     pub path: PathBuf,
-    /// 1-based admitted-source line, before `+` continuation merging.
+    /// 1-based admitted-source line.
     /// External commands may change line numbering; the path remains original.
     pub line: usize,
 }
 
-/// Linked byte buffer and one origin for each `\n`-separated logical line.
+/// Linked byte buffer and one origin for each physical output line.
 #[derive(Clone, Debug)]
 pub struct LinkedSource {
-    /// Normalized concatenated source accepted by `ModelLibrary::parse`.
+    /// Concatenated source, with original physical statements retained.
     pub bytes: Vec<u8>,
     /// Provenance ordered in exact output-line order.
     pub origins: Vec<SourceOrigin>,
@@ -43,9 +43,34 @@ pub struct SourceLinker {
     pub search_paths: Vec<PathBuf>,
 }
 
+/// Root source treatment. Included resources are always include-safe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootKind {
+    /// First physical line is a SPICE deck title.
+    Deck,
+    /// All lines are library source, not a deck title.
+    Include,
+}
+
+/// Limits on emitted linked source.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkLimits {
+    /// Maximum concatenated bytes, including repeated includes.
+    pub output_bytes: usize,
+}
+
+impl Default for LinkLimits {
+    fn default() -> Self {
+        Self {
+            output_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
 struct LinkState<'a> {
     settings: &'a SourceLinker,
     admission: &'a mut SourceSession,
+    limits: LinkLimits,
     stack: Vec<(PathBuf, Option<String>)>,
     output: LinkedSource,
 }
@@ -100,77 +125,55 @@ const fn name_matches(selected: &str, name: &str) -> bool {
     selected.eq_ignore_ascii_case(name)
 }
 
-/// Select one named section, or retain only the statements outside all
-/// section definitions. Nested two-operand library references are left
-/// intact for recursive expansion by the caller.
-fn select_statements(
-    lines: Vec<(usize, Vec<u8>)>,
-    section: Option<&str>,
-    path: &Path,
-) -> Result<Vec<(usize, Vec<u8>)>> {
-    let mut selected = Vec::new();
-    let mut active: Option<String> = None;
-    let mut found = section.is_none();
-    for (number, bytes) in lines {
-        let text = std::str::from_utf8(&bytes)
-            .with_context(|| format!("{}:{number}: invalid source encoding", path.display()))?;
-        if let Some(args) = library_marker(text)?
-            && args.len() == 1
-        {
-            ensure!(
-                active.is_none(),
-                "{}:{number}: nested .lib section definitions",
-                path.display()
-            );
-            if section.is_some_and(|name| name_matches(name, &args[0])) {
-                ensure!(
-                    !found,
-                    "{}:{number}: duplicate section {}",
-                    path.display(),
-                    args[0]
-                );
-                found = true;
-            }
-            active = args.into_iter().next();
-            continue;
-        }
-        if let Some(rest) = directive(text, ".endl") {
-            let ending = operands(rest)?;
-            ensure!(
-                ending.len() <= 1,
-                "{}:{number}: invalid .endl",
-                path.display()
-            );
-            let opened = active
-                .take()
-                .with_context(|| format!("{}:{number}: .endl without .lib", path.display()))?;
-            ensure!(
-                ending.is_empty() || name_matches(&opened, &ending[0]),
-                "{}:{number}: .endl does not match .lib {opened}",
-                path.display()
-            );
-            continue;
-        }
-        let include = match (section, active.as_deref()) {
-            (None, None) => true,
-            (Some(wanted), Some(opened)) => name_matches(wanted, opened),
-            _ => false,
-        };
-        if include {
-            selected.push((number, bytes));
-        }
-    }
-    ensure!(
-        active.is_none(),
-        "{}: unterminated .lib section",
-        path.display()
-    );
-    if let Some(name) = section {
-        ensure!(found, "{}: no .lib section named {name}", path.display());
-    }
-    Ok(selected)
+// The lexical view recognizes directives and continuation boundaries, while
+// the emitted bytes retain physical lines, comments and original spelling.
+struct Record {
+    line: usize,
+    physical: std::ops::Range<usize>,
+    logical: Vec<u8>,
 }
 
+fn records(bytes: &[u8], first_line: usize) -> Result<Vec<Record>> {
+    let physical_count = bytes.split_inclusive(|byte| *byte == b'\n').count();
+    let normalized = normalize_nbsp(bytes);
+    let normalized = normalized.as_deref().unwrap_or(bytes);
+    let mut starts = vec![0];
+    for line in normalized.split_inclusive(|byte| *byte == b'\n') {
+        starts.push(starts.last().copied().unwrap_or_default() + line.len());
+    }
+    let mut result = Vec::new();
+    let mut cursor = 0;
+    for statement in statements(normalized)? {
+        let start = statement.line - 1;
+        let end = statement
+            .source_ranges(0..statement.text.len())
+            .last()
+            .map_or(start + 1, |range| {
+                starts.partition_point(|offset| *offset < range.end)
+            });
+        if cursor < start {
+            result.push(Record {
+                line: first_line + cursor,
+                physical: cursor..start,
+                logical: Vec::new(),
+            });
+        }
+        result.push(Record {
+            line: first_line + start,
+            physical: start..end,
+            logical: statement.text,
+        });
+        cursor = end;
+    }
+    if cursor < physical_count {
+        result.push(Record {
+            line: first_line + cursor,
+            physical: cursor..physical_count,
+            logical: Vec::new(),
+        });
+    }
+    Ok(result)
+}
 impl SourceLinker {
     /// Recursively load one native-ngspice source deck, expanding `.include`
     /// and `.inc`, and selected `.lib path section` references, with origin
@@ -195,62 +198,96 @@ impl SourceLinker {
         source: &Path,
         admission: &mut SourceSession,
     ) -> Result<LinkedSource> {
+        let source = admission.load(source)?;
+        self.link_admitted(&source, RootKind::Include, LinkLimits::default(), admission)
+    }
+
+    /// Link an already-admitted root (including an in-memory source).
+    ///
+    /// # Errors
+    ///
+    /// Invalid source, missing or recursive resources, malformed sections,
+    /// or exceeded linked-output budget.
+    pub fn link_admitted(
+        &self,
+        source: &AdmittedSource,
+        kind: RootKind,
+        limits: LinkLimits,
+        admission: &mut SourceSession,
+    ) -> Result<LinkedSource> {
         let mut state = LinkState {
             settings: self,
             admission,
+            limits,
             stack: Vec::new(),
             output: LinkedSource {
                 bytes: Vec::new(),
                 origins: Vec::new(),
             },
         };
-        state.expand(source, None, None)?;
+        state.expand_source(source, None, kind)?;
         Ok(state.output)
     }
 }
 
 impl LinkState<'_> {
-    fn resolve(&self, path: &Path, parent: Option<&Path>) -> Result<PathBuf> {
-        let local = parent
-            .into_iter()
-            .filter_map(Path::parent)
-            .map(|dir| dir.join(path));
-        let candidates = local
-            .chain((parent.is_none()).then(|| path.to_path_buf()))
-            .chain(self.settings.search_paths.iter().map(|dir| dir.join(path)));
+    fn resolve(&self, path: &Path, parent: &Path) -> Result<PathBuf> {
+        let local = parent.parent().into_iter().map(|dir| dir.join(path));
+        let candidates = local.chain(self.settings.search_paths.iter().map(|dir| dir.join(path)));
         for candidate in candidates {
-            if let Ok(canonical) = candidate.canonicalize() {
-                ensure!(
-                    canonical.is_file(),
-                    "linked source is not a regular file: {}",
-                    canonical.display()
-                );
-                return Ok(canonical);
+            match self.admission.resolve_path(&candidate) {
+                Ok(canonical) => return Ok(canonical),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("resolving linked source {}", candidate.display())
+                    });
+                }
             }
         }
         bail!(
             "cannot resolve source file {} relative to {}",
             path.display(),
-            parent.map_or_else(|| "<root>".to_owned(), |p| p.display().to_string())
+            parent.display()
         )
     }
 
-    fn emit(&mut self, path: &Path, physical_line: usize, text: &[u8]) {
+    fn emit(&mut self, path: &Path, physical_line: usize, text: &[u8]) -> Result<()> {
+        let extra = usize::from(!text.ends_with(b"\n"));
+        ensure!(
+            text.len().saturating_add(extra)
+                <= self
+                    .limits
+                    .output_bytes
+                    .saturating_sub(self.output.bytes.len()),
+            "linked output byte budget exceeded at {}:{physical_line}",
+            path.display()
+        );
         self.output.bytes.extend_from_slice(text);
-        self.output.bytes.push(b'\n');
+        if extra != 0 {
+            self.output.bytes.push(b'\n');
+        }
         self.output.origins.push(SourceOrigin {
             path: path.to_path_buf(),
             line: physical_line,
         });
+        Ok(())
     }
 
-    fn expand(
-        &mut self,
-        requested: &Path,
-        parent: Option<&Path>,
-        section: Option<&str>,
-    ) -> Result<()> {
+    fn expand(&mut self, requested: &Path, parent: &Path, section: Option<&str>) -> Result<()> {
         let path = self.resolve(requested, parent)?;
+        // Resolve an existing admitted snapshot before interpreting its syntax.
+        let source = self.admission.load(&path)?;
+        self.expand_source(&source, section, RootKind::Include)
+    }
+
+    fn expand_source(
+        &mut self,
+        source: &AdmittedSource,
+        section: Option<&str>,
+        kind: RootKind,
+    ) -> Result<()> {
+        let path = &source.path;
         ensure!(
             self.stack.len() < 128,
             "ngspice source linking depth exceeded 128"
@@ -260,13 +297,13 @@ impl LinkState<'_> {
             !self
                 .stack
                 .iter()
-                .any(|(candidate, selected)| candidate == &path && selected == &section_key),
+                .any(|(candidate, selected)| candidate == path && selected == &section_key),
             "recursive ngspice source include: {}{}",
             path.display(),
             section.map_or_else(String::new, |name| format!(" section {name}"))
         );
         self.stack.push((path.clone(), section_key));
-        let result = self.expand_inner(&path, section);
+        let result = self.expand_inner(source, section, kind);
         self.stack.pop();
         result.with_context(|| {
             format!(
@@ -277,45 +314,191 @@ impl LinkState<'_> {
         })
     }
 
-    fn expand_inner(&mut self, path: &Path, section: Option<&str>) -> Result<()> {
-        let source = self.admission.load(path)?;
-        let lines = logical_statements(&source.bytes)?;
-        let selected = select_statements(lines, section, path)?;
+    fn expand_inner(
+        &mut self,
+        source: &AdmittedSource,
+        section: Option<&str>,
+        kind: RootKind,
+    ) -> Result<()> {
+        let path = &source.path;
+        crate::lexical::ensure_textual(&source.bytes)?;
+        let (body, first_line) = if kind == RootKind::Deck {
+            let title = source
+                .bytes
+                .split_inclusive(|byte| *byte == b'\n')
+                .next()
+                .context("native deck has no title line")?;
+            self.emit(path, 1, title)?;
+            (&source.bytes[title.len()..], 2)
+        } else {
+            (&source.bytes[..], 1)
+        };
+        let mut selection = SectionSelection::new(section);
         let mut in_control = false;
-        for (physical_line, bytes) in selected {
-            let text = std::str::from_utf8(&bytes).with_context(|| {
-                format!("{}:{physical_line}: non-UTF-8 statement", path.display())
+        let physical = body
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        for record in records(body, first_line)? {
+            let text = std::str::from_utf8(&record.logical).with_context(|| {
+                format!(
+                    "{}:{}: invalid source encoding",
+                    path.display(),
+                    record.line
+                )
             })?;
-            if directive(text, ".control").is_some() {
+            let control_start = directive(text, ".control").is_some();
+            let control_end = directive(text, ".endc").is_some();
+            if !in_control && !control_start && !selection.observe(text, path, record.line)? {
+                continue;
+            }
+            let selected = selection.selected();
+            if control_start {
                 in_control = true;
             }
-            if directive(text, ".endc").is_some() {
+            if selected {
+                if in_control || control_end {
+                    self.emit_record(path, &record, &physical)?;
+                } else {
+                    self.expand_record(path, &record, &physical, text, kind)?;
+                }
+            }
+            if control_end {
                 in_control = false;
             }
-            if in_control || directive(text, ".endc").is_some() {
-                self.emit(path, physical_line, &bytes);
-                continue;
+        }
+        ensure!(
+            !in_control,
+            "{}: unterminated .control block",
+            path.display()
+        );
+        selection.finish(path)
+    }
+
+    fn emit_record(&mut self, path: &Path, record: &Record, physical: &[&[u8]]) -> Result<()> {
+        for (offset, line) in physical[record.physical.clone()].iter().enumerate() {
+            self.emit(path, record.line + offset, line)?;
+        }
+        Ok(())
+    }
+
+    fn expand_record(
+        &mut self,
+        path: &Path,
+        record: &Record,
+        physical: &[&[u8]],
+        text: &str,
+        kind: RootKind,
+    ) -> Result<()> {
+        let physical_line = record.line;
+        if let Some(rest) = directive(text, ".include").or_else(|| directive(text, ".inc")) {
+            let args = operands(rest)?;
+            ensure!(
+                args.len() == 1,
+                "{}:{physical_line}: .include requires one pathname",
+                path.display()
+            );
+            return self.expand(Path::new(&args[0]), path, None);
+        }
+        if let Some(args) = library_marker(text)? {
+            ensure!(
+                args.len() == 2,
+                "{}:{physical_line}: native .lib requires a file and section",
+                path.display()
+            );
+            return self.expand(Path::new(&args[0]), path, Some(&args[1]));
+        }
+        if kind == RootKind::Include && text.eq_ignore_ascii_case(".end") {
+            // An included terminator must not terminate the consuming deck.
+            // Keep one mapped comment for each physical source line.
+            for (offset, line) in physical[record.physical.clone()].iter().enumerate() {
+                let mut comment = b"* ".to_vec();
+                comment.extend_from_slice(line);
+                self.emit(path, physical_line + offset, &comment)?;
             }
-            if let Some(rest) = directive(text, ".include").or_else(|| directive(text, ".inc")) {
-                let args = operands(rest)?;
+            return Ok(());
+        }
+        self.emit_record(path, record, physical)
+    }
+}
+
+struct SectionSelection<'a> {
+    wanted: Option<&'a str>,
+    active: Option<String>,
+    found: bool,
+}
+
+impl<'a> SectionSelection<'a> {
+    const fn new(wanted: Option<&'a str>) -> Self {
+        Self {
+            wanted,
+            active: None,
+            found: wanted.is_none(),
+        }
+    }
+
+    /// Return false for section boundary records; they are never emitted.
+    fn observe(&mut self, text: &str, path: &Path, line: usize) -> Result<bool> {
+        if let Some(args) = library_marker(text)?
+            && args.len() == 1
+        {
+            ensure!(
+                self.active.is_none(),
+                "{}:{line}: nested .lib section definitions",
+                path.display()
+            );
+            if self.wanted.is_some_and(|name| name_matches(name, &args[0])) {
                 ensure!(
-                    args.len() == 1,
-                    "{}:{physical_line}: .include requires one pathname",
-                    path.display()
+                    !self.found,
+                    "{}:{line}: duplicate section {}",
+                    path.display(),
+                    args[0]
                 );
-                self.expand(Path::new(&args[0]), Some(path), None)?;
-                continue;
+                self.found = true;
             }
-            if let Some(args) = library_marker(text)? {
-                ensure!(
-                    args.len() == 2,
-                    "{}:{physical_line}: native .lib requires a file and section",
-                    path.display()
-                );
-                self.expand(Path::new(&args[0]), Some(path), Some(&args[1]))?;
-                continue;
-            }
-            self.emit(path, physical_line, &bytes);
+            self.active = args.into_iter().next();
+            return Ok(false);
+        }
+        if let Some(rest) = directive(text, ".endl") {
+            let ending = operands(rest)?;
+            ensure!(
+                ending.len() <= 1,
+                "{}:{line}: invalid .endl",
+                path.display()
+            );
+            let opened = self
+                .active
+                .take()
+                .with_context(|| format!("{}:{line}: .endl without .lib", path.display()))?;
+            ensure!(
+                ending.is_empty() || name_matches(&opened, &ending[0]),
+                "{}:{line}: .endl does not match .lib {opened}",
+                path.display()
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn selected(&self) -> bool {
+        match (self.wanted, self.active.as_deref()) {
+            (None, None) => true,
+            (Some(wanted), Some(opened)) => name_matches(wanted, opened),
+            _ => false,
+        }
+    }
+
+    fn finish(self, path: &Path) -> Result<()> {
+        ensure!(
+            self.active.is_none(),
+            "{}: unterminated .lib section",
+            path.display()
+        );
+        if let Some(name) = self.wanted {
+            ensure!(
+                self.found,
+                "{}: no .lib section named {name}",
+                path.display()
+            );
         }
         Ok(())
     }
