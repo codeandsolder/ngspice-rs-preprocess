@@ -27,7 +27,7 @@ enum ExpressionContext {
 
 struct Builtins {
     realization: Option<Realization>,
-    next_site: u64,
+    next_call: u64,
     lncosh: bool,
     static_temp: bool,
     lncosh_name: String,
@@ -55,7 +55,7 @@ impl Builtins {
         }
         Self {
             realization,
-            next_site: 0,
+            next_call: 0,
             lncosh: false,
             static_temp: false,
             lncosh_name: unused_identifier(LNCOSH_NAME, &source),
@@ -147,10 +147,10 @@ impl Builtins {
                 let invocation = Invocation {
                     function: distribution,
                     realization,
-                    site: self.next_site,
+                    site: self.next_call,
                 };
-                self.next_site = self
-                    .next_site
+                self.next_call = self
+                    .next_call
                     .checked_add(1)
                     .context("statistical source site overflow")?;
                 let mut rewritten = format!("{}(", invocation.marker_name());
@@ -251,6 +251,11 @@ impl Builtins {
     }
 
     fn statement(&mut self, statement: &str) -> Result<String> {
+        // The occurrence binder combines this declaration-local ordinal
+        // with the bound declaration and macro call path. Unrelated
+        // statements, library order, and traversal scheduling cannot
+        // move a call site to a different random stream.
+        self.next_call = 0;
         let trimmed = statement.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('*') {
             return Ok(statement.to_owned());
