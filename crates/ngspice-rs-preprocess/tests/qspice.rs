@@ -253,3 +253,67 @@ fn native_reference_matches_dc_ac_and_transient_laws() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn numeric_spelling_preserves_names_and_laws() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("deck.cir");
+    fs::write(&root, b"* 3k4 title\n.param gain={1mho+2mho}\nV1 3k4 0 1\nR1 3k4 out 3k4\nR2 out 0 1k7\nC1 out 0 10\xb5\nD1 out 0 1k5\n.model 1k5 D(IS=1f5)\nB1 result 0 V={V(3k4)*2k5 + gain + 1e-3mho}\nE1 linear 0 out 0 1mho\n.dc V1 0 1 0.5\n.end\n")?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    for expected in [
+        "* 3k4 title",
+        ".param gain={1+2}",
+        "V1 3k4 0 1",
+        "R1 3k4 out 3.4k",
+        "R2 out 0 1.7k",
+        "C1 out 0 10u",
+        "D1 out 0 1k5",
+        ".model 1k5 D(IS=1.5f)",
+        "V(3k4)*2.5k + gain + 1e-3",
+        "E1 linear 0 out 0 1",
+    ] {
+        ensure!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    let rows = reference(
+        dir.path(),
+        "* numeric witness\n.param gain={1mho+2mho}\nV1 3k4 0 1\nR1 3k4 out 3k4\nR2 out 0 1k7\nB1 result 0 V={V(3k4)*2k5 + gain + 1e-3mho}\nE1 linear 0 out 0 1mho\n.dc V1 0 1 0.5\n.end\n",
+        "run\nwrdata witness.dat v(out) v(result) v(linear)",
+    )?;
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let [input, divider, result, linear] = row.as_slice() else {
+            bail!("unexpected numeric witness shape");
+        };
+        ensure!((divider - input / 3.).abs() < 1e-10, "{row:?}");
+        ensure!(
+            (result - input.mul_add(2500., 3.001)).abs() < 1e-9,
+            "{row:?}"
+        );
+        ensure!((linear - divider).abs() < 1e-10, "{row:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn numeric_spelling_covers_continuations_and_analysis_values() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("deck.cir");
+    fs::write(&root, b"Title\nV1 a 0 PULSE(0 1 1u5 1n 1n 2u5 1m)\nR1 a b 2Meg8\nC1 b 0 1n\n+ Rser=0mho\n.tran 0 1m5 0 1u5 UIC\n.end\n")?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    ensure!(text.contains("PULSE(0 1 1.5u 1n 1n 2.5u 1m)"), "{text}");
+    ensure!(text.contains("R1 a b 2.8Meg"), "{text}");
+    ensure!(text.contains("1.5m 0 1.5u UIC"), "{text}");
+    ensure!(!text.contains("Rser"), "{text}");
+    fs::write(&root, b"Title\nR1 a b 1.2k3\n.end\n")?;
+    let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+        .err()
+        .context("ambiguous literal accepted")?;
+    let diagnostic = error
+        .downcast_ref::<Unsupported>()
+        .context("missing numeric diagnostic")?;
+    assert_eq!(diagnostic.feature, Feature::NumericLiteral);
+    assert_eq!(diagnostic.line, 2);
+    Ok(())
+}

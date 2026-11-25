@@ -1,4 +1,5 @@
 //! Source-scoped QSPICE plaintext normalization. No compiled device execution.
+mod numeric;
 use crate::{
     lexical::{Edit, Statement, apply_edits, replace_span, statements, tokens},
     linked_source::{LinkedSource, RootKind, SourceOrigin},
@@ -19,6 +20,8 @@ pub enum Feature {
     NonTextResource,
     /// Invalid byte sequence for the selected source encoding.
     SourceEncoding,
+    /// Numeric spelling not representable in the native grammar.
+    NumericLiteral,
     /// Digital, specialized or compiled device class.
     SpecialDevice,
     /// Simulator-specific command, search path or execution directive.
@@ -36,6 +39,7 @@ impl fmt::Display for Feature {
         formatter.write_str(match self {
             Self::NonTextResource => "non-netlist resource",
             Self::SourceEncoding => "source encoding",
+            Self::NumericLiteral => "numeric literal",
             Self::SpecialDevice => "specialized device class",
             Self::Directive => "simulator-specific directive",
             Self::PassiveParasitics => "passive parasitics",
@@ -150,10 +154,8 @@ pub(crate) fn decode_resource<'a>(path: &Path, input: &'a [u8]) -> Result<Cow<'a
     if let Some(utf8) = input.strip_prefix(b"\xef\xbb\xbf") {
         if let Err(error) = std::str::from_utf8(utf8) {
             let line = utf8[..error.valid_up_to()]
-                .iter()
-                .filter(|&&byte| byte == b'\n')
-                .count()
-                + 1;
+                .split(|byte| *byte == b'\n')
+                .count();
             return Err(unsupported(
                 path,
                 line,
@@ -315,19 +317,19 @@ fn lower_tran(
     {
         args = &args[..args.len() - 1];
     }
-    let [step, stop, start, max] = args else {
+    let [interval, duration, start, maximum] = args else {
         return Err(reject(
             origin,
             Feature::TransientTiming,
             "explicit step, stop, zero start and positive maxstep required until simulator defaults are qualified",
         ));
     };
-    let values = [step, stop, start, max].map(|span| literal(&text[span.clone()]));
+    let values = [interval, duration, start, maximum].map(|span| literal(&text[span.clone()]));
     let [
-        Some(step_value),
-        Some(stop_value),
+        Some(interval_value),
+        Some(duration_value),
         Some(start_value),
-        Some(max_value),
+        Some(maximum_value),
     ] = values
     else {
         return Err(reject(
@@ -336,8 +338,12 @@ fn lower_tran(
             "symbolic time fields need analysis-specific parameter binding",
         ));
     };
-    let end = step_value.max(stop_value);
-    if step_value < 0.0 || stop_value < 0.0 || end <= 0.0 || start_value != 0.0 || max_value <= 0.0
+    let end = interval_value.max(duration_value);
+    if interval_value < 0.0
+        || duration_value < 0.0
+        || end <= 0.0
+        || start_value != 0.0
+        || maximum_value <= 0.0
     {
         return Err(reject(
             origin,
@@ -347,14 +353,14 @@ fn lower_tran(
     }
     // QSPICE ignores the first interval except that it can extend the stop
     // time. Native SPICE requires a positive output interval.
-    if step_value > stop_value {
-        replace_span(statement, stop.clone(), &text[step.clone()], edits);
+    if interval_value > duration_value {
+        replace_span(statement, duration.clone(), &text[interval.clone()], edits);
     }
-    let interval = end.min(max_value);
+    let native_interval = end.min(maximum_value);
     replace_span(
         statement,
-        step.clone(),
-        interval.to_string().as_bytes(),
+        interval.clone(),
+        native_interval.to_string().as_bytes(),
         edits,
     );
     Ok(())
@@ -460,6 +466,15 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Option<Vec<
         0
     };
     let body = &input[title_len..];
+    let mut numeric_edits = Vec::new();
+    for statement in statements(body)? {
+        let origin = linked
+            .origin(statement.line + usize::from(title_len != 0))
+            .context("missing QSPICE source location")?;
+        numeric::rewrite(&statement, origin, &mut numeric_edits)?;
+    }
+    let lowered = apply_edits(body, numeric_edits);
+    let body = lowered.as_deref().unwrap_or(body);
     let mut edits = Vec::new();
     for statement in statements(body)? {
         let line = statement.line + usize::from(title_len != 0);
@@ -469,9 +484,10 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Option<Vec<
         lower_statement(&statement, origin, &mut edits, body)
             .with_context(|| format!("QSPICE source {}:{}", origin.path.display(), origin.line))?;
     }
-    for (range, _) in &mut edits {
-        range.start += title_len;
-        range.end += title_len;
-    }
-    Ok(apply_edits(input, edits))
+    let final_body = apply_edits(body, edits).or(lowered);
+    Ok(final_body.map(|body| {
+        let mut bytes = input[..title_len].to_vec();
+        bytes.extend_from_slice(&body);
+        bytes
+    }))
 }
