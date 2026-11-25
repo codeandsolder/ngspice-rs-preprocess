@@ -321,6 +321,77 @@ fn advanced_latch_vendor_ambiguous_inputs(runtime: &Path) -> Result<()> {
     verify(runtime, &source, &checks)
 }
 
+fn event_edges<const N: usize>(stdout: &str, initial: [bool; N]) -> [Vec<(f64, bool)>; N] {
+    let mut previous = initial;
+    let mut edges = std::array::from_fn(|_| Vec::new());
+    for line in stdout.lines() {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != N + 1 {
+            continue;
+        }
+        let Ok(time) = fields[0].parse::<f64>() else {
+            continue;
+        };
+        for (index, value) in fields[1..].iter().enumerate() {
+            let bit = *value == "1s";
+            if bit != previous[index] {
+                edges[index].push((time, bit));
+                previous[index] = bit;
+            }
+        }
+    }
+    edges
+}
+
+fn check_edges(actual: &[Vec<(f64, bool)>], expected: &[&[(f64, bool)]]) -> Result<()> {
+    ensure!(actual.len() == expected.len(), "incorrect trace width");
+    for (trace, expected) in actual.iter().zip(expected) {
+        ensure!(
+            trace.len() == expected.len(),
+            "wrong event sequence: {actual:?}"
+        );
+        for ((time, bit), (reference_time, reference_bit)) in trace.iter().zip(*expected) {
+            ensure!(
+                (time - reference_time).abs() < 1e-15 && bit == reference_bit,
+                "event {time} {bit} != {reference_time} {reference_bit}; sequence={actual:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn threshold_plateau_and_latch_cancellation(runtime: &Path) -> Result<()> {
+    let source = "Vref rtn 0 0.75
+V1 a rtn PWL(0 0 1u 0 1.01u 3 2u 3 2.01u 5 3u 5 3.01u 2 4u 2 4.01u 0 9u 0)
+V2 b rtn 5
+V3 c rtn PWL(0 0 4.5u 0 4.51u 5 4.6u 5 4.61u 0 6u 0 6.01u 5 7u 5 7.01u 0 9u 0)
+!D1 t rtn a b M1 IC=0
+.MODEL M1 AND2 RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 DELAY=500n LOGIC=POS
+A2 %gnd_ref rtn [ i ib ] [ a b ] MODEL=M2 IC=0
+.MODEL M2 DIGITAL1 D_AND RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 OUT_DELAY=500n
+A3 %gnd_ref rtn [ l lb ] [ a c ] MODEL=M3 IC=0
+.MODEL M3 DIGITAL1 D_SRLATCH RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 OUT_DELAY=500n SET_RESET_LEVEL=1 DOM=NONE
+Rt t rtn 100
+Ri i rtn 100
+Rib ib rtn 100
+Rl l rtn 100
+Rlb lb rtn 100
+.end
+";
+    let stdout = run_native(
+        runtime,
+        source,
+        "tran 100n 8u\neprint ___D1_Q_STATE __A2_Q_STATE __A3_Q_STATE\n",
+    )?;
+    // Holding exactly at either threshold does not transition. Departure
+    // must be resolved at the solver's breakpoint precision rather than
+    // delayed by an entire coarse accepted step. A short reset is cancelled
+    // and the latch retains its committed set bit until the sustained reset.
+    let gate = [(2.5e-6, true), (4.5e-6, false)];
+    let latch = [(2.5e-6, true), (6.506e-6, false)];
+    check_edges(&event_edges(&stdout, [false; 3]), &[&gate, &gate, &latch])
+}
+
 /// Expected event times and output states from SIMPLIS 9.40.2's
 /// independently exported 100-ohm loaded traces and final-state sweeps.
 fn vendor_timing(runtime: &Path) -> Result<()> {
@@ -344,15 +415,21 @@ Rs s rtn 100
 Rsb sb rtn 100
 .end
 ";
-    for (fall, after, long) in [("1.19u", "1.2u", false), ("1.99u", "2u", true)] {
+    // Independently swept pulse widths 190, 499, 500, 501 and 990 ns.
+    // The exact-width 500 ns pulse is suppressed by DIGITAL1.
+    for (fall, after, long, falling) in [
+        ("1.19u", "1.2u", false, 1.696e-6),
+        ("1.499u", "1.509u", false, 2.005e-6),
+        ("1.5u", "1.51u", false, 2.006e-6),
+        ("1.501u", "1.511u", true, 2.007e-6),
+        ("1.99u", "2u", true, 2.496e-6),
+    ] {
         let source = format!("V1 a rtn PWL(0 0 1u 0 1.01u 5 {fall} 5 {after} 0 9u 0)\n{BASE}");
         let mut checks = Vec::new();
-        for (time, values) in [
-            (1.3, [false, false, false, false]),
-            (1.65, [true, long, long, true]),
-            (1.85, [long, long, long, true]),
-            (2.6, [false, false, long, true]),
-        ] {
+        for time in [1.3, 1.65, 1.85, 2.2, 2.6] {
+            let arrived = time > 1.506;
+            let gate = arrived && time * 1e-6 < falling;
+            let values = [gate, gate && long, arrived && long, arrived];
             for (node, high) in ["t", "i", "l", "s"].into_iter().zip(values) {
                 checks.push((node.to_owned(), time, loaded(high)));
                 if node != "t" {
@@ -368,24 +445,7 @@ Rsb sb rtn 100
             &source,
             "tran 100n 2.6u\neprint ___D1_Q_STATE __A2_Q_STATE __A3_Q_STATE __D4_Q_STATE\n",
         )?;
-        let mut previous = ["0s"; 4];
-        let mut edges = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        for line in stdout.lines() {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() != 5 {
-                continue;
-            }
-            let Ok(time) = fields[0].parse::<f64>() else {
-                continue;
-            };
-            for (index, value) in fields[1..].iter().enumerate() {
-                if *value != previous[index] {
-                    edges[index].push((time, *value == "1s"));
-                    previous[index] = value;
-                }
-            }
-        }
-        let falling = if long { 2.496e-6 } else { 1.696e-6 };
+        let edges = event_edges(&stdout, [false; 4]);
         let transport = [(1.506e-6, true), (falling, false)];
         let set_only = [(1.506e-6, true)];
         let expected: [&[(f64, bool)]; 4] = [
@@ -394,18 +454,7 @@ Rsb sb rtn 100
             if long { &set_only } else { &[] },
             &set_only,
         ];
-        for (actual, expected) in edges.iter().zip(expected) {
-            ensure!(
-                actual.len() == expected.len(),
-                "wrong event sequence: {edges:?}\n{stdout}"
-            );
-            for ((time, bit), (reference_time, reference_bit)) in actual.iter().zip(expected) {
-                ensure!(
-                    (time - reference_time).abs() < 1e-15 && bit == reference_bit,
-                    "event {time} {bit} != {reference_time} {reference_bit}; sequence={edges:?}"
-                );
-            }
-        }
+        check_edges(&edges, &expected)?;
     }
     Ok(())
 }
@@ -425,6 +474,7 @@ fn main() -> Result<()> {
     advanced_gate_vendor_boundaries_and_trailing_inversions(&runtime)?;
     advanced_latch_vendor_ambiguous_inputs(&runtime)?;
     vendor_timing(&runtime)?;
+    threshold_plateau_and_latch_cancellation(&runtime)?;
     println!("All native ngspice logic regressions passed");
     Ok(())
 }

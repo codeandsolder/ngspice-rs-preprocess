@@ -958,39 +958,6 @@ struct LogicGateSpec {
     mode: LogicGateMode,
 }
 
-/// A receiver emits a logical event at its physical input threshold.
-fn emit_logic_receiver(
-    output: &mut String,
-    io: LogicIo,
-    stem: &str,
-    rtn: &str,
-    label: &str,
-    input: &str,
-    receiver: LogicReceiver,
-) -> Result<String> {
-    let upper = io.threshold + io.hystwd / 2.0;
-    let lower = io.threshold - io.hystwd / 2.0;
-    if !upper.is_finite() || !lower.is_finite() {
-        bail!("SIMPLIS logic thresholds overflow");
-    }
-    let state = format!("__{stem}_{label}_STATE");
-    let model = format!("__{stem}_{label}_RX_M");
-    write!(output, "R__{stem}_RIN_{label} {input} {rtn} ")?;
-    write_number(output, io.rin)?;
-    output.push('\n');
-    writeln!(
-        output,
-        "A__{stem}_{label}_RX %vd({input} {rtn}) {state} {model}"
-    )?;
-    writeln!(
-        output,
-        ".model {model} preprocess_logic_receiver(low={lower:.17e} high={upper:.17e} inverted={} ic={})",
-        receiver.polarity.negative(),
-        u8::from(receiver.initial)
-    )?;
-    Ok(state)
-}
-
 // The numeric discriminants are the interface of preprocess_logic_event,
 // shared with the independent native reference code model.
 #[derive(Clone, Copy, Debug)]
@@ -1027,28 +994,52 @@ struct LogicTiming {
 fn emit_logic_event(
     output: &mut String,
     stem: &str,
-    states: &[String],
+    rtn: &str,
+    inputs: &[String],
+    receivers: &[LogicReceiver],
+    io: LogicIo,
     timing: LogicTiming,
 ) -> Result<String> {
+    let upper = io.threshold + io.hystwd / 2.0;
+    let lower = io.threshold - io.hystwd / 2.0;
+    if !upper.is_finite() || !lower.is_finite() {
+        bail!("SIMPLIS logic thresholds overflow");
+    }
+    if inputs.len() != receivers.len() {
+        bail!("inconsistent logic receiver count");
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        write!(output, "R__{stem}_RIN_I{} {input} {rtn} ", index + 1)?;
+        write_number(output, io.rin)?;
+        output.push('\n');
+    }
     let state = format!("__{stem}_Q_STATE");
     let model = format!("__{stem}_EVENT_M");
-    writeln!(
-        output,
-        "A__{stem}_EVENT [ {} ] {state} {model}",
-        states.join(" ")
-    )?;
+    write!(output, "A__{stem}_EVENT %vd [")?;
+    for input in inputs {
+        write!(output, " {input} {rtn}")?;
+    }
+    writeln!(output, " ] {state} {model}")?;
     write!(
         output,
         ".model {model} preprocess_logic_event(operation={} delay=",
         timing.operation as u8
     )?;
     write_number(output, timing.delay)?;
-    writeln!(
+    write!(
         output,
-        " inertial={} ic={})",
+        " inertial={} ic={} low={lower:.17e} high={upper:.17e} inverted=[",
         timing.inertial,
         u8::from(timing.initial)
     )?;
+    for receiver in receivers {
+        write!(output, " {}", receiver.polarity.negative())?;
+    }
+    output.push_str(" ] rx_ic=[");
+    for receiver in receivers {
+        write!(output, " {}", u8::from(receiver.initial))?;
+    }
+    output.push_str(" ])\n");
     Ok(state)
 }
 
@@ -1092,24 +1083,16 @@ fn emit_logic_output(
 
 fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
     let mut output = String::new();
-    let mut states = Vec::with_capacity(spec.inputs.len());
-    for (index, input) in spec.inputs.iter().enumerate() {
-        let label = format!("I{}", index + 1);
-        let receiver = spec.mode.receiver(spec.kind, index, spec.inputs.len());
-        states.push(emit_logic_receiver(
-            &mut output,
-            spec.io,
-            &spec.stem,
-            &spec.rtn,
-            &label,
-            input,
-            receiver,
-        )?);
-    }
+    let receivers = (0..spec.inputs.len())
+        .map(|index| spec.mode.receiver(spec.kind, index, spec.inputs.len()))
+        .collect::<Vec<_>>();
     let state = emit_logic_event(
         &mut output,
         &spec.stem,
-        &states,
+        &spec.rtn,
+        &spec.inputs,
+        &receivers,
+        spec.io,
         LogicTiming {
             operation: spec.kind.into(),
             delay: spec.io.delay,

@@ -1,14 +1,14 @@
 NAME_TABLE:
 Spice_Model_Name:      preprocess_logic_event
 C_Function_Name:       cm_preprocess_logic_event
-Description:           "Event-timed binary gate or committed SR latch"
+Description:           "Hybrid logic gate with analog input qualification"
 
 PORT_TABLE:
 Port_Name:             in               out
 Description:           "logic inputs"   "logic output"
 Direction:             in               out
-Default_Type:          d                d
-Allowed_Types:         [d]              [d]
+Default_Type:          v                d
+Allowed_Types:         [v,vd]           [d]
 Vector:                yes              no
 Vector_Bounds:         [2 -]            -
 Null_Allowed:          no               no
@@ -22,3 +22,23 @@ Limits:                [0 6]             [0 -]             -               [0 1]
 Vector:                no                no                no              no
 Vector_Bounds:         -                 -                 -               -
 Null_Allowed:          yes               yes               yes             yes
+
+PARAMETER_TABLE:
+Parameter_Name:        low               high
+Description:           "lower threshold" "upper threshold"
+Data_Type:             real              real
+Default_Value:         2                 3
+Limits:                -                 -
+Vector:                no                no
+Vector_Bounds:         -                 -
+Null_Allowed:          yes               yes
+
+PARAMETER_TABLE:
+Parameter_Name:        inverted          rx_ic
+Description:           "invert input"    "initial receiver bit"
+Data_Type:             boolean           int
+Default_Value:         false             0
+Limits:                -                 [0 1]
+Vector:                yes               yes
+Vector_Bounds:         in                in
+Null_Allowed:          yes               yes

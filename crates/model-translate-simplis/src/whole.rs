@@ -3,9 +3,9 @@ use super::{
     CodeModelRuntime, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateMode,
     LogicGateSpec, LogicIo, LogicOperation, LogicOutput, LogicPolarity, LogicReceiver, LogicTiming,
     Point, Translation, TranslationKind, emit_digital_buffer, emit_logic_event, emit_logic_gate,
-    emit_logic_output, emit_logic_receiver, indexed_points, integer_parameter,
-    normalized_statement, numeric_parameter, parse_assignments, sanitized_name, statement_tokens,
-    translate_charge_capacitor, translate_ipwlr, translate_vpwlr, validate_node, write_number,
+    emit_logic_output, indexed_points, integer_parameter, normalized_statement, numeric_parameter,
+    parse_assignments, sanitized_name, statement_tokens, translate_charge_capacitor,
+    translate_ipwlr, translate_vpwlr, validate_node, write_number,
 };
 use crate::alb::{
     KnownTruthTable, StatefulProgram, TimedCombinationalGraph, TimingEnvironment, analyze_body,
@@ -1749,14 +1749,13 @@ fn emit_sr_state(model: &RawDigitalModel, spec: &SrStateSpec<'_>) -> Result<Tran
             initial: false,
         }
     };
-    let states = [
-        emit_logic_receiver(&mut output, io, stem, rtn, "S", set, receiver)?,
-        emit_logic_receiver(&mut output, io, stem, rtn, "R", reset, receiver)?,
-    ];
     let state = emit_logic_event(
         &mut output,
         stem,
-        &states,
+        rtn,
+        inputs,
+        &[receiver; 2],
+        io,
         LogicTiming {
             operation,
             delay: model.delay,
@@ -7673,7 +7672,7 @@ R1 out 0 1k
             translated.required_code_models,
             vec![CodeModelRuntime::Logic]
         );
-        assert!(text.contains("A___DAND_EVENT [ ___DAND_I1_STATE ___DAND_I2_STATE ]"));
+        assert!(text.contains("A___DAND_EVENT %vd [ a 0 b 0 ]"));
         assert!(text.contains("preprocess_logic_event(operation=0"));
         assert!(!text.contains("!DAND"));
         assert!(!text.contains(".MODEL MAND AND2"));

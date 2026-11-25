@@ -18,7 +18,7 @@ fi
 stage="$(mktemp -d "$icm/preprocess_logic_XXXXXXXX")"
 trap 'rm -rf -- "$stage"' EXIT
 module="$(basename -- "$stage")"
-cp -R -- "$source_dir"/{modpath.lst,udnpath.lst,logic_event,logic_receiver,logic_voltage} "$stage/"
+cp -R -- "$source_dir"/{modpath.lst,udnpath.lst,logic_event,logic_voltage} "$stage/"
 make -C "$icm" -j1 CC="$wrapper gcc" cm="$module" "$module/$module.cm"
 mkdir -p -- "$output_dir"
 cp -- "$stage/$module.cm" "$output_dir/ngspice_preprocess_logic.cm"
