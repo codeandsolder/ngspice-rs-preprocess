@@ -122,6 +122,17 @@ and selection origin. Model selections retain the admitted physical line
 span, including continuations. A new alias requires an explicit `LETTER`.
 The analysis plan records consumed model options with the
 `model_selection` disposition; native option emission skips them.
+Selected SIMetrix level-1 diodes are emitted as
+`.model <name> simetrix_diode_level1 (LEVEL=1 ...)`. This is a typed prepared-kernel family, not an alias for
+ordinary ngspice `D`. The consumer must bind the
+[measured level-1 kernel](crates/model-kernel-diode/) through the
+prepared-model ABI. Model fields retain their lexical expressions and
+temperature policies until instance-scoped evaluation. Literal model
+parameters are checked against the kernel schema during preparation;
+unknown physical fields and unsupported levels are rejected. Explicit
+level-3 selection still emits the native level-3 model, and native-deck
+preparation does not substitute the SIMetrix kernel for ordinary `D`.
+
 Selection identifies the intended physical implementation; it does not
 certify numerical equivalence of every parameter or geometry variant.
 Unsupported target implementations, versions, and access letters are

@@ -10,7 +10,10 @@ pub mod artifact;
 mod parameters;
 mod physics;
 
-pub use parameters::{ParameterError, compile_simetrix};
+pub use parameters::{ParameterError, SOURCE_PARAMETERS, compile_simetrix};
+
+/// Explicit model family used by prepared source and the artifact descriptor.
+pub const MODEL_FAMILY: &str = "simetrix_diode_level1";
 pub use physics::{Evaluation, NoiseDensity, PreparedInstance, evaluate_batch};
 
 /// Historical constants measured in `SIMetrix` 9.40d.

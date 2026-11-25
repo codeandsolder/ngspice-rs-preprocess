@@ -59,29 +59,6 @@ impl Default for Grouped {
 }
 
 impl Grouped {
-    fn set(&mut self, name: &str, value: f64) -> bool {
-        let field = match name {
-            "ikf" => {
-                self.ikf = Some(value);
-                return true;
-            }
-            "bv" => {
-                self.bv = Some(value);
-                return true;
-            }
-            "tikf" => &mut self.tikf,
-            "ibv" => &mut self.primary.current,
-            "nbv" => &mut self.primary.emission,
-            "ibvl" => &mut self.low_current.current,
-            "nbvl" => &mut self.low_current.emission,
-            "tbv1" => &mut self.tbv[0],
-            "tbv2" => &mut self.tbv[1],
-            _ => return false,
-        };
-        *field = value;
-        true
-    }
-
     fn finish(self, model: &mut Model) {
         model.high_injection =
             self.ikf
@@ -103,45 +80,96 @@ impl Grouped {
     }
 }
 
-fn set_junction(model: &mut Model, name: &str, value: f64) -> bool {
-    let field = match name {
-        "is" => &mut model.transport.saturation_current,
-        "n" => &mut model.transport.emission,
-        "isr" => &mut model.recombination.saturation_current,
-        "nr" => &mut model.recombination.emission,
-        "cjo" | "cj0" => &mut model.depletion.capacitance,
-        "vj" => &mut model.depletion.potential,
-        "m" => &mut model.depletion.grading,
-        "fc" => &mut model.depletion.forward_coefficient,
-        "tt" => &mut model.transit_time,
-        _ => return false,
+// One name table supplies both the source grammar and the typed compiler.
+macro_rules! source_parameters {
+    ($($variant:ident => $($name:literal)|+),+ $(,)?) => {
+        #[derive(Clone, Copy)]
+        enum SourceParameter { $($variant),+ }
+
+        /// Accepted case-insensitive SIMetrix model fields, including aliases.
+        pub const SOURCE_PARAMETERS: &[&str] = &[$($($name),+),+];
+
+        impl SourceParameter {
+            fn parse(name: &str) -> Option<Self> {
+                match name.to_ascii_lowercase().as_str() {
+                    $($($name)|+ => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
     };
-    *field = value;
-    true
 }
 
-fn set_temperature_and_series(model: &mut Model, name: &str, value: f64) -> bool {
-    let field = match name {
-        "tnom" | "t_measured" => {
-            model.temperature.nominal = value + 273.15;
-            return true;
-        }
-        "t_abs" => {
-            model.temperature.absolute = Some(value + 273.15);
-            return true;
-        }
-        "t_rel_global" => &mut model.temperature.relative,
-        "eg" => &mut model.temperature.energy_gap,
-        "xti" => &mut model.temperature.exponent,
-        "rs" => &mut model.series.resistance,
-        "trs1" => &mut model.series.linear_temperature,
-        "trs2" => &mut model.series.quadratic_temperature,
-        "kf" => &mut model.noise.coefficient,
-        "af" => &mut model.noise.exponent,
-        _ => return false,
-    };
-    *field = value;
-    true
+source_parameters! {
+    Level => "level",
+    Is => "is", N => "n", Isr => "isr", Nr => "nr",
+    Cjo => "cjo" | "cj0", Vj => "vj", M => "m", Fc => "fc", Tt => "tt",
+    Tnom => "tnom" | "t_measured", Tabs => "t_abs", Trel => "t_rel_global",
+    Eg => "eg", Xti => "xti", Rs => "rs", Trs1 => "trs1", Trs2 => "trs2",
+    Kf => "kf", Af => "af", Ikf => "ikf", Tikf => "tikf",
+    Bv => "bv", Ibv => "ibv", Nbv => "nbv", Ibvl => "ibvl", Nbvl => "nbvl",
+    Tbv1 => "tbv1", Tbv2 => "tbv2",
+}
+
+impl SourceParameter {
+    fn apply(
+        self,
+        model: &mut Model,
+        grouped: &mut Grouped,
+        value: f64,
+    ) -> Result<(), ParameterError> {
+        use SourceParameter::*;
+        let field = match self {
+            Level => {
+                if value.to_bits() != 1.0_f64.to_bits() {
+                    return Err(ParameterError::Unsupported(format!("LEVEL={value}")));
+                }
+                return Ok(());
+            }
+            Is => &mut model.transport.saturation_current,
+            N => &mut model.transport.emission,
+            Isr => &mut model.recombination.saturation_current,
+            Nr => &mut model.recombination.emission,
+            Cjo => &mut model.depletion.capacitance,
+            Vj => &mut model.depletion.potential,
+            M => &mut model.depletion.grading,
+            Fc => &mut model.depletion.forward_coefficient,
+            Tt => &mut model.transit_time,
+            Tnom => {
+                model.temperature.nominal = value + 273.15;
+                return Ok(());
+            }
+            Tabs => {
+                model.temperature.absolute = Some(value + 273.15);
+                return Ok(());
+            }
+            Trel => &mut model.temperature.relative,
+            Eg => &mut model.temperature.energy_gap,
+            Xti => &mut model.temperature.exponent,
+            Rs => &mut model.series.resistance,
+            Trs1 => &mut model.series.linear_temperature,
+            Trs2 => &mut model.series.quadratic_temperature,
+            Kf => &mut model.noise.coefficient,
+            Af => &mut model.noise.exponent,
+            Ikf => {
+                grouped.ikf = Some(value);
+                return Ok(());
+            }
+            Tikf => &mut grouped.tikf,
+            Bv => {
+                grouped.bv = Some(value);
+                return Ok(());
+            }
+            Ibv => &mut grouped.primary.current,
+            Nbv => &mut grouped.primary.emission,
+            Ibvl => &mut grouped.low_current.current,
+            Nbvl => &mut grouped.low_current.emission,
+            Tbv1 => &mut grouped.tbv[0],
+            Tbv2 => &mut grouped.tbv[1],
+        };
+        *field = value;
+        Ok(())
+    }
 }
 
 /// Compile already-resolved `SIMetrix` level-1 numeric model parameters.
@@ -161,17 +189,9 @@ pub fn compile_simetrix<'a>(
         if !value.is_finite() {
             return Err(ModelError::Invalid("source parameter").into());
         }
-        let name = original.to_ascii_lowercase();
-        if name == "level" {
-            if value.to_bits() != 1.0_f64.to_bits() {
-                return Err(ParameterError::Unsupported(format!("LEVEL={value}")));
-            }
-        } else if !(grouped.set(&name, value)
-            || set_junction(&mut model, &name, value)
-            || set_temperature_and_series(&mut model, &name, value))
-        {
-            return Err(ParameterError::Unknown(original.to_owned()));
-        }
+        SourceParameter::parse(original)
+            .ok_or_else(|| ParameterError::Unknown(original.to_owned()))?
+            .apply(&mut model, &mut grouped, value)?;
     }
     grouped.finish(&mut model);
     Ok(model.prepare()?)
