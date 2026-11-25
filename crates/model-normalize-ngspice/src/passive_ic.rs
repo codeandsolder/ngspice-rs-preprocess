@@ -171,6 +171,93 @@ fn evaluate(
 }
 
 impl InitialConditions {
+    /// Verify declaration identities against the final emitted electrical artifact.
+    ///
+    /// Translation may replace a source device or flatten its definition.
+    /// Do not let metadata silently bind a missing or ambiguous storage row.
+    ///
+    /// # Errors
+    /// Missing or duplicate device identities, or missing node-hint scope.
+    pub fn validate_artifact(&self, filename: &str, bytes: &[u8]) -> Result<()> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let canonical = |scope: &[String]| {
+            scope
+                .iter()
+                .map(|part| part.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let mut expected = BTreeMap::new();
+        for declaration in self
+            .devices
+            .iter()
+            .filter(|device| device.artifact == filename)
+        {
+            let key = (
+                canonical(&declaration.scope),
+                declaration.device.to_ascii_lowercase(),
+            );
+            ensure!(
+                expected.insert(key, false).is_none(),
+                "duplicate initialization declaration {}",
+                declaration.device
+            );
+        }
+        let node_scopes = self
+            .nodes
+            .iter()
+            .filter(|node| node.artifact == filename)
+            .map(|node| canonical(&node.scope))
+            .collect::<BTreeSet<_>>();
+        if expected.is_empty() && node_scopes.is_empty() {
+            return Ok(());
+        }
+        let mut seen_scopes = BTreeSet::from([Vec::new()]);
+        let mut scope = Vec::new();
+        for statement in crate::lexical::statements(bytes)? {
+            let text = std::str::from_utf8(&statement.text)?;
+            let mut fields = text.split_ascii_whitespace();
+            let Some(first) = fields.next() else { continue };
+            if first.eq_ignore_ascii_case(".subckt") {
+                scope.push(
+                    fields
+                        .next()
+                        .context("unnamed emitted subcircuit")?
+                        .to_ascii_lowercase(),
+                );
+                if node_scopes.contains(&scope) {
+                    seen_scopes.insert(scope.clone());
+                }
+            } else if first.eq_ignore_ascii_case(".ends") {
+                ensure!(scope.pop().is_some(), "unmatched emitted .ends");
+            } else if matches!(
+                first.as_bytes().first().map(u8::to_ascii_uppercase),
+                Some(b'C' | b'L')
+            ) {
+                let key = (scope.clone(), first.to_ascii_lowercase());
+                if let Some(seen) = expected.get_mut(&key) {
+                    ensure!(
+                        !*seen,
+                        "ambiguous emitted initialization target {first} in {scope:?}"
+                    );
+                    *seen = true;
+                }
+            }
+        }
+        for ((scope, device), seen) in expected {
+            ensure!(
+                seen,
+                "missing emitted initialization target {device} in {scope:?} ({filename})"
+            );
+        }
+        ensure!(
+            node_scopes.is_subset(&seen_scopes),
+            "missing emitted node initialization scope in {filename}"
+        );
+        Ok(())
+    }
+}
+
+impl InitialConditions {
     /// Bind root expressions for this enclosing analysis. The caller
     /// supplies its root parameter resolver, including ANALYSIS.
     ///

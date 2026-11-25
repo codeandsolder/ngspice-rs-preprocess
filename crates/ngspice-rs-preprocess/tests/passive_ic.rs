@@ -318,9 +318,21 @@ fn source_policy_preserves_native_path_and_validates_modes() -> Result<()> {
     Ok(())
 }
 
+fn linked_library(
+    bundle: &ngspice_rs_preprocess::PreparedBundle,
+) -> Result<model_normalize_ngspice::parameter_scope::ModelLibrary> {
+    let directory = tempfile::tempdir()?;
+    for artifact in bundle.artifacts() {
+        fs::write(directory.path().join(&artifact.filename), &artifact.bytes)?;
+    }
+    let linked = model_normalize_ngspice::linked_source::SourceLinker::default()
+        .link(&directory.path().join(&bundle.primary.filename))?;
+    model_normalize_ngspice::parameter_scope::ModelLibrary::parse(&linked.bytes)
+}
+
 #[test]
 fn nested_actuals_bind_distinct_initial_conditions_in_emitted_scope() -> Result<()> {
-    use model_normalize_ngspice::parameter_scope::{ModelLibrary, topology::Limits};
+    use model_normalize_ngspice::parameter_scope::topology::Limits;
     let bundle = prepare_fixture("analysis-tran")?;
     let policy = bundle
         .initial_conditions
@@ -333,13 +345,7 @@ fn nested_actuals_bind_distinct_initial_conditions_in_emitted_scope() -> Result<
         .context("missing nested capacitor")?;
     // The hierarchy linker generates hygienic parameter identifiers and
     // definition names. Resolve against the actual emitted declarations.
-    let directory = tempfile::tempdir()?;
-    for artifact in bundle.artifacts() {
-        fs::write(directory.path().join(&artifact.filename), &artifact.bytes)?;
-    }
-    let linked = model_normalize_ngspice::linked_source::SourceLinker::default()
-        .link(&directory.path().join(&bundle.primary.filename))?;
-    let library = ModelLibrary::parse(&linked.bytes)?;
+    let library = linked_library(&bundle)?;
     let topology = library.instantiate(Limits::default())?;
     let mut targets = Vec::new();
     let analysis = Analysis::Transient { uic: false };
@@ -398,6 +404,113 @@ fn typed_bias_paths_disqualify_only_affected_private_loops() -> Result<()> {
         let scales = &result[1].scalings;
         assert_eq!(scales.len(), 1, "{declaration}");
         assert_eq!(scales[0].scope, ["cell2"]);
+    }
+    Ok(())
+}
+
+#[test]
+fn analysis_dependent_alias_and_function_resolve_per_instance() -> Result<()> {
+    use model_normalize_ngspice::parameter_scope::topology::Limits;
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("alias.net");
+    fs::write(&input,b"* analysis-dependent alias witness\n.options INITCONDMODE=2 ICRES={2}\n.param a_mode={IF(ANALYSIS=2,1,0)}\n.func want(x) {IF(ANALYSIS=2,x,0)}\n.subckt cell a b params: start=1\nC1 a b 1u IC={start} BRANCH={want(a_mode)} ICMODE={IF(start>0,1,2)}\n.ends cell\nV1 s 0 10\nR1 s p 1k\nX1 p 0 cell params: start=2\nR2 s q 1k\nX2 q 0 cell params: start=-1\n.tran 1u 5u\n.end\n")?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::SimetrixDeck,
+            input: SourceInput::File(input),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let policy = bundle
+        .initial_conditions
+        .as_ref()
+        .context("missing policy")?;
+    let [device] = policy.devices.as_slice() else {
+        bail!("expected one capacitor declaration")
+    };
+    let library = linked_library(&bundle)?;
+    let topology = library.instantiate(Limits::default())?;
+    for analysis in [
+        Analysis::OperatingPoint,
+        Analysis::Transient { uic: false },
+        Analysis::Ac,
+        Analysis::DcSweep,
+    ] {
+        let defaults = policy.resolve_defaults(|value| {
+            library.evaluate_scalar(0, value, &[(0, "analysis", analysis.source_code())])
+        })?;
+        let mut results = Vec::new();
+        for frame in topology.frames.iter().skip(1) {
+            let mut overrides = frame
+                .overrides
+                .iter()
+                .map(|(name, &value)| (frame.declaration, name.as_str(), value))
+                .collect::<Vec<_>>();
+            overrides.push((0, "analysis", analysis.source_code()));
+            let resolved = device.resolve(analysis, defaults, |value| {
+                library.evaluate_scalar(frame.declaration, value, &overrides)
+            })?;
+            results.push(resolved);
+        }
+        results.sort_by(|a, b| {
+            a.storage_ic
+                .unwrap_or_default()
+                .total_cmp(&b.storage_ic.unwrap_or_default())
+        });
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].storage_ic, Some(-1.));
+        assert_eq!(results[1].storage_ic, Some(2.));
+        match analysis {
+            Analysis::Transient { .. } => {
+                assert_eq!(
+                    results[0].bias,
+                    BiasConstraint::CapacitorHard { voltage: -1. }
+                );
+                assert_eq!(
+                    results[1].bias,
+                    BiasConstraint::CapacitorHard { voltage: 2. }
+                );
+            }
+            Analysis::DcSweep => assert!(
+                results
+                    .iter()
+                    .all(|result| result.bias == BiasConstraint::None)
+            ),
+            _ => {
+                assert_eq!(
+                    results[0].bias,
+                    BiasConstraint::CapacitorSoft {
+                        voltage: -1.,
+                        resistance: 2.
+                    }
+                );
+                assert_eq!(results[1].bias, BiasConstraint::None);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn final_emitted_scope_and_device_must_match_policy() -> Result<()> {
+    let mut policy = InitialConditions::default();
+    let scope = ["cell".to_owned()];
+    let _ = ngspice_rs_preprocess::passive_ic::capture_statement(
+        &mut policy,
+        "model.lib",
+        &scope,
+        "C1 a b 1u IC=1",
+    )?;
+    policy.validate_artifact("model.lib", b".subckt CELL a b\nC1 a b 1u\n.ends\n")?;
+    for invalid in [
+        b".subckt other a b\nC1 a b 1u\n.ends\n".as_slice(),
+        b".subckt cell a b\nC2 a b 1u\n.ends\n".as_slice(),
+        b".subckt cell a b\nC1 a b 1u\nC1 a b 2u\n.ends\n".as_slice(),
+    ] {
+        assert!(policy.validate_artifact("model.lib", invalid).is_err());
     }
     Ok(())
 }

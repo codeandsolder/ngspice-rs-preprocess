@@ -494,6 +494,11 @@ fn linked(
     );
     let mut bundle = bundle(root, request.format, primary, companions);
     bundle.device_identities = device_identities;
+    if let Some(initialization) = &initial_conditions {
+        for artifact in bundle.artifacts() {
+            initialization.validate_artifact(&artifact.filename, &artifact.bytes)?;
+        }
+    }
     bundle.initial_conditions = initial_conditions;
     Ok(bundle)
 }
