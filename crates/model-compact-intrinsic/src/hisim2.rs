@@ -2,13 +2,19 @@
 //! Copyright (C) 2014 Hiroshima University & STARC; see package LICENSE.
 //! Setup parameters retain card units. This is not a nonlinear kernel.
 
+mod junction;
 mod physical;
 mod rules;
+mod temperature;
 
+pub use junction::{
+    JunctionBias, JunctionResult, JunctionResults, PreparedJunctions, prepare_junctions,
+};
 pub use physical::{
     BodyConductance, EffectiveGeometry, PreparedPhysical, SeriesResistance, prepare_physical,
 };
 use std::sync::Arc;
+pub use temperature::{PreparedTemperature, prepare_temperature};
 
 use crate::{
     BoundParameters, ModelError, ModelVariant, MosPolarity, ParameterScope, ParameterValue,
@@ -303,6 +309,7 @@ pub struct PreparedInstance {
     topology: Topology,
     initial_conditions: [f64; 3],
     temperature_kelvin: f64,
+    evaluator_temperature_kelvin: f64,
     model_identity: Arc<()>,
 }
 
@@ -347,6 +354,12 @@ impl PreparedInstance {
     #[must_use = "temperature selects temperature-dependent physical laws"]
     pub const fn temperature_kelvin(&self) -> f64 {
         self.temperature_kelvin
+    }
+
+    /// Circuit temperature plus DTEMP, used by the source depletion-capacitance law.
+    #[must_use = "junction capacitance temperature differs from the setup temperature"]
+    pub const fn evaluator_temperature_kelvin(&self) -> f64 {
+        self.evaluator_temperature_kelvin
     }
 }
 
@@ -520,6 +533,10 @@ pub fn prepare_instance(
         circuit_temperature_kelvin
     };
     let temperature_kelvin = positive(base + real(&parameters, "dtemp")?, "device temperature")?;
+    let evaluator_temperature_kelvin = positive(
+        circuit_temperature_kelvin + real(&parameters, "dtemp")?,
+        "evaluator temperature",
+    )?;
     Ok(PreparedInstance {
         parameters,
         given: given_bits(source),
@@ -528,6 +545,7 @@ pub fn prepare_instance(
         topology,
         initial_conditions,
         temperature_kelvin,
+        evaluator_temperature_kelvin,
         model_identity: Arc::clone(&model.identity),
     })
 }

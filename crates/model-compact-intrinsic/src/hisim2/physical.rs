@@ -155,10 +155,11 @@ fn series(
 ) -> Result<SeriesResistance, ModelError> {
     let sheet = real(model, "rsh")?;
     let specific = real(model, resistance_name)?;
-    let mut r = 0.0;
-    if sheet > 0.0 {
-        r = sheet * real(instance, square_name)?;
-    }
+    let mut r = if sheet > 0.0 {
+        sheet * real(instance, square_name)?
+    } else {
+        0.0
+    };
     if specific > 0.0 {
         r += specific / geometry.total_width_m;
     }
