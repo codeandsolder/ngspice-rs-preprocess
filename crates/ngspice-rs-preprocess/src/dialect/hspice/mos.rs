@@ -26,6 +26,23 @@ pub struct Options {
 }
 
 impl Options {
+    pub fn rewrite(
+        &self,
+        mut bind: impl FnMut(&str) -> Result<String>,
+        budget: &WorkBudget,
+    ) -> Result<Self> {
+        let values = self
+            .values
+            .iter()
+            .map(|(name, value)| {
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                budget.charge(Resource::EmittedBytes, name.len())?;
+                Ok((name.clone(), bind(value)?))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { values })
+    }
+
     pub fn set(&mut self, name: &str, value: &str, budget: &WorkBudget) -> Result<()> {
         let value = lower_spice_expression(
             value,
