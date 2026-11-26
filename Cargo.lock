@@ -180,6 +180,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-kernel-bsim"
+version = "0.1.0"
+dependencies = [
+ "model-compact-intrinsic",
+ "model-kernel-api",
+]
+
+[[package]]
 name = "model-kernel-diode"
 version = "0.1.0"
 dependencies = [

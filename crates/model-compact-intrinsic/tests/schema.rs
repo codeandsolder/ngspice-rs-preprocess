@@ -55,6 +55,12 @@ fn source_catalogs_are_sorted_unique_and_have_dense_canonical_slots() {
         (393, 16),
         (470, 25),
         (87, 25),
+        (81, 14),
+        (137, 14),
+        (354, 12),
+        (367, 12),
+        (428, 15),
+        (429, 19),
     ];
     for (variant, (model_count, instance_count)) in VARIANTS.into_iter().zip(expected_counts) {
         for (scope, count) in [
@@ -305,6 +311,77 @@ fn candidate_binding_is_independent_and_bad_inputs_fail_closed() -> Result<(), M
             [("ic", ParameterValue::RealVector(vec![1.0, f64::INFINITY]))]
         ),
         Err(ModelError::NonFinite("ic".to_owned()))
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_bsim_exact_source_family_and_setter_schema() -> Result<(), ModelError> {
+    use ModelVariant::{Bsim1, Bsim2, Bsim3V0, Bsim3V1, Bsim3V32, Bsim3V33};
+    use ParameterScope::{Instance, Model};
+    assert_eq!(ModelVariant::from_level_version(4, None)?, Bsim1);
+    assert_eq!(ModelVariant::from_level_version(5, None)?, Bsim2);
+    for level in [8, 49] {
+        for (version, variant) in [
+            (None, Bsim3V33),
+            (Some("default"), Bsim3V33),
+            (Some("3.0.0"), Bsim3V0),
+            (Some("3.1"), Bsim3V1),
+            (Some("3.2.4"), Bsim3V32),
+            (Some("3.3.0"), Bsim3V33),
+        ] {
+            assert_eq!(ModelVariant::from_level_version(level, version)?, variant);
+        }
+        assert_eq!(
+            ModelVariant::from_level_version(level, Some("4.8.3")),
+            Err(ModelError::UnknownBsim3Version("4.8.3".into()))
+        );
+    }
+    for variant in [Bsim1, Bsim2, Bsim3V0, Bsim3V1, Bsim3V32, Bsim3V33] {
+        assert_eq!(variant.terminals(), ["Drain", "Gate", "Source", "Bulk"]);
+        assert_eq!(
+            variant.parameter(Instance, "ic").map(|spec| spec.kind),
+            Some(ParameterType::RealVector)
+        );
+        assert!(variant.parameter(Instance, "gm").is_none());
+    }
+    for variant in [Bsim3V0, Bsim3V1, Bsim3V32, Bsim3V33] {
+        let slot = variant
+            .parameter(Model, "vth0")
+            .ok_or_else(|| ModelError::UnknownParameter("vth0".into()))?
+            .slot;
+        assert_eq!(
+            variant.parameter(Model, "vtho").map(|spec| spec.slot),
+            Some(slot)
+        );
+        let bound = BoundParameters::bind(
+            variant,
+            Model,
+            [
+                ("VTH0", ParameterValue::Real(0.4)),
+                ("vtho", ParameterValue::Real(0.7)),
+            ],
+        )?;
+        assert_eq!(bound.get_slot(slot), Some(&ParameterValue::Real(0.7)));
+        assert!(variant.parameter(Model, "capmod").is_some());
+        assert!(variant.parameter(Instance, "nqsmod").is_some());
+        assert_eq!(
+            variant.parameter(Instance, "acnqsmod").is_some(),
+            variant == Bsim3V33
+        );
+    }
+    assert!(Bsim3V0.parameter(Model, "version").is_none());
+    assert_eq!(
+        Bsim3V1.parameter(Model, "version").map(|spec| spec.kind),
+        Some(ParameterType::Real)
+    );
+    assert_eq!(
+        Bsim3V32.parameter(Model, "version").map(|spec| spec.kind),
+        Some(ParameterType::Text)
+    );
+    assert_eq!(
+        Bsim3V33.parameter(Model, "version").map(|spec| spec.kind),
+        Some(ParameterType::Text)
     );
     Ok(())
 }
