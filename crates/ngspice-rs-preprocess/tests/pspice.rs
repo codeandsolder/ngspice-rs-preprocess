@@ -737,3 +737,72 @@ quit
     }
     Ok(())
 }
+
+#[test]
+fn laplace_source_dialects_preserve_rational_numerator_and_poles() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    for (name, format, voltage, current) in [
+        (
+            "pspice",
+            InputFormat::PspiceDeck,
+            "E1 out 0 LAPLACE {V(in,ref)} = {(2+3*s*tau)/(1+2*s*tau+(s*tau)^2)}",
+            "G1 gout 0 LAPLACE {V(in,ref)} = {(2+3*s*tau)/(1+2*s*tau+(s*tau)^2)}",
+        ),
+        (
+            "simetrix",
+            InputFormat::SimetrixDeck,
+            "E1 out 0 LAPLACE {V(in,ref)} {(2+3*s*tau)/(1+2*s*tau+(s*tau)^2)}",
+            "G1 gout 0 LAPLACE {V(in,ref)} {(2+3*s*tau)/(1+2*s*tau+(s*tau)^2)}",
+        ),
+        (
+            "ltspice",
+            InputFormat::NativeDeck,
+            "E1 out 0 in ref Laplace=(2+3*s*tau)/(1+2*s*tau+(s*tau)^2)",
+            "G1 gout 0 in ref Laplace=(2+3*s*tau)/(1+2*s*tau+(s*tau)^2)",
+        ),
+    ] {
+        let path = directory.path().join(format!("{name}.cir"));
+        let source = format!(
+            "* Rational transfer syntax\n.param tau=1m\nV1 in ref dc 1 ac 1\nVref ref 0 3\n{voltage}\n{current}\nR1 out 0 1k\nRg gout 0 1\n.end\n"
+        );
+        fs::write(&path, &source)?;
+        let prepared =
+            prepare_source(&path, format).with_context(|| format!("preparing {name}"))?;
+        let native = std::str::from_utf8(&prepared.primary.bytes)?;
+        assert!(native.contains("s_xfer"), "{name}: {native}");
+        assert!(
+            !native.to_ascii_lowercase().contains(" laplace"),
+            "{name}: {native}"
+        );
+        // The analysis harness is deliberately native and independent of
+        // the source dialect's analysis declaration projection.
+        let native = format!(
+            "{}.control\nset wr_singlescale\nset wr_vecnames\nac lin 5 100 500\nwrdata response.dat v(out) v(gout)\nquit\n.endc\n.end\n",
+            native
+                .strip_suffix(".end\n")
+                .context("missing native terminator")?
+        );
+        let result = rows(&directory.path().join(name), native.as_bytes(), false)
+            .with_context(|| format!("native {name}: {native}"))?;
+        if let Some(values) = result {
+            assert_eq!(values.len(), 5);
+            for row in values {
+                let [frequency, real, imaginary, current_real, current_imaginary] = row.as_slice()
+                else {
+                    anyhow::bail!("unexpected AC row {row:?}");
+                };
+                // Evaluate the second-order rational function independently at s=jω.
+                let omega = std::f64::consts::TAU * frequency * 0.001;
+                let dr = 1. - omega * omega;
+                let di = 2. * omega;
+                let ni = 3. * omega;
+                let scale = dr.mul_add(dr, di * di);
+                close(*real, 2.0_f64.mul_add(dr, ni * di) / scale);
+                close(*imaginary, ni.mul_add(dr, -2. * di) / scale);
+                close(*current_real, -*real);
+                close(*current_imaginary, -*imaginary);
+            }
+        }
+    }
+    Ok(())
+}

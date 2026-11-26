@@ -364,11 +364,11 @@ fn parse_with_layout(statement: &str) -> Result<Option<(ControlledTransfer, bool
         } else if eq(keyword, "freq") && !ordinary_control_tail(tail) {
             let (control, transfer) = frequency(tail)?;
             (*third, control, transfer, false)
-        } else if eq(keyword, "laplace") && !(tail.len() == 2 && !tail[0].starts_with(['{', '='])) {
-            let (control, transfer) = laplace(tail, false)?;
-            (*third, control, transfer, false)
         } else if rest.len() > 3 && rest.get(2).is_some_and(|s| eq(s, "laplace")) {
             let (control, transfer) = laplace(rest, true)?;
+            (*third, control, transfer, false)
+        } else if eq(keyword, "laplace") && (tail.len() != 2 || tail[0].starts_with(['{', '='])) {
+            let (control, transfer) = laplace(tail, false)?;
             (*third, control, transfer, false)
         } else if rest.len() > 3 && rest.get(2).is_some_and(|s| eq(s, "table")) {
             let (control, transfer, wrapped) = table(rest, true, output)?;

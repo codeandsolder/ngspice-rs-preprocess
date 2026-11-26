@@ -54,7 +54,16 @@ fn structural_polynomial_arithmetic_preserves_scoped_coefficients() -> Result<()
         (vec![1., 3., 2.], vec![1., 5., 6.])
     );
     let source = card("Efilter out 0 in 0 Laplace={g/(1+s/p)}")?;
-    assert_eq!(resolve(&source, 2., 3.)?, (vec![6.], vec![1., 2.]));
+    assert_eq!(resolve(&source, 2., 3.)?, (vec![3.], vec![0.5, 1.]));
+    assert!(resolve(&source, 0., 3.).is_err());
+    let source = card("Efilter out 0 laplace ref LAPLACE={1/(s+1)}")?;
+    assert_eq!(
+        source.control,
+        Control::Differential {
+            positive: "laplace".into(),
+            negative: "ref".into()
+        }
+    );
     Ok(())
 }
 
@@ -70,6 +79,8 @@ fn malformed_or_nonrational_forms_fail_without_changing_ordinary_sources() -> Re
         "E1 out 0 LAPLACE {v(in)} =",
         "E1 out 0 in 0 Laplace={1/(s^257+1)}",
         "E1 out 0 in 0 Laplace={1/(s+1)+1/0}",
+        "E1 out 0 in 0 Laplace={0*(1/0)*s}",
+        "E1 out 0 in 0 Laplace={1/(1e-200*s*1e-200+1)}",
         "E1 out 0 in 0 Laplace={1/(s+1}",
     ] {
         assert!(parse(text).is_err(), "{text}");
@@ -109,7 +120,7 @@ fn lowering_keeps_scope_branch_names_source_lines_and_collision_free_ids() -> Re
     let repeated = normalize_mapped(&result.model.bytes, RootKind::Deck)?;
     assert_eq!(repeated.model.bytes, result.model.bytes);
     let bad = normalize_mapped(
-        b"title\nR1 a 0 1k\nE1 b 0 a 0 Laplace={exp(-s)}\n.end\n",
+        b"title\nL1 a 0 1m Rser=1\nE1 b 0 a 0 Laplace={exp(-s)}\n.end\n",
         RootKind::Deck,
     );
     assert!(format!("{:#}", bad.err().context("expected positioned failure")?).contains("line 3"));

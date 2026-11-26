@@ -18,10 +18,9 @@ impl Scalar {
     }
 
     fn from_expr(expr: &Expr) -> Result<Self> {
-        Ok(match expr.known_value()? {
-            Some(value) => Self::number(value),
-            None => Self(scalar_text(expr)),
-        })
+        Ok(expr
+            .known_value()?
+            .map_or_else(|| Self(scalar_text(expr)), Self::number))
     }
 
     fn zero() -> Self {
@@ -46,11 +45,21 @@ impl Scalar {
                 "+" => left + right,
                 "-" => left - right,
                 "*" => left * right,
+                "/" => {
+                    ensure!(right != 0., "zero Laplace scalar divisor");
+                    left / right
+                }
                 _ => bail!("invalid polynomial operation"),
             };
-            if value.is_finite() {
-                return Ok(Self::number(value));
-            }
+            ensure!(
+                value.is_finite(),
+                "non-finite Laplace polynomial coefficient"
+            );
+            ensure!(
+                !matches!(op, "*" | "/") || left == 0. || right == 0. || value != 0.,
+                "Laplace polynomial coefficient underflow"
+            );
+            return Ok(Self::number(value));
         }
         match op {
             "+" if self.is_zero() => return Ok(rhs.clone()),
@@ -230,9 +239,9 @@ impl Rational {
         // The range and integrality are checked above.
         #[expect(
             clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "integer range and sign checked above"
+            reason = "integer range checked above"
         )]
+        #[expect(clippy::cast_sign_loss, reason = "absolute value is nonnegative")]
         let mut exponent = value.abs() as usize;
         let mut result = Self::constant(Scalar::one());
         while exponent != 0 {
@@ -264,6 +273,14 @@ impl Rational {
                 Self::compile(left)?.add(op, &Self::compile(right)?)
             }
             Expr::Binary("*", left, right) => Self::compile(left)?.multiply(&Self::compile(right)?),
+            Expr::Binary("/", left, right) if !contains_s(right) => {
+                // Keep scalar division in the coefficient domain. Clearing a
+                // parameter-valued scalar divisor could otherwise make an
+                // undefined instance (e.g. p=0 in s/p) appear valid.
+                let divisor = Scalar::from_expr(right)?;
+                let reciprocal = Scalar::one().binary("/", &divisor)?;
+                Self::compile(left)?.multiply(&Self::constant(reciprocal))
+            }
             Expr::Binary("/", left, right) => {
                 Self::compile(left)?.multiply(&Self::compile(right)?.reciprocal()?)
             }
@@ -276,7 +293,7 @@ impl Rational {
 /// Extract descending numerator and denominator coefficient expressions from
 /// a proper rational transfer. The scalar subexpressions retain lexical
 /// parameter names and are bound by the native model at occurrence preparation.
-pub(crate) fn coefficients(raw: &str) -> Result<(Vec<String>, Vec<String>)> {
+pub fn coefficients(raw: &str) -> Result<(Vec<String>, Vec<String>)> {
     let expression = SpiceExpression::parse(raw)?;
     let result = Rational::compile(&expression.0)?;
     ensure!(!result.denominator.is_zero(), "zero Laplace denominator");

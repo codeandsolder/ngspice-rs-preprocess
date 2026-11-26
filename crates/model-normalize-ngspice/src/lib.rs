@@ -669,27 +669,33 @@ fn normalize_body(
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
-    let mut origins = Vec::new();
-    let mut previous = inserted_lines.iter().copied().peekable();
-    for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
-        while previous.peek() == Some(&line) {
+    let origins = if inserted_lines.is_empty() {
+        None
+    } else {
+        let mut origins = Vec::new();
+        let mut previous = inserted_lines.iter().copied().peekable();
+        for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
+            while previous.peek() == Some(&line) {
+                origins.push(line);
+                previous.next();
+            }
             origins.push(line);
-            previous.next();
         }
-        origins.push(line);
-    }
-    if let Some(lowered) = controlled_transfer::lower_sources(&bytes, |line| {
-        origins
-            .get(line - 1)
-            .map(|line| line + title_lines)
-            .context("missing transfer source line")
-    })? {
+        Some(origins)
+    };
+    let original_line = |line: usize| {
+        origins.as_ref().map_or(Ok(line), |mapping| {
+            mapping
+                .get(line - 1)
+                .copied()
+                .context("missing transfer source line")
+        })
+    };
+    if let Some(lowered) =
+        controlled_transfer::lower_sources(&bytes, |line| Ok(original_line(line)? + title_lines))?
+    {
         for line in lowered.inserted_lines {
-            inserted_lines.push(
-                *origins
-                    .get(line - 1)
-                    .context("missing transfer source line")?,
-            );
+            inserted_lines.push(original_line(line)?);
         }
         inserted_lines.sort_unstable();
         bytes = lowered.bytes;
