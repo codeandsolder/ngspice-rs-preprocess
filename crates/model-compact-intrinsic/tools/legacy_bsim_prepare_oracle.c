@@ -9,6 +9,8 @@
 #include "ngspice/cktdefs.h"
 #include "bsim1def.h"
 #include "bsim2def.h"
+#include "ngspice/trandefs.h"
+#include "ngspice/const.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +24,11 @@ extern int B2param(int, IFvalue *, GENinstance *, IFvalue *);
 extern int B1temp(GENmodel *, CKTcircuit *);
 extern int B2temp(GENmodel *, CKTcircuit *);
 
+double CONSTvt0 = CONSTboltz * REFTEMP / CHARGE;
+extern void B1evaluate(double, double, double, B1instance *, B1model *,
+    double *, double *, double *, double *, double *, double *,
+    double *, double *, double *, double *, double *, double *,
+    double *, double *, double *, double *, double *, double *, CKTcircuit *);
 IFfrontEnd *SPfrontEnd;
 void *tmalloc(size_t size) { return calloc(1, size); }
 void txfree(const void *p) { free((void *)p); }
@@ -65,12 +72,24 @@ static int inputs(int family, GENmodel *model, GENinstance *instance) {
 
 #define OUT(name, value) printf("%s %.17g\n", name, (double)(value))
 
-static int bsim1(void) {
+static int bsim1(int argc, char **argv) {
     B1model model = {0};
     B1instance device = {0};
     model.gen.GENinstances = (GENinstance *)&device;
     if (inputs(1, (GENmodel *)&model, (GENinstance *)&device)) return 1;
     if (B1temp((GENmodel *)&model, NULL)) return 1;
+    if (argc == 5) {
+        CKTcircuit ckt = {0};
+        ckt.CKTmode = MODEAC;
+        double drain = strtod(argv[2], NULL), gate = strtod(argv[3], NULL), bulk = strtod(argv[4], NULL);
+        double gm, gds, gmbs, qg, qb, qd, caps[9], id, von, sat;
+        B1evaluate(drain, bulk, gate, &device, &model, &gm, &gds, &gmbs,
+            &qg, &qb, &qd, &caps[0], &caps[1], &caps[2], &caps[3], &caps[4],
+            &caps[5], &caps[6], &caps[7], &caps[8], &id, &von, &sat, &ckt);
+        printf("%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+            drain, gate, bulk, id, qd, qg, qb, von, sat);
+        return 0;
+    }
     OUT("oxide_density", model.B1Cox * 1e4);
     OUT("oxide_charge", model.B1Cox * (device.B1l - model.B1deltaL * 1e-6) * (device.B1w - model.B1deltaW * 1e-6) * 1e4);
     OUT("threshold", device.B1vt0);
@@ -173,8 +192,8 @@ static int bsim2(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
-    if (strcmp(argv[1], "1") == 0) return bsim1();
-    if (strcmp(argv[1], "2") == 0) return bsim2();
+    if (argc != 2 && argc != 5) return 2;
+    if (strcmp(argv[1], "1") == 0) return bsim1(argc, argv);
+    if (argc == 2 && strcmp(argv[1], "2") == 0) return bsim2();
     return 2;
 }

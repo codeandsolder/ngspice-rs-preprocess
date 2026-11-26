@@ -5,7 +5,13 @@
 //! Thomas L. Quarles (BSIM1), Min-Chie Jeng (BSIM2). See the package license.
 //! No topology, history, model-name resolution or circuit rows belong here.
 
+mod bsim1;
 mod coefficients;
+mod differential;
+
+pub use bsim1::{
+    BSIM1_REFERENCE_THERMAL_VOLTAGE, Bsim1Bias, Bsim1IntrinsicPoint, evaluate_bsim1_intrinsic,
+};
 
 pub use coefficients::{Bsim1Coefficients, Bsim2Coefficients, LegacyBsimChannel};
 

@@ -102,8 +102,11 @@ fn coefficients(device: &PreparedLegacyBsimInstance) -> BTreeMap<String, f64> {
     values
 }
 
-fn check_fixture(variant: ModelVariant, fixture: &str) -> TestResult {
-    let (input, reference) = fixture
+fn prepare_fixture(
+    variant: ModelVariant,
+    fixture: &str,
+) -> Result<PreparedLegacyBsimInstance, Box<dyn std::error::Error>> {
+    let (input, _) = fixture
         .split_once("\n--\n")
         .ok_or("missing fixture separator")?;
     let mut model = Vec::new();
@@ -135,6 +138,15 @@ fn check_fixture(variant: ModelVariant, fixture: &str) -> TestResult {
     )?)?;
     let source = BoundParameters::bind(variant, ParameterScope::Instance, instance)?;
     let prepared = model.prepare_instance(&source)?;
+    assert_eq!(prepared, model.prepare_instance(&source)?);
+    Ok(prepared)
+}
+
+fn check_fixture(variant: ModelVariant, fixture: &str) -> TestResult {
+    let (_, reference) = fixture
+        .split_once("\n--\n")
+        .ok_or("missing fixture separator")?;
+    let prepared = prepare_fixture(variant, fixture)?;
     let mut actual = coefficients(&prepared);
     for line in reference.lines() {
         let (name, expected) = line.split_once(' ').ok_or("missing reference value")?;
@@ -145,7 +157,6 @@ fn check_fixture(variant: ModelVariant, fixture: &str) -> TestResult {
         close(name, observed, expected);
     }
     assert!(actual.is_empty(), "uncompared prepared fields: {actual:?}");
-    assert_eq!(prepared, model.prepare_instance(&source)?);
     Ok(())
 }
 
@@ -347,5 +358,176 @@ fn complete_model_defaults_match_ngspice_showmod() -> TestResult {
         }
         assert_eq!(checked, count);
     }
+    Ok(())
+}
+
+fn check_bsim1_channel(fixture: &str, points: &str) -> TestResult {
+    use model_compact_intrinsic::{Bsim1Bias, evaluate_bsim1_intrinsic};
+    let prepared = prepare_fixture(ModelVariant::Bsim1, fixture)?;
+    let mut count = 0;
+    for line in points.lines().filter(|line| !line.starts_with('#')) {
+        let values = line
+            .split_whitespace()
+            .map(str::parse::<f64>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let [vds, vgs, vbs, id, qd, qg, qb, von, sat]: [f64; 9] = values
+            .try_into()
+            .map_err(|_| "wrong reference row length")?;
+        let bias = Bsim1Bias { vds, vgs, vbs };
+        let point = evaluate_bsim1_intrinsic(&prepared, bias)?;
+        for (label, actual, expected, absolute) in [
+            ("Id", point.drain_current, id, 1e-22),
+            ("Qd", point.charge[0], qd, 1e-28),
+            ("Qg", point.charge[1], qg, 1e-28),
+            ("Qb", point.charge[3], qb, 1e-28),
+            ("Von", point.threshold, von, 1e-14),
+            ("Vdsat", point.saturation_voltage, sat, 1e-14),
+        ] {
+            let tolerance = 3e-12 * expected.abs() + absolute;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "{bias:?} {label}: {actual:.17e} != {expected:.17e}"
+            );
+        }
+        let norm: f64 = point.charge.iter().map(|q| q.abs()).sum();
+        assert!(point.charge.iter().sum::<f64>().abs() <= 2e-15 * norm);
+        for column in 0..3 {
+            let sum = point.capacitance.iter().map(|row| row[column]).sum::<f64>();
+            let norm = point
+                .capacitance
+                .iter()
+                .map(|row| row[column].abs())
+                .sum::<f64>();
+            assert!(sum.abs() <= 2e-15 * norm);
+        }
+        count += 1;
+    }
+    assert_eq!(count, 108);
+    Ok(())
+}
+
+#[test]
+fn bsim1_channel_and_both_charge_partitions_match_original_c() -> TestResult {
+    check_bsim1_channel(
+        include_str!("fixtures/legacy-bsim/bsim1-ordinary.txt"),
+        include_str!("fixtures/legacy-bsim/bsim1-channel-ordinary.txt"),
+    )?;
+    check_bsim1_channel(
+        include_str!("fixtures/legacy-bsim/bsim1-wide.txt"),
+        include_str!("fixtures/legacy-bsim/bsim1-channel-wide.txt"),
+    )
+}
+
+#[test]
+fn bsim1_channel_jacobians_differentiate_the_actual_constitutive_law() -> TestResult {
+    use model_compact_intrinsic::{Bsim1Bias, evaluate_bsim1_intrinsic};
+    let h = 1e-5;
+    for fixture in [
+        include_str!("fixtures/legacy-bsim/bsim1-ordinary.txt"),
+        include_str!("fixtures/legacy-bsim/bsim1-wide.txt"),
+    ] {
+        let prepared = prepare_fixture(ModelVariant::Bsim1, fixture)?;
+        for vds in [0.03, 0.23, 0.91, 4.2, 6.2] {
+            for vgs in [-1.7, -0.33, 0.27, 0.67, 1.29, 2.57] {
+                for vbs in [-1.9, -0.37, 0.07] {
+                    let bias = Bsim1Bias { vds, vgs, vbs };
+                    let point = evaluate_bsim1_intrinsic(&prepared, bias)?;
+                    for column in 0..3 {
+                        let sample = |delta: f64| {
+                            let mut shifted = [vds, vgs, vbs];
+                            shifted[column] += delta;
+                            evaluate_bsim1_intrinsic(
+                                &prepared,
+                                Bsim1Bias {
+                                    vds: shifted[0],
+                                    vgs: shifted[1],
+                                    vbs: shifted[2],
+                                },
+                            )
+                        };
+                        let [a, b, c, d] =
+                            [sample(-2. * h)?, sample(-h)?, sample(h)?, sample(2. * h)?];
+                        let derivative =
+                            |a: f64, b: f64, c: f64, d: f64| ((c - b) * 8. - (d - a)) / (12. * h);
+                        let expected = derivative(
+                            a.drain_current,
+                            b.drain_current,
+                            c.drain_current,
+                            d.drain_current,
+                        );
+                        let actual = point.conductance[column];
+                        assert!(
+                            (actual - expected).abs() <= 3e-7 * expected.abs() + 1e-12,
+                            "{bias:?} column {column} dI: {actual:e} != {expected:e}"
+                        );
+                        for row in 0..4 {
+                            let expected = derivative(
+                                a.charge[row],
+                                b.charge[row],
+                                c.charge[row],
+                                d.charge[row],
+                            );
+                            let actual = point.capacitance[row][column];
+                            assert!(
+                                (actual - expected).abs() <= 3e-7 * expected.abs() + 1e-20,
+                                "{bias:?} column {column} row {row} dQ: {actual:e} != {expected:e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn bsim1_large_inversion_and_zero_mobility_limits_are_finite() -> TestResult {
+    use model_compact_intrinsic::{Bsim1Bias, evaluate_bsim1_intrinsic};
+    let fixture = include_str!("fixtures/legacy-bsim/bsim1-ordinary.txt");
+    let prepared = prepare_fixture(ModelVariant::Bsim1, fixture)?;
+    let high = evaluate_bsim1_intrinsic(
+        &prepared,
+        Bsim1Bias {
+            vds: 1.,
+            vgs: 100.,
+            vbs: -0.2,
+        },
+    )?;
+    assert!(high.drain_current.is_finite());
+    let mut zero = prepared.clone();
+    if let LegacyBsimChannel::Bsim1(channel) = &mut zero.channel {
+        channel.beta_zero = [0.; 2];
+        channel.beta_vdd = [0.; 3];
+        channel.k1 = 0.;
+    }
+    for vgs in [-2., -0.5, 0.2, 100.] {
+        let point = evaluate_bsim1_intrinsic(
+            &zero,
+            Bsim1Bias {
+                vds: 1.,
+                vgs,
+                vbs: -0.2,
+            },
+        )?;
+        assert!(point.drain_current.abs() < f64::MIN_POSITIVE);
+        assert!(
+            point
+                .conductance
+                .iter()
+                .all(|x| x.abs() < f64::MIN_POSITIVE)
+        );
+    }
+    assert!(
+        evaluate_bsim1_intrinsic(
+            &prepared,
+            Bsim1Bias {
+                vds: -1.,
+                vgs: 0.,
+                vbs: 0.
+            }
+        )
+        .is_err()
+    );
     Ok(())
 }
