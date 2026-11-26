@@ -889,3 +889,16 @@ The API does not yet provide nonlinear terminal currents or charges.
 Source references: `soi3/{soi3set,soi3temp,soi3mpar,soi3par,soi3mask,soi3ask}.c`.
 STAG's separate DERA licence and original notices are in the package
 LICENSE.
+
+The SOI3 prepared instance also exposes its two-diode junction law,
+including parasitic BJT transport, GMIN, voltage and temperature Newton
+tangents, and integrated depletion charge and capacitance. Charge is
+continuous across FC*PB and has a finite logarithmic limit at MJ=1.
+The caller supplies the limited thermal rise: the native solver clamps
+negative thermal-node values before evaluation. The voltage/temperature
+Newton tangents retain the native overflow-guard slope convention.
+The native qualification uses DC for current and conductance and
+transient for depletion charge and capacitance (native transient current
+and conductance include the integration companion). Across both
+polarities, DVT modes and ambient/thermal-rise combinations, 100 DC and
+889 transient rows agree in 3,956 scalar comparisons.
