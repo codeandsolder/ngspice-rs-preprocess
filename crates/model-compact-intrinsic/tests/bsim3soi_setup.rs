@@ -510,3 +510,6 @@ mod leakage;
 #[cfg(target_os = "linux")]
 #[path = "bsim3soi_setup/pd_thermal.rs"]
 mod pd_thermal;
+
+#[path = "bsim3soi_setup/depleted.rs"]
+mod depleted;

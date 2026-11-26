@@ -1016,3 +1016,25 @@ checks 180 channel/threshold/saturation/junction values over -20 to +60 K
 relative to ambient. `accepted_surface_potential` computes the predictor's
 next surface potential from the last accepted temperature, without mutating
 trial state. The solver owns the predictor and source/drain reversal.
+
+The FD/DD 2.1 depletion electrostatic evaluator is exposed through
+`PhysicalTemperature.depleted_electrostatics`. It preserves the model-level
+silicon film and buried-oxide capacitances, effective film correction, binned
+backgate coupling, equilibrium threshold, inversion-induced body-potential
+shift and the smoothed contact/diode/effective body potentials. FD takes the
+diode-body potential directly from the depletion equilibrium; DD retains
+its independent body voltage through the source's smooth lower bound.
+The common threshold and poly-depletion primitives are shared with PD,
+but preserve the 34 versus 100 exponent cutoffs and PD's extended
+surface-potential root. The result carries analytic derivatives with
+respect to VGS, VDS, VBS, VES, VPS and temperature. Self-heated trial
+evaluation freezes caller-owned accepted surface potential.
+
+The independent native matrix verifies 16,848 equilibrium-body,
+diode-body, effective-body and threshold voltages across both families
+and polarities, with maximum absolute error 1.78e-15 V. A further
+77,760 central-difference checks qualify all six analytic coordinates,
+including independently varying backgate and body-contact bias,
+self-heating, nonzero film correction and poly depletion. Negative
+substrate doping uses explicit K1/K2 (otherwise the native default
+gamma2 derivation is not real-valued).

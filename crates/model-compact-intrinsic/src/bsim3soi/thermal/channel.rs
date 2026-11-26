@@ -5,6 +5,7 @@ mod leakage;
 mod threshold;
 mod transport;
 
+use super::channel_threshold::{Threshold, ThresholdGeometry};
 use super::{Context, Electrostatics, K_OVER_Q, Transport, differential::Differential};
 use crate::{
     ModelError,
@@ -12,7 +13,6 @@ use crate::{
 };
 use leakage::Leakage;
 pub use leakage::{PdCurrent, PdLeakage};
-use threshold::Threshold;
 use transport::ChannelTransport;
 
 type D = Differential<4>;
@@ -89,6 +89,7 @@ pub struct PreparedPdChannel {
     electrostatics: Electrostatics,
     transport: Transport,
     threshold: Threshold,
+    threshold_geometry: ThresholdGeometry,
     channel: ChannelTransport,
     leakage: Leakage,
     temperature: TemperatureCoefficients,
@@ -117,6 +118,7 @@ impl PreparedPdChannel {
             electrostatics,
             transport,
             threshold: Threshold::prepare(c)?,
+            threshold_geometry: ThresholdGeometry::prepare(c, electrostatics)?,
             channel: ChannelTransport::prepare(c)?,
             leakage: Leakage::prepare(c, transport.oxide_ratio)?,
             temperature: TemperatureCoefficients {
@@ -220,10 +222,14 @@ impl PreparedPdChannel {
     }
 }
 
-fn intrinsic_density(temp: D, thermal: D) -> D {
-    let gap = D::constant(1.16) - (temp * temp).scale(7.02e-4) / (temp + D::constant(1108.0));
+pub(super) fn intrinsic_density<const N: usize>(
+    temp: Differential<N>,
+    thermal: Differential<N>,
+) -> Differential<N> {
+    let gap = Differential::constant(1.16)
+        - (temp * temp).scale(7.02e-4) / (temp + Differential::constant(1108.0));
     (temp * temp.sqrt()).scale(1.45e10 * 1.923_058_4e-4)
-        * (D::constant(21.556_598_1) - gap / thermal.scale(2.0)).exp()
+        * (Differential::constant(21.556_598_1) - gap / thermal.scale(2.0)).exp()
 }
 
 fn built_in(temp: D, thermal: D, doping: f64) -> D {
