@@ -1,8 +1,8 @@
 //! Typed source-derived schemas for intrinsic `HiSIM`, SOI and bulk BSIM MOS compact models.
 //!
-//! This crate provides **model/instance parameter binding**, not nonlinear device
-//! equations. A solver must not treat successful binding as proof that DC, AC,
-//! transient, thermal or noise kernels are implemented. See `ModelVariant::KERNEL_STATUS`.
+//! This crate provides model/instance parameter binding and family-specific
+//! constitutive routines. Binding alone is not proof of complete device support.
+//! Solver-ready residual/charge artifacts are provided by separate kernel crates.
 
 mod catalog;
 mod defaults;

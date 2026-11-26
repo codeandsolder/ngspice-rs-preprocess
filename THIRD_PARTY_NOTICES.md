@@ -132,3 +132,9 @@ Copyright 1990 Regents of the University of California. All rights reserved.
 Authors: Hong J. Park, Thomas L. Quarles and Min-Chie Jeng.
 The modified BSD notice reproduced above also applies to these preparations;
 the package LICENSE reproduces the terms for standalone distribution.
+
+The BSIM1 constitutive, junction, overlap and noise implementation in
+`model-compact-intrinsic/src/legacy_bsim/bsim1.rs` and `model-kernel-bsim`
+is based on ngspice 47 `bsim1/b1eval.c`, `b1ld.c`, and `b1noi.c`,
+Copyright 1990 Regents of the University of California; Hong J. Park and
+Thomas L. Quarles. See the respective crate licenses.

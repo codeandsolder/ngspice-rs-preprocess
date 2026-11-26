@@ -448,7 +448,7 @@ fn bsim1_channel_jacobians_differentiate_the_actual_constitutive_law() -> TestRe
                         let [a, b, c, d] =
                             [sample(-2. * h)?, sample(-h)?, sample(h)?, sample(2. * h)?];
                         let derivative =
-                            |a: f64, b: f64, c: f64, d: f64| ((c - b) * 8. - (d - a)) / (12. * h);
+                            |a: f64, b: f64, c: f64, d: f64| (c - b).mul_add(8., a - d) / (12. * h);
                         let expected = derivative(
                             a.drain_current,
                             b.drain_current,

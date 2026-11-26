@@ -54,7 +54,7 @@ Existing v3.3 numerical evidence includes `c_bsim3_dc_reference`,
 BSIM3 unit and integration suites. Native BSIM4 remains a separate,
 extensively tested 4.8.x device and is not an alias for BSIM3.
 
-The catalogs are an input schema only. BSIM1 and BSIM2 additionally have immutable model and size-dependent instance preparation (see below). No legacy-BSIM solver-ready artifact or complete numerical kernel is advertised. In particular the
+The catalogs are an input schema only. BSIM1 and BSIM2 additionally have immutable model and size-dependent instance preparation (see below). BSIM1 has a generalized physical artifact in `model-kernel-bsim`; BSIM2 channel evaluation remains a separate stage. Neither is registered in the consuming solver yet. In particular the
 new v33 input metadata does not transfer ownership of the existing
 working solver implementation. The producer should eventually own
 immutable physical preparation, while the consuming solver continues
@@ -151,3 +151,34 @@ showmod output. Candidate changes, wrong family, nonphysical dimensions
 and repeated preparation are exercised by source-free tests. The C
 harness and numeric witnesses are in the intrinsic crate's tools and
 tests/fixtures/legacy-bsim directories.
+
+## BSIM1 artifact and reference discrepancies
+
+The BSIM1 intrinsic law differentiates the current and conservative channel
+charge with a three-coordinate stack-only forward derivative. Both charge
+partitions are covered by 216 direct C channel points and 180 independent
+five-point derivative probes. The generalized artifact assembles these
+physical terms with junction current/charge, overlap capacitance, optional
+series branches, and thermal/flicker noise. Its tests cover both polarities,
+both intrinsic orientations, hidden-node topology changes, and immutable
+candidate reevaluation. Sixteen native ngspice operating points validate
+external currents and hidden-node residuals.
+
+The artifact intentionally does not reproduce these upstream inconsistencies:
+
+- The original load adds gmin to the junction law and again in its equivalent
+  source stamping. A generalized residual uses it exactly once; its Jacobian
+  matches the residual. Native OP comparisons isolate the physical law with
+  gmin=0, and a separate test verifies the full nonzero-gmin difference.
+- Transient and AC/PZ overlap geometry differs in the C device. The artifact
+  uses the temperature-prepared overlap for one analysis-independent
+  conservative charge law.
+- Both original noise routines read the state-slot *indices* of gm and cd
+  rather than the actual state values. For the first BSIM1 instance the
+  channel conductance input is 7 times its multiplicity, not its actual gm,
+  and the flicker expression uses 4 instead of the drain current. This
+  produces a spurious dependence on device ordering. The physical source
+  densities instead use the true current and analytic gm. The fixture
+  noise-probe.cir reproduces the native discrepancy; noise-dc.cir measures
+  the physical current and gate derivative independently, which the
+  source-density tests use at three frequencies.
