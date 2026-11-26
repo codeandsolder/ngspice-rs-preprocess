@@ -9,7 +9,7 @@
 
 use super::{active_statement_prefix, logical_statements, lower_hex};
 use crate::{find_ascii_case_insensitive, parameter_assignments, validate_simetrix_parameter_name};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,7 +66,7 @@ fn generated_name(prefix: &str, identity: &str, name: &str) -> String {
 }
 
 const fn identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.')
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.' | b'#' | b'[' | b']')
 }
 
 fn number_end(bytes: &[u8], start: usize) -> usize {
@@ -108,21 +108,96 @@ fn rewrite_expression(input: &str, names: &Names, budget: &WorkBudget) -> Result
     rewrite_symbols(input, names, false, budget)
 }
 
-/// Shared expression token walker. Assignment destinations can be excluded
-/// when the caller supplies a complete device field list.
+/// An occurrence-specific name and source arity of a user function.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionAlias {
+    /// Native declaration identifier.
+    pub name: String,
+    /// Number of formal parameters.
+    pub arity: usize,
+}
+
+/// An expression with its resolved user-function dependency edges.
+#[derive(Debug)]
+pub struct BoundExpression {
+    /// Rewritten expression, preserving non-symbol source text.
+    pub text: String,
+    /// Case-folded source identifiers of referenced user functions.
+    pub calls: BTreeSet<String>,
+    /// Calls not matched by the supplied function environment (including builtins).
+    pub unbound_calls: BTreeSet<String>,
+}
+
 pub(super) fn rewrite_symbols(
     input: &str,
     names: &Names,
     preserve_assignments: bool,
     budget: &WorkBudget,
 ) -> Result<String> {
-    budget.charge(Resource::EvaluationSteps, input.len())?;
-    budget.charge(Resource::EmittedBytes, input.len())?;
     if names.is_empty() {
+        budget.charge(Resource::EvaluationSteps, input.len())?;
+        budget.charge(Resource::EmittedBytes, input.len())?;
         return Ok(input.to_owned());
     }
+    Ok(rewrite_symbols_inner(input, names, None, preserve_assignments, budget)?.text)
+}
+
+fn checked_arity(
+    input: &str,
+    name: &str,
+    open: usize,
+    arity: usize,
+    budget: &WorkBudget,
+) -> Result<()> {
+    let close = crate::source_dialect::group_end(input, open, budget)?;
+    let body = &input[open + 1..close];
+    budget.charge(Resource::EvaluationSteps, body.len())?;
+    let arguments = crate::source_dialect::split_arguments(body, budget)?;
+    let count = if body.trim().is_empty() {
+        0
+    } else {
+        ensure!(
+            arguments.iter().all(|arg| !arg.is_empty()),
+            "empty argument to function {name}"
+        );
+        arguments.len()
+    };
+    ensure!(
+        count == arity,
+        "function {name} expects {arity} arguments, got {count}"
+    );
+    Ok(())
+}
+
+/// Shared expression token walker. Assignment destinations, numeric suffixes
+/// and electrical probe arguments remain untouched. Function references use
+/// a separate namespace from scalar parameters; their arity is checked
+/// without expanding or evaluating the expression.
+pub(super) fn rewrite_bound_symbols(
+    input: &str,
+    names: &Names,
+    functions: &BTreeMap<String, FunctionAlias>,
+    preserve_assignments: bool,
+    budget: &WorkBudget,
+) -> Result<BoundExpression> {
+    rewrite_symbols_inner(input, names, Some(functions), preserve_assignments, budget)
+}
+
+fn rewrite_symbols_inner(
+    input: &str,
+    names: &Names,
+    functions: Option<&BTreeMap<String, FunctionAlias>>,
+    preserve_assignments: bool,
+    budget: &WorkBudget,
+) -> Result<BoundExpression> {
+    budget.charge(Resource::EvaluationSteps, input.len())?;
+    budget.charge(Resource::EmittedBytes, input.len())?;
+    let mut result = BoundExpression {
+        text: String::with_capacity(input.len()),
+        calls: BTreeSet::new(),
+        unbound_calls: BTreeSet::new(),
+    };
     let bytes = input.as_bytes();
-    let mut output = String::with_capacity(input.len());
     let mut offset = 0;
     while offset < bytes.len() {
         let byte = bytes[offset];
@@ -130,7 +205,7 @@ pub(super) fn rewrite_symbols(
             || (byte == b'.' && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit))
         {
             let end = number_end(bytes, offset);
-            output.push_str(&input[offset..end]);
+            result.text.push_str(&input[offset..end]);
             offset = end;
             continue;
         }
@@ -139,7 +214,7 @@ pub(super) fn rewrite_symbols(
                 .find('"')
                 .map(|index| index + offset + 2)
                 .context("unclosed string in runtime expression")?;
-            output.push_str(&input[offset..end]);
+            result.text.push_str(&input[offset..end]);
             offset = end;
             continue;
         }
@@ -154,27 +229,44 @@ pub(super) fn rewrite_symbols(
                 next += 1;
             }
             if bytes.get(next) == Some(&b'(') {
-                // V/I probes name electrical objects, not parameters.
                 if name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I") {
-                    let close = closing_parenthesis(bytes, next)?;
-                    output.push_str(&input[offset..=close]);
+                    let close = crate::source_dialect::group_end(input, next, budget)?;
+                    result.text.push_str(&input[offset..=close]);
                     offset = close + 1;
                     continue;
                 }
-                output.push_str(name);
+                if let Some(functions) = functions {
+                    let key = name.to_ascii_uppercase();
+                    if let Some(function) = functions.get(&key) {
+                        checked_arity(input, name, next, function.arity, budget)?;
+                        budget.charge(
+                            Resource::EmittedBytes,
+                            function.name.len().saturating_sub(name.len()),
+                        )?;
+                        budget.charge(Resource::GeneratedNodes, 1)?;
+                        result.text.push_str(&function.name);
+                        // Native SPICE call syntax has no intervening whitespace.
+                        result.calls.insert(key);
+                        offset = next;
+                        continue;
+                    }
+                    budget.charge(Resource::GeneratedNodes, 1)?;
+                    result.unbound_calls.insert(key);
+                }
+                result.text.push_str(name);
             } else if preserve_assignments
                 && bytes.get(next) == Some(&b'=')
                 && bytes.get(next + 1) != Some(&b'=')
             {
-                output.push_str(name);
+                result.text.push_str(name);
             } else if let Some(replacement) = names.get(&name.to_ascii_uppercase()) {
                 budget.charge(
                     Resource::EmittedBytes,
                     replacement.len().saturating_sub(name.len()),
                 )?;
-                output.push_str(replacement);
+                result.text.push_str(replacement);
             } else {
-                output.push_str(name);
+                result.text.push_str(name);
             }
             offset = end;
             continue;
@@ -183,10 +275,10 @@ pub(super) fn rewrite_symbols(
             .chars()
             .next()
             .context("expression character")?;
-        output.push(character);
+        result.text.push(character);
         offset += character.len_utf8();
     }
-    Ok(output)
+    Ok(result)
 }
 
 fn param_tail(statement: &str) -> Option<&str> {
@@ -735,6 +827,34 @@ mod tests {
             assert_eq!(
                 scope.rewrite_statement(&statement)?,
                 format!("C1 p n Q={left}{gain}*V(p,n)+{p}{right} M={{{m}}}")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn user_function_bindings_distinguish_calls_parameters_and_probes() -> Result<()> {
+        let names = BTreeMap::from([("F".into(), "scalar".into()), ("P".into(), "param".into())]);
+        let functions = BTreeMap::from([(
+            "F".into(),
+            FunctionAlias {
+                name: "func".into(),
+                arity: 2,
+            },
+        )]);
+        let bound = rewrite_bound_symbols(
+            "f (p,f(p,2))+F+v(f)+i(p)+1f",
+            &names,
+            &functions,
+            false,
+            &WorkBudget::default(),
+        )?;
+        assert_eq!(bound.text, "func(param,func(param,2))+scalar+v(f)+i(p)+1f");
+        assert_eq!(bound.calls, BTreeSet::from(["F".into()]));
+        for invalid in ["f()", "f(1)", "f(1,2,3)", "f(1,)"] {
+            assert!(
+                rewrite_bound_symbols(invalid, &names, &functions, false, &WorkBudget::default())
+                    .is_err()
             );
         }
         Ok(())

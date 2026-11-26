@@ -131,6 +131,122 @@ pub fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
     Ok(parsed)
 }
 
+/// A function declaration's identifier and ordered formal arguments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionSignature {
+    /// Case-preserved source name.
+    pub name: String,
+    /// Case-preserved formals, unique under ASCII case folding.
+    pub formals: Vec<String>,
+}
+
+/// A scalar or function-valued parameter declaration, in source order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterDeclaration {
+    /// Exact field text and source spans, including a formal list if present.
+    pub field: ModelParameter,
+    /// A function signature, absent for scalar assignments.
+    pub function: Option<FunctionSignature>,
+}
+
+fn valid_formal(name: &str) -> bool {
+    name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Parse a source function signature, returning the remaining declaration body.
+///
+/// # Errors
+/// Missing/malformed formal list, invalid identifiers, or repeated formals.
+pub fn parse_function_signature(source: &str) -> Result<(FunctionSignature, &str)> {
+    let open = source
+        .find('(')
+        .context("user-defined function requires formal argument list")?;
+    let close = source[open + 1..]
+        .find(')')
+        .map(|position| position + open + 1)
+        .context("user-defined function missing closing parenthesis")?;
+    let name = source[..open].trim();
+    ensure!(
+        name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && name.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'#' | b'$' | b'[' | b']')),
+        "invalid function identifier {name}"
+    );
+    let mut formals = Vec::new();
+    let raw = source[open + 1..close].trim();
+    if !raw.is_empty() {
+        let mut seen = std::collections::BTreeSet::new();
+        for item in raw.split(',') {
+            let formal = item.trim();
+            ensure!(valid_formal(formal), "invalid formal parameter {formal}");
+            ensure!(
+                seen.insert(formal.to_ascii_lowercase()),
+                "repeated function formal {formal}"
+            );
+            formals.push(formal.to_owned());
+        }
+    }
+    Ok((
+        FunctionSignature {
+            name: name.to_owned(),
+            formals,
+        },
+        &source[close + 1..],
+    ))
+}
+
+/// Parse mixed scalar and user-defined function assignments.
+///
+/// Uses the shared named-field tokenizer. Whitespace between a function name and its formal
+/// list is allowed; expression values retain their original delimiters.
+///
+/// # Errors
+/// Malformed fields, formal lists, or missing assignment values.
+pub fn parse_parameter_declarations(input: &str) -> Result<Vec<ParameterDeclaration>> {
+    let mut source = Source {
+        text: input,
+        offset: 0,
+    };
+    let mut result = Vec::new();
+    loop {
+        source.skip_separators();
+        if source.offset == input.len() {
+            return Ok(result);
+        }
+        let start = source.offset;
+        source.token(true)?;
+        let mut end = source.offset;
+        source.skip_space();
+        if source.text.as_bytes().get(source.offset) == Some(&b'(') {
+            source.token(true)?;
+            end = source.offset;
+        }
+        let function = if input[start..end].contains('(') {
+            let (signature, rest) = parse_function_signature(&input[start..end])?;
+            ensure!(
+                rest.trim().is_empty(),
+                "unexpected function signature suffix"
+            );
+            Some(signature)
+        } else {
+            None
+        };
+        let field = source.field_after_name(start..end, &[])?;
+        ensure!(
+            field.explicit_equals,
+            "parameter {} requires name=value",
+            &input[field.name]
+        );
+        result.push(ParameterDeclaration {
+            field: ModelParameter::from_span(input, field),
+            function,
+        });
+    }
+}
+
 /// Read positional tokens up to the first named parameter or PARAMS: marker.
 ///
 /// Parenthesized terminal lists and commas use the same token boundaries as
@@ -353,8 +469,16 @@ impl<'a> Source<'a> {
 
     fn field(&mut self, positional: &[&str]) -> Result<FieldSpan> {
         let name_start = self.offset;
-        let name = self.token(true)?;
-        let name_end = self.offset;
+        self.token(true)?;
+        self.field_after_name(name_start..self.offset, positional)
+    }
+
+    fn field_after_name(
+        &mut self,
+        name_span: Range<usize>,
+        positional: &[&str],
+    ) -> Result<FieldSpan> {
+        let name = &self.text[name_span.clone()];
         self.skip_space();
         let explicit_equals = self.text.as_bytes().get(self.offset) == Some(&b'=');
         let value =
@@ -377,7 +501,7 @@ impl<'a> Source<'a> {
                 None
             };
         Ok(FieldSpan {
-            name: name_start..name_end,
+            name: name_span,
             value,
             explicit_equals,
         })
@@ -604,6 +728,60 @@ pub fn parse_spice_constant(raw: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_parameter_declarations_preserve_signatures_and_value_spans() -> Result<()> {
+        let source = "gain=2 CentToFar (c) = '(((c*9)/5)+32)' f(x, Y)={max(x, Y)} base=f(1,2)";
+        let declarations = parse_parameter_declarations(source)?;
+        assert_eq!(declarations.len(), 4);
+        assert!(declarations[0].function.is_none());
+        assert_eq!(
+            declarations[1].function.as_ref().context("signature")?.name,
+            "CentToFar"
+        );
+        assert_eq!(
+            declarations[1]
+                .function
+                .as_ref()
+                .context("signature")?
+                .formals,
+            ["c"]
+        );
+        assert_eq!(
+            declarations[2]
+                .function
+                .as_ref()
+                .context("signature")?
+                .formals,
+            ["x", "Y"]
+        );
+        assert!(declarations[3].function.is_none());
+        for declaration in declarations {
+            let field = declaration.field;
+            assert_eq!(&source[field.span.name], field.name);
+            assert_eq!(
+                &source[field.span.value.context("value span")?],
+                field.expression.context("expression")?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_parameter_function_declarations_are_rejected() {
+        for source in [
+            "f(a,A)=1",
+            "f(a,)=2",
+            "f(1)=2",
+            "f(a+b)=1",
+            "f(a) junk=2",
+            "f(a)=",
+            "f(a=1",
+            "f(a)(b)=2",
+        ] {
+            assert!(parse_parameter_declarations(source).is_err(), "{source}");
+        }
+    }
 
     #[test]
     fn multiline_cards_preserve_expressions_flags_and_order() -> Result<()> {
