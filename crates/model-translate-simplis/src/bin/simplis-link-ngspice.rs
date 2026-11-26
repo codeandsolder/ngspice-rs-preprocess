@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::WorkBudget;
 use model_preprocess_simplis::{
     LibrarySimulator, ParsedLibrary, SubcircuitCatalog, preprocess_netlist_linked,
 };
@@ -145,7 +146,8 @@ fn main() -> Result<()> {
 
     let input_bytes = fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
     let input_bytes = inline_init_includes(&input, &input_bytes)?;
-    let mut catalog = SubcircuitCatalog::for_simulator(simulator);
+    let budget = WorkBudget::default();
+    let mut catalog = SubcircuitCatalog::for_simulator(simulator).with_budget(budget.clone());
     let mut definitions = 0usize;
     for library in &libraries {
         let bytes = fs::read(library).with_context(|| format!("reading {}", library.display()))?;
@@ -169,15 +171,16 @@ fn main() -> Result<()> {
 
     let mut linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
     if simulator == LibrarySimulator::Simetrix {
-        lower_simetrix_linked_runtime(&mut linked)?;
-        let initialization = capture_passive_initial_conditions(&mut linked)?;
+        lower_simetrix_linked_runtime(&mut linked, &budget)?;
+        let initialization = capture_passive_initial_conditions(&mut linked, &budget)?;
         if !initialization.devices.is_empty() || !initialization.nodes.is_empty() {
             bail!(
                 "source-specific initial conditions require ngspice-rs-preprocess simetrix-deck and its typed initialization manifest"
             );
         }
     }
-    let (translated_root, translated_libraries) = translate_simplis_linked_netlist(&linked)?;
+    let (translated_root, translated_libraries) =
+        translate_simplis_linked_netlist(&linked, &budget)?;
     let output_dir = output_root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())

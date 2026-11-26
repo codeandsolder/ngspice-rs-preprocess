@@ -102,11 +102,24 @@ struct Source {
     waveform_sources: BTreeSet<usize>,
 }
 
+fn charge_conditioning_input(
+    bytes: &[u8],
+    budget: &model_preprocess_command::WorkBudget,
+) -> Result<()> {
+    use model_preprocess_command::Resource;
+    budget.charge(Resource::ScannedBytes, bytes.len())?;
+    budget.charge(
+        Resource::Statements,
+        bytes.split_inclusive(|byte| *byte == b'\n').count(),
+    )
+}
+
 impl Source {
     fn parse(
         inputs: &[ConditioningInput<'_>],
         initialization: Option<&crate::passive_ic::InitialConditions>,
         waveforms: &[crate::waveform::PreparedWaveform],
+        budget: &model_preprocess_command::WorkBudget,
     ) -> Result<Self> {
         let mut cards = Vec::new();
         let mut scopes = vec![Scope::default()];
@@ -118,6 +131,7 @@ impl Source {
         // an additional admission gate for already translated artifacts.
         let mut parameters = String::new();
         for (artifact, input) in inputs.iter().enumerate() {
+            charge_conditioning_input(input.bytes, budget)?;
             let mut stack = vec![0];
             for statement in lexical::statements(input.bytes)? {
                 let text = std::str::from_utf8(&statement.text)?.to_owned();
@@ -192,7 +206,11 @@ impl Source {
             }
             ensure!(stack.len() == 1, "unclosed conditioning scope");
         }
-        let parameters = ModelLibrary::parse(parameters.as_bytes())?;
+        let parameters = ModelLibrary::parse_source_with_budget(
+            parameters.as_bytes(),
+            crate::linked_source::RootKind::Include,
+            budget.clone(),
+        )?;
         ensure!(
             parameters.scopes.len() == scopes.len(),
             "conditioning scope mismatch"
@@ -840,6 +858,27 @@ pub fn condition_private_differentiators(
     initialization: Option<&crate::passive_ic::InitialConditions>,
     waveforms: &[crate::waveform::PreparedWaveform],
 ) -> Result<Vec<ConditionedArtifact>> {
+    condition_private_differentiators_with_budget(
+        inputs,
+        initialization,
+        waveforms,
+        &model_preprocess_command::WorkBudget::default(),
+    )
+}
+
+/// Condition a closed artifact set with shared work counters.
+/// # Errors
+/// Invalid source edit invariants or exhausted resource budget.
+pub fn condition_private_differentiators_with_budget(
+    inputs: &[ConditioningInput<'_>],
+    initialization: Option<&crate::passive_ic::InitialConditions>,
+    waveforms: &[crate::waveform::PreparedWaveform],
+    budget: &model_preprocess_command::WorkBudget,
+) -> Result<Vec<ConditionedArtifact>> {
+    use model_preprocess_command::Resource;
+    for input in inputs {
+        budget.charge(Resource::EmittedBytes, input.bytes.len())?;
+    }
     let mut result = inputs
         .iter()
         .map(|bytes| ConditionedArtifact {
@@ -847,7 +886,8 @@ pub fn condition_private_differentiators(
             scalings: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let Ok(source) = Source::parse(inputs, initialization, waveforms) else {
+    let Ok(source) = Source::parse(inputs, initialization, waveforms, budget) else {
+        budget.check()?;
         return Ok(result);
     };
     let mut plans = Vec::new();
@@ -855,6 +895,7 @@ pub fn condition_private_differentiators(
     for scope in source.scopes.iter().skip(1) {
         let graph = VoltageGraph::new(&source, scope);
         for &index in &scope.cards {
+            budget.charge(Resource::Statements, 1)?;
             let Some(nodes) = capacitor(&source.cards[index]) else {
                 continue;
             };
@@ -888,5 +929,6 @@ pub fn condition_private_differentiators(
             output.bytes = bytes;
         }
     }
+    budget.check()?;
     Ok(result)
 }

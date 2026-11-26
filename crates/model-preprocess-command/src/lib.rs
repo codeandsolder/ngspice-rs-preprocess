@@ -2,6 +2,9 @@
 //! bytes on stdin and returns the entire replacement on stdout. No shell
 //! evaluation or invocation of a numerical solver is involved.
 
+mod budget;
+pub use budget::{DepthGuard, Resource, WorkBudget, WorkLimits};
+
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::HashMap,
@@ -127,17 +130,36 @@ pub struct SourceSession {
     config: AdmissionConfig,
     cancellation: Cancellation,
     sources: HashMap<PathBuf, Result<Arc<[u8]>, String>>,
+    budget: WorkBudget,
 }
 
 impl SourceSession {
     /// Start an empty source graph with explicit settings and cancellation.
     #[must_use = "the returned session owns admission state and source snapshots"]
     pub fn new(config: AdmissionConfig, cancellation: Cancellation) -> Self {
+        let budget = WorkBudget::new(WorkLimits::default(), cancellation.clone());
+        Self::with_budget(config, cancellation, budget)
+    }
+
+    /// Start an admission cache sharing a complete request budget.
+    #[must_use]
+    pub fn with_budget(
+        config: AdmissionConfig,
+        cancellation: Cancellation,
+        budget: WorkBudget,
+    ) -> Self {
         Self {
             config,
             cancellation,
             sources: HashMap::new(),
+            budget,
         }
+    }
+
+    /// Shared counters for downstream preparation stages.
+    #[must_use]
+    pub const fn budget(&self) -> &WorkBudget {
+        &self.budget
     }
 
     /// Admit a file once per canonical source identity.
@@ -211,6 +233,7 @@ impl SourceSession {
                 session.config.input_bytes,
                 path.display()
             );
+            session.budget.charge(Resource::InputBytes, bytes.len())?;
             Ok(bytes)
         })
     }
@@ -220,6 +243,7 @@ impl SourceSession {
         path: PathBuf,
         read: impl FnOnce(&Self, &Path) -> Result<Arc<[u8]>>,
     ) -> Result<AdmittedSource> {
+        self.budget.check()?;
         if let Some(snapshot) = self.sources.get(&path) {
             let bytes = snapshot
                 .as_ref()
@@ -229,6 +253,7 @@ impl SourceSession {
                 bytes: Arc::clone(bytes),
             });
         }
+        self.budget.charge(Resource::Sources, 1)?;
         match read(self, &path).and_then(|bytes| self.transform(&path, bytes)) {
             Ok(bytes) => {
                 self.sources.insert(path.clone(), Ok(Arc::clone(&bytes)));
@@ -258,12 +283,16 @@ impl SourceSession {
             );
             let mut arguments = config.arguments.clone();
             arguments.push(path.as_os_str().to_owned());
+            let mut limits = self.config.process;
+            limits.output_bytes = limits
+                .output_bytes
+                .min(self.budget.remaining(Resource::AdmittedBytes)?);
             let result = capture(
                 &config.executable,
                 directory,
                 &arguments,
                 &bytes,
-                self.config.process,
+                limits,
                 &self.cancellation,
             )
             .with_context(|| format!("preprocessing {}", path.display()))?;
@@ -278,7 +307,7 @@ impl SourceSession {
         } else {
             bytes
         };
-        self.cancellation.check()?;
+        self.budget.charge(Resource::AdmittedBytes, bytes.len())?;
         Ok(bytes)
     }
 
@@ -313,6 +342,7 @@ impl SourceSession {
                 .config
                 .input_bytes
                 .saturating_sub(data.len())
+                .min(self.budget.remaining(Resource::InputBytes)?)
                 .saturating_add(1)
                 .min(buffer.len());
             let read = match file.read(&mut buffer[..count]) {
@@ -328,6 +358,7 @@ impl SourceSession {
                 self.config.input_bytes,
                 path.display()
             );
+            self.budget.charge(Resource::InputBytes, read)?;
             data.extend_from_slice(&buffer[..read]);
         }
         Ok(Arc::from(data))
