@@ -792,6 +792,44 @@ mod tests {
     }
 
     #[test]
+    fn intermediate_power_expansion_consumes_the_request_ledger() -> Result<()> {
+        use model_preprocess_command::{Cancellation, WorkLimits};
+        let hspice = DialectContext {
+            language: SourceLanguage::Hspice,
+            separator: None,
+        };
+        let mut nested = "2".to_owned();
+        for _ in 0..10 {
+            nested = format!("PWR({nested},1)");
+        }
+        for (expression, context) in [
+            (nested, hspice),
+            (format!("{}1", "2**".repeat(10)), DialectContext::default()),
+        ] {
+            let source = format!(".param gain={{{expression}}}");
+            let budget = WorkBudget::new(
+                WorkLimits {
+                    emitted_bytes: 4096,
+                    ..WorkLimits::default()
+                },
+                Cancellation::default(),
+            );
+            let error =
+                lower_statement_with_budget(&source, context, DEFAULT_PROJECTION_BYTES, &budget)
+                    .err()
+                    .context("intermediate expression expansion bypassed the request limit")?;
+            assert!(
+                error.to_string().contains("EmittedBytes budget exceeded"),
+                "{error:#}"
+            );
+            assert!(budget.check().is_err());
+            let lowered = lower_statement(&source, context, DEFAULT_PROJECTION_BYTES)?;
+            assert!(lowered.len() > source.len());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn comments_respect_dialect_and_quoted_paths() {
         let hs =
             DialectContext::resolve("*#HSPICE", DialectContext::default(), SourceKind::Include);
