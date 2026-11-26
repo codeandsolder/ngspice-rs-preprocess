@@ -143,7 +143,7 @@ impl PreparedPdChannel {
         let limited = if x.value < 0.96 {
             (D::constant(1.0) - x).sqrt().reciprocal()
         } else {
-            (D::constant(6.00167) - x.scale(6.26044)) / (D::constant(1.0) - x.scale(1.043406))
+            (D::constant(6.00167) - x.scale(6.26044)) / (D::constant(1.0) - x.scale(1.043_406))
         };
         let k = limited.scale(
             0.5 * self.electrostatics.effective_k1 / (self.electrostatics.phi + ketas).sqrt(),
@@ -207,29 +207,39 @@ impl PreparedPdChannel {
         }
     }
 
-    fn saturation(&self, b: &Bias, s: &State, g: Geometry, m: Mobility) -> Saturation {
-        let drive = s.overdrive + b.thermal.scale(2.0);
-        let field_length = m.velocity.scale(2.0 * self.length) / m.mobility;
-        let wvcox_rds = g.width * m.velocity * g.resistance.scale(self.oxide);
-        let lambda = self.lambda(s.overdrive);
-        let voltage = if g.resistance.value == 0.0 && (lambda.value - 1.0).abs() == 0.0 {
-            field_length * drive / (g.bulk * field_length + drive)
+    fn saturation(
+        &self,
+        bias: &Bias,
+        state: &State,
+        geometry: Geometry,
+        mobility: Mobility,
+    ) -> Saturation {
+        let drive = state.overdrive + bias.thermal.scale(2.0);
+        let field_length = mobility.velocity.scale(2.0 * self.length) / mobility.mobility;
+        let wvcox_rds = geometry.width * mobility.velocity * geometry.resistance.scale(self.oxide);
+        let lambda = self.lambda(state.overdrive);
+        let voltage = if geometry.resistance.value == 0.0 && (lambda.value - 1.0).abs() == 0.0 {
+            field_length * drive / (geometry.bulk * field_length + drive)
         } else {
-            let t = g.bulk * wvcox_rds;
-            let a = g.bulk.scale(2.0) * (t - D::constant(1.0) + lambda.reciprocal());
-            let b = drive * (lambda.reciprocal().scale(2.0) - D::constant(1.0))
-                + g.bulk * field_length
-                + (drive * t).scale(3.0);
-            let c = drive * (field_length + (drive * wvcox_rds).scale(2.0));
+            let bulk_resistance = geometry.bulk * wvcox_rds;
+            let quadratic = geometry.bulk.scale(2.0)
+                * (bulk_resistance - D::constant(1.0) + lambda.reciprocal());
+            let linear = drive * (lambda.reciprocal().scale(2.0) - D::constant(1.0))
+                + geometry.bulk * field_length
+                + (drive * bulk_resistance).scale(3.0);
+            let constant = drive * (field_length + (drive * wvcox_rds).scale(2.0));
             // Rationalized quadratic root also covers the removable a=0 limit.
-            c.scale(2.0) / (b + (b * b - (a * c).scale(2.0)).sqrt())
+            constant.scale(2.0)
+                / (linear + (linear * linear - (quadratic * constant).scale(2.0)).sqrt())
         };
         let delta = self.channel.delta;
-        let t = voltage - b.drain - D::constant(delta);
-        let raw = voltage - (t + (t * t + voltage.scale(4.0 * delta)).sqrt()).scale(0.5);
-        let effective = if raw.value > b.drain.value {
+        let difference = voltage - bias.drain - D::constant(delta);
+        let raw = voltage
+            - (difference + (difference * difference + voltage.scale(4.0 * delta)).sqrt())
+                .scale(0.5);
+        let effective = if raw.value > bias.drain.value {
             D {
-                value: b.drain.value,
+                value: bias.drain.value,
                 ..raw
             }
         } else {
@@ -238,7 +248,7 @@ impl PreparedPdChannel {
         Saturation {
             voltage,
             effective,
-            excess: b.drain - effective,
+            excess: bias.drain - effective,
             field_length,
             wvcox_rds,
             lambda,
