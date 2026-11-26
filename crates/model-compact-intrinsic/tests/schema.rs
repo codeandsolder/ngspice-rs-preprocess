@@ -340,14 +340,20 @@ fn legacy_bsim_exact_source_family_and_setter_schema() -> Result<(), ModelError>
     for variant in [Bsim1, Bsim2, Bsim3V0, Bsim3V1, Bsim3V32, Bsim3V33] {
         assert_eq!(variant.terminals(), ["Drain", "Gate", "Source", "Bulk"]);
         assert_eq!(
-            variant.parameter(Instance, "ic").unwrap().kind,
-            ParameterType::RealVector
+            variant.parameter(Instance, "ic").map(|spec| spec.kind),
+            Some(ParameterType::RealVector)
         );
         assert!(variant.parameter(Instance, "gm").is_none());
     }
     for variant in [Bsim3V0, Bsim3V1, Bsim3V32, Bsim3V33] {
-        let slot = variant.parameter(Model, "vth0").unwrap().slot;
-        assert_eq!(variant.parameter(Model, "vtho").unwrap().slot, slot);
+        let slot = variant
+            .parameter(Model, "vth0")
+            .ok_or_else(|| ModelError::UnknownParameter("vth0".into()))?
+            .slot;
+        assert_eq!(
+            variant.parameter(Model, "vtho").map(|spec| spec.slot),
+            Some(slot)
+        );
         let bound = BoundParameters::bind(
             variant,
             Model,
@@ -366,16 +372,16 @@ fn legacy_bsim_exact_source_family_and_setter_schema() -> Result<(), ModelError>
     }
     assert!(Bsim3V0.parameter(Model, "version").is_none());
     assert_eq!(
-        Bsim3V1.parameter(Model, "version").unwrap().kind,
-        ParameterType::Real
+        Bsim3V1.parameter(Model, "version").map(|spec| spec.kind),
+        Some(ParameterType::Real)
     );
     assert_eq!(
-        Bsim3V32.parameter(Model, "version").unwrap().kind,
-        ParameterType::Text
+        Bsim3V32.parameter(Model, "version").map(|spec| spec.kind),
+        Some(ParameterType::Text)
     );
     assert_eq!(
-        Bsim3V33.parameter(Model, "version").unwrap().kind,
-        ParameterType::Text
+        Bsim3V33.parameter(Model, "version").map(|spec| spec.kind),
+        Some(ParameterType::Text)
     );
     Ok(())
 }
