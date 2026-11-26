@@ -144,3 +144,17 @@ The BSIM2 constitutive implementation is based on ngspice 47
 `bsim2/b2eval.c`, and the shared legacy BSIM kernel assembly also follows
 `bsim2/b2ld.c` and `b2noi.c`. Copyright 1990 Regents of the University of
 California; Min-Chie Jeng, Hong J. Park and Thomas L. Quarles.
+
+## HiSIM2 2.80 intrinsic compact-model preparation
+
+The HiSIM2 setup, defaults, binning and topology in `crates/model-compact-intrinsic` derive from the Hiroshima University/STARC HiSIM2 2.80 implementation in ngspice 47 (Copyright (C) 2014 Hiroshima University & STARC). The upstream HiSIM2 Distribution Statement and Copyright Notice, including attribution, redistribution and charging conditions, are reproduced in [the package LICENSE](crates/model-compact-intrinsic/LICENSE).
+
+
+## BSIM3SOI FD/DD 2.1 and PD 2.2.3
+
+The source-order defaults, size preparation and geometry in `crates/model-compact-intrinsic/src/bsim3soi` follow ngspice 47 BSIM3SOI FD/DD (copyright 1999 Regents of the University of California) and PD (copyright 1990 Regents of the University of California). Original author and modification notices and modified BSD terms are reproduced in [the package LICENSE](crates/model-compact-intrinsic/LICENSE).
+
+
+## STAG 2.7 (SOI3 level 60)
+
+The SOI3 electrostatic, thermal and instance preparation follows STAG version 2.7, copyright 2000 owned by the UK Secretary of State for Defence acting through the Defence Evaluation and Research Agency (DERA), developed by Jim Benson and colleagues at the University of Southampton. The original copyright and DERA royalty-free use/distribution terms from ngspice `src/spicelib/devices/soi3/README` are reproduced in [the package LICENSE](crates/model-compact-intrinsic/LICENSE). The repository MIT licence does not supersede the STAG terms.

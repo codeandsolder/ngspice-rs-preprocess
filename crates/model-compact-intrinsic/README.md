@@ -12,7 +12,7 @@ The crate binds **source-defined model and instance parameters** and implements 
 **BSIMSOI 4.x and HiSIM-HV1/HV2 model setup defaults** are implemented.
 HiSIM-HV1/HV2 additionally have source-derived **instance defaults, binning,
 metallurgical channel geometry and leading temperature-dependent bandgap,
-thermal-voltage and carrier-density inputs**. Legacy BSIM1/2 have complete model defaults, size-dependent preparation and intrinsic constitutive laws.
+thermal-voltage and carrier-density inputs**. HiSIM2, BSIM3SOI FD/DD/PD and SOI3 also provide source-derived setup, instance preparation and the physical subkernels documented below. Legacy BSIM1/2 have complete model defaults, size-dependent preparation and intrinsic constitutive laws.
 `ModelVariant::KERNEL_STATUS` explicitly advertises `NotImplemented`. Downstream
 must not substitute generic MOS laws for these devices or interpret successfully
 bound parameters as physical model support.
@@ -60,6 +60,57 @@ The terminal arrays preserve the upstream positions rather than collapsing to fo
 MOS terminals. HiSIM-HV adds substrate and temperature; BSIMSOI/BSIM3SOI have
 additional backgate, body, thermal and charge terminals with a reserved blank
 fifth position; SOI3 has separate front/back gates and a thermal terminal.
+
+## HiSIM2 2.80 setup, geometry and topology
+
+The `hisim2` module implements the source-derived setup for level 68, version
+280. It reuses the existing registration catalog, covering 528 constant
+defaults, dependent polarity/mode defaults, original source-given flags,
+depletion/reciprocity adjustments, forced noise enable and upstream range
+resets. Invalid explicit versions and checked mode selectors are rejected
+instead of silently falling back to another physical configuration.
+
+- `hisim2::prepare_model` returns prepared model-card values in their original
+  units, including Celsius TNOM.
+- `hisim2::prepare_instance` takes a bound instance and the circuit temperature
+  in Kelvin. It resolves model-inherited values, source IC ordering, effective
+  device temperature, and all 72 source binning terms with the VFBC length
+  correction. Values remain in source units.
+- `hisim2::prepare_physical` checks model/instance identity and applies the
+  source temperature-routine geometry corrections, evaluator-unit conversion
+  of binned coefficients, and drain/source, gate and body parasitics. The
+  external series conductances are checked against native DC internal-node
+  voltage drops and branch currents.
+- `hisim2::prepare_temperature` computes nominal and actual band gap, inverse
+  thermal voltage and intrinsic carrier density with the original constants.
+- `hisim2::prepare_junctions` binds saturation, reverse leakage, linear
+  continuation, and area/sidewall/gate-sidewall charge coefficients once per
+  prepared instance. Evaluation accepts normalized drain/source junction
+  voltages and circuit GMIN; returns multiplicity-scaled current, charge and
+  analytic voltage derivatives. The source uses instance TEMP for saturation
+  preparation and circuit temperature plus DTEMP for capacitance scaling.
+  The logarithmic limit at grading=1 is evaluated analytically, avoiding the
+  original expression's removable singularity.
+- The topology identifies distinct drain, source, gate and body-network nodes
+  and NQS state selection without allocating solver nodes. It does not imply a
+  complete numerical kernel.
+
+Source-backed setup tests and a live native ngspice 47 reference matrix:
+
+```sh
+cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup
+cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup --test hisim2_junction -- --include-ignored --nocapture
+```
+
+The native reference compares all 544 numeric model-table fields and 31
+numeric instance inputs. The native display truncates two groups of parameter
+names to eleven characters; the test maps their occurrences using the source
+registration order. A second native matrix checks 936 junction current,
+conductance and capacitance values across 156 bias points (NMOS and PMOS,
+-20 to 100 C, explicit TEMP/DTEMP, geometry and multiplicity). Charge
+derivatives are independently checked by finite differences. The original HiSIM2 Distribution Statement and Copyright
+Notice (Copyright (C) 2014 Hiroshima University & STARC) is reproduced in
+the package LICENSE.
 
 ## BSIMSOI 4.x source-derived model preparation
 
@@ -786,3 +837,182 @@ Likewise the v1/v2 HiSIM-HV **instance** tables are identical and shared, while
 their **model** tables remain version-specific. Physical equations, defaults and
 state structures are **not** assumed interchangeable just because the registration
 metadata matches; future kernels must preserve their exact source-family behavior.
+
+
+### BSIM3SOI FD/DD/PD setup and instance preparation
+
+`bsim3soi::prepare_model` evaluates the ordered default programs shared by FD
+and DD (2.1), or the distinct PD 2.2.3 program. It preserves original given
+flags for later size-dependent derivation. In FD/DD the registered XDIF name
+aliases XBJT, whereas the internal diffusion exponent defaults to 2. PD has
+a separate XDIF input with an XBJT-dependent default.
+
+`bsim3soi::prepare_instance` supplies source defaults, five-component initial
+conditions, effective IV and CV dimensions, and the raw length/width/cross
+bin program. PD retains its independent CV corrections, body-contact widths,
+segment geometry and body/backgate CV lengths. Deferred physical coefficients
+remain distinguishable from explicit zero. These are preparation APIs, not
+a complete current/charge kernel.
+
+The ignored native setup test compares 2,422 model and 100 instance getter
+values across FD/DD/PD NMOS and PMOS cases against ngspice 47. Six FD/DD native
+mask getters (LDVBD0/1, WDVBD0/1, PDVBD0/1) return the corresponding base DVBD
+rather than the stored coefficient. The test checks the actual getter
+mapping separately from the source default of 1 for each bin coefficient.
+Eight size-derived model fields are intentionally deferred. Native showmod
+values are compared only where the source exposes a usable getter.
+
+Source references: `bsim3soi_{fd,dd,pd}/b3soi{fd,dd,pd}{set,mpar,par,temp,mask}.c`.
+
+
+### STAG SOI3 2.7 preparation
+
+`soi3::prepare_model` derives nominal film and surface-state capacitance,
+mobility/KP, doping-derived surface potential, body factors and flat-band
+voltages; it preserves explicit VT0/VTEX precedence and the source's
+LAMBDA versus LX/VP/MEXP mode selection. TOF, TOB and TB are mandatory.
+CHID/CHID1 are deferred until the instance temperature is known.
+
+`soi3::prepare_instance` takes circuit geometry and ambient-temperature
+defaults. It resolves source/drain series conductance by explicit RD/RS,
+then RSH and squares, then width-scaled RDW/RSW. The source's explicit zero
+precedence is retained; topology is based on the effective conductance,
+rather than creating an unconnected prime node. Thermal area uses drawn
+dimensions before LD correction. Explicit instance RT/CT override the
+model's explicit RTA/CTA scaling, otherwise material parameters set the
+values. Up to five thermal ladder sections stop at the first zero RT;
+resistance divides by M and capacitance multiplies by M. RT=0 requires
+a thermal-ground constraint; an active ladder uses ambient circuit
+temperature even when instance TEMP is present.
+
+The temperature prelude retains native band-gap constants, thermal
+voltage, mobility, surface potential, front/back flat-band and threshold,
+saturation-current scaling, critical voltage and zero-bias junction
+capacitances. Absent CHID/CHID1 are instance-local instead of mutating
+the shared model. Conflicting overlapping vector/scalar IC assignments
+are rejected because the typed slot buffer does not encode input order.
+The API does not yet provide nonlinear terminal currents or charges.
+
+Source references: `soi3/{soi3set,soi3temp,soi3mpar,soi3par,soi3mask,soi3ask}.c`.
+STAG's separate DERA licence and original notices are in the package
+LICENSE.
+
+The SOI3 prepared instance also exposes its two-diode junction law,
+including parasitic BJT transport, GMIN, voltage and temperature Newton
+tangents, and integrated depletion charge and capacitance. Charge is
+continuous across FC*PB and has a finite logarithmic limit at MJ=1.
+The caller supplies the limited thermal rise: the native solver clamps
+negative thermal-node values before evaluation. The voltage/temperature
+Newton tangents retain the native overflow-guard slope convention.
+The native qualification uses DC for current and conductance and
+transient for depletion charge and capacitance (native transient current
+and conductance include the integration companion). Across both
+polarities, DVT modes and ambient/thermal-rise combinations, 100 DC and
+889 transient rows agree in 3,956 scalar comparisons.
+
+`bsim3soi::prepare_temperature` binds the size prelude to its original
+model identity and resolves mobility, velocity saturation, intrinsic and
+external resistances, thermal RC coefficients, junction saturation
+densities, substrate and channel electrostatics, threshold and DIBL
+factors, and overlap capacitances. FD/DD and PD retain their different
+junction activation and thermal scaling laws; PD includes quantum-oxide,
+width-dependent K1 and high-level-injection corrections. Instance-local
+derived substrate capacitance avoids the native shared-model mutation.
+
+The native C setup/temperature fixture in
+`tests/fixtures/bsim3soi-thermal` contains 1,026 internal coefficients from
+18 independent cases across all three families. The original compiled
+C routines supply the values; a small harness substitutes only node,
+matrix and allocation plumbing. The regular Rust regression test reads
+this full-precision reference without requiring ngspice. Regeneration
+instructions accompany the fixture.
+
+The resulting `substrate_charge` evaluates drain/source-to-backgate
+charge and differential capacitance using physical terminal voltage
+differences, including multiplicity. The two cubic transition segments
+and their constant-capacitance tails share a continuous charge primitive.
+PD retains the CSDMIN=0 linear branch; FD/DD use effective width for
+sidewall fringing, PD drawn width. A zero-length transition segment is
+evaluated through its finite limiting form. Invalid reversed endpoints
+or out-of-range ASD are rejected.
+
+The independent transient/AC matrix checks 80,134 capacitance values,
+integrated charge, and finite-difference derivatives at the transition
+boundaries. FD/DD use transient qualification because the original
+FD/DD AC loaders omit these extrinsic capacitances; PD uses differential
+AC. The C reference circuits use separate model records to avoid the
+legacy size cache's sharing of area-dependent coefficients. Rust
+preparation keeps them local to each instance and provides the physical
+charge and derivative consistently for both AC and transient assembly.
+
+The `PhysicalTemperature.junction_currents` evaluator supplies normalized
+source-oriented body-to-source/body-to-drain diffusion, recombination,
+bipolar and tunnelling currents, parasitic collector current, and the
+PD-specific effective diffusion current for storage. FD explicitly
+returns zero for this intrinsic junction contribution, matching its
+load routine. DD uses the 30-exponent continuation and geometry-dependent
+bipolar transport; PD retains the 100-exponent continuation,
+trap-assisted recombination/tunnelling, high-level injection, neutral
+body recombination, Early effect, and separate C-V geometry. The
+isothermal path uses prepared ambient densities; self-heating uses the
+load-time density law, including DD's fixed 1.115 eV gap and model-card
+tunnelling density. The caller applies polarity/multiplicity and owns
+source/drain reversal and limiting. Guarded native Newton tangents are
+retained where they differ from unrestricted calculus.
+
+The current qualification covers 3,384 native debug-node comparisons
+and 16,848 analytic derivative checks. PD's current debug nodes report
+absolute magnitudes plus 1e-14 A; DD reports signed currents. The
+normalized physical result is not modified to emulate debug reporting.
+
+The intrinsic gate-sidewall charge law also supplies the body-side
+source/drain charge and analytic voltage/temperature tangents. DD uses
+the quadratic forward continuation and TT times ideal diffusion; PD
+uses temperature-dependent sidewall potential/capacitance, a 90 percent
+potential continuation and TT times effective bipolar diffusion. Both
+use the finite logarithmic primitive at unity grading. FD has no
+intrinsic junction charge in its load routine.
+
+The PD 2.2.3 channel evaluator is exposed as
+`PhysicalTemperature.pd_channel`. It retains the family's body-potential
+smoothing, poly-gate depletion, threshold and subthreshold shifts,
+bias-dependent width and intrinsic resistance, bulk charge factor, all
+three mobility modes, velocity saturation, DIBL and channel-length
+modulation. The evaluation uses normalized forward-oriented VGS, VDS
+and VBS with an analytic four-coordinate gradient including absolute
+temperature. Self-heated evaluation takes a caller-owned accepted
+surface potential; isothermal evaluation uses the prepared ambient
+state. It returns channel current separately from junction/bipolar
+currents and exposes threshold, overdrive, mobility, effective/saturation
+drain voltage, intrinsic series resistance and bulk factor. The
+quadratic saturation root is rationalized to avoid cancellation.
+
+The isolated native PD channel matrix compares 11,988 scalar values
+(Ids, gm, gds, gmb, threshold and saturation voltage), with maximum
+absolute errors of 8.48e-20 A, 4.41e-19 S and 2.06e-14 V. Both polarities,
+all three mobility modes, nonzero resistance and geometry corrections,
+and independently imposed body/gate/drain bias are represented.
+There are also 3,240 analytic derivative checks at fixed accepted
+surface potential. The explicit seven native terminal slots are
+required to avoid an unintended floating internal body in the legacy
+parser; this also strengthens the junction-current and charge
+qualification to 3,384 and 12,820 comparisons at imposed body bias.
+
+The PD channel result additionally exposes source/drain gate-induced leakage,
+signed gate-body tunnelling, and the impact-ionization coefficient. Impact
+ionization is composed with the channel and independently evaluated parasitic
+collector current at the same normalized bias. All four contributions have
+analytic VGS/VDS/VBS/temperature gradients. The gate tunnelling gradient includes
+the effective-width product derivative and the poly-depletion chain in the
+accumulation branch, which the native handwritten Jacobian omits. The native
+leakage-value oracle compares 7,128 drain-GIDL, gate current, impact-ionization
+and body-terminal KCL values with independent terminal biases; its worst
+body-terminal residual is 7.40e-17 A. Native current debug-node sign/magnitude
+conventions are applied only inside the oracle.
+
+The externally imposed temperature oracle uses fresh operating points, an
+explicit native temperature node, and independently controlled body bias. It
+checks 180 channel/threshold/saturation/junction values over -20 to +60 K
+relative to ambient. `accepted_surface_potential` computes the predictor's
+next surface potential from the last accepted temperature, without mutating
+trial state. The solver owns the predictor and source/drain reversal.

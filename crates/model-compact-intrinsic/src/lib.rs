@@ -4,10 +4,14 @@
 //! constitutive routines. Binding alone is not proof of complete device support.
 //! Solver-ready residual/charge artifacts are provided by separate kernel crates.
 
+pub mod bsim3soi;
 mod catalog;
 mod defaults;
+pub mod hisim2;
 mod hv;
 mod legacy_bsim;
+mod preparation;
+pub mod soi3;
 
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use legacy_bsim::{
@@ -132,7 +136,7 @@ pub enum ModelError {
     InvalidPhysicalParameter(&'static str),
     /// A caller supplied an ignored/unsupported version-specific instance input.
     UnsupportedInstanceParameter(&'static str),
-    /// Initial condition vector must contain 1-3 finite VDS/VGS/VBS values.
+    /// Initial condition vector has an invalid length for the selected family.
     InvalidInitialConditions(usize),
     /// A size-binned parameter became non-finite during C-source arithmetic.
     InvalidBinningParameter(u16),
@@ -159,10 +163,9 @@ impl std::fmt::Display for ModelError {
                 f,
                 "model preparation requires a supported family and model parameter block"
             ),
-            Self::MismatchedPreparedContext => write!(
-                f,
-                "incompatible prepared HiSIM-HV model, instance, or thermal state"
-            ),
+            Self::MismatchedPreparedContext => {
+                write!(f, "incompatible prepared model, instance, or thermal state")
+            }
             Self::ConflictingPolarity => write!(f, "both NMOS and PMOS flags were set"),
             Self::InvalidNominalTemperature => {
                 write!(f, "invalid nominal model/circuit temperature")
@@ -181,10 +184,10 @@ impl std::fmt::Display for ModelError {
                 write!(f, "unsupported instance input '{name}'")
             }
             Self::InvalidInitialConditions(length) => {
-                write!(f, "invalid HiSIM-HV IC vector length {length}")
+                write!(f, "invalid initial-condition vector length {length}")
             }
             Self::InvalidBinningParameter(slot) => {
-                write!(f, "non-finite HiSIM-HV binned model parameter slot {slot}")
+                write!(f, "non-finite binned model parameter slot {slot}")
             }
             Self::CorruptSourceCatalog(problem) => write!(f, "invalid source catalog: {problem}"),
         }
