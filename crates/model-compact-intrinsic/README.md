@@ -830,3 +830,29 @@ Likewise the v1/v2 HiSIM-HV **instance** tables are identical and shared, while
 their **model** tables remain version-specific. Physical equations, defaults and
 state structures are **not** assumed interchangeable just because the registration
 metadata matches; future kernels must preserve their exact source-family behavior.
+
+
+### BSIM3SOI FD/DD/PD setup and instance preparation
+
+`bsim3soi::prepare_model` evaluates the ordered default programs shared by FD
+and DD (2.1), or the distinct PD 2.2.3 program. It preserves original given
+flags for later size-dependent derivation. In FD/DD the registered XDIF name
+aliases XBJT, whereas the internal diffusion exponent defaults to 2. PD has
+a separate XDIF input with an XBJT-dependent default.
+
+`bsim3soi::prepare_instance` supplies source defaults, five-component initial
+conditions, effective IV and CV dimensions, and the raw length/width/cross
+bin program. PD retains its independent CV corrections, body-contact widths,
+segment geometry and body/backgate CV lengths. Deferred physical coefficients
+remain distinguishable from explicit zero. These are preparation APIs, not
+a complete current/charge kernel.
+
+The ignored native setup test compares 2,422 model and 100 instance getter
+values across FD/DD/PD NMOS and PMOS cases against ngspice 47. Six FD/DD native
+mask getters (LDVBD0/1, WDVBD0/1, PDVBD0/1) return the corresponding base DVBD
+rather than the stored coefficient. The test checks the actual getter
+mapping separately from the source default of 1 for each bin coefficient.
+Eight size-derived model fields are intentionally deferred. Native showmod
+values are compared only where the source exposes a usable getter.
+
+Source references: `bsim3soi_{fd,dd,pd}/b3soi{fd,dd,pd}{set,mpar,par,temp,mask}.c`.

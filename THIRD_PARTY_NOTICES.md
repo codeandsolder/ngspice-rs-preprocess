@@ -125,3 +125,8 @@ The top-level MIT license does not supersede these terms.
 ## HiSIM2 2.80 intrinsic compact-model preparation
 
 The HiSIM2 setup, defaults, binning and topology in `crates/model-compact-intrinsic` derive from the Hiroshima University/STARC HiSIM2 2.80 implementation in ngspice 47 (Copyright (C) 2014 Hiroshima University & STARC). The upstream HiSIM2 Distribution Statement and Copyright Notice, including attribution, redistribution and charging conditions, are reproduced in [the package LICENSE](crates/model-compact-intrinsic/LICENSE).
+
+
+## BSIM3SOI FD/DD 2.1 and PD 2.2.3
+
+The source-order defaults, size preparation and geometry in `crates/model-compact-intrinsic/src/bsim3soi` follow ngspice 47 BSIM3SOI FD/DD (copyright 1999 Regents of the University of California) and PD (copyright 1990 Regents of the University of California). Original author and modification notices and modified BSD terms are reproduced in [the package LICENSE](crates/model-compact-intrinsic/LICENSE).
