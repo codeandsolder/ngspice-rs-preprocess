@@ -571,12 +571,12 @@ fn emit_frequency(
     source: &ControlledTransfer,
     encoding: FrequencyEncoding,
     points: &[[String; 3]],
-    used: &mut std::collections::BTreeSet<Vec<u8>>,
+    used: &mut super::IdentifierAllocator,
     serial: usize,
 ) -> Result<String> {
     use std::fmt::Write;
     let mut fresh = |base: &[u8]| -> Result<String> {
-        let name = super::fresh_identifier(used, base).context("transfer identifier overflow")?;
+        let name = used.fresh(base)?;
         Ok(String::from_utf8(name)?)
     };
     let model = fresh(format!("__freq_{serial}_model").as_bytes())?;
@@ -639,7 +639,12 @@ pub struct LoweredSources {
 /// Control commands, ordinary E/G cards and comments are not transformed.
 /// # Errors
 /// Malformed transfer cards, invalid text, or identifier allocation failure.
-pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
+pub fn lower_sources(
+    input: &[u8],
+    budget: &model_preprocess_command::WorkBudget,
+) -> Result<Option<LoweredSources>> {
+    use model_preprocess_command::Resource;
+    budget.charge(Resource::ScannedBytes, input.len())?;
     if !input.windows(4).any(|w| w.eq_ignore_ascii_case(b"freq"))
         && !input.windows(5).any(|w| w.eq_ignore_ascii_case(b"table"))
     {
@@ -650,6 +655,7 @@ pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
     let mut inserted_lines = Vec::new();
     let mut in_control = false;
     for statement in lexical::statements(input)? {
+        budget.charge(Resource::Statements, 1)?;
         let text = &statement.text;
         let first = text
             .split(u8::is_ascii_whitespace)
@@ -677,6 +683,7 @@ pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
         };
         let generated = match &transfer.transfer {
             Transfer::Table { points, multiplier } => {
+                budget.charge(Resource::GeneratedNodes, points.len())?;
                 // ngspice parses adjacent tuples containing braced ordinates
                 // incorrectly. Separate the tuples even when already braced.
                 let symbolic_expression_table = matches!(transfer.control, Control::Expression(_))
@@ -692,14 +699,21 @@ pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
                 }
                 emit_table(&transfer, points, multiplier.as_deref())?
             }
-            Transfer::Frequency { encoding, points } => emit_frequency(
-                &transfer,
-                *encoding,
-                points,
-                used.get_or_insert_with(|| super::source_identifiers(input)),
-                statement.line,
-            )?,
+            Transfer::Frequency { encoding, points } => {
+                budget.charge(Resource::GeneratedNodes, points.len())?;
+                if used.is_none() {
+                    used = Some(super::IdentifierAllocator::new(input, budget)?);
+                }
+                emit_frequency(
+                    &transfer,
+                    *encoding,
+                    points,
+                    used.as_mut().context("missing identifier allocator")?,
+                    statement.line,
+                )?
+            }
         };
+        budget.charge(Resource::EmittedBytes, generated.len())?;
         if generated.as_bytes() == text {
             continue;
         }
@@ -718,7 +732,7 @@ pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
         }
     }
     Ok(
-        lexical::apply_edits(input, edits).map(|bytes| LoweredSources {
+        lexical::apply_budgeted_edits(input, edits, budget)?.map(|bytes| LoweredSources {
             bytes,
             inserted_lines,
         }),
@@ -850,14 +864,22 @@ mod tests {
     #[test]
     fn lowering_preserves_comments_source_map_and_branch_names() -> Result<()> {
         let input = b"title\r\nL1 a b 1u Rser=1\r\nE1 out 0 FREQ {v(a,b)*2}=MAG RAD\r\n+ (10,2,0)\r\n+ (20,2,1.57) ; tail\r\nR1 __freq_3_out 0 1k\r\nE2 q 0 TABLE {v(a)}=(0,0)(1,1)\r\n.end\r\n";
-        let result = normalize_mapped(input, RootKind::Deck)?;
+        let result = normalize_mapped(
+            input,
+            RootKind::Deck,
+            &model_preprocess_command::WorkBudget::default(),
+        )?;
         let text = std::str::from_utf8(&result.model.bytes)?;
         assert!(text.contains("E1 out 0 __freq_3_out_1 0 1\r\n"));
         assert!(text.contains("db=false rad=true table=[10 2 0 20 2 1.57]"));
         assert!(text.contains("E2 q 0 TABLE {v(a)}=(0,0)(1,1)"));
         assert!(text.contains("; tail"));
         assert_eq!(result.input_lines, [1, 2, 2, 3, 3, 3, 3, 4, 5, 6, 7, 8]);
-        let repeated = normalize_mapped(&result.model.bytes, RootKind::Deck)?;
+        let repeated = normalize_mapped(
+            &result.model.bytes,
+            RootKind::Deck,
+            &model_preprocess_command::WorkBudget::default(),
+        )?;
         assert_eq!(repeated.model.bytes, result.model.bytes);
         assert_eq!(
             normalize_ngspice(b"E1 out 0 TABLE {v(a)}=(0,0)(1,1)")?.bytes,
@@ -883,7 +905,11 @@ mod tests {
     fn native_xfer_reference_complex_interpolation_and_current_polarity() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let source = b"Frequency transfer reference\n.param f0=100 f1=300 gain=2\nV1 in 0 dc 1 ac 1\nV2 ref 0 dc 0.25 ac 0.25\nEout out 0 FREQ {V(in,ref)*2} MAG RAD ({f0},{gain},0) ({f1},{gain},1.5707963267948966)\nRload out 0 1k\nGout gout 0 FREQ {V(in,ref)*2} R_I (f0,gain,0) (f1,0,gain)\nRg gout 0 1\n.control\nset wr_singlescale\nset wr_vecnames\nac lin 5 50 350\nwrdata response.dat v(out) v(gout)\nquit\n.endc\n.end\n";
-        let normalized = normalize_mapped(source, RootKind::Deck)?;
+        let normalized = normalize_mapped(
+            source,
+            RootKind::Deck,
+            &model_preprocess_command::WorkBudget::default(),
+        )?;
         fs::write(
             directory.path().join("reference.cir"),
             normalized.model.bytes,

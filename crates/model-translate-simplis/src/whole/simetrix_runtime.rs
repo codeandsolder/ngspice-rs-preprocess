@@ -4,11 +4,13 @@
 //! temperature. Native behavioral expressions use ngspice's live temperature.
 
 use super::{
-    Item, behavioral_function_arguments, directive_name, lower_simetrix_behavioral_expression,
-    matching_behavioral_parenthesis, model_header, parse_items, render_native_subcircuit,
+    ExpressionWriter, Item, append_budgeted, append_format_budgeted, behavioral_function_arguments,
+    directive_name, format_budgeted, lower_simetrix_behavioral_expression,
+    matching_behavioral_parenthesis, model_header, parse_deck_items, render_native_subcircuit,
 };
 use crate::{normalized_statement, parse_numeric, statement_tokens};
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::{
     LinkedPreprocessedNetlist, active_statement_prefix, capacitor_charge_assignments,
     parameter_assignments, simetrix_constant, validate_simetrix_parameter_name,
@@ -25,7 +27,8 @@ enum ExpressionContext {
     Behavioral,
 }
 
-struct Builtins {
+struct Builtins<'a> {
+    budget: &'a WorkBudget,
     realization: Option<Realization>,
     next_call: u64,
     lncosh: bool,
@@ -34,33 +37,23 @@ struct Builtins {
     temp_name: String,
 }
 
-fn unused_identifier(base: &str, source: &str) -> String {
-    // The complete source is case folded once. Avoid *all* existing source
-    // identifiers, not only declarations known to this particular pass.
-    let mut name = base.to_owned();
-    let mut suffix = 0usize;
-    while source.contains(&name) {
-        suffix += 1;
-        name = format!("{base}_{suffix}");
-    }
-    name
-}
-
-impl Builtins {
-    fn new(linked: &LinkedPreprocessedNetlist, realization: Option<Realization>) -> Self {
-        let mut source = String::from_utf8_lossy(&linked.root_bytes).to_ascii_lowercase();
-        for library in &linked.libraries {
-            source.push('\n');
-            source.push_str(&String::from_utf8_lossy(&library.bytes).to_ascii_lowercase());
-        }
-        Self {
+impl<'a> Builtins<'a> {
+    fn new(
+        root: &[Item],
+        libraries: &[Vec<Item>],
+        realization: Option<Realization>,
+        budget: &'a WorkBudget,
+    ) -> Result<Self> {
+        let scopes = || std::iter::once(root).chain(libraries.iter().map(Vec::as_slice));
+        Ok(Self {
+            budget,
             realization,
             next_call: 0,
             lncosh: false,
             static_temp: false,
-            lncosh_name: unused_identifier(LNCOSH_NAME, &source),
-            temp_name: unused_identifier(TEMP_NAME, &source),
-        }
+            lncosh_name: super::pwls::scope_prefix(scopes(), None, LNCOSH_NAME, budget)?,
+            temp_name: super::pwls::scope_prefix(scopes(), None, TEMP_NAME, budget)?,
+        })
     }
 }
 
@@ -73,33 +66,83 @@ const fn symbol_start(input: &[u8], index: usize) -> bool {
         && (index == 0 || !symbol_byte(input[index - 1]))
 }
 
-impl Builtins {
+impl Builtins<'_> {
     fn expression(&mut self, input: &str, context: ExpressionContext) -> Result<String> {
-        let mut output = String::with_capacity(input.len());
+        let budget = self.budget;
+        let _depth = budget.enter()?;
+        budget.charge(Resource::EvaluationSteps, input.len())?;
+        let mut output = ExpressionWriter::new(input, budget);
         let bytes = input.as_bytes();
         let mut cursor = 0;
         while cursor < bytes.len() {
             if bytes[cursor] == b'"' {
-                let end = input[cursor + 1..]
+                cursor = input[cursor + 1..]
                     .find('"')
                     .map(|index| cursor + index + 2)
                     .context("unterminated quoted expression string")?;
-                output.push_str(&input[cursor..end]);
-                cursor = end;
             } else if symbol_start(bytes, cursor) {
                 let (rewritten, end) = self.symbol(input, cursor, context)?;
-                output.push_str(&rewritten);
+                if rewritten != input[cursor..end] {
+                    output.replace(cursor, end, &rewritten)?;
+                }
                 cursor = end;
             } else {
                 let character = input[cursor..]
                     .chars()
                     .next()
                     .context("expression boundary")?;
-                output.push(character);
                 cursor += character.len_utf8();
             }
         }
-        Ok(output)
+        output.finish()
+    }
+
+    fn statistical_call(
+        &mut self,
+        input: &str,
+        open: usize,
+        distribution: Function,
+    ) -> Result<(String, usize)> {
+        let close = matching_behavioral_parenthesis(input, open)?;
+        let args = behavioral_function_arguments(&input[open + 1..close])?;
+        distribution.validate_arity(args.len())?;
+        ensure!(
+            args.iter().all(|arg| !arg.is_empty()),
+            "empty statistical argument"
+        );
+        // Nominal distribution functions never evaluate tolerance expressions.
+        let Some(realization) = self.realization else {
+            return Ok(("1".to_owned(), close + 1));
+        };
+        ensure!(
+            distribution.sampled_supported(),
+            "{} has no validated sampled law",
+            distribution.name()
+        );
+        let invocation = Invocation {
+            function: distribution,
+            realization,
+            site: self.next_call,
+        };
+        self.next_call = self
+            .next_call
+            .checked_add(1)
+            .context("statistical source site overflow")?;
+        self.budget.charge(Resource::GeneratedNodes, 1)?;
+        let mut rewritten =
+            format_budgeted(self.budget, format_args!("{}(", invocation.marker_name()))?;
+        for word in invocation.metadata() {
+            append_format_budgeted(&mut rewritten, self.budget, format_args!("{word},"))?;
+        }
+        for (index, arg) in args.iter().enumerate() {
+            if index != 0 {
+                append_budgeted(&mut rewritten, ",", self.budget)?;
+            }
+            let arg = self.expression(arg, ExpressionContext::Static)?;
+            append_budgeted(&mut rewritten, &arg, self.budget)?;
+        }
+        append_budgeted(&mut rewritten, ")", self.budget)?;
+        Ok((rewritten, close + 1))
     }
 
     fn symbol(
@@ -128,43 +171,7 @@ impl Builtins {
                 "reserved prepared statistical function {name} in source"
             );
             if let Some(distribution) = Function::simetrix(name) {
-                let close = matching_behavioral_parenthesis(input, open)?;
-                let args = behavioral_function_arguments(&input[open + 1..close])?;
-                distribution.validate_arity(args.len())?;
-                ensure!(
-                    args.iter().all(|arg| !arg.is_empty()),
-                    "empty statistical argument"
-                );
-                // Nominal distribution functions never evaluate tolerance expressions.
-                let Some(realization) = self.realization else {
-                    return Ok(("1".to_owned(), close + 1));
-                };
-                ensure!(
-                    distribution.sampled_supported(),
-                    "{} has no validated sampled law",
-                    distribution.name()
-                );
-                let invocation = Invocation {
-                    function: distribution,
-                    realization,
-                    site: self.next_call,
-                };
-                self.next_call = self
-                    .next_call
-                    .checked_add(1)
-                    .context("statistical source site overflow")?;
-                let mut rewritten = format!("{}(", invocation.marker_name());
-                for word in invocation.metadata() {
-                    write!(rewritten, "{word},")?;
-                }
-                for (index, arg) in args.iter().enumerate() {
-                    if index != 0 {
-                        rewritten.push(',');
-                    }
-                    rewritten.push_str(&self.expression(arg, ExpressionContext::Static)?);
-                }
-                rewritten.push(')');
-                return Ok((rewritten, close + 1));
+                return self.statistical_call(input, open, distribution);
             }
             if name.eq_ignore_ascii_case("LNCOSH") {
                 let close = matching_behavioral_parenthesis(input, open)?;
@@ -175,7 +182,10 @@ impl Builtins {
                 );
                 self.lncosh = true;
                 let value = self.expression(args[0], context)?;
-                return Ok((format!("{}({value})", self.lncosh_name), close + 1));
+                return Ok((
+                    format_budgeted(self.budget, format_args!("{}({value})", self.lncosh_name))?,
+                    close + 1,
+                ));
             }
             return Ok((name.to_owned(), end));
         }
@@ -203,7 +213,7 @@ impl Builtins {
         for (name, value) in parameter_assignments(text)? {
             validate_simetrix_parameter_name(name)?;
             let rewritten = self.expression(value, ExpressionContext::Static)?;
-            let rewritten = lower_simetrix_behavioral_expression(&rewritten)?;
+            let rewritten = lower_simetrix_behavioral_expression(&rewritten, self.budget)?;
             write!(output, " {name}={rewritten}")?;
         }
         Ok(output)
@@ -225,7 +235,10 @@ impl Builtins {
             output.push_str(&statement[offset..=start]);
             let expression =
                 self.expression(&statement[start + 1..close], ExpressionContext::Static)?;
-            output.push_str(&lower_simetrix_behavioral_expression(&expression)?);
+            output.push_str(&lower_simetrix_behavioral_expression(
+                &expression,
+                self.budget,
+            )?);
             output.push('}');
             offset = close + 1;
         }
@@ -243,7 +256,7 @@ impl Builtins {
             };
             result.push_str(&self.braced_regions(&statement[cursor..span.start])?);
             let value = self.expression(&statement[span.clone()], ExpressionContext::Static)?;
-            result.push_str(&lower_simetrix_behavioral_expression(&value)?);
+            result.push_str(&lower_simetrix_behavioral_expression(&value, self.budget)?);
             cursor = span.end;
         }
         result.push_str(&self.braced_regions(&statement[cursor..])?);
@@ -274,11 +287,13 @@ impl Builtins {
                         .or_else(|| value.strip_prefix('{').and_then(|v| v.strip_suffix('}')))
                         .unwrap_or(value);
                     let expression = self.expression(value, ExpressionContext::Behavioral)?;
-                    let expression = lower_simetrix_behavioral_expression(&expression)?;
+                    let expression =
+                        lower_simetrix_behavioral_expression(&expression, self.budget)?;
                     write!(output, " Q='{expression}'")?;
                 } else {
                     let expression = self.expression(value, ExpressionContext::Static)?;
-                    let expression = lower_simetrix_behavioral_expression(&expression)?;
+                    let expression =
+                        lower_simetrix_behavioral_expression(&expression, self.budget)?;
                     write!(output, " {name}={expression}")?;
                 }
             }
@@ -313,7 +328,7 @@ impl Builtins {
                 Ok(format!(
                     "{}{}",
                     &active[..=close],
-                    lower_simetrix_behavioral_expression(&body)?
+                    lower_simetrix_behavioral_expression(&body, self.budget)?
                 ))
             }
             Some(
@@ -550,10 +565,19 @@ fn lower_model_temperature(statement: &str, models: &Temperatures) -> Result<Str
 fn lower_scope(
     items: &mut [Item],
     inherited: &Temperatures,
-    builtins: &mut Builtins,
+    builtins: &mut Builtins<'_>,
 ) -> Result<()> {
+    let budget = builtins.budget;
+    let _depth = budget.enter()?;
     let mut local = Temperatures::new();
     collect_model_temperatures(items, &mut local)?;
+    budget.charge(Resource::GeneratedNodes, inherited.len())?;
+    for (name, model) in inherited {
+        budget.charge(
+            Resource::EmittedBytes,
+            name.len().saturating_add(model.value.len()),
+        )?;
+    }
     let mut visible = inherited.clone();
     // A local model without T_ABS also shadows an outer model with it.
     for item in items.iter() {
@@ -567,10 +591,18 @@ fn lower_scope(
     for item in items {
         match item {
             Item::Statement(statement) => {
-                *statement = builtins.statement(&lower_model_temperature(statement, &visible)?)?;
+                budget.charge(Resource::ScannedBytes, statement.len())?;
+                budget.charge(Resource::Statements, 1)?;
+                let rewritten =
+                    builtins.statement(&lower_model_temperature(statement, &visible)?)?;
+                budget.charge(Resource::EmittedBytes, rewritten.len())?;
+                *statement = rewritten;
             }
             Item::Subcircuit(block) => {
-                block.header = builtins.statement(&block.header)?;
+                budget.charge(Resource::ScannedBytes, block.header.len())?;
+                let header = builtins.statement(&block.header)?;
+                budget.charge(Resource::EmittedBytes, header.len())?;
+                block.header = header;
                 lower_scope(&mut block.body, &visible, builtins)?;
             }
         }
@@ -578,12 +610,14 @@ fn lower_scope(
     Ok(())
 }
 
-fn render_items(items: &[Item]) -> Result<Vec<u8>> {
+fn render_items(items: &[Item], budget: &WorkBudget) -> Result<Vec<u8>> {
     let mut output = String::new();
     for item in items {
         match item {
-            Item::Statement(statement) => writeln!(output, "{statement}")?,
-            Item::Subcircuit(block) => render_native_subcircuit(block, &mut output)?,
+            Item::Statement(statement) => {
+                append_format_budgeted(&mut output, budget, format_args!("{statement}\n"))?;
+            }
+            Item::Subcircuit(block) => render_native_subcircuit(block, &mut output, budget)?,
         }
     }
     Ok(output.into_bytes())
@@ -596,12 +630,13 @@ fn render_items(items: &[Item]) -> Result<Vec<u8>> {
 pub fn lower_simetrix_linked_runtime(
     linked: &mut LinkedPreprocessedNetlist,
     realization: Option<Realization>,
+    budget: &WorkBudget,
 ) -> Result<()> {
-    let mut root = parse_items(std::str::from_utf8(&linked.root_bytes)?)?;
+    let mut root = parse_deck_items(&linked.root_bytes, budget)?;
     let mut libraries = linked
         .libraries
         .iter()
-        .map(|library| parse_items(std::str::from_utf8(&library.bytes)?))
+        .map(|library| parse_deck_items(&library.bytes, budget))
         .collect::<Result<Vec<_>>>()?;
     let mut globals = Temperatures::new();
     collect_model_temperatures(&root, &mut globals)?;
@@ -609,7 +644,7 @@ pub fn lower_simetrix_linked_runtime(
         collect_model_temperatures(items, &mut globals)?;
     }
     let temp = root_temperature(&root)?;
-    let mut builtins = Builtins::new(linked, realization);
+    let mut builtins = Builtins::new(&root, &libraries, realization, budget)?;
     lower_scope(&mut root, &globals, &mut builtins)?;
     for items in &mut libraries {
         lower_scope(items, &globals, &mut builtins)?;
@@ -630,9 +665,9 @@ pub fn lower_simetrix_linked_runtime(
         prelude.push(Item::Statement(format!(".func {}(x) {{abs(x)<0.01 ? x*x*(0.5-x*x/12+x*x*x*x/45) : abs(x)+ln(1+exp(-2*abs(x)))-ln(2)}}", builtins.lncosh_name)));
     }
     prelude.append(&mut root);
-    linked.root_bytes = render_items(&prelude)?;
+    linked.root_bytes = render_items(&prelude, budget)?;
     for (library, items) in linked.libraries.iter_mut().zip(libraries) {
-        library.bytes = render_items(&items)?;
+        library.bytes = render_items(&items, budget)?;
     }
     Ok(())
 }

@@ -24,10 +24,17 @@ pub mod vdmos_ltspice;
 pub mod waveform;
 
 use anyhow::{Context, Result, bail};
-use model_preprocess_command::{Cancellation, ProcessLimits, capture};
+use model_preprocess_command::{Cancellation, ProcessLimits, Resource, WorkBudget, capture};
 use regex::bytes::Regex;
 use serde::Serialize;
-use std::{collections::BTreeSet, fs, io::Write, path::Path, sync::LazyLock, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Write,
+    path::Path,
+    sync::LazyLock,
+    time::Duration,
+};
 use tempfile::TempDir;
 
 static NGSPICE_ERROR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -115,46 +122,71 @@ pub fn looks_like_simplis(input: &[u8]) -> bool {
 
 use lexical::{ensure_textual, normalize_nbsp, split_line_ending};
 
-/// Reserve source identifiers before introducing synthetic elements or nets.
-///
-/// ngspice node and element names are case-insensitive. Tokenizing across
-/// structural punctuation also reserves names inside parameter expressions,
-/// rather than considering only device names at the start of a line.
-fn source_identifiers(input: &[u8]) -> BTreeSet<Vec<u8>> {
-    let mut used = BTreeSet::new();
-    // Preserve the full spelling of SPICE identifiers with punctuation,
-    // and separately reserve plain identifiers embedded in expressions.
-    for token in input.split(|byte| {
-        byte.is_ascii_whitespace()
-            || matches!(
-                *byte,
-                b'[' | b']' | b'(' | b')' | b'{' | b'}' | b',' | b';' | b'=' | b'"' | b'\''
-            )
-    }) {
-        if !token.is_empty() {
-            used.insert(token.to_ascii_uppercase());
-        }
-    }
-    for token in input.split(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_')) {
-        if !token.is_empty() {
-            used.insert(token.to_ascii_uppercase());
-        }
-    }
-    used
+/// Reserve source identifiers, then allocate names with a monotonic cursor
+/// per canonical base. Scoped repetitions do not restart collision searches.
+struct IdentifierAllocator {
+    used: BTreeSet<Vec<u8>>,
+    next: BTreeMap<Vec<u8>, usize>,
+    budget: WorkBudget,
 }
 
-/// Allocate a source-unique element or net identifier, including against
-/// identifiers generated earlier in the same normalization pass.
-fn fresh_identifier(used: &mut BTreeSet<Vec<u8>>, base: &[u8]) -> Option<Vec<u8>> {
-    let mut candidate = base.to_vec();
-    let mut suffix = 0usize;
-    loop {
-        if used.insert(candidate.to_ascii_uppercase()) {
-            return Some(candidate);
+impl IdentifierAllocator {
+    fn new(input: &[u8], budget: &WorkBudget) -> Result<Self> {
+        let mut allocator = Self {
+            used: BTreeSet::new(),
+            next: BTreeMap::new(),
+            budget: budget.clone(),
+        };
+        budget.charge(Resource::ScannedBytes, input.len().saturating_mul(2))?;
+        // Reserve full punctuation-bearing names and plain identifiers
+        // embedded within expressions.
+        for token in input
+            .split(|byte| {
+                byte.is_ascii_whitespace()
+                    || matches!(
+                        *byte,
+                        b'[' | b']' | b'(' | b')' | b'{' | b'}' | b',' | b';' | b'=' | b'"' | b'\''
+                    )
+            })
+            .chain(input.split(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_')))
+        {
+            if !token.is_empty() {
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                budget.charge(Resource::EmittedBytes, token.len())?;
+                allocator.used.insert(token.to_ascii_uppercase());
+            }
         }
-        suffix = suffix.checked_add(1)?;
-        candidate = base.to_vec();
-        write!(&mut candidate, "_{suffix}").ok()?;
+        Ok(allocator)
+    }
+
+    fn fresh(&mut self, base: &[u8]) -> Result<Vec<u8>> {
+        self.budget.charge(Resource::EmittedBytes, base.len())?;
+        self.budget.charge(Resource::GeneratedNodes, 1)?;
+        let key = base.to_ascii_uppercase();
+        let next = self.next.entry(key).or_default();
+        loop {
+            self.budget.charge(Resource::EvaluationSteps, 1)?;
+            let suffix = if *next == 0 {
+                String::new()
+            } else {
+                format!("_{next}")
+            };
+            self.budget.charge(
+                Resource::EmittedBytes,
+                base.len().saturating_add(suffix.len()),
+            )?;
+            let mut candidate = base.to_vec();
+            candidate.extend_from_slice(suffix.as_bytes());
+            *next = next
+                .checked_add(1)
+                .context("generated identifier overflow")?;
+            self.budget
+                .charge(Resource::EmittedBytes, candidate.len())?;
+            self.budget.charge(Resource::GeneratedNodes, 1)?;
+            if self.used.insert(candidate.to_ascii_uppercase()) {
+                return Ok(candidate);
+            }
+        }
     }
 }
 
@@ -193,15 +225,16 @@ fn rser_assignment(
 fn rewrite_ltspice_inductor_rser(
     input: &[u8],
     inserted_lines: &mut Vec<usize>,
+    budget: &WorkBudget,
 ) -> Result<Option<Vec<u8>>> {
-    use lexical::{apply_edits, replace_span, statements, tokens};
+    use lexical::{replace_span, statements, tokens};
     if !input
         .windows(4)
         .any(|word| word.eq_ignore_ascii_case(b"rser"))
     {
         return Ok(None);
     }
-    let mut used = source_identifiers(input);
+    let mut used = IdentifierAllocator::new(input, budget)?;
     let mut edits = Vec::new();
     let mut serial = 0;
     let mut in_control = false;
@@ -236,13 +269,11 @@ fn rewrite_ltspice_inductor_rser(
         let mut resistor_base = b"R__".to_vec();
         resistor_base.extend_from_slice(ind);
         resistor_base.extend_from_slice(b"_RSER");
-        let resistor =
-            fresh_identifier(&mut used, &resistor_base).context("element identifier overflow")?;
+        let resistor = used.fresh(&resistor_base)?;
         let mut internal_base = b"__".to_vec();
         internal_base.extend_from_slice(ind);
         write!(&mut internal_base, "_rser_{serial}")?;
-        let internal =
-            fresh_identifier(&mut used, &internal_base).context("node identifier overflow")?;
+        let internal = used.fresh(&internal_base)?;
         serial += 1;
         let physical = input[statement.start..]
             .split_inclusive(|b| *b == b'\n')
@@ -278,7 +309,7 @@ fn rewrite_ltspice_inductor_rser(
             }
         }
     }
-    Ok(apply_edits(input, edits))
+    lexical::apply_budgeted_edits(input, edits, budget)
 }
 
 fn params_header_end(text: &[u8], fields: &[std::ops::Range<usize>]) -> Option<usize> {
@@ -352,7 +383,8 @@ fn expression_start(text: &[u8], first: &[u8]) -> Result<Option<usize>> {
     Ok(index.and_then(|at| fields.get(at)).map(|span| span.start))
 }
 
-fn rewrite_pspice_arctan(input: &[u8]) -> Result<Option<Vec<u8>>> {
+fn rewrite_pspice_arctan(input: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
     if !input
         .windows(6)
         .any(|word| word.eq_ignore_ascii_case(b"arctan"))
@@ -388,10 +420,11 @@ fn rewrite_pspice_arctan(input: &[u8]) -> Result<Option<Vec<u8>>> {
             lexical::replace_span(&statement, span, b"atan", &mut edits);
         }
     }
-    Ok(lexical::apply_edits(input, edits))
+    lexical::apply_budgeted_edits(input, edits, budget)
 }
 
-fn rewrite_spaced_parameter_marker(input: &[u8]) -> Result<Option<Vec<u8>>> {
+fn rewrite_spaced_parameter_marker(input: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
     if !input
         .windows(6)
         .any(|word| word.eq_ignore_ascii_case(b"params"))
@@ -451,10 +484,11 @@ fn rewrite_spaced_parameter_marker(input: &[u8]) -> Result<Option<Vec<u8>>> {
             }
         }
     }
-    Ok(lexical::apply_edits(input, edits))
+    lexical::apply_budgeted_edits(input, edits, budget)
 }
 
-fn rewrite_pspice_positional_params(input: &[u8]) -> Result<Option<Vec<u8>>> {
+fn rewrite_pspice_positional_params(input: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
     if !input
         .windows(6)
         .any(|word| word.eq_ignore_ascii_case(b"params"))
@@ -515,10 +549,11 @@ fn rewrite_pspice_positional_params(input: &[u8]) -> Result<Option<Vec<u8>>> {
             }
         }
     }
-    Ok(lexical::apply_edits(input, edits))
+    lexical::apply_budgeted_edits(input, edits, budget)
 }
 
-fn strip_standalone_end(input: &[u8]) -> Result<Option<Vec<u8>>> {
+fn strip_standalone_end(input: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
     let mut edits = Vec::new();
     let mut in_control = false;
     for statement in lexical::statements(input)? {
@@ -535,7 +570,7 @@ fn strip_standalone_end(input: &[u8]) -> Result<Option<Vec<u8>>> {
             );
         }
     }
-    Ok(lexical::apply_edits(input, edits))
+    lexical::apply_budgeted_edits(input, edits, budget)
 }
 
 fn apply_optional<F>(
@@ -564,7 +599,7 @@ fn apply_optional<F>(
 /// Returns an error for binary input or source identified as SIMPLIS, which requires
 /// semantic translation rather than syntax normalization.
 pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
-    normalize_body(input, true, &mut Vec::new())
+    normalize_body(input, true, &mut Vec::new(), &WorkBudget::default())
 }
 
 /// Normalized bytes and one original input line for each emitted physical line.
@@ -586,6 +621,7 @@ pub struct MappedNormalization {
 pub fn normalize_mapped(
     input: &[u8],
     kind: linked_source::RootKind,
+    budget: &WorkBudget,
 ) -> Result<MappedNormalization> {
     ensure_textual(input)?;
     let (title, body) = if kind == linked_source::RootKind::Deck {
@@ -602,16 +638,25 @@ pub fn normalize_mapped(
         body,
         kind == linked_source::RootKind::Include,
         &mut inserted,
+        budget,
     )?;
     let title_lines = usize::from(!title.is_empty());
     let mut input_lines = Vec::new();
     if title_lines != 0 {
         input_lines.push(1);
+        budget.charge(
+            Resource::EmittedBytes,
+            title.len().saturating_add(model.bytes.len()),
+        )?;
         let mut bytes = Vec::with_capacity(title.len() + model.bytes.len());
         bytes.extend_from_slice(title);
         bytes.extend_from_slice(&model.bytes);
         model.bytes = bytes;
     }
+    budget.charge(
+        Resource::GeneratedNodes,
+        model.bytes.split_inclusive(|byte| *byte == b'\n').count(),
+    )?;
     let mut inserted = inserted.into_iter().peekable();
     for (index, _) in body.split_inclusive(|byte| *byte == b'\n').enumerate() {
         let line = index + 1;
@@ -633,7 +678,10 @@ fn normalize_body(
     input: &[u8],
     strip_end: bool,
     inserted_lines: &mut Vec<usize>,
+    budget: &WorkBudget,
 ) -> Result<NormalizedModel> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    budget.charge(Resource::EmittedBytes, input.len())?;
     ensure_textual(input)?;
     if looks_like_simplis(input) {
         bail!("SIMPLIS source requires translation, not ngspice normalization");
@@ -641,33 +689,37 @@ fn normalize_body(
 
     let mut bytes = input.to_vec();
     let mut passes = Vec::new();
+    budget.charge(Resource::ScannedBytes, bytes.len())?;
+    if bytes.contains(&0xa0) {
+        budget.charge(Resource::EmittedBytes, bytes.len())?;
+    }
     apply_optional(
         &mut bytes,
         &mut passes,
         NormalizationPass::NormalizeNbspWhitespace,
         normalize_nbsp,
     );
-    if let Some(rewritten) = rewrite_ltspice_inductor_rser(&bytes, inserted_lines)? {
+    if let Some(rewritten) = rewrite_ltspice_inductor_rser(&bytes, inserted_lines, budget)? {
         bytes = rewritten;
         passes.push(NormalizationPass::LtspiceInductorRser);
     }
-    if let Some(rewritten) = rewrite_pspice_arctan(&bytes)? {
+    if let Some(rewritten) = rewrite_pspice_arctan(&bytes, budget)? {
         bytes = rewritten;
         passes.push(NormalizationPass::PspiceArctan);
     }
-    if let Some(rewritten) = rewrite_pspice_positional_params(&bytes)? {
+    if let Some(rewritten) = rewrite_pspice_positional_params(&bytes, budget)? {
         bytes = rewritten;
         passes.push(NormalizationPass::PspicePositionalParams);
     }
-    if let Some(rewritten) = rewrite_spaced_parameter_marker(&bytes)? {
+    if let Some(rewritten) = rewrite_spaced_parameter_marker(&bytes, budget)? {
         bytes = rewritten;
         passes.push(NormalizationPass::PspiceParamsMarker);
     }
-    if strip_end && let Some(rewritten) = strip_standalone_end(&bytes)? {
+    if strip_end && let Some(rewritten) = strip_standalone_end(&bytes, budget)? {
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
-    if let Some(lowered) = controlled_transfer::lower_sources(&bytes)? {
+    if let Some(lowered) = controlled_transfer::lower_sources(&bytes, budget)? {
         let mut origins = Vec::new();
         let mut previous = inserted_lines.iter().copied().peekable();
         for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
@@ -1015,7 +1067,11 @@ mod tests {
     #[test]
     fn spaced_parameter_markers_keep_physical_lines_and_non_markers() -> Result<()> {
         let source = b".subckt c a b PARAMS : R=1k\nX1 a b c params\n+ :\n+ R=2k\nX2 params : c\nR1 a b {f('params :')}\n.ends\n";
-        let result = normalize_mapped(source, linked_source::RootKind::Include)?;
+        let result = normalize_mapped(
+            source,
+            linked_source::RootKind::Include,
+            &WorkBudget::default(),
+        )?;
         let actual = std::str::from_utf8(&result.model.bytes)?;
         assert!(actual.contains("PARAMS:  R=1k"));
         assert!(actual.contains("params:\n* \n+ R=2k"));
@@ -1039,5 +1095,32 @@ mod tests {
         let input = b".MODEL SW VCSW RON=1m ROFF=1MEG TH=2 HYSTWD=1 LOGIC=POS\n";
         assert!(looks_like_simplis(input));
         assert!(normalize_ngspice(input).is_err());
+    }
+}
+
+#[cfg(test)]
+mod identifier_budget_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_case_folded_bases_do_not_rescan_prior_candidates() -> Result<()> {
+        let budget = WorkBudget::default();
+        let mut allocator = IdentifierAllocator::new(b"R__l1_rser R__L1_RSER_1", &budget)?;
+        let before = budget.remaining(Resource::EvaluationSteps)?;
+        for index in 2..10_002 {
+            let base = if index % 2 == 0 {
+                b"R__L1_RSER"
+            } else {
+                b"r__l1_rser"
+            };
+            let actual = allocator.fresh(base)?;
+            let expected = format!("{}_{index}", std::str::from_utf8(base)?);
+            assert_eq!(actual, expected.as_bytes());
+        }
+        assert_eq!(
+            before - budget.remaining(Resource::EvaluationSteps)?,
+            10_002
+        );
+        Ok(())
     }
 }

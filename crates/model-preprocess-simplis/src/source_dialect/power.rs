@@ -4,6 +4,7 @@
 
 use super::group_end;
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -24,8 +25,9 @@ struct Token {
     text: String,
 }
 
-struct Lowerer {
+struct Lowerer<'a> {
     limit: usize,
+    budget: &'a WorkBudget,
 }
 
 struct Cursor<'a> {
@@ -96,14 +98,14 @@ impl<'a> Cursor<'a> {
     }
 }
 
-impl Lowerer {
-    fn group(&self, cursor: &mut Cursor<'_>, depth: usize) -> Result<String> {
+impl Lowerer<'_> {
+    fn group(&self, cursor: &mut Cursor<'_>) -> Result<String> {
         let (open, body, close) = cursor.group()?;
-        let body = self.expression(body, depth + 1)?;
+        let body = self.expression(body)?;
         Ok(format!("{open}{body}{close}"))
     }
 
-    fn identifier(&self, cursor: &mut Cursor<'_>, depth: usize) -> Result<String> {
+    fn identifier(&self, cursor: &mut Cursor<'_>) -> Result<String> {
         let start = cursor.offset;
         cursor.identifier();
         let name = &cursor.input[start..cursor.offset];
@@ -126,26 +128,26 @@ impl Lowerer {
                 cursor.offset = close + 1;
             } else {
                 output.push_str(&cursor.input[before_space..cursor.offset]);
-                output.push_str(&self.group(cursor, depth)?);
+                output.push_str(&self.group(cursor)?);
             }
             first = false;
         }
         Ok(output)
     }
 
-    fn operand(&self, cursor: &mut Cursor<'_>, depth: usize) -> Result<Option<String>> {
+    fn operand(&self, cursor: &mut Cursor<'_>) -> Result<Option<String>> {
         let Some(byte) = cursor.byte() else {
             return Ok(None);
         };
         let value = match byte {
-            b'(' | b'{' | b'[' => self.group(cursor, depth)?,
+            b'(' | b'{' | b'[' => self.group(cursor)?,
             b'\'' | b'"' => {
                 let body = cursor.quoted(byte)?;
                 let quote = char::from(byte);
                 // Single quotes delimit electrical expressions; double
                 // quoted literal text is not an expression.
                 if byte == b'\'' {
-                    format!("{quote}{}{quote}", self.expression(body, depth + 1)?)
+                    format!("{quote}{}{quote}", self.expression(body)?)
                 } else {
                     format!("{quote}{body}{quote}")
                 }
@@ -156,14 +158,14 @@ impl Lowerer {
                 cursor.input[start..cursor.offset].to_owned()
             }
             byte if byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$' | b'@') => {
-                self.identifier(cursor, depth)?
+                self.identifier(cursor)?
             }
             _ => return Ok(None),
         };
         Ok(Some(value))
     }
 
-    fn tokens(&self, input: &str, depth: usize) -> Result<Vec<Token>> {
+    fn tokens(&self, input: &str) -> Result<Vec<Token>> {
         let mut cursor = Cursor::new(input);
         let mut tokens = Vec::new();
         let mut bytes = 0usize;
@@ -182,7 +184,7 @@ impl Lowerer {
                 }
             }
             let operand_start = cursor.offset;
-            if let Some(operand) = self.operand(&mut cursor, depth)? {
+            if let Some(operand) = self.operand(&mut cursor)? {
                 let prefix = &input[start..operand_start];
                 bytes = bytes
                     .saturating_add(prefix.len())
@@ -256,6 +258,7 @@ impl Lowerer {
             let leading = &first.text[..first.text.len() - first.text.trim_start().len()];
             let mut lhs = first.text.trim().to_owned();
             for pair in tokens[start + 1..index].as_chunks::<2>().0 {
+                self.budget.charge(Resource::EvaluationSteps, lhs.len())?;
                 let rhs = pair[1].text.trim();
                 lhs = if pair[0].kind == Kind::AbsolutePower {
                     guarded(&lhs, rhs, self.limit.saturating_sub(output.len()))?
@@ -273,7 +276,7 @@ impl Lowerer {
         Ok(output)
     }
 
-    fn expression(&self, input: &str, depth: usize) -> Result<String> {
+    fn expression(&self, input: &str) -> Result<String> {
         ensure!(
             input.len() <= self.limit,
             "source power expansion byte budget exceeded"
@@ -281,8 +284,9 @@ impl Lowerer {
         if !input.contains("**") {
             return Ok(input.to_owned());
         }
-        ensure!(depth <= 256, "source power expression nesting exceeds 256");
-        let tokens = self.tokens(input, depth)?;
+        let _frame = self.budget.enter()?;
+        self.budget.charge(Resource::EvaluationSteps, input.len())?;
+        let tokens = self.tokens(input)?;
         self.fold(&tokens)
     }
 }
@@ -316,8 +320,13 @@ pub(super) fn guarded(base: &str, exponent: &str, limit: usize) -> Result<String
     ))
 }
 
-pub(super) fn lower(input: &str, limit: usize) -> Result<String> {
-    Lowerer { limit }.expression(input, 0)
+#[cfg(test)]
+fn lower(input: &str, limit: usize) -> Result<String> {
+    lower_with_budget(input, limit, &WorkBudget::default())
+}
+
+pub(super) fn lower_with_budget(input: &str, limit: usize, budget: &WorkBudget) -> Result<String> {
+    Lowerer { limit, budget }.expression(input)
 }
 
 #[cfg(test)]

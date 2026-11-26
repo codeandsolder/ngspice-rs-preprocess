@@ -11,6 +11,7 @@ use crate::{
     model_card::{ModelCard, parse_parameter_fields, parse_spice_constant},
 };
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
@@ -48,7 +49,7 @@ struct Functions {
     scopes: Scopes,
     scope: usize,
     ground: String,
-    identifiers: BTreeSet<Vec<u8>>,
+    identifiers: crate::IdentifierAllocator,
     passives: passive::PassiveModels,
     temperature: bool,
     uses_gmin: bool,
@@ -58,18 +59,14 @@ struct Functions {
 
 impl Functions {
     fn new(input: &[u8], scopes: Scopes, options: options::GlobalOptions) -> Result<Self> {
-        let mut identifiers = crate::source_identifiers(input);
+        let mut identifiers = crate::IdentifierAllocator::new(input, scopes.budget())?;
         let mut names = BTreeMap::new();
         for (name, _) in FUNCTIONS {
             let base = format!("__ps_{name}");
-            let chosen = crate::fresh_identifier(&mut identifiers, base.as_bytes())
-                .context("PSpice helper identifier overflow")?;
+            let chosen = identifiers.fresh(base.as_bytes())?;
             names.insert((*name).to_owned(), String::from_utf8(chosen)?);
         }
-        let ground = String::from_utf8(
-            crate::fresh_identifier(&mut identifiers, b"__ps_gnd")
-                .context("PSpice ground identifier overflow")?,
-        )?;
+        let ground = String::from_utf8(identifiers.fresh(b"__ps_gnd")?)?;
         let passives = passive::PassiveModels::collect(&scopes, &mut identifiers)?;
         Ok(Self {
             names,
@@ -87,10 +84,7 @@ impl Functions {
     }
 
     fn allocate(&mut self, base: &str) -> Result<String> {
-        Ok(String::from_utf8(
-            crate::fresh_identifier(&mut self.identifiers, base.as_bytes())
-                .context("PSpice generated identifier overflow")?,
-        )?)
+        Ok(String::from_utf8(self.identifiers.fresh(base.as_bytes())?)?)
     }
 
     fn definitions(&self) -> Result<String> {
@@ -141,8 +135,11 @@ impl Functions {
                 return Ok(close);
             }
             let lower = name.to_ascii_lowercase();
-            if !self.scopes.shadows(self.scope, &lower) {
+            if !self.scopes.shadows(self.scope, &lower)? {
                 if let Some(generated) = self.names.get(&lower) {
+                    self.scopes
+                        .budget()
+                        .charge(Resource::EmittedBytes, generated.len())?;
                     output.extend_from_slice(generated.as_bytes());
                     self.used.insert(lower);
                     return Ok(end);
@@ -166,6 +163,12 @@ impl Functions {
     }
 
     fn expression(&mut self, input: &str, table: bool) -> Result<String> {
+        self.scopes
+            .budget()
+            .charge(Resource::EvaluationSteps, input.len())?;
+        self.scopes
+            .budget()
+            .charge(Resource::EmittedBytes, input.len())?;
         let bytes = input.as_bytes();
         let mut cursor = 0;
         let mut output = Vec::with_capacity(input.len());
@@ -211,6 +214,7 @@ impl Functions {
                     cursor += 1;
                 }
                 b'&' | b'|' => {
+                    self.scopes.budget().charge(Resource::EmittedBytes, 1)?;
                     output.extend_from_slice(&[byte, byte]);
                     cursor += 1 + usize::from(bytes.get(cursor + 1) == Some(&byte));
                 }
@@ -478,6 +482,14 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
     let Some(rewritten) = law.lower_instance(&fields, functions)? else {
         return Ok(text.to_owned());
     };
+    scope::charge_scope(
+        functions.scopes.path(functions.scope),
+        functions.scopes.budget(),
+    )?;
+    functions
+        .scopes
+        .budget()
+        .charge(Resource::GeneratedNodes, 1)?;
     functions.renamed.push(RenamedDevice {
         input_line: line,
         scope: functions.scopes.path(functions.scope).to_vec(),
@@ -615,6 +627,11 @@ fn rewrite_statements(
     let mut rewritten_statements = Vec::with_capacity(statements.len());
     let mut in_control = false;
     for statement in statements {
+        functions.scopes.budget().charge(Resource::Statements, 1)?;
+        functions
+            .scopes
+            .budget()
+            .charge(Resource::ScannedBytes, statement.text.len())?;
         let text = std::str::from_utf8(&statement.text).context("PSpice source is not UTF-8")?;
         let first = text.split_ascii_whitespace().next().unwrap_or_default();
         if first.eq_ignore_ascii_case(".control") {
@@ -643,6 +660,10 @@ fn rewrite_statements(
             let rewritten = rewrite(&text, statement.line, functions)
                 .with_context(|| format!("PSpice source line {}", statement.line))?;
             if first.eq_ignore_ascii_case(".model") {
+                functions
+                    .scopes
+                    .budget()
+                    .charge(Resource::EmittedBytes, rewritten.len())?;
                 rewritten_statements.push(rewritten);
                 continue;
             }
@@ -655,14 +676,19 @@ fn rewrite_statements(
             )?;
             switch_instance(&rewritten, statement.line, functions)?
         };
+        functions
+            .scopes
+            .budget()
+            .charge(Resource::EmittedBytes, rewritten.len())?;
         rewritten_statements.push(rewritten);
     }
     Ok(rewritten_statements)
 }
 
-fn lower_body(body: &[u8]) -> Result<LoweredBody> {
+fn lower_body(body: &[u8], budget: &WorkBudget) -> Result<LoweredBody> {
+    budget.charge(Resource::ScannedBytes, body.len())?;
     let statements = lexical::statements(body)?;
-    let scopes = Scopes::collect(&statements)?;
+    let scopes = Scopes::collect(&statements, budget)?;
     let options = options::GlobalOptions::collect(&statements)?;
     let mut functions = Functions::new(body, scopes, options)?;
     let rewritten_statements = rewrite_statements(&statements, &mut functions)?;
@@ -713,7 +739,8 @@ fn lower_body(body: &[u8]) -> Result<LoweredBody> {
         }
         offset += line.len();
     }
-    let bytes = lexical::apply_edits(body, edits).unwrap_or_else(|| body.to_vec());
+    let bytes =
+        lexical::apply_budgeted_edits(body, edits, budget)?.unwrap_or_else(|| body.to_vec());
     let lines = (1..=body.split_inclusive(|b| *b == b'\n').count())
         .flat_map(|line| {
             std::iter::repeat_n(line, inserted.get(&line).copied().unwrap_or_default() + 1)
@@ -754,8 +781,14 @@ pub struct PspiceNormalization {
 ///
 /// # Errors
 /// Malformed statements, unsupported physical source semantics or invalid provenance.
-pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<PspiceNormalization> {
-    let shared = super::normalize_mapped(input, kind)?;
+pub fn normalize_mapped(
+    input: &[u8],
+    kind: RootKind,
+    budget: &WorkBudget,
+) -> Result<PspiceNormalization> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    let shared = super::normalize_mapped(input, kind, budget)?;
+    budget.charge(Resource::EmittedBytes, shared.model.bytes.len())?;
     let first = usize::from(kind == RootKind::Deck);
     let title_end = if first != 0 {
         shared
@@ -772,13 +805,19 @@ pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<PspiceNormalizat
         lines,
         definitions,
         mut renamed,
-    } = lower_body(&shared.model.bytes[title_end..])?;
+    } = lower_body(&shared.model.bytes[title_end..], budget)?;
     for device in &mut renamed {
         device.input_line = *shared
             .input_lines
             .get(first + device.input_line - 1)
             .context("missing renamed device origin")?;
     }
+    budget.charge(
+        Resource::EmittedBytes,
+        title_end
+            .saturating_add(definitions.len())
+            .saturating_add(body.len()),
+    )?;
     let mut bytes = shared.model.bytes[..title_end].to_vec();
     let mut input_lines = shared.input_lines[..first].to_vec();
     let origin = shared.input_lines.get(first).copied().unwrap_or(1);

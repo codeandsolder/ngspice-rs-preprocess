@@ -16,6 +16,7 @@ anyhow = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 model-normalize-ngspice = { path = "../model-normalize-ngspice" }
+model-preprocess-command = { path = "../model-preprocess-command", version = "=0.1.0" }
 model-preprocess-simplis = { path = "../model-preprocess-simplis" }
 
 [dev-dependencies]
