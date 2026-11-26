@@ -5283,11 +5283,13 @@ fn translate_deck_items(
     budget.charge(Resource::EmittedBytes, 5)?;
     output.push_str(".end\n");
     reject_residual_simplis(&output)?;
-    let bytes =
-        match model_normalize_ngspice::controlled_transfer::lower_sources(output.as_bytes())? {
-            Some(lowered) => lowered.bytes,
-            None => output.into_bytes(),
-        };
+    let bytes = match model_normalize_ngspice::controlled_transfer::lower_sources(
+        output.as_bytes(),
+        budget,
+    )? {
+        Some(lowered) => lowered.bytes,
+        None => output.into_bytes(),
+    };
     Ok(WholeModelTranslation {
         bytes,
         primitives,

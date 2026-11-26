@@ -627,6 +627,7 @@ fn expanded(
         if include { "model.lib" } else { "deck.cir" },
         Some(&root.path),
         &[],
+        budget,
     )?;
     let mut waveforms = Vec::new();
     capture_artifact_waveforms(
@@ -655,12 +656,16 @@ fn expanded(
     Ok(bundle)
 }
 
+struct CompanionOrigins<'a> {
+    sources: &'a BTreeMap<String, BTreeSet<String>>,
+    root: &'a BTreeSet<String>,
+}
+
 fn translate_companions(
     linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
     translated_libraries: Vec<WholeModelTranslation>,
     known: &BTreeSet<&str>,
-    sources: &BTreeMap<String, BTreeSet<String>>,
-    root_sources: &BTreeSet<String>,
+    origins: CompanionOrigins<'_>,
     initial_conditions: &mut Option<super::passive_ic::InitialConditions>,
     mut remaining: usize,
     budget: &model_preprocess_command::WorkBudget,
@@ -685,12 +690,15 @@ fn translate_companions(
         remaining = remaining
             .checked_sub(translated.bytes.len())
             .context("combined artifact output byte budget exceeded")?;
-        let origins = sources
+        let origin_set = origins
+            .sources
             .get(&library.source_id)
-            .unwrap_or(root_sources)
-            .iter()
-            .cloned()
-            .collect();
+            .unwrap_or(origins.root);
+        budget.charge(super::Resource::GeneratedNodes, origin_set.len())?;
+        for origin in origin_set {
+            budget.charge(super::Resource::EmittedBytes, origin.len())?;
+        }
+        let origins = origin_set.iter().cloned().collect();
         dependencies.push(library.source_id.clone());
         companions.push(generated(
             library.filename.clone(),
@@ -709,6 +717,7 @@ fn capture_linked_plan(
     root: &AdmittedSource,
     format: InputFormat,
     declarations: &[analysis_plan::SourceDeclaration],
+    budget: &WorkBudget,
 ) -> Result<AnalysisPlan> {
     let dialect = if format == InputFormat::SimetrixDeck {
         AnalysisDialect::Simetrix
@@ -726,9 +735,17 @@ fn capture_linked_plan(
         "deck.cir",
         None,
         declarations,
+        budget,
     )?;
     for library in &mut linked.libraries {
-        analysis_plan::capture(&mut plan, &mut library.bytes, &library.filename, None, &[])?;
+        analysis_plan::capture(
+            &mut plan,
+            &mut library.bytes,
+            &library.filename,
+            None,
+            &[],
+            budget,
+        )?;
     }
     Ok(plan)
 }
@@ -860,7 +877,13 @@ fn linked(
             },
     } = resolve_deck(root, request, options, cancellation, session)?;
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
-    let plan = capture_linked_plan(&mut linked, root, request.format, &declarations)?;
+    let plan = capture_linked_plan(
+        &mut linked,
+        root,
+        request.format,
+        &declarations,
+        session.budget(),
+    )?;
     let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
         lower_simetrix_linked_runtime(&mut linked, session.budget())?;
         Some(capture_passive_initial_conditions(
@@ -892,7 +915,7 @@ fn linked(
             session.budget(),
         )?;
     }
-    plan.append_native_options(&mut translated_root.bytes)?;
+    plan.append_native_options(&mut translated_root.bytes, session.budget())?;
     check_closed_includes(&translated_root.bytes, &known)?;
     let remaining = options
         .output_bytes
@@ -902,8 +925,10 @@ fn linked(
         &linked,
         translated_libraries,
         &known,
-        &sources,
-        &root_sources,
+        CompanionOrigins {
+            sources: &sources,
+            root: &root_sources,
+        },
         &mut initial_conditions,
         remaining,
         session.budget(),
@@ -922,7 +947,11 @@ fn linked(
     bundle.analysis_plan = Some(plan);
     if let Some(initialization) = &initial_conditions {
         for artifact in bundle.artifacts() {
-            initialization.validate_artifact(&artifact.filename, &artifact.bytes)?;
+            initialization.validate_artifact(
+                &artifact.filename,
+                &artifact.bytes,
+                session.budget(),
+            )?;
         }
     }
     bundle.initial_conditions = initial_conditions.filter(|policy| {

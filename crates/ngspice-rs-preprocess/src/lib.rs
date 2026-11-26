@@ -6,8 +6,8 @@ mod dialect;
 
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
-    NormalizationPass,
-    linked_source::{LinkLimits, RootKind, SourceLinker},
+    MappedNormalization, NormalizationPass,
+    linked_source::{LinkLimits, LinkedSource, RootKind, SourceLinker},
     normalize_mapped,
 };
 pub use model_normalize_ngspice::{passive_ic, waveform};
@@ -272,6 +272,71 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+struct NativeProjection {
+    normalized: MappedNormalization,
+    device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
+}
+
+fn project_native(
+    linked: &LinkedSource,
+    kind: RootKind,
+    format: InputFormat,
+    budget: &WorkBudget,
+) -> Result<NativeProjection> {
+    budget.charge(Resource::ScannedBytes, linked.bytes.len())?;
+    let (normalized, device_identities) = if matches!(
+        format,
+        InputFormat::PspiceDeck
+            | InputFormat::PspiceLibrary
+            | InputFormat::TinaDeck
+            | InputFormat::TinaLibrary
+    ) {
+        let normalized = if matches!(format, InputFormat::TinaDeck | InputFormat::TinaLibrary) {
+            model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind, budget)?
+        } else {
+            model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind, budget)?
+        };
+        let identities = normalized
+            .renamed
+            .into_iter()
+            .map(|device| {
+                let origin = linked
+                    .origin(device.input_line)
+                    .context("missing renamed device origin")?;
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    origin
+                        .path
+                        .as_os_str()
+                        .len()
+                        .saturating_add(device.declared.len())
+                        .saturating_add(device.declared.len())
+                        .saturating_add(device.linked.len()),
+                )?;
+                for part in &device.scope {
+                    budget.charge(Resource::EmittedBytes, part.len())?;
+                }
+                Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
+                    source: display_path(&origin.path),
+                    scope: device.scope,
+                    displayed: device.declared.clone(),
+                    declared: device.declared,
+                    linked: device.linked,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (normalized.mapped, identities)
+    } else {
+        (normalize_mapped(&linked.bytes, kind, budget)?, Vec::new())
+    };
+    budget.charge(Resource::EmittedBytes, normalized.model.bytes.len())?;
+    Ok(NativeProjection {
+        normalized,
+        device_identities,
+    })
+}
+
 fn native(
     root: &AdmittedSource,
     request: &Request,
@@ -309,57 +374,10 @@ fn native(
     } else {
         source_resolver.link_admitted(root, kind, limits, session)?
     };
-    session
-        .budget()
-        .charge(Resource::ScannedBytes, linked.bytes.len())?;
-    let (normalized, device_identities) = if pspice || tina {
-        let normalized = if tina {
-            model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind, session.budget())?
-        } else {
-            model_normalize_ngspice::pspice::normalize_mapped(
-                &linked.bytes,
-                kind,
-                session.budget(),
-            )?
-        };
-        let identities = normalized
-            .renamed
-            .into_iter()
-            .map(|device| {
-                let origin = linked
-                    .origin(device.input_line)
-                    .context("missing renamed device origin")?;
-                let budget = session.budget();
-                budget.charge(Resource::GeneratedNodes, 1)?;
-                budget.charge(
-                    Resource::EmittedBytes,
-                    origin
-                        .path
-                        .as_os_str()
-                        .len()
-                        .saturating_add(device.declared.len())
-                        .saturating_add(device.declared.len())
-                        .saturating_add(device.linked.len()),
-                )?;
-                for part in &device.scope {
-                    budget.charge(Resource::EmittedBytes, part.len())?;
-                }
-                Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
-                    source: display_path(&origin.path),
-                    scope: device.scope,
-                    displayed: device.declared.clone(),
-                    declared: device.declared,
-                    linked: device.linked,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        (normalized.mapped, identities)
-    } else {
-        (normalize_mapped(&linked.bytes, kind)?, Vec::new())
-    };
-    session
-        .budget()
-        .charge(Resource::EmittedBytes, normalized.model.bytes.len())?;
+    let NativeProjection {
+        normalized,
+        device_identities,
+    } = project_native(&linked, kind, request.format, session.budget())?;
     let lines = normalized
         .input_lines
         .into_iter()
@@ -487,7 +505,12 @@ pub fn prepare(
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
         budget.charge(Resource::EmittedBytes, artifact.bytes.len())?;
-        waveform::validate_artifact(&result.waveforms, &artifact.filename, &artifact.bytes)?;
+        waveform::validate_artifact(
+            &result.waveforms,
+            &artifact.filename,
+            &artifact.bytes,
+            &budget,
+        )?;
         remaining = remaining
             .checked_sub(artifact.bytes.len())
             .context("combined artifact output byte budget exceeded")?;

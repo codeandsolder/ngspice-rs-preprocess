@@ -49,7 +49,7 @@ struct Functions {
     scopes: Scopes,
     scope: usize,
     ground: String,
-    identifiers: BTreeSet<Vec<u8>>,
+    identifiers: crate::IdentifierAllocator,
     passives: passive::PassiveModels,
     temperature: bool,
     uses_gmin: bool,
@@ -59,18 +59,14 @@ struct Functions {
 
 impl Functions {
     fn new(input: &[u8], scopes: Scopes, options: options::GlobalOptions) -> Result<Self> {
-        let mut identifiers = crate::source_identifiers(input);
+        let mut identifiers = crate::IdentifierAllocator::new(input, scopes.budget())?;
         let mut names = BTreeMap::new();
         for (name, _) in FUNCTIONS {
             let base = format!("__ps_{name}");
-            let chosen = crate::fresh_identifier(&mut identifiers, base.as_bytes())
-                .context("PSpice helper identifier overflow")?;
+            let chosen = identifiers.fresh(base.as_bytes())?;
             names.insert((*name).to_owned(), String::from_utf8(chosen)?);
         }
-        let ground = String::from_utf8(
-            crate::fresh_identifier(&mut identifiers, b"__ps_gnd")
-                .context("PSpice ground identifier overflow")?,
-        )?;
+        let ground = String::from_utf8(identifiers.fresh(b"__ps_gnd")?)?;
         let passives = passive::PassiveModels::collect(&scopes, &mut identifiers)?;
         Ok(Self {
             names,
@@ -88,10 +84,7 @@ impl Functions {
     }
 
     fn allocate(&mut self, base: &str) -> Result<String> {
-        Ok(String::from_utf8(
-            crate::fresh_identifier(&mut self.identifiers, base.as_bytes())
-                .context("PSpice generated identifier overflow")?,
-        )?)
+        Ok(String::from_utf8(self.identifiers.fresh(base.as_bytes())?)?)
     }
 
     fn definitions(&self) -> Result<String> {
@@ -746,16 +739,8 @@ fn lower_body(body: &[u8], budget: &WorkBudget) -> Result<LoweredBody> {
         }
         offset += line.len();
     }
-    let emitted = edits
-        .iter()
-        .try_fold(body.len(), |length, (range, replacement)| {
-            length
-                .checked_sub(range.len())
-                .and_then(|length| length.checked_add(replacement.len()))
-                .context("PSpice projection size overflow")
-        })?;
-    budget.charge(Resource::EmittedBytes, emitted)?;
-    let bytes = lexical::apply_edits(body, edits).unwrap_or_else(|| body.to_vec());
+    let bytes =
+        lexical::apply_budgeted_edits(body, edits, budget)?.unwrap_or_else(|| body.to_vec());
     let lines = (1..=body.split_inclusive(|b| *b == b'\n').count())
         .flat_map(|line| {
             std::iter::repeat_n(line, inserted.get(&line).copied().unwrap_or_default() + 1)
@@ -802,7 +787,7 @@ pub fn normalize_mapped(
     budget: &WorkBudget,
 ) -> Result<PspiceNormalization> {
     budget.charge(Resource::ScannedBytes, input.len())?;
-    let shared = super::normalize_mapped(input, kind)?;
+    let shared = super::normalize_mapped(input, kind, budget)?;
     budget.charge(Resource::EmittedBytes, shared.model.bytes.len())?;
     let first = usize::from(kind == RootKind::Deck);
     let title_end = if first != 0 {

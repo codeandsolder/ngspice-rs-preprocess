@@ -1,5 +1,6 @@
 //! Source analysis intent, independent of the prepared electrical circuit.
 use anyhow::{Context, Result, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write as _, path::PathBuf};
 
@@ -234,9 +235,14 @@ impl AnalysisPlan {
             || matches!(&entry.directive, Directive::Options { settings } if settings.iter().any(|setting| setting.disposition == Disposition::RequiresBinding)))
     }
 
-    pub(crate) fn append_native_options(&self, bytes: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn append_native_options(
+        &self,
+        bytes: &mut Vec<u8>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
         let mut output = String::new();
         for entry in &self.entries {
+            budget.charge(Resource::EvaluationSteps, 1)?;
             if entry.disposition == Disposition::Circuit
                 && let Directive::Options { settings } = &entry.directive
             {
@@ -244,12 +250,15 @@ impl AnalysisPlan {
                 for option in settings.iter().filter(|option| {
                     option.disposition == Disposition::Circuit && option.name != "TEMP"
                 }) {
+                    budget.charge(Resource::EmittedBytes, option.name.len().saturating_add(1))?;
                     write!(card, " {}", option.name)?;
                     if let Some(value) = &option.value {
+                        budget.charge(Resource::EmittedBytes, value.len().saturating_add(1))?;
                         write!(card, "={value}")?;
                     }
                 }
                 if !card.is_empty() {
+                    budget.charge(Resource::EmittedBytes, card.len().saturating_add(9))?;
                     writeln!(output, ".options{card}")?;
                 }
             }
@@ -263,6 +272,7 @@ impl AnalysisPlan {
                 &bytes[end..] == b".end\n",
                 "missing prepared deck terminator"
             );
+            budget.charge(Resource::EmittedBytes, output.len())?;
             bytes.splice(end..end, output.bytes());
         }
         Ok(())
@@ -625,8 +635,20 @@ fn push_entry(
     scope: &[String],
     text: &str,
     library: bool,
+    budget: &WorkBudget,
 ) -> Result<()> {
+    budget.charge(Resource::GeneratedNodes, 1)?;
+    budget.charge(Resource::EmittedBytes, text.len())?;
+    budget.charge(Resource::GeneratedNodes, scope.len())?;
+    for part in scope {
+        budget.charge(Resource::EmittedBytes, part.len())?;
+    }
     let name = command(text);
+    budget.charge(Resource::ScannedBytes, text.len())?;
+    budget.charge(
+        Resource::EmittedBytes,
+        text.len().saturating_add(name.len()),
+    )?;
     let (directive, disposition) =
         classify(&name, text, plan.dialect, library || !scope.is_empty())
             .with_context(|| format!("analysis declaration at {origin:?}"))?;
@@ -642,6 +664,7 @@ fn push_entry(
 }
 
 struct Capture<'a> {
+    budget: &'a WorkBudget,
     plan: &'a mut AnalysisPlan,
     artifact: &'a str,
     source: Option<&'a std::path::Path>,
@@ -659,8 +682,13 @@ impl Capture<'_> {
         self.artifact != "deck.cir" || self.plan.kind == PlanKind::Library
     }
 
-    fn origin(&self, first_line: usize, last_line: usize) -> DirectiveOrigin {
-        self.source.map_or_else(
+    fn origin(&self, first_line: usize, last_line: usize) -> Result<DirectiveOrigin> {
+        self.budget.charge(
+            Resource::EmittedBytes,
+            self.source
+                .map_or(self.artifact.len(), |path| path.as_os_str().len()),
+        )?;
+        Ok(self.source.map_or_else(
             || DirectiveOrigin::Generated {
                 artifact: self.artifact.to_owned(),
                 first_line,
@@ -671,12 +699,21 @@ impl Capture<'_> {
                 first_line,
                 last_line,
             },
-        )
+        ))
     }
 
     fn entry(&mut self, origin: DirectiveOrigin, text: &str) -> Result<()> {
         let library = self.library();
-        push_entry(self.plan, origin, &self.scope, text, library)
+        push_entry(self.plan, origin, &self.scope, text, library, self.budget)
+    }
+
+    fn clone_origin(&self, origin: &DirectiveOrigin) -> Result<DirectiveOrigin> {
+        let bytes = match origin {
+            DirectiveOrigin::Source { path, .. } => path.as_os_str().len(),
+            DirectiveOrigin::Generated { artifact, .. } => artifact.len(),
+        };
+        self.budget.charge(Resource::EmittedBytes, bytes)?;
+        Ok(origin.clone())
     }
 
     fn tag(&mut self, tag: &str, first_line: usize) -> Result<()> {
@@ -690,7 +727,7 @@ impl Capture<'_> {
             .context("missing internal analysis origin")?;
         self.removed[first_line - 1] = true;
         if matches!(command(&declaration.text).as_str(), ".INIT" | ".CONTROL") {
-            self.entry(declaration.origin.clone(), &declaration.text)?;
+            self.entry(self.clone_origin(&declaration.origin)?, &declaration.text)?;
         } else {
             self.pending = Some(declaration);
         }
@@ -702,11 +739,19 @@ impl Capture<'_> {
         line: &model_preprocess_simplis::source_dialect::ProjectedStatement,
     ) -> Result<()> {
         use model_translate_simplis::syntax::file_boundary;
+        self.budget.charge(Resource::Statements, 1)?;
+        self.budget
+            .charge(Resource::ScannedBytes, line.text.len())?;
         let name = command(&line.text);
         if let Some(first) = self.control {
             if name == ".ENDC" {
-                let statement = self.physical[first - 1..line.last_line].concat();
-                self.entry(self.origin(first, line.last_line), &statement)?;
+                let lines = &self.physical[first - 1..line.last_line];
+                self.budget.charge(
+                    Resource::EmittedBytes,
+                    lines.iter().map(|line| line.len()).sum(),
+                )?;
+                let statement = lines.concat();
+                self.entry(self.origin(first, line.last_line)?, &statement)?;
                 self.removed[first - 1..line.last_line].fill(true);
                 self.control = None;
             }
@@ -729,13 +774,16 @@ impl Capture<'_> {
             return Ok(());
         }
         if name == ".SUBCKT" {
-            self.scope.push(
-                line.text
-                    .split_ascii_whitespace()
-                    .nth(1)
-                    .context("missing subcircuit name")?
-                    .to_owned(),
-            );
+            let name = line
+                .text
+                .split_ascii_whitespace()
+                .nth(1)
+                .context("missing subcircuit name")?;
+            self.budget
+                .check_depth(self.scope.len().saturating_add(1))?;
+            self.budget.charge(Resource::EmittedBytes, name.len())?;
+            self.budget.charge(Resource::GeneratedNodes, 1)?;
+            self.scope.push(name.to_owned());
             return Ok(());
         }
         if name == ".ENDS" {
@@ -765,9 +813,9 @@ impl Capture<'_> {
                 command(&declaration.text) == name,
                 "analysis origin does not match {name}"
             );
-            declaration.origin.clone()
+            self.clone_origin(&declaration.origin)?
         } else {
-            self.origin(line.first_line, line.last_line)
+            self.origin(line.first_line, line.last_line)?
         };
         self.entry(origin, &line.text)?;
         if !matches!(
@@ -789,6 +837,13 @@ impl Capture<'_> {
             self.scope.is_empty(),
             "unterminated subcircuit in analysis capture"
         );
+        let length = self
+            .physical
+            .iter()
+            .zip(&self.removed)
+            .filter_map(|(line, remove)| (!remove).then_some(line.len()))
+            .sum();
+        self.budget.charge(Resource::EmittedBytes, length)?;
         Ok(self
             .physical
             .into_iter()
@@ -807,7 +862,9 @@ pub(crate) fn capture(
     artifact: &str,
     source: Option<&std::path::Path>,
     declarations: &[SourceDeclaration],
+    budget: &WorkBudget,
 ) -> Result<()> {
+    budget.charge(Resource::ScannedBytes, bytes.len())?;
     use model_preprocess_simplis::{
         LibrarySimulator, project_resource,
         source_dialect::{DialectContext, SourceKind},
@@ -828,6 +885,7 @@ pub(crate) fn capture(
         .collect::<Vec<_>>();
     let removed = vec![false; physical.len()];
     let mut capture = Capture {
+        budget,
         plan,
         artifact,
         source,

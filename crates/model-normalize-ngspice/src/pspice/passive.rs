@@ -4,14 +4,11 @@
 
 use super::{parameter, scope::Scopes, temperature::expression};
 use crate::{
-    fresh_identifier, lexical,
+    IdentifierAllocator, lexical,
     model_card::{ModelCard, parse_spice_constant},
 };
 use anyhow::{Context, Result, ensure};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-};
+use std::{collections::BTreeMap, fmt::Write as _};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Kind {
@@ -63,7 +60,7 @@ pub(super) struct PassiveModels {
 }
 
 impl PassiveModels {
-    pub(super) fn collect(scopes: &Scopes, identifiers: &mut BTreeSet<Vec<u8>>) -> Result<Self> {
+    pub(super) fn collect(scopes: &Scopes, identifiers: &mut IdentifierAllocator) -> Result<Self> {
         let mut result = Self::default();
         for (line, family) in scopes.model_declarations() {
             let Some(kind) = Kind::source(family) else {
@@ -84,10 +81,7 @@ impl PassiveModels {
                 for byte in card.name.bytes().map(|byte| byte.to_ascii_lowercase()) {
                     write!(base, "{byte:02x}")?;
                 }
-                let name = String::from_utf8(
-                    fresh_identifier(identifiers, base.as_bytes())
-                        .context("passive multiplier identifier overflow")?,
-                )?;
+                let name = String::from_utf8(identifiers.fresh(base.as_bytes())?)?;
                 Some(Multiplier { name, value })
             } else {
                 None

@@ -180,7 +180,16 @@ impl InitialConditions {
     ///
     /// # Errors
     /// Missing or duplicate device identities, or missing node-hint scope.
-    pub fn validate_artifact(&self, filename: &str, bytes: &[u8]) -> Result<()> {
+    pub fn validate_artifact(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        budget.charge(
+            Resource::EvaluationSteps,
+            self.devices.len().saturating_add(self.nodes.len()),
+        )?;
         let canonical = |scope: &[String]| {
             scope
                 .iter()
@@ -193,6 +202,8 @@ impl InitialConditions {
             .iter()
             .filter(|device| device.artifact == filename)
         {
+            charge_identity(&declaration.scope, declaration.device.len(), budget)?;
+            budget.charge(Resource::GeneratedNodes, 1)?;
             let key = (
                 canonical(&declaration.scope),
                 declaration.device.to_ascii_lowercase(),
@@ -207,18 +218,24 @@ impl InitialConditions {
             .nodes
             .iter()
             .filter(|node| node.artifact == filename)
-            .map(|node| canonical(&node.scope))
-            .collect::<BTreeSet<_>>();
+            .map(|node| {
+                charge_identity(&node.scope, 0, budget)?;
+                Ok(canonical(&node.scope))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
         if expected.is_empty() && node_scopes.is_empty() {
             return Ok(());
         }
         let mut seen_scopes = BTreeSet::from([Vec::new()]);
         let mut scope = Vec::new();
+        budget.charge(Resource::ScannedBytes, bytes.len())?;
         for statement in crate::lexical::statements(bytes)? {
+            budget.charge(Resource::Statements, 1)?;
             let text = std::str::from_utf8(&statement.text)?;
             let mut fields = text.split_ascii_whitespace();
             let Some(first) = fields.next() else { continue };
             if first.eq_ignore_ascii_case(".subckt") {
+                budget.check_depth(scope.len().saturating_add(1))?;
                 scope.push(
                     fields
                         .next()
@@ -226,6 +243,7 @@ impl InitialConditions {
                         .to_ascii_lowercase(),
                 );
                 if node_scopes.contains(&scope) {
+                    charge_identity(&scope, 0, budget)?;
                     seen_scopes.insert(scope.clone());
                 }
             } else if first.eq_ignore_ascii_case(".ends") {
@@ -234,6 +252,7 @@ impl InitialConditions {
                 first.as_bytes().first().map(u8::to_ascii_uppercase),
                 Some(b'C' | b'L')
             ) {
+                charge_identity(&scope, first.len(), budget)?;
                 let key = (scope.clone(), first.to_ascii_lowercase());
                 if let Some(seen) = expected.get_mut(&key) {
                     ensure!(

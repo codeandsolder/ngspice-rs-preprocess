@@ -76,8 +76,12 @@ pub struct Statement {
 
 impl Statement {
     pub fn source_ranges(&self, span: Range<usize>) -> Vec<Range<usize>> {
-        self.segments
+        let first = self
+            .segments
+            .partition_point(|(logical, _)| logical.end <= span.start);
+        self.segments[first..]
             .iter()
+            .take_while(|(logical, _)| logical.start < span.end)
             .filter_map(|(logical, source)| {
                 let start = span.start.max(logical.start);
                 let end = span.end.min(logical.end);
@@ -305,6 +309,29 @@ pub fn apply_edits(input: &[u8], mut edits: Vec<Edit>) -> Option<Vec<u8>> {
     }
     out.extend_from_slice(&input[offset..]);
     Some(out)
+}
+
+pub fn apply_budgeted_edits(
+    input: &[u8],
+    edits: Vec<Edit>,
+    budget: &model_preprocess_command::WorkBudget,
+) -> Result<Option<Vec<u8>>> {
+    use anyhow::Context as _;
+    use model_preprocess_command::Resource;
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    budget.charge(Resource::GeneratedNodes, edits.len())?;
+    let length = edits
+        .iter()
+        .try_fold(input.len(), |length, (range, replacement)| {
+            length
+                .checked_sub(range.len())
+                .and_then(|length| length.checked_add(replacement.len()))
+                .context("source projection length overflow")
+        })?;
+    budget.charge(Resource::EmittedBytes, length)?;
+    Ok(apply_edits(input, edits))
 }
 
 pub fn replace_span(

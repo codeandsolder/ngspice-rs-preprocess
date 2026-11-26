@@ -509,13 +509,25 @@ fn final_emitted_scope_and_device_must_match_policy() -> Result<()> {
         &model_preprocess_command::WorkBudget::default(),
     )?
     .statement(&scope, "C1 a b 1u IC=1")?;
-    policy.validate_artifact("model.lib", b".subckt CELL a b\nC1 a b 1u\n.ends\n")?;
+    policy.validate_artifact(
+        "model.lib",
+        b".subckt CELL a b\nC1 a b 1u\n.ends\n",
+        &model_preprocess_command::WorkBudget::default(),
+    )?;
     for invalid in [
         b".subckt other a b\nC1 a b 1u\n.ends\n".as_slice(),
         b".subckt cell a b\nC2 a b 1u\n.ends\n".as_slice(),
         b".subckt cell a b\nC1 a b 1u\nC1 a b 2u\n.ends\n".as_slice(),
     ] {
-        assert!(policy.validate_artifact("model.lib", invalid).is_err());
+        assert!(
+            policy
+                .validate_artifact(
+                    "model.lib",
+                    invalid,
+                    &model_preprocess_command::WorkBudget::default()
+                )
+                .is_err()
+        );
     }
     Ok(())
 }
