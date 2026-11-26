@@ -7,9 +7,9 @@ mod thermal;
 pub use thermal::{
     DepletedBias, DepletedChannelEvaluation, DepletedElectrostaticPoint, DepletedValue,
     Electrostatics, JunctionCharge, JunctionComponents, JunctionCurrent, JunctionDensities,
-    JunctionEvaluation, PdChannelEvaluation, PdCurrent, PdLeakage, PhysicalTemperature,
-    PreparedDepletedChannel, PreparedJunctions, PreparedPdChannel, PreparedSubstrateCharge,
-    SubstrateCharge, TemperatureMaterial, Transport, prepare_temperature,
+    JunctionEvaluation, PdChannelEvaluation, PdCharge, PdCurrent, PdLeakage, PdTerminalCharges,
+    PhysicalTemperature, PreparedDepletedChannel, PreparedJunctions, PreparedPdChannel,
+    PreparedSubstrateCharge, SubstrateCharge, TemperatureMaterial, Transport, prepare_temperature,
 };
 
 pub use instance::{Geometry, PdGeometry, PreparedInstance, RawBinned, prepare_instance};

@@ -1,6 +1,7 @@
 //! Partially depleted BSIM3SOI 2.2.3 channel transport.
 //! Copyright 1999/1990 Regents of the University of California. See package LICENSE.
 
+mod charge;
 mod leakage;
 mod threshold;
 mod transport;
@@ -9,6 +10,8 @@ use super::channel_threshold::{Threshold, ThresholdGeometry};
 use super::channel_transport::{BulkParameters, ChannelTransport};
 use super::{Context, Electrostatics, K_OVER_Q, Transport, differential::Differential};
 use crate::{ModelError, preparation::positive};
+use charge::ChargeParameters;
+pub use charge::{PdCharge, PdTerminalCharges};
 use leakage::Leakage;
 pub use leakage::{PdCurrent, PdLeakage};
 
@@ -66,6 +69,7 @@ pub(super) struct State {
     depth: D,
     threshold: D,
     overdrive: D,
+    n: D,
 }
 
 /// Prepared PD channel evaluator with layout, electrostatics, and model coefficients.
@@ -76,6 +80,7 @@ pub struct PreparedPdChannel {
     threshold_geometry: ThresholdGeometry,
     channel: ChannelTransport,
     leakage: Leakage,
+    charge: ChargeParameters,
     bulk_params: BulkParameters,
     ketas: f64,
     length: f64,
@@ -100,6 +105,7 @@ impl PreparedPdChannel {
             threshold_geometry: ThresholdGeometry::prepare(c, electrostatics)?,
             channel: ChannelTransport::prepare(c, transport)?,
             leakage: Leakage::prepare(c, transport.oxide_ratio)?,
+            charge: ChargeParameters::prepare(c, electrostatics)?,
             bulk_params: BulkParameters::prepare(c)?,
             ketas: c.binned("ketas")?,
             length: geometry.length_m,
@@ -156,6 +162,19 @@ impl PreparedPdChannel {
         kelvin: f64,
         accepted_phi: f64,
     ) -> Result<PdChannelEvaluation, ModelError> {
+        let b = self.trial_bias(vgs, vds, vbs, kelvin, accepted_phi)?;
+        let state = self.state(&b)?;
+        self.channel_current(&b, &state)
+    }
+
+    fn trial_bias(
+        &self,
+        vgs: f64,
+        vds: f64,
+        vbs: f64,
+        kelvin: f64,
+        accepted_phi: f64,
+    ) -> Result<Bias, ModelError> {
         if ![vgs, vds, vbs].into_iter().all(f64::is_finite) || vds < 0.0 {
             return Err(ModelError::InvalidPhysicalParameter(
                 "PD normalized channel bias",
@@ -177,7 +196,7 @@ impl PreparedPdChannel {
         } else {
             D::constant(self.electrostatics.built_in_potential)
         };
-        let b = Bias {
+        Ok(Bias {
             gate: D::variable(vgs, 0),
             drain: D::variable(vds, 1),
             body: D::variable(vbs, 2),
@@ -186,9 +205,7 @@ impl PreparedPdChannel {
                 - D::constant(1.0),
             built_in,
             phi,
-        };
-        let state = self.state(&b)?;
-        self.channel_current(&b, &state)
+        })
     }
 }
 

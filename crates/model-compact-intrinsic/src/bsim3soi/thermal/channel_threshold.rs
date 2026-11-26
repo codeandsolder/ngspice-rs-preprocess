@@ -149,6 +149,19 @@ impl Threshold {
         self.poly_doping
     }
 
+    pub(super) fn zero_body_flatband<const N: usize>(
+        &self,
+        g: &ThresholdGeometry,
+        b: &ThresholdBias<N>,
+        cv_tox: f64,
+    ) -> Differential<N> {
+        self.evaluate(g, b, true).threshold
+            - Differential::constant(
+                g.electrostatics.effective_k1.mul_add(b.phi.sqrt(), b.phi)
+                    + self.narrow[0] * (g.tox - cv_tox) * b.phi / (g.width + self.narrow[2]),
+            )
+    }
+
     pub(super) fn evaluate<const N: usize>(
         &self,
         g: &ThresholdGeometry,

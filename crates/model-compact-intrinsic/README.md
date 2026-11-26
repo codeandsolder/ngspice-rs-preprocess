@@ -1051,3 +1051,14 @@ cases (maximum 8.71e-7 S in this matrix); the evaluator differentiates the
 constitutive law, as independently verified by native scalar perturbations.
 The full FD/DD electrostatics and transport derivative matrix checks 132,192
 values across six electrical and thermal coordinates.
+
+PD intrinsic terminal charges use the same frozen-predictor electrostatic
+state as channel transport. The CAPMOD=2 charge-sheet and CAPMOD=3 quantum
+centroid laws preserve the original capacitance geometry, body/backgate
+coupling, and all three XPART partitions; the returned normalized terminal
+charges and analytic gradients sum to zero. Extrinsic overlap, junction and
+substrate capacitances remain separate. The 48 independent ngspice transient
+voltage ramps compare 11,760 integrated terminal displacement charge values
+after subtracting the native channel current, with maximum absolute error
+7.98e-23 C. Another 18,000 checks verify the charge Jacobian and conservation,
+including thermal derivatives.

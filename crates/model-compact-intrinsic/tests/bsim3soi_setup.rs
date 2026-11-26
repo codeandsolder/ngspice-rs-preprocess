@@ -513,3 +513,6 @@ mod pd_thermal;
 
 #[path = "bsim3soi_setup/depleted.rs"]
 mod depleted;
+
+#[path = "bsim3soi_setup/pd_charge.rs"]
+mod pd_charge;

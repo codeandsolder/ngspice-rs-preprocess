@@ -6,7 +6,7 @@ use super::{Bias, D, PdChannelEvaluation, PreparedPdChannel, State};
 use crate::ModelError;
 
 impl PreparedPdChannel {
-    fn bulk(&self, s: &State) -> D {
+    pub(super) fn bulk_at(&self, s: &State, overdrive: D) -> D {
         let p = self.bulk_params;
         if p.a0 == 0.0 {
             return D::constant(1.0);
@@ -21,9 +21,7 @@ impl PreparedPdChannel {
         let k = limited.scale(
             0.5 * self.electrostatics.effective_k1 / (self.electrostatics.phi + self.ketas).sqrt(),
         );
-        effective_bulk(
-            D::constant(1.0) + k * p.base(&self.threshold_geometry, s.depth, s.overdrive),
-        )
+        effective_bulk(D::constant(1.0) + k * p.base(&self.threshold_geometry, s.depth, overdrive))
     }
 
     pub(super) fn channel_current(
@@ -31,7 +29,7 @@ impl PreparedPdChannel {
         b: &Bias,
         s: &State,
     ) -> Result<PdChannelEvaluation, ModelError> {
-        let bulk = self.bulk(s);
+        let bulk = self.bulk_at(s, s.overdrive);
         let point = self.channel.evaluate(
             &self.threshold_geometry,
             &TransportInput {

@@ -53,6 +53,7 @@ impl PreparedPdChannel {
             depth: point.depth,
             threshold: point.threshold,
             overdrive,
+            n: point.n,
         })
     }
 }

@@ -10,7 +10,9 @@ mod channel;
 mod channel_threshold;
 mod channel_transport;
 mod depleted;
-pub use channel::{PdChannelEvaluation, PdCurrent, PdLeakage, PreparedPdChannel};
+pub use channel::{
+    PdChannelEvaluation, PdCharge, PdCurrent, PdLeakage, PdTerminalCharges, PreparedPdChannel,
+};
 pub use depleted::{
     DepletedBias, DepletedChannelEvaluation, DepletedElectrostaticPoint, DepletedValue,
     PreparedDepletedChannel,
