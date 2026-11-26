@@ -5,9 +5,9 @@
 //! functions avoid silently substituting deterministic model parameters.
 
 use crate::model_card::parse_spice_constant;
+use crate::native_scalar::{BinaryOp, ConditionalChain, Function, UnaryOp};
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
-use std::cmp::Ordering;
 mod rational;
 pub(crate) use rational::coefficients as rational_coefficients;
 
@@ -117,6 +117,7 @@ fn tokenize(raw: &str) -> Result<Vec<Token>> {
             b'!' => Token::Op("!"),
             b'<' => Token::Op("<"),
             b'>' => Token::Op(">"),
+            b'=' => Token::Op("="),
             _ => bail!(
                 "unsupported ngspice expression character {:?}",
                 char::from(byte)
@@ -163,8 +164,8 @@ pub struct SpiceExpression(Expr);
 enum Expr {
     Number(f64),
     Symbol(String),
-    Unary(&'static str, Box<Self>),
-    Binary(&'static str, Box<Self>, Box<Self>),
+    Unary(UnaryOp, Box<Self>),
+    Binary(BinaryOp, Box<Self>, Box<Self>),
     Conditional(Box<Self>, Box<Self>, Box<Self>),
     Call(String, Vec<Self>),
 }
@@ -206,7 +207,7 @@ impl Parser<'_> {
         Ok(Parsed { tree, height })
     }
 
-    fn prefix(&mut self) -> Result<Parsed> {
+    fn prefix(&mut self, minimum: u8) -> Result<Parsed> {
         match self.take() {
             Token::Value(value) => self.node(Expr::Number(value), 1),
             Token::Name(name) => {
@@ -230,8 +231,18 @@ impl Parser<'_> {
                 self.expect(&Token::Close)?;
                 self.node(Expr::Call(name, args), height + 1)
             }
-            Token::Op(op @ ("+" | "-" | "!")) => {
-                let arg = self.expression(8)?;
+            Token::Op(symbol @ ("+" | "-" | "!")) => {
+                let op = UnaryOp::from_symbol(symbol).context("invalid prefix operator")?;
+                // A sign at the beginning of a native expression binds below
+                // products; after an operator a signed literal binds atomically.
+                let precedence = match op {
+                    UnaryOp::Not => BinaryOp::Pow.precedence() + 1,
+                    UnaryOp::Plus | UnaryOp::Minus if minimum == 0 => {
+                        BinaryOp::Add.precedence() + 1
+                    }
+                    UnaryOp::Plus | UnaryOp::Minus => BinaryOp::Pow.precedence() + 1,
+                };
+                let arg = self.expression(precedence)?;
                 self.node(Expr::Unary(op, Box::new(arg.tree)), arg.height + 1)
             }
             Token::Open => {
@@ -245,43 +256,24 @@ impl Parser<'_> {
 
     fn expression(&mut self, minimum: u8) -> Result<Parsed> {
         let _depth = self.budget.enter()?;
-        let mut left = self.prefix()?;
+        let mut left = self.prefix(minimum)?;
         loop {
             if *self.peek() == Token::Question {
                 if minimum > 1 {
                     break;
                 }
                 self.take();
-                let then_branch = self.expression(0)?;
-                self.expect(&Token::Colon)?;
-                let else_branch = self.expression(1)?;
-                let height = left.height.max(then_branch.height).max(else_branch.height) + 1;
-                left = self.node(
-                    Expr::Conditional(
-                        Box::new(left.tree),
-                        Box::new(then_branch.tree),
-                        Box::new(else_branch.tree),
-                    ),
-                    height,
-                )?;
-                continue;
+                return self.conditional(left);
             }
             let Token::Op(op) = self.peek() else { break };
-            let precedence = match *op {
-                "||" => 2,
-                "&&" => 3,
-                "==" | "!=" | "<=" | ">=" | "<" | ">" => 4,
-                "+" | "-" => 5,
-                "*" | "/" | "%" | "\\" => 6,
-                "**" => 8,
-                _ => break,
+            let Some(op) = BinaryOp::from_symbol(op) else {
+                break;
             };
+            let precedence = op.precedence();
             if precedence < minimum {
                 break;
             }
-            let Token::Op(op) = self.take() else {
-                unreachable!()
-            };
+            self.take();
             let right = self.expression(precedence + 1)?;
             let height = left.height.max(right.height) + 1;
             left = self.node(
@@ -290,6 +282,42 @@ impl Parser<'_> {
             )?;
         }
         Ok(left)
+    }
+    fn conditional(&mut self, condition: Parsed) -> Result<Parsed> {
+        let mut chain = ConditionalChain::new(condition, ());
+        loop {
+            let operand = self.expression(2)?;
+            match self.peek() {
+                Token::Question => {
+                    self.take();
+                    chain.question(operand, ());
+                }
+                Token::Colon => {
+                    self.take();
+                    chain
+                        .colon(operand)
+                        .map_err(|_| anyhow::anyhow!("unmatched ':'"))?;
+                }
+                _ => {
+                    return chain.finish(
+                        operand,
+                        |_| anyhow::anyhow!("unmatched '?'"),
+                        |condition, positive, negative, ()| {
+                            let height =
+                                condition.height.max(positive.height).max(negative.height) + 1;
+                            self.node(
+                                Expr::Conditional(
+                                    Box::new(condition.tree),
+                                    Box::new(positive.tree),
+                                    Box::new(negative.tree),
+                                ),
+                                height,
+                            )
+                        },
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -374,9 +402,6 @@ impl SpiceExpression {
 fn truthy(value: f64) -> bool {
     value != 0.0
 }
-const fn bool_value(value: bool) -> f64 {
-    if value { 1.0 } else { 0.0 }
-}
 fn finite(value: f64) -> Result<f64> {
     ensure!(value.is_finite(), "non-finite ngspice expression result");
     Ok(value)
@@ -426,15 +451,7 @@ impl Expr {
             Self::Symbol(name) => resolve
                 .symbol(name)
                 .with_context(|| format!("resolving parameter {name}"))?,
-            Self::Unary(op, arg) => {
-                let arg = arg.evaluate(resolve, budget)?;
-                match *op {
-                    "+" => arg,
-                    "-" => -arg,
-                    "!" => bool_value(!truthy(arg)),
-                    _ => unreachable!(),
-                }
-            }
+            Self::Unary(op, arg) => op.evaluate(arg.evaluate(resolve, budget)?),
             Self::Conditional(condition, positive, negative) => {
                 let selected = if truthy(condition.evaluate(resolve, budget)?) {
                     positive
@@ -445,29 +462,10 @@ impl Expr {
             }
             Self::Binary(op, lhs, rhs) => {
                 let l = lhs.evaluate(resolve, budget)?;
-                match *op {
-                    "&&" if !truthy(l) => return Ok(0.0),
-                    "||" if truthy(l) => return Ok(1.0),
-                    _ => {}
+                if let Some(value) = op.short_circuit(l) {
+                    return Ok(value);
                 }
-                let r = rhs.evaluate(resolve, budget)?;
-                match *op {
-                    "+" => l + r,
-                    "-" => l - r,
-                    "*" => l * r,
-                    "/" => l / r,
-                    "%" => l % r,
-                    "\\" => (l / r).trunc(),
-                    "**" => l.powf(r),
-                    "==" => bool_value(l.partial_cmp(&r) == Some(Ordering::Equal)),
-                    "!=" => bool_value(l.partial_cmp(&r) != Some(Ordering::Equal)),
-                    ">" => bool_value(l > r),
-                    "<" => bool_value(l < r),
-                    ">=" => bool_value(l >= r),
-                    "<=" => bool_value(l <= r),
-                    "&&" | "||" => bool_value(truthy(r)),
-                    _ => unreachable!(),
-                }
+                op.evaluate(l, rhs.evaluate(resolve, budget)?)
             }
             Self::Call(name, args) => {
                 if name == "ternary_fcn" {
@@ -479,12 +477,14 @@ impl Expr {
                     };
                     return branch.evaluate(resolve, budget);
                 }
-                if let Some(builtin) = built_in(name) {
+                if let Some(builtin) = Function::from_name(name) {
                     let values = args
                         .iter()
                         .map(|arg| arg.evaluate(resolve, budget))
                         .collect::<Result<Vec<_>>>()?;
-                    builtin.evaluate(name, &values)?
+                    builtin
+                        .evaluate(&values)
+                        .with_context(|| format!("{name} expects {} arguments", builtin.arity()))?
                 } else {
                     let source_args = args
                         .iter()
@@ -497,74 +497,6 @@ impl Expr {
         };
         finite(value)
     }
-}
-
-#[derive(Clone, Copy)]
-enum BuiltinFunction {
-    Unary(fn(f64) -> f64),
-    Binary(fn(f64, f64) -> f64),
-}
-impl BuiltinFunction {
-    fn evaluate(self, name: &str, args: &[f64]) -> Result<f64> {
-        match self {
-            Self::Unary(f) => {
-                ensure!(args.len() == 1, "{name} expects one argument");
-                finite(f(args[0]))
-            }
-            Self::Binary(f) => {
-                ensure!(args.len() == 2, "{name} expects two arguments");
-                finite(f(args[0], args[1]))
-            }
-        }
-    }
-}
-fn pwr(base: f64, power: f64) -> f64 {
-    base.abs().powf(power)
-}
-fn sgn(value: f64) -> f64 {
-    if value.partial_cmp(&0.0) == Some(Ordering::Equal) {
-        0.0
-    } else {
-        value.signum()
-    }
-}
-fn built_in(name: &str) -> Option<BuiltinFunction> {
-    let unary: Option<fn(f64) -> f64> = match name {
-        "sqrt" => Some(f64::sqrt),
-        "sin" => Some(f64::sin),
-        "cos" => Some(f64::cos),
-        "tan" => Some(f64::tan),
-        "sinh" => Some(f64::sinh),
-        "cosh" => Some(f64::cosh),
-        "tanh" => Some(f64::tanh),
-        "asin" => Some(f64::asin),
-        "acos" => Some(f64::acos),
-        "atan" | "arctan" => Some(f64::atan),
-        "asinh" => Some(f64::asinh),
-        "acosh" => Some(f64::acosh),
-        "atanh" => Some(f64::atanh),
-        "exp" => Some(f64::exp),
-        "ln" | "log" => Some(f64::ln),
-        "log10" => Some(f64::log10),
-        "abs" => Some(f64::abs),
-        "nint" => Some(f64::round_ties_even),
-        "int" => Some(f64::trunc),
-        "floor" => Some(f64::floor),
-        "ceil" => Some(f64::ceil),
-        "sgn" => Some(sgn),
-        _ => None,
-    };
-    if let Some(f) = unary {
-        return Some(BuiltinFunction::Unary(f));
-    }
-    let binary: Option<fn(f64, f64) -> f64> = match name {
-        "min" => Some(f64::min),
-        "max" => Some(f64::max),
-        "pow" => Some(f64::powf),
-        "pwr" => Some(pwr),
-        _ => None,
-    };
-    binary.map(BuiltinFunction::Binary)
 }
 
 #[cfg(test)]
@@ -618,6 +550,22 @@ mod tests {
             ("{2**3^2}", 64.0),
             ("-2^2", -4.0),
             ("2^-2", 0.25),
+            ("(-2)^3", 8.0),
+            ("pow(-2,3)", -8.0),
+            ("0^0", 1.0),
+            ("2==3<1", 1.0),
+            ("1=1", 1.0),
+            ("!2^0", 1.0),
+            ("-2*3^2", -18.0),
+            ("2*-3^2", 18.0),
+            ("1?0?3:4:5", 3.0),
+            ("1?(0?3:4):5", 4.0),
+            ("0?3:1?4:5", 4.0),
+            ("0?3:0?4:5", 5.0),
+            ("1?3:missing?missing:missing", 3.0),
+            ("sqr(4)", 16.0),
+            ("(-8)%3", -2.0),
+            ("(-8)\\3", 2.0),
             ("{2 * 3 + 4}", 10.0),
             ("{a>b ? 7 : min(a,b)}", 3.0),
             ("{(a<b) ? 3 : 1/0}", 3.0),
