@@ -11,7 +11,8 @@ mod temperature;
 mod transport;
 
 pub use channel::{
-    BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, PreparedBsimSoiChannel,
+    BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, BsimSoiDrainChannelPoint,
+    PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
 };
 pub use electrostatics::{
     BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint, PreparedBsimSoiElectrostatics,

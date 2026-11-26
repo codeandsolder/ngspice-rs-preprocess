@@ -1,5 +1,7 @@
 //! Bias-dependent BSIMSOI 4.4 channel electrostatics.
 //! Copyright 2010 Regents of the University of California. See package LICENSE.
+mod current;
+pub use current::{BsimSoiDrainChannelPoint, PreparedBsimSoiDrainChannel};
 mod fd;
 mod jet;
 mod threshold;

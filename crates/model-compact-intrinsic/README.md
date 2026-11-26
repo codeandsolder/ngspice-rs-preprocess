@@ -176,6 +176,23 @@ terminal current/charge stamp. Finite differences cover 192 operating points;
 96 native threshold comparisons cover both polarities, both thermal modes
 and all three depletion modes.
 
+### BSIMSOI intrinsic channel conduction
+
+`prepare_drain_channel` binds all four native mobility formulations, bulk
+charge and width corrections, temperature/stress-dependent mobility,
+intrinsic series resistance, velocity saturation, CLM, DIBL and DITS.
+The evaluated current is signed into the physical drain, including NF, M
+and NSEG; the other scalars use native source/drain orientation. Five
+physical bias/temperature derivatives accompany each output. The
+constitutive saturation root is rationalized to avoid a singular limit
+when Rds=0 and Lambda=1. This does not include bipolar, impact-ionization
+or gate leakage currents, intrinsic channel charges, or solver stamps.
+
+Finite differences cover 864 cases (including generalized materials and
+external-series mode); 432 native silicon model-card comparisons validate
+intrinsic current and saturation voltage across both polarities, all
+three depletion modes, four mobility modes, and heating/reversal.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds
