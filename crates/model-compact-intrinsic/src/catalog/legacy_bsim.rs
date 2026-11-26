@@ -1,5 +1,5 @@
 //! Source interface facts for the six legacy Berkeley bulk-MOS implementations.
-//! Derived from the upstream IFparm tables, preserving alias identity.
+//! Derived from the upstream `IFparm` tables, preserving alias identity.
 //! Output-only rows are excluded from the input schema; no equations/defaults are copied.
 
 // bsim1/b1.c: B1pTable.
