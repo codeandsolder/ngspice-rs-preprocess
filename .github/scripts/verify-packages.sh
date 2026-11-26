@@ -65,8 +65,9 @@ trap 'rm -rf -- "$temporary"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 mkdir "$temporary/source" "$temporary/vendor" "$temporary/install" "$temporary/package-target"
-git -C "$root" archive --format=tar HEAD | tar -xf - -C "$temporary/source"
-printf 'Qualifying revision %s\n' "$(git -C "$root" rev-parse HEAD)"
+revision=$(git -C "$root" rev-parse HEAD)
+git -C "$root" archive --format=tar "$revision" | tar -xf - -C "$temporary/source"
+printf 'Qualifying revision %s\n' "$revision"
 cd "$temporary/source"
 selection=$(metadata)
 check_licenses "$selection"
@@ -102,15 +103,32 @@ while IFS= read -r item; do
     extracted="$temporary/vendor/$name-$version"
     tar -xf "$archive" -C "$temporary/vendor"
     crate_path=$(dirname "${manifest#"$temporary/source/"}")
+    # The manifest is the only tracked file Cargo may normalize. Verify
+    # its original staged bytes and all other tracked content, not just
+    # presence. No untracked sources may enter an archive.
+    expected=()
     while IFS= read -r -d '' tracked; do
-        test -f "$extracted/${tracked#"$crate_path/"}"
-    done < <(git -C "$root" ls-tree -r --name-only -z HEAD -- "$crate_path")
+        relative=${tracked#"$crate_path/"}
+        expected+=("$relative")
+        if [[ "$relative" == Cargo.toml ]]; then
+            cmp -- "$temporary/source/$tracked" "$extracted/Cargo.toml.orig"
+        else
+            cmp -- "$temporary/source/$tracked" "$extracted/$relative"
+        fi
+    done < <(git -C "$root" ls-tree -r --name-only -z "$revision" -- "$crate_path")
     packaged=$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$extracted/Cargo.toml")
     jq -e --arg name "$name" --arg version "$version" '
         .packages | length == 1 and
         (.[0] | .name == $name and .version == $version and
          all(.dependencies[]; .path == null and .source == "registry+https://github.com/rust-lang/crates.io-index"))
     ' <<<"$packaged" >/dev/null
+    # Cargo also generates a lockfile and can copy an external README
+    # or license. Derive the names from the normalized manifest.
+    expected+=(Cargo.toml.orig Cargo.lock)
+    expected+=("$(jq -r '.packages[0].readme' <<<"$packaged")")
+    expected+=("$(jq -r '.packages[0].license_file // "LICENSE"' <<<"$packaged")")
+    cmp -- <(printf '%s\0' "${expected[@]}" | sort -zu) \
+        <(find "$extracted" -type f -printf '%P\0' | sort -zu)
     license=$(jq -r '.license_file // "LICENSE"' <<<"$item")
     packaged_license=$(jq -r '.packages[0].license_file // "LICENSE"' <<<"$packaged")
     cmp -- "$(dirname "$manifest")/$license" "$extracted/$packaged_license"
@@ -121,13 +139,12 @@ while IFS= read -r item; do
     # extracted file. No checksum exceptions and no path dependency patches.
     (
         cd "$extracted"
-        find . -type f -print0 | sort -z |
-            while IFS= read -r -d '' file; do
-                digest=$(sha256sum < "$file")
-                jq -cn --arg key "${file#./}" --arg value "${digest%% *}" '{key:$key,value:$value}'
-            done
-    ) | jq -s --arg package "$(sha256sum < "$archive" | cut -d ' ' -f 1)" \
-        '{package:$package,files:from_entries}' > "$temporary/checksums.json"
+        find . -type f -printf '%P\0' | sort -z |
+            xargs -0 -r sha256sum --zero --
+    ) | jq -Rs --arg package "$(sha256sum < "$archive" | cut -d ' ' -f 1)" '
+        {package:$package,files:(split("\u0000") | map(select(length>0) |
+            {key:.[66:],value:.[0:64]}) | from_entries)}
+    ' > "$temporary/checksums.json"
     mv -- "$temporary/checksums.json" "$extracted/.cargo-checksum.json"
 done < <(jq -c '.[]' <<<"$selection")
 

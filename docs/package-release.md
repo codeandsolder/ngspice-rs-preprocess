@@ -53,9 +53,10 @@ The actual checkout remains unpublishable. Cargo's multi-package
 in dependency order, using its temporary registry overlay for unpublished
 workspace dependencies. No upload occurs.
 
-The verifier compares packaged license/readme bytes and checks that all tracked
-crate files are present. It checks normalized manifests contain only registry
-dependencies. It then builds a temporary checksum-verified directory source
+The verifier compares all tracked crate file bytes against the staged source,
+including Cargo.toml.orig before normalization, and rejects unexpected files.
+It also compares packaged license/readme bytes and checks that normalized
+manifests contain only registry dependencies. It then builds a temporary checksum-verified directory source
 from the exact public dependencies in Cargo.lock and the actual local package
 tarballs. Every packaged lockfile resolves offline against that source. It
 performs a real offline registry installation of the CLI (not a path install),
