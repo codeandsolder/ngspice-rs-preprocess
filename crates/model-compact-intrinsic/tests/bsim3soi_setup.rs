@@ -516,3 +516,6 @@ mod depleted;
 
 #[path = "bsim3soi_setup/pd_charge.rs"]
 mod pd_charge;
+
+#[path = "bsim3soi_setup/depleted_leakage.rs"]
+mod depleted_leakage;

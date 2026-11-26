@@ -194,6 +194,7 @@ pub(super) struct TransportPoint<const N: usize> {
     pub saturation: Differential<N>,
     pub effective_drain: Differential<N>,
     pub resistance: Differential<N>,
+    pub field_length: Differential<N>,
 }
 
 impl ChannelTransport {
@@ -379,6 +380,7 @@ impl ChannelTransport {
             saturation: sat.voltage,
             effective_drain: sat.effective,
             resistance: geometry.resistance,
+            field_length: sat.field_length,
         }
     }
 }

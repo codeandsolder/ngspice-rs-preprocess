@@ -14,6 +14,10 @@ use super::{
 };
 use crate::{ModelError, ModelVariant, preparation::positive};
 
+mod leakage;
+pub use leakage::DepletedLeakage;
+use leakage::Leakage;
+
 type D = Differential<6>;
 
 /// Source-oriented, polarity-normalized terminal voltages and trial temperature.
@@ -101,6 +105,8 @@ pub struct DepletedChannelEvaluation {
     pub resistance: DepletedValue,
     /// Effective bulk factor including FD/DD body coupling.
     pub bulk_factor: DepletedValue,
+    /// Family-specific leakage and body-contact transport.
+    pub leakage: DepletedLeakage,
 }
 
 /// FD/DD model-specific silicon-film and backgate coupling coefficients.
@@ -195,6 +201,7 @@ pub struct PreparedDepletedChannel {
     film: Film,
     transport: ChannelTransport,
     bulk: DepletedBulk,
+    leakage: Leakage,
     fd: bool,
     nsub: f64,
     voff: f64,
@@ -230,10 +237,16 @@ struct InternalBody {
     effective: D,
     contact: D,
     coupling: D,
+    contact_coupling: D,
 }
 
 fn smooth_positive(x: D, square: f64) -> D {
-    (x + (x * x + D::constant(square)).sqrt()).scale(0.5)
+    let root = (x * x + D::constant(square)).sqrt();
+    if x.value >= 0.0 {
+        (x + root).scale(0.5)
+    } else {
+        D::constant(0.5 * square) / (root - x)
+    }
 }
 
 fn limit_upper(value: D, limit: f64, square: f64) -> D {
@@ -253,6 +266,7 @@ impl PreparedDepletedChannel {
             film: Film::prepare(c, electrostatics)?,
             transport: ChannelTransport::prepare(c, transport)?,
             bulk: DepletedBulk::prepare(c)?,
+            leakage: Leakage::prepare(c, transport)?,
             fd: c.model.parameters().variant() == ModelVariant::Bsim3SoiFd,
             nsub: c.binned("nsub")?,
             voff: c.binned("voff")?,
@@ -416,14 +430,16 @@ impl PreparedDepletedChannel {
                 .scale(0.5 * self.film.effective_cap / self.film.effective_charge);
         let limit = bias.phi - self.delp;
         let effective = limit_upper(mos, limit, 0.02 * limit);
-        let contact =
-            equilibrium + smooth_positive(bias.contact - equilibrium + D::constant(1e-7), 1e-14);
+        let contact_coupling =
+            smooth_positive(bias.contact - equilibrium + D::constant(1e-7), 1e-14);
+        let contact = equilibrium + contact_coupling;
         InternalBody {
             equilibrium,
             diode,
             effective,
             contact: diode - contact,
             coupling: diode - equilibrium,
+            contact_coupling,
         }
     }
 
@@ -489,6 +505,14 @@ impl PreparedDepletedChannel {
             effective_drain: DepletedValue::from_d(transport.effective_drain)?,
             resistance: DepletedValue::from_d(transport.resistance)?,
             bulk_factor: DepletedValue::from_d(bulk)?,
+            leakage: self.leakage.evaluate(
+                self.fd,
+                &self.geometry,
+                &trial,
+                &body,
+                drive,
+                &transport,
+            )?,
         })
     }
 }

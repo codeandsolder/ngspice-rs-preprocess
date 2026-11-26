@@ -1062,3 +1062,17 @@ voltage ramps compare 11,760 integrated terminal displacement charge values
 after subtracting the native channel current, with maximum absolute error
 7.98e-23 C. Another 18,000 checks verify the charge Jacobian and conservation,
 including thermal derivatives.
+
+FD/DD leakage follows the original distinction between the fully depleted
+model (no avalanche, GIDL or body-contact current) and the dynamically
+depleted model. DD includes the separate impact-ionization saturation law,
+source/drain gate-induced leakage, and the carrier-dependent nonlinear
+resistive body-contact branch. Contact current is stamped only for a distinct
+resistive contact. Analytic gradients are evaluated from the constitutive
+law, with cancellation-resistant smoothing of very small positive carrier
+densities. Qualification includes 36,288 independent native leakage
+comparisons, 20,736 derivative comparisons, and 24 separately initialized
+native body-contact operating points spanning both polarities and internal,
+external and combined resistances. The native DC continuation can retain
+a stale contact debug value near zero current; fresh operating points
+avoid that discrepancy.

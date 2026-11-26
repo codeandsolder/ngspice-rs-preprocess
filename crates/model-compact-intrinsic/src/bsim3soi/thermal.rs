@@ -14,8 +14,8 @@ pub use channel::{
     PdChannelEvaluation, PdCharge, PdCurrent, PdLeakage, PdTerminalCharges, PreparedPdChannel,
 };
 pub use depleted::{
-    DepletedBias, DepletedChannelEvaluation, DepletedElectrostaticPoint, DepletedValue,
-    PreparedDepletedChannel,
+    DepletedBias, DepletedChannelEvaluation, DepletedElectrostaticPoint, DepletedLeakage,
+    DepletedValue, PreparedDepletedChannel,
 };
 mod differential;
 mod junction;
