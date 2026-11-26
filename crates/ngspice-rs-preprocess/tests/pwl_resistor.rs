@@ -127,6 +127,22 @@ fn current_defined_law_keeps_signed_coordinates_and_branch() -> Result<()> {
     let decoded: Vec<PreparedPwlResistor> = serde_json::from_slice(&encoded)?;
     assert_eq!(decoded, bundle.pwl_resistors);
     let budget = model_preprocess_command::WorkBudget::default();
+    let tight = model_preprocess_command::WorkBudget::new(
+        model_preprocess_command::WorkLimits {
+            generated_nodes: 0,
+            ..Default::default()
+        },
+        Cancellation::default(),
+    );
+    assert!(
+        validate_artifact(
+            &decoded,
+            &bundle.primary.filename,
+            &bundle.primary.bytes,
+            &tight
+        )
+        .is_err()
+    );
     validate_artifact(
         &decoded,
         &bundle.primary.filename,

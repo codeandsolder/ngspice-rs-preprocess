@@ -148,9 +148,40 @@ impl PreparedPwlResistor {
             !self.artifact.is_empty()
                 && !self.device.is_empty()
                 && !self.positive.is_empty()
-                && !self.negative.is_empty(),
+                && !self.negative.is_empty()
+                && self.scope.iter().all(|part| !part.is_empty()),
             "empty PWL resistor identity"
         );
+        let mut internal = BTreeSet::from([
+            self.positive.to_ascii_lowercase(),
+            self.negative.to_ascii_lowercase(),
+        ]);
+        let current_sensor_node = self
+            .series_sensor
+            .as_ref()
+            .map(|sensor| sensor.intermediate.as_str());
+        let law_sensor_node = match &self.binding {
+            NativeBinding::VoltageLaw { intermediate, .. } => Some(intermediate.as_str()),
+            NativeBinding::CurrentLaw { .. } => None,
+        };
+        for node in [current_sensor_node, law_sensor_node].into_iter().flatten() {
+            ensure!(
+                internal.insert(node.to_ascii_lowercase()),
+                "PWL resistor {} aliases an internal sensor node {node}",
+                self.device
+            );
+        }
+        let mut names = BTreeSet::new();
+        for (name, positive, negative, _) in self.expected_cards() {
+            ensure!(
+                !name.is_empty() && !positive.is_empty() && !negative.is_empty(),
+                "empty PWL resistor native binding"
+            );
+            ensure!(
+                names.insert(name.to_ascii_lowercase()),
+                "duplicate PWL resistor native binding {name}"
+            );
+        }
         Ok(())
     }
 
@@ -192,22 +223,109 @@ enum CardKind {
 }
 
 impl CardKind {
-    fn matches(self, name: &str, tail: &str) -> bool {
+    fn matches(self, name: &str, mut fields: std::str::SplitAsciiWhitespace<'_>) -> bool {
         match self {
-            Self::Sensor => name.starts_with(['V', 'v']) && tail.trim() == "0",
-            Self::Current => name.starts_with(['B', 'b']) && tail.trim_start().starts_with("I="),
-            Self::Voltage => name.starts_with(['B', 'b']) && tail.trim_start().starts_with("V="),
+            Self::Sensor => {
+                name.starts_with(['V', 'v'])
+                    && fields.next() == Some("0")
+                    && fields.next().is_none()
+            }
+            Self::Current => {
+                name.starts_with(['B', 'b'])
+                    && fields.next().is_some_and(|tail| tail.starts_with("I="))
+            }
+            Self::Voltage => {
+                name.starts_with(['B', 'b'])
+                    && fields.next().is_some_and(|tail| tail.starts_with("V="))
+            }
         }
     }
 }
 
-type Identity = (Vec<String>, String);
+struct ExpectedCard<'a> {
+    positive: &'a str,
+    negative: &'a str,
+    kind: CardKind,
+    seen: bool,
+}
 
-fn canonical(scope: &[String], name: &str) -> Identity {
-    (
-        scope.iter().map(|part| part.to_ascii_lowercase()).collect(),
-        name.to_ascii_lowercase(),
-    )
+type ScopeCards<'a> = BTreeMap<Vec<String>, BTreeMap<String, ExpectedCard<'a>>>;
+
+fn collect_bindings<'a>(
+    declarations: &'a [PreparedPwlResistor],
+    filename: &str,
+    budget: &WorkBudget,
+) -> Result<ScopeCards<'a>> {
+    budget.charge(Resource::EvaluationSteps, declarations.len())?;
+    let mut devices = BTreeSet::new();
+    let mut expected = ScopeCards::new();
+    for declaration in declarations
+        .iter()
+        .filter(|value| value.artifact == filename)
+    {
+        budget.charge(Resource::EvaluationSteps, declaration.knots.len())?;
+        budget.check_depth(declaration.scope.len())?;
+        budget.charge(
+            Resource::GeneratedNodes,
+            declaration.scope.len().saturating_add(1),
+        )?;
+        budget.charge(Resource::EmittedBytes, declaration.device.len())?;
+        for part in &declaration.scope {
+            budget.charge(Resource::EmittedBytes, part.len())?;
+        }
+        declaration.validate()?;
+        let scope = declaration
+            .scope
+            .iter()
+            .map(|part| part.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        ensure!(
+            devices.insert((scope.clone(), declaration.device.to_ascii_lowercase())),
+            "duplicate PWL resistor declaration {}",
+            declaration.device
+        );
+        let cards = expected.entry(scope).or_default();
+        for (name, positive, negative, kind) in declaration.expected_cards() {
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(Resource::EmittedBytes, name.len())?;
+            let card = ExpectedCard {
+                positive,
+                negative,
+                kind,
+                seen: false,
+            };
+            ensure!(
+                cards.insert(name.to_ascii_lowercase(), card).is_none(),
+                "duplicate PWL resistor native binding {name}"
+            );
+        }
+    }
+    Ok(expected)
+}
+
+impl ExpectedCard<'_> {
+    fn observe(
+        &mut self,
+        name: &str,
+        mut fields: std::str::SplitAsciiWhitespace<'_>,
+    ) -> Result<()> {
+        ensure!(!self.seen, "ambiguous PWL resistor native binding {name}");
+        ensure!(
+            fields
+                .next()
+                .is_some_and(|node| node.eq_ignore_ascii_case(self.positive))
+                && fields
+                    .next()
+                    .is_some_and(|node| node.eq_ignore_ascii_case(self.negative)),
+            "incorrect native PWL resistor orientation for {name}"
+        );
+        ensure!(
+            self.kind.matches(name, fields),
+            "incorrect native PWL resistor law or sensor for {name}"
+        );
+        self.seen = true;
+        Ok(())
+    }
 }
 
 /// Ensure each prepared law refers to unique, correctly oriented native
@@ -221,34 +339,7 @@ pub fn validate_artifact(
     bytes: &[u8],
     budget: &WorkBudget,
 ) -> Result<()> {
-    budget.charge(Resource::EvaluationSteps, declarations.len())?;
-    let mut devices = BTreeSet::new();
-    let mut expected = BTreeMap::new();
-    for declaration in declarations
-        .iter()
-        .filter(|value| value.artifact == filename)
-    {
-        budget.charge(Resource::EvaluationSteps, declaration.knots.len())?;
-        budget.charge(Resource::GeneratedNodes, 1)?;
-        for part in &declaration.scope {
-            budget.charge(Resource::ScannedBytes, part.len())?;
-        }
-        declaration.validate()?;
-        ensure!(
-            devices.insert(canonical(&declaration.scope, &declaration.device)),
-            "duplicate PWL resistor declaration {}",
-            declaration.device
-        );
-        for (name, positive, negative, kind) in declaration.expected_cards() {
-            let key = canonical(&declaration.scope, name);
-            ensure!(
-                expected
-                    .insert(key, (positive, negative, kind, false))
-                    .is_none(),
-                "duplicate PWL resistor native binding {name}"
-            );
-        }
-    }
+    let mut expected = collect_bindings(declarations, filename, budget)?;
     if expected.is_empty() {
         return Ok(());
     }
@@ -276,31 +367,20 @@ pub fn validate_artifact(
             );
         } else if first.eq_ignore_ascii_case(".ends") {
             ensure!(scope.pop().is_some(), "unmatched emitted .ends");
-        } else if let Some((positive, negative, kind, seen)) =
-            expected.get_mut(&(scope.clone(), first.to_ascii_lowercase()))
+        } else if first.starts_with(['B', 'b', 'V', 'v'])
+            && let Some(cards) = expected.get_mut(&scope)
+            && let Some(card) = cards.get_mut(&first.to_ascii_lowercase())
         {
-            ensure!(!*seen, "ambiguous PWL resistor native binding {first}");
-            ensure!(
-                fields
-                    .next()
-                    .is_some_and(|node| node.eq_ignore_ascii_case(positive))
-                    && fields
-                        .next()
-                        .is_some_and(|node| node.eq_ignore_ascii_case(negative)),
-                "incorrect native PWL resistor orientation for {first}"
-            );
-            ensure!(
-                kind.matches(first, &fields.collect::<Vec<_>>().join(" ")),
-                "incorrect native PWL resistor law or sensor for {first}"
-            );
-            *seen = true;
+            card.observe(first, fields)?;
         }
     }
-    for ((scope, name), (_, _, _, seen)) in expected {
-        ensure!(
-            seen,
-            "missing PWL resistor native binding {name} in {scope:?} ({filename})"
-        );
+    for (scope, cards) in expected {
+        for (name, card) in cards {
+            ensure!(
+                card.seen,
+                "missing PWL resistor native binding {name} in {scope:?} ({filename})"
+            );
+        }
     }
     Ok(())
 }

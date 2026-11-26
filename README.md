@@ -493,6 +493,17 @@ current as an initial constraint, and do not reset the hint during an
 ordinary Newton iteration or continuation step. A consumer that ignores
 this metadata cannot guarantee the source's multiroot startup choice.
 
+Generated branch and internal node names are allocated against the entire
+lexical scope, including subcircuit ports and current-control targets.
+Distinct linked devices therefore cannot alias through punctuation
+normalization. Artifact validation checks scoped electrical card identity,
+orientation and sensor/law type under the shared preparation work budget.
+
+References: [SIMPLIS device statements](https://simplis.com/documentation/simplis/simplis_reference/topics/devicestatements_simplisdevicetypes.htm),
+[resistor model laws](https://www.simplis.com/documentation/simplis/simplis_reference/topics/modelstatements_devicemodelsusedinsimplis.htm),
+and [initial-condition overrides](https://simplis.com/documentation/simetrix/simplis_reference/topics/controlstatements_controlstatementsforsettinginitialconditions.htm).
+
+
 ### SIMPLIS reactive startup and snapshots
 
 For linked SIMPLIS decks, `.INIT` assignments are resolved per instance
