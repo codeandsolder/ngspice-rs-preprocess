@@ -1,8 +1,14 @@
-//! Source-derived HiSIM2 2.80 setup from ngspice 47.
+//! Source-derived `HiSIM2` 2.80 setup from ngspice 47.
 //! Copyright (C) 2014 Hiroshima University & STARC; see package LICENSE.
 //! Setup parameters retain card units. This is not a nonlinear kernel.
 
+mod physical;
 mod rules;
+
+pub use physical::{
+    BodyConductance, EffectiveGeometry, PreparedPhysical, SeriesResistance, prepare_physical,
+};
+use std::sync::Arc;
 
 use crate::{
     BoundParameters, ModelError, ModelVariant, MosPolarity, ParameterScope, ParameterValue,
@@ -96,12 +102,13 @@ fn given_bits(p: &BoundParameters) -> Box<[bool]> {
     p.values.iter().map(Option::is_some).collect()
 }
 
-/// HiSIM2 setup parameters with original source-given bits.
+/// `HiSIM2` setup parameters with original source-given bits.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedModel {
     parameters: BoundParameters,
     polarity: MosPolarity,
     given: Box<[bool]>,
+    identity: Arc<()>,
 }
 
 impl PreparedModel {
@@ -173,7 +180,7 @@ fn mode_defaults(p: &mut BoundParameters, polarity: MosPolarity) -> Result<(), M
     Ok(())
 }
 
-/// Apply HiSIM2 2.80 setup defaults and mode-dependent overrides.
+/// Apply `HiSIM2` 2.80 setup defaults and mode-dependent overrides.
 ///
 /// TNOM remains Celsius. Unsupported explicit versions and checked invalid
 /// selectors are rejected instead of silently changing physics. Source range
@@ -217,10 +224,11 @@ pub fn prepare_model(source: &BoundParameters) -> Result<PreparedModel, ModelErr
         parameters,
         polarity,
         given: given_bits(source),
+        identity: Arc::new(()),
     })
 }
 
-/// Gate geometry used by the HiSIM2 binning equations.
+/// Gate geometry used by the `HiSIM2` binning equations.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BinningGeometry {
     /// Drawn length plus model XL, in meters.
@@ -233,22 +241,59 @@ pub struct BinningGeometry {
     pub width_bin: f64,
 }
 
+/// Prime-node connectivity after source setup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrimeNode {
+    /// Alias the external terminal.
+    External,
+    /// Allocate an independent internal node.
+    Internal,
+}
+
+impl PrimeNode {
+    const fn from_internal(required: bool) -> Self {
+        if required {
+            Self::Internal
+        } else {
+            Self::External
+        }
+    }
+}
+
+/// Body-network connectivity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyNetwork {
+    /// All body nodes alias the external bulk terminal.
+    Collapsed,
+    /// Allocate bulk-prime, drain-body and source-body nodes.
+    Distributed,
+}
+
+/// Charge dynamics selected by CONQS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChargeDynamics {
+    /// Quasistatic device with 18 source history slots.
+    Quasistatic,
+    /// Non-quasistatic device with 21 source history slots.
+    NonQuasistatic,
+}
+
 /// Topology requirements from the original setup routine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Topology {
-    /// Allocate a separate drain-prime node.
-    pub drain_prime: bool,
-    /// Allocate a separate source-prime node.
-    pub source_prime: bool,
-    /// Allocate a separate gate-prime node.
-    pub gate_prime: bool,
-    /// Allocate bulk-prime, drain-body and source-body nodes.
-    pub body_network: bool,
-    /// Use non-quasistatic charge states.
-    pub non_quasistatic: bool,
+    /// Drain-prime connectivity.
+    pub drain_prime: PrimeNode,
+    /// Source-prime connectivity.
+    pub source_prime: PrimeNode,
+    /// Gate-prime connectivity.
+    pub gate_prime: PrimeNode,
+    /// Body-network connectivity.
+    pub body_network: BodyNetwork,
+    /// Charge dynamics.
+    pub charge_dynamics: ChargeDynamics,
 }
 
-/// HiSIM2 instance preparation in source units, before SI conversion.
+/// `HiSIM2` instance preparation in source units, before SI conversion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedInstance {
     parameters: BoundParameters,
@@ -258,6 +303,7 @@ pub struct PreparedInstance {
     topology: Topology,
     initial_conditions: [f64; 3],
     temperature_kelvin: f64,
+    model_identity: Arc<()>,
 }
 
 impl PreparedInstance {
@@ -420,15 +466,29 @@ fn topology(model: &BoundParameters, instance: &BoundParameters) -> Result<Topol
     let external_resistance = integer(model, "corsrd")? < 0;
     let sheet = real(model, "rsh")? > 0.0;
     Ok(Topology {
-        drain_prime: external_resistance && (sheet || real(model, "rd")? > 0.0),
-        source_prime: external_resistance && (sheet || real(model, "rs")? > 0.0),
-        gate_prime: integer(instance, "corg")? == 1 && real(model, "rshg")? > 0.0,
-        body_network: integer(instance, "corbnet")? == 1,
-        non_quasistatic: integer(model, "conqs")? != 0,
+        drain_prime: PrimeNode::from_internal(
+            external_resistance && (sheet || real(model, "rd")? > 0.0),
+        ),
+        source_prime: PrimeNode::from_internal(
+            external_resistance && (sheet || real(model, "rs")? > 0.0),
+        ),
+        gate_prime: PrimeNode::from_internal(
+            integer(instance, "corg")? == 1 && real(model, "rshg")? > 0.0,
+        ),
+        body_network: if integer(instance, "corbnet")? == 1 {
+            BodyNetwork::Distributed
+        } else {
+            BodyNetwork::Collapsed
+        },
+        charge_dynamics: if integer(model, "conqs")? != 0 {
+            ChargeDynamics::NonQuasistatic
+        } else {
+            ChargeDynamics::Quasistatic
+        },
     })
 }
 
-/// Prepare HiSIM2 instance defaults, geometry, binning and topology.
+/// Prepare `HiSIM2` instance defaults, geometry, binning and topology.
 ///
 /// The caller applies frontend geometry scale. Circuit temperature is Kelvin;
 /// card TEMP and DTEMP use Celsius and a temperature difference respectively.
@@ -468,5 +528,6 @@ pub fn prepare_instance(
         topology,
         initial_conditions,
         temperature_kelvin,
+        model_identity: Arc::clone(&model.identity),
     })
 }

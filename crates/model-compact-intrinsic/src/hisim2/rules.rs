@@ -1,4 +1,4 @@
-//! Source-derived HiSIM2 2.80 defaults and binning, ngspice 47 hsm2set.c.
+//! Source-derived `HiSIM2` 2.80 defaults and binning, ngspice 47 hsm2set.c.
 //! Copyright (C) 2014 Hiroshima University & STARC. See package LICENSE.
 
 pub(super) const REAL_DEFAULTS: &[(&str, f64)] = &[

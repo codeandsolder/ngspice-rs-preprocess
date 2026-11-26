@@ -68,8 +68,12 @@ instead of silently falling back to another physical configuration.
 - `hisim2::prepare_instance` takes a bound instance and the circuit temperature
   in Kelvin. It resolves model-inherited values, source IC ordering, effective
   device temperature, and all 72 source binning terms with the VFBC length
-  correction. Values remain in source units; SI conversion and effective
-  channel geometry are separate future physical preparation stages.
+  correction. Values remain in source units.
+- `hisim2::prepare_physical` checks model/instance identity and applies the
+  source temperature-routine geometry corrections, evaluator-unit conversion
+  of binned coefficients, and drain/source, gate and body parasitics. The
+  external series conductances are checked against native DC internal-node
+  voltage drops and branch currents.
 - The topology identifies distinct drain, source, gate and body-network nodes
   and NQS state selection without allocating solver nodes. It does not imply a
   complete numerical kernel.

@@ -128,10 +128,9 @@ impl std::fmt::Display for ModelError {
                 f,
                 "model preparation requires a supported family and model parameter block"
             ),
-            Self::MismatchedPreparedContext => write!(
-                f,
-                "incompatible prepared HiSIM-HV model, instance, or thermal state"
-            ),
+            Self::MismatchedPreparedContext => {
+                write!(f, "incompatible prepared model, instance, or thermal state")
+            }
             Self::ConflictingPolarity => write!(f, "both NMOS and PMOS flags were set"),
             Self::InvalidNominalTemperature => {
                 write!(f, "invalid nominal model/circuit temperature")

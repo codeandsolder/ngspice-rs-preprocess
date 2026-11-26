@@ -1,6 +1,9 @@
 use model_compact_intrinsic::{
     BoundParameters, ModelError, ModelVariant, MosPolarity, ParameterScope, ParameterValue,
-    hisim2::{PreparedInstance, PreparedModel, prepare_instance, prepare_model},
+    hisim2::{
+        BodyNetwork, ChargeDynamics, PreparedInstance, PreparedModel, PrimeNode, prepare_instance,
+        prepare_model,
+    },
 };
 
 const FAMILY: ModelVariant = ModelVariant::HiSim2;
@@ -178,8 +181,11 @@ fn geometry_binning_topology_and_temperature_follow_source() -> Result<(), Model
     );
     assert_eq!(i.initial_conditions(), [0.1, 0.2, 0.0]);
     assert_eq!(i.temperature_kelvin(), 330.0);
-    assert!(i.topology().drain_prime && i.topology().gate_prime && i.topology().body_network);
-    assert!(i.topology().non_quasistatic && !i.topology().source_prime);
+    assert_eq!(i.topology().drain_prime, PrimeNode::Internal);
+    assert_eq!(i.topology().gate_prime, PrimeNode::Internal);
+    assert_eq!(i.topology().source_prime, PrimeNode::External);
+    assert_eq!(i.topology().body_network, BodyNetwork::Distributed);
+    assert_eq!(i.topology().charge_dynamics, ChargeDynamics::NonQuasistatic);
     assert_eq!(get(i.parameters(), "rbdb")?, &Real(80.0));
     assert_eq!(get(i.parameters(), "nrd")?, &Real(0.0));
     let i = instance(
@@ -192,7 +198,7 @@ fn geometry_binning_topology_and_temperature_follow_source() -> Result<(), Model
         400.0,
     )?;
     assert_eq!(i.temperature_kelvin(), 318.15);
-    assert!(!i.topology().body_network);
+    assert_eq!(i.topology().body_network, BodyNetwork::Collapsed);
     assert!(i.explicitly_given(slot(ParameterScope::Instance, "temp")?));
     Ok(())
 }
@@ -435,4 +441,61 @@ mod native {
         );
         Ok(())
     }
+}
+
+#[test]
+fn physical_geometry_series_and_context() -> Result<(), ModelError> {
+    use ParameterValue::{Integer, Real};
+    let m = model(&[
+        ("corsrd", Integer(-1)),
+        ("rsh", Real(12.0)),
+        ("rd", Real(20e-6)),
+        ("rs", Real(10e-6)),
+        ("xl", Real(0.1e-6)),
+        ("xw", Real(0.2e-6)),
+        ("xld", Real(0.1e-6)),
+        ("xwd", Real(0.15e-6)),
+        ("ll", Real(0.05e-6)),
+        ("wl", Real(0.025e-6)),
+        ("corg", Integer(1)),
+        ("rshg", Real(10.0)),
+        ("corbnet", Integer(1)),
+        ("rbdb", Real(80.0)),
+    ])?;
+    let i = instance(
+        &m,
+        &[
+            ("l", Real(3e-6)),
+            ("w", Real(10e-6)),
+            ("nf", Real(2.0)),
+            ("nrd", Real(2.0)),
+            ("nrs", Real(3.0)),
+            ("m", Real(4.0)),
+        ],
+        300.15,
+    )?;
+    let p = model_compact_intrinsic::hisim2::prepare_physical(&m, &i)?;
+    assert!((p.geometry.length_m - 2.8e-6).abs() < 1e-18);
+    assert!((p.geometry.total_width_m - 9.7e-6).abs() < 1e-18);
+    // Independent ngspice 47 DC node-drop/current measurements, level 68.
+    assert!((p.drain.external_s - 0.15348101265822761).abs() < 1e-12);
+    assert!((p.source.external_s - 0.10801781737193764).abs() < 1e-12);
+    assert_eq!(p.drain.internal_noise_s, 0.0);
+    assert!(
+        (p.kernel_binned_slot(slot(ParameterScope::Model, "vmax")?)
+            .unwrap()
+            - 1e5)
+            .abs()
+            < 1e-9
+    );
+    assert!(p.gate_s.unwrap() > 0.0);
+    assert!(p.body.unwrap().drain_bulk_s > 0.05);
+    let other = model(&[])?;
+    assert_eq!(
+        model_compact_intrinsic::hisim2::prepare_physical(&other, &i),
+        Err(ModelError::MismatchedPreparedContext)
+    );
+    let short = instance(&m, &[("l", Real(1e-9))], 300.15)?;
+    assert!(model_compact_intrinsic::hisim2::prepare_physical(&m, &short).is_err());
+    Ok(())
 }
