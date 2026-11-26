@@ -389,7 +389,6 @@ fn project_native(
                 waveforms,
             })
         }
-
     }
 }
 

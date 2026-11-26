@@ -455,7 +455,13 @@ fn apply_optional<F>(
 /// Returns an error for binary input or source identified as SIMPLIS, which requires
 /// semantic translation rather than syntax normalization.
 pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
-    normalize_body(input, true, 0, &mut Vec::new(), NormalizationDialect::Native)
+    normalize_body(
+        input,
+        true,
+        0,
+        &mut Vec::new(),
+        NormalizationDialect::Native,
+    )
 }
 
 /// Normalized bytes and one original input line for each emitted physical line.

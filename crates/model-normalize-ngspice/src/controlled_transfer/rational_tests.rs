@@ -117,10 +117,17 @@ fn lowering_keeps_scope_branch_names_source_lines_and_collision_free_ids() -> Re
     assert!(text.contains("; source"));
     assert!(text.contains("echo laplace"));
     assert_eq!(result.input_lines, [1, 2, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10]);
-    let repeated = normalize_mapped(&result.model.bytes, RootKind::Deck, crate::NormalizationDialect::Native)?;
+    let repeated = normalize_mapped(
+        &result.model.bytes,
+        RootKind::Deck,
+        crate::NormalizationDialect::Native,
+    )?;
     assert_eq!(repeated.model.bytes, result.model.bytes);
     let bad = normalize_mapped(
-        b"title\nL1 a 0 1m Rser=1\nE1 b 0 a 0 Laplace={exp(-s)}\n.end\n", RootKind::Deck, crate::NormalizationDialect::Native);
+        b"title\nL1 a 0 1m Rser=1\nE1 b 0 a 0 Laplace={exp(-s)}\n.end\n",
+        RootKind::Deck,
+        crate::NormalizationDialect::Native,
+    );
     assert!(format!("{:#}", bad.err().context("expected positioned failure")?).contains("line 3"));
     Ok(())
 }
