@@ -460,3 +460,31 @@ fn repeated_compiled_catalog_members_consume_work_before_catalog_construction() 
     );
     Ok(())
 }
+
+#[test]
+fn native_provenance_storage_is_charged_before_copying_paths() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let long_name = "a".repeat(200);
+    let name = format!("{long_name}.lib");
+    let lines = "R1 1 0 1k\n".repeat(100);
+    fs::write(dir.path().join(&name), &lines)?;
+    let source = format!("* title\n.include {name}\n.end\n");
+    let req = request(dir.path(), InputFormat::NativeDeck, &source);
+    // Source text is small, but each linked row retains the physical path.
+    fails(
+        &req,
+        WorkLimits {
+            emitted_bytes: 8192,
+            ..WorkLimits::default()
+        },
+        "EmittedBytes budget exceeded",
+    )?;
+    let bundle = run(&req, WorkLimits::default())?;
+    assert_eq!(
+        std::str::from_utf8(&bundle.primary.bytes)?
+            .matches("R1 1 0 1k")
+            .count(),
+        100
+    );
+    Ok(())
+}

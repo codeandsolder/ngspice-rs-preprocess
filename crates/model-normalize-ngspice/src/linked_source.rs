@@ -340,9 +340,10 @@ impl LinkState<'_> {
             "linked output byte budget exceeded at {}:{physical_line}",
             path.display()
         );
-        self.admission
-            .budget()
-            .charge(Resource::EmittedBytes, text.len().saturating_add(extra))?;
+        let budget = self.admission.budget();
+        budget.charge(Resource::EmittedBytes, text.len().saturating_add(extra))?;
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        budget.charge(Resource::EmittedBytes, path.as_os_str().len())?;
         self.output.bytes.extend_from_slice(text);
         if extra != 0 {
             self.output.bytes.push(b'\n');

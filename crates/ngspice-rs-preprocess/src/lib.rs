@@ -325,6 +325,21 @@ fn native(
                 let origin = linked
                     .origin(device.input_line)
                     .context("missing renamed device origin")?;
+                let budget = session.budget();
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    origin
+                        .path
+                        .as_os_str()
+                        .len()
+                        .saturating_add(device.declared.len())
+                        .saturating_add(device.declared.len())
+                        .saturating_add(device.linked.len()),
+                )?;
+                for part in &device.scope {
+                    budget.charge(Resource::EmittedBytes, part.len())?;
+                }
                 Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
                     source: display_path(&origin.path),
                     scope: device.scope,
@@ -348,6 +363,10 @@ fn native(
             let mapped = linked
                 .origin(line)
                 .context("missing linked source location")?;
+            session.budget().charge(Resource::GeneratedNodes, 1)?;
+            session
+                .budget()
+                .charge(Resource::EmittedBytes, mapped.path.as_os_str().len())?;
             Ok(OriginLine {
                 source: mapped.path.clone(),
                 line: mapped.line,

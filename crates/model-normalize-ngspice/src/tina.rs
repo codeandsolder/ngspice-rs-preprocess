@@ -234,7 +234,7 @@ mod tests {
         let input = b".subckt a b c PARAMS: p={f('.param')}\n.ends\n";
         let result = normalize_mapped(input, RootKind::Include)?;
         assert_eq!(result.mapped.model.bytes, input);
-        assert!(result.mapped.model.passes.is_empty());
+        assert_eq!(result.mapped.model.passes, [] as [NormalizationPass; 0]);
         assert!(normalize_mapped(b".subckt a b c .param\n", RootKind::Include).is_err());
         assert!(normalize_mapped(b"PK\x03\x04abc", RootKind::Include).is_err());
         Ok(())
