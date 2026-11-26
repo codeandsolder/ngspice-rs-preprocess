@@ -5,7 +5,10 @@
 //! Source: ngspice VBIC `vbic_4T_it_cf_fj` (AVC1, AVC2, PC, MC).
 //! Currents and partials use local intrinsic Vbei / Vbci coordinates.
 
-use super::transport;
+use super::{
+    temperature::{self, Coefficient as C},
+    transport::{self, CheckedGradient, Gradient},
+};
 use crate::{Branch, EvaluationError, ModelError, validate_nonnegative, validate_positive};
 
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +39,7 @@ pub struct Output {
     pub d_vbei: f64,
     /// Partial d(Ibc)/d(Vbci) in siemens.
     pub d_vbci: f64,
+    pub d_temperature: f64,
     /// Avalanche generation current; subtract from unmodified diode.
     pub igc: f64,
     /// Dimensionless source avalanche factor.
@@ -45,6 +49,8 @@ pub struct Output {
 #[derive(Clone, Copy, Debug)]
 pub struct Prepared {
     p: Parameters,
+    pc: Gradient,
+    avc2: Gradient,
 }
 
 impl Prepared {
@@ -55,7 +61,18 @@ impl Prepared {
         validate_nonnegative("avc2", p.avc2)?;
         validate_positive("pc", p.pc)?;
         validate_nonnegative("mc", p.mc)?;
-        Ok(Self { p })
+        Ok(Self {
+            p,
+            pc: Gradient::constant(p.pc),
+            avc2: Gradient::constant(p.avc2),
+        })
+    }
+
+    pub(super) fn from_temperature(t: &temperature::Prepared) -> Result<Self, ModelError> {
+        let mut prepared = Self::new(t.avalanche_parameters())?;
+        prepared.pc = t.jet(C::Pc);
+        prepared.avc2 = t.jet(C::Avc2);
+        Ok(prepared)
     }
 
     /// Evaluate the native B-C avalanche law and both partials.
@@ -63,63 +80,49 @@ impl Prepared {
     /// # Errors
     /// Rejects nonfinite voltage, source current/partials or numerical overflow.
     pub fn evaluate(&self, bias: Bias) -> Result<Output, EvaluationError> {
+        self.evaluate_thermal(bias, 0.0)
+    }
+
+    pub(super) fn evaluate_thermal(
+        &self,
+        bias: Bias,
+        junction_temperature: f64,
+    ) -> Result<Output, EvaluationError> {
         if !bias.vbci.is_finite() {
             return Err(EvaluationError::NonFiniteBias);
         }
         let transfer = bias.transport.net;
-        let junction = bias.ibcj;
-        if ![
-            transfer.value,
-            transfer.d_vbei,
-            transfer.d_vbci,
-            junction.amperes,
-            junction.siemens,
-        ]
-        .iter()
-        .all(|value| value.is_finite())
-        {
+        let net = Gradient::new(transfer.value, transfer.d_vbei, transfer.d_vbci, 0.0)
+            .with_temperature(transfer.d_temperature);
+        let junction = Gradient::new(bias.ibcj.amperes, 0.0, bias.ibcj.siemens, 0.0)
+            .with_temperature(junction_temperature);
+        if !net.is_finite() || !junction.is_finite() {
             return Err(EvaluationError::NonFiniteBias);
         }
         if self.p.avc1 == 0.0 {
             return Ok(Output {
-                ibc: junction.amperes,
-                d_vbci: junction.siemens,
+                ibc: junction.value,
+                d_vbci: junction.bc,
+                d_temperature: junction.temperature,
                 ..Output::default()
             });
         }
-        let p = self.p;
-        let distance = p.pc - bias.vbci;
-        let smooth = distance.hypot(0.1);
-        let potential = smooth.midpoint(distance);
-        if potential <= 0.0 {
-            return Err(EvaluationError::InvalidPhysicalDomain);
-        }
-        let gradient = -0.5 * (distance / smooth + 1.0);
-        let power = potential.powf(p.mc - 1.0);
-        let exponential = (-p.avc2 * power).exp();
-        let factor = p.avc1 * potential * exponential;
-        let derivative =
-            p.avc1 * exponential * (p.avc2 * (p.mc - 1.0)).mul_add(-power, 1.0) * gradient;
-        let source = transfer.value - junction.amperes;
-        let igc = source * factor;
+        let distance = self.pc - Gradient::collector(bias.vbci);
+        let smooth = (distance * distance + 0.01).checked_sqrt()?;
+        let potential = (smooth + distance) * 0.5;
+        let power = potential.checked_powf(self.p.mc - 1.0)?;
+        let factor = potential * (-self.avc2 * power).exp() * self.p.avc1;
+        let igc = (net - junction) * factor;
+        let ibc = junction - igc;
         let output = Output {
-            ibc: junction.amperes - igc,
-            d_vbei: -transfer.d_vbei * factor,
-            d_vbci: junction.siemens
-                - (transfer.d_vbci - junction.siemens).mul_add(factor, source * derivative),
-            igc,
-            avalanche_factor: factor,
+            ibc: ibc.value,
+            d_vbei: ibc.be,
+            d_vbci: ibc.bc,
+            d_temperature: ibc.temperature,
+            igc: igc.value,
+            avalanche_factor: factor.value,
         };
-        if ![
-            output.ibc,
-            output.d_vbei,
-            output.d_vbci,
-            output.igc,
-            output.avalanche_factor,
-        ]
-        .iter()
-        .all(|value| value.is_finite())
-        {
+        if ![ibc, igc, factor].into_iter().all(Gradient::is_finite) {
             return Err(EvaluationError::NonFiniteResult);
         }
         Ok(output)
