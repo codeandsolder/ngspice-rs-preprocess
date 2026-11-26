@@ -140,7 +140,8 @@ fn measured_scoped_diode_temperatures(
 ) -> Result<()> {
     use model_kernel_diode::{Instance, MODEL_FAMILY, compile_simetrix};
     let source = prepared_diode::linked_library(bundle)?;
-    let topology = source.instantiate(Default::default())?;
+    let topology = source
+        .instantiate(model_normalize_ngspice::parameter_scope::topology::Limits::default())?;
     let mut currents = Vec::new();
     for frame in topology.frames.iter().skip(1) {
         let model = source

@@ -861,7 +861,9 @@ pub fn prepare(
         | InputFormat::TinaDeck
         | InputFormat::TinaLibrary
         | InputFormat::PspiceDeck
-        | InputFormat::PspiceLibrary => {
+        | InputFormat::PspiceLibrary
+        | InputFormat::QspiceDeck
+        | InputFormat::QspiceLibrary => {
             bail!("native input is not a dialect translation request")
         }
     }

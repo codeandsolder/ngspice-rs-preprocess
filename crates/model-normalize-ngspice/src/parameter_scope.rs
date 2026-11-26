@@ -13,6 +13,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) mod declarations;
 pub mod topology;
 
 #[derive(Clone, Debug)]

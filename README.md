@@ -37,8 +37,10 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
 | `hspice-deck` | Link standalone HSPICE sources and bind qualified parameter/model occurrences | `deck.cir` |
 | `hspice-library` | Compile a neutral HSPICE source graph for later deck binding | `library.json` |
-| `pspice-deck` | PSpice source deck with native lowering | `deck.cir` |
-| `pspice-library` | PSpice source library with native lowering | `model.lib` |
+| `pspice-deck` | PSpice plaintext circuit; link libraries and lower qualified syntax | `deck.cir` |
+| `pspice-library` | PSpice plaintext models; include-safe native source | `model.lib` |
+| `qspice-deck` | QSPICE plaintext circuit; link libraries and normalize qualified source semantics | `deck.cir` |
+| `qspice-library` | QSPICE plaintext models; include-safe native source | `model.lib` |
 | `tina-deck` | TINA/TINA-TI plaintext SPICE export, with local parameter normalization | `deck.cir` |
 | `tina-library` | TINA/TINA-TI plaintext SPICE macro source | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
@@ -47,6 +49,14 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `expanded-library` | Lower already expanded dialect source as an include | `model.lib` |
 | `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
 | `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
+
+QSPICE preparation supports linked plaintext sources, scoped scalar
+declarations, numeric spellings, explicitly ideal passives, and native or
+occurrence-bound PWL/PULSE waveforms. The typed waveform metadata is mandatory
+when present; the source card may contain a placeholder DC bias. Known
+unsupported source laws and topology directives have physical-source
+diagnostics. See [the QSPICE adapter contract](docs/qspice.md) for the
+qualified behavior, boundaries and reference evidence.
 
 TINA support targets plaintext SPICE exports, not TINA schematic/project
 or mixed-language macro containers. Export the electrical netlist first.

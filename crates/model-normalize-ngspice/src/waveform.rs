@@ -7,6 +7,9 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+mod qspice;
+pub use qspice::{QspicePoint, QspiceWaveform};
+
 /// Scalar expressions use the emitted circuit's parameter grammar.
 pub type Scalar = String;
 
@@ -17,6 +20,8 @@ pub struct PreparedWaveform {
     pub scope: Vec<String>,
     pub source: String,
     pub spec: WaveformSpec,
+    /// Explicit source bias value, independent of transient time-zero forcing.
+    pub dc_override: Option<Scalar>,
     /// Freeze at the startup value during source periodic operating point
     /// and its associated AC analysis.
     pub idle_in_pop: Scalar,
@@ -26,6 +31,8 @@ pub struct PreparedWaveform {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "shape", rename_all = "kebab-case")]
 pub enum WaveformSpec {
+    /// Occurrence-bound QSPICE positional source laws.
+    Qspice(QspiceWaveform),
     Pulse(PulseSpec),
     Saw {
         first: Scalar,
@@ -140,8 +147,10 @@ pub enum Forcing {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedWaveform {
-    /// Exact right-hand startup value (held level if delay has not elapsed).
+    /// Operating-point bias, honoring an explicit source DC override.
     pub dc: f64,
+    /// Source-defined transient initial value, independent of DC override.
+    pub startup: f64,
     pub forcing: Forcing,
     pub idle_in_pop: bool,
 }
@@ -294,6 +303,21 @@ fn pulse_forcing(
     let delay = scalar(&spec.delay, resolve)?;
     let hold = flag(&spec.hold_before_delay, resolve)?;
     let [rise, width, fall] = spec.edges.resolve(period, resolve)?;
+    let knots = pulse_knots(first, second, rise, width, fall, period)?;
+    Ok(Forcing::PiecewiseLinear {
+        knots,
+        repeat: Some(repeat(period, delay, hold, first)),
+    })
+}
+
+fn pulse_knots(
+    first: f64,
+    second: f64,
+    rise: f64,
+    width: f64,
+    fall: f64,
+    period: f64,
+) -> Result<Vec<Knot>> {
     let high_end = rise + width;
     let end = high_end + fall;
     // At a full-period boundary two rounded additions can produce one
@@ -308,7 +332,7 @@ fn pulse_forcing(
         (width <= 0. || high_end > rise) && (fall <= 0. || end > high_end),
         "pulse duration is smaller than a representable interval"
     );
-    let knots = if end == 0. {
+    Ok(if end == 0. {
         vec![Knot {
             time: 0.,
             left: first,
@@ -322,10 +346,6 @@ fn pulse_forcing(
             (end, first),
             (period, first),
         ])?
-    };
-    Ok(Forcing::PiecewiseLinear {
-        knots,
-        repeat: Some(repeat(period, delay, hold, first)),
     })
 }
 
@@ -365,6 +385,7 @@ impl WaveformSpec {
     /// an inconsistent structural point count.
     pub fn resolve(&self, mut resolve: impl FnMut(&str) -> Result<f64>) -> Result<Forcing> {
         match self {
+            Self::Qspice(spec) => spec.forcing(&mut resolve),
             Self::Pulse(spec) => pulse_forcing(spec, &mut resolve),
             Self::Saw {
                 first,
@@ -512,10 +533,12 @@ impl PreparedWaveform {
         mut resolve: impl FnMut(&str) -> Result<f64>,
     ) -> Result<ResolvedWaveform> {
         let forcing = self.spec.resolve(&mut resolve)?;
-        let dc = forcing.startup()?;
+        let startup = forcing.startup()?;
+        let dc = optional(self.dc_override.as_deref(), startup, &mut resolve)?;
         let idle_in_pop = flag(&self.idle_in_pop, &mut resolve)?;
         Ok(ResolvedWaveform {
             dc,
+            startup,
             forcing,
             idle_in_pop,
         })

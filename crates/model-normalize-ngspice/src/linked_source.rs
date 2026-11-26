@@ -41,6 +41,21 @@ impl LinkedSource {
 pub struct SourceLinker {
     /// Directories to search after the including file's containing directory.
     pub search_paths: Vec<PathBuf>,
+    /// Meaning of one-operand library references.
+    pub library_syntax: LibrarySyntax,
+}
+
+/// Dialect-specific interpretation of library references.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LibrarySyntax {
+    /// A single operand introduces a named section; references require a section.
+    #[default]
+    NamedSections,
+    /// A single operand references an entire file outside a selected section.
+    /// Two operands reference a named section in another file.
+    Qspice,
+    /// Whole-file and named-section imports with `PSpice` path and header rules.
+    Pspice,
 }
 
 /// Root source treatment. Included resources are always include-safe.
@@ -72,8 +87,9 @@ struct LinkState<'a> {
     admission: &'a mut SourceSession,
     limits: LinkLimits,
     stack: Vec<(PathBuf, Option<String>)>,
-    pspice: bool,
     output: LinkedSource,
+    source_root: PathBuf,
+    source_search_paths: Vec<PathBuf>,
 }
 
 fn directive<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -265,38 +281,17 @@ impl SourceLinker {
         limits: LinkLimits,
         admission: &mut SourceSession,
     ) -> Result<LinkedSource> {
-        self.link_admitted_mode(source, kind, limits, admission, false)
-    }
-
-    /// Link a `PSpice` deck or library. A one-operand .LIB is a whole-file
-    /// import; two operands retain explicit named-section semantics.
-    ///
-    /// # Errors
-    /// Invalid source, unresolved references, cycles or exhausted budget.
-    pub fn link_pspice_admitted(
-        &self,
-        source: &AdmittedSource,
-        kind: RootKind,
-        limits: LinkLimits,
-        admission: &mut SourceSession,
-    ) -> Result<LinkedSource> {
-        self.link_admitted_mode(source, kind, limits, admission, true)
-    }
-
-    fn link_admitted_mode(
-        &self,
-        source: &AdmittedSource,
-        kind: RootKind,
-        limits: LinkLimits,
-        admission: &mut SourceSession,
-        pspice: bool,
-    ) -> Result<LinkedSource> {
         let mut state = LinkState {
             settings: self,
             admission,
             limits,
             stack: Vec::new(),
-            pspice,
+            source_root: source
+                .path
+                .parent()
+                .context("source root has no containing directory")?
+                .to_path_buf(),
+            source_search_paths: Vec::new(),
             output: LinkedSource {
                 bytes: Vec::new(),
                 origins: Vec::new(),
@@ -307,10 +302,79 @@ impl SourceLinker {
     }
 }
 
+fn portable_qspice_path(path: &Path) -> Result<PathBuf> {
+    let text = path.to_str().context("non-UTF-8 QSPICE resource path")?;
+    if !cfg!(windows) {
+        ensure!(
+            !text.starts_with("\\\\") && text.as_bytes().get(1).is_none_or(|byte| *byte != b':'),
+            "QSPICE Windows absolute resource path {} requires an explicit host path",
+            path.display()
+        );
+    }
+    Ok(PathBuf::from(text.replace('\\', "/")))
+}
+
+fn check_pspice_header(body: &[u8], path: &Path, kind: RootKind) -> Result<()> {
+    let mut lines = body.split_inclusive(|byte| *byte == b'\n');
+    let first = lines.next().unwrap_or_default().trim_ascii();
+    let second = lines.next().unwrap_or_default().trim_ascii();
+    let header = if kind == RootKind::Include && (first.is_empty() || first.starts_with(b"*")) {
+        [first, second]
+            .into_iter()
+            .find(|line| line.starts_with(b"*#"))
+            .unwrap_or_default()
+    } else {
+        first
+    };
+    let declaration = header
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or_default();
+    ensure!(
+        ![
+            b"*#SIMETRIX".as_slice(),
+            b"*#HSPICE",
+            b"*#LTSPICE",
+            b"*#NATIVE"
+        ]
+        .iter()
+        .any(|name| declaration.eq_ignore_ascii_case(name)),
+        "{}: explicit foreign source dialect in standalone PSpice graph",
+        path.display()
+    );
+    Ok(())
+}
+
 impl LinkState<'_> {
     fn resolve(&self, path: &Path, parent: &Path) -> Result<PathBuf> {
-        let local = parent.parent().into_iter().map(|dir| dir.join(path));
-        let candidates = local.chain(self.settings.search_paths.iter().map(|dir| dir.join(path)));
+        let portable;
+        let qspice = self.settings.library_syntax == LibrarySyntax::Qspice;
+        let path = if qspice {
+            portable = portable_qspice_path(path)?;
+            portable.as_path()
+        } else if self.settings.library_syntax == LibrarySyntax::Pspice {
+            portable = PathBuf::from(
+                path.to_str()
+                    .context("non-UTF-8 PSpice resource path")?
+                    .replace('\\', "/"),
+            );
+            portable.as_path()
+        } else {
+            path
+        };
+        // QSPICE's library search is rooted in the original deck, not the
+        // current nested resource. Source-declared paths are ordered and the
+        // explicit caller directories are additional search roots.
+        let local = if qspice {
+            Some(self.source_root.as_path())
+        } else {
+            parent.parent()
+        };
+        let candidates = local
+            .into_iter()
+            .chain(self.source_search_paths.iter().map(PathBuf::as_path))
+            .chain(self.settings.search_paths.iter().map(PathBuf::as_path))
+            .map(|dir| dir.join(path));
         for candidate in candidates {
             match self.admission.resolve_path(&candidate) {
                 Ok(canonical) => return Ok(canonical),
@@ -398,54 +462,44 @@ impl LinkState<'_> {
         kind: RootKind,
     ) -> Result<()> {
         let path = &source.path;
-        crate::lexical::ensure_textual(&source.bytes)?;
+        let decoded = if self.settings.library_syntax == LibrarySyntax::Qspice {
+            crate::qspice::decode_resource(path, &source.bytes)?
+        } else {
+            std::borrow::Cow::Borrowed(&source.bytes[..])
+        };
+        crate::lexical::ensure_textual(&decoded)?;
         let (body, first_line) = if kind == RootKind::Deck {
-            let title = source
-                .bytes
+            let title = decoded
                 .split_inclusive(|byte| *byte == b'\n')
                 .next()
                 .context("native deck has no title line")?;
             self.emit(path, 1, title)?;
-            (&source.bytes[title.len()..], 2)
+            (&decoded[title.len()..], 2)
         } else {
-            (&source.bytes[..], 1)
+            (&decoded[..], 1)
         };
-        if self.pspice {
-            let mut lines = body.split_inclusive(|byte| *byte == b'\n');
-            let first = lines.next().unwrap_or_default().trim_ascii();
-            let second = lines.next().unwrap_or_default().trim_ascii();
-            let header =
-                if kind == RootKind::Include && (first.is_empty() || first.starts_with(b"*")) {
-                    [first, second]
-                        .into_iter()
-                        .find(|line| line.starts_with(b"*#"))
-                        .unwrap_or_default()
-                } else {
-                    first
-                };
-            let declaration = header
-                .split(u8::is_ascii_whitespace)
-                .next()
-                .unwrap_or_default();
-            ensure!(
-                ![
-                    b"*#SIMETRIX".as_slice(),
-                    b"*#HSPICE",
-                    b"*#LTSPICE",
-                    b"*#NATIVE"
-                ]
-                .iter()
-                .any(|name| declaration.eq_ignore_ascii_case(name)),
-                "{}: explicit foreign source dialect in standalone PSpice graph",
-                path.display()
-            );
+        if self.settings.library_syntax == LibrarySyntax::Pspice {
+            check_pspice_header(body, path, kind)?;
+        }
+        let records = records(body, first_line)?;
+        if self.settings.library_syntax == LibrarySyntax::Qspice && self.stack.len() == 1 {
+            self.collect_source_paths(path, &records)?;
         }
         let mut selection = SectionSelection::new(section);
         let mut in_control = false;
         let physical = body
             .split_inclusive(|byte| *byte == b'\n')
             .collect::<Vec<_>>();
-        for record in records(body, first_line)? {
+        for record in records {
+            // Non-ASCII QSPICE device designators require a qualified kernel.
+            if self.settings.library_syntax == LibrarySyntax::Qspice
+                && record.logical.first().is_some_and(|byte| !byte.is_ascii())
+            {
+                if selection.selected() {
+                    crate::qspice::reject_special_device(path, record.line)?;
+                }
+                continue;
+            }
             let text = std::str::from_utf8(&record.logical).with_context(|| {
                 format!(
                     "{}:{}: invalid source encoding",
@@ -455,15 +509,14 @@ impl LinkState<'_> {
             })?;
             let control_start = directive(text, ".control").is_some();
             let control_end = directive(text, ".endc").is_some();
-            let whole_library = self.pspice
-                && !in_control
-                && !control_start
-                && (section.is_none() || selection.active.is_some())
-                && library_marker(text)?.is_some_and(|args| args.len() == 1);
             if !in_control
                 && !control_start
-                && !whole_library
-                && !selection.observe(text, path, record.line)?
+                && !selection.observe_with_syntax(
+                    text,
+                    path,
+                    record.line,
+                    self.settings.library_syntax,
+                )?
             {
                 continue;
             }
@@ -475,6 +528,9 @@ impl LinkState<'_> {
                 if in_control || control_end {
                     self.emit_record(path, &record, &physical)?;
                 } else {
+                    if self.settings.library_syntax == LibrarySyntax::Qspice {
+                        crate::qspice::check_topology_directive(path, record.line, text)?;
+                    }
                     self.expand_record(path, &record, &physical, text, kind)?;
                 }
             }
@@ -488,6 +544,45 @@ impl LinkState<'_> {
             path.display()
         );
         selection.finish(path)
+    }
+
+    fn collect_source_paths(&mut self, path: &Path, records: &[Record]) -> Result<()> {
+        let mut depth = 0usize;
+        for record in records {
+            let text = std::str::from_utf8(&record.logical)?;
+            crate::qspice::check_topology_directive(path, record.line, text)?;
+            if [".subckt", ".control"]
+                .iter()
+                .any(|name| directive(text, name).is_some())
+            {
+                depth = depth
+                    .checked_add(1)
+                    .context("QSPICE source scope overflow")?;
+            } else if [".ends", ".endc"]
+                .iter()
+                .any(|name| directive(text, name).is_some())
+            {
+                depth = depth.saturating_sub(1);
+            }
+            if let Some(rest) = directive(text, ".libpath") {
+                if depth != 0 {
+                    return Err(crate::qspice::reject_nested_search(path, record.line));
+                }
+                let args = operands(rest)?;
+                let [directory] = args.as_slice() else {
+                    bail!(
+                        "{}:{}: .libpath requires one directory",
+                        path.display(),
+                        record.line
+                    );
+                };
+                let portable = portable_qspice_path(Path::new(directory))
+                    .with_context(|| format!("{}:{}: .libpath", path.display(), record.line))?;
+                self.source_search_paths
+                    .push(self.source_root.join(portable));
+            }
+        }
+        Ok(())
     }
 
     fn emit_record(&mut self, path: &Path, record: &Record, physical: &[&[u8]]) -> Result<()> {
@@ -513,33 +608,26 @@ impl LinkState<'_> {
                 "{}:{physical_line}: .include requires one pathname",
                 path.display()
             );
-            let filename = if self.pspice {
-                args[0].replace('\\', "/")
-            } else {
-                args[0].clone()
-            };
-            return self.expand(Path::new(&filename), path, None);
+            return self.expand(Path::new(&args[0]), path, None);
         }
         if let Some(args) = library_marker(text)? {
-            if self.pspice
-                && let [filename] = args.as_slice()
-            {
-                return self.expand(Path::new(&filename.replace('\\', "/")), path, None);
-            }
-            ensure!(
-                args.len() == 2,
-                "{}:{physical_line}: native .lib requires a file and section",
-                path.display()
-            );
-            let filename = if self.pspice {
-                args[0].replace('\\', "/")
-            } else {
-                args[0].clone()
+            return match args.as_slice() {
+                [file, section] => self.expand(Path::new(file), path, Some(section)),
+                [file] if self.settings.library_syntax != LibrarySyntax::NamedSections => {
+                    self.expand(Path::new(file), path, None)
+                }
+                _ => bail!(
+                    "{}:{physical_line}: .lib requires a file and section in this dialect",
+                    path.display()
+                ),
             };
-            return self.expand(Path::new(&filename), path, Some(&args[1]));
         }
-        if kind == RootKind::Include && text.eq_ignore_ascii_case(".end") {
-            // An included terminator must not terminate the consuming deck.
+        if (kind == RootKind::Include && text.eq_ignore_ascii_case(".end"))
+            || (self.settings.library_syntax == LibrarySyntax::Qspice
+                && self.stack.len() == 1
+                && directive(text, ".libpath").is_some())
+        {
+            // Consumed search paths and included terminators stay mapped as comments.
             // Keep one mapped comment for each physical source line.
             for (offset, line) in physical[record.physical.clone()].iter().enumerate() {
                 let mut comment = b"* ".to_vec();
@@ -569,8 +657,20 @@ impl<'a> SectionSelection<'a> {
 
     /// Return false for section boundary records; they are never emitted.
     fn observe(&mut self, text: &str, path: &Path, line: usize) -> Result<bool> {
+        self.observe_with_syntax(text, path, line, LibrarySyntax::NamedSections)
+    }
+
+    fn observe_with_syntax(
+        &mut self,
+        text: &str,
+        path: &Path,
+        line: usize,
+        syntax: LibrarySyntax,
+    ) -> Result<bool> {
         if let Some(args) = library_marker(text)?
             && args.len() == 1
+            && (syntax == LibrarySyntax::NamedSections
+                || (self.wanted.is_some() && self.active.is_none()))
         {
             ensure!(
                 self.active.is_none(),
@@ -781,6 +881,7 @@ mod tests {
         fs::write(&root,b"title\n.include part.inc\n.lib disabled\n.model invalid vdmos(vto=1)\n.endl disabled\n.model accepted vdmos (kp={scale})\n")?;
         let linked = SourceLinker {
             search_paths: vec![libs],
+            library_syntax: LibrarySyntax::NamedSections,
         }
         .link(&root)?;
         let library = ModelLibrary::parse(&linked.bytes)?;

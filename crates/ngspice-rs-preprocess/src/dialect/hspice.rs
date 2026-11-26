@@ -3,7 +3,8 @@
 //! compatibility flag is set by this producer.
 use super::{SourceExpansion, analysis_plan};
 use crate::{
-    AdmittedSource, Cancellation, Options, PreparedBundle, Request, SourceSession, native_bundle,
+    AdmittedSource, Cancellation, NativeProjection, Options, PreparedBundle, Request,
+    SourceSession, native_bundle,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
@@ -568,7 +569,7 @@ pub(super) fn prepare(
         root.path.clone(),
         request.format,
         RootKind::Deck,
-        &bytes,
+        NativeProjection::plain(&bytes, RootKind::Deck)?,
         &origins,
     )?;
     bundle.model_selections = selections;
