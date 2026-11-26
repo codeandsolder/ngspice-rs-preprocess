@@ -589,6 +589,76 @@ mod tests {
     }
 
     #[test]
+    fn native_scalar_semantics_match_ngspice() -> Result<()> {
+        use std::fmt::Write as _;
+        use std::process::Command;
+
+        let cases = [
+            "(-2)^3",
+            "pow(-2,3)",
+            "0^0",
+            "2==3<1",
+            "1=1",
+            "!2^0",
+            "-2*3^2",
+            "2*-3^2",
+            "1?0?3:4:5",
+            "1?(0?3:4):5",
+            "0?3:1?4:5",
+            "0?3:0?4:5",
+            "sqr(4)",
+            "(-8)%3",
+            "(-8)\\3",
+            "nint(2.5)",
+            "nint(3.5)",
+            "floor(-1.2)",
+            "ceil(-1.2)",
+            "pwr(-2,3)",
+            "log(2)",
+        ];
+        let directory = tempfile::tempdir()?;
+        let circuit = directory.path().join("native-scalar.cir");
+        let mut deck = String::from("Native scalar comparison\n");
+        for (index, expression) in cases.iter().enumerate() {
+            writeln!(deck, "V{index} scalar_{index} 0 {{{expression}}}")?;
+        }
+        deck.push_str(".control\nset numdgt=16\nop\n");
+        for index in 0..cases.len() {
+            writeln!(deck, "print v(scalar_{index})")?;
+        }
+        deck.push_str("quit\n.endc\n.end\n");
+        std::fs::write(&circuit, deck)?;
+        let execution = Command::new("ngspice")
+            .args(["-n", "-b"])
+            .arg(&circuit)
+            .current_dir(directory.path())
+            .output()?;
+        ensure!(
+            execution.status.success(),
+            "ngspice failed: {}",
+            String::from_utf8_lossy(&execution.stderr)
+        );
+        let output = String::from_utf8(execution.stdout)?;
+        for (index, expression) in cases.iter().enumerate() {
+            let label = format!("v(scalar_{index})");
+            let expected: f64 = output
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .find(|(name, _)| name.trim() == label)
+                .with_context(|| format!("missing {label} in {output}"))?
+                .1
+                .trim()
+                .parse()?;
+            let actual = evaluate(expression)?;
+            ensure!(
+                (actual - expected).abs() <= expected.abs().max(1.0) * 1e-12,
+                "{expression}: actual {actual:e}, ngspice {expected:e}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn full_frontend_function_grammar_and_errors() -> Result<()> {
         for (input, expected) in [
             ("{sin(acos(0))*4 + 2**3^2}", 68.0),
