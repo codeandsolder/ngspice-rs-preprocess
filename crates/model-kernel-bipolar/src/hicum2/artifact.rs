@@ -3,7 +3,7 @@
 //! Compiling a scalar model card establishes immutable parameter identity.
 //! Binding scales and freezes independent instance geometry and topology.
 //! Trial evaluation borrows solver-owned local unknowns and returns the
-//! physical I/Q and complete isothermal G/C Jacobians, without runtime
+//! physical I/Q and complete electrothermal G/C Jacobians, without runtime
 //! parsing, dispatch, allocation or accepted-step state mutation.
 //! The circuit owns netlist syntax, global sparse matrix, accepted state,
 //! analysis policy, integration and frequency/noise transfer.

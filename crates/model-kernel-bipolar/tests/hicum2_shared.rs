@@ -382,3 +382,142 @@ fn complete_thermal_column_matches_independent_trial_repreparation() -> TestResu
     }
     Ok(())
 }
+
+fn dynamic_model(mode: u8, correlated: bool) -> Nominal {
+    let mut nominal = Nominal::source_defaults();
+    nominal.transport.flcomp = 2.3;
+    nominal.transport.t0 = 5e-12;
+    nominal.transport.tr = 1e-12;
+    nominal.auxiliary.flsh = mode;
+    nominal.auxiliary.rth = 200.;
+    nominal.auxiliary.cth = 1e-9;
+    nominal.coefficients.alrth = 0.0003;
+    nominal.coefficients.zetarth = 0.5;
+    nominal.noise.correlated = correlated;
+    nominal.noise.alit = 0.5;
+    nominal.noise.alqf = 0.5;
+    nominal
+}
+
+#[test]
+fn native_ngspice47_hot_collector_noise() -> TestResult {
+    let mut count = 0;
+    for line in include_str!("fixtures/hicum2_ngspice47_device_noise.csv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let fields: Vec<_> = line.split(',').collect();
+        let number = |index: usize| fields[index].parse::<f64>();
+        let ambient = Temperature::new(number(0)? + 273.15)?;
+        let model = Model::new(&dynamic_model(2, fields[3] == "1"), None)?;
+        let artifact = shared::artifact(&model, ambient, Options::default())?;
+        let candidate = artifact.prepare(&[1., 1., 0.], ambient.kelvin())?;
+        let x = [1.2, number(2)?, 0., -0.1, ambient.kelvin() + number(1)?];
+        let mut sink = Noise::default();
+        artifact.evaluate_noise(&candidate, &x, number(4)?, &mut sink)?;
+        let spectrum = sink
+            .0
+            .iter()
+            .map(|(_, density, injections)| {
+                let (re, im) = injections
+                    .iter()
+                    .filter(|entry| entry.row == 0)
+                    .fold((0., 0.), |(re, im), entry| (re + entry.re, im + entry.im));
+                density * re.mul_add(re, im * im)
+            })
+            .sum::<f64>();
+        let expected = number(5)?;
+        assert!(
+            (spectrum - expected).abs() <= 5e-4 * spectrum.abs().max(expected.abs()) + 1e-32,
+            "hot collector PSD: {spectrum:e} vs {expected:e}; {line}"
+        );
+        count += 1;
+    }
+    assert_eq!(count, 144);
+    Ok(())
+}
+
+/// Independent trapezoidal integration of the producer's heat-current
+/// and energy equations. All electrical terminals are ideal drives.
+#[test]
+fn native_ngspice47_free_thermal_transient() -> TestResult {
+    let reference = include_str!("fixtures/hicum2_ngspice47_device_transient.csv");
+    let rows: Vec<_> = reference
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    assert_eq!(rows.len(), 3006);
+    for series in rows.chunks_exact(501) {
+        let first: Vec<_> = series[0].split(',').collect();
+        let ambient = Temperature::new(first[1].parse::<f64>()? + 273.15)?;
+        let model = Model::new(&dynamic_model(first[0].parse()?, false), None)?;
+        let artifact = shared::artifact(&model, ambient, Options::default())?;
+        let candidate = artifact.prepare(&[1., 1., 0.], ambient.kelvin())?;
+        let mut x = [1.2, 0.68, 0., -0.1, ambient.kelvin()];
+        let mut buffer = PointBuffer::new(x.len())?;
+        let mut previous_time = 0.;
+        let mut previous_heat = 0.;
+        let mut previous_energy = 0.;
+        for (index, line) in series.iter().enumerate() {
+            let fields: Vec<_> = line.split(',').collect();
+            let number = |i: usize| fields[i].parse::<f64>();
+            let time = number(2)?;
+            let bias = number(3)?;
+            let previous_bias = x[1];
+            // Resolve the exponential current change within the drive ramp;
+            // the independently sampled reference has 2 ns spacing.
+            let subdivisions = if index > 0 && time <= 22e-9 { 16 } else { 1 };
+            let inverse_step = if index == 0 {
+                0.
+            } else {
+                2. * f64::from(subdivisions) / (time - previous_time)
+            };
+            for substep in 1..=subdivisions {
+                x[1] = (bias - previous_bias)
+                    .mul_add(f64::from(substep) / f64::from(subdivisions), previous_bias);
+                let mut converged = false;
+                for _ in 0..30 {
+                    let mut point = buffer.point();
+                    artifact.evaluate(&candidate, &x, &mut point)?;
+                    let heat = point.current[4];
+                    let energy = point.charge[4];
+                    let residual = if index == 0 {
+                        heat
+                    } else {
+                        inverse_step.mul_add(energy - previous_energy, heat + previous_heat)
+                    };
+                    if residual.abs() < 1e-11 {
+                        previous_heat = heat;
+                        previous_energy = energy;
+                        converged = true;
+                        break;
+                    }
+                    let slope = inverse_step.mul_add(point.capacitance[24], point.conductance[24]);
+                    x[4] -= (residual / slope).clamp(-10., 10.);
+                }
+                assert!(converged, "thermal trapezoidal step failed: {line}");
+            }
+            let rise = x[4] - ambient.kelvin();
+            let expected = number(4)?;
+            assert!(
+                (rise - expected).abs() <= 2e-4 * rise.abs().max(expected.abs()) + 2e-7,
+                "thermal transient rise: {rise:e} vs {expected:e}; {line}"
+            );
+            // Away from the driven ramp, terminal current is DC plus
+            // a negligible temperature-induced displacement current.
+            if time >= 30e-9 {
+                let mut point = buffer.point();
+                artifact.evaluate(&candidate, &x, &mut point)?;
+                let expected_ic = number(5)?;
+                let actual_ic = point.current[0];
+                assert!(
+                    (actual_ic - expected_ic).abs()
+                        <= 5e-4 * actual_ic.abs().max(expected_ic.abs()) + 2e-10,
+                    "transient collector current: {actual_ic:e} vs {expected_ic:e}; {line}"
+                );
+            }
+            previous_time = time;
+        }
+    }
+    Ok(())
+}

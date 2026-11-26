@@ -100,6 +100,18 @@ pub struct Prepared {
     noise: noise::Prepared,
 }
 
+#[derive(Clone, Copy)]
+struct ThermalDerivatives {
+    diode: super::CurrentSensitivity,
+    junction: junction::TemperatureSensitivities,
+    avalanche: f64,
+    tunnel: f64,
+    base: internal_base::TemperatureSensitivity,
+    external: external::CurrentSensitivity,
+    substrate: substrate::TemperatureSensitivity,
+    transfer: transport::TemperatureSensitivity,
+}
+
 impl Prepared {
     /// # Errors
     /// Validates all prepared families once per temperature trial.
@@ -531,27 +543,62 @@ impl Prepared {
         layout: super::nodal::Layout,
         op: &Output,
     ) -> Result<super::nodal::TemperatureCoupling, EvaluationError> {
+        let slope = op.thermal.d_tdev_d_rise;
+        if slope == 0. {
+            return Ok(super::nodal::TemperatureCoupling::default());
+        }
+        let source = ThermalDerivatives {
+            diode: self.diode_temperature_sensitivity(op)?,
+            junction: self.junction_temperature_sensitivity(op)?,
+            avalanche: self.avalanche_temperature_sensitivity(op)?.generation,
+            tunnel: self.tunneling_temperature_sensitivity(op)?,
+            base: self.internal_base_temperature_sensitivity(op)?,
+            external: self.external_temperature_sensitivity(op)?,
+            substrate: self.substrate_temperature_sensitivity(op)?,
+            transfer: op.transfer.temperature_sensitivity,
+        };
+        let mut result = super::nodal::TemperatureCoupling {
+            d_tf_d_rise: slope * source.transfer.forward_transit_time,
+            d_thermal_current_d_rise_from_power: -slope * self.power_temperature_slope(op, &source),
+            ..super::nodal::TemperatureCoupling::default()
+        };
+        self.stamp_thermal_branches(layout, op, &source, &mut result);
+        let (current, charge) = self
+            .nqs
+            .temperature_partials(&op.nqs, &op.transfer, self.t0_slope);
+        for (index, (current, charge)) in current.into_iter().zip(charge).enumerate() {
+            if let Some(row) = layout.nqs_slot(index) {
+                result.current[row] = slope * current;
+                result.charge[row] = slope * charge;
+            }
+        }
+        Ok(result)
+    }
+
+    fn stamp_thermal_branches(
+        &self,
+        layout: super::nodal::Layout,
+        op: &Output,
+        source: &ThermalDerivatives,
+        result: &mut super::nodal::TemperatureCoupling,
+    ) {
         use super::topology::Branch;
-        let diode = self.diode_temperature_sensitivity(op)?;
-        let junction = self.junction_temperature_sensitivity(op)?;
-        let avalanche = self.avalanche_temperature_sensitivity(op)?.generation;
-        let tunnel = self.tunneling_temperature_sensitivity(op)?;
-        let base = self.internal_base_temperature_sensitivity(op)?;
-        let external = self.external_temperature_sensitivity(op)?;
-        let substrate = self.substrate_temperature_sensitivity(op)?;
-        let transfer = op.transfer.temperature_sensitivity;
+        let ThermalDerivatives {
+            diode,
+            junction,
+            avalanche,
+            tunnel,
+            base,
+            external,
+            substrate,
+            transfer,
+        } = *source;
         let sign = if matches!(self.polarity, Polarity::Npn) {
             1.
         } else {
             -1.
         };
         let slope = op.thermal.d_tdev_d_rise;
-        let mut result = super::nodal::TemperatureCoupling {
-            current: [0.; super::nodal::MAX_UNKNOWN],
-            charge: [0.; super::nodal::MAX_UNKNOWN],
-            d_tf_d_rise: slope * transfer.forward_transit_time,
-            d_thermal_current_d_rise_from_power: 0.,
-        };
         let (intrinsic_tunnel, peripheral_tunnel) = match self.tunneling_location {
             tunneling::Location::Intrinsic => (tunnel, 0.),
             tunneling::Location::Peripheral => (0., tunnel),
@@ -613,46 +660,21 @@ impl Prepared {
             let from = layout.node(from);
             let to = layout.node(to);
             if from != to {
-                result.current[from] += slope * current;
-                result.current[to] -= slope * current;
-                result.charge[from] += slope * charge;
-                result.charge[to] -= slope * charge;
+                result.current[from] = slope.mul_add(current, result.current[from]);
+                result.current[to] = slope.mul_add(-current, result.current[to]);
+                result.charge[from] = slope.mul_add(charge, result.charge[from]);
+                result.charge[to] = slope.mul_add(-charge, result.charge[to]);
             }
         }
-        let (current, charge) = self
-            .nqs
-            .temperature_partials(&op.nqs, &op.transfer, self.t0_slope);
-        for (index, (current, charge)) in current.into_iter().zip(charge).enumerate() {
-            if let Some(row) = layout.nqs_slot(index) {
-                result.current[row] = slope * current;
-                result.charge[row] = slope * charge;
-            }
-        }
-        result.d_thermal_current_d_rise_from_power = -slope
-            * self.power_temperature_slope(
-                op,
-                &diode,
-                transfer.net_transfer_current,
-                avalanche,
-                base.resistance,
-                external,
-            );
-        Ok(result)
     }
 
-    fn power_temperature_slope(
-        &self,
-        op: &Output,
-        diode: &super::CurrentSensitivity,
-        transfer: f64,
-        avalanche: f64,
-        base_resistance: f64,
-        external: external::CurrentSensitivity,
-    ) -> f64 {
+    fn power_temperature_slope(&self, op: &Output, source: &ThermalDerivatives) -> f64 {
+        let diode = source.diode;
+        let external = source.external;
         let power = op.thermal.electrical;
         let product = [
-            (power.transport, transfer),
-            (power.avalanche, avalanche),
+            (power.transport, source.transfer.net_transfer_current),
+            (power.avalanche, source.avalanche),
             (power.intrinsic_emitter, diode.ibei),
             (power.intrinsic_collector, diode.ibci),
             (power.peripheral_emitter, diode.ibep),
@@ -665,7 +687,7 @@ impl Prepared {
         // The source avalanche headroom is Vdci(T)-Vbici. Its explicit
         // temperature derivative is independent of the generation slope.
         let avalanche_headroom = power.avalanche.d_voltage * self.collector_potential_slope;
-        let internal = power.intrinsic_base.d_resistance * base_resistance;
+        let internal = power.intrinsic_base.d_resistance * source.base.resistance;
         // A present resistor contributes V*dI/dT. Its independent
         // voltage partial is zero for disabled heat modes or zero drive.
         let nodes = op.nodes;
