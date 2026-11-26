@@ -171,6 +171,39 @@ impl Prepared {
         Ok(output)
     }
 
+    /// Fixed-Tf source temperature derivatives for auxiliary residuals
+    /// and storage. Tf's own derivative is chained by nodal assembly.
+    pub(super) fn temperature_partials(
+        &self,
+        output: &Output,
+        transport: &transport::Output,
+        t0_slope: f64,
+    ) -> ([f64; 3], [f64; 3]) {
+        if !output.active {
+            return ([0.; 3], [0.; 3]);
+        }
+        let factor = self.p.t0 / transport.forward_transit_time;
+        let relative = t0_slope / self.p.t0;
+        let slopes = transport.temperature_sensitivity;
+        let residual = [
+            relative.mul_add(
+                output.first_current.current.value,
+                -factor * slopes.forward_current,
+            ),
+            relative * output.second_current.current.value,
+            relative.mul_add(
+                output.charge_current.current.value,
+                -factor * slopes.forward_diffusion_charge,
+            ),
+        ];
+        let charge = [
+            relative * output.first_charge.coulombs,
+            relative * output.second_charge.coulombs,
+            relative * output.charge_filter_charge.coulombs,
+        ];
+        (residual, charge)
+    }
+
     fn active_network(&self, transport: &transport::Output, state: State) -> Output {
         let factor = self.p.t0 / transport.forward_transit_time;
         let first = (state.current_second - transport.forward_current.value) * factor;

@@ -1,9 +1,5 @@
-//! Shared prepared-model ABI producer for the complete isothermal HICUM/L2
-//! residual.
-//!
+//! Shared prepared-model ABI producer for coupled HICUM/L2 residuals.
 //! The native family artifact remains the only physical evaluator.
-//! Live self-heating requires a complete temperature Jacobian, and is not
-//! silently represented by an isothermal kernel.
 
 use std::{fmt::Display, sync::Arc};
 
@@ -15,7 +11,7 @@ use model_kernel_api::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    artifact::{Model, Prepared, StructureKey, Trial},
+    artifact::{Frame, Instance, Model, Prepared, StructureKey, Trial},
     instance::Options,
     nodal::Layout,
     noise::{FlickerLocation, Output, ShotCovariance},
@@ -23,12 +19,43 @@ use super::{
 };
 use crate::Temperature;
 
-/// Fixed, reduced electrical and NQS topology.
+/// Fixed, reduced electrical, thermal and NQS topology.
 #[derive(Debug)]
 pub struct HicumKernel {
     model: Model,
     layout: Layout,
     temperature_override: bool,
+}
+
+/// Immutable per-instance nominal binding and zero-rise prepared kernel.
+#[derive(Debug)]
+pub struct BoundKernel {
+    instance: Instance,
+    baseline: Prepared,
+}
+
+impl BoundKernel {
+    fn evaluate(&self, coordinates: &[f64]) -> Result<(Prepared, Frame)> {
+        let mut source = [0.; super::nodal::MAX_UNKNOWN];
+        let layout = self.instance.layout();
+        let width = layout.count();
+        if coordinates.len() != width {
+            return Err(Error::Shape("HICUM coordinates"));
+        }
+        source[..width].copy_from_slice(coordinates);
+        let prepared = if let Some(row) = layout.thermal_slot() {
+            source[row] -= self.instance.thermal_reference_kelvin();
+            self.instance.prepare(source[row]).map_err(domain)?
+        } else {
+            self.baseline
+        };
+        let frame = prepared
+            .evaluate(Trial {
+                unknowns: &source[..width],
+            })
+            .map_err(domain)?;
+        Ok((prepared, frame))
+    }
 }
 
 fn domain(error: impl Display) -> Error {
@@ -72,6 +99,13 @@ fn equations(layout: Layout) -> Result<Vec<Equation>> {
             });
         }
     }
+    if let Some(row) = layout.thermal_slot() {
+        slots[row] = Some(Equation {
+            name: "junction_temperature".into(),
+            kind: EquationKind::Thermal,
+            binding: Binding::Terminal,
+        });
+    }
     slots
         .into_iter()
         .map(|slot| slot.ok_or(Error::Shape("unbound HICUM row")))
@@ -82,7 +116,7 @@ fn equations(layout: Layout) -> Result<Vec<Equation>> {
 /// OFF settings are solver initial conditions, not physical model parameters.
 ///
 /// # Errors
-/// Invalid instance, unrepresentable descriptor, or live thermal topology.
+/// Invalid instance or unrepresentable descriptor.
 pub fn artifact(
     model: &Model,
     ambient: Temperature,
@@ -90,9 +124,6 @@ pub fn artifact(
 ) -> Result<Arc<Artifact<HicumKernel>>> {
     let instance = model.bind(ambient, reference).map_err(domain)?;
     let layout = instance.layout();
-    if layout.thermal_slot().is_some() {
-        return Err(Error::Unsupported("HICUM full electrothermal Jacobian"));
-    }
     let mut parameters = vec![
         parameter("area", reference.area),
         parameter("multiplicity", reference.multiplicity),
@@ -211,7 +242,7 @@ fn noise_sources(sink: &mut dyn Sink, layout: Layout, spectra: Output) -> Result
 }
 
 impl Kernel for HicumKernel {
-    type Prepared = Prepared;
+    type Prepared = BoundKernel;
 
     fn prepare(&self, values: &[f64], ambient_kelvin: f64) -> Result<Self::Prepared> {
         let (area, multiplicity, dt_kelvin, temp_celsius) =
@@ -236,7 +267,10 @@ impl Kernel for HicumKernel {
         if candidate.layout() != self.layout {
             return Err(Error::Unsupported("HICUM topology requires new artifact"));
         }
-        candidate.prepare(0.).map_err(domain)
+        Ok(BoundKernel {
+            baseline: candidate.prepare(0.).map_err(domain)?,
+            instance: candidate,
+        })
     }
 
     fn evaluate(
@@ -253,12 +287,7 @@ impl Kernel for HicumKernel {
         {
             return Err(Error::Shape("HICUM point"));
         }
-        let frame = prepared
-            .evaluate(Trial {
-                unknowns: coordinates,
-                electrothermal: None,
-            })
-            .map_err(domain)?;
+        let (_, frame) = prepared.evaluate(coordinates)?;
         out.current.copy_from_slice(&frame.local.current[..n]);
         out.charge.copy_from_slice(&frame.local.charge[..n]);
         for (row, (conductance, capacitance)) in out
@@ -280,12 +309,7 @@ impl Kernel for HicumKernel {
         frequency: f64,
         sink: &mut dyn Sink,
     ) -> Result<()> {
-        let frame = prepared
-            .evaluate(Trial {
-                unknowns: coordinates,
-                electrothermal: None,
-            })
-            .map_err(domain)?;
+        let (prepared, frame) = prepared.evaluate(coordinates)?;
         let spectra = prepared
             .evaluate_noise(&frame.operating, frequency)
             .map_err(domain)?;

@@ -1,7 +1,45 @@
-# Native VBIC / HICUM2 compact-model subkernels
+# Native VBIC / HICUM2 compact-model kernels
 
 This standalone crate implements validated slices of two bipolar-model physics families.
 The families have separate physical equations; no Gummel-Poon substitution.
+
+## Prepared VBIC model artifact
+
+The native VBIC 1.1.5 producer accepts resolved ordered model/instance
+assignments through `vbic::binding`. Level 4/9 NPN/PNP selectors,
+all 108 source defaults, aliases, explicit minimum resistances,
+self-heating selectors and OFF/IC initialization metadata are resolved
+once. Geometry and instance multiplicity scale currents and stored
+charge; the four optional terminal resistances collapse exactly when
+absent. Model identity is a SHA-256 digest of the resolved nominal
+physical schema. The two excess-phase states and thermal port are
+present only when enabled by the resolved model.
+
+`vbic::device::Prepared` returns the coupled local residual F,
+stored charge/energy Q, and exact analytic Jacobians G=dF/dx and
+C=dQ/dx, including temperature derivatives. The thermal coordinate
+is absolute junction temperature in kelvin, with residual in watts
+and storage in joules. Native rise is the difference from the
+effective ambient (instance TEMP or circuit temperature, plus
+instance and model DTEMP). Ambient temperature preparation is
+followed by the source's local rise transformation. The source
+heat balance uses undelayed transport even with excess phase enabled.
+
+`vbic::shared::artifact` exports this topology through
+`model-kernel-api`; terminal rows are C/B/E/S and, if active, the
+thermal port. The internal phase coordinates are forward transport
+current states in amperes. Runtime parameter lanes contain AREA,
+M, instance DTEMP and optional TEMP, without string lookup or heap
+allocation in evaluation. Noise emits individually resolved physical
+branch injections. Global stamping, integration, initialization and
+noise transfer remain the solver's responsibility.
+
+The device conformance fixture uses a resolved public IHP SG13G2
+Nx4 HBT card, with independent native ngspice DC, AC and forced
+thermal-drive results. The native thermal AC heat-generation sign
+discrepancy is documented in the fixture README; the physical
+Jacobian follows the converged native DC residual, not the
+inconsistent native derivative.
 
 ## Prepared HICUM2 model artifact
 
@@ -17,7 +55,7 @@ as solver initialization, reduces five nominal resistor short constraints
 and reserves optional vertical NQS and thermal unknowns. Model/scaled
 instance digests and a seven-bit structural key allow correct prepared
 kernel reuse. Temperature-specific physical kernels accept borrowed
-local trial vectors and return complete isothermal current/charge/
+local trial vectors and return complete coupled electrothermal current/charge/
 conductance/capacitance matrices, homogeneous caller-owned output
 batches, and source-referred noise without per-trial string lookup,
 allocation, dynamic dispatch or accepted-step mutation. All three NQS
@@ -25,21 +63,25 @@ states are read directly from reserved fixed local unknown indices.
 
 **Capability boundary:** local I/Q/G/C and noise are available;
 global DC/AC/transient solver analysis, sparse assembly, time-history,
-noise transfer and final convergence remain simulator-owned. A live
-self-heating node explicitly requires the remaining full electrothermal
-coupling; it is never silently zero-filled. A stale thermal-prepared
-kernel is rejected if the local thermal unknown changes. Interface
+noise transfer and final convergence remain simulator-owned. The physical producer assembles the complete electrical/thermal Jacobian,
+including source power, temperature-dependent storage and all NQS
+derivatives. A stale family-specific thermal-prepared kernel is rejected
+if the local thermal unknown changes. Interface
 tests and an on-demand local benchmark are in tests/hicum2_artifact.rs.
 
-The `hicum2::shared` producer exposes the same isothermal kernel through
+The `hicum2::shared` producer exposes the same coupled kernel through
 `model-kernel-api`, including topology-specific hidden rows and NQS
 coordinates. Area and multiplicity candidates that cross a physical
 short threshold require a new artifact. The correlated base/collector
 shot spectrum is emitted as independent generators with coherent complex
 branch injections, not by subtracting nearly equal spectral densities.
-Live self-heating is rejected at this interface until the complete
-electrothermal Jacobian is available. The family-specific artifact remains
-available for callers supplying the thermal coupling.
+The shared thermal coordinate is absolute junction temperature in kelvin;
+the family-specific evaluator uses source temperature rise relative to
+bound ambient plus model DT. The shared producer reprepares at each
+thermal trial, applies the source constitutive clamp without clipping the
+thermal coordinate, and returns watts and joules. Noise generators use
+the same trial junction temperature. The solver does not supply
+compact-model derivatives.
 
 ## Implemented
 
@@ -73,7 +115,8 @@ available for callers supplying the thermal coupling.
   intrinsic RBI modulated by qB, and peripheral RBP modulated by qBp.
   All nonlinear branch currents include analytic mixed conductances wrt
   their local voltage and both coupled junction voltages. Parser-level
-  minimum resistances/topology reduction remain outside the kernel.
+  minimum resistances/topology reduction are handled by the prepared
+  device binding.
 - **VBIC 1.1.5 complete temperature preparation:** all 108 VBIC source
   coefficient slots, mapped by a compile-time enum to typed junction, charge,
   resistance, transport, parasitic, avalanche, and local noise parameters.
@@ -82,8 +125,8 @@ available for callers supplying the thermal coupling.
   and depletion capacitances, impact-ionization coefficients, and reverse
   breakdown terms. One immutable preparation per effective temperature;
   no coefficient-name lookup inside nonlinear evaluation. The full
-  model-card parser/default schema, device-level DTEMP and geometry/multiplicity
-  remain a separate preparation/binding responsibility.
+  model-card/default schema, device-level DTEMP and geometry/multiplicity
+  are handled by the VBIC prepared device binding.
 - **VBIC local noise:** all seven thermal-resistance sources, four shot
   sources (Itzf/Ibe/Ibep/Iccp), and two KFN/AFN/BFN flicker sources,
   using the ngspice analysis constants and instance M scaling. The output
@@ -167,6 +210,26 @@ available for callers supplying the thermal coupling.
   Those six are explicitly *not* claimed to be thermal-equilibrium
   solutions. Independent finite-difference tests check all
   resistor and temperature partials.
+  The assembled producer also passes 1,280 coupled thermal-column
+  finite-difference cases (all resistor masks, both polarities, both
+  NQS settings and thermal modes, including constitutive clamps).
+  The reproducible ngspice-47 forced-temperature corpus contains 384
+  DC/AC rows with independent central DC slopes and 1 Hz AC stamps.
+  At cold low-current bias (-40 C, Vbe=.65 V), native AC gm differs
+  from its own DC derivative by approximately 0.9%; the test retains
+  raw values and independently corrects only that transport slope
+  through the published NQS transfer and undelayed heat-power law.
+  The source equations are not altered to reproduce this discrepancy.
+  The free-thermal transient oracle contains 3,006 samples across six
+  cases (three ambient temperatures, both heat modes); an independent
+  trapezoidal test integrates the producer's heat and energy equations.
+  Another 144 native collector-noise samples check both correlated
+  and uncorrelated source noise at imposed temperature rises.
+  Native forced-temperature runs with nonzero series resistances
+  did not converge in the tested ngspice-47 deck, so the independent
+  thermal AC/noise/transient corpus uses shorted series resistances;
+  all masks remain covered by the analytic coupled-Jacobian tests.
+
 - **Full implicit HICCR electrothermal transport and storage:**
   The fixed-size HICCR Jet now includes a temperature derivative
   lane alongside intrinsic BE/BC and independent hole-charge lanes.
@@ -626,11 +689,10 @@ inputs/outputs, with no per-iteration allocation, identifier lookup or generic
 dispatch. Numerical evaluation has no accepted-step state side effects.
 The simulator still owns model topology binding, stamps and solver lifecycle.
 
-**Complete transistor capability is not advertised.** Remaining device
-assembly work includes source-validated model-card defaults, per-instance
-geometry/multiplicity transformations, VBIC and HICUM internal/external
-node binding and exact short reduction, integrated
-electrothermal cross-Jacobians and accepted-step state. The circuit solver
+**Capability boundary:** VBIC exposes complete local source-model
+residuals and Jacobians; HICUM capability remains version- and
+interface-specific as described above. Accepted-step state and global
+analysis are solver responsibilities. The circuit solver
 still owns DC/AC/transient/noise stamping, correlated-source transfer and
 integration, thermal-network convergence, complete PDK model coverage,
 and oscillator differential gates. Unsupported devices must fail binding
@@ -744,5 +806,5 @@ NIST-1998 k=1.3806503e-23 J/K and q=1.602176462e-19 C by default.
 The family kernels reproduce those numerical constants rather than silently
 applying modern exact SI constants. The VBIC temperature-preparation stage
 now implements all reference transforms and exposes its effective temperature
-to each electrical subkernel. Complete source-aware .MODEL defaulting and
-instance geometry and multiplier binding are still separate work.
+to each electrical subkernel. Source-aware model defaults and instance
+geometry and multiplier binding are resolved by the VBIC artifact.

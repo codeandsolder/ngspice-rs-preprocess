@@ -10,13 +10,13 @@ pub use waveforms::{capture_artifact_waveforms, capture_linked_waveforms};
 mod simetrix_runtime;
 use super::{
     CodeModelRuntime, DigitalBufferKind, DigitalBufferSpec, LogicGateKind, LogicGateMode,
-    LogicGateSpec, LogicIo, LogicOperation, LogicOutput, LogicPolarity, LogicReceiver,
-    LogicThresholds, LogicTiming, Point, Translation, TranslationKind, emit_digital_buffer,
-    emit_logic_event, emit_logic_gate, emit_logic_input_loads, emit_logic_output,
-    emit_logic_voltage, indexed_points, integer_parameter, normalized_statement, numeric_parameter,
-    parse_assignments, read_indexed_points, sanitized_name, statement_tokens,
-    translate_charge_capacitor, translate_flux_inductor, translate_ipwlr, translate_vpwlr,
-    validate_node, validate_resistor_end_slopes, write_number,
+    LogicGateSpec, LogicIo, LogicOperation, LogicPolarity, LogicReceiver, LogicThresholds,
+    LogicTiming, OutputDrive, OutputPins, OutputSignal, OutputStage, Point, Translation,
+    TranslationKind, emit_digital_buffer, emit_logic_event, emit_logic_gate,
+    emit_logic_input_loads, emit_logic_voltage, indexed_points, integer_parameter,
+    normalized_statement, numeric_parameter, parse_assignments, read_indexed_points,
+    sanitized_name, statement_tokens, translate_charge_capacitor, translate_flux_inductor,
+    translate_ipwlr, translate_vpwlr, validate_node, validate_resistor_end_slopes, write_number,
 };
 #[cfg(test)]
 use crate::syntax::logical_statements;
@@ -1296,7 +1296,7 @@ fn bracket_groups(tokens: &[String]) -> Result<Vec<Vec<String>>> {
 #[derive(Clone, Copy)]
 struct StateElementSpec<'a> {
     stem: &'a str,
-    outputs: &'a [&'a str],
+    outputs: OutputPins<'a>,
     rtn: &'a str,
     inputs: &'a [String],
     receiver: LogicReceiver,
@@ -1318,7 +1318,7 @@ fn emit_state_element(io: LogicIo, spec: &StateElementSpec<'_>) -> Result<Transl
     } = *spec;
     for node in outputs
         .iter()
-        .copied()
+        .map(|(node, _)| node)
         .chain(std::iter::once(rtn))
         .chain(inputs.iter().map(String::as_str))
     {
@@ -1335,20 +1335,15 @@ fn emit_state_element(io: LogicIo, spec: &StateElementSpec<'_>) -> Result<Transl
         io.thresholds(),
         timing,
     )?;
-    for (index, node) in outputs.iter().enumerate() {
-        emit_logic_output(
-            &mut output,
-            io,
-            stem,
-            node,
-            rtn,
-            &state,
-            LogicOutput {
-                negative: output_polarity.negative(),
-                complement: index == 1,
-            },
-        )?;
+    OutputStage {
+        stem,
+        rtn,
+        pins: outputs,
+        drive: io.into(),
+        polarity: output_polarity,
+        signal: OutputSignal::Event(&state),
     }
+    .emit(&mut output)?;
     Ok(Translation {
         bytes: output.into_bytes(),
         kind,
@@ -1392,7 +1387,10 @@ fn emit_raw_sr_latch(
         io,
         &StateElementSpec {
             stem,
-            outputs: &[out, out_bar],
+            outputs: OutputPins {
+                primary: out,
+                complement: Some(out_bar),
+            },
             rtn,
             inputs,
             receiver: LogicReceiver::digital1(input_polarity),
@@ -2425,14 +2423,7 @@ fn translate_raw_comp_device(
     let diff = format!("__{stem}_DIFF");
     let state_input = format!("__{stem}_STATE_INPUT");
     let state = format!("__{stem}_STATE");
-    let delayed = if model.delay == 0.0 {
-        state.clone()
-    } else {
-        format!("__{stem}_DELAYED")
-    };
-    let out_int = format!("__{stem}_OUT_INT");
     let hyst_model = format!("__{stem}_HYST_M");
-    let delay_model = format!("__{stem}_DELAY_M");
     let mut output = String::new();
     write!(output, "R__{stem}_RINP {input_p} {rtn} ")?;
     write_number(&mut output, model.rin)?;
@@ -2456,20 +2447,25 @@ fn translate_raw_comp_device(
     write!(output, ".model {hyst_model} hyst(in_low=0 in_high=0 hyst=")?;
     write_number(&mut output, model.hystwd / 2.0)?;
     output.push_str(" out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)\n");
-    if model.delay != 0.0 {
-        writeln!(output, "A__{stem}_DELAY {state} {delayed} 0 {delay_model}")?;
-        write!(output, ".model {delay_model} delay(delay=")?;
-        write_number(&mut output, model.delay)?;
-        output.push_str(" buffer_size=2048)\n");
+    OutputStage {
+        stem: &stem,
+        rtn,
+        pins: OutputPins {
+            primary: out,
+            complement: None,
+        },
+        drive: OutputDrive {
+            low: model.vol,
+            high: model.voh,
+            resistance: model.rout,
+        },
+        polarity: LogicPolarity::Positive,
+        signal: OutputSignal::Analog {
+            state: &state,
+            delay: model.delay,
+        },
     }
-    write!(output, "B__{stem}_OUTV {out_int} {rtn} V='")?;
-    write_number(&mut output, model.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, model.voh - model.vol)?;
-    writeln!(output, ")*v({delayed})'")?;
-    write!(output, "R__{stem}_OUT {out_int} {out} ")?;
-    write_number(&mut output, model.rout)?;
-    output.push('\n');
+    .emit(&mut output)?;
     Ok(Some(Translation {
         bytes: output.into_bytes(),
         kind: TranslationKind::Comparator,
@@ -5118,7 +5114,7 @@ fn translate_deck_items(
     output.push_str(".end\n");
     reject_residual_simplis(&output)?;
     let bytes =
-        match model_normalize_ngspice::controlled_transfer::lower_sources(output.as_bytes())? {
+        match model_normalize_ngspice::controlled_transfer::lower_sources(output.as_bytes(), Ok)? {
             Some(lowered) => lowered.bytes,
             None => output.into_bytes(),
         };
