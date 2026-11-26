@@ -239,7 +239,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 7 includes
+counts, dependencies and provenance. Manifest version 9 includes typed PWL resistor declarations as well as
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
 `Artifact::required_code_models` and `PreparedBundle::required_code_models()`.
@@ -442,6 +442,31 @@ This policy selects the measured SIMetrix Elements GUI defaults
 Do not simulate the electrical text alone if this policy contains
 initialization declarations. Native decks have no source-specific
 initialization policy and retain their normal IC semantics.
+
+### SIMPLIS piecewise-linear resistor startup
+
+The `PreparedBundle::pwl_resistors` list and manifest v9 contain each
+translated resistor's signed voltage/current knots, independent axis,
+one-based optional `initial_segment`, emitted artifact and lexical scope,
+and original linked device and terminal names. A linked definition may be
+instantiated repeatedly; bind its declaration independently for each
+elaborated occurrence. Hierarchical snapshots specialize definitions
+before translation and the effective segment must be valid.
+
+The `binding` describes the exact native behavioral source and, for a
+current-defined law, its series zero-volt sensor and intermediate node.
+`series_sensor` describes additional instrumentation inserted to observe
+the current in another device's control law. Preserve these observation
+branches when replacing the behavioral stamp. The emitted electrical
+text represents the same physical law regardless of the startup hint.
+
+During an initial nonlinear bias attempt, an explicit hint selects
+the first linearized segment only. Recompute the segment from the
+actual solved independent coordinate, including end extrapolation;
+interior negative slopes are valid. Do not enforce terminal voltage or
+current as an initial constraint, and do not reset the hint during an
+ordinary Newton iteration or continuation step. A consumer that ignores
+this metadata cannot guarantee the source's multiroot startup choice.
 
 ### SIMPLIS reactive startup and snapshots
 

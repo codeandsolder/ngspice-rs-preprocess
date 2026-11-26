@@ -15,8 +15,9 @@ use super::{
     TranslationKind, emit_digital_buffer, emit_logic_event, emit_logic_gate,
     emit_logic_input_loads, emit_logic_voltage, indexed_points, integer_parameter,
     normalized_statement, numeric_parameter, parse_assignments, read_indexed_points,
-    sanitized_name, statement_tokens, translate_charge_capacitor, translate_flux_inductor,
-    translate_ipwlr, translate_vpwlr, validate_node, validate_resistor_end_slopes, write_number,
+    resistor_binding, resistor_knots, sanitized_name, statement_tokens, translate_charge_capacitor,
+    translate_flux_inductor, translate_ipwlr, translate_vpwlr, validate_node,
+    validate_resistor_end_slopes, write_number,
 };
 #[cfg(test)]
 use crate::syntax::logical_statements;
@@ -25,21 +26,27 @@ use crate::syntax::{
     model_header, parse_items, simple_assignment_span, simple_assignment_value,
 };
 use anyhow::{Context, Result, bail};
-use model_normalize_ngspice::passive_ic::PassiveKind;
+use model_normalize_ngspice::{
+    passive_ic::PassiveKind,
+    pwl_resistor::{Axis, PreparedPwlResistor},
+};
 use serde::Serialize;
 pub use simetrix_runtime::lower_simetrix_linked_runtime;
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WholeModelTranslation {
     pub bytes: Vec<u8>,
     pub primitives: Vec<TranslationKind>,
     pub required_code_models: Vec<CodeModelRuntime>,
     pub stripped_directives: usize,
     pub flattened_subcircuits: usize,
+    /// Exact prepared resistor laws and advisory startup segments.
+    pub pwl_resistors: Vec<PreparedPwlResistor>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SplitDeckTranslation {
     pub deck_bytes: Vec<u8>,
     pub library_bytes: Vec<u8>,
@@ -47,6 +54,8 @@ pub struct SplitDeckTranslation {
     pub required_code_models: Vec<CodeModelRuntime>,
     pub stripped_directives: usize,
     pub flattened_subcircuits: usize,
+    /// Exact prepared resistor laws and advisory startup segments.
+    pub pwl_resistors: Vec<PreparedPwlResistor>,
 }
 
 fn render_native_subcircuit(block: &Subcircuit, output: &mut String) -> Result<()> {
@@ -2330,22 +2339,25 @@ fn translate_current_controlled_source(
 fn validate_pwl_segment_hint(
     parameters: &std::collections::BTreeMap<String, String>,
     segments: usize,
-) -> Result<()> {
-    anyhow::ensure!(
-        parameters.keys().all(|name| name == "IC"),
-        "unsupported SIMPLIS PWL resistor instance parameter"
-    );
+) -> Result<usize> {
     let initial = integer_parameter(parameters, "IC")?;
     anyhow::ensure!(
         (1..=segments).contains(&initial),
         "SIMPLIS PWL resistor IC must select a defined segment"
     );
-    Ok(())
+    Ok(initial)
+}
+
+struct PwlDeclarations {
+    artifact: String,
+    values: Vec<PreparedPwlResistor>,
 }
 
 fn translate_raw_pwl_device(
     statement: &str,
     models: &std::collections::BTreeMap<String, RawPwlModel>,
+    scope: &[String],
+    declarations: &mut PwlDeclarations,
 ) -> Result<Option<Translation>> {
     if !statement.trim_start().starts_with('!') {
         return Ok(None);
@@ -2360,31 +2372,63 @@ fn translate_raw_pwl_device(
     }
 
     let instance = name.trim_start_matches('!');
-    let (kind, points) = if let Some(model) = models.get(&tokens[3].to_ascii_uppercase()) {
-        let parameters = parse_assignments(&tokens[4..])?;
-        validate_pwl_segment_hint(&parameters, model.points.len() - 1)?;
-        (model.kind, model.points.as_slice())
-    } else if name
-        .as_bytes()
-        .get(1)
-        .is_some_and(|byte| matches!(*byte, b'R' | b'r'))
-        && tokens[3].contains('=')
-    {
-        let parameters = parse_assignments(&tokens[3..])?;
-        let segments = integer_parameter(&parameters, "NSEG")?;
-        validate_pwl_segment_count(segments)?;
-        let points = indexed_points(&parameters, segments, "X", "Y")
-            .with_context(|| format!("parsing inline SIMPLIS PWL resistor {instance}"))?;
-        let translation = translate_vpwlr(instance, &tokens[1], &tokens[2], &points)?;
-        return Ok(Some(translation));
-    } else {
-        return Ok(None);
-    };
+    let (kind, points, initial_segment) =
+        if let Some(model) = models.get(&tokens[3].to_ascii_uppercase()) {
+            let parameters = parse_assignments(&tokens[4..])?;
+            anyhow::ensure!(
+                parameters.keys().all(|name| name == "IC"),
+                "unsupported SIMPLIS PWL resistor instance parameter"
+            );
+            let initial = validate_pwl_segment_hint(&parameters, model.points.len() - 1)?;
+            (
+                model.kind,
+                Cow::Borrowed(model.points.as_slice()),
+                Some(initial),
+            )
+        } else if name
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| matches!(*byte, b'R' | b'r'))
+            && tokens[3].contains('=')
+        {
+            let parameters = parse_assignments(&tokens[3..])?;
+            let segments = integer_parameter(&parameters, "NSEG")?;
+            validate_pwl_segment_count(segments)?;
+            let points = indexed_points(&parameters, segments, "X", "Y")
+                .with_context(|| format!("parsing inline SIMPLIS PWL resistor {instance}"))?;
+            let initial = parameters
+                .contains_key("IC")
+                .then(|| validate_pwl_segment_hint(&parameters, segments))
+                .transpose()?;
+            (RawPwlKind::Vpwlr, Cow::Owned(points), initial)
+        } else {
+            return Ok(None);
+        };
 
-    let translation = match kind {
-        RawPwlKind::Vpwlr => translate_vpwlr(instance, &tokens[1], &tokens[2], points)?,
-        RawPwlKind::Ipwlr => translate_ipwlr(instance, &tokens[1], &tokens[2], points)?,
+    let (axis, translation) = match kind {
+        RawPwlKind::Vpwlr => (
+            Axis::Voltage,
+            translate_vpwlr(instance, &tokens[1], &tokens[2], &points)?,
+        ),
+        RawPwlKind::Ipwlr => (
+            Axis::Current,
+            translate_ipwlr(instance, &tokens[1], &tokens[2], &points)?,
+        ),
     };
+    let declaration = PreparedPwlResistor {
+        artifact: declarations.artifact.clone(),
+        scope: scope.to_vec(),
+        device: name.clone(),
+        positive: tokens[1].clone(),
+        negative: tokens[2].clone(),
+        axis,
+        knots: resistor_knots(&points).collect(),
+        initial_segment,
+        binding: resistor_binding(instance, axis),
+        series_sensor: None,
+    };
+    declaration.validate()?;
+    declarations.values.push(declaration);
     Ok(Some(translation))
 }
 
@@ -4327,6 +4371,8 @@ fn translate_inline_schematic_x(statement: &str) -> Result<Option<Translation>> 
 fn translate_deck_primitive(
     statement: &str,
     models: &ScopeAnalysis<'_>,
+    scope: &[String],
+    pwl: &mut PwlDeclarations,
 ) -> Result<Option<Translation>> {
     // Evaluate in source-dispatch precedence order. Neither a successful
     // translation nor an error may fall through to a later translator.
@@ -4351,7 +4397,7 @@ fn translate_deck_primitive(
         waveforms::translate(statement, &models.pwls_prefix),
         translate_raw_transformer(statement),
         translate_raw_mutual_inductance(statement, &models.inductors),
-        translate_raw_pwl_device(statement, &models.pwl),
+        translate_raw_pwl_device(statement, &models.pwl, scope, pwl),
         translate_raw_reactive_device(statement, &models.reactive),
         translate_classic_state_device(statement, &models.srff),
         translate_raw_comp_device(statement, &models.comp),
@@ -4678,6 +4724,8 @@ fn emit_deck_statement(
     output: &mut String,
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
+    scope: &[String],
+    pwl: &mut PwlDeclarations,
 ) -> Result<()> {
     let trimmed = statement.trim();
     if trimmed.is_empty() || trimmed.starts_with('*') {
@@ -4716,7 +4764,31 @@ fn emit_deck_statement(
         output.push('\n');
         return Ok(());
     }
-    if let Some(translation) = translate_deck_primitive(statement, models)? {
+    if let Some(translation) = translate_deck_primitive(statement, models, scope, pwl)? {
+        if matches!(
+            translation.kind,
+            TranslationKind::Vpwlr | TranslationKind::Ipwlr
+        ) {
+            let declaration = pwl
+                .values
+                .last_mut()
+                .context("missing PWL resistor declaration")?;
+            if let Some(sensor) = models
+                .sensed_branches
+                .get(&declaration.device.to_ascii_uppercase())
+            {
+                let (positive, _) = models
+                    .voltage_branches
+                    .get(&declaration.device.to_ascii_uppercase())
+                    .context("missing original current-sensed resistor terminals")?;
+                declaration.positive.clone_from(positive);
+                declaration.series_sensor =
+                    Some(model_normalize_ngspice::pwl_resistor::SeriesSensor {
+                        source: sensor.source.clone(),
+                        intermediate: sensor.node.clone(),
+                    });
+            }
+        }
         primitives.push(translation.kind);
         output.push_str(std::str::from_utf8(&translation.bytes)?);
         return Ok(());
@@ -4814,6 +4886,7 @@ fn emit_deck_subcircuit_children(
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
     flattened_subcircuits: &mut usize,
+    pwl: &mut PwlDeclarations,
 ) -> Result<()> {
     for item in &block.body {
         if let Item::Subcircuit(child) = item {
@@ -4824,6 +4897,7 @@ fn emit_deck_subcircuit_children(
                 primitives,
                 stripped_directives,
                 flattened_subcircuits,
+                pwl,
             )
             .map_err(|error| anyhow::anyhow!("translating subcircuit {}: {error:#}", child.name))?;
         }
@@ -4921,6 +4995,7 @@ fn emit_deck_subcircuit(
     primitives: &mut Vec<TranslationKind>,
     stripped_directives: &mut usize,
     flattened_subcircuits: &mut usize,
+    pwl: &mut PwlDeclarations,
 ) -> Result<()> {
     let scope = parent.child(block)?;
     emit_deck_subcircuit_children(
@@ -4930,6 +5005,7 @@ fn emit_deck_subcircuit(
         primitives,
         stripped_directives,
         flattened_subcircuits,
+        pwl,
     )?;
     let dead_calls = dead_numeric_subcircuit_calls(block)?;
     let repair_one_model_typo = repair_unambiguous_pspice_one_model_typo(&block.body)?;
@@ -4967,14 +5043,22 @@ fn emit_deck_subcircuit(
             }
             let repaired =
                 rewrite_unambiguous_pspice_one_model_typo(statement, repair_one_model_typo)?;
-            emit_deck_statement(&repaired, &models, output, primitives, stripped_directives)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "translating statement in subcircuit {}: {}: {error:#}",
-                        block.name,
-                        statement.trim()
-                    )
-                })?;
+            emit_deck_statement(
+                &repaired,
+                &models,
+                output,
+                primitives,
+                stripped_directives,
+                std::slice::from_ref(&block.name),
+                pwl,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "translating statement in subcircuit {}: {}: {error:#}",
+                    block.name,
+                    statement.trim()
+                )
+            })?;
         }
     }
     if embedded_file {
@@ -5019,7 +5103,11 @@ pub fn translate_simplis_deck(input: &[u8]) -> Result<WholeModelTranslation> {
     let items = vec![parse_deck_items(input)?];
     let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
     let scope = level17::Scope::global(&prefix, &items)?;
-    translate_deck_items(items.into_iter().next().context("missing deck")?, &scope)
+    translate_deck_items(
+        items.into_iter().next().context("missing deck")?,
+        &scope,
+        "deck.cir",
+    )
 }
 
 fn parse_deck_items(input: &[u8]) -> Result<Vec<Item>> {
@@ -5048,9 +5136,16 @@ pub fn translate_simplis_linked_netlist(
         .collect::<Result<Vec<_>>>()?;
     let prefix = pwls::scope_prefix(items.iter().map(Vec::as_slice), None, "__l17_");
     let scope = level17::Scope::global(&prefix, &items)?;
+    let filenames = std::iter::once("deck.cir").chain(
+        linked
+            .libraries
+            .iter()
+            .map(|library| library.filename.as_str()),
+    );
     let mut translated = items
         .into_iter()
-        .map(|items| translate_deck_items(items, &scope));
+        .zip(filenames)
+        .map(|(items, filename)| translate_deck_items(items, &scope, filename));
     let root = translated.next().context("missing linked root")??;
     let libraries = translated
         .map(|result| include_safe(result?))
@@ -5061,6 +5156,7 @@ pub fn translate_simplis_linked_netlist(
 fn translate_deck_items(
     mut items: Vec<Item>,
     scope: &level17::Scope<'_>,
+    filename: &str,
 ) -> Result<WholeModelTranslation> {
     reject_experimental_models(&items)?;
     distribute_root_init_overrides(&mut items)?;
@@ -5071,6 +5167,10 @@ fn translate_deck_items(
     let mut primitives = Vec::new();
     let mut stripped_directives = 0usize;
     let mut flattened_subcircuits = 0usize;
+    let mut pwl = PwlDeclarations {
+        artifact: filename.to_owned(),
+        values: Vec::new(),
+    };
     for item in &items {
         match item {
             Item::Subcircuit(block) => emit_deck_subcircuit(
@@ -5080,6 +5180,7 @@ fn translate_deck_items(
                 &mut primitives,
                 &mut stripped_directives,
                 &mut flattened_subcircuits,
+                &mut pwl,
             )
             .map_err(|error| anyhow::anyhow!("translating subcircuit {}: {error:#}", block.name))?,
             Item::Statement(statement) => emit_deck_statement(
@@ -5088,6 +5189,8 @@ fn translate_deck_items(
                 &mut output,
                 &mut primitives,
                 &mut stripped_directives,
+                &[],
+                &mut pwl,
             )
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -5118,12 +5221,14 @@ fn translate_deck_items(
             Some(lowered) => lowered.bytes,
             None => output.into_bytes(),
         };
+    model_normalize_ngspice::pwl_resistor::validate_artifact(&pwl.values, filename, &bytes)?;
     Ok(WholeModelTranslation {
         bytes,
         primitives,
         required_code_models,
         stripped_directives,
         flattened_subcircuits,
+        pwl_resistors: pwl.values,
     })
 }
 
@@ -5136,7 +5241,11 @@ fn translate_deck_items(
 ///
 /// Returns the same semantic errors as [`translate_simplis_deck`].
 pub fn translate_simplis_expanded_library(input: &[u8]) -> Result<WholeModelTranslation> {
-    include_safe(translate_simplis_deck(input)?)
+    let mut result = include_safe(translate_simplis_deck(input)?)?;
+    for declaration in &mut result.pwl_resistors {
+        "model.lib".clone_into(&mut declaration.artifact);
+    }
+    Ok(result)
 }
 
 fn include_safe(mut translated: WholeModelTranslation) -> Result<WholeModelTranslation> {
@@ -5163,8 +5272,13 @@ pub fn translate_simplis_deck_split(
     input: &[u8],
     include_path: &str,
 ) -> Result<SplitDeckTranslation> {
-    let translated = translate_simplis_deck(input)?;
+    let mut translated = translate_simplis_deck(input)?;
     let (deck_bytes, library_bytes) = split_native_deck(&translated.bytes, include_path)?;
+    for declaration in &mut translated.pwl_resistors {
+        if !declaration.scope.is_empty() {
+            include_path.clone_into(&mut declaration.artifact);
+        }
+    }
     Ok(SplitDeckTranslation {
         deck_bytes,
         library_bytes,
@@ -5172,6 +5286,7 @@ pub fn translate_simplis_deck_split(
         required_code_models: translated.required_code_models,
         stripped_directives: translated.stripped_directives,
         flattened_subcircuits: translated.flattened_subcircuits,
+        pwl_resistors: translated.pwl_resistors,
     })
 }
 
@@ -5467,6 +5582,17 @@ Q1 drain 0 !RGAIN MQ IC=OPEN
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("B__Q1_CTRL"));
         assert!(text.contains("i(V___21RGAIN_CONTROL_SENSE)"));
+        let [resistor] = translated.pwl_resistors.as_slice() else {
+            bail!("missing typed PWL resistor");
+        };
+        assert_eq!(resistor.positive, "gate");
+        assert_eq!(resistor.negative, "0");
+        assert_eq!(resistor.initial_segment, Some(1));
+        let sensor = resistor
+            .series_sensor
+            .as_ref()
+            .context("missing probe binding")?;
+        assert_eq!(sensor.source, "V___21RGAIN_CONTROL_SENSE");
         assert!(text.contains("max("));
         assert!(text.contains("min("));
         assert!(!text.contains(" ICQPOS "));

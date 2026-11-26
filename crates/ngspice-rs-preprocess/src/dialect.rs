@@ -82,6 +82,7 @@ fn bundle(
         initial_conditions: None,
         analysis_plan: None,
         waveforms: Vec::new(),
+        pwl_resistors: Vec::new(),
     }
 }
 
@@ -581,6 +582,7 @@ fn expanded(root: &AdmittedSource, format: InputFormat) -> Result<PreparedBundle
     let mut bundle = bundle(root, format, artifact, Vec::new());
     bundle.analysis_plan = Some(plan);
     bundle.waveforms = waveforms;
+    bundle.pwl_resistors = translated.pwl_resistors;
     Ok(bundle)
 }
 
@@ -788,7 +790,12 @@ fn linked(
         .iter()
         .map(|library| library.filename.as_str())
         .collect::<BTreeSet<_>>();
-    let (mut translated_root, translated_libraries) = translate_simplis_linked_netlist(&linked)?;
+    let (mut translated_root, mut translated_libraries) =
+        translate_simplis_linked_netlist(&linked)?;
+    let mut pwl_resistors = std::mem::take(&mut translated_root.pwl_resistors);
+    for library in &mut translated_libraries {
+        pwl_resistors.append(&mut library.pwl_resistors);
+    }
     if request.format == InputFormat::SimplisDeck {
         initial_conditions = Some(super::passive_ic::InitialConditions {
             mode: Some("1".to_owned()),
@@ -836,6 +843,7 @@ fn linked(
             || !policy.nodes.is_empty()
     });
     bundle.waveforms = waveforms;
+    bundle.pwl_resistors = pwl_resistors;
     Ok(bundle)
 }
 

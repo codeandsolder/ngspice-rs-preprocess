@@ -174,6 +174,7 @@ struct Manifest<'a> {
     initial_conditions: &'a Option<ngspice_rs_preprocess::passive_ic::InitialConditions>,
     analysis_plan: &'a Option<ngspice_rs_preprocess::analysis_plan::AnalysisPlan>,
     waveforms: &'a [ngspice_rs_preprocess::waveform::PreparedWaveform],
+    pwl_resistors: &'a [ngspice_rs_preprocess::pwl_resistor::PreparedPwlResistor],
 }
 
 #[derive(Serialize)]
@@ -188,7 +189,7 @@ struct ManifestArtifact<'a> {
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 8,
+        version: 9,
         input_format: bundle.format,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,
@@ -210,6 +211,7 @@ fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
         initial_conditions: &bundle.initial_conditions,
         analysis_plan: &bundle.analysis_plan,
         waveforms: &bundle.waveforms,
+        pwl_resistors: &bundle.pwl_resistors,
     }
 }
 
