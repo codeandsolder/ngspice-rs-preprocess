@@ -322,3 +322,94 @@ fn group_candidate_replays_and_does_not_mutate_reference() -> TestResult {
     assert!(a.prepare(&structural, 300.15).is_err());
     Ok(())
 }
+
+#[test]
+fn native_clamped_terminal_residual_and_admittance() -> TestResult {
+    let fixture = include_str!("fixtures/bsimsoi-clamped-ngspice47.txt");
+    let card = fixture
+        .lines()
+        .find_map(|line| line.strip_prefix("# model-card "))
+        .ok_or("native model card")?;
+    let raw_card = card
+        .split_whitespace()
+        .map(|assignment| -> TestResult<(&str, ParameterValue)> {
+            let (name, value) = assignment.split_once('=').ok_or("model assignment")?;
+            let spec = ModelVariant::BsimSoi
+                .parameter(ParameterScope::Model, name)
+                .ok_or("model slot")?;
+            let value = if matches!(spec.kind, model_compact_intrinsic::ParameterType::Integer) {
+                Integer(value.parse()?)
+            } else {
+                Real(value.parse()?)
+            };
+            Ok((name, value))
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    let mut count = 0;
+    let mut group = None;
+    for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+        let values = line.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(values.len(), 34);
+        let pmos = values[0] == "1";
+        let soi = values[1].parse::<i32>()?;
+        let cap = values[2].parse::<i32>()?;
+        let heat = values[3].parse::<i32>()?;
+        let reverse = values[4] == "1";
+        let excite = values[5].parse::<usize>()?;
+        if excite == 0 {
+            let model = Arc::new(prepare_bsim_soi_model(
+                &BoundParameters::bind(
+                    ModelVariant::BsimSoi,
+                    ParameterScope::Model,
+                    raw_card.iter().cloned().chain([
+                        ("pmos", Flag(pmos)),
+                        ("soimod", Integer(soi)),
+                        ("fdmod", Integer(1)),
+                        ("capmod", Integer(cap)),
+                        ("shmod", Integer(heat)),
+                        ("vth0", Real(if pmos { -0.55 } else { 0.55 })),
+                    ]),
+                )?,
+                300.15,
+            )?);
+            let mut raw = instance(7, true, 5e-7)?;
+            raw.parameters.assign("nrd", Real(0.))?;
+            raw.parameters.assign("nrs", Real(0.))?;
+            let model_group = BsimSoiGroup::new(model, vec![raw])?;
+            let artifact = model_group.artifact(0, 1e-18, [4; 16])?;
+            let prepared = artifact.prepare(&model_group.defaults(1e-18), 300.15)?;
+            group = Some((artifact, prepared));
+        }
+        let (a, p) = group.as_ref().ok_or("native fixture group")?;
+        let data = values[6..]
+            .iter()
+            .map(|value| value.parse::<f64>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut x = data[..7].to_vec();
+        x[6] += 300.15;
+        let point = sample(a, p, &x)?;
+        assert_eq!(point.f.len(), 7);
+        for row in 0..7 {
+            let context = (pmos, soi, cap, heat, reverse, excite, row);
+            close(point.f[row], -data[7 + row], 3e-5, 2e-13, (context, "DC"));
+            // Native current-source signs are opposite to residual signs.
+            close(
+                point.g[row * 7 + excite],
+                -data[14 + 2 * row],
+                3e-4,
+                2e-10,
+                (context, "AC real"),
+            );
+            close(
+                point.c[row * 7 + excite],
+                -data[15 + 2 * row] / (2. * std::f64::consts::PI * 1e6),
+                3e-4,
+                2e-20,
+                (context, "AC imaginary"),
+            );
+        }
+        count += 1;
+    }
+    assert_eq!(count, 336);
+    Ok(())
+}
