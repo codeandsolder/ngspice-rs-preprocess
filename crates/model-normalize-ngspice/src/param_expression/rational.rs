@@ -18,9 +18,10 @@ impl Scalar {
     }
 
     fn from_expr(expr: &Expr) -> Result<Self> {
-        Ok(expr
-            .known_value()?
-            .map_or_else(|| Self(scalar_text(expr)), Self::number))
+        match expr.known_value()? {
+            Some(value) => Ok(Self::number(value)),
+            None => Ok(Self(scalar_text(expr)?)),
+        }
     }
 
     fn zero() -> Self {
@@ -90,9 +91,9 @@ impl Scalar {
 
 fn contains_s(expr: &Expr) -> bool {
     match expr {
-        Expr::Number(_) => false,
+        Expr::Number(_) | Expr::SourceAtom(_) => false,
         Expr::Symbol(name) => name == "s",
-        Expr::Unary(_, value) => contains_s(value),
+        Expr::Unary(_, value) | Expr::ParameterGroup(value) => contains_s(value),
         Expr::Binary(_, left, right) => contains_s(left) || contains_s(right),
         Expr::Conditional(condition, yes, no) => {
             contains_s(condition) || contains_s(yes) || contains_s(no)
@@ -101,25 +102,32 @@ fn contains_s(expr: &Expr) -> bool {
     }
 }
 
-fn scalar_text(expr: &Expr) -> String {
-    match expr {
+fn scalar_text(expr: &Expr) -> Result<String> {
+    Ok(match expr {
         Expr::Number(value) => format!("{value:e}"),
         Expr::Symbol(name) => name.clone(),
-        Expr::Unary(op, value) => format!("({op}{})", scalar_text(value)),
+        Expr::Unary(op, value) => format!("({op}{})", scalar_text(value)?),
         Expr::Binary(op, left, right) => {
-            format!("({}{op}{})", scalar_text(left), scalar_text(right))
+            format!("({}{op}{})", scalar_text(left)?, scalar_text(right)?)
         }
         Expr::Conditional(condition, yes, no) => format!(
             "({}?{}:{})",
-            scalar_text(condition),
-            scalar_text(yes),
-            scalar_text(no)
+            scalar_text(condition)?,
+            scalar_text(yes)?,
+            scalar_text(no)?
         ),
         Expr::Call(name, args) => {
-            let args = args.iter().map(scalar_text).collect::<Vec<_>>().join(",");
+            let args = args
+                .iter()
+                .map(scalar_text)
+                .collect::<Result<Vec<_>>>()?
+                .join(",");
             format!("{name}({args})")
         }
-    }
+        Expr::SourceAtom(_) | Expr::ParameterGroup(_) => {
+            bail!("source-only expression cannot be a native Laplace coefficient")
+        }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
