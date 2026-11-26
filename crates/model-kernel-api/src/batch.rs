@@ -127,6 +127,7 @@ pub struct LaneUpdate<'a> {
 }
 
 /// Validated replacements holding exclusive access to the target tile.
+///
 /// Dropping this transaction leaves every original lane unchanged.
 /// Multiple disjoint tiles may be staged before any of them is committed.
 #[must_use = "commit the validated replacements or explicitly discard them"]
@@ -191,7 +192,7 @@ impl<K: Kernel> PreparedTile<K> {
     }
 
     #[must_use = "the lane count determines valid lane ordinals"]
-    pub fn lanes(&self) -> usize {
+    pub const fn lanes(&self) -> usize {
         self.data.len()
     }
 
