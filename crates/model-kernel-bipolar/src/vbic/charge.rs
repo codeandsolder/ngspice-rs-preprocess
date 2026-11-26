@@ -240,11 +240,11 @@ impl Prepared {
             .with_temperature(dep.intrinsic.d_qdbe_temperature);
         let collector_depletion = Gradient::new(dep.intrinsic.qdbc, 0.0, dep.intrinsic.cbc, 0.0)
             .with_temperature(dep.intrinsic.d_qdbc_temperature);
-        let qbe = emitter_depletion * self.cje * p.wbe + transit * forward;
-        let qbc = collector_depletion * self.cjc
+        let intrinsic_emitter = emitter_depletion * self.cje * p.wbe + transit * forward;
+        let intrinsic_collector = collector_depletion * self.cjc
             + reverse_injection * p.tr
             + self.epitaxial_factor(bias.vbci, false)? * p.qco;
-        let qbcx = self.epitaxial_factor(bias.vbcx, true)? * p.qco;
+        let epitaxial_external = self.epitaxial_factor(bias.vbcx, true)? * p.qco;
         let ifp = Gradient::new(
             para.ideal_forward,
             para.ideal_forward_vbep,
@@ -252,27 +252,37 @@ impl Prepared {
             0.0,
         )
         .with_temperature(para.ideal_forward_temperature);
-        let qbep = depletion_gradient(dep.peripheral_collector) * self.cjep + ifp * p.tr;
-        let qbex = depletion_gradient(dep.external_emitter) * self.cje * (1.0 - p.wbe);
-        let qbcp = depletion_gradient(dep.substrate_collector) * self.cjcp
+        let peripheral_collector =
+            depletion_gradient(dep.peripheral_collector) * self.cjep + ifp * p.tr;
+        let external_emitter = depletion_gradient(dep.external_emitter) * self.cje * (1.0 - p.wbe);
+        let substrate_charge = depletion_gradient(dep.substrate_collector) * self.cjcp
             + Gradient::emitter(bias.vbcp) * p.ccso;
-        let qbeo = Gradient::emitter(bias.vbe) * p.cbeo;
-        let qbco = Gradient::emitter(bias.vbc) * p.cbco;
-        if ![qbe, qbc, qbcx, qbep, qbex, qbcp, qbeo, qbco]
-            .into_iter()
-            .all(Gradient::is_finite)
+        let emitter_overlap = Gradient::emitter(bias.vbe) * p.cbeo;
+        let collector_overlap = Gradient::emitter(bias.vbc) * p.cbco;
+        if ![
+            intrinsic_emitter,
+            intrinsic_collector,
+            epitaxial_external,
+            peripheral_collector,
+            external_emitter,
+            substrate_charge,
+            emitter_overlap,
+            collector_overlap,
+        ]
+        .into_iter()
+        .all(Gradient::is_finite)
         {
             return Err(EvaluationError::NonFiniteResult);
         }
         let output = Output {
-            qbe: two(qbe),
-            qbex: one(qbex, qbex.be),
-            qbc: one(qbc, qbc.bc),
-            qbcx: one(qbcx, qbcx.be),
-            qbep: two(qbep),
-            qbcp: one(qbcp, qbcp.be),
-            qbeo: one(qbeo, qbeo.be),
-            qbco: one(qbco, qbco.be),
+            qbe: two(intrinsic_emitter),
+            qbex: one(external_emitter, external_emitter.be),
+            qbc: one(intrinsic_collector, intrinsic_collector.bc),
+            qbcx: one(epitaxial_external, epitaxial_external.be),
+            qbep: two(peripheral_collector),
+            qbcp: one(substrate_charge, substrate_charge.be),
+            qbeo: one(emitter_overlap, emitter_overlap.be),
+            qbco: one(collector_overlap, collector_overlap.be),
         };
         Ok(Physics {
             charge: output,

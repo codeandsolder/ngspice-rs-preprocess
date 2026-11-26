@@ -1,9 +1,10 @@
-//! VBIC 1.1.5 intrinsic and parasitic base-junction current laws.
+//! VBIC 1.1.5 prepared bipolar device and constitutive laws.
 //!
 //! Based on the publicly documented VBIC pseudo-code and ngspice's VBIC
-//! level-9 equations. All current parameters are *temperature-adjusted*
-//! values, rather than uncorrected .MODEL-card values. This module does not
-//! expose a complete VBIC device kernel.
+//! level-9 equations. The binding module resolves native model and instance
+//! cards, device assembles the coupled residual and Jacobian, and shared
+//! exports the prepared-model ABI. Constitutive-law inputs are temperature
+//! adjusted unless explicitly identified as nominal.
 
 pub mod avalanche;
 pub mod binding;
@@ -178,13 +179,22 @@ impl Prepared {
         let p = &self.parameters;
         let intrinsic = self.be_junction(bias.vbei) * p.wbe;
         let external = self.be_junction(bias.vbex) * (1.0 - p.wbe);
-        let [_, _, ibci, ibcn, ibeip, ibenp, ibcip, ibcnp] = self.junctions;
-        let bc =
-            junction(ibci, p.nci, self.vt, bias.vbci) + junction(ibcn, p.ncn, self.vt, bias.vbci);
-        let bep =
-            junction(ibeip, p.nci, self.vt, bias.vbep) + junction(ibenp, p.ncn, self.vt, bias.vbep);
-        let bcp = junction(ibcip, p.ncip, self.vt, bias.vbcp)
-            + junction(ibcnp, p.ncnp, self.vt, bias.vbcp);
+        let [
+            _,
+            _,
+            ideal_collector,
+            recombination_collector,
+            ideal_peripheral,
+            recombination_peripheral,
+            ideal_substrate,
+            recombination_substrate,
+        ] = self.junctions;
+        let bc = junction(ideal_collector, p.nci, self.vt, bias.vbci)
+            + junction(recombination_collector, p.ncn, self.vt, bias.vbci);
+        let bep = junction(ideal_peripheral, p.nci, self.vt, bias.vbep)
+            + junction(recombination_peripheral, p.ncn, self.vt, bias.vbep);
+        let bcp = junction(ideal_substrate, p.ncip, self.vt, bias.vbcp)
+            + junction(recombination_substrate, p.ncnp, self.vt, bias.vbcp);
         Ok(Currents {
             ibe: branch(intrinsic)?,
             ibex: branch(external)?,
@@ -203,8 +213,9 @@ impl Prepared {
 
     fn be_junction(&self, voltage: f64) -> Gradient {
         let p = &self.parameters;
-        let [ibei, iben, ..] = self.junctions;
-        let sum = junction(ibei, p.nei, self.vt, voltage) + junction(iben, p.nen, self.vt, voltage);
+        let [ideal, recombination, ..] = self.junctions;
+        let sum = junction(ideal, p.nei, self.vt, voltage)
+            + junction(recombination, p.nen, self.vt, voltage);
         if p.vbbe == 0.0 || p.ibbe == 0.0 {
             return sum;
         }

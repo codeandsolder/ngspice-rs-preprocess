@@ -220,13 +220,13 @@ struct Stamps<'a, 'b> {
 }
 
 impl Stamps<'_, '_> {
-    fn branch(&mut self, pair: Pair, contribution: Contribution<'_>, kind: StampKind) {
+    fn branch(&mut self, pair: Pair, contribution: &Contribution<'_>, kind: StampKind) {
         let (from, to) = pair.slots(self.layout);
         if from == to {
             return;
         }
         if kind == StampKind::Current {
-            self.heat(pair, &contribution);
+            self.heat(pair, contribution);
         }
         let width = self.layout.count();
         let (values, matrix) = if kind == StampKind::Charge {
@@ -289,7 +289,7 @@ impl Stamps<'_, '_> {
     fn single(&mut self, pair: Pair, value: f64, slope: f64, temperature: f64, kind: StampKind) {
         self.branch(
             pair,
-            Contribution {
+            &Contribution {
                 value,
                 slopes: &[(pair, slope)],
                 temperature,
@@ -410,7 +410,7 @@ impl Stamps<'_, '_> {
         let av = source.avalanche;
         self.branch(
             BCI,
-            Contribution {
+            &Contribution {
                 value: av.ibc,
                 slopes: &[(BEI, av.d_vbei), (BCI, av.d_vbci)],
                 temperature: av.d_temperature,
@@ -428,7 +428,7 @@ impl Stamps<'_, '_> {
             self.heat(CEI, &net_branch);
             self.branch(
                 CEI,
-                Contribution {
+                &Contribution {
                     value: -transport.reverse.value,
                     slopes: &[
                         (BEI, -transport.reverse.d_vbei),
@@ -440,13 +440,13 @@ impl Stamps<'_, '_> {
             );
             self.scale.mul_add(-transport.reverse.value, x[rows[1]])
         } else {
-            self.branch(CEI, net_branch, StampKind::Current);
+            self.branch(CEI, &net_branch, StampKind::Current);
             self.scale * transport.net.value
         };
         let parasitic = source.phys.parasitic;
         self.branch(
             CCP,
-            Contribution {
+            &Contribution {
                 value: parasitic.iccp,
                 slopes: &[
                     (BEP, parasitic.d_vbep),
@@ -478,7 +478,7 @@ impl Stamps<'_, '_> {
         ] {
             self.branch(
                 pair,
-                Contribution {
+                &Contribution {
                     value: branch.amperes,
                     slopes: &[
                         (pair, branch.d_resistor),
@@ -513,7 +513,7 @@ impl Stamps<'_, '_> {
         for (pair, branch) in [(BEI, charges.qbe), (BEP, charges.qbep)] {
             self.branch(
                 pair,
-                Contribution {
+                &Contribution {
                     value: branch.coulombs,
                     slopes: &[(pair, branch.primary_farads), (BCI, branch.coupled_farads)],
                     temperature: branch.d_temperature,
@@ -535,17 +535,20 @@ impl Prepared {
         ambient: Temperature,
     ) -> Result<Self, Error> {
         let layout = Layout::new(model);
-        let t = model
-            .nominal()
-            .prepare(instance.ambient(ambient).map_err(domain)?)
-            .map_err(domain)?;
-        let effective = t.temperature();
+        let instance_ambient = instance.ambient(ambient).map_err(domain)?;
+        let t = model.nominal().prepare(instance_ambient).map_err(domain)?;
         Ok(Self {
             layout,
             baseline: t,
             family: Family::new(&t)?,
-            noise: noise::Prepared::new(t.noise_parameters(), effective, instance.multiplicity())
-                .map_err(domain)?,
+            // Native resistor-noise temperature follows the instance ambient,
+            // excluding model DTEMP and live thermal rise.
+            noise: noise::Prepared::new(
+                t.noise_parameters(),
+                instance_ambient,
+                instance.multiplicity(),
+            )
+            .map_err(domain)?,
             scale: instance.scale(),
             sign: model.polarity().sign(),
             delay: t.value(Coefficient::Td),

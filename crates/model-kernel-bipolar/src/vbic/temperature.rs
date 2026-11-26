@@ -277,8 +277,13 @@ fn transform(v: &[f64; COUNT], effective: Temperature) -> Result<Prepared, Model
         * ((rt - 1.0) / vt * v[Coefficient::Ea.index()]).exp()
         * v[Coefficient::Gamm.index()];
     p[Coefficient::Vo.index()] = rt.powf(v[Coefficient::Xvo.index()]) * v[Coefficient::Vo.index()];
-    p[Coefficient::Ebbe.index()] =
-        (-p[Coefficient::Vbbe.index()] / (p[Coefficient::Nbbe.index()] * vt)).exp();
+    let breakdown = -p[Coefficient::Vbbe.index()];
+    let emission_voltage = p[Coefficient::Nbbe.index()] * vt;
+    // Preserve correctly rounded scalar division before the very sensitive
+    // exponential; the AD quotient already provides the derivative.
+    p[Coefficient::Ebbe.index()] = (breakdown / emission_voltage)
+        .with_value(breakdown.value / emission_voltage.value)
+        .exp();
     p[Coefficient::Tnom.index()] = td - 273.15;
 
     if !p.iter().all(|value| value.is_finite()) {
@@ -484,7 +489,7 @@ fn transformed_potential(
 }
 
 impl Prepared {
-    pub(super) fn jet(&self, coefficient: Coefficient) -> Jet {
+    pub(super) const fn jet(&self, coefficient: Coefficient) -> Jet {
         Jet::thermal_constant(self.value(coefficient), self.slope(coefficient))
     }
 

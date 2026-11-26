@@ -226,15 +226,15 @@ impl Prepared {
             peripheral_charge.qb_vbci,
         )
         .with_temperature(peripheral_charge.qb_temperature);
-        let irbi = Gradient::emitter(bias.vrbi) * self.inverse_rbi * base;
-        let irbp = Gradient::emitter(bias.vrbp) * self.inverse_rbp * peripheral;
+        let internal_base = Gradient::emitter(bias.vrbi) * self.inverse_rbi * base;
+        let peripheral_base = Gradient::emitter(bias.vrbp) * self.inverse_rbp * peripheral;
         let result = Output {
             ircx: linear(bias.vrcx, self.inverse_rcx)?,
             irci: self.epitaxial_current(bias.vrci, bias.vbci, bias.vbcx)?,
             irbx: linear(bias.vrbx, self.inverse_rbx)?,
-            irbi: nonlinear(irbi)?,
+            irbi: nonlinear(internal_base)?,
             ire: linear(bias.vre, self.inverse_re)?,
-            irbp: nonlinear(irbp)?,
+            irbp: nonlinear(peripheral_base)?,
             irs: linear(bias.vrs, self.inverse_rs)?,
         };
         Ok(result)
