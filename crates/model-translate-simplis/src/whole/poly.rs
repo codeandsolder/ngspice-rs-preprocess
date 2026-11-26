@@ -59,7 +59,7 @@ struct FieldContext {
 }
 
 impl FieldContext {
-    fn expression(&mut self, c: char) -> bool {
+    const fn expression(&mut self, c: char) -> bool {
         match c {
             '\'' => {
                 self.quoted = !self.quoted;
@@ -108,12 +108,12 @@ pub(super) fn operands<'a>(
                 '(' => {
                     depth = depth
                         .checked_add(1)
-                        .context("POLY operand nesting overflow")?
+                        .context("POLY operand nesting overflow")?;
                 }
                 ')' => {
                     depth = depth
                         .checked_sub(1)
-                        .context("unmatched POLY operand parenthesis")?
+                        .context("unmatched POLY operand parenthesis")?;
                 }
                 _ => {}
             }

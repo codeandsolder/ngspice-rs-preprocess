@@ -50,7 +50,7 @@ fn transformer(count: u32) -> Result<(String, String, Vec<f64>)> {
     let mut expected = vec![0.];
     for winding in 2..=count {
         let node = format!("s{winding}");
-        let (dotted, undotted, sign) = if winding % 2 == 0 {
+        let (dotted, undotted, sign) = if winding.is_multiple_of(2) {
             (node.as_str(), "0", 1.)
         } else {
             ("0", node.as_str(), -1.)

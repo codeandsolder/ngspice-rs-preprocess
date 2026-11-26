@@ -3866,7 +3866,7 @@ impl<'a> ScopeAnalysis<'a> {
                 // Traditional linear and POLY sources name physical device
                 // branches. VALUE expressions are resolved independently.
                 let poly = poly::header(&tokens, 3)?;
-                let (start, count) = poly.unwrap_or((3, usize::from(tokens.len() == 5)));
+                let (start, count) = poly.unwrap_or_else(|| (3, usize::from(tokens.len() == 5)));
                 let tail = tokens.get(start..).unwrap_or_default();
                 if poly.is_some() {
                     // Validate the same token boundaries as electrical lowering.
