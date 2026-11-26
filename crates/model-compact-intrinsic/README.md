@@ -242,16 +242,20 @@ effective source column; the test explicitly removes the resulting
 The Rust law uses the physical derivative instead. Native individual
 IGS/IGD/IGCS/IGCD accessors are compared without a correction.
 
-### BSIMSOI classical intrinsic charge (CAPMOD=2)
+### BSIMSOI intrinsic charge (CAPMOD=2 and 3)
 
-`prepare_capmod2` resolves the three native CV overdrive selectors and
+`prepare_intrinsic_charges` resolves the three native CV overdrive selectors and
 three charge partitions, including body, backgate, opposite-type contact
 area and inversion charge. It shares the zero-overdrive bulk factor with
 the intrinsic drain law. Physical terminal charges and five-coordinate
 Jacobians conserve charge and preserve physical drain/source orientation.
-The native intrinsic QB/QD/QS values and finite differences pass 1,728
-cases each across material, polarity, thermal, depletion, CV overdrive,
-partition and contact-area selectors.
+The native intrinsic QB/QD/QS values and finite differences cover 1,728
+cases per CAPMOD across material, polarity, thermal, depletion, CV overdrive,
+partition and contact-area selectors. CAPMOD=3 adds charge-centroid oxide
+capacitance and surface-potential correction. Its physical oxide is derived
+from TOX minus DTOXCV or the generalized-material EOT reference iteration,
+including the native ordered size cache. Batch preparation shares the final
+model-wide oxide and each size-specific zero-bias flatband reference.
 
 ### BSIMSOI body junction transport and storage
 

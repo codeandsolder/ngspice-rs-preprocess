@@ -6,6 +6,7 @@ use super::super::{
 };
 use super::{
     BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, Jet, PreparedBsimSoiChannel,
+    centroid::{Centroid, CentroidTrial, physical_oxide},
     current::{Geometry, prepare_geometry},
 };
 use crate::ModelError;
@@ -52,7 +53,7 @@ impl Partition {
             Self::Equal
         }
     }
-    fn source(self, overdrive: Jet, drop: Jet, scale: f64, inversion: Jet, bulk: Jet) -> Jet {
+    fn source(self, overdrive: Jet, drop: Jet, scale: Jet, inversion: Jet, bulk: Jet) -> Jet {
         let denominator = overdrive - 0.5 * drop + 1e-20;
         match self {
             Self::Disabled => Jet::constant(0.),
@@ -137,6 +138,23 @@ fn softplus(value: Jet) -> Jet {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct LayerState {
+    overdrive: Jet,
+    inversion_scale: Jet,
+    bulk_scale: Jet,
+    centroid: bool,
+}
+impl LayerState {
+    const fn classical(overdrive: Jet) -> Self {
+        Self {
+            overdrive,
+            inversion_scale: Jet::constant(1.),
+            bulk_scale: Jet::constant(1.),
+            centroid: false,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct ChargeArea {
     inversion: f64,
     bulk: f64,
@@ -144,25 +162,44 @@ struct ChargeArea {
 impl ChargeArea {
     fn channel(
         self,
-        overdrive: Jet,
+        layer: LayerState,
         drain: Jet,
         bulk: Jet,
         partition: Partition,
         ideal: bool,
     ) -> [Jet; 3] {
+        let overdrive = layer.overdrive;
         let saturation = overdrive / bulk;
         let delta = saturation - drain - 0.02;
-        let effective = 2. * saturation * drain
-            / (saturation + drain + 0.02 + (delta * delta + 0.08 * saturation).sqrt());
+        let root = (delta * delta + 0.08 * saturation).sqrt();
+        let effective = if saturation.value >= 0. {
+            2. * saturation * drain / (saturation + drain + 0.02 + root)
+        } else {
+            saturation - 0.5 * (delta + root)
+        };
         let drop = bulk * effective;
         let denominator = 12. * (overdrive - 0.5 * drop + 1e-20);
-        let inversion = self.inversion * (overdrive - 0.5 * drop + drop * drop / denominator);
+        let inversion_scale = self.inversion * layer.inversion_scale;
+        let inversion = inversion_scale * (overdrive - 0.5 * drop + drop * drop / denominator);
         let body = if ideal {
             Jet::constant(0.)
         } else {
-            self.bulk * (1. - bulk) * (0.5 * effective - drop * effective / denominator)
+            self.bulk
+                * layer.bulk_scale
+                * (1. - bulk)
+                * (0.5 * effective - drop * effective / denominator)
         };
-        let source = partition.source(overdrive, drop, self.inversion, inversion, body);
+        let source = partition.source(
+            overdrive,
+            drop,
+            inversion_scale,
+            inversion,
+            if layer.centroid {
+                Jet::constant(0.)
+            } else {
+                body
+            },
+        );
         [inversion, body, source]
     }
 
@@ -173,12 +210,12 @@ impl ChargeArea {
         body: Jet,
         overdrive: Jet,
         k1: f64,
-        opposite: bool,
+        smoothing: [f64; 2],
     ) -> Jet {
-        let shift = flatband - gate + body - 0.08;
+        let [delta, multiplier] = smoothing;
+        let shift = flatband - gate + body - delta;
         let sign = if flatband.value <= 0. { -1. } else { 1. };
-        let smoothing = if opposite { 8. } else { 0.32 };
-        let accumulation = shift.half_positive(smoothing * sign * flatband);
+        let accumulation = shift.half_positive(multiplier * delta * sign * flatband);
         let effective = flatband - accumulation;
         let offset = gate - effective - body - overdrive;
         let depletion = if k1 == 0. {
@@ -193,11 +230,12 @@ impl ChargeArea {
     }
 }
 
-/// Prepared intrinsic CAPMOD=2 storage. The classical CV constitutive
-/// equations are independent of the extrinsic and junction charges.
+/// Prepared intrinsic CAPMOD=2 or CAPMOD=3 storage, independent of
+/// extrinsic and junction charges.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PreparedBsimSoiCapmod2 {
+pub struct PreparedBsimSoiIntrinsicCharges {
     channel: PreparedBsimSoiChannel,
+    centroid: Option<Centroid>,
     geometry: Geometry,
     overdrive: CvOverdrive,
     normal: ChargeArea,
@@ -208,7 +246,67 @@ pub struct PreparedBsimSoiCapmod2 {
     multiplicity: f64,
     ideal: bool,
 }
-impl PreparedBsimSoiCapmod2 {
+#[derive(Clone, Copy)]
+struct LayerInput<'a> {
+    area: ChargeArea,
+    overdrive: Jet,
+    gate: Jet,
+    flatband: Jet,
+    point: &'a BsimSoiChannelPoint,
+    bulk: Jet,
+    centroid: Option<CentroidTrial>,
+    opposite: bool,
+}
+impl PreparedBsimSoiIntrinsicCharges {
+    fn layer(&self, input: &LayerInput<'_>) -> (Jet, Jet, Jet, Jet) {
+        let LayerInput {
+            area,
+            overdrive,
+            gate,
+            flatband,
+            point,
+            bulk,
+            centroid,
+            opposite,
+        } = *input;
+        let (layer, accumulation, smoothing) =
+            if let (Some(law), Some(trial)) = (self.centroid, centroid) {
+                let factor = law.inversion_factor(trial, point.threshold, overdrive);
+                let acc = if self.ideal {
+                    Jet::constant(0.)
+                } else {
+                    law.accumulation_factor(gate, point.body_effective, flatband)
+                };
+                (
+                    LayerState {
+                        overdrive: law.effective_overdrive(trial, overdrive),
+                        inversion_scale: factor,
+                        bulk_scale: factor,
+                        centroid: true,
+                    },
+                    acc,
+                    0.02,
+                )
+            } else {
+                (LayerState::classical(overdrive), Jet::constant(1.), 0.08)
+            };
+        let [inversion, body, source] =
+            area.channel(layer, point.drain_voltage, bulk, self.partition, self.ideal);
+        let substrate = if self.ideal {
+            Jet::constant(0.)
+        } else {
+            area.substrate(
+                flatband,
+                gate,
+                point.body_effective,
+                overdrive,
+                self.channel.threshold.k1ox,
+                [smoothing, if opposite { 100. } else { 4. }],
+            ) * accumulation
+        };
+        (inversion, body, source, substrate)
+    }
+
     /// Evaluate conservative physical intrinsic terminal charges.
     ///
     /// # Errors
@@ -229,48 +327,46 @@ impl PreparedBsimSoiCapmod2 {
             Jet::thermal(material.depletion_capacitance),
         );
         let bulk = self.geometry.bulk_factors(&point, phi).0 * self.bulk_cv_factor;
-        let [mut inversion, mut body, mut source] = self.normal.channel(
-            normal,
-            point.drain_voltage,
-            bulk,
-            self.partition,
-            self.ideal,
+        let centroid = self
+            .centroid
+            .map(|law| law.trial(&self.channel, material, self.overdrive.offset, self.ideal));
+        let flatband = centroid.map_or_else(
+            || {
+                point.threshold - phi - self.channel.threshold.k1 * point.surface_potential.sqrt()
+                    + self.overdrive.offset
+            },
+            |trial| trial.flatband,
         );
-        let flatband =
-            point.threshold - phi - self.channel.threshold.k1 * point.surface_potential.sqrt()
-                + self.overdrive.offset;
-        let mut substrate = if self.ideal {
-            Jet::constant(0.)
-        } else {
-            self.normal.substrate(
-                flatband,
-                point.gate_voltage,
-                point.body_effective,
-                normal,
-                self.channel.threshold.k1ox,
-                false,
-            )
-        };
+        let (mut inversion, mut body, mut source, mut substrate) = self.layer(&LayerInput {
+            area: self.normal,
+            overdrive: normal,
+            gate: point.gate_voltage,
+            flatband,
+            point: &point,
+            bulk,
+            centroid,
+            opposite: false,
+        });
         if let Some(area) = self.opposite {
-            let [inv, bod, src] =
-                area.channel(opposite, point.drain_voltage, bulk, self.partition, false);
-            inversion = inversion + inv;
-            body = body + bod;
-            source = source + src;
             let sign = self.channel.polarity;
             let mut gate = Jet::coordinate(sign * bias.gate, 0, sign);
             if point.reversed {
                 gate = gate + point.drain_voltage;
             }
-            substrate = substrate
-                + area.substrate(
-                    flatband + 1.12,
-                    gate,
-                    point.body_effective,
-                    opposite,
-                    self.channel.threshold.k1ox,
-                    true,
-                );
+            let (inv, bod, src, sub) = self.layer(&LayerInput {
+                area,
+                overdrive: opposite,
+                gate,
+                flatband: flatband + 1.12,
+                point: &point,
+                bulk,
+                centroid,
+                opposite: true,
+            });
+            inversion = inversion + inv;
+            body = body + bod;
+            source = source + src;
+            substrate = substrate + sub;
         }
         let sign = self.channel.polarity;
         let mut backgate = Jet::coordinate(sign * bias.backgate, 3, sign);
@@ -279,7 +375,12 @@ impl PreparedBsimSoiCapmod2 {
         }
         let backgate = self.backgate_capacitance
             * (backgate - Jet::thermal(material.backgate_flatband) - point.body_voltage);
-        let gate = inversion + substrate;
+        let gate = inversion + substrate
+            - if self.centroid.is_some() {
+                body
+            } else {
+                Jet::constant(0.)
+            };
         let body = body - substrate - backgate;
         let drain = -(gate + body + source + backgate);
         let (drain, source) = if point.reversed {
@@ -318,19 +419,77 @@ impl CvOverdrive {
     }
 }
 impl PreparedBsimSoiSetup {
-    /// Bind the native CAPMOD=2 intrinsic charge law.
+    /// Bind the native CAPMOD=2 or 3 intrinsic charge law.
     ///
     /// # Errors
-    /// Missing inputs, wrong CAPMOD or invalid charge geometry.
-    pub fn prepare_capmod2(
+    /// Missing inputs, unsupported CAPMOD or invalid charge geometry.
+    pub fn prepare_intrinsic_charges(
         &self,
         index: usize,
         ambient: f64,
-    ) -> Result<PreparedBsimSoiCapmod2, ModelError> {
+    ) -> Result<PreparedBsimSoiIntrinsicCharges, ModelError> {
+        let oxides = self.charge_oxides(ambient)?;
+        self.prepare_charge_with_oxides(index, ambient, &oxides)
+    }
+
+    /// Bind every instance in native model order, sharing the CV oxide preparation.
+    /// # Errors
+    /// Invalid instance, model or charge geometry.
+    pub fn prepare_all_intrinsic_charges(
+        &self,
+        ambient: f64,
+    ) -> Result<Vec<PreparedBsimSoiIntrinsicCharges>, ModelError> {
+        let oxides = self.charge_oxides(ambient)?;
+        (0..self.instances.len())
+            .map(|index| self.prepare_charge_with_oxides(index, ambient, &oxides))
+            .collect()
+    }
+
+    fn charge_oxides(&self, ambient: f64) -> Result<Vec<[f64; 2]>, ModelError> {
         let model = self.model.parameters();
-        if integer(model, "capmod")? != 2 {
-            return Err(ModelError::InvalidPhysicalParameter("CAPMOD=2 required"));
+        if integer(model, "capmod")? != 3 {
+            return Ok(Vec::new());
         }
+        let mut cache = std::collections::HashMap::new();
+        let mut last = 0.;
+        let mut oxides = Vec::with_capacity(self.instances.len());
+        for (index, instance) in self.instances.iter().enumerate() {
+            let mut key = [0_u64; 5];
+            for (slot, name) in key.iter_mut().zip(["l", "w", "rth0", "cth0", "nf"]) {
+                let value = real(instance.parameters(), name)?;
+                *slot = if value == 0. { 0 } else { value.to_bits() };
+            }
+            let size_oxide = match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    last = physical_oxide(
+                        model,
+                        &self.sizes[index],
+                        &self.prepare_channel(index, ambient)?,
+                    )?;
+                    *entry.insert(last)
+                }
+            };
+            oxides.push([0., size_oxide]);
+        }
+        for oxide in &mut oxides {
+            oxide[0] = last;
+        }
+        Ok(oxides)
+    }
+
+    fn prepare_charge_with_oxides(
+        &self,
+        index: usize,
+        ambient: f64,
+        oxides: &[[f64; 2]],
+    ) -> Result<PreparedBsimSoiIntrinsicCharges, ModelError> {
+        let model = self.model.parameters();
+        let mode = integer(model, "capmod")?;
+        if !matches!(mode, 2 | 3) {
+            return Err(ModelError::InvalidPhysicalParameter("unsupported CAPMOD"));
+        }
+
         let instance = self
             .instances
             .get(index)
@@ -349,12 +508,12 @@ impl PreparedBsimSoiSetup {
         let cox = channel.threshold.cox;
         let fbody = real(model, "fbody")?;
         let area = real(parameters, "agbcp")?;
-        let normal = ChargeArea {
+        let mut normal = ChargeArea {
             inversion: cox * width.mul_add(g.leff_cv, area),
             bulk: cox * fbody * width.mul_add(g.leff_cv_body, area),
         };
         let opposite_area = real(parameters, "agbcp2")?;
-        let opposite = if !ideal
+        let mut opposite = if !ideal
             && instance.topology().body_mode != BsimSoiBodyMode::NoContact
             && opposite_area > 0.
         {
@@ -372,8 +531,31 @@ impl PreparedBsimSoiSetup {
                 / positive(real(model, "tbox")?, "CV buried oxide")?
                 * width.mul_add(g.leff_cv_backgate, real(parameters, "aebcp")?)
         };
-        Ok(PreparedBsimSoiCapmod2 {
+        let centroid = if mode == 3 {
+            let oxides = *oxides
+                .get(index)
+                .ok_or(ModelError::MismatchedPreparedContext)?;
+            let oxide = oxides[0];
+            let physical_ratio = real(model, "tox")? / oxide;
+            normal.inversion *= channel.threshold.toxe / oxide;
+            normal.bulk *= physical_ratio;
+            if let Some(area) = opposite.as_mut() {
+                area.inversion *= physical_ratio;
+                area.bulk *= physical_ratio;
+            }
+            let stress = self.prepare_transport(index, ambient)?.stress_offsets();
+            let unstressed = channel
+                .polarity
+                .mul_add(-stress.threshold, channel.threshold.vth0);
+            Some(Centroid::prepare(
+                model, size, &channel, unstressed, oxides,
+            )?)
+        } else {
+            None
+        };
+        Ok(PreparedBsimSoiIntrinsicCharges {
             channel,
+            centroid,
             geometry,
             overdrive: CvOverdrive::prepare(size, &channel, integer(model, "vgstcvmod")?)?,
             normal,

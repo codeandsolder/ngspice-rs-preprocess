@@ -1,8 +1,8 @@
 use ParameterValue::{Flag, Integer, Real};
 use model_compact_intrinsic::{
     BoundParameters, BsimSoiChannelBias, BsimSoiChannelScalar, BsimSoiInstanceInput,
-    BsimSoiIntrinsicCharges, ModelVariant, ParameterScope, ParameterValue, PreparedBsimSoiCapmod2,
-    prepare_bsim_soi_model, prepare_bsim_soi_setup,
+    BsimSoiIntrinsicCharges, ModelVariant, ParameterScope, ParameterValue,
+    PreparedBsimSoiIntrinsicCharges, prepare_bsim_soi_model, prepare_bsim_soi_setup,
 };
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 const CARD: &str = "tsi=3e-8 tbox=1e-7 nch=1.7e17 nsub=6e16 ngate=1e20 k1=.53 k2=-.02 vfb=-.8 tox=3e-9 fbody=.8 kb1=.9 a0=.8 ags=.2 b0=2e-8 b1=1e-8 keta=-.02 ketas=.02 clc=1e-8 cle=.6 minv=.13 minvcv=.2 voff=-.08 voffcv=-.03 noff=1.1 delvt=.025";
@@ -20,7 +20,10 @@ impl Case {
     const fn sign(self) -> f64 {
         if self.pmos { -1. } else { 1. }
     }
-    fn prepare(self) -> Result<PreparedBsimSoiCapmod2, Box<dyn std::error::Error>> {
+    fn prepare(
+        self,
+        capmod: i32,
+    ) -> Result<PreparedBsimSoiIntrinsicCharges, Box<dyn std::error::Error>> {
         let card = CARD
             .split_whitespace()
             .map(|part| -> Result<_, Box<dyn std::error::Error>> {
@@ -39,7 +42,7 @@ impl Case {
                     ("shmod", Integer(i32::from(self.heat))),
                     ("rth0", Real(0.005)),
                     ("vth0", Real(self.sign() * 0.55)),
-                    ("capmod", Integer(2)),
+                    ("capmod", Integer(capmod)),
                     ("vgstcvmod", Integer(self.cv)),
                     ("xpart", Real(self.partition)),
                     ("mtrlmod", Integer(i32::from(self.material))),
@@ -74,7 +77,7 @@ impl Case {
                 geometry_scale: 1.,
             }],
         )?;
-        Ok(setup.prepare_capmod2(0, 300.15)?)
+        Ok(setup.prepare_intrinsic_charges(0, 300.15)?)
     }
     fn bias(self, g: f64, d: f64, b: f64, e: f64, rise: f64) -> BsimSoiChannelBias {
         let s = self.sign();
@@ -132,8 +135,15 @@ fn perturb(mut bias: BsimSoiChannelBias, axis: usize, h: f64) -> BsimSoiChannelB
 }
 #[test]
 fn capmod2_gradients_and_conservation() -> TestResult {
+    check_gradients_and_conservation(2)
+}
+#[test]
+fn capmod3_gradients_and_conservation() -> TestResult {
+    check_gradients_and_conservation(3)
+}
+fn check_gradients_and_conservation(capmod: i32) -> TestResult {
     for case in cases() {
-        let law = case.prepare()?;
+        let law = case.prepare(capmod)?;
         for (g, d, b, e) in [
             (1.2, 0.6, -0.2, 0.1),
             (-1.4, 0.3, -0.1, 0.2),
@@ -173,9 +183,19 @@ fn capmod2_gradients_and_conservation() -> TestResult {
 #[test]
 #[ignore = "requires local ngspice 47 binary"]
 fn native_capmod2_charges() -> TestResult {
+    check_native_charges(2, |_| true)
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires local ngspice 47 binary"]
+fn native_capmod3_charges() -> TestResult {
+    check_native_charges(3, |_| true)
+}
+#[cfg(target_os = "linux")]
+fn check_native_charges(capmod: i32, filter: impl Fn(&Case) -> bool) -> TestResult {
     use std::{fs, process::Command};
-    for case in cases() {
-        let law = case.prepare()?;
+    for case in cases().filter(filter) {
+        let law = case.prepare(capmod)?;
         let sign = case.sign();
         let polarity = if case.pmos { "pmos" } else { "nmos" };
         let Case {
@@ -207,7 +227,7 @@ fn native_capmod2_charges() -> TestResult {
                 ..
             } = bias;
             let deck = format!(
-                "BSIMSOI intrinsic charge reference\nVd d 0 {drain}\nVg g 0 {gate}\nVb b 0 {body}\nVe e 0 {backgate}\nVp p 0 {body}\nVt t 0 {rise}\nM1 d g 0 e p b t soi tnodeout l=.5u w=4u nf=2 nseg=2 m=2.3 pd=4u ps=4u agbcp=1e-13 aebcp=2e-13 agbcp2={area}\n.model soi {polarity} level=10 soimod={soi} fdmod=1 shmod={shmod} rth0=.005 vth0={vth0} capmod=2 vgstcvmod={cv} xpart={partition} mtrlmod={mtrlmod} eot=3e-9 epsrsub=11.7 phig=4.1 easub=4.05\n+ {CARD}\n.temp 27\n.options gmin=1e-18 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.control\nset numdgt=17\nset wr_singlescale\nop\nwrdata out.dat @m1[qb] @m1[qd] @m1[qs]\nquit\n.endc\n.end\n"
+                "BSIMSOI intrinsic charge reference\nVd d 0 {drain}\nVg g 0 {gate}\nVb b 0 {body}\nVe e 0 {backgate}\nVp p 0 {body}\nVt t 0 {rise}\nM1 d g 0 e p b t soi tnodeout l=.5u w=4u nf=2 nseg=2 m=2.3 pd=4u ps=4u agbcp=1e-13 aebcp=2e-13 agbcp2={area}\n.model soi {polarity} level=10 soimod={soi} fdmod=1 shmod={shmod} rth0=.005 vth0={vth0} capmod={capmod} vgstcvmod={cv} xpart={partition} mtrlmod={mtrlmod} eot=3e-9 epsrsub=11.7 phig=4.1 easub=4.05\n+ {CARD}\n.temp 27\n.options gmin=1e-18 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.control\nset numdgt=17\nset wr_singlescale\nop\nwrdata out.dat @m1[qb] @m1[qd] @m1[qs]\nquit\n.endc\n.end\n"
             );
             let dir = tempfile::tempdir()?;
             fs::write(dir.path().join("test.cir"), deck)?;
@@ -245,4 +265,13 @@ fn native_capmod2_charges() -> TestResult {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires local ngspice 47 binary"]
+fn native_capmod3_generalized_regression() -> TestResult {
+    check_native_charges(3, |case| {
+        case.material && !case.heat && !case.pmos && case.soi == 0 && case.cv == 0
+    })
 }

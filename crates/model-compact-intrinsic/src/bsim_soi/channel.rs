@@ -1,7 +1,8 @@
 //! Bias-dependent BSIMSOI 4.4 channel electrostatics.
 //! Copyright 2010 Regents of the University of California. See package LICENSE.
+mod centroid;
 mod charge;
-pub use charge::{BsimSoiIntrinsicCharges, PreparedBsimSoiCapmod2};
+pub use charge::{BsimSoiIntrinsicCharges, PreparedBsimSoiIntrinsicCharges};
 mod current;
 pub use current::{BsimSoiDrainChannelPoint, PreparedBsimSoiDrainChannel};
 mod extrinsic;
