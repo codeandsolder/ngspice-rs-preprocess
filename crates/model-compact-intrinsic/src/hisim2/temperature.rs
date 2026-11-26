@@ -54,15 +54,19 @@ pub fn prepare_temperature(
     let nominal_kelvin = real(model.parameters(), "tnom")? + 273.15;
     let ratio = kelvin / nominal_kelvin;
     let nominal_band_gap_ev = positive(
-        binned(instance, "eg0")? - nominal_kelvin * 1.0e-7f64.mul_add(nominal_kelvin, 90.25e-6),
+        nominal_kelvin.mul_add(
+            -1.0e-7f64.mul_add(nominal_kelvin, 90.25e-6),
+            binned(instance, "eg0")?,
+        ),
         "nominal band gap",
     )?;
     let delta = kelvin - nominal_kelvin;
-    let delta_squared = kelvin * kelvin - nominal_kelvin * nominal_kelvin;
+    let delta_squared = delta * (kelvin + nominal_kelvin);
     let band_gap_ev = positive(
-        nominal_band_gap_ev
-            - binned(instance, "bgtmp1")? * delta
-            - binned(instance, "bgtmp2")? * delta_squared,
+        binned(instance, "bgtmp2")?.mul_add(
+            -delta_squared,
+            binned(instance, "bgtmp1")?.mul_add(-delta, nominal_band_gap_ev),
+        ),
         "band gap",
     )?;
     let beta = CHARGE / (BOLTZMANN * kelvin);
@@ -70,7 +74,7 @@ pub fn prepare_temperature(
     let intrinsic_density_per_m3 = positive(
         INTRINSIC_DENSITY
             * ratio.powf(1.5)
-            * (-band_gap_ev / 2.0 * beta + nominal_band_gap_ev / 2.0 * nominal_beta).exp(),
+            * (0.5 * activation(nominal_band_gap_ev, band_gap_ev, nominal_beta, beta)).exp(),
         "intrinsic carrier density",
     )?;
     Ok(PreparedTemperature {
@@ -83,4 +87,20 @@ pub fn prepare_temperature(
         nominal_beta,
         intrinsic_density_per_m3,
     })
+}
+
+// Factor the difference to avoid cancellation close to the nominal temperature.
+fn activation(nominal_gap: f64, gap: f64, nominal_beta: f64, beta: f64) -> f64 {
+    (nominal_gap - gap).mul_add(nominal_beta, gap * (nominal_beta - beta))
+}
+
+impl PreparedTemperature {
+    pub(super) fn activation_exponent(self) -> f64 {
+        activation(
+            self.nominal_band_gap_ev,
+            self.band_gap_ev,
+            self.nominal_beta,
+            self.beta,
+        )
+    }
 }

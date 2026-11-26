@@ -74,6 +74,16 @@ instead of silently falling back to another physical configuration.
   of binned coefficients, and drain/source, gate and body parasitics. The
   external series conductances are checked against native DC internal-node
   voltage drops and branch currents.
+- `hisim2::prepare_temperature` computes nominal and actual band gap, inverse
+  thermal voltage and intrinsic carrier density with the original constants.
+- `hisim2::prepare_junctions` binds saturation, reverse leakage, linear
+  continuation, and area/sidewall/gate-sidewall charge coefficients once per
+  prepared instance. Evaluation accepts normalized drain/source junction
+  voltages and circuit GMIN; returns multiplicity-scaled current, charge and
+  analytic voltage derivatives. The source uses instance TEMP for saturation
+  preparation and circuit temperature plus DTEMP for capacitance scaling.
+  The logarithmic limit at grading=1 is evaluated analytically, avoiding the
+  original expression's removable singularity.
 - The topology identifies distinct drain, source, gate and body-network nodes
   and NQS state selection without allocating solver nodes. It does not imply a
   complete numerical kernel.
@@ -82,13 +92,16 @@ Source-backed setup tests and a live native ngspice 47 reference matrix:
 
 ```sh
 cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup
-cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup -- --include-ignored --nocapture
+cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup --test hisim2_junction -- --include-ignored --nocapture
 ```
 
 The native reference compares all 544 numeric model-table fields and 31
 numeric instance inputs. The native display truncates two groups of parameter
 names to eleven characters; the test maps their occurrences using the source
-registration order. The original HiSIM2 Distribution Statement and Copyright
+registration order. A second native matrix checks 936 junction current,
+conductance and capacitance values across 156 bias points (NMOS and PMOS,
+-20 to 100 C, explicit TEMP/DTEMP, geometry and multiplicity). Charge
+derivatives are independently checked by finite differences. The original HiSIM2 Distribution Statement and Copyright
 Notice (Copyright (C) 2014 Hiroshima University & STARC) is reproduced in
 the package LICENSE.
 

@@ -1,4 +1,4 @@
-//! Substrate-source/drain junction current and charge laws from HiSIM2 2.80.
+//! Substrate-source/drain junction current and charge laws from `HiSIM2` 2.80.
 //! Copyright (C) 2014 Hiroshima University & STARC; see package LICENSE.
 
 use super::{
@@ -20,6 +20,7 @@ pub struct JunctionBias {
 }
 
 /// One junction's source-normalized current, stored charge and analytic derivatives.
+///
 /// Values include the device multiplier. The caller applies polarity to current
 /// and charge when stamping physical terminals; derivatives are polarity invariant.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -109,7 +110,7 @@ fn densities(
 ) -> Result<SaturationDensity, ModelError> {
     let nj = positive(binned(i, "nj")?, "nj")?;
     let njsw = positive(real(m, "njsw")?, "njsw")?;
-    let band = t.nominal_band_gap_ev * t.nominal_beta - t.band_gap_ev * t.beta;
+    let band = t.activation_exponent();
     let scale = |xti: &str| -> Result<(f64, f64), ModelError> {
         let exponent = real(m, xti)?.mul_add(t.ratio.ln(), band);
         Ok((
