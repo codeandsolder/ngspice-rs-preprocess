@@ -135,7 +135,7 @@ fn inner(expression: &str) -> &str {
 }
 
 fn bind_values(text: &str, names: &Names, limit: usize, budget: &WorkBudget) -> Result<String> {
-    map_values(text, limit, |value, remaining| {
+    map_values(text, limit, budget, |value, remaining| {
         // Explicit braces make standalone positional parameters native values;
         // the common expression scanner handles expressions without renaming
         // node/current probes, function names or assignment destinations.

@@ -223,8 +223,11 @@ fn controlled_value_start(
 fn map_values(
     text: &str,
     limit: usize,
+    budget: &WorkBudget,
     mut map: impl FnMut(&str, usize) -> Result<String>,
 ) -> Result<String> {
+    budget.charge(Resource::ScannedBytes, text.len())?;
+    budget.charge(Resource::EmittedBytes, text.len())?;
     let ranges = statement_token_spans(text)?;
     let command = analysis_plan::command(text);
     let start = |index: usize| ranges.get(index).map_or(text.len(), |range| range.start);
@@ -251,7 +254,12 @@ fn map_values(
                 let begin = start(index);
                 let end = start(index + 3);
                 output.push_str(&text[previous..begin]);
-                output.push_str(&map(&text[begin..end], limit.saturating_sub(output.len()))?);
+                let mapped = map(&text[begin..end], limit.saturating_sub(output.len()))?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    mapped.len().saturating_sub(end - begin),
+                )?;
+                output.push_str(&mapped);
                 previous = end;
             }
             output.push_str(&text[previous..]);
@@ -273,7 +281,12 @@ fn map_values(
         },
     };
     let mut output = text[..offset].to_owned();
-    output.push_str(&map(&text[offset..], limit.saturating_sub(offset))?);
+    let mapped = map(&text[offset..], limit.saturating_sub(offset))?;
+    budget.charge(
+        Resource::EmittedBytes,
+        mapped.len().saturating_sub(text.len() - offset),
+    )?;
+    output.push_str(&mapped);
     ensure!(
         output.len() <= limit,
         "source expression byte budget exceeded"
@@ -355,7 +368,7 @@ fn lower_card(
         _ if command.starts_with('.') => bail!("unqualified HSPICE directive {command}"),
         _ => lower_source(text)?,
     };
-    source = map_values(&source, limit, |value, remaining| {
+    source = map_values(&source, limit, budget, |value, remaining| {
         lower_spice_expression(value, context, remaining, budget)
     })?;
     if matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN") {

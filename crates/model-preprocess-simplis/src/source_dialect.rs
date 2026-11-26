@@ -369,10 +369,15 @@ fn lower_call(
         } else {
             "ln"
         };
-        return Ok(format!(
-            "{target}({})",
-            rewrite_expression(body, language, true, limit, numeric_suffixes, budget)?
-        ));
+        let argument = rewrite_expression(body, language, true, limit, numeric_suffixes, budget)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            target
+                .len()
+                .saturating_add(argument.len())
+                .saturating_add(2),
+        )?;
+        return Ok(format!("{target}({argument})"));
     }
     let args = split_arguments(body)?;
     let [base, exponent] = args.as_slice() else {
@@ -385,7 +390,7 @@ fn lower_call(
     let base = rewrite_expression(base, language, true, limit, numeric_suffixes, budget)?;
     let exponent = rewrite_expression(exponent, language, true, limit, numeric_suffixes, budget)?;
     if language == SourceLanguage::Simetrix {
-        return power::guarded(&base, &exponent, limit);
+        return power::guarded(&base, &exponent, limit, budget);
     }
     // ngspice's behavioral PWR is signed, but its static PWR is unsigned.
     // Use the same explicit mathematical operators in both contexts.
@@ -402,6 +407,7 @@ fn lower_call(
         expansion <= limit,
         "source expression expansion byte budget exceeded"
     );
+    budget.charge(Resource::EmittedBytes, expansion)?;
     let power = format!("pow(abs({base}),{exponent})");
     if language == SourceLanguage::Hspice {
         Ok(format!("(sgn({base})*{power})"))
@@ -441,17 +447,23 @@ fn numeric_literal(bytes: &[u8], start: usize) -> (usize, usize) {
     (end, suffix)
 }
 
-fn append_hspice_number(input: &str, start: usize, output: &mut String) -> usize {
+fn append_hspice_number(
+    input: &str,
+    start: usize,
+    output: &mut String,
+    budget: &WorkBudget,
+) -> Result<usize> {
     let bytes = input.as_bytes();
     let (end, suffix) = numeric_literal(bytes, start);
     if matches!(bytes.get(suffix), Some(b'x' | b'X')) {
+        budget.charge(Resource::EmittedBytes, 2)?;
         output.push_str(&input[start..suffix]);
         output.push_str("meg");
         output.push_str(&input[suffix + 1..end]);
     } else {
         output.push_str(&input[start..end]);
     }
-    end
+    Ok(end)
 }
 
 /// Lower one expression region of a standalone SPICE dialect.
@@ -478,6 +490,7 @@ fn rewrite_expression(
         input.len() <= limit,
         "source expression byte budget exceeded"
     );
+    budget.charge(Resource::EmittedBytes, input.len())?;
     let mut output = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut offset = 0;
@@ -507,14 +520,19 @@ fn rewrite_expression(
             // A nested braced expression is a mathematical group, not a
             // second ngspice substitution. Canonicalize mixed quote forms.
             output.push(if grouped { '(' } else { '{' });
-            output.push_str(&rewrite_expression(
+            let lowered = rewrite_expression(
                 &input[offset + 1..end],
                 language,
                 true,
                 limit.saturating_sub(output.len()),
                 numeric_suffixes,
                 budget,
-            )?);
+            )?;
+            budget.charge(
+                Resource::EmittedBytes,
+                lowered.len().saturating_sub(end - offset - 1),
+            )?;
+            output.push_str(&lowered);
             output.push(if grouped { ')' } else { '}' });
             offset = end + 1;
         } else if numeric_suffixes
@@ -523,7 +541,7 @@ fn rewrite_expression(
             && (ch.is_ascii_digit()
                 || (ch == '.' && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit)))
         {
-            offset = append_hspice_number(input, offset, &mut output);
+            offset = append_hspice_number(input, offset, &mut output, budget)?;
         } else if (ch.is_ascii_alphabetic() || ch == '_')
             && (offset == 0 || !symbol_byte(bytes[offset - 1]))
         {
@@ -547,14 +565,19 @@ fn rewrite_expression(
                     // Electrical names, not parameter expressions.
                     output.push_str(&input[start..=end]);
                 } else {
-                    output.push_str(&lower_call(
+                    let lowered = lower_call(
                         name,
                         &input[open + 1..end],
                         language,
                         limit.saturating_sub(output.len()),
                         numeric_suffixes,
                         budget,
-                    )?);
+                    )?;
+                    budget.charge(
+                        Resource::EmittedBytes,
+                        lowered.len().saturating_sub(end + 1 - start),
+                    )?;
+                    output.push_str(&lowered);
                 }
                 offset = end + 1;
             } else {
