@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 pub mod batch;
 pub mod noise;
+pub mod trial;
 
 /// Interface revision, independent of any model-family revision.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// A missing contribution is not a known physical zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +76,7 @@ pub struct Descriptor {
     pub parameters: Vec<Parameter>,
     pub charge: Capability,
     pub noise: Capability,
+    pub trial: trial::TrialCapabilities,
 }
 
 /// Failures carry model or interface context, never solver-specific types.
@@ -330,6 +332,41 @@ pub trait Kernel: Debug + Send + Sync + 'static {
         out: &mut batch::BatchOutput,
     ) -> Result<()> {
         batch::evaluate_scalar_tile(self, prepared, coordinates, out)
+    }
+
+    /// Modify a cold-start local point in place, without retaining history.
+    /// Called only when the descriptor declares this family capability.
+    ///
+    /// # Errors
+    /// Invalid initialization or an unsupported declared policy.
+    fn initialize_trial(&self, _prepared: &Self::Prepared, _coordinates: &mut [f64]) -> Result<()> {
+        Err(Error::Unsupported("trial initialization"))
+    }
+
+    /// Limit a proposal against the selected immutable evaluated reference.
+    /// The engine distinguishes previous Newton from accepted-step reference.
+    ///
+    /// # Errors
+    /// Invalid local point or an unsupported declared policy.
+    fn limit_trial(
+        &self,
+        _prepared: &Self::Prepared,
+        _reference: trial::TrialReference<'_>,
+        _coordinates: &mut [f64],
+    ) -> Result<()> {
+        Err(Error::Unsupported("trial limiting"))
+    }
+
+    /// Evaluate an additional family-specific static convergence criterion.
+    ///
+    /// # Errors
+    /// Invalid physical sample or an unsupported declared policy.
+    fn trial_convergence(
+        &self,
+        _prepared: &Self::Prepared,
+        _input: trial::ConvergenceInput<'_>,
+    ) -> Result<trial::Convergence> {
+        Err(Error::Unsupported("trial convergence"))
     }
 
     /// Enumerate independent source generators at a solved point. No circuit

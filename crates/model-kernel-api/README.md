@@ -5,7 +5,7 @@ An artifact holds immutable model-specific data and its validated descriptor;
 the circuit engine binds coordinates and owns Newton iteration, numerical
 integration, limiting, accepted/rejected trial state and matrix assembly.
 
-## ABI version 3
+## ABI version 4
 
 The producer supplies a stable content fingerprint and an ordered descriptor.
 Every coordinate declares its physical domain and terminal/hidden binding.
@@ -57,3 +57,5 @@ cargo test --locked -p model-kernel-vdmos --test ngspice47 -- --ignored
 The VDMOS and SIMetrix level-1 diode artifacts implement this contract.
 Their circuit-coupled engine integration is a separate task. This is a native Rust source-level
 contract, not a stable dynamic-library ABI.
+
+ABI 4 adds explicit family trial capabilities. See [prepared trial policy](../../docs/prepared-trial-policy.md) for engine integration, numerical units, and failure/acceptance semantics.

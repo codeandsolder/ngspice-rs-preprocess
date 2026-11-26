@@ -12,7 +12,7 @@ select ordinary native diode physics.
 their domain, and returns an immutable model. `bind` resolves instance
 temperature, area, multiplicity and gmin once. `evaluate` returns signed
 intrinsic current, charge and their exact bias derivatives. The circuit
-solver owns series resistance topology, Newton limiting, history and
+solver owns series resistance topology, Newton iteration history and
 integration. `noise_density` returns independent local current PSDs for
 shot, flicker and positive-series-resistance thermal noise. No per-bias
 allocation or source parameter lookup is required.
@@ -39,7 +39,7 @@ Other diode levels, unrecognized source parameters and nonrepresentable
 results are rejected rather than silently approximated. This is a
 physical kernel; circuit integration remains solver-owned.
 
-The `artifact` module implements `model-kernel-api` ABI version 3.
+The `artifact` module implements `model-kernel-api` ABI version 4.
 It binds fixed terminal/series-resistor topology and independent numeric
 instance candidates, evaluates conservative current/charge residuals
 and both exact Jacobians, and emits each independent noise source at its
@@ -72,3 +72,5 @@ Maximum manufacturer errors in the external holdout: 48.05 pV and 38.89 pA.
 The holdout is optional and not distributed; the checked-in tests use
 independently authored numerical witnesses. Fixture hashes are recorded
 in tests/fixtures/SHA256SUMS.
+
+The prepared ABI 4 diode also declares cold-start, logarithmic trial limiting and additional static convergence hooks; see [trial policy](../../docs/prepared-trial-policy.md). The caller owns all accepted history and integration.

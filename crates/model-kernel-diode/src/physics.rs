@@ -1,4 +1,5 @@
 //! Intrinsic physical current, charge and derivatives at bound temperature.
+mod trial;
 use super::{
     BOLTZMANN, ELEMENTARY_CHARGE, Instance, Junction, K_OVER_Q, Model, ModelError, Noise, finite,
     nonnegative, positive,
@@ -243,6 +244,7 @@ pub struct PreparedInstance {
     temperature: f64,
     multiplier: f64,
     noise: Noise,
+    trial_limits: trial::TrialLimits,
 }
 
 /// Signed junction outputs, excluding the separate ohmic series branch.
@@ -331,6 +333,7 @@ impl PreparedInstance {
             temperature,
             multiplier: instance.multiplier,
             noise: model.noise,
+            trial_limits: trial::TrialLimits::new(transport, recombination, avalanche),
         })
     }
 
