@@ -93,7 +93,7 @@ fn rejects_ambiguous_flags_and_shadowed_intrinsics() -> Result<()> {
         "R1 a 0 1k noisy=1 noiseless",
         ".func limit(x,y,z) {x}",
         ".backanno unexpected",
-        ".model ideal D(Ron=0.1 Roff=1Meg)",
+        ".model ambiguous D(Ilimit=1 Epsilon=0.2)",
         ".model smooth SW(Ron=1 Roff=1Meg Vh=-1)",
         ".model smooth SW(Vh={width})",
         ".model smooth SW(level=2)",
@@ -1033,5 +1033,28 @@ fn exp_analysis_dependent_defaults_require_binding_instead_of_native_substitutio
         fs::write(&root, format!("title\n{card}\n.end\n"))?;
         assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
     }
+    Ok(())
+}
+
+#[test]
+fn idealized_diode_selects_explicit_family_without_rewriting_identity() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("ideal.cir");
+    let source = b"ideal diode\nD1 a 0 dm m=3 n=2\n.model dm D(Ron={r}\n+ Roff=100 Vfwd=1 Ilimit=0.25 Epsilon=0.4)\n.param r=2\n.subckt nested a b\nD2 a b dm\n.model dm D(IS=1p)\n.ends\n.end\n";
+    fs::write(&root, source)?;
+    let native = prepared(&root, InputFormat::NativeDeck)?;
+    assert_eq!(native.primary.bytes, source);
+    let translated = prepared(&root, InputFormat::LtspiceDeck)?;
+    let text = std::str::from_utf8(&translated.primary.bytes)?;
+    assert!(text.contains("D1 a 0 dm m=3 n=2"));
+    assert!(text.contains(".model dm ltspice_ideal_diode(Ron={r}"));
+    assert!(text.contains("+ Roff=100 Vfwd=1 Ilimit=0.25 Epsilon=0.4)"));
+    assert!(text.contains(".model dm D(IS=1p)"));
+    let Provenance::Native { lines } = &translated.primary.provenance else {
+        anyhow::bail!("missing source mapping");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    assert_eq!(lines[2].line, 3);
+    assert_eq!(lines[3].line, 4);
     Ok(())
 }

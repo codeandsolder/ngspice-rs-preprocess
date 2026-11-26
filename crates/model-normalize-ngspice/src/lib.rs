@@ -73,6 +73,8 @@ pub enum NormalizationPass {
     LtspiceOperators,
     /// Resolve source-specific independent waveform timing defaults.
     LtspiceSourceWaveforms,
+    /// Preserve the source idealized diode as an explicit native model family.
+    LtspiceIdealDiode,
     /// Map `PSpice` `arctan()` to ngspice `atan()`.
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.

@@ -137,10 +137,42 @@ fn reject_shadowed_helpers(statement: &lexical::Statement) -> Result<()> {
 }
 
 /// Reject known model forms whose native counterpart has different physics.
-fn validate_model(statement: &lexical::Statement) -> Result<()> {
+fn validate_model(statement: &lexical::Statement, edits: &mut Vec<Edit>) -> Result<bool> {
     use crate::model_card::parse_spice_constant;
+    let mut ideal_diode = false;
     for model in crate::model_card::parse_model_cards(&statement.text)? {
         let family = model.family.to_ascii_lowercase();
+        if family == "d"
+            && model.parameters.iter().any(|field| {
+                matches!(
+                    field.name.to_ascii_lowercase().as_str(),
+                    "ron" | "roff" | "vfwd" | "vrev" | "rrev"
+                )
+            })
+        {
+            let spans = lexical::tokens(&statement.text)?;
+            let span = spans.get(2).context("missing idealized diode family")?;
+            let family_end = span.start + model.family.len();
+            ensure!(
+                statement
+                    .text
+                    .get(span.start..family_end)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(b"d")),
+                "line {}: inconsistent idealized diode family span",
+                statement.line
+            );
+            lexical::replace_span(
+                statement,
+                span.start..family_end,
+                b"ltspice_ideal_diode",
+                edits,
+            );
+            ideal_diode = true;
+            // The explicit native family validates its own ordered scalar
+            // setters. Do not interpret idealized model fields as junction
+            // diode parameters or duplicate the physical schema here.
+            continue;
+        }
         for field in &model.parameters {
             let name = field.name.to_ascii_lowercase();
             match family.as_str() {
@@ -192,7 +224,7 @@ fn validate_model(statement: &lexical::Statement) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(ideal_diode)
 }
 
 fn validate_expression(statement: &lexical::Statement, start: usize) -> Result<()> {
@@ -254,6 +286,7 @@ struct RewritePlan {
     helpers: HelperMap,
     flags_changed: bool,
     annotation_changed: bool,
+    ideal_diode_changed: bool,
 }
 
 fn rewrite_intrinsics(
@@ -327,6 +360,7 @@ fn plan_rewrites(
     let mut helpers = HelperMap::new();
     let mut flags_changed = false;
     let mut annotation_changed = false;
+    let mut ideal_diode_changed = false;
     let mut control = false;
     for statement in lexical::statements(body)? {
         let text = &statement.text;
@@ -365,7 +399,7 @@ fn plan_rewrites(
             reject_shadowed_helpers(&statement)?;
         }
         if first.eq_ignore_ascii_case(b".model") {
-            validate_model(&statement)?;
+            ideal_diode_changed |= validate_model(&statement, &mut edits)?;
         }
         let Some(start) = expression_start(text, first)? else {
             continue;
@@ -386,6 +420,7 @@ fn plan_rewrites(
         helpers,
         flags_changed,
         annotation_changed,
+        ideal_diode_changed,
     })
 }
 
@@ -469,6 +504,7 @@ pub fn normalize(
         helpers,
         flags_changed,
         annotation_changed,
+        ideal_diode_changed,
     } = plan;
     let Some(rewritten) = lexical::apply_edits(body, edits) else {
         return Ok(input);
@@ -495,6 +531,12 @@ pub fn normalize(
     );
     input.model.bytes = output;
     input.input_lines = origins;
+    if ideal_diode_changed {
+        input
+            .model
+            .passes
+            .push(NormalizationPass::LtspiceIdealDiode);
+    }
     if annotation_changed {
         input
             .model
