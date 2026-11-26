@@ -106,7 +106,7 @@ fn area(text: &str, bjt: bool, local: bool, ground: &str) -> Result<String> {
     )?)
 }
 
-/// PSpice's one-dimensional, one-coefficient shorthand is P1 with P0=0.
+/// `PSpice`'s one-dimensional, one-coefficient shorthand is P1 with P0=0.
 /// Preserve native POLY identity and every coefficient spelling; only make
 /// the dialect-specific implicit constant explicit before native parsing.
 fn poly_shorthand(text: &str, voltage: bool) -> Result<String> {
@@ -137,7 +137,7 @@ fn poly_shorthand(text: &str, voltage: bool) -> Result<String> {
     let tokens = lexical::waveform_tokens(tail.as_bytes())?;
     let first = tokens.first().context("PSpice POLY lacks coefficients")?;
     // Remaining named setters do not count as polynomial coefficients.
-    if tokens.len() > 1 && !tokens.get(2).is_some_and(|span| &tail[span.clone()] == "=") {
+    if tokens.len() > 1 && tokens.get(2).is_none_or(|span| &tail[span.clone()] != "=") {
         return Ok(text.to_owned());
     }
     let spelling = &tail[first.clone()];
