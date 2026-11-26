@@ -8,7 +8,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
-    linked_source::RootKind, model_card::parse_parameter_fields, statement_token_spans,
+    linked_source::RootKind,
+    model_card::{
+        FunctionSignature, parse_function_signature, parse_parameter_declarations,
+        parse_parameter_fields,
+    },
+    statement_token_spans,
 };
 use model_preprocess_simplis::{
     lower_spice_expression,
@@ -280,6 +285,68 @@ fn map_values(
     Ok(output)
 }
 
+fn lower_function(
+    signature: &FunctionSignature,
+    body: &str,
+    context: DialectContext,
+    limit: usize,
+) -> Result<String> {
+    let body = body.trim().trim_start_matches('=').trim();
+    ensure!(!body.is_empty(), "empty HSPICE function body");
+    let value = lower_spice_expression(body, context, limit)?;
+    let value = value
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .unwrap_or(&value);
+    let output = format!(
+        ".func {}({}) {{{value}}}",
+        signature.name,
+        signature.formals.join(",")
+    );
+    ensure!(
+        output.len() <= limit,
+        "HSPICE function declaration byte budget exceeded"
+    );
+    Ok(output)
+}
+
+fn lower_parameter_functions(
+    text: &str,
+    context: DialectContext,
+    limit: usize,
+) -> Result<Option<Vec<String>>> {
+    let tail = text
+        .split_once(char::is_whitespace)
+        .context("empty parameter declaration")?
+        .1;
+    let declarations = parse_parameter_declarations(tail)?;
+    if declarations
+        .iter()
+        .all(|declaration| declaration.function.is_none())
+    {
+        return Ok(None);
+    }
+    let mut output = Vec::new();
+    let mut remaining = limit;
+    for declaration in declarations {
+        let value = declaration
+            .field
+            .expression
+            .context("missing HSPICE parameter value")?;
+        let line = if let Some(signature) = declaration.function {
+            lower_function(&signature, &value, context, remaining)?
+        } else {
+            let lowered = lower_spice_expression(&value, context, remaining)?;
+            format!(".param {}={lowered}", declaration.field.name)
+        };
+        remaining = remaining
+            .checked_sub(line.len().saturating_add(1))
+            .context("HSPICE parameter declarations exceed source byte budget")?;
+        output.push(line);
+    }
+    Ok(Some(output))
+}
+
 fn lower_card(
     text: &str,
     context: DialectContext,
@@ -299,10 +366,18 @@ fn lower_card(
         state.depth = state.depth.checked_sub(1).context("unmatched .ENDS")?;
     }
     if state.depth > 0
-        && (matches!(command.as_str(), ".FUNC" | ".OPTION" | ".OPTIONS" | ".OPT")
+        && (matches!(command.as_str(), ".OPTION" | ".OPTIONS" | ".OPT")
             || matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN" | ".TEMP"))
     {
         bail!("HSPICE scoped parameters/options require hierarchy lowering");
+    }
+    if command == ".FUNC" {
+        let tail = text
+            .split_once(char::is_whitespace)
+            .context("empty function declaration")?
+            .1;
+        let (signature, body) = parse_function_signature(tail)?;
+        return lower_function(&signature, body, context, limit);
     }
     if !command.starts_with('.') {
         let kind = command.as_bytes()[0];
@@ -413,6 +488,23 @@ fn lower_expansion(
     let mut origins = Vec::new();
     let mut state = DeckOptions::default();
     for (index, (statement, origin)) in statements.iter().zip(input_origins).enumerate() {
+        if index != 0
+            && statement.context.language == SourceLanguage::Hspice
+            && analysis_plan::command(&statement.text) == ".PARAM"
+            && let Some(lines) = lower_parameter_functions(
+                &statement.text,
+                statement.context,
+                limit.saturating_sub(bytes.len()),
+            )
+            .with_context(|| format!("{}:{}", statement.source, statement.first_line))?
+        {
+            for line in lines {
+                bytes.extend_from_slice(line.as_bytes());
+                bytes.push(b'\n');
+                origins.push(origin.clone());
+            }
+            continue;
+        }
         let text = if index == 0 {
             // Native ngspice may expand resource directives before discarding
             // the title. Protect the title without changing its source span.

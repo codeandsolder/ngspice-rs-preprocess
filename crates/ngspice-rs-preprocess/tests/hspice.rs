@@ -746,3 +746,108 @@ M1 d g 0 0 selected L=1u W=2u IC=0.15,0.85,-0.05
     }
     Ok(())
 }
+
+#[test]
+fn hspice_parameter_functions_bind_to_each_occurrence() -> Result<()> {
+    for (policy, expected) in [
+        ("GLOBAL", [15., 12., 12., 12., 7.]),
+        ("LOCAL", [15., 29., 41., 29., 16.]),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let text = numeric_deck(
+            dir.path(),
+            &format!(
+                r#"Function occurrences
+.option parhier={policy}
+.param gain=3 f (x)= 'gain*x' g(x)='f(x)+1'
++ rootval='g(4)+2'
+.param f(x)='gain*x+0'
+Vroot root 0 'rootval'
+X1 first fromcaller stage gain=7
+X2 second unused stage gain=10
+.subckt stage p q gain=5 actual='g(2)'
+.param f(x)='gain*x+1'
+.param shadow(gain)='gain*2'
+V1 p 0 'g(4)+shadow(1)-3'
+V2 q 0 'actual'
+.ends stage
+X3 third ignored stage gain=7
+.op
+.end
+"#
+            ),
+            "op\nwrdata op.dat v(root) v(first) v(second) v(third) v(fromcaller)",
+        )?;
+        let rows = values(dir.path(), "op.dat")?;
+        let row = rows.first().context("missing function OP data")?;
+        assert_eq!(row.len(), 6);
+        // g(4)+shadow(1)-3 = f(4), with root or occurrence f.
+        for (&measured, target) in row[1..].iter().zip(expected) {
+            ensure!(
+                (measured - target).abs() < 1e-10,
+                "{policy}: {measured} != {target}\n{text}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_function_actuals_and_runtime_probes_preserve_caller_context() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let text = numeric_deck(
+        dir.path(),
+        r#"Function runtime
+.option parhier=local
+.param gain=2 f(x)='gain*x'
+V1 in 0 dc 1 ac 1 PULSE(0 1 0 1n 1n 10m 20m)
+Vmeas in p 0
+R1 p 0 1k
+X1 p out stage gain=4 av='f(3)'
+.subckt stage a b gain=8 av=0
+.param fun(x)='f(x)+av'
+B1 b 0 V='fun(V(a))'
+.ends stage
+.op
+.ac lin 2 1000 2000
+.tran 10u 1m
+.end
+"#,
+        "op\nwrdata op.dat v(out)\nac lin 2 1000 2000\nwrdata ac.dat v(out)\ntran 10u 1m 0 10u\nwrdata tran.dat v(out) v(p)",
+    )?;
+    let rows = values(dir.path(), "op.dat")?;
+    ensure!((rows[0][1] - 6.).abs() < 1e-10, "{rows:?}\n{text}");
+    for row in values(dir.path(), "ac.dat")? {
+        ensure!(
+            (row[1] - 4.).abs() < 1e-10 && row[2].abs() < 1e-10,
+            "{row:?}\n{text}"
+        );
+    }
+    for row in values(dir.path(), "tran.dat")? {
+        ensure!(
+            (row[1] - (4. * row[2] + 6.)).abs() < 1e-8,
+            "{row:?}\n{text}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_function_malformed_and_cyclic_declarations_are_rejected() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("functions.sp");
+    for (source, expected) in [
+        (".param f(x,x)='x'", "repeated function formal"),
+        (".param f(x)='x'\nV1 a 0 'f(1,2)'", "expects 1 arguments"),
+        (
+            ".param f(x)='g(x)' g(x)='f(x)'",
+            "recursive HSPICE function",
+        ),
+        (".param f(x)='f(x)'", "recursive HSPICE function"),
+    ] {
+        fs::write(&root, format!("Function errors\n{source}\n.end\n"))?;
+        let error = compile(&root, InputFormat::HspiceDeck).expect_err("malformed function");
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+    Ok(())
+}

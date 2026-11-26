@@ -1146,6 +1146,22 @@ pub fn project_spice_resource(
     Ok((context, statements))
 }
 
+pub use runtime_params::{BoundExpression, FunctionAlias};
+
+/// Rewrite distinct scalar and user-function namespaces in source expressions,
+/// collecting call dependencies without substituting function bodies.
+///
+/// # Errors
+/// Invalid probe/group syntax or incorrect user-function arity.
+pub fn rewrite_bound_symbols(
+    expression: &str,
+    names: &BTreeMap<String, String>,
+    functions: &BTreeMap<String, FunctionAlias>,
+    preserve_assignments: bool,
+) -> Result<BoundExpression> {
+    runtime_params::rewrite_bound_symbols(expression, names, functions, preserve_assignments)
+}
+
 /// Rewrite parameter references in an expression or device value field list,
 /// excluding assignment destinations, function names and electrical probes.
 ///

@@ -3,7 +3,7 @@
 //! Electrical instance names and terminal identities are never flattened.
 use super::{analysis_plan, map_values, models, mos};
 use crate::OriginLine;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
     linked_source::RootKind,
     model_card::{parse_assignments, parse_model_card, positional_prefix},
@@ -13,6 +13,9 @@ use model_normalize_ngspice::{
 use model_preprocess_simplis::rewrite_parameter_symbols;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+
+mod functions;
+use functions::{Functions, Scope};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Precedence {
@@ -37,6 +40,7 @@ type Parameters = BTreeMap<String, Parameter>;
 struct Definition {
     body: Vec<usize>,
     parameters: Parameters,
+    functions: Functions,
 }
 
 fn collect_parameters(
@@ -96,6 +100,8 @@ fn collect_definitions(source: &ModelLibrary, lines: &[&str]) -> Result<Vec<Defi
                     .context("empty parameter declaration")?
                     .1;
                 collect_parameters(tail, line, false, &mut definitions[owner].parameters)?;
+            } else if analysis_plan::command(text) == ".FUNC" {
+                functions::collect(text, line, &mut definitions[owner].functions)?;
             }
         }
     }
@@ -111,12 +117,14 @@ fn inner(expression: &str) -> &str {
         .unwrap_or_else(|| expression.trim())
 }
 
-fn bind_values(text: &str, names: &Names, limit: usize) -> Result<String> {
+fn bind_values(text: &str, scope: &Scope, limit: usize) -> Result<String> {
     map_values(text, limit, |value, remaining| {
         // Explicit braces make standalone positional parameters native values;
         // the common expression scanner handles expressions without renaming
         // node/current probes, function names or assignment destinations.
-        let tokens = statement_token_spans(value)?;
+        let value = scope.calls(value)?;
+        let tokens = statement_token_spans(&value)?;
+        let names = &scope.names;
         let mut output = String::new();
         let mut previous = 0;
         for (index, range) in tokens.iter().enumerate() {
@@ -267,25 +275,45 @@ impl Binder<'_> {
         Ok(())
     }
 
-    fn visible(&mut self, scope: usize, parent: &Names, actuals: Parameters) -> Result<Names> {
+    fn bind_scope(&mut self, scope: usize, names: Names, parent: Option<&Scope>) -> Result<Scope> {
+        let local = self.definitions[scope].functions.clone();
+        let precedence = self.precedence;
+        let limit = self.limit.saturating_sub(self.emitted_bytes);
+        let (scope, rows) = Scope::bind(
+            names,
+            parent,
+            local,
+            precedence,
+            |kind| self.fresh(kind),
+            limit,
+        )?;
+        for (text, line) in rows {
+            let row = self.account(text, line)?;
+            self.parameters.push(row);
+        }
+        Ok(scope)
+    }
+
+    fn visible(&mut self, scope: usize, parent: &Scope, actuals: Parameters) -> Result<Scope> {
         let mut definitions = self.definitions[scope].parameters.clone();
         definitions.extend(actuals);
         if self.precedence == Precedence::Global {
-            definitions.retain(|name, _| !parent.contains_key(name));
+            definitions.retain(|name, _| !parent.names.contains_key(name));
         }
-        let mut names = parent.clone();
+        let mut names = parent.names.clone();
         for name in definitions.keys() {
             names.insert(name.clone(), self.fresh('p')?);
         }
+        let scope = self.bind_scope(scope, names, Some(parent))?;
         for (name, parameter) in definitions {
-            let visible = if parameter.actual { parent } else { &names };
-            let expression = rewrite_parameter_symbols(&parameter.value, visible, false)?;
-            self.declare(&names[&name], &expression, parameter.line)?;
+            let visible = if parameter.actual { parent } else { &scope };
+            let expression = visible.expression(&parameter.value)?;
+            self.declare(&scope.names[&name], &expression, parameter.line)?;
         }
-        Ok(names)
+        Ok(scope)
     }
 
-    fn enter_models(&mut self, scope: usize, names: &Names) -> Result<()> {
+    fn enter_models(&mut self, scope: usize, names: &Scope) -> Result<()> {
         let mut aliases = ModelFrame::default();
         for line in self.definitions[scope].body.clone() {
             if analysis_plan::command(self.lines[line]) != ".MODEL" {
@@ -299,9 +327,7 @@ impl Binder<'_> {
                 self.fresh('d')?
             };
             aliases.insert(card.name.to_ascii_uppercase(), alias.clone(), mos)?;
-            let text = models::render(&card, &alias, |value| {
-                rewrite_parameter_symbols(value, names, false)
-            })?;
+            let text = models::render(&card, &alias, |value| names.expression(value))?;
             let row = self.account(text, line)?;
             self.parameters.push(row);
         }
@@ -369,7 +395,7 @@ impl Binder<'_> {
         &mut self,
         owner: usize,
         line: usize,
-        parent: &Names,
+        parent: &Scope,
         inherited_multiplier: Option<&str>,
     ) -> Result<String> {
         let (positional, fields) = positional_prefix(self.lines[line]);
@@ -397,7 +423,7 @@ impl Binder<'_> {
         collect_parameters(fields, line, true, &mut actuals)?;
         let local_multiplier = actuals
             .get("M")
-            .map(|parameter| rewrite_parameter_symbols(&parameter.value, parent, false))
+            .map(|parameter| parent.expression(&parameter.value))
             .transpose()?;
         // The X multiplier affects device multiplicity independently of the
         // ordinary M expression parameter. HSPICE defaults XMULT_IN_EXP to NO.
@@ -429,7 +455,7 @@ impl Binder<'_> {
         for card in self.definitions[scope].body.clone() {
             if matches!(
                 analysis_plan::command(self.lines[card]).as_str(),
-                ".PARAM" | ".MODEL"
+                ".PARAM" | ".MODEL" | ".FUNC"
             ) {
                 continue;
             }
@@ -452,7 +478,7 @@ impl Binder<'_> {
         &mut self,
         owner: usize,
         line: usize,
-        names: &Names,
+        names: &Scope,
         multiplier: Option<&str>,
     ) -> Result<String> {
         let text = self.lines[line];
@@ -460,12 +486,11 @@ impl Binder<'_> {
         if command.starts_with('X') {
             return self.call(owner, line, names, multiplier);
         }
-        if command.is_empty()
-            || command.starts_with('*')
-            || command == ".PARAM"
-            || command == ".FUNC"
-        {
+        if command.is_empty() || command.starts_with('*') {
             return Ok(text.to_owned());
+        }
+        if command == ".PARAM" {
+            return names.calls(text);
         }
         let bound = bind_values(text, names, self.limit)?;
         let bound = if command.starts_with(['D', 'M']) {
@@ -483,11 +508,15 @@ impl Binder<'_> {
             .keys()
             .map(|name| (name.clone(), name.clone()))
             .collect();
+        let names = self.bind_scope(0, names, None)?;
         self.enter_models(0, &names)?;
         let mut root = Vec::new();
         let mut ends = Vec::new();
         for card in self.definitions[0].body.clone() {
-            if analysis_plan::command(self.lines[card]) == ".MODEL" {
+            if matches!(
+                analysis_plan::command(self.lines[card]).as_str(),
+                ".MODEL" | ".FUNC"
+            ) {
                 continue;
             }
             let text = self.card(0, card, &names, None)?;
@@ -504,7 +533,8 @@ impl Binder<'_> {
         result.append(&mut self.emitted_definitions);
         result.append(&mut ends);
         super::analysis::validate_dc_sources(&result)?;
-        mos::finish(&mut result, &self.pending_mos, mos_options)?;
+        let mos_options = mos_options.rewrite(|value| names.expression(value))?;
+        mos::finish(&mut result, &self.pending_mos, &mos_options)?;
         Ok(result)
     }
 }
@@ -534,18 +564,6 @@ pub fn bind(
     let mut prefix = String::from("hspbind_");
     while lower.contains(&prefix) {
         prefix.push('_');
-    }
-    // Source function macros have simulator-specific visibility; don't
-    // silently reinterpret them across specialized parameter scopes.
-    if definitions
-        .iter()
-        .skip(1)
-        .any(|definition| !definition.parameters.is_empty())
-        && lines
-            .iter()
-            .any(|line| analysis_plan::command(line) == ".FUNC")
-    {
-        bail!("HSPICE functions with hierarchical parameters require qualified binding");
     }
     let binder = Binder {
         source: &source,

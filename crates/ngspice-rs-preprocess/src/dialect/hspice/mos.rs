@@ -25,6 +25,15 @@ pub struct Options {
 }
 
 impl Options {
+    pub fn rewrite(&self, mut bind: impl FnMut(&str) -> Result<String>) -> Result<Self> {
+        let values = self
+            .values
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), bind(value)?)))
+            .collect::<Result<_>>()?;
+        Ok(Self { values })
+    }
+
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
         let value = lower_spice_expression(
             value,

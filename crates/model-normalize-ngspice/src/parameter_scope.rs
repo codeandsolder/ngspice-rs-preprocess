@@ -6,7 +6,10 @@
 
 use crate::{
     linked_source::{LinkedSource, RootKind, SourceOrigin},
-    model_card::{ModelCard, logical_statements, parse_assignments, parse_one, positional_prefix},
+    model_card::{
+        ModelCard, logical_statements, parse_assignments, parse_function_signature, parse_one,
+        positional_prefix,
+    },
     param_expression::{SpiceExpression, SpiceExpressionContext},
     vdmos_card::{VdmosLiterals, vdmos_resolved},
 };
@@ -243,49 +246,19 @@ fn subcircuit_header(
 }
 
 fn parse_function(source: &str, line: usize) -> Result<(String, UserFunction)> {
-    let open = source.find('(').with_context(|| {
-        format!("line {line}: user-defined function requires formal argument list")
-    })?;
-    let close = source[open + 1..]
-        .find(')')
-        .map(|pos| pos + open + 1)
-        .with_context(|| {
-            format!("line {line}: user-defined function missing closing parenthesis")
-        })?;
-    let name = source[..open].trim().to_ascii_lowercase();
-    ensure!(
-        !name.is_empty() && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic),
-        "line {line}: invalid function identifier {name}"
-    );
+    let (signature, body) =
+        parse_function_signature(source).with_context(|| format!("line {line}"))?;
+    let name = signature.name.to_ascii_lowercase();
     ensure!(
         !reserved_parameter(&name),
         "line {line}: builtin/reserved function identifier {name}"
     );
-    let raw = source[open + 1..close].trim();
-    let mut seen = BTreeSet::new();
-    let mut formals = Vec::new();
-    if !raw.is_empty() {
-        for field in raw.split(',') {
-            let argument = field.trim().to_ascii_lowercase();
-            ensure!(
-                !argument.is_empty()
-                    && argument
-                        .as_bytes()
-                        .first()
-                        .is_some_and(u8::is_ascii_alphabetic)
-                    && argument
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
-                "line {line}: invalid formal parameter {argument}"
-            );
-            ensure!(
-                seen.insert(argument.clone()),
-                "line {line}: repeated function formal {argument}"
-            );
-            formals.push(argument);
-        }
-    }
-    let body = source[close + 1..].trim().trim_start_matches('=').trim();
+    let formals = signature
+        .formals
+        .into_iter()
+        .map(|formal| formal.to_ascii_lowercase())
+        .collect();
+    let body = body.trim().trim_start_matches('=').trim();
     ensure!(
         !body.is_empty(),
         "line {line}: empty user-defined function body"

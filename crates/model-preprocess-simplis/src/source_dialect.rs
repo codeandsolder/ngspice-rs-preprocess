@@ -290,7 +290,7 @@ const fn symbol_byte(byte: u8) -> bool {
 }
 
 /// Find a complete function call or expression group, retaining nesting.
-fn group_end(input: &str, start: usize) -> Result<usize> {
+pub(super) fn group_end(input: &str, start: usize) -> Result<usize> {
     let mut stack = Vec::new();
     let mut quote = None;
     for (relative, ch) in input[start..].char_indices() {
@@ -320,7 +320,7 @@ fn group_end(input: &str, start: usize) -> Result<usize> {
     bail!("unterminated expression group in {input}")
 }
 
-fn split_arguments(input: &str) -> Result<Vec<&str>> {
+pub(super) fn split_arguments(input: &str) -> Result<Vec<&str>> {
     let mut args = Vec::new();
     let mut start = 0;
     let mut offset = 0;
