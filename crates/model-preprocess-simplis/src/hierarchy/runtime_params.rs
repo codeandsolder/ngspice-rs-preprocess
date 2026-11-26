@@ -58,7 +58,7 @@ fn generated_name(prefix: &str, identity: &str, name: &str) -> String {
 }
 
 const fn identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.')
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.' | b'#' | b'[' | b']')
 }
 
 fn number_end(bytes: &[u8], start: usize) -> usize {
@@ -116,6 +116,8 @@ pub struct BoundExpression {
     pub text: String,
     /// Case-folded source identifiers of referenced user functions.
     pub calls: BTreeSet<String>,
+    /// Calls not matched by the supplied function environment (including builtins).
+    pub unbound_calls: BTreeSet<String>,
 }
 
 pub(super) fn rewrite_symbols(
@@ -123,6 +125,9 @@ pub(super) fn rewrite_symbols(
     names: &Names,
     preserve_assignments: bool,
 ) -> Result<String> {
+    if names.is_empty() {
+        return Ok(input.to_owned());
+    }
     Ok(rewrite_bound_symbols(input, names, &BTreeMap::new(), preserve_assignments)?.text)
 }
 
@@ -159,11 +164,8 @@ pub(super) fn rewrite_bound_symbols(
     let mut result = BoundExpression {
         text: String::with_capacity(input.len()),
         calls: BTreeSet::new(),
+        unbound_calls: BTreeSet::new(),
     };
-    if names.is_empty() && functions.is_empty() {
-        result.text.push_str(input);
-        return Ok(result);
-    }
     let bytes = input.as_bytes();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -211,6 +213,7 @@ pub(super) fn rewrite_bound_symbols(
                     offset = next;
                     continue;
                 }
+                result.unbound_calls.insert(key);
                 result.text.push_str(name);
             } else if preserve_assignments
                 && bytes.get(next) == Some(&b'=')

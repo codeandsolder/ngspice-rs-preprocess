@@ -11,8 +11,11 @@ use model_normalize_ngspice::{
     statement_token_spans,
 };
 use model_preprocess_simplis::rewrite_parameter_symbols;
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 mod functions;
 use functions::{Functions, Scope};
@@ -235,6 +238,7 @@ struct Binder<'a> {
     index: SubcircuitIndex,
     lines: &'a [&'a str],
     definitions: Vec<Definition>,
+    known_functions: Arc<BTreeSet<String>>,
     precedence: Precedence,
     xmult_in_exp: bool,
     prefix: String,
@@ -284,6 +288,7 @@ impl Binder<'_> {
             parent,
             local,
             precedence,
+            Arc::clone(&self.known_functions),
             |kind| self.fresh(kind),
             limit,
         )?;
@@ -565,11 +570,18 @@ pub fn bind(
     while lower.contains(&prefix) {
         prefix.push('_');
     }
+    let known_functions = Arc::new(
+        definitions
+            .iter()
+            .flat_map(|definition| definition.functions.keys().cloned())
+            .collect(),
+    );
     let binder = Binder {
         source: &source,
         index,
         lines: &lines,
         definitions,
+        known_functions,
         precedence,
         xmult_in_exp,
         prefix,

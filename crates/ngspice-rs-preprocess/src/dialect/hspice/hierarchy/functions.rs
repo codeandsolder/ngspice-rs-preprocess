@@ -2,7 +2,7 @@
 use super::{Names, Precedence, Rows, inner};
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::model_card::parse_function_signature;
-use model_preprocess_simplis::{FunctionAlias, rewrite_bound_symbols};
+use model_preprocess_simplis::{BoundExpression, FunctionAlias, rewrite_bound_symbols};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -44,6 +44,8 @@ pub(super) struct Scope {
     pub(super) names: Names,
     declarations: Functions,
     aliases: BTreeMap<String, FunctionAlias>,
+    known: Arc<BTreeSet<String>>,
+    inaccessible: Names,
 }
 
 impl Scope {
@@ -52,6 +54,7 @@ impl Scope {
         parent: Option<&Self>,
         local: Functions,
         precedence: Precedence,
+        known: Arc<BTreeSet<String>>,
         mut fresh: impl FnMut(char) -> Result<String>,
         limit: usize,
     ) -> Result<(Self, Rows)> {
@@ -74,16 +77,22 @@ impl Scope {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let scope = Self {
+        let mut scope = Self {
             names,
             declarations,
             aliases,
+            known,
+            inaccessible: Names::new(),
         };
         let rows = scope.render(&mut fresh, limit)?;
         Ok((scope, rows))
     }
 
-    fn render(&self, fresh: &mut impl FnMut(char) -> Result<String>, limit: usize) -> Result<Rows> {
+    fn render(
+        &mut self,
+        fresh: &mut impl FnMut(char) -> Result<String>,
+        limit: usize,
+    ) -> Result<Rows> {
         let mut rows = BTreeMap::new();
         let mut dependencies = BTreeMap::new();
         let mut remaining = limit;
@@ -96,6 +105,9 @@ impl Scope {
                 formals.push(alias);
             }
             let bound = rewrite_bound_symbols(&function.body, &parameters, &self.aliases, false)?;
+            if let Some(hidden) = bound.unbound_calls.intersection(&self.known).next() {
+                self.inaccessible.insert(name.clone(), hidden.clone());
+            }
             let alias = &self.aliases[name].name;
             let row = format!(".func {alias}({}) {{{}}}", formals.join(","), bound.text);
             remaining = remaining
@@ -121,6 +133,9 @@ impl Scope {
         while let Some(name) = ready.pop_first() {
             result.push(rows.remove(&name).context("missing function row")?);
             for user in users.remove(&name).unwrap_or_default() {
+                if let Some(hidden) = self.inaccessible.get(&name).cloned() {
+                    self.inaccessible.entry(user.clone()).or_insert(hidden);
+                }
                 let calls = dependencies
                     .get_mut(&user)
                     .context("missing function dependency")?;
@@ -138,14 +153,38 @@ impl Scope {
         Ok(result)
     }
 
+    fn validate(&self, bound: BoundExpression) -> Result<String> {
+        if let Some(hidden) = bound.unbound_calls.intersection(&self.known).next() {
+            anyhow::bail!("HSPICE function {hidden} is not visible in this occurrence");
+        }
+        for name in &bound.calls {
+            if let Some(hidden) = self.inaccessible.get(name) {
+                anyhow::bail!(
+                    "HSPICE function {name} calls {hidden}, which is not visible in this occurrence"
+                );
+            }
+        }
+        Ok(bound.text)
+    }
+
     pub(super) fn expression(&self, value: &str) -> Result<String> {
-        Ok(rewrite_bound_symbols(value, &self.names, &self.aliases, false)?.text)
+        self.validate(rewrite_bound_symbols(
+            value,
+            &self.names,
+            &self.aliases,
+            false,
+        )?)
     }
 
     pub(super) fn calls(&self, value: &str) -> Result<String> {
-        if self.aliases.is_empty() {
+        if self.known.is_empty() {
             return Ok(value.to_owned());
         }
-        Ok(rewrite_bound_symbols(value, &Names::new(), &self.aliases, true)?.text)
+        self.validate(rewrite_bound_symbols(
+            value,
+            &Names::new(),
+            &self.aliases,
+            true,
+        )?)
     }
 }

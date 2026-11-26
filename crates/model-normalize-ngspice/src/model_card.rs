@@ -169,7 +169,12 @@ pub fn parse_function_signature(source: &str) -> Result<(FunctionSignature, &str
         .map(|position| position + open + 1)
         .context("user-defined function missing closing parenthesis")?;
     let name = source[..open].trim();
-    ensure!(valid_formal(name), "invalid function identifier {name}");
+    ensure!(
+        name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && name.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'#' | b'$' | b'[' | b']')),
+        "invalid function identifier {name}"
+    );
     let mut formals = Vec::new();
     let raw = source[open + 1..close].trim();
     if !raw.is_empty() {
@@ -193,8 +198,9 @@ pub fn parse_function_signature(source: &str) -> Result<(FunctionSignature, &str
     ))
 }
 
-/// Parse mixed scalar and user-defined function assignments using the shared
-/// named-field tokenizer. Whitespace between a function name and its formal
+/// Parse mixed scalar and user-defined function assignments.
+///
+/// Uses the shared named-field tokenizer. Whitespace between a function name and its formal
 /// list is allowed; expression values retain their original delimiters.
 ///
 /// # Errors

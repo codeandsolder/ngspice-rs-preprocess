@@ -813,10 +813,13 @@ B1 b 0 V='fun(V(a))'
 .tran 10u 1m
 .end
 "#,
-        "op\nwrdata op.dat v(out)\nac lin 2 1000 2000\nwrdata ac.dat v(out)\ntran 10u 1m 0 10u\nwrdata tran.dat v(out) v(p)",
+        "op\nwrdata op.dat v(out) v(p)\nac lin 2 1000 2000\nwrdata ac.dat v(out)\ntran 10u 1m 0 10u\nwrdata tran.dat v(out) v(p)",
     )?;
     let rows = values(dir.path(), "op.dat")?;
-    ensure!((rows[0][1] - 6.).abs() < 1e-10, "{rows:?}\n{text}");
+    ensure!(
+        (rows[0][1] - (4. * rows[0][2] + 6.)).abs() < 1e-10,
+        "{rows:?}\n{text}"
+    );
     for row in values(dir.path(), "ac.dat")? {
         ensure!(
             (row[1] - 4.).abs() < 1e-10 && row[2].abs() < 1e-10,
@@ -849,5 +852,142 @@ fn hspice_function_malformed_and_cyclic_declarations_are_rejected() -> Result<()
         let error = compile(&root, InputFormat::HspiceDeck).expect_err("malformed function");
         assert!(format!("{error:#}").contains(expected), "{error:#}");
     }
+    Ok(())
+}
+
+#[test]
+fn hspice_function_geometry_and_model_parameters_match_explicit_native() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let reference = tempfile::tempdir()?;
+    let script = "dc Vg 0.5 1.5 0.1\nwrdata dc.dat i(va) i(vb)";
+    let text = numeric_deck(
+        dir.path(),
+        r#"Function-based bins
+.option parhier=local
+.param width(x)='x*1u' length(x)='x*1u'
+.param edge=1u threshold(x)='x/10'
+Vg g 0 1
+Va a 0 0.8
+Vb b 0 0.8
+X1 a g cell ll=0.9
+X2 b g cell ll=1.1
+.subckt cell d g ll=1
+M1 d g 0 0 n W='width(2)' L='length(ll)'
+.model n.a NMOS LEVEL=54 VERSION=4.7 VTH0='threshold(3)' LMIN=0.5u LMAX=edge WMIN=1u WMAX=3u
+.model n.b NMOS LEVEL=54 VERSION=4.7 VTH0='threshold(6)' LMIN=edge LMAX=2u WMIN=1u WMAX=3u
+.ends cell
+.end
+"#,
+        script,
+    )?;
+    measure_native(
+        reference.path(),
+        r#"Explicit bins
+.options TNOM=25
+.temp 25
+Vg g 0 1
+Va a 0 0.8
+Vb b 0 0.8
+Ma a g 0 0 low W=2u L=0.9u
+Mb b g 0 0 high W=2u L=1.1u
+.model low NMOS LEVEL=14 VERSION=4.70 VTH0=0.3
+.model high NMOS LEVEL=14 VERSION=4.70 VTH0=0.6
+.end
+"#,
+        script,
+    )?;
+    let actual = values(dir.path(), "dc.dat")?;
+    let expected = values(reference.path(), "dc.dat")?;
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert_eq!(actual.len(), expected.len());
+        for (&a, e) in actual.iter().zip(expected) {
+            ensure!(
+                (a - e).abs() <= e.abs() * 1e-7 + 1e-13,
+                "{a:e} != {e:e}\n{text}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_function_linked_continuations_and_scope_isolation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    fs::write(
+        &root,
+        r#"Linked functions
+.option parhier=local
+.inc 'functions.lib'
+V1 a 0 dc 1 ac 1
+X1 a b cell
+X2 a c other
+.end
+"#,
+    )?;
+    fs::write(
+        dir.path().join("functions.lib"),
+        r#".subckt cell a b
+.param twice (x)='2*x'
++ gain=3
+Vsense a n 0
+R1 n 0 1k
+.param probe(x)='twice(x)+gain*1000*I(Vsense)'
+B1 b 0 V='probe (V(a))'
+.ends cell
+.subckt other a b
+.param twice(x)='3*x'
+B1 b 0 V='twice(V(a))'
+.ends other
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native source map")
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    assert!(
+        text.lines()
+            .zip(lines)
+            .any(|(line, origin)| line.starts_with(".func ")
+                && origin.source.ends_with("functions.lib")
+                && (origin.line, origin.last_line) == (2, 3))
+    );
+    measure_native(
+        dir.path(),
+        text,
+        "op\nwrdata op.dat v(b) v(c)\nac lin 2 1000 2000\nwrdata ac.dat v(b) v(c)",
+    )?;
+    let op = values(dir.path(), "op.dat")?;
+    ensure!(
+        (op[0][1] - 5.).abs() < 1e-10 && (op[0][2] - 3.).abs() < 1e-10,
+        "{op:?}\n{text}"
+    );
+    for row in values(dir.path(), "ac.dat")? {
+        ensure!(
+            (row[1] - 5.).abs() < 1e-10
+                && row[2].abs() < 1e-10
+                && (row[3] - 3.).abs() < 1e-10
+                && row[4].abs() < 1e-10,
+            "{row:?}\n{text}"
+        );
+    }
+    fs::write(
+        &root,
+        r#"Invisible function
+.option parhier=local
+.inc 'functions.lib'
+.param outside(x)='twice(x)'
+V1 a 0 'outside(2)'
+.end
+"#,
+    )?;
+    let error = compile(&root, InputFormat::HspiceDeck).expect_err("local function escapes scope");
+    assert!(
+        format!("{error:#}").contains("not visible in this occurrence"),
+        "{error:#}"
+    );
     Ok(())
 }
