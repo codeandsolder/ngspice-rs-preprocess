@@ -351,11 +351,10 @@ fn thermal_and_nqs_complete_matrix_matches_full_temperature_trial_differences() 
 fn solve_nqs_ac(
     complete: &nodal::Complete,
     frequency_hz: f64,
-    excited_node: Node,
+    excited: usize,
 ) -> Result<[(f64, f64); 3], Box<dyn std::error::Error>> {
     let omega = 2.0 * std::f64::consts::PI * frequency_hz;
     let mut rows = [[0.0_f64; 7]; 6];
-    let excited = complete.layout.node(excited_node);
     for target in 0..3 {
         let r = complete.layout.nqs_slot(target).ok_or("NQS slot absent")?;
         rows[target][6] = -complete.conductance[r][excited];
@@ -443,7 +442,8 @@ fn assembled_nodal_ac_network_matches_source_nqs_current_and_charge_transfers() 
                 assert!(norm_current.abs() > 1e-18);
                 assert!(norm_charge.abs() > 1e-25);
                 for frequency_hz in [0.0, 1e3, 1e6, 1e9, 1e11] {
-                    let solved = solve_nqs_ac(&complete, frequency_hz, Node::Bi)?;
+                    let solved =
+                        solve_nqs_ac(&complete, frequency_hz, complete.layout.node(Node::Bi))?;
                     let source = reference.frequency_response(tf, frequency_hz)?;
                     close(solved[1].0 / norm_current, source.current.real, 2e-8, 1e-11);
                     close(
@@ -533,5 +533,177 @@ fn analytic_transit_gradient_completes_all_npn_pnp_nqs_matrix_columns() -> TestR
         }
     }
     assert_eq!(checks, 1944);
+    Ok(())
+}
+
+fn forced_thermal_model(mode: u8, nqs: bool) -> temperature::Nominal {
+    let mut p = temperature::Nominal::source_defaults();
+    p.transport.flcomp = 2.3;
+    p.transport.t0 = 5e-12;
+    p.transport.tr = 1e-12;
+    p.transport.junction.intrinsic_emitter.zero_bias_capacitance = 2.5e-15;
+    p.transport
+        .junction
+        .intrinsic_collector
+        .zero_bias_capacitance = 1.4e-15;
+    p.transport
+        .junction
+        .peripheral_emitter
+        .zero_bias_capacitance = 1e-15;
+    p.transport
+        .junction
+        .external_collector
+        .external_zero_bias_capacitance = 0.9e-15;
+    p.transport.junction.substrate.zero_bias_capacitance = 0.4e-15;
+    p.auxiliary.flsh = mode;
+    p.auxiliary.flnqs = nqs;
+    p.auxiliary.rth = 200.;
+    p.auxiliary.cth = 1e-9;
+    p.coefficients.alrth = 0.0003;
+    p.coefficients.zetarth = 0.5;
+    p.noise.alit = 0.5;
+    p.noise.alqf = 0.5;
+    p
+}
+
+#[test]
+fn native_ngspice47_forced_thermal_device_dc_ac() -> TestResult {
+    use hicum2::{
+        artifact::{Model, Trial},
+        instance::Options,
+    };
+    let mut count = 0;
+    for line in include_str!("fixtures/hicum2_ngspice47_device_thermal.csv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let fields: Vec<_> = line.split(',').collect();
+        assert_eq!(fields.len(), 25);
+        let number = |i: usize| fields[i].parse::<f64>();
+        let ambient = Temperature::new(number(2)? + 273.15)?;
+        let rise = number(3)?;
+        let model = Model::new(
+            &forced_thermal_model(fields[0].parse()?, fields[1] == "1"),
+            None,
+        )?;
+        let instance = model.bind(ambient, Options::default())?;
+        let prepared = instance.prepare(rise)?;
+        let layout = instance.layout();
+        let thermal = layout.thermal_slot().ok_or("thermal row")?;
+        let mut x = [0.; MAX_UNKNOWN];
+        x[layout.node(Node::C)] = 1.2;
+        x[layout.node(Node::B)] = number(4)?;
+        x[layout.node(Node::S)] = -0.1;
+        x[thermal] = rise;
+        let trial = prepared.evaluate(Trial {
+            unknowns: &x[..layout.count()],
+        })?;
+        if trial.operating.nqs.active {
+            let transfer = trial.operating.transfer;
+            for (state, value) in [
+                transfer.forward_current.value,
+                transfer.forward_current.value,
+                transfer.forward_diffusion_charge.value,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                x[layout.nqs_slot(state).ok_or("NQS row")?] = value;
+            }
+        }
+        let frame = prepared.evaluate(Trial {
+            unknowns: &x[..layout.count()],
+        })?;
+        let local = &frame.local;
+        for (row, reference) in [0, 1, 2, 3, thermal].into_iter().zip(7..12) {
+            let expected = number(reference)?;
+            let actual = local.current[row];
+            assert!(
+                (actual - expected).abs() <= 3e-4 * expected.abs().max(actual.abs()) + 4e-11,
+                "DC row {row}: {actual:e} vs {expected:e}; {line}"
+            );
+        }
+        let excited = if fields[5] == "b" {
+            layout.node(Node::B)
+        } else {
+            thermal
+        };
+        // Compare static derivatives against independent central DC sweeps,
+        // not the native AC stamp (which has a cold low-current gm error).
+        let static_states = if layout.nqs_slot(0).is_some() {
+            solve_nqs_ac(local, 0., excited)?
+        } else {
+            [(0., 0.); 3]
+        };
+        for (row, column) in [0, 1, thermal].into_iter().zip(18..21) {
+            let mut slope = local.conductance[row][excited];
+            for (state, (value, _)) in static_states.into_iter().enumerate() {
+                if let Some(col) = layout.nqs_slot(state) {
+                    slope += local.conductance[row][col] * value;
+                }
+            }
+            let expected = number(column)?;
+            assert!(
+                (slope - expected).abs() <= 5e-4 * slope.abs().max(expected.abs()) + 2e-10,
+                "DC slope row {row}: {slope:e} vs {expected:e}; {line}"
+            );
+        }
+        let frequency = number(6)?;
+        let omega = 2. * std::f64::consts::PI * frequency;
+        let states = if layout.nqs_slot(0).is_some() {
+            solve_nqs_ac(local, frequency, excited)?
+        } else {
+            [(0., 0.); 3]
+        };
+        for (row, reference) in [0, 1, thermal].into_iter().zip([12, 14, 16]) {
+            let mut re = local.conductance[row][excited];
+            let mut im = omega * local.capacitance[row][excited];
+            for (state, (a, b)) in states.into_iter().enumerate() {
+                if let Some(col) = layout.nqs_slot(state) {
+                    let g = local.conductance[row][col];
+                    let c = omega * local.capacitance[row][col];
+                    re += g * a - c * b;
+                    im += g * b + c * a;
+                }
+            }
+            let mut expected_re = number(reference)?;
+            let mut expected_im = number(reference + 1)?;
+            // Ngspice 47's analytic small-signal transport slope disagrees
+            // with its own cold low-current DC curve. Retain the raw AC
+            // samples and correct *only* the independently measured static
+            // discrepancy. Transport contributes through the published NQS
+            // current transfer, while dissipated power uses undelayed It.
+            if fields[2] == "-40"
+                && fields[4] == ".65"
+                && fields[5] == "b"
+                && (row == 0 || row == thermal)
+            {
+                let index = (reference - 12) / 2;
+                let derivative = number(18 + index)?;
+                let quasistatic = number(21 + index)?;
+                let delta = derivative - quasistatic;
+                assert!(
+                    delta.abs() > 0.005 * derivative.abs(),
+                    "expected documented native AC/DC discrepancy: {line}"
+                );
+                if row == 0 && fields[1] == "1" {
+                    let z = omega * 0.5 * number(24)?;
+                    let real = 1. - z * z / 3.;
+                    let norm = real * real + z * z;
+                    expected_re += delta * real / norm;
+                    expected_im -= delta * z / norm;
+                } else {
+                    expected_re += delta;
+                }
+            }
+            let tol = 3e-3 * re.hypot(im).max(expected_re.hypot(expected_im)) + 2e-10;
+            assert!(
+                (re - expected_re).hypot(im - expected_im) <= tol,
+                "AC row {row}: ({re:e},{im:e}) vs ({expected_re:e},{expected_im:e}); {line}"
+            );
+        }
+        count += 1;
+    }
+    assert_eq!(count, 384);
     Ok(())
 }

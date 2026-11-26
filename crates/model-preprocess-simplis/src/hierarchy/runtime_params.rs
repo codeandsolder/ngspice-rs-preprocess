@@ -97,6 +97,16 @@ fn closing_parenthesis(bytes: &[u8], open: usize) -> Result<usize> {
 /// literals, or node/current probe arguments. Expressions may contain braces
 /// or native behavioural expression syntax; no numeric evaluation is done.
 fn rewrite_expression(input: &str, names: &Names) -> Result<String> {
+    rewrite_symbols(input, names, false)
+}
+
+/// Shared expression token walker. Assignment destinations can be excluded
+/// when the caller supplies a complete device field list.
+pub(super) fn rewrite_symbols(
+    input: &str,
+    names: &Names,
+    preserve_assignments: bool,
+) -> Result<String> {
     if names.is_empty() {
         return Ok(input.to_owned());
     }
@@ -140,6 +150,11 @@ fn rewrite_expression(input: &str, names: &Names) -> Result<String> {
                     offset = close + 1;
                     continue;
                 }
+                output.push_str(name);
+            } else if preserve_assignments
+                && bytes.get(next) == Some(&b'=')
+                && bytes.get(next + 1) != Some(&b'=')
+            {
                 output.push_str(name);
             } else if let Some(replacement) = names.get(&name.to_ascii_uppercase()) {
                 output.push_str(replacement);

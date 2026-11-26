@@ -218,8 +218,8 @@ impl Partials {
     /// automatically handles TYPE NPN/PNP, intrinsic BE/BC polarity and
     /// cross-couplings, without caller-provided numerical differences.
     ///
-    /// The solver still supplies thermal derivatives for a live
-    /// electrothermal node; the isothermal path is fully complete.
+    /// The family producer supplies thermal derivatives for a live
+    /// electrothermal node; the isothermal path needs no coupling.
     ///
     /// # Errors
     /// Reports missing electrothermal coupling or overflow.
@@ -328,7 +328,7 @@ impl Partials {
 /// The input electrical row vectors contain their temperature derivatives
 /// at fixed Tf. The thermal row scalar contains the extra power-law
 /// derivative missing from the cooling-only Rth prepared derivative.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct TemperatureCoupling {
     pub current: [f64; MAX_UNKNOWN],
     pub charge: [f64; MAX_UNKNOWN],

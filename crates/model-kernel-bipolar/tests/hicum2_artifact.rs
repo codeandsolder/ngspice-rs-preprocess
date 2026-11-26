@@ -236,7 +236,6 @@ fn immutable_artifact_trial_matches_direct_physical_device_on_all_topologies() -
             let unknowns = layout_unknowns(&instance, b, c);
             let trial = Trial {
                 unknowns: &unknowns,
-                electrothermal: None,
             };
             let frame = prepared.evaluate(trial)?;
             let direct = instance::Bound::new(&nominal, ambient, option(2.0, 3.0))?
@@ -290,18 +289,9 @@ fn borrowed_batch_reuses_output_slots_and_never_owns_accepted_state() -> TestRes
     let second = layout_unknowns(&instance, 0.72, 1.2);
     let third = layout_unknowns(&instance, 0.78, 0.4);
     let inputs = [
-        Trial {
-            unknowns: &first,
-            electrothermal: None,
-        },
-        Trial {
-            unknowns: &second,
-            electrothermal: None,
-        },
-        Trial {
-            unknowns: &third,
-            electrothermal: None,
-        },
+        Trial { unknowns: &first },
+        Trial { unknowns: &second },
+        Trial { unknowns: &third },
     ];
     let mut outputs = [None; 3];
     assert!(matches!(
@@ -332,16 +322,7 @@ fn borrowed_batch_reuses_output_slots_and_never_owns_accepted_state() -> TestRes
     }
     let mut failed = third.clone();
     failed[0] = f64::NAN;
-    let inputs = [
-        Trial {
-            unknowns: &first,
-            electrothermal: None,
-        },
-        Trial {
-            unknowns: &failed,
-            electrothermal: None,
-        },
-    ];
+    let inputs = [Trial { unknowns: &first }, Trial { unknowns: &failed }];
     let mut output = [None; 2];
     assert!(matches!(
         prepared.evaluate_batch(&inputs, &mut output),
@@ -352,17 +333,11 @@ fn borrowed_batch_reuses_output_slots_and_never_owns_accepted_state() -> TestRes
     let mut invalid = third;
     invalid.push(0.0);
     assert!(matches!(
-        prepared.evaluate(Trial {
-            unknowns: &invalid,
-            electrothermal: None
-        }),
+        prepared.evaluate(Trial { unknowns: &invalid }),
         Err(EvaluationError::LengthMismatch)
     ));
     assert!(matches!(
-        prepared.evaluate(Trial {
-            unknowns: &[],
-            electrothermal: None
-        }),
+        prepared.evaluate(Trial { unknowns: &[] }),
         Err(EvaluationError::LengthMismatch)
     ));
     Ok(())
@@ -390,7 +365,6 @@ fn borrowed_nqs_unknowns_are_distinct_and_source_residual_is_differentiable() ->
     candidate[layout.nqs_slot(2).ok_or("missing stored-charge unknown")?] = 1e-14;
     let center = prepared.evaluate(Trial {
         unknowns: &candidate,
-        electrothermal: None,
     })?;
     assert!(center.operating.nqs.active);
     for (slot, delta) in [(0, 1e-7), (1, 1e-7), (2, 1e-17)] {
@@ -399,14 +373,8 @@ fn borrowed_nqs_unknowns_are_distinct_and_source_residual_is_differentiable() ->
         let mut low = candidate.clone();
         high[col] += delta;
         low[col] -= delta;
-        let upper = prepared.evaluate(Trial {
-            unknowns: &high,
-            electrothermal: None,
-        })?;
-        let lower = prepared.evaluate(Trial {
-            unknowns: &low,
-            electrothermal: None,
-        })?;
+        let upper = prepared.evaluate(Trial { unknowns: &high })?;
+        let lower = prepared.evaluate(Trial { unknowns: &low })?;
         for row in 0..layout.count() {
             let derivative = (upper.local.current[row] - lower.local.current[row]) / (2.0 * delta);
             let predicted = center.local.conductance[row][col];
@@ -426,16 +394,13 @@ fn borrowed_nqs_unknowns_are_distinct_and_source_residual_is_differentiable() ->
     }
     let mut changed = candidate;
     changed[layout.nqs_slot(0).ok_or("missing source NQS slot")?] *= 1.3;
-    let new_frame = prepared.evaluate(Trial {
-        unknowns: &changed,
-        electrothermal: None,
-    })?;
+    let new_frame = prepared.evaluate(Trial { unknowns: &changed })?;
     assert_ne!(center.operating.nqs, new_frame.operating.nqs);
     Ok(())
 }
 
 #[test]
-fn self_heating_requires_complete_external_thermal_column_and_fresh_preparation() -> TestResult {
+fn self_heating_computes_thermal_column_and_requires_fresh_preparation() -> TestResult {
     let mut nominal = temperature::Nominal::source_defaults();
     nominal.auxiliary.flsh = 2;
     nominal.auxiliary.rth = 250.0;
@@ -444,20 +409,16 @@ fn self_heating_requires_complete_external_thermal_column_and_fresh_preparation(
     let device = artifact.bind(Temperature::new(300.15)?, instance::Options::default())?;
     assert_eq!(
         device.capabilities().electrothermal,
-        Electrothermal::ExternalCouplingRequired
+        Electrothermal::Computed
     );
     assert!(device.layout().thermal_slot().is_some());
     assert_eq!(device.layout().count(), 5);
     assert_eq!(device.identity().structure.0 & (1 << 6), 1 << 6);
     let previous = device.prepare(0.0)?;
     let mut candidate = layout_unknowns(&device, 0.72, 1.2);
-    assert!(matches!(
-        previous.evaluate(Trial {
-            unknowns: &candidate,
-            electrothermal: None,
-        }),
-        Err(EvaluationError::MissingCoupling("electrothermal"))
-    ));
+    previous.evaluate(Trial {
+        unknowns: &candidate,
+    })?;
     let slot = device
         .layout()
         .thermal_slot()
@@ -466,18 +427,13 @@ fn self_heating_requires_complete_external_thermal_column_and_fresh_preparation(
     assert!(matches!(
         previous.evaluate(Trial {
             unknowns: &candidate,
-            electrothermal: None,
         }),
         Err(EvaluationError::InvalidPhysicalDomain)
     ));
     let next = device.prepare(6.0)?;
-    assert!(matches!(
-        next.evaluate(Trial {
-            unknowns: &candidate,
-            electrothermal: None,
-        }),
-        Err(EvaluationError::MissingCoupling("electrothermal"))
-    ));
+    next.evaluate(Trial {
+        unknowns: &candidate,
+    })?;
     assert!(matches!(
         device.prepare(f64::NAN),
         Err(ModelError::InvalidParameter("thermal_rise"))
@@ -675,10 +631,7 @@ fn benchmark_prepared_artifact_binding_and_trial_throughput() -> TestResult {
     let prepare_ns = prepared_at.elapsed().as_nanos() / 2048;
     let evaluator = bound.prepare(0.0)?;
     let values = layout_unknowns(&bound, 0.73, 1.2);
-    let trial = Trial {
-        unknowns: &values,
-        electrothermal: None,
-    };
+    let trial = Trial { unknowns: &values };
     for _ in 0..256 {
         black_box(evaluator.evaluate(black_box(trial))?);
     }

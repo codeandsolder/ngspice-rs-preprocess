@@ -2,7 +2,7 @@
 
 use super::{StateElementSpec, emit_state_element, escaped_device_stem};
 use crate::{
-    LogicIo, LogicOperation, LogicPolarity, LogicReceiver, LogicTiming, Translation,
+    LogicIo, LogicOperation, LogicPolarity, LogicReceiver, LogicTiming, OutputPins, Translation,
     TranslationKind, integer_parameter, normalized_statement, numeric_parameter, statement_tokens,
 };
 use anyhow::{Context, Result, bail};
@@ -184,6 +184,25 @@ pub(super) fn classic_state_model(card: &ModelCard) -> Result<Option<(String, Cl
     Ok(Some((card.name.to_ascii_uppercase(), model)))
 }
 
+fn instance_initial(fields: &str, kind: ClassicStateKind) -> Result<bool> {
+    let parameters = state_assignments(&parse_parameter_fields(fields, &[])?)?;
+    anyhow::ensure!(
+        parameters.keys().all(|key| key == "IC"),
+        "unsupported classic state instance parameter"
+    );
+    let initial = if parameters.contains_key("IC") {
+        integer_parameter(&parameters, "IC")?
+    } else {
+        anyhow::ensure!(
+            matches!(kind, ClassicStateKind::Sr),
+            "classic state instance requires IC"
+        );
+        0
+    };
+    anyhow::ensure!(initial <= 1, "invalid classic state IC");
+    Ok(initial == 1)
+}
+
 pub(super) fn translate_classic_state_device(
     statement: &str,
     models: &std::collections::BTreeMap<String, ClassicStateModel>,
@@ -230,31 +249,21 @@ pub(super) fn translate_classic_state_device(
         tokens[0]
     );
     let polarity = model.polarity;
-    let parameters = state_assignments(&parse_parameter_fields(
-        &tokens[assignment..].join(" "),
-        &[],
-    )?)?;
-    anyhow::ensure!(
-        parameters.keys().all(|key| key == "IC"),
-        "unsupported classic state instance parameter"
-    );
-    let initial = if parameters.contains_key("IC") {
-        integer_parameter(&parameters, "IC")?
-    } else {
-        anyhow::ensure!(
-            matches!(model.kind, ClassicStateKind::Sr),
-            "classic state instance requires IC"
-        );
-        0
-    };
-    anyhow::ensure!(initial <= 1, "invalid classic state IC");
+    let initial = instance_initial(&tokens[assignment..].join(" "), model.kind)?;
     let rtn_index = 1 + model.kind.outputs();
     let rtn = &tokens[rtn_index];
     let inputs = &tokens[rtn_index + 1..index];
-    let outputs = tokens[1..rtn_index]
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
+    let outputs = match &tokens[1..rtn_index] {
+        [primary] => OutputPins {
+            primary,
+            complement: None,
+        },
+        [primary, complement] => OutputPins {
+            primary,
+            complement: Some(complement),
+        },
+        _ => bail!("invalid classic state output count"),
+    };
     let stem = escaped_device_stem(tokens[0].trim_start_matches('!'));
     let io = LogicIo {
         rin: model.rin,
@@ -269,7 +278,7 @@ pub(super) fn translate_classic_state_device(
         io,
         &StateElementSpec {
             stem: &stem,
-            outputs: &outputs,
+            outputs,
             rtn,
             inputs,
             receiver: LogicReceiver {
@@ -281,7 +290,7 @@ pub(super) fn translate_classic_state_device(
                 operation: model.operation,
                 delay: io.delay,
                 inertial: false,
-                initial: initial == 1,
+                initial,
             },
             kind: model.kind.translation(),
         },

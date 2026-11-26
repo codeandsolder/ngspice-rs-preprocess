@@ -55,7 +55,7 @@ as solver initialization, reduces five nominal resistor short constraints
 and reserves optional vertical NQS and thermal unknowns. Model/scaled
 instance digests and a seven-bit structural key allow correct prepared
 kernel reuse. Temperature-specific physical kernels accept borrowed
-local trial vectors and return complete isothermal current/charge/
+local trial vectors and return complete coupled electrothermal current/charge/
 conductance/capacitance matrices, homogeneous caller-owned output
 batches, and source-referred noise without per-trial string lookup,
 allocation, dynamic dispatch or accepted-step mutation. All three NQS
@@ -63,21 +63,25 @@ states are read directly from reserved fixed local unknown indices.
 
 **Capability boundary:** local I/Q/G/C and noise are available;
 global DC/AC/transient solver analysis, sparse assembly, time-history,
-noise transfer and final convergence remain simulator-owned. A live
-self-heating node explicitly requires the remaining full electrothermal
-coupling; it is never silently zero-filled. A stale thermal-prepared
-kernel is rejected if the local thermal unknown changes. Interface
+noise transfer and final convergence remain simulator-owned. The physical producer assembles the complete electrical/thermal Jacobian,
+including source power, temperature-dependent storage and all NQS
+derivatives. A stale family-specific thermal-prepared kernel is rejected
+if the local thermal unknown changes. Interface
 tests and an on-demand local benchmark are in tests/hicum2_artifact.rs.
 
-The `hicum2::shared` producer exposes the same isothermal kernel through
+The `hicum2::shared` producer exposes the same coupled kernel through
 `model-kernel-api`, including topology-specific hidden rows and NQS
 coordinates. Area and multiplicity candidates that cross a physical
 short threshold require a new artifact. The correlated base/collector
 shot spectrum is emitted as independent generators with coherent complex
 branch injections, not by subtracting nearly equal spectral densities.
-Live self-heating is rejected at this interface until the complete
-electrothermal Jacobian is available. The family-specific artifact remains
-available for callers supplying the thermal coupling.
+The shared thermal coordinate is absolute junction temperature in kelvin;
+the family-specific evaluator uses source temperature rise relative to
+bound ambient plus model DT. The shared producer reprepares at each
+thermal trial, applies the source constitutive clamp without clipping the
+thermal coordinate, and returns watts and joules. Noise generators use
+the same trial junction temperature. The solver does not supply
+compact-model derivatives.
 
 ## Implemented
 
@@ -206,6 +210,26 @@ available for callers supplying the thermal coupling.
   Those six are explicitly *not* claimed to be thermal-equilibrium
   solutions. Independent finite-difference tests check all
   resistor and temperature partials.
+  The assembled producer also passes 1,280 coupled thermal-column
+  finite-difference cases (all resistor masks, both polarities, both
+  NQS settings and thermal modes, including constitutive clamps).
+  The reproducible ngspice-47 forced-temperature corpus contains 384
+  DC/AC rows with independent central DC slopes and 1 Hz AC stamps.
+  At cold low-current bias (-40 C, Vbe=.65 V), native AC gm differs
+  from its own DC derivative by approximately 0.9%; the test retains
+  raw values and independently corrects only that transport slope
+  through the published NQS transfer and undelayed heat-power law.
+  The source equations are not altered to reproduce this discrepancy.
+  The free-thermal transient oracle contains 3,006 samples across six
+  cases (three ambient temperatures, both heat modes); an independent
+  trapezoidal test integrates the producer's heat and energy equations.
+  Another 144 native collector-noise samples check both correlated
+  and uncorrelated source noise at imposed temperature rises.
+  Native forced-temperature runs with nonzero series resistances
+  did not converge in the tested ngspice-47 deck, so the independent
+  thermal AC/noise/transient corpus uses shorted series resistances;
+  all masks remain covered by the analytic coupled-Jacobian tests.
+
 - **Full implicit HICCR electrothermal transport and storage:**
   The fixed-size HICCR Jet now includes a temperature derivative
   lane alongside intrinsic BE/BC and independent hole-charge lanes.

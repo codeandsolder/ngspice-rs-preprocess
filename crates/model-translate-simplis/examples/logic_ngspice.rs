@@ -83,6 +83,56 @@ fn loaded(high: bool) -> f64 {
     }
 }
 
+/// Analog-state producers must retain their native hysteresis and transport
+/// delay, while sharing loaded output polarity and node naming with gates.
+fn analog_buffer_and_comparator_loaded_outputs(runtime: &Path) -> Result<()> {
+    let mut source = String::from(
+        "Vref rtn 0 0.75\nVth th rtn 2.5\nVa a rtn PWL(0 2.5 1u 2.5 1.1u 0 2u 0 2.1u 5 4u 5 4.1u 0 9u 0)\n",
+    );
+    let mut checks = Vec::new();
+    for (delay_name, delay, delayed) in [("zero", "0", false), ("late", "300n", true)] {
+        for initial in [false, true] {
+            let id = format!("{delay_name}{}", u8::from(initial));
+            writeln!(
+                source,
+                ".model mc{id} COMP RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 DELAY={delay}\n!dc{id} c{id} rtn a th mc{id} IC={}",
+                u8::from(initial)
+            )?;
+            writeln!(
+                source,
+                ".model mb{id} DIGITAL1 D_BUFFER RIN=10Meg ROUT=10 VOL=0.5 VOH=4.5 HYSTWD=1 TH=2.5 OUT_DELAY={delay}\nAb{id} %gnd_ref rtn [ b{id} n{id} ] [ a ] MODEL=mb{id} IC={}",
+                u8::from(initial)
+            )?;
+            writeln!(
+                source,
+                "Rc{id} c{id} rtn 100\nRb{id} b{id} rtn 100\nRn{id} n{id} rtn 200"
+            )?;
+            for (time, high) in [
+                (0.7, initial),
+                (1.2, initial && delayed),
+                (1.6, false),
+                (2.2, !delayed),
+                (2.6, true),
+                (4.2, delayed),
+                (4.6, false),
+                (8.0, false),
+            ] {
+                checks.push((format!("c{id}"), time, loaded(high)));
+                checks.push((format!("b{id}"), time, loaded(high)));
+                let rail = if high { 0.5 } else { 4.5 };
+                checks.push((format!("n{id}"), time, rail * 20.0 / 21.0));
+            }
+        }
+    }
+    source.push_str(".end\n");
+    verify(runtime, &source, &checks)?;
+    println!(
+        "Analog comparator and buffer: {} independent loaded transient checks",
+        checks.len()
+    );
+    Ok(())
+}
+
 fn numbered_logic_all_arities_polarities_and_initial_states(runtime: &Path) -> Result<()> {
     let mut source = String::from("Vref rtn 0 0.75\n");
     // Initial ambiguous, then all low, all high, mixed, all ambiguous
@@ -1206,6 +1256,7 @@ fn main() -> Result<()> {
         runtime.is_file() && !runtime.to_string_lossy().contains(char::is_whitespace),
         "runtime must be a file with a whitespace-free absolute path"
     );
+    analog_buffer_and_comparator_loaded_outputs(&runtime)?;
     numbered_logic_all_arities_polarities_and_initial_states(&runtime)?;
     sr_latch_polarities_priorities_and_loaded_complements(&runtime)?;
     classic_clocked_state_elements(&runtime)?;
