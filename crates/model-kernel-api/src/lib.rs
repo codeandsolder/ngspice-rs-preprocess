@@ -439,6 +439,15 @@ impl<K: Kernel> Artifact<K> {
         out: &mut Point<'_>,
     ) -> Result<()> {
         self.check(instance)?;
+        self.evaluate_data(&instance.data, coordinates, out)
+    }
+
+    fn evaluate_data(
+        &self,
+        data: &K::Prepared,
+        coordinates: &[f64],
+        out: &mut Point<'_>,
+    ) -> Result<()> {
         self.check_coordinates(coordinates)?;
         let n = coordinates.len();
         if out.current.len() != n
@@ -449,7 +458,7 @@ impl<K: Kernel> Artifact<K> {
             return Err(Error::Shape("point dimensions"));
         }
         out.reset(self.descriptor.charge);
-        self.kernel.evaluate(&instance.data, coordinates, out)?;
+        self.kernel.evaluate(data, coordinates, out)?;
         out.validate(&self.descriptor)
     }
 
@@ -465,6 +474,16 @@ impl<K: Kernel> Artifact<K> {
         sink: &mut dyn noise::Sink,
     ) -> Result<()> {
         self.check(instance)?;
+        self.evaluate_noise_data(&instance.data, coordinates, frequency, sink)
+    }
+
+    fn evaluate_noise_data(
+        &self,
+        data: &K::Prepared,
+        coordinates: &[f64],
+        frequency: f64,
+        sink: &mut dyn noise::Sink,
+    ) -> Result<()> {
         self.check_coordinates(coordinates)?;
         if !frequency.is_finite() || frequency <= 0. {
             return Err(Error::Domain("noise frequency".into()));
@@ -475,7 +494,7 @@ impl<K: Kernel> Artifact<K> {
             Capability::Computed => {
                 let mut checked = noise::CheckedSink::new(&self.descriptor, sink);
                 self.kernel
-                    .evaluate_noise(&instance.data, coordinates, frequency, &mut checked)
+                    .evaluate_noise(data, coordinates, frequency, &mut checked)
             }
         }
     }
