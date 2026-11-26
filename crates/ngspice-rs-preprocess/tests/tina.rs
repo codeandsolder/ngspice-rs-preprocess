@@ -126,7 +126,7 @@ fn normalized_tina_export_matches_op_dc_ac_and_transient_laws() -> Result<()> {
         // Source has a finite 1 ns ramp; this is the exact response after it.
         let rise = 1e-9;
         let ramp_factor = (rise / tau).exp_m1() / (rise / tau);
-        let expected = 2.0 * (1.0 - (-time / tau).exp() * ramp_factor);
+        let expected = 2.0 * (-time / tau).exp().mul_add(-ramp_factor, 1.0);
         assert!((actual - expected).abs() < 2e-4, "{actual} vs {expected}");
     }
     Ok(())
