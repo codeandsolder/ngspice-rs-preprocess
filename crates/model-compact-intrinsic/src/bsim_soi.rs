@@ -3,9 +3,15 @@
 
 mod binning;
 mod geometry;
+mod junction;
 mod temperature;
 
 pub use geometry::BsimSoiGeometry;
+pub use junction::{
+    BsimSoiCollectorCurrent, BsimSoiJunctionCharge, BsimSoiJunctionCharges, BsimSoiJunctionCurrent,
+    BsimSoiJunctionDensities, BsimSoiJunctionPoint, BsimSoiJunctionSide, BsimSoiJunctionStorage,
+    BsimSoiNeutralBody, PreparedBsimSoiJunctions,
+};
 pub use temperature::{
     BsimSoiTemperaturePoint, BsimSoiThermalNetwork, BsimSoiThermalScalar,
     PreparedBsimSoiTemperature,
@@ -339,6 +345,9 @@ fn fill_instance(
 // B4SOIsetup constants, not revised SI values: changing these changes the
 // native automatic depletion boundary.
 const CHARGE: f64 = 1.60219e-19;
+const K_OVER_Q: f64 = 8.617_087e-5;
+const EPS_0: f64 = 8.85418e-12;
+const EPS_OX: f64 = 3.453_133e-11;
 const EPS_SI: f64 = 1.03594e-10;
 
 fn film(model: &BoundParameters) -> Result<f64, ModelError> {
@@ -358,10 +367,7 @@ fn clamp_ideal_fd_doping(model: &mut BoundParameters) -> Result<(), ModelError> 
     let (bandgap, epsilon) = if integer(model, "mtrlmod")? == 0 {
         (1.12, EPS_SI)
     } else {
-        (
-            real(model, "bg0sub")?,
-            8.85418e-12 * real(model, "epsrsub")?,
-        )
+        (real(model, "bg0sub")?, EPS_0 * real(model, "epsrsub")?)
     };
     let maximum = positive(
         (bandgap - 0.1) / CHARGE * 2e-6 * epsilon / (thickness * thickness),

@@ -1,14 +1,11 @@
 //! Leading B4SOI temperature and electrostatic laws and passive heat storage.
 //! Copyright 2010 Regents of the University of California. See package LICENSE.
 
-use super::{BsimSoiNode, PreparedBsimSoiSetup, integer, positive, real, slot};
+use super::{
+    BsimSoiNode, CHARGE, EPS_0, EPS_OX, EPS_SI, K_OVER_Q, PreparedBsimSoiSetup, integer, positive,
+    real, slot,
+};
 use crate::{ModelError, MosPolarity, ParameterScope};
-
-const K_OVER_Q: f64 = 8.617087e-5;
-const Q: f64 = 1.60219e-19;
-const EPS_SI: f64 = 1.03594e-10;
-const EPS_0: f64 = 8.85418e-12;
-const EPS_OX: f64 = 3.453133e-11;
 
 /// A constitutive quantity and its analytic partial derivative per kelvin.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -25,7 +22,7 @@ impl BsimSoiThermalScalar {
         }
     }
 
-    fn checked(self, name: &'static str) -> Result<Self, ModelError> {
+    const fn checked(self, name: &'static str) -> Result<Self, ModelError> {
         if self.value.is_finite() && self.d_temperature.is_finite() {
             Ok(self)
         } else {
@@ -94,13 +91,13 @@ impl Material {
         } else {
             // The live source uses a rounded silicon T^-3/2 reference.
             let scale = if live {
-                1.9230584e-4
+                1.923_058_4e-4
             } else {
                 300.15_f64.powf(-1.5)
             };
             (
                 1.45e10 * scale * temperature * temperature.sqrt(),
-                21.5565981,
+                21.556_598_1,
             )
         };
         let density = prefactor * (reference - gap.value / (2. * voltage)).exp();
@@ -186,8 +183,9 @@ impl PreparedBsimSoiTemperature {
                     .d_temperature
                     .mul_add(back_log, voltage.value * back_slope),
         );
-        let width =
-            (2. * self.material.permittivity * phi.value / (Q * self.channel_doping * 1e6)).sqrt();
+        let width = (2. * self.material.permittivity * phi.value
+            / (CHARGE * self.channel_doping * 1e6))
+            .sqrt();
         let capacitance = self.material.permittivity / width;
         let relative_width = 0.5 * phi.d_temperature / phi.value;
         let slope = if live { 1. } else { 0. };
@@ -274,17 +272,17 @@ impl PreparedBsimSoiSetup {
         };
         let nch = slot(ParameterScope::Model, "nch")?;
         let gamma1 = slot(ParameterScope::Model, "gamma1")?;
-        let mut channel = size
-            .binned_model_slot(nch)
-            .ok_or(ModelError::MissingDefaultDependency(nch))?;
-        if !self.model.was_given(nch) && self.model.was_given(gamma1) {
+        let channel = if !self.model.was_given(nch) && self.model.was_given(gamma1) {
             let oxide = if generalized {
                 3.9 * EPS_0 / positive(real(model, "eot")?, "eot")?
             } else {
                 EPS_OX / positive(real(model, "tox")?, "tox")?
             };
-            channel = 3.021e22 * (real(model, "gamma1")? * oxide).powi(2);
-        }
+            3.021e22 * (real(model, "gamma1")? * oxide).powi(2)
+        } else {
+            size.binned_model_slot(nch)
+                .ok_or(ModelError::MissingDefaultDependency(nch))?
+        };
         let nsub = slot(ParameterScope::Model, "nsub")?;
         let substrate = size
             .binned_model_slot(nsub)

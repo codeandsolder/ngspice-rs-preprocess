@@ -1,7 +1,7 @@
 //! Typed source-derived schemas for intrinsic `HiSIM` and SOI MOS compact models.
 //!
-//! This crate provides **model/instance parameter binding**, not nonlinear device
-//! equations. A solver must not treat successful binding as proof that DC, AC,
+//! This crate provides **model/instance parameter binding** and selected physical
+//! subkernels. A solver must not treat successful binding as proof that complete DC, AC,
 //! transient, thermal or noise kernels are implemented. See `ModelVariant::KERNEL_STATUS`.
 
 mod bsim_soi;
@@ -10,8 +10,11 @@ mod defaults;
 mod hv;
 
 pub use bsim_soi::{
-    BsimSoiBodyMode, BsimSoiGeometry, BsimSoiInstanceInput, BsimSoiNode, BsimSoiTemperaturePoint,
-    BsimSoiThermalNetwork, BsimSoiThermalScalar, BsimSoiTopology, PreparedBsimSoiInstance,
+    BsimSoiBodyMode, BsimSoiCollectorCurrent, BsimSoiGeometry, BsimSoiInstanceInput,
+    BsimSoiJunctionCharge, BsimSoiJunctionCharges, BsimSoiJunctionCurrent,
+    BsimSoiJunctionDensities, BsimSoiJunctionPoint, BsimSoiJunctionSide, BsimSoiJunctionStorage,
+    BsimSoiNeutralBody, BsimSoiNode, BsimSoiTemperaturePoint, BsimSoiThermalNetwork,
+    BsimSoiThermalScalar, BsimSoiTopology, PreparedBsimSoiInstance, PreparedBsimSoiJunctions,
     PreparedBsimSoiSetup, PreparedBsimSoiSize, PreparedBsimSoiTemperature, prepare_bsim_soi_setup,
 };
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
@@ -63,7 +66,7 @@ pub const VARIANTS: [ModelVariant; 8] = [
     ModelVariant::Soi3,
 ];
 
-/// Known model inputs are a parsed schema only; no valid numerical kernel exists yet.
+/// Complete solver-ready numerical kernel availability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelStatus {
     /// Requires a separate, verified physical current/charge/derivative implementation.

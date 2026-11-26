@@ -8,10 +8,10 @@ Rust MIT license. See the package [`LICENSE`](LICENSE) and the repository's
 
 ## Exact scope
 
-The crate binds **source-defined model and instance parameters**, without
-running the physical compact-model equations. It **does not** yet provide nonlinear
-currents, terminal charges, capacitance Jacobians, noise, thermal dynamics,
-solver topology or solver-ready native device kernels. Source-derived
+The crate binds **source-defined model and instance parameters** and implements
+selected physical current, charge, material and thermal subkernels. It **does not**
+yet provide complete nonlinear device kernels, noise, or assembled solver-ready
+current/charge/thermal Jacobians. Source-derived
 **BSIMSOI 4.x and HiSIM-HV1/HV2 model setup defaults** are implemented.
 BSIMSOI 4.4 also has ordered instance setup, native terminal topology, and
 raw electrical/C–V effective geometry and 179 size-binning equations.
@@ -146,6 +146,34 @@ electrical bias, including multiplicity, finger count, segmentation,
 thermal width and effective geometry. Run
 `cargo +nightly test -p model-compact-intrinsic --test bsim_soi_temperature -- --include-ignored`.
 
+### BSIMSOI body junction transport and storage
+
+`PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds
+independent source/drain temperature-dependent saturation densities,
+diffusion, recombination, tunneling, neutral-body bipolar transport and
+junction storage. The inputs are absolute kelvin and physical B-S/B-D
+voltages; output current and charge signs follow physical polarity, with
+source/drain identity retained in reverse operation. Effective junction
+geometry, NF, NSEG and parallel multiplicity follow the native equations.
+The neutral-body collector transfer is a separate physical D-to-S branch
+with both bias derivatives. BJTOFF disables that transfer but does not
+remove neutral-body recombination or its effective diffusion charge.
+Ideal-FD mode disables the body junction contributions.
+
+The storage law uses side-specific gate-sidewall depletion capacitance,
+temperature corrections, grading, the native 0.9-potential linear
+extension, and the TT-scaled neutral-body diffusion current. All subkernels
+return analytic derivatives of their constitutive values. In particular
+the reverse denominator floor and forward depletion extension are
+differentiated as actual piecewise functions, rather than reproducing
+the native suppressed or incomplete Newton tangents. The grading=1
+logarithmic limit is evaluated without a removable singularity.
+
+These are local conservative branch laws, not a complete MOS channel
+kernel or a solver stamp. The focused tests cover independent junction
+current, asymmetric neutral-body collector and storage derivatives,
+and independent native current and AC comparisons. Run
+`cargo +nightly test -p model-compact-intrinsic --test bsim_soi_junction --test bsim_soi_neutral -- --include-ignored`.
 
 Independent reference test: on Linux with ngspice 47 installed, run:
 

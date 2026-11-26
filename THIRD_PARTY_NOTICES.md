@@ -123,9 +123,10 @@ The top-level MIT license does not supersede these terms.
 
 ## BSIMSOI 4.4 intrinsic compact-model preparations
 
-Source-derived model defaults, ordered instance setup, effective geometry and
-size binning in `crates/model-compact-intrinsic` follow ngspice revision
+Source-derived model defaults, ordered instance setup, effective geometry,
+size binning, material/thermal and body-junction laws in
+`crates/model-compact-intrinsic` follow ngspice revision
 `972dbf45db1e47d18bc4fda5d8bb829aff2d0e05`, files `bsimsoi/b4soiset.c`,
-`b4soipar.c`, `b4soimpar.c`, `b4soi.c`, and `b4soitemp.c`. Copyright 2010
+`b4soipar.c`, `b4soimpar.c`, `b4soi.c`, `b4soitemp.c`, and `b4soild.c`. Copyright 2010
 Regents of the University of California. The upstream author notice and
 modified BSD terms appear in the package LICENSE.
