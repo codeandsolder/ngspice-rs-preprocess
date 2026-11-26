@@ -750,11 +750,11 @@ fn emit_rational(
     serial: usize,
     budget: &WorkBudget,
 ) -> Result<String> {
+    use std::fmt::Write as _;
     for value in numerator.iter().chain(denominator) {
         budget.charge(Resource::EmittedBytes, value.len().saturating_add(3))?;
     }
     let (mut text, model) = emit_transfer_network(source, "laplace", used, serial)?;
-    use std::fmt::Write as _;
     write!(text, ".model {model} s_xfer(num_coeff=[")?;
     for (index, values) in [numerator, denominator].into_iter().enumerate() {
         if index != 0 {
@@ -769,6 +769,69 @@ fn emit_rational(
     }
     text.push_str("] denormalized_freq=1)");
     Ok(text)
+}
+
+fn emit_lowered_transfer(
+    transfer: &ControlledTransfer,
+    wrapped: bool,
+    input: &[u8],
+    used: &mut Option<super::IdentifierAllocator>,
+    serial: usize,
+    budget: &WorkBudget,
+) -> Result<Option<String>> {
+    let generated = match &transfer.transfer {
+        Transfer::Table { points, multiplier } => {
+            budget.charge(Resource::GeneratedNodes, points.len())?;
+            // ngspice parses adjacent tuples containing braced ordinates
+            // incorrectly. Separate the tuples even when already braced.
+            let symbolic_expression_table = matches!(transfer.control, Control::Expression(_))
+                && points
+                    .iter()
+                    .flatten()
+                    .any(|value| crate::model_card::parse_spice_constant(value).is_err());
+            if !wrapped
+                && !symbolic_expression_table
+                && !table_needs_rewrite(points, multiplier.as_deref())
+            {
+                return Ok(None);
+            }
+            emit_table(transfer, points, multiplier.as_deref())?
+        }
+        Transfer::Frequency { encoding, points } => {
+            budget.charge(Resource::GeneratedNodes, points.len())?;
+            if used.is_none() {
+                *used = Some(super::IdentifierAllocator::new(input, budget)?);
+            }
+            emit_frequency(
+                transfer,
+                *encoding,
+                points,
+                used.as_mut().context("missing identifier allocator")?,
+                serial,
+            )?
+        }
+        Transfer::Rational {
+            numerator,
+            denominator,
+        } => {
+            budget.charge(
+                Resource::GeneratedNodes,
+                numerator.len().saturating_add(denominator.len()),
+            )?;
+            if used.is_none() {
+                *used = Some(super::IdentifierAllocator::new(input, budget)?);
+            }
+            emit_rational(
+                transfer,
+                numerator,
+                denominator,
+                used.as_mut().context("missing identifier allocator")?,
+                serial,
+                budget,
+            )?
+        }
+    };
+    Ok(Some(generated))
 }
 
 /// Native source transformation with one physical input-line reference for
@@ -831,57 +894,10 @@ pub fn lower_sources(
         else {
             continue;
         };
-        let generated = match &transfer.transfer {
-            Transfer::Table { points, multiplier } => {
-                budget.charge(Resource::GeneratedNodes, points.len())?;
-                // ngspice parses adjacent tuples containing braced ordinates
-                // incorrectly. Separate the tuples even when already braced.
-                let symbolic_expression_table = matches!(transfer.control, Control::Expression(_))
-                    && points
-                        .iter()
-                        .flatten()
-                        .any(|value| crate::model_card::parse_spice_constant(value).is_err());
-                if !wrapped
-                    && !symbolic_expression_table
-                    && !table_needs_rewrite(points, multiplier.as_deref())
-                {
-                    continue;
-                }
-                emit_table(&transfer, points, multiplier.as_deref())?
-            }
-            Transfer::Frequency { encoding, points } => {
-                budget.charge(Resource::GeneratedNodes, points.len())?;
-                if used.is_none() {
-                    used = Some(super::IdentifierAllocator::new(input, budget)?);
-                }
-                emit_frequency(
-                    &transfer,
-                    *encoding,
-                    points,
-                    used.as_mut().context("missing identifier allocator")?,
-                    statement.line,
-                )?
-            }
-            Transfer::Rational {
-                numerator,
-                denominator,
-            } => {
-                budget.charge(
-                    Resource::GeneratedNodes,
-                    numerator.len().saturating_add(denominator.len()),
-                )?;
-                if used.is_none() {
-                    used = Some(super::IdentifierAllocator::new(input, budget)?);
-                }
-                emit_rational(
-                    &transfer,
-                    numerator,
-                    denominator,
-                    used.as_mut().context("missing identifier allocator")?,
-                    statement.line,
-                    budget,
-                )?
-            }
+        let Some(generated) =
+            emit_lowered_transfer(&transfer, wrapped, input, &mut used, statement.line, budget)?
+        else {
+            continue;
         };
         budget.charge(Resource::EmittedBytes, generated.len())?;
         if generated.as_bytes() == text {
