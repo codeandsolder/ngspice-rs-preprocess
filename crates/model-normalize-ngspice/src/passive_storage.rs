@@ -12,6 +12,7 @@ pub const PSPICE_CAPACITOR: &str = "pspice_cap";
 pub const PSPICE_INDUCTOR: &str = "pspice_ind";
 
 /// The same scalar constitutive polynomial represents Q(V) or Phi(I).
+///
 /// Its base is already adjusted for the occurrence's multiplier, geometry,
 /// and operating/measurement temperature, once at candidate preparation.
 #[derive(Clone, Copy, Debug, PartialEq)]

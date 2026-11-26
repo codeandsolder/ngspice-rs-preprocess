@@ -1,6 +1,7 @@
-//! Explicit `PSpice` source lowering. The target is ordinary ngspice syntax,
-//! not a deck that needs the global `ngbehavior=ps` parser mode. Explicit
-//! source-selected physical model families require the native engine.
+//! Explicit `PSpice` source lowering.
+//!
+//! Ordinary syntax needs no global `ngbehavior=ps` mode; explicit physical
+//! model families require the native engine.
 //!
 //! Reference: ngspice-47 frontend inpcompat.c, `pspice_compat`. Unsupported
 //! physical model families and stochastic declarations fail explicitly.
