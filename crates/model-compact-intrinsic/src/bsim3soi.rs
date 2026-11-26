@@ -5,7 +5,8 @@ mod instance;
 mod thermal;
 
 pub use thermal::{
-    Electrostatics, JunctionDensities, PhysicalTemperature, PreparedSubstrateCharge,
+    Electrostatics, JunctionCharge, JunctionComponents, JunctionCurrent, JunctionDensities,
+    JunctionEvaluation, PhysicalTemperature, PreparedJunctions, PreparedSubstrateCharge,
     SubstrateCharge, TemperatureMaterial, Transport, prepare_temperature,
 };
 

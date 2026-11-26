@@ -6,7 +6,12 @@ use crate::{
     ModelError, ModelVariant, MosPolarity,
     preparation::{integer, positive, real, slot},
 };
+mod differential;
+mod junction;
 mod substrate;
+pub use junction::{
+    JunctionCharge, JunctionComponents, JunctionCurrent, JunctionEvaluation, PreparedJunctions,
+};
 pub use substrate::{PreparedSubstrateCharge, SubstrateCharge};
 
 use std::sync::Arc;
@@ -126,6 +131,8 @@ pub struct PhysicalTemperature {
     pub transport: Transport,
     /// Junction saturation densities.
     pub junctions: JunctionDensities,
+    /// Bias-local junction and parasitic bipolar current evaluator.
+    pub junction_currents: PreparedJunctions,
     /// Electrostatic state.
     pub electrostatics: Electrostatics,
     /// Drain/source gate overlap and backgate overlap capacitances, before M.
@@ -295,53 +302,6 @@ fn transport(c: &Context<'_>) -> Result<Transport, ModelError> {
         thermal_capacitance,
         body_resistance,
         oxide_ratio,
-    })
-}
-
-fn dexp(x: f64) -> f64 {
-    if x > 100.0 {
-        2.688_117_142e43 * (x - 99.0)
-    } else if x < -100.0 {
-        3.720_075_976e-44
-    } else {
-        x.exp()
-    }
-}
-
-fn junctions(c: &Context<'_>) -> Result<JunctionDensities, ModelError> {
-    let ratio = c.material.ratio;
-    let n = positive(c.binned("ndiode")?, "ndiode")?;
-    let xbjt = c.model("xbjt")?;
-    let xdif = c.model.diffusion_temperature_exponent();
-    let xrec = c.model("xrec")?;
-    let xtun = c.model("xtun")?;
-    let (bjt, dif, rec, tun, high_level_injection) = if c.pd() {
-        let activation = 1.115 / c.material.thermal_voltage * (ratio - 1.0);
-        let bjt = dexp(xbjt * activation / n);
-        (
-            bjt,
-            dexp(xdif * activation / n),
-            dexp(xrec * activation / positive(c.binned("nrecf0")?, "nrecf0")?),
-            dexp(xtun * (ratio - 1.0)),
-            Some(finite(c.binned("ahli")? * bjt, "ahli0")?),
-        )
-    } else {
-        let activation = c.material.nominal_gap / n / c.material.thermal_voltage * (ratio - 1.0);
-        let exponential = activation.exp();
-        (
-            ratio.powf(xbjt / n) * exponential,
-            ratio.powf(xdif / n) * exponential,
-            ratio.powf(xrec / n / 2.0) * exponential.sqrt(),
-            ratio.powf(xtun / positive(c.binned("ntun")?, "ntun")?),
-            None,
-        )
-    };
-    Ok(JunctionDensities {
-        bipolar: finite(c.binned("isbjt")? * bjt, "jbjt")?,
-        diffusion: finite(c.binned("isdif")? * dif, "jdif")?,
-        recombination: finite(c.binned("isrec")? * rec, "jrec")?,
-        tunneling: finite(c.binned("istun")? * tun, "jtun")?,
-        high_level_injection,
     })
 }
 
@@ -590,10 +550,13 @@ pub fn prepare_temperature(
     let (substrate_sidewall, series_conductances, external_body_resistance) = extrinsic(&c)?;
     let electrostatics = electrostatics(&c)?;
     let substrate_charge = substrate::prepare(&c, electrostatics, substrate_sidewall)?;
+    let density = junction::DensityLaw::prepare(&c)?;
+    let junction_currents = junction::prepare(&c, density)?;
     Ok(PhysicalTemperature {
         material,
         transport: transport(&c)?,
-        junctions: junctions(&c)?,
+        junctions: density.ambient(&c)?,
+        junction_currents,
         electrostatics,
         substrate_charge,
         overlaps: overlaps(&c)?,

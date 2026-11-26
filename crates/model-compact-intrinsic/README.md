@@ -937,3 +937,31 @@ AC. The C reference circuits use separate model records to avoid the
 legacy size cache's sharing of area-dependent coefficients. Rust
 preparation keeps them local to each instance and provides the physical
 charge and derivative consistently for both AC and transient assembly.
+
+The `PhysicalTemperature.junction_currents` evaluator supplies normalized
+source-oriented body-to-source/body-to-drain diffusion, recombination,
+bipolar and tunnelling currents, parasitic collector current, and the
+PD-specific effective diffusion current for storage. FD explicitly
+returns zero for this intrinsic junction contribution, matching its
+load routine. DD uses the 30-exponent continuation and geometry-dependent
+bipolar transport; PD retains the 100-exponent continuation,
+trap-assisted recombination/tunnelling, high-level injection, neutral
+body recombination, Early effect, and separate C-V geometry. The
+isothermal path uses prepared ambient densities; self-heating uses the
+load-time density law, including DD's fixed 1.115 eV gap and model-card
+tunnelling density. The caller applies polarity/multiplicity and owns
+source/drain reversal and limiting. Guarded native Newton tangents are
+retained where they differ from unrestricted calculus.
+
+The current qualification covers 3,384 native debug-node comparisons
+and 16,848 analytic derivative checks. PD's current debug nodes report
+absolute magnitudes plus 1e-14 A; DD reports signed currents. The
+normalized physical result is not modified to emulate debug reporting.
+
+The intrinsic gate-sidewall charge law also supplies the body-side
+source/drain charge and analytic voltage/temperature tangents. DD uses
+the quadratic forward continuation and TT times ideal diffusion; PD
+uses temperature-dependent sidewall potential/capacitance, a 90 percent
+potential continuation and TT times effective bipolar diffusion. Both
+use the finite logarithmic primitive at unity grading. FD has no
+intrinsic junction charge in its load routine.

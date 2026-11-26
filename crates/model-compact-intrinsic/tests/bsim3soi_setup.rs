@@ -497,3 +497,6 @@ fn physical_temperature_rejects_mismatched_preparation() -> Result<(), Box<dyn E
 
 #[path = "bsim3soi_setup/substrate.rs"]
 mod substrate;
+
+#[path = "bsim3soi_setup/junction.rs"]
+mod junction;
