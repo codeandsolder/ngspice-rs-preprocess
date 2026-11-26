@@ -1,7 +1,7 @@
-//! Independent BSIM1 series, channel and flicker noise generators.
+//! Independent BSIM1/2 series, channel and flicker noise generators.
 //! No adjoint circuit transfer function is evaluated by the producer.
-use super::{Bsim1Prepared, Layout, domain, junction};
-use model_compact_intrinsic::evaluate_bsim1_intrinsic;
+use super::{Layout, LegacyBsimPrepared, domain, junction};
+use model_compact_intrinsic::evaluate_legacy_bsim_intrinsic;
 use model_kernel_api::{
     Result,
     noise::{Injection, Sink, Source},
@@ -31,14 +31,15 @@ fn emit(sink: &mut dyn Sink, name: &str, density: f64, a: usize, b: usize) -> Re
 
 pub fn evaluate(
     layout: Layout,
-    prepared: &Bsim1Prepared,
+    prepared: &LegacyBsimPrepared,
     coordinates: &[f64],
     frequency: f64,
     sink: &mut dyn Sink,
 ) -> Result<()> {
     let p = &prepared.physical;
     let orientation = layout.orientation(p, coordinates);
-    let point = evaluate_bsim1_intrinsic(p, orientation.bias).map_err(|error| domain(&error))?;
+    let point =
+        evaluate_legacy_bsim_intrinsic(p, orientation.bias).map_err(|error| domain(&error))?;
     let m = p.geometry.multiplier;
     let thermal = 4. * 1.380_648_52e-23 * prepared.ambient * m;
     emit(

@@ -1,4 +1,4 @@
-//! BSIM1 junction current and depletion charge, including the M=1 limit.
+//! BSIM1/2 junction current and depletion charge, including the M=1 limit.
 use model_compact_intrinsic::{
     BSIM1_REFERENCE_THERMAL_VOLTAGE, LegacyBsimJunction, LegacyBsimJunctionLaw,
 };
@@ -27,7 +27,9 @@ pub fn current(saturation: f64, voltage: f64, gmin: f64) -> Result<(f64, f64)> {
     if value.is_finite() && slope.is_finite() {
         Ok((value, slope))
     } else {
-        Err(Error::Domain("nonfinite BSIM1 junction current".into()))
+        Err(Error::Domain(
+            "nonfinite legacy BSIM junction current".into(),
+        ))
     }
 }
 
@@ -78,6 +80,8 @@ pub fn charge(
     if value.is_finite() && slope.is_finite() && slope >= 0. {
         Ok((value, slope))
     } else {
-        Err(Error::Domain("nonphysical BSIM1 junction charge".into()))
+        Err(Error::Domain(
+            "nonphysical legacy BSIM junction charge".into(),
+        ))
     }
 }

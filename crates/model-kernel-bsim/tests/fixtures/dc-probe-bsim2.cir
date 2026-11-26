@@ -1,0 +1,16 @@
+BSIM1 reference operating point
+.model b1 nmos(level=5 tox=0.024 vdd=5 vfb=-0.9 phi=0.75 k1=0.75 k2=0.02 mus0=510 mu0=400 n0=1.2 eta0=0.02 ua0=0.1 u10=0.06 vbb=-3 ai0=0.05 bi0=0.5 dl=0.17 dw=0.28 rsh=52 js=2e-5 cj=1e-3 cjsw=2e-10 pb=0.74 pbsw=0.83 mj=0.5 mjsw=0.33 cgdo=1.5e-10 cgso=2e-10 cgbo=4e-11 kf=2e-25 af=1.2)
+M1 d g s b b1 l=8.3u w=17.6u m=2 ad=3e-11 as=4e-11 pd=13u ps=17u nrd=2.3 nrs=3.1
+vd d 0 1.2
+vg g 0 1.7
+vs s 0 0.1
+vb b 0 -0.3
+.options gmin=0 reltol=1e-10 abstol=1e-16 vntol=1e-12
+.control
+set numdgt=16
+op
+display
+print all
+quit
+.endc
+.end

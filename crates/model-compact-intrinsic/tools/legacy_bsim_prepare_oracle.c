@@ -29,6 +29,10 @@ extern void B1evaluate(double, double, double, B1instance *, B1model *,
     double *, double *, double *, double *, double *, double *,
     double *, double *, double *, double *, double *, double *,
     double *, double *, double *, double *, double *, double *, CKTcircuit *);
+extern void B2evaluate(double, double, double, B2instance *, B2model *,
+    double *, double *, double *, double *, double *, double *,
+    double *, double *, double *, double *, double *, double *,
+    double *, double *, double *, double *, double *, double *, CKTcircuit *);
 IFfrontEnd *SPfrontEnd;
 void *tmalloc(size_t size) { return calloc(1, size); }
 void txfree(const void *p) { free((void *)p); }
@@ -125,12 +129,25 @@ static int bsim1(int argc, char **argv) {
     return 0;
 }
 
-static int bsim2(void) {
+static int bsim2(int argc, char **argv) {
     B2model model = {0};
     B2instance device = {0};
     model.gen.GENinstances = (GENinstance *)&device;
     if (inputs(2, (GENmodel *)&model, (GENinstance *)&device)) return 1;
     if (B2temp((GENmodel *)&model, NULL)) return 1;
+    if (argc == 5) {
+        CKTcircuit ckt = {0};
+        ckt.CKTmode = MODEAC;
+        double drain = strtod(argv[2], NULL), gate = strtod(argv[3], NULL), bulk = strtod(argv[4], NULL);
+        double gm, gds, gmbs, qg, qb, qd, caps[9], id, von, sat;
+        B2evaluate(drain, bulk, gate, &device, &model, &gm, &gds, &gmbs,
+            &qg, &qb, &qd, &caps[0], &caps[1], &caps[2], &caps[3], &caps[4],
+            &caps[5], &caps[6], &caps[7], &caps[8], &id, &von, &sat, &ckt);
+        printf("%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+            drain, gate, bulk, id, qd, qg, qb, von, sat);
+        free(device.pParam);
+        return 0;
+    }
     struct bsim2SizeDependParam *p = device.pParam;
     OUT("oxide_density", model.B2Cox * 1e4);
     OUT("oxide_charge", p->CoxWL);
@@ -194,6 +211,6 @@ static int bsim2(void) {
 int main(int argc, char **argv) {
     if (argc != 2 && argc != 5) return 2;
     if (strcmp(argv[1], "1") == 0) return bsim1(argc, argv);
-    if (argc == 2 && strcmp(argv[1], "2") == 0) return bsim2();
+    if (strcmp(argv[1], "2") == 0) return bsim2(argc, argv);
     return 2;
 }

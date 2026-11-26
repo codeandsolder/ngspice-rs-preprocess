@@ -45,6 +45,12 @@ impl Jet {
         self.unary(self.value.exp_m1(), self.value.exp())
     }
 
+    pub(super) fn tanh(self) -> Self {
+        let value = self.value.tanh();
+        let tail = (-2. * self.value.abs()).exp();
+        self.unary(value, 4. * tail / (1. + tail).powi(2))
+    }
+
     pub(super) fn sqrt(self) -> Self {
         let value = self.value.sqrt();
         self.unary(value, 0.5 / value)

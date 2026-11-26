@@ -1,6 +1,6 @@
 # Prepared Berkeley BSIM kernels
 
-The BSIM1 artifact composes the independently validated model and intrinsic
+The BSIM1/2 artifact composes the independently validated model and intrinsic
 channel in `model-compact-intrinsic` with body junction current and charge,
 overlap storage, drain/source sheet resistance, and the four independent
 noise contributions defined by ngspice 47. See [legacy BSIM ownership and
@@ -26,7 +26,7 @@ use the source temperature-stage AC/PZ geometry. Historical ngspice
 transient overlap stamping uses a different drawn/corrected geometry;
 it is deliberately not reproduced as an analysis-dependent storage law.
 
-BSIM2 has distinct prepared coefficients but is not yet an artifact.
+BSIM2 uses a distinct intrinsic law with the same generalized branch assembly. Its channel temperature follows the historical model TEMP convention while junction current uses the fixed legacy reference thermal voltage.
 No BSIM3 revision is substituted, and no existing native solver physics
 is moved by this package.
 The junction regularization is included exactly once. Noise uses the physical

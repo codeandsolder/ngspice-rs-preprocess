@@ -8,11 +8,15 @@ use model_kernel_api::{
     Artifact, Binding, Capability, Error, PointBuffer, Prepared,
     noise::{Sink, Source},
 };
-use model_kernel_bsim::{Bsim1Kernel, Instance, bsim1_artifact};
+use model_kernel_bsim::{Instance, LegacyBsimKernel, legacy_bsim_artifact};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-fn model(pmos: bool, sheet: f64) -> TestResult<Arc<PreparedLegacyBsimModel>> {
+fn family_model(
+    variant: ModelVariant,
+    pmos: bool,
+    sheet: f64,
+) -> TestResult<Arc<PreparedLegacyBsimModel>> {
     let params = [
         ("tox", ParameterValue::Real(0.024)),
         ("vdd", ParameterValue::Real(5.)),
@@ -20,12 +24,7 @@ fn model(pmos: bool, sheet: f64) -> TestResult<Arc<PreparedLegacyBsimModel>> {
         ("phi", ParameterValue::Real(0.75)),
         ("k1", ParameterValue::Real(0.75)),
         ("k2", ParameterValue::Real(0.02)),
-        ("mus", ParameterValue::Real(510.)),
-        ("muz", ParameterValue::Real(400.)),
         ("n0", ParameterValue::Real(1.2)),
-        ("eta", ParameterValue::Real(0.02)),
-        ("u0", ParameterValue::Real(0.1)),
-        ("u1", ParameterValue::Real(0.06)),
         ("dl", ParameterValue::Real(0.17)),
         ("dw", ParameterValue::Real(0.28)),
         ("rsh", ParameterValue::Real(sheet)),
@@ -43,12 +42,44 @@ fn model(pmos: bool, sheet: f64) -> TestResult<Arc<PreparedLegacyBsimModel>> {
         ("af", ParameterValue::Real(1.2)),
         ("pmos", ParameterValue::Flag(pmos)),
     ];
+    let specific: &[(&str, f64)] = match variant {
+        ModelVariant::Bsim1 => &[
+            ("mus", 510.),
+            ("muz", 400.),
+            ("eta", 0.02),
+            ("u0", 0.1),
+            ("u1", 0.06),
+        ],
+        ModelVariant::Bsim2 => &[
+            ("mus0", 510.),
+            ("mu0", 400.),
+            ("eta0", 0.02),
+            ("ua0", 0.1),
+            ("u10", 0.06),
+            ("vbb", -3.),
+            ("ai0", 0.05),
+            ("bi0", 0.5),
+        ],
+        _ => return Err("unexpected model family".into()),
+    };
     Ok(Arc::new(prepare_legacy_bsim_model(
-        &BoundParameters::bind(ModelVariant::Bsim1, ParameterScope::Model, params)?,
+        &BoundParameters::bind(
+            variant,
+            ParameterScope::Model,
+            params.into_iter().chain(
+                specific
+                    .iter()
+                    .map(|&(name, value)| (name, ParameterValue::Real(value))),
+            ),
+        )?,
     )?))
 }
 
-fn reference() -> Instance {
+fn model(pmos: bool, sheet: f64) -> TestResult<Arc<PreparedLegacyBsimModel>> {
+    family_model(ModelVariant::Bsim1, pmos, sheet)
+}
+
+const fn reference() -> Instance {
     Instance {
         length: 8.3e-6,
         width: 17.6e-6,
@@ -78,8 +109,8 @@ struct Sample {
 }
 
 fn sample(
-    artifact: &Artifact<Bsim1Kernel>,
-    instance: &Prepared<Bsim1Kernel>,
+    artifact: &Artifact<LegacyBsimKernel>,
+    instance: &Prepared<LegacyBsimKernel>,
     coordinates: &[f64],
 ) -> TestResult<Sample> {
     let mut buffer = PointBuffer::new(coordinates.len())?;
@@ -97,7 +128,7 @@ fn sample(
 fn structural_candidates_and_polarity_are_transactional() -> TestResult {
     let model = model(false, 52.)?;
     let instance = reference();
-    let artifact = bsim1_artifact(Arc::clone(&model), instance, [1; 16])?;
+    let artifact = legacy_bsim_artifact(Arc::clone(&model), instance, [1; 16])?;
     let desc = artifact.descriptor();
     assert_eq!(desc.charge, Capability::Computed);
     assert_eq!(desc.noise, Capability::Computed);
@@ -130,7 +161,7 @@ fn structural_candidates_and_polarity_are_transactional() -> TestResult {
         artifact.prepare(&updated.slots(), 300.15),
         Err(Error::Unsupported(_))
     ));
-    let one_hidden = bsim1_artifact(Arc::clone(&model), updated, [2; 16])?;
+    let one_hidden = legacy_bsim_artifact(Arc::clone(&model), updated, [2; 16])?;
     assert_eq!(one_hidden.descriptor().equations.len(), 5);
     let again = sample(&artifact, &base, &coordinates)?;
     assert_eq!(first.current, again.current);
@@ -140,8 +171,8 @@ fn structural_candidates_and_polarity_are_transactional() -> TestResult {
 }
 
 fn check_jacobian(
-    artifact: &Artifact<Bsim1Kernel>,
-    instance: &Prepared<Bsim1Kernel>,
+    artifact: &Artifact<LegacyBsimKernel>,
+    instance: &Prepared<LegacyBsimKernel>,
     coordinates: &[f64],
 ) -> TestResult {
     let base = sample(artifact, instance, coordinates)?;
@@ -184,23 +215,29 @@ fn check_jacobian(
 
 #[test]
 fn complete_nodal_law_has_exact_jacobians_in_both_polarities_and_orientations() -> TestResult {
-    for pmos in [false, true] {
-        let polarity = if pmos { -1. } else { 1. };
-        for sheet in [0., 52.] {
-            let artifact = bsim1_artifact(model(pmos, sheet)?, reference(), [3; 16])?;
-            let instance = artifact.prepare(&reference().slots(), 310.)?;
-            for forward in [false, true] {
-                let (drain, source) = if forward { (1.1, 0.1) } else { (0.1, 1.1) };
-                for bulk in [-0.4, 0.16] {
-                    let mut coordinates = vec![drain, 1.7, source, bulk];
-                    if sheet > 0. {
-                        coordinates.extend([drain - 0.03, source + 0.02]);
+    for variant in [ModelVariant::Bsim1, ModelVariant::Bsim2] {
+        for pmos in [false, true] {
+            let polarity = if pmos { -1. } else { 1. };
+            for sheet in [0., 52.] {
+                let artifact = legacy_bsim_artifact(
+                    family_model(variant, pmos, sheet)?,
+                    reference(),
+                    [3; 16],
+                )?;
+                let instance = artifact.prepare(&reference().slots(), 310.)?;
+                for forward in [false, true] {
+                    let (drain, source) = if forward { (1.1, 0.1) } else { (0.1, 1.1) };
+                    for bulk in [-0.4, 0.16] {
+                        let mut coordinates = vec![drain, 1.7, source, bulk];
+                        if sheet > 0. {
+                            coordinates.extend([drain - 0.03, source + 0.02]);
+                        }
+                        let coordinates = coordinates
+                            .into_iter()
+                            .map(|x| x * polarity)
+                            .collect::<Vec<_>>();
+                        check_jacobian(&artifact, &instance, &coordinates)?;
                     }
-                    let coordinates = coordinates
-                        .into_iter()
-                        .map(|x| x * polarity)
-                        .collect::<Vec<_>>();
-                    check_jacobian(&artifact, &instance, &coordinates)?;
                 }
             }
         }
@@ -224,7 +261,7 @@ impl Sink for Sources {
 
 #[test]
 fn noise_and_parallel_multiplicity_follow_physical_branch_scaling() -> TestResult {
-    let artifact = bsim1_artifact(model(false, 52.)?, reference(), [4; 16])?;
+    let artifact = legacy_bsim_artifact(model(false, 52.)?, reference(), [4; 16])?;
     let coordinates = [1.2, 1.7, 0., -0.3, 1.1, 0.1];
     let single = artifact.prepare(&reference().slots(), 300.)?;
     let mut double = reference();
@@ -259,47 +296,59 @@ fn noise_and_parallel_multiplicity_follow_physical_branch_scaling() -> TestResul
 
 #[test]
 fn native_ngspice_operating_points_include_hidden_series_nodes() -> TestResult {
-    let mut count = 0;
-    for line in include_str!("fixtures/bsim1-dc-ngspice47.txt")
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-    {
-        let data = line
-            .split_whitespace()
-            .map(str::parse::<f64>)
-            .collect::<Result<Vec<_>, _>>()?;
-        let [pmos, sheet, drain, gate, source, bulk, id, ig, is, ib]: [f64; 10] =
-            data.try_into()
+    for (variant, fixture) in [
+        (
+            ModelVariant::Bsim1,
+            include_str!("fixtures/bsim1-dc-ngspice47.txt"),
+        ),
+        (
+            ModelVariant::Bsim2,
+            include_str!("fixtures/bsim2-dc-ngspice47.txt"),
+        ),
+    ] {
+        let mut count = 0;
+        for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+            let data = line
+                .split_whitespace()
+                .map(str::parse::<f64>)
+                .collect::<Result<Vec<_>, _>>()?;
+            let [pmos, sheet, drain, gate, source, bulk, id, ig, is, ib]: [f64; 10] = data
+                .try_into()
                 .map_err(|_| "wrong native OP fixture width")?;
-        let reference = Instance {
-            gmin: 0.,
-            ..reference()
-        };
-        let artifact = bsim1_artifact(model(pmos != 0., sheet)?, reference, [5; 16])?;
-        let prepared = artifact.prepare(&reference.slots(), 300.15)?;
-        let mut coords = vec![drain, gate, source, bulk];
-        if sheet > 0. {
-            // The native reference supplies the external series current.
-            // Recover each hidden voltage from the independent Ohm's law.
-            coords.push(id.mul_add(
-                sheet * reference.drain_squares / reference.multiplier,
-                drain,
-            ));
-            coords.push(is.mul_add(
-                sheet * reference.source_squares / reference.multiplier,
-                source,
-            ));
+            let reference = Instance {
+                gmin: 0.,
+                ..reference()
+            };
+            let artifact = legacy_bsim_artifact(
+                family_model(variant, pmos != 0., sheet)?,
+                reference,
+                [5; 16],
+            )?;
+            let prepared = artifact.prepare(&reference.slots(), 300.15)?;
+            let mut coords = vec![drain, gate, source, bulk];
+            if sheet > 0. {
+                // The native reference supplies the external series current.
+                // Recover each hidden voltage from the independent Ohm's law.
+                coords.push(id.mul_add(
+                    sheet * reference.drain_squares / reference.multiplier,
+                    drain,
+                ));
+                coords.push(is.mul_add(
+                    sheet * reference.source_squares / reference.multiplier,
+                    source,
+                ));
+            }
+            let point = sample(&artifact, &prepared, &coords)?;
+            for (actual, expected) in point.current[..4].iter().zip([-id, -ig, -is, -ib]) {
+                close("external DC residual", *actual, expected, 3e-9, 1e-15);
+            }
+            for actual in &point.current[4..] {
+                close("native solved hidden residual", *actual, 0., 0., 1e-12);
+            }
+            count += 1;
         }
-        let point = sample(&artifact, &prepared, &coords)?;
-        for (actual, expected) in point.current[..4].iter().zip([-id, -ig, -is, -ib]) {
-            close("external DC residual", *actual, expected, 3e-9, 1e-15);
-        }
-        for actual in &point.current[4..] {
-            close("native solved hidden residual", *actual, 0., 0., 1e-12);
-        }
-        count += 1;
+        assert_eq!(count, 16);
     }
-    assert_eq!(count, 16);
     Ok(())
 }
 
@@ -309,7 +358,7 @@ fn gmin_is_a_single_consistent_junction_conductance() -> TestResult {
         gmin: 0.,
         ..reference()
     };
-    let artifact = bsim1_artifact(model(false, 0.)?, reference, [6; 16])?;
+    let artifact = legacy_bsim_artifact(model(false, 0.)?, reference, [6; 16])?;
     let baseline = artifact.prepare(&reference.slots(), 300.15)?;
     let gmin = 1e-5;
     let candidate = artifact.prepare(&Instance { gmin, ..reference }.slots(), 300.15)?;
@@ -356,13 +405,13 @@ fn physical_noise_density_from_native_dc_measurements() -> TestResult {
         gmin: 0.,
         ..reference()
     };
-    let artifact = bsim1_artifact(model(false, 0.)?, reference, [7; 16])?;
+    let artifact = legacy_bsim_artifact(model(false, 0.)?, reference, [7; 16])?;
     let prepared = artifact.prepare(&reference.slots(), 300.15)?;
     let coordinates = [1.204_300_731_234_587_5, 1.7, 0.1, -0.3];
     // Independent ngspice 47 DC measurements at a fixed drain voltage
     // (noise-dc.cir). The gate sweep measures the total device gm.
     let id = 9.956_992_687_654_125e-5_f64;
-    let gm = (9.957_182_602_677_812e-5 - 9.956_802_774_274_540e-5) / 2e-5;
+    let gm = (9.957_182_602_677_812e-5 - 9.956_802_774_274_54e-5) / 2e-5;
     let thermal = 4. * 1.380_648_52e-23 * 300.15;
     let cox = 3.453e-13 / (0.024e-4);
     let area = (8.3e-6 - 0.17e-6) * (17.6e-6 - 0.28e-6);

@@ -138,3 +138,9 @@ The BSIM1 constitutive, junction, overlap and noise implementation in
 is based on ngspice 47 `bsim1/b1eval.c`, `b1ld.c`, and `b1noi.c`,
 Copyright 1990 Regents of the University of California; Hong J. Park and
 Thomas L. Quarles. See the respective crate licenses.
+
+
+The BSIM2 constitutive implementation is based on ngspice 47
+`bsim2/b2eval.c`, and the shared legacy BSIM kernel assembly also follows
+`bsim2/b2ld.c` and `b2noi.c`. Copyright 1990 Regents of the University of
+California; Min-Chie Jeng, Hong J. Park and Thomas L. Quarles.

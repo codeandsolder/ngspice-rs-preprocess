@@ -1,11 +1,11 @@
-//! Prepared Berkeley BSIM1 device, without solver topology, integration or history.
+//! Prepared Berkeley BSIM1/2 devices, without solver topology, integration or history.
 //!
 //! The intrinsic current and charge law is owned by `model-compact-intrinsic`.
 //! This crate composes it with the source-family junctions, overlaps, series
 //! resistance and noise, and exposes the shared generalized equation contract.
 //!
-//! Based on ngspice 47 BSIM1 load/noise equations, Copyright 1990 Regents of
-//! the University of California, Hong J. Park and Thomas L. Quarles. See LICENSE.
+//! Based on ngspice 47 BSIM1/2 load/noise equations, Copyright 1990 Regents of
+//! the University of California, Hong J. Park and Thomas L. Quarles and Min-Chie Jeng. See LICENSE.
 
 #![forbid(unsafe_code)]
 
@@ -15,9 +15,9 @@ mod noise;
 use std::sync::Arc;
 
 use model_compact_intrinsic::{
-    BoundParameters, Bsim1Bias, Bsim1IntrinsicPoint, ModelError, ModelVariant, MosPolarity,
-    ParameterScope, ParameterValue, PreparedLegacyBsimInstance, PreparedLegacyBsimModel,
-    evaluate_bsim1_intrinsic,
+    BoundParameters, LegacyBsimBias, LegacyBsimIntrinsicPoint, ModelError, ModelVariant,
+    MosPolarity, ParameterScope, ParameterValue, PreparedLegacyBsimInstance,
+    PreparedLegacyBsimModel, evaluate_legacy_bsim_intrinsic,
 };
 use model_kernel_api::{
     ABI_VERSION, Artifact, Binding, Capability, Descriptor, Equation, EquationKind, Error, Kernel,
@@ -97,21 +97,21 @@ fn prepare_instance(
     model: &PreparedLegacyBsimModel,
     values: &[f64],
     ambient: f64,
-) -> Result<Bsim1Prepared> {
-    if model.variant() != ModelVariant::Bsim1 {
-        return Err(Error::Unsupported("not a BSIM1 model"));
+) -> Result<LegacyBsimPrepared> {
+    if !matches!(model.variant(), ModelVariant::Bsim1 | ModelVariant::Bsim2) {
+        return Err(Error::Unsupported("not a legacy BSIM model"));
     }
     let Some((&gmin, geometry)) = values.split_last() else {
-        return Err(Error::Shape("BSIM1 parameter count"));
+        return Err(Error::Shape("legacy BSIM parameter count"));
     };
     if geometry.len() != INSTANCE_PARAMETERS.len() - 1 {
-        return Err(Error::Shape("BSIM1 parameter count"));
+        return Err(Error::Shape("legacy BSIM parameter count"));
     }
     if !gmin.is_finite() || gmin < 0. || !ambient.is_finite() || ambient <= 0. {
-        return Err(Error::Domain("BSIM1 gmin or ambient".into()));
+        return Err(Error::Domain("legacy BSIM gmin or ambient".into()));
     }
     let params = BoundParameters::bind(
-        ModelVariant::Bsim1,
+        model.variant(),
         ParameterScope::Instance,
         INSTANCE_PARAMETERS
             .iter()
@@ -122,7 +122,7 @@ fn prepare_instance(
     let physical = model
         .prepare_instance(&params)
         .map_err(|error| domain(&error))?;
-    Ok(Bsim1Prepared {
+    Ok(LegacyBsimPrepared {
         physical,
         ambient,
         gmin,
@@ -192,7 +192,7 @@ impl Layout {
         } else {
             (self.source, self.drain)
         };
-        let bias = Bsim1Bias {
+        let bias = LegacyBsimBias {
             vds: sign * (coordinates[high] - coordinates[low]),
             vgs: sign * (coordinates[1] - coordinates[low]),
             vbs: sign * (coordinates[3] - coordinates[low]),
@@ -209,27 +209,27 @@ impl Layout {
 #[derive(Clone, Copy)]
 struct Orientation {
     rows: [usize; 4],
-    bias: Bsim1Bias,
+    bias: LegacyBsimBias,
     sign: f64,
     forward: bool,
 }
 
-/// Compiled BSIM1 model, fixed series-node shape and shared immutable data.
+/// Compiled legacy BSIM model, fixed series-node shape and shared immutable data.
 #[derive(Debug)]
-pub struct Bsim1Kernel {
+pub struct LegacyBsimKernel {
     model: Arc<PreparedLegacyBsimModel>,
     layout: Layout,
 }
 
 /// Immutable instance derived from the kernel's numeric slots.
 #[derive(Debug)]
-pub struct Bsim1Prepared {
+pub struct LegacyBsimPrepared {
     physical: PreparedLegacyBsimInstance,
     ambient: f64,
     gmin: f64,
 }
 
-/// Build a BSIM1 artifact.
+/// Build a legacy BSIM artifact.
 ///
 /// Geometry and gmin are numeric candidate slots.
 /// The producer supplies a stable fingerprint of model and series-node shape.
@@ -237,11 +237,11 @@ pub struct Bsim1Prepared {
 ///
 /// # Errors
 /// Wrong model family, invalid instance physics or descriptor identity.
-pub fn bsim1_artifact(
+pub fn legacy_bsim_artifact(
     model: Arc<PreparedLegacyBsimModel>,
     reference: Instance,
     fingerprint: [u8; 16],
-) -> Result<Arc<Artifact<Bsim1Kernel>>> {
+) -> Result<Arc<Artifact<LegacyBsimKernel>>> {
     let slots = reference.slots();
     let initial = prepare_instance(&model, &slots, 300.15)?;
     let layout = Layout::new(&initial.physical);
@@ -256,7 +256,12 @@ pub fn bsim1_artifact(
         .collect();
     Artifact::new(
         Descriptor {
-            family: "bsim1".into(),
+            family: match model.variant() {
+                ModelVariant::Bsim1 => "bsim1",
+                ModelVariant::Bsim2 => "bsim2",
+                _ => return Err(Error::Unsupported("not a legacy BSIM model")),
+            }
+            .into(),
             fingerprint,
             abi: ABI_VERSION,
             equations: layout.equations(),
@@ -264,7 +269,7 @@ pub fn bsim1_artifact(
             charge: Capability::Computed,
             noise: Capability::Computed,
         },
-        Bsim1Kernel { model, layout },
+        LegacyBsimKernel { model, layout },
     )
 }
 
@@ -294,7 +299,7 @@ fn gradient(row: &mut [f64], coordinates: [usize; 4], gradient: [f64; 3], scale:
 fn stamp_intrinsic(
     out: &mut Point<'_>,
     orientation: Orientation,
-    point: &Bsim1IntrinsicPoint,
+    point: &LegacyBsimIntrinsicPoint,
     multiplier: f64,
 ) {
     let width = out.current.len();
@@ -325,7 +330,7 @@ fn stamp_intrinsic(
 fn stamp_junctions(
     out: &mut Point<'_>,
     layout: Layout,
-    prepared: &Bsim1Prepared,
+    prepared: &LegacyBsimPrepared,
     coordinates: &[f64],
     sign: f64,
 ) -> Result<()> {
@@ -396,14 +401,14 @@ fn stamp_passive(
     }
 }
 
-impl Kernel for Bsim1Kernel {
-    type Prepared = Bsim1Prepared;
+impl Kernel for LegacyBsimKernel {
+    type Prepared = LegacyBsimPrepared;
 
     fn prepare(&self, values: &[f64], ambient_kelvin: f64) -> Result<Self::Prepared> {
         let prepared = prepare_instance(&self.model, values, ambient_kelvin)?;
         if Layout::new(&prepared.physical) != self.layout {
             return Err(Error::Unsupported(
-                "BSIM1 series-node edit requires new artifact",
+                "legacy BSIM series-node edit requires new artifact",
             ));
         }
         Ok(prepared)
@@ -416,7 +421,7 @@ impl Kernel for Bsim1Kernel {
         out: &mut Point<'_>,
     ) -> Result<()> {
         let orientation = self.layout.orientation(&prepared.physical, coordinates);
-        let intrinsic = evaluate_bsim1_intrinsic(&prepared.physical, orientation.bias)
+        let intrinsic = evaluate_legacy_bsim_intrinsic(&prepared.physical, orientation.bias)
             .map_err(|error| domain(&error))?;
         out.current.fill(0.);
         out.conductance.fill(0.);

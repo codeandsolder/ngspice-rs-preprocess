@@ -6,12 +6,30 @@
 //! No topology, history, model-name resolution or circuit rows belong here.
 
 mod bsim1;
+mod bsim2;
 mod coefficients;
 mod differential;
 
 pub use bsim1::{
-    BSIM1_REFERENCE_THERMAL_VOLTAGE, Bsim1Bias, Bsim1IntrinsicPoint, evaluate_bsim1_intrinsic,
+    BSIM1_REFERENCE_THERMAL_VOLTAGE, LegacyBsimBias, LegacyBsimIntrinsicPoint,
+    evaluate_bsim1_intrinsic,
 };
+
+pub use bsim2::evaluate_bsim2_intrinsic;
+
+/// Evaluate the selected legacy BSIM family without changing its physics.
+///
+/// # Errors
+/// Invalid bias or a nonrepresentable constitutive result.
+pub fn evaluate_legacy_bsim_intrinsic(
+    instance: &PreparedLegacyBsimInstance,
+    bias: LegacyBsimBias,
+) -> Result<LegacyBsimIntrinsicPoint, ModelError> {
+    match &instance.channel {
+        LegacyBsimChannel::Bsim1(_) => evaluate_bsim1_intrinsic(instance, bias),
+        LegacyBsimChannel::Bsim2(_) => evaluate_bsim2_intrinsic(instance, bias),
+    }
+}
 
 pub use coefficients::{Bsim1Coefficients, Bsim2Coefficients, LegacyBsimChannel};
 
@@ -393,6 +411,14 @@ impl PreparedLegacyBsimModel {
     ) -> Result<PreparedLegacyBsimInstance, ModelError> {
         if source.variant() != self.variant() || source.scope() != ParameterScope::Instance {
             return Err(ModelError::WrongModelScope);
+        }
+        if self.variant() == ModelVariant::Bsim2 {
+            let partition = self.real("xpart")?;
+            if partition != 0. && partition.to_bits() != 1.0f64.to_bits() {
+                return Err(ModelError::InvalidPhysicalParameter(
+                    "BSIM2 xpart must be 0 or 1",
+                ));
+            }
         }
         let geometry = self.geometry(source)?;
         let tox = positive(self.real("tox")?, "tox")?;

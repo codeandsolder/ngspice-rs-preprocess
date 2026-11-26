@@ -8,14 +8,11 @@ Rust MIT license. See the package [`LICENSE`](LICENSE) and the repository's
 
 ## Exact scope
 
-The crate binds **source-defined model and instance parameters**, without
-running the physical compact-model equations. It **does not** yet provide nonlinear
-currents, terminal charges, capacitance Jacobians, noise, thermal dynamics,
-solver topology or solver-ready native device kernels. Source-derived
+The crate binds **source-defined model and instance parameters** and implements family-specific physical subkernels. BSIM1 and BSIM2 provide nonlinear intrinsic currents, conservative terminal charges, and analytic Jacobians; their complete generalized residual/charge/noise assembly is in [model-kernel-bsim](../model-kernel-bsim/). Other families have their own explicitly documented implementation boundaries. Source-derived
 **BSIMSOI 4.x and HiSIM-HV1/HV2 model setup defaults** are implemented.
 HiSIM-HV1/HV2 additionally have source-derived **instance defaults, binning,
 metallurgical channel geometry and leading temperature-dependent bandgap,
-thermal-voltage and carrier-density inputs**. Legacy BSIM1/2 have complete model defaults and size-dependent preparation; other families still need dedicated setup and per-instance preparation.
+thermal-voltage and carrier-density inputs**. Legacy BSIM1/2 have complete model defaults, size-dependent preparation and intrinsic constitutive laws.
 `ModelVariant::KERNEL_STATUS` explicitly advertises `NotImplemented`. Downstream
 must not substitute generic MOS laws for these devices or interpret successfully
 bound parameters as physical model support.

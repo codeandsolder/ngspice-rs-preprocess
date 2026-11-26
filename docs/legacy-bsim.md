@@ -54,7 +54,7 @@ Existing v3.3 numerical evidence includes `c_bsim3_dc_reference`,
 BSIM3 unit and integration suites. Native BSIM4 remains a separate,
 extensively tested 4.8.x device and is not an alias for BSIM3.
 
-The catalogs are an input schema only. BSIM1 and BSIM2 additionally have immutable model and size-dependent instance preparation (see below). BSIM1 has a generalized physical artifact in `model-kernel-bsim`; BSIM2 channel evaluation remains a separate stage. Neither is registered in the consuming solver yet. In particular the
+The catalogs are an input schema only. BSIM1 and BSIM2 additionally have immutable model and size-dependent instance preparation (see below). BSIM1 and BSIM2 have distinct constitutive laws in a shared generalized physical artifact in `model-kernel-bsim`. Neither is registered in the consuming solver yet. In particular the
 new v33 input metadata does not transfer ownership of the existing
 working solver implementation. The producer should eventually own
 immutable physical preparation, while the consuming solver continues
@@ -138,11 +138,7 @@ values, while the transient load recomputes overlap using drawn width
 and corrected length. A single generalized charge law must not switch
 geometry based on analysis kind. Resolve that explicitly at kernel
 integration and qualify AC and transient against independent physical
-derivatives, distinguishing the native reference discrepancy. BSIM2
-also declares XPART as a real but reads the integer member of IFvalue;
-the raw source value remains in the model block, pending a physically
-qualified charge-mode contract. No alternate B2 charge mode is inferred
-from the union representation.
+derivatives, distinguishing the native reference discrepancy. BSIM2 also declares XPART as a real but reads the integer member of IFvalue. The physical kernel accepts the documented boolean values 0 and 1, which use the same conservative charge law; arbitrary bit-pattern interpretations are rejected.
 
 Verification: 3 nontrivial parameter/geometry cases per family compare
 261 size-dependent values against the actual C setters and temperature
@@ -182,3 +178,24 @@ The artifact intentionally does not reproduce these upstream inconsistencies:
   noise-probe.cir reproduces the native discrepancy; noise-dc.cir measures
   the physical current and gate derivative independently, which the
   source-density tests use at three frequencies.
+
+## BSIM2 artifact
+
+BSIM2 retains its separate model-temperature law, voltage-domain bounds,
+cubic-Hermite weak-inversion transition, mobility/interpolation function,
+impact ionization and channel charge equations. The cubic is evaluated in
+dimensionless endpoint coordinates, and derivatives follow the actual
+constitutive function, including its voltage clamps. The model's VBB
+bound is retained even when the source default is positive. The native
+positive drain-current numerical floor is not a physical source and is
+not included in the zero-current limit.
+
+The same stack-only differentiation and generalized branch assembly used
+for BSIM1 support BSIM2 without substituting its channel equations.
+There are 448 additional direct C operating-point/charge witnesses,
+another 180 independent derivative probes, and 16 additional native
+circuit operating points. The shared artifact tests exercise both model
+families, both orientations and polarities and optional series nodes.
+Native solver registration and family-specific limiting/convergence
+integration remain separate consumer work. Older BSIM3 revisions and
+additional v3.3 modes remain separate, coordinated physical-port work.

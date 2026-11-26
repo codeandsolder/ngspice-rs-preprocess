@@ -16,7 +16,7 @@ pub const BSIM1_REFERENCE_THERMAL_VOLTAGE: f64 = 1.380_648_52e-23 * 300.15 / 1.6
 /// Polarity-normalized bias with drain >= source. The caller chooses the
 /// intrinsic orientation before evaluating and maps the terminal rows back.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Bsim1Bias {
+pub struct LegacyBsimBias {
     /// Drain minus source voltage.
     pub vds: f64,
     /// Gate minus source voltage.
@@ -28,7 +28,7 @@ pub struct Bsim1Bias {
 /// Per-device intrinsic current/charge at a normalized bias. The derivative
 /// columns are Vds, Vgs, Vbs; the charge rows are drain, gate, source, bulk.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Bsim1IntrinsicPoint {
+pub struct LegacyBsimIntrinsicPoint {
     /// Channel drain current in amperes, before the parallel multiplier.
     pub drain_current: f64,
     /// Exact partial derivatives of channel current, in siemens.
@@ -39,7 +39,7 @@ pub struct Bsim1IntrinsicPoint {
     pub capacitance: [[f64; 3]; 4],
     /// Bias-dependent normalized threshold.
     pub threshold: f64,
-    /// Current-law saturation voltage.
+    /// Reported saturation voltage (BSIM2 may recompute it for charge).
     pub saturation_voltage: f64,
 }
 
@@ -51,7 +51,7 @@ struct Coordinates {
 }
 
 impl Coordinates {
-    const fn new(bias: Bsim1Bias) -> Self {
+    const fn new(bias: LegacyBsimBias) -> Self {
         Self {
             drain: Jet::coordinate(bias.vds, 0),
             gate: Jet::coordinate(bias.vgs, 1),
@@ -215,8 +215,8 @@ fn charge(c: &Bsim1Coefficients, x: Coordinates, s: Surface, oxide: f64) -> [Jet
 /// Wrong family, nonfinite/incorrectly oriented bias or invalid physical result.
 pub fn evaluate_bsim1_intrinsic(
     instance: &PreparedLegacyBsimInstance,
-    bias: Bsim1Bias,
-) -> Result<Bsim1IntrinsicPoint, ModelError> {
+    bias: LegacyBsimBias,
+) -> Result<LegacyBsimIntrinsicPoint, ModelError> {
     let LegacyBsimChannel::Bsim1(c) = &instance.channel else {
         return Err(ModelError::WrongModelScope);
     };
@@ -244,7 +244,7 @@ pub fn evaluate_bsim1_intrinsic(
             "nonfinite BSIM1 channel evaluation",
         ));
     }
-    Ok(Bsim1IntrinsicPoint {
+    Ok(LegacyBsimIntrinsicPoint {
         drain_current: current.value,
         conductance: current.gradient,
         charge: charge.map(|q| q.value),

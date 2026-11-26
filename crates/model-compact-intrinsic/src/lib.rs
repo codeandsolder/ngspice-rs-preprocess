@@ -11,10 +11,11 @@ mod legacy_bsim;
 
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use legacy_bsim::{
-    BSIM1_REFERENCE_THERMAL_VOLTAGE, Bsim1Bias, Bsim1Coefficients, Bsim1IntrinsicPoint,
-    Bsim2Coefficients, LegacyBsimChannel, LegacyBsimGeometry, LegacyBsimJunction,
+    BSIM1_REFERENCE_THERMAL_VOLTAGE, Bsim1Coefficients, Bsim2Coefficients, LegacyBsimBias,
+    LegacyBsimChannel, LegacyBsimGeometry, LegacyBsimIntrinsicPoint, LegacyBsimJunction,
     LegacyBsimJunctionLaw, LegacyBsimOverlap, PreparedLegacyBsimInstance, PreparedLegacyBsimModel,
-    evaluate_bsim1_intrinsic, prepare_legacy_bsim_model,
+    evaluate_bsim1_intrinsic, evaluate_bsim2_intrinsic, evaluate_legacy_bsim_intrinsic,
+    prepare_legacy_bsim_model,
 };
 
 pub use hv::{
