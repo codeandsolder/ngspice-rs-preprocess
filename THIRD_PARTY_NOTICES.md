@@ -130,3 +130,8 @@ The HiSIM2 setup, defaults, binning and topology in `crates/model-compact-intrin
 ## BSIM3SOI FD/DD 2.1 and PD 2.2.3
 
 The source-order defaults, size preparation and geometry in `crates/model-compact-intrinsic/src/bsim3soi` follow ngspice 47 BSIM3SOI FD/DD (copyright 1999 Regents of the University of California) and PD (copyright 1990 Regents of the University of California). Original author and modification notices and modified BSD terms are reproduced in [the package LICENSE](crates/model-compact-intrinsic/LICENSE).
+
+
+## STAG 2.7 (SOI3 level 60)
+
+The SOI3 electrostatic, thermal and instance preparation follows STAG version 2.7, copyright 2000 owned by the UK Secretary of State for Defence acting through the Defence Evaluation and Research Agency (DERA), developed by Jim Benson and colleagues at the University of Southampton. The original copyright and DERA royalty-free use/distribution terms from ngspice `src/spicelib/devices/soi3/README` are reproduced in [the package LICENSE](crates/model-compact-intrinsic/LICENSE). The repository MIT licence does not supersede the STAG terms.

@@ -9,6 +9,8 @@ mod catalog;
 mod defaults;
 pub mod hisim2;
 mod hv;
+mod preparation;
+pub mod soi3;
 
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use hv::{

@@ -1,7 +1,8 @@
 //! Source setup and size-bin arithmetic for the three BSIM3SOI implementations.
 //! Copyright 1999/1990 Regents of the University of California. See package LICENSE.
 
-use super::{PreparedModel, default, integer, positive, real, rules, slot};
+use super::{PreparedModel, rules};
+use crate::preparation::{default, integer, positive, real, slot};
 use crate::{BoundParameters, ModelError, ModelVariant, ParameterScope, ParameterValue};
 
 /// The additional geometry used only by the partially depleted implementation.

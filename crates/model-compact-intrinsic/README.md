@@ -856,3 +856,36 @@ Eight size-derived model fields are intentionally deferred. Native showmod
 values are compared only where the source exposes a usable getter.
 
 Source references: `bsim3soi_{fd,dd,pd}/b3soi{fd,dd,pd}{set,mpar,par,temp,mask}.c`.
+
+
+### STAG SOI3 2.7 preparation
+
+`soi3::prepare_model` derives nominal film and surface-state capacitance,
+mobility/KP, doping-derived surface potential, body factors and flat-band
+voltages; it preserves explicit VT0/VTEX precedence and the source's
+LAMBDA versus LX/VP/MEXP mode selection. TOF, TOB and TB are mandatory.
+CHID/CHID1 are deferred until the instance temperature is known.
+
+`soi3::prepare_instance` takes circuit geometry and ambient-temperature
+defaults. It resolves source/drain series conductance by explicit RD/RS,
+then RSH and squares, then width-scaled RDW/RSW. The source's explicit zero
+precedence is retained; topology is based on the effective conductance,
+rather than creating an unconnected prime node. Thermal area uses drawn
+dimensions before LD correction. Explicit instance RT/CT override the
+model's explicit RTA/CTA scaling, otherwise material parameters set the
+values. Up to five thermal ladder sections stop at the first zero RT;
+resistance divides by M and capacitance multiplies by M. RT=0 requires
+a thermal-ground constraint; an active ladder uses ambient circuit
+temperature even when instance TEMP is present.
+
+The temperature prelude retains native band-gap constants, thermal
+voltage, mobility, surface potential, front/back flat-band and threshold,
+saturation-current scaling, critical voltage and zero-bias junction
+capacitances. Absent CHID/CHID1 are instance-local instead of mutating
+the shared model. Conflicting overlapping vector/scalar IC assignments
+are rejected because the typed slot buffer does not encode input order.
+The API does not yet provide nonlinear terminal currents or charges.
+
+Source references: `soi3/{soi3set,soi3temp,soi3mpar,soi3par,soi3mask,soi3ask}.c`.
+STAG's separate DERA licence and original notices are in the package
+LICENSE.

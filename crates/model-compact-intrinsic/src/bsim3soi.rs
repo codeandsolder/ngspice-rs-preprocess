@@ -10,6 +10,8 @@ use crate::{
     BoundParameters, ModelError, ModelVariant, MosPolarity, ParameterScope, ParameterValue,
 };
 
+use crate::preparation::{assign, flag, given, integer, positive, real, value};
+
 const EPS_OX: f64 = 3.453_133e-11;
 // This release uses a truncated pi in the fringe-capacitance expression.
 const SOURCE_PI: f64 = 3_141_592_654.0 / 1e9;
@@ -35,79 +37,6 @@ struct Rule {
 impl Rule {
     const fn new(name: &'static str, expression: Expression) -> Self {
         Self { name, expression }
-    }
-}
-
-fn slot(p: &BoundParameters, name: &str) -> Result<u16, ModelError> {
-    p.variant()
-        .parameter(p.scope(), name)
-        .map(|spec| spec.slot)
-        .ok_or_else(|| ModelError::UnknownParameter(name.to_owned()))
-}
-
-fn value<'a>(p: &'a BoundParameters, name: &str) -> Result<&'a ParameterValue, ModelError> {
-    let id = slot(p, name)?;
-    p.get_slot(id)
-        .ok_or(ModelError::MissingDefaultDependency(id))
-}
-
-fn real(p: &BoundParameters, name: &str) -> Result<f64, ModelError> {
-    if let ParameterValue::Real(v) = value(p, name)? {
-        Ok(*v)
-    } else {
-        Err(ModelError::MissingDefaultDependency(slot(p, name)?))
-    }
-}
-
-fn integer(p: &BoundParameters, name: &str) -> Result<i32, ModelError> {
-    if let ParameterValue::Integer(v) = value(p, name)? {
-        Ok(*v)
-    } else {
-        Err(ModelError::MissingDefaultDependency(slot(p, name)?))
-    }
-}
-
-fn given(p: &BoundParameters, name: &str) -> Result<bool, ModelError> {
-    Ok(p.get_slot(slot(p, name)?).is_some())
-}
-
-fn flag(p: &BoundParameters, name: &str) -> Result<bool, ModelError> {
-    Ok(matches!(
-        p.get_slot(slot(p, name)?),
-        Some(ParameterValue::Flag(true))
-    ))
-}
-
-fn assign(p: &mut BoundParameters, name: &str, v: ParameterValue) -> Result<(), ModelError> {
-    let spec = p
-        .variant()
-        .parameter(p.scope(), name)
-        .ok_or_else(|| ModelError::UnknownParameter(name.to_owned()))?;
-    if spec.kind != v.kind() {
-        return Err(ModelError::WrongType {
-            name: name.to_owned(),
-            expected: spec.kind,
-        });
-    }
-    if !v.finite() {
-        return Err(ModelError::NonFinite(name.to_owned()));
-    }
-    p.values[usize::from(spec.slot)] = Some(v);
-    Ok(())
-}
-
-fn default(p: &mut BoundParameters, name: &str, v: ParameterValue) -> Result<(), ModelError> {
-    if !given(p, name)? {
-        assign(p, name, v)?;
-    }
-    Ok(())
-}
-
-fn positive(v: f64, name: &'static str) -> Result<f64, ModelError> {
-    if v.is_finite() && v > 0.0 {
-        Ok(v)
-    } else {
-        Err(ModelError::InvalidPhysicalParameter(name))
     }
 }
 
