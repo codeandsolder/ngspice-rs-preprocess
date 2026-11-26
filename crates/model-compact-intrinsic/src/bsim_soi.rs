@@ -3,8 +3,13 @@
 
 mod binning;
 mod geometry;
+mod temperature;
 
 pub use geometry::BsimSoiGeometry;
+pub use temperature::{
+    BsimSoiTemperaturePoint, BsimSoiThermalNetwork, BsimSoiThermalScalar,
+    PreparedBsimSoiTemperature,
+};
 
 use crate::{
     BoundParameters, ModelError, ModelVariant, ParameterScope, ParameterValue, PreparedBsimSoiModel,

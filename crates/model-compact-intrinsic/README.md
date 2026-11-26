@@ -116,6 +116,37 @@ independent size records, avoiding cross-instance reuse of incorrect
 dimensions. These are raw binned inputs, not final effective coefficients
 after temperature, stress, electrostatic and parameter-checking corrections.
 
+### BSIMSOI material and passive thermal preparation
+
+`PreparedBsimSoiSetup::prepare_temperature(index, ambient_kelvin)` resolves
+the selected instance and its final shared model, including size-binned
+channel/substrate doping and the native gamma1-derived channel doping
+rule. The immutable `PreparedBsimSoiTemperature` evaluates absolute-kelvin
+trial points without parameter-name lookup or state mutation. Silicon
+and generalized-material bandgap and intrinsic-density expressions
+preserve the different native ambient and live-heating normalizations.
+It returns analytic temperature partials of thermal voltage, bandgap,
+intrinsic density, surface and built-in potentials, sign-dependent
+backgate flatband, depletion width and depletion capacitance. Isothermal
+instances use the bound ambient and have zero local thermal partials.
+
+The passive heat residual and stored energy use the native
+Rth0/(Weff+Wth0)*NSEG/NF and Cth0*(Weff+Wth0)*NF/NSEG expressions,
+including parallel multiplicity M. Self-heating is active only on a
+resolved thermal node. The heat-port coordinate is absolute kelvin;
+the zero of stored heat and conductive heat is the bound ambient.
+Generated device heat is a separate physical contribution, not yet
+assembled by this preparation layer.
+
+The focused derivative test covers 96 temperature points across
+silicon/generalized material, both polarities, both substrate signs,
+three ambients and four rises. The opt-in native ngspice-47 passive
+thermal oracle independently compares 12 DC/AC circuits at zero
+electrical bias, including multiplicity, finger count, segmentation,
+thermal width and effective geometry. Run
+`cargo +nightly test -p model-compact-intrinsic --test bsim_soi_temperature -- --include-ignored`.
+
+
 Independent reference test: on Linux with ngspice 47 installed, run:
 
 ```sh

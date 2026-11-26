@@ -10,8 +10,9 @@ mod defaults;
 mod hv;
 
 pub use bsim_soi::{
-    BsimSoiBodyMode, BsimSoiGeometry, BsimSoiInstanceInput, BsimSoiNode, BsimSoiTopology,
-    PreparedBsimSoiInstance, PreparedBsimSoiSetup, PreparedBsimSoiSize, prepare_bsim_soi_setup,
+    BsimSoiBodyMode, BsimSoiGeometry, BsimSoiInstanceInput, BsimSoiNode, BsimSoiTemperaturePoint,
+    BsimSoiThermalNetwork, BsimSoiThermalScalar, BsimSoiTopology, PreparedBsimSoiInstance,
+    PreparedBsimSoiSetup, PreparedBsimSoiSize, PreparedBsimSoiTemperature, prepare_bsim_soi_setup,
 };
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use hv::{
