@@ -8,10 +8,12 @@ use crate::{
 };
 mod channel;
 mod channel_threshold;
+mod channel_transport;
 mod depleted;
 pub use channel::{PdChannelEvaluation, PdCurrent, PdLeakage, PreparedPdChannel};
 pub use depleted::{
-    DepletedBias, DepletedElectrostaticPoint, DepletedValue, PreparedDepletedElectrostatics,
+    DepletedBias, DepletedChannelEvaluation, DepletedElectrostaticPoint, DepletedValue,
+    PreparedDepletedChannel,
 };
 mod differential;
 mod junction;
@@ -142,8 +144,8 @@ pub struct PhysicalTemperature {
     pub junction_currents: PreparedJunctions,
     /// Channel transport evaluator for the partially depleted family.
     pub pd_channel: Option<PreparedPdChannel>,
-    /// Coupled depletion electrostatics for the FD/DD families.
-    pub depleted_electrostatics: Option<PreparedDepletedElectrostatics>,
+    /// Coupled depletion electrostatics and channel transport for the FD/DD families.
+    pub depleted_channel: Option<PreparedDepletedChannel>,
     /// Electrostatic state.
     pub electrostatics: Electrostatics,
     /// Drain/source gate overlap and backgate overlap capacitances, before M.
@@ -569,10 +571,14 @@ pub fn prepare_temperature(
     } else {
         None
     };
-    let depleted_electrostatics = if c.pd() {
+    let depleted_channel = if c.pd() {
         None
     } else {
-        Some(PreparedDepletedElectrostatics::prepare(&c, electrostatics)?)
+        Some(PreparedDepletedChannel::prepare(
+            &c,
+            electrostatics,
+            transport,
+        )?)
     };
     Ok(PhysicalTemperature {
         material,
@@ -580,7 +586,7 @@ pub fn prepare_temperature(
         junctions: density.ambient(&c)?,
         junction_currents,
         pd_channel,
-        depleted_electrostatics,
+        depleted_channel,
         electrostatics,
         substrate_charge,
         overlaps: overlaps(&c)?,

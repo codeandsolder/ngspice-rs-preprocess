@@ -1,18 +1,18 @@
-//! FD/DD 2.1 body electrostatics, including the coupled backgate.
+//! FD/DD 2.1 coupled body electrostatics and channel transport.
 //! Copyright 1999 Regents of the University of California. See package LICENSE.
 
 use super::{
-    CHARGE, Context, EPS_SI, Electrostatics, K_OVER_Q,
+    CHARGE, Context, EPS_SI, Electrostatics, K_OVER_Q, Transport,
     channel::intrinsic_density,
     channel_threshold::{
         Threshold, ThresholdBias, ThresholdGeometry, ThresholdPoint, overdrive, poly_depletion,
     },
+    channel_transport::{
+        BulkParameters, ChannelTransport, TransportInput, effective_bulk, one_plus_nine,
+    },
     differential::Differential,
 };
-use crate::{
-    ModelError, ModelVariant,
-    preparation::{integer, positive},
-};
+use crate::{ModelError, ModelVariant, preparation::positive};
 
 type D = Differential<6>;
 
@@ -46,7 +46,9 @@ pub struct DepletedValue {
 impl DepletedValue {
     fn from_d(d: D) -> Result<Self, ModelError> {
         if !d.finite() {
-            return Err(ModelError::InvalidPhysicalParameter("FD/DD electrostatics"));
+            return Err(ModelError::InvalidPhysicalParameter(
+                "FD/DD constitutive evaluation",
+            ));
         }
         Ok(Self {
             value: d.value,
@@ -78,6 +80,27 @@ pub struct DepletedElectrostaticPoint {
     pub overdrive: DepletedValue,
     /// Depletion depth, in meters.
     pub depletion_depth: DepletedValue,
+}
+
+/// FD/DD intrinsic channel transport and complete depletion state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepletedChannelEvaluation {
+    /// Coupled frontgate/backgate electrostatics.
+    pub electrostatics: DepletedElectrostaticPoint,
+    /// Normalized intrinsic channel current in amperes, before M.
+    pub current: DepletedValue,
+    /// Effective channel width in meters.
+    pub width: DepletedValue,
+    /// Effective mobility in square meters per volt-second.
+    pub mobility: DepletedValue,
+    /// Saturation drain voltage.
+    pub saturation_voltage: DepletedValue,
+    /// Effective drain voltage.
+    pub effective_drain: DepletedValue,
+    /// Bias-dependent intrinsic resistance in ohms.
+    pub resistance: DepletedValue,
+    /// Effective bulk factor including FD/DD body coupling.
+    pub bulk_factor: DepletedValue,
 }
 
 /// FD/DD model-specific silicon-film and backgate coupling coefficients.
@@ -114,19 +137,64 @@ impl Film {
     }
 }
 
+/// FD/DD accumulation/depletion mixing law, not the PD bulk equation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DepletedBulk {
+    common: BulkParameters,
+    abp: f64,
+    mxc: f64,
+    adice0: f64,
+}
+
+impl DepletedBulk {
+    fn prepare(c: &Context<'_>) -> Result<Self, ModelError> {
+        Ok(Self {
+            common: BulkParameters::prepare(c)?,
+            abp: c.binned("abp")?,
+            mxc: c.binned("mxc")?,
+            adice0: c.model("adice0")?,
+        })
+    }
+
+    fn evaluate(
+        &self,
+        prepared: &PreparedDepletedChannel,
+        bias: &Trial,
+        body: &InternalBody,
+        point: &ThresholdPoint<6>,
+        drive: D,
+    ) -> D {
+        let raw = if self.common.a0 == 0.0 {
+            D::constant(0.0)
+        } else {
+            self.common
+                .base(&prepared.geometry, point.depth, drive)
+                .scale(0.5 * prepared.electrostatics.k1 / bias.phi.sqrt())
+        };
+        let abulk = D::constant(1.0)
+            + effective_bulk(raw) / one_plus_nine(body.effective.scale(self.common.keta));
+        let coupling = body.coupling / (drive + bias.thermal.scale(2.0)).scale(self.abp);
+        let mix = D::constant(1.0) - smooth_positive(D::constant(0.8) - coupling, 0.04);
+        let x = (mix * mix).scale(self.mxc) + mix.scale(1.0 - self.mxc);
+        let cbox = prepared.film.box_cap;
+        let csi = prepared.film.cap;
+        let adice = self.adice0 / (1.0 + cbox * csi / (cbox + csi) / prepared.geometry.oxide);
+        x * abulk + (D::constant(1.0) - x).scale(adice)
+    }
+}
+
 /// Prepared fully/dynamically depleted channel electrostatics.
 ///
 /// FD and DD share the source's coupled backgate threshold equations, but
 /// retain different internal diode-body potential laws.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PreparedDepletedElectrostatics {
+pub struct PreparedDepletedChannel {
     electrostatics: Electrostatics,
     threshold: Threshold,
     geometry: ThresholdGeometry,
     film: Film,
-    nominal: f64,
-    ambient: f64,
-    selfheat: bool,
+    transport: ChannelTransport,
+    bulk: DepletedBulk,
     fd: bool,
     nsub: f64,
     voff: f64,
@@ -172,19 +240,19 @@ fn limit_upper(value: D, limit: f64, square: f64) -> D {
     D::constant(limit) - smooth_positive(D::constant(limit - 0.005) - value, square)
 }
 
-impl PreparedDepletedElectrostatics {
+impl PreparedDepletedChannel {
     pub(super) fn prepare(
         c: &Context<'_>,
         electrostatics: Electrostatics,
+        transport: Transport,
     ) -> Result<Self, ModelError> {
         Ok(Self {
             electrostatics,
             threshold: Threshold::prepare(c)?,
             geometry: ThresholdGeometry::prepare(c, electrostatics)?,
             film: Film::prepare(c, electrostatics)?,
-            nominal: positive(c.model("tnom")?, "tnom")?,
-            ambient: c.material.kelvin,
-            selfheat: integer(c.model.parameters(), "shmod")? == 1 && c.instance("rth0")? != 0.0,
+            transport: ChannelTransport::prepare(c, transport)?,
+            bulk: DepletedBulk::prepare(c)?,
             fd: c.model.parameters().variant() == ModelVariant::Bsim3SoiFd,
             nsub: c.binned("nsub")?,
             voff: c.binned("voff")?,
@@ -206,7 +274,7 @@ impl PreparedDepletedElectrostatics {
     /// # Errors
     /// Invalid temperature or surface potential.
     pub fn accepted_surface_potential(&self, kelvin: f64) -> Result<f64, ModelError> {
-        if !self.selfheat {
+        if !self.transport.temperature.selfheat {
             return Ok(self.electrostatics.phi);
         }
         let temperature = D::constant(positive(kelvin, "accepted temperature")?);
@@ -228,18 +296,18 @@ impl PreparedDepletedElectrostatics {
                 "FD/DD normalized bias",
             ));
         }
-        let temperature = if self.selfheat {
+        let temperature = if self.transport.temperature.selfheat {
             D::variable(positive(bias.kelvin, "trial temperature")?, 5)
         } else {
-            D::constant(self.ambient)
+            D::constant(self.transport.temperature.ambient)
         };
-        let phi = if self.selfheat {
+        let phi = if self.transport.temperature.selfheat {
             positive(accepted_phi, "accepted phi")?
         } else {
             self.electrostatics.phi
         };
         let thermal = temperature.scale(K_OVER_Q);
-        let (built_in, back_flatband) = if self.selfheat {
+        let (built_in, back_flatband) = if self.transport.temperature.selfheat {
             let ni = intrinsic_density(temperature, thermal);
             let doping = self.electrostatics.channel_doping;
             let built_in = thermal * (D::constant(1e20 * doping) / (ni * ni)).ln();
@@ -269,7 +337,8 @@ impl PreparedDepletedElectrostatics {
             backgate: D::variable(bias.ves, 3),
             contact: D::variable(bias.vps, 4),
             thermal,
-            ratio_delta: temperature.scale(self.nominal.recip()) - D::constant(1.0),
+            ratio_delta: temperature.scale(self.transport.temperature.nominal.recip())
+                - D::constant(1.0),
             built_in,
             back_flatband,
             phi,
@@ -293,7 +362,7 @@ impl PreparedDepletedElectrostatics {
 
     fn equilibrium(&self, bias: &Trial) -> Equilibrium {
         let exponent = -self.dvbd[1] * self.geometry.length / self.electrostatics.lateral_length;
-        let shift = self.dvbd[0] * ((0.5 * exponent).exp() + 2.0 * exponent.exp());
+        let shift = self.dvbd[0] * 2.0_f64.mul_add(exponent.exp(), (0.5 * exponent).exp());
         let thermal_body =
             D::constant(bias.phi - 0.5 * self.film.charge / self.film.cap + self.vbsa)
                 + (bias.built_in - D::constant(bias.phi)).scale(shift);
@@ -358,7 +427,8 @@ impl PreparedDepletedElectrostatics {
         }
     }
 
-    /// Evaluate all coupled front/backgate body and threshold potentials.
+    /// Evaluate all coupled front/backgate body and threshold potentials
+    /// and intrinsic channel transport.
     ///
     /// Isothermal mode uses the prepared ambient coefficients; self-heated
     /// mode uses a frozen accepted surface potential with trial temperature.
@@ -369,7 +439,7 @@ impl PreparedDepletedElectrostatics {
         &self,
         bias: DepletedBias,
         accepted_phi: f64,
-    ) -> Result<DepletedElectrostaticPoint, ModelError> {
+    ) -> Result<DepletedChannelEvaluation, ModelError> {
         let trial = self.trial(bias, accepted_phi)?;
         let eq = self.equilibrium(&trial);
         let body = self.internal_body(&trial, &eq);
@@ -383,7 +453,22 @@ impl PreparedDepletedElectrostatics {
             self.geometry.oxide,
             34.0,
         );
-        Ok(DepletedElectrostaticPoint {
+        let bulk = self.bulk.evaluate(self, &trial, &body, &point, drive);
+        let transport = self.transport.evaluate(
+            &self.geometry,
+            &TransportInput {
+                drain: trial.drain,
+                thermal: trial.thermal,
+                ratio_delta: trial.ratio_delta,
+                root_delta: point.root - D::constant(trial.phi.sqrt()),
+                body: body.effective,
+                overdrive: drive,
+                threshold: point.threshold,
+                bulk,
+                width_factor: 2.0,
+            },
+        );
+        let electrostatics = DepletedElectrostaticPoint {
             gate_effective: DepletedValue::from_d(trial.gate)?,
             depleted_threshold: DepletedValue::from_d(eq.threshold)?,
             equilibrium_body: DepletedValue::from_d(body.equilibrium)?,
@@ -394,6 +479,16 @@ impl PreparedDepletedElectrostatics {
             threshold: DepletedValue::from_d(point.threshold)?,
             overdrive: DepletedValue::from_d(drive)?,
             depletion_depth: DepletedValue::from_d(point.depth)?,
+        };
+        Ok(DepletedChannelEvaluation {
+            electrostatics,
+            current: DepletedValue::from_d(transport.current)?,
+            width: DepletedValue::from_d(transport.width)?,
+            mobility: DepletedValue::from_d(transport.mobility)?,
+            saturation_voltage: DepletedValue::from_d(transport.saturation)?,
+            effective_drain: DepletedValue::from_d(transport.effective_drain)?,
+            resistance: DepletedValue::from_d(transport.resistance)?,
+            bulk_factor: DepletedValue::from_d(bulk)?,
         })
     }
 }

@@ -93,7 +93,7 @@ pub(super) struct ThresholdGeometry {
     pub oxide: f64,
     pub tox: f64,
     pub sign: f64,
-    electrostatics: Electrostatics,
+    pub(super) electrostatics: Electrostatics,
 }
 
 impl ThresholdGeometry {

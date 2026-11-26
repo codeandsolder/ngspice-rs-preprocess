@@ -6,14 +6,11 @@ mod threshold;
 mod transport;
 
 use super::channel_threshold::{Threshold, ThresholdGeometry};
+use super::channel_transport::{BulkParameters, ChannelTransport};
 use super::{Context, Electrostatics, K_OVER_Q, Transport, differential::Differential};
-use crate::{
-    ModelError,
-    preparation::{integer, positive},
-};
+use crate::{ModelError, preparation::positive};
 use leakage::Leakage;
 pub use leakage::{PdCurrent, PdLeakage};
-use transport::ChannelTransport;
 
 type D = Differential<4>;
 
@@ -71,30 +68,17 @@ pub(super) struct State {
     overdrive: D,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TemperatureCoefficients {
-    ambient: f64,
-    nominal: f64,
-    mobility_exponent: f64,
-    velocity_slope: f64,
-    resistance_slope: f64,
-    resistance_base: f64,
-    mobility_slopes: [f64; 3],
-    selfheat: bool,
-}
-
 /// Prepared PD channel evaluator with layout, electrostatics, and model coefficients.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreparedPdChannel {
     electrostatics: Electrostatics,
-    transport: Transport,
     threshold: Threshold,
     threshold_geometry: ThresholdGeometry,
     channel: ChannelTransport,
     leakage: Leakage,
-    temperature: TemperatureCoefficients,
+    bulk_params: BulkParameters,
+    ketas: f64,
     length: f64,
-    width: f64,
     oxide: f64,
     tox: f64,
     sign: f64,
@@ -110,30 +94,15 @@ impl PreparedPdChannel {
         transport: Transport,
     ) -> Result<Self, ModelError> {
         let geometry = c.instance.geometry();
-        let mut resistance_base = c.binned("rdsw")?;
-        if c.checked()? && resistance_base < 0.0 {
-            resistance_base = 0.0;
-        }
         Ok(Self {
             electrostatics,
-            transport,
             threshold: Threshold::prepare(c)?,
             threshold_geometry: ThresholdGeometry::prepare(c, electrostatics)?,
-            channel: ChannelTransport::prepare(c)?,
+            channel: ChannelTransport::prepare(c, transport)?,
             leakage: Leakage::prepare(c, transport.oxide_ratio)?,
-            temperature: TemperatureCoefficients {
-                ambient: c.material.kelvin,
-                nominal: positive(c.model("tnom")?, "tnom")?,
-                mobility_exponent: c.binned("ute")?,
-                velocity_slope: c.binned("at")?,
-                resistance_slope: c.binned("prt")?,
-                resistance_base,
-                mobility_slopes: [c.binned("ua1")?, c.binned("ub1")?, c.binned("uc1")?],
-                selfheat: integer(c.model.parameters(), "shmod")? == 1
-                    && c.instance("rth0")? != 0.0,
-            },
+            bulk_params: BulkParameters::prepare(c)?,
+            ketas: c.binned("ketas")?,
             length: geometry.length_m,
-            width: geometry.width_m,
             oxide: c.model.oxide_capacitance_f_per_m2(),
             tox: positive(c.model("tox")?, "tox")?,
             sign: c.sign(),
@@ -158,7 +127,7 @@ impl PreparedPdChannel {
     /// # Errors
     /// Nonpositive temperature or surface potential.
     pub fn accepted_surface_potential(&self, kelvin: f64) -> Result<f64, ModelError> {
-        if !self.temperature.selfheat {
+        if !self.channel.temperature.selfheat {
             return Ok(self.electrostatics.phi);
         }
         let temperature = D::constant(positive(kelvin, "accepted temperature")?);
@@ -192,18 +161,18 @@ impl PreparedPdChannel {
                 "PD normalized channel bias",
             ));
         }
-        let temperature = if self.temperature.selfheat {
+        let temperature = if self.channel.temperature.selfheat {
             D::variable(positive(kelvin, "channel temperature")?, 3)
         } else {
-            D::constant(self.temperature.ambient)
+            D::constant(self.channel.temperature.ambient)
         };
-        let phi = if self.temperature.selfheat {
+        let phi = if self.channel.temperature.selfheat {
             positive(accepted_phi, "accepted phi")?
         } else {
             self.electrostatics.phi
         };
         let thermal = temperature.scale(K_OVER_Q);
-        let built_in = if self.temperature.selfheat {
+        let built_in = if self.channel.temperature.selfheat {
             built_in(temperature, thermal, self.electrostatics.channel_doping)
         } else {
             D::constant(self.electrostatics.built_in_potential)
@@ -213,7 +182,8 @@ impl PreparedPdChannel {
             drain: D::variable(vds, 1),
             body: D::variable(vbs, 2),
             thermal,
-            ratio_delta: temperature.scale(self.temperature.nominal.recip()) - D::constant(1.0),
+            ratio_delta: temperature.scale(self.channel.temperature.nominal.recip())
+                - D::constant(1.0),
             built_in,
             phi,
         };

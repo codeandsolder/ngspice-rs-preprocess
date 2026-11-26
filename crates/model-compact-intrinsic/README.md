@@ -1018,7 +1018,7 @@ next surface potential from the last accepted temperature, without mutating
 trial state. The solver owns the predictor and source/drain reversal.
 
 The FD/DD 2.1 depletion electrostatic evaluator is exposed through
-`PhysicalTemperature.depleted_electrostatics`. It preserves the model-level
+`PhysicalTemperature.depleted_channel`. It preserves the model-level
 silicon film and buried-oxide capacitances, effective film correction, binned
 backgate coupling, equilibrium threshold, inversion-induced body-potential
 shift and the smoothed contact/diode/effective body potentials. FD takes the
@@ -1038,3 +1038,16 @@ including independently varying backgate and body-contact bias,
 self-heating, nonzero film correction and poly depletion. Negative
 substrate doping uses explicit K1/K2 (otherwise the native default
 gamma2 derivation is not real-valued).
+
+
+The FD/DD transport evaluator includes the distinct depleted bulk-coupling
+law, all three mobility modes, velocity saturation, bias-dependent resistance
+and output resistance. Common source-derived primitives are shared with PD.
+The independent native matrix verifies 46,332 scalar values and fourth-order
+finite-difference current derivatives, with maximum current deviation
+2.71e-19 A and derivative deviation 1.80e-14 S. The separately maintained DD
+C Jacobian differs from the derivative of its own current law in nondefault
+cases (maximum 8.71e-7 S in this matrix); the evaluator differentiates the
+constitutive law, as independently verified by native scalar perturbations.
+The full FD/DD electrostatics and transport derivative matrix checks 132,192
+values across six electrical and thermal coordinates.
