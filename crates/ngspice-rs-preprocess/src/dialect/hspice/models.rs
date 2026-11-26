@@ -7,7 +7,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
     linked_source::RootKind,
-    model_card::{ModelCard, ModelParameter, parse_model_card, parse_spice_constant},
+    model_card::{ModelCard, parse_assignments, parse_model_card, parse_spice_constant},
     parameter_scope::ModelLibrary,
 };
 use model_preprocess_simplis::{
@@ -109,12 +109,10 @@ pub fn lower(
             .card
             .parameters
             .retain(|field| !matches!(field.name.as_str(), "FC" | "FCS"));
-        for name in ["FC", "FCS"] {
-            selected.card.parameters.push(ModelParameter {
-                name: name.to_owned(),
-                expression: Some("0".to_owned()),
-            });
-        }
+        selected
+            .card
+            .parameters
+            .extend(parse_assignments("FC=0 FCS=0")?);
     }
     let native = selected.lower()?;
     let card = parse_model_card(&native, statement.first_line, &[])?;

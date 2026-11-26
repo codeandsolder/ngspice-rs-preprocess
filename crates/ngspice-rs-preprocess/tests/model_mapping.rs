@@ -1,3 +1,5 @@
+mod prepared_diode;
+
 use anyhow::{Context, Result, ensure};
 use model_preprocess_simplis::source_dialect::model_mapping::{Device, SelectionOrigin};
 use ngspice_rs_preprocess::analysis_plan::{Directive, Disposition};
@@ -49,8 +51,39 @@ fn execute(bundle: &PreparedBundle) -> Result<f64> {
         .parse()?)
 }
 
+// The selected level-1 law is no longer an ordinary ngspice D card.
+// Evaluate the prepared declaration with its actual kernel, while the
+// explicitly mapped level-3 case continues using the independent C oracle.
+fn execute_level1(bundle: &PreparedBundle) -> Result<f64> {
+    use model_kernel_diode::{Instance, MODEL_FAMILY, compile_simetrix};
+    use model_normalize_ngspice::model_card::{parse_model_cards, parse_spice_constant};
+    let cards = parse_model_cards(&bundle.primary.bytes)?;
+    let [model] = cards.as_slice() else {
+        anyhow::bail!("expected one model declaration")
+    };
+    ensure!(
+        model.family.eq_ignore_ascii_case(MODEL_FAMILY),
+        "lost prepared model identity"
+    );
+    let values = model
+        .parameters
+        .iter()
+        .map(|parameter| {
+            Ok((
+                parameter.name.as_str(),
+                parse_spice_constant(parameter.expression.as_deref().context("missing value")?)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let device = compile_simetrix(values)?.bind(Instance {
+        area: 10.,
+        ..Instance::default()
+    })?;
+    Ok(-device.evaluate(-5.)?.current)
+}
+
 #[test]
-fn map_changes_breakdown_current_and_does_not_leak_between_decks() -> Result<()> {
+fn map_selects_physical_backend_and_does_not_leak_between_decks() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.net");
     let content = "* diode breakdown\nVbias a 0 -5\nD1 a 0 dtest AREA=10\n.model dtest D(LEVEL=1 IS=1p BV=5 IBV=100u)\n";
@@ -63,8 +96,11 @@ fn map_changes_breakdown_current_and_does_not_leak_between_decks() -> Result<()>
     )?;
     let mapped = prepare(&req, &Options::default(), &Cancellation::default())?;
     assert_eq!(mapped.model_selections[0].mapping.device, Device::Diode3);
-    let ratio = execute(&mapped)? / execute(&baseline)?;
-    assert!((ratio - 10.).abs() < 0.002, "breakdown ratio {ratio}");
+    // At -BV, SIMetrix level 1 adds AREA*IBV to reverse transport
+    // leakage and gmin. Native level 3 uses a different avalanche law.
+    assert!((execute_level1(&baseline)? - (1e-3 + 10e-12 + 5e-12)).abs() < 1e-15);
+    assert!((execute(&mapped)? - 1e-3).abs() < 2e-8);
+    assert_ne!(baseline.primary.bytes, mapped.primary.bytes);
     fs::write(&root, format!("{content}.OPTIONS HSPICEMODELS=1\n.end\n"))?;
     let preset = prepare(&req, &Options::default(), &Cancellation::default())?;
     assert_eq!(
@@ -161,7 +197,9 @@ fn device_configuration_is_explicit_and_overridden_by_deck_map() -> Result<()> {
     );
     let fresh = prepare(&req, &Options::default(), &Cancellation::default())?;
     assert_eq!(fresh.model_selections[0].mapping.device, Device::Diode1);
-    assert!((execute(&configured)? / execute(&fresh)? - 10.).abs() < 0.002);
+    assert!((execute_level1(&fresh)? - (1e-3 + 10e-12 + 5e-12)).abs() < 1e-15);
+    assert!((execute(&configured)? - 1e-3).abs() < 2e-8);
+    assert_ne!(configured.primary.bytes, fresh.primary.bytes);
     fs::write(
         &root,
         "* test\nVbias a 0 -5\nD1 a 0 selected 10\n.model selected D LEVEL=1 IS=1p BV=5 IBV=100u\n.map ModelName=D Level=1 Device=Diode1\n.end\n",
@@ -247,5 +285,172 @@ fn indexed_library_cannot_change_the_global_device_mapping() -> Result<()> {
         .err()
         .context("indexed global map accepted")?;
     assert!(format!("{error:#}").contains("global .MAP"));
+    Ok(())
+}
+
+#[test]
+fn discrete_mos_model_selection_and_linked_binding_survive_compilation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.net");
+    let lib = dir.path().join("parts.lib");
+    // Level 7 with a discrete charge signature must select Level 17.
+    fs::write(
+        &lib,
+        "*#SIMETRIX\n.model selected NMOS (LEVEL=7 VTO=1 KP=.1 CGDMIN=1n LIMIT(VDS)=(*, 400))\n",
+    )?;
+    fs::write(
+        &root,
+        "* test\nVbias d 0 1\nVgate g 0 3\nM1 d g 0 0 selected M=3\n.end\n",
+    )?;
+    let req = request(&root, InputFormat::SimetrixDeck);
+    let mut raw = req.clone();
+    raw.libraries
+        .push(LibraryInput::Source(SourceInput::File(lib.clone())));
+    let admitted = prepare(&raw, &Options::default(), &Cancellation::default())?;
+    let compiled = prepare(
+        &request(&lib, InputFormat::SimetrixLibrary),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let mut cached = req;
+    cached
+        .libraries
+        .push(LibraryInput::Parsed(ParsedLibrary::from_json(
+            &compiled.primary.bytes,
+        )?));
+    let restored = prepare(&cached, &Options::default(), &Cancellation::default())?;
+    for bundle in [&admitted, &restored] {
+        let selection = bundle
+            .model_selections
+            .iter()
+            .find(|selection| selection.card.name.eq_ignore_ascii_case("selected"))
+            .context("missing model selection")?;
+        assert_eq!(selection.mapping.device, Device::Mos17);
+        assert_eq!(
+            selection.mapping.origin,
+            SelectionOrigin::LegacyMos17Signature
+        );
+        assert_eq!(selection.declared_level, Some(7));
+        assert!(
+            selection
+                .card
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name.eq_ignore_ascii_case("LIMIT(VDS)"))
+        );
+        let current = execute(bundle)?;
+        assert!(
+            (current + 0.45).abs() < 1e-8,
+            "linked Level 17 current {current}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn prepared_diode_identity_survives_local_models_and_source_parameter_expressions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.net");
+    fs::write(
+        &root,
+        "* local diode models
+.param sat=3p
+.model same D(IS={sat} RS=1)
+D0 a 0 same
+X1 a 0 cell params: local_is=2p
+X2 b 0 cell params: local_is=7p
+.subckt cell p n params: local_is=1p
+D1 p n same
+.model same D(IS {local_is} RS 2 T_ABS={27+1})
+.ends
+.end
+",
+    )?;
+    let bundle = prepare(
+        &request(&root, InputFormat::SimetrixDeck),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let source = prepared_diode::linked_library(&bundle)?;
+    let topology = source.instantiate(Default::default())?;
+    let models = source
+        .models
+        .iter()
+        .filter(|m| {
+            m.card
+                .family
+                .eq_ignore_ascii_case(model_kernel_diode::MODEL_FAMILY)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(models.len(), 2, "{text}");
+    let mut currents = Vec::new();
+    for frame in &topology.frames {
+        let model = models
+            .iter()
+            .find(|model| model.scope == frame.declaration)
+            .context("missing scoped prepared diode")?;
+        let overrides = frame
+            .overrides
+            .iter()
+            .map(|(name, value)| (frame.declaration, name.as_str(), *value))
+            .collect::<Vec<_>>();
+        let values = model
+            .card
+            .parameters
+            .iter()
+            .map(|p| {
+                Ok((
+                    p.name.as_str(),
+                    source.evaluate_scalar(
+                        model.scope,
+                        p.expression.as_deref().context("missing model value")?,
+                        &overrides,
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let diode = model_kernel_diode::compile_simetrix(values)?
+            .bind(model_kernel_diode::Instance::default())?;
+        currents.push(diode.evaluate(0.5)?.current);
+    }
+    assert_eq!(currents.len(), 3, "{text}");
+    assert!(
+        currents[1] < currents[0] && currents[0] < currents[2],
+        "{currents:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_selected_diode_fields_fail_without_native_fallback() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.net");
+    for fields in [
+        "LEVEL=2",
+        "LEVEL=1 N=0",
+        "LEVEL=1 T_ABS=-300",
+        "LEVEL=1 UNKNOWN_PHYSICS=1",
+    ] {
+        fs::write(
+            &root,
+            format!(
+                "* rejected model
+D1 a 0 dm
+.model dm D({fields})
+.end
+"
+            ),
+        )?;
+        assert!(
+            prepare(
+                &request(&root, InputFormat::SimetrixDeck),
+                &Options::default(),
+                &Cancellation::default()
+            )
+            .is_err(),
+            "{fields}"
+        );
+    }
     Ok(())
 }

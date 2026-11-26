@@ -179,7 +179,7 @@ fn instance_parameters(
         fields.insert(name.to_owned(), Some(token.to_owned()));
         consumed = span.end;
     }
-    for parameter in instance_fields(&tail[consumed..])? {
+    for parameter in instance_fields(&tail[consumed..], 3)? {
         let name = parameter.name.to_ascii_uppercase();
         ensure!(
             fields.insert(name.clone(), parameter.expression).is_none(),

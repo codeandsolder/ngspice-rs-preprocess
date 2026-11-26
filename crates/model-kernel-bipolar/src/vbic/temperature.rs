@@ -182,7 +182,7 @@ impl Nominal {
         Ok(Self { values: *values })
     }
 
-    #[must_use]
+    #[must_use = "the coefficient value is returned without modifying the parameter set"]
     pub const fn value(&self, parameter: Coefficient) -> f64 {
         self.values[parameter.index()]
     }
@@ -426,17 +426,17 @@ fn transformed_potential(
 }
 
 impl Prepared {
-    #[must_use]
+    #[must_use = "the coefficient value is returned without modifying the parameter set"]
     pub const fn value(&self, parameter: Coefficient) -> f64 {
         self.values[parameter.index()]
     }
 
-    #[must_use]
+    #[must_use = "the effective temperature is required by subsequent physical laws"]
     pub const fn temperature(self) -> Temperature {
         self.effective
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to the transport equations"]
     pub const fn transport_parameters(&self) -> transport::Parameters {
         transport::Parameters {
             is: self.value(Coefficient::Is),
@@ -456,7 +456,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to the depletion equations"]
     pub const fn depletion_parameters(&self) -> depletion::Parameters {
         depletion::Parameters {
             fc: self.value(Coefficient::Fc),
@@ -471,7 +471,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to the substrate depletion equations"]
     pub const fn substrate_parameters(&self) -> depletion::SubstrateParameters {
         depletion::SubstrateParameters {
             ps: self.value(Coefficient::Ps),
@@ -480,7 +480,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to the parasitic transistor equations"]
     pub const fn parasitic_parameters(&self) -> parasitic::Parameters {
         parasitic::Parameters {
             isp: self.value(Coefficient::Isp),
@@ -490,7 +490,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to the branch equations"]
     pub const fn branch_parameters(&self) -> super::Parameters {
         super::Parameters {
             ibei: self.value(Coefficient::Ibei),
@@ -514,7 +514,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to avalanche current evaluation"]
     pub const fn avalanche_parameters(&self) -> avalanche::Parameters {
         avalanche::Parameters {
             avc1: self.value(Coefficient::Avc1),
@@ -524,7 +524,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to the resistance equations"]
     pub const fn resistance_parameters(&self) -> resistance::Parameters {
         resistance::Parameters {
             rcx: self.value(Coefficient::Rcx),
@@ -540,7 +540,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to charge evaluation"]
     pub const fn charge_parameters(&self) -> charge::Parameters {
         charge::Parameters {
             transport: self.transport_parameters(),
@@ -566,7 +566,7 @@ impl Prepared {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned coefficients are inputs to noise evaluation"]
     pub const fn noise_parameters(&self) -> noise::Parameters {
         noise::Parameters {
             kfn: self.value(Coefficient::Kfn),

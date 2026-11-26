@@ -37,12 +37,28 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `native-library` | Native-compatible source library; link static includes and make include-safe | `model.lib` |
 | `hspice-deck` | Link standalone HSPICE sources and bind qualified parameter/model occurrences | `deck.cir` |
 | `hspice-library` | Compile a neutral HSPICE source graph for later deck binding | `library.json` |
+| `pspice-deck` | PSpice source deck with native lowering | `deck.cir` |
+| `pspice-library` | PSpice source library with native lowering | `model.lib` |
+| `tina-deck` | TINA/TINA-TI plaintext SPICE export, with local parameter normalization | `deck.cir` |
+| `tina-library` | TINA/TINA-TI plaintext SPICE macro source | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
 | `expanded-library` | Lower already expanded dialect source as an include | `model.lib` |
 | `simplis-library` | Compile a SIMPLIS library projection | `library.json` |
 | `simetrix-library` | Compile a SIMetrix library projection | `library.json` |
+
+TINA support targets plaintext SPICE exports, not TINA schematic/project
+or mixed-language macro containers. Export the electrical netlist first.
+The documented PSpice-style syntax uses the same source linker and lowering pipeline as the explicit PSpice dialect;
+a local `.PARAM` appended to a `.SUBCKT` header is split into a scoped
+directive without changing source location. Formal `PARAMS:` defaults are
+kept separate. Source metadata in comments remains intact. See
+[TI SLVA527](https://www.ti.com/lit/an/slva527/slva527.pdf) and
+[DesignSoft TINA manual](https://www.tina.com/docs/v12/Tina-v12-manual.pdf).
+The inline declaration is observed in the public ISO224X export discussion
+([reference](https://electronics.stackexchange.com/questions/518473/error-importing-third-party-model-to-ltspice-from-tina));
+the regression fixtures are independently authored and contain no vendor model text.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:
@@ -98,6 +114,19 @@ instances in model scope, preserving explicit instance TEMP precedence.
 A different nominal temperature requires preparing the source again.
 Statistical analyses and conflicting or multiple analysis temperatures
 are rejected rather than approximated by the nominal translation.
+
+SIMetrix discrete MOS level 17 cards use explicit absolute geometry and a
+native MOS level-1 channel and junction core, with series-resistance
+multiplicity and temperature binding. The nonlinear gate-drain capacitance
+is lowered as conserved terminal charge (not capacitance times voltage).
+Model references resolve across linked artifacts and lexical scopes; local
+native model declarations shadow inherited discrete MOS models. Independent
+DC, transient and complex AC measurements qualify both polarities,
+resistance temperature coefficients, multiplicity, and junction and gate
+charge. Native semiconductor constants differ slightly from the historical
+source constants. Unsupported geometry and nonconstant instance fields
+are rejected; source SOA annotations are retained as metadata, not enforced
+by the native MOS core.
 
 ### Standalone HSPICE
 
@@ -165,6 +194,17 @@ and selection origin. Model selections retain the admitted physical line
 span, including continuations. A new alias requires an explicit `LETTER`.
 The analysis plan records consumed model options with the
 `model_selection` disposition; native option emission skips them.
+Selected SIMetrix level-1 diodes are emitted as
+`.model <name> simetrix_diode_level1 (LEVEL=1 ...)`. This is a typed prepared-kernel family, not an alias for
+ordinary ngspice `D`. The consumer must bind the
+[measured level-1 kernel](crates/model-kernel-diode/) through the
+prepared-model ABI. Model fields retain their lexical expressions and
+temperature policies until instance-scoped evaluation. Literal model
+parameters are checked against the kernel schema during preparation;
+unknown physical fields and unsupported levels are rejected. Explicit
+level-3 selection still emits the native level-3 model, and native-deck
+preparation does not substitute the SIMetrix kernel for ordinary `D`.
+
 Selection identifies the intended physical implementation; it does not
 certify numerical equivalence of every parameter or geometry variant.
 Unsupported target implementations, versions, and access letters are

@@ -74,7 +74,7 @@ impl Device {
 
     /// Canonical source level; this is deliberately *not* an assertion
     /// that the target simulator implements this source variant.
-    #[must_use]
+    #[must_use = "the returned level identifies the source-model variant"]
     pub const fn source_level(self) -> u16 {
         match self {
             Self::Diode1 | Self::Resistor | Self::Mos1 | Self::GummelPoon => 1,
@@ -508,7 +508,7 @@ impl MappingTable {
     }
 
     /// True if unmodeled resistors select the HSPICE implementation.
-    #[must_use]
+    #[must_use = "the result selects the default resistor implementation"]
     pub fn hspice_default_resistor(&self) -> bool {
         let key = ModelKey {
             model_type: "R".into(),
@@ -590,7 +590,23 @@ impl MappingTable {
         if !known_family(&family) && !self.entries.keys().any(|key| key.model_type == family) {
             return Ok(None);
         }
-        let card = parse_model_card(text, line.first_line, &["LEVEL", "VERSION", "VLEVEL"])?;
+        let structural = ["LEVEL", "VERSION", "VLEVEL"];
+        let diode_fields;
+        let positional = if family == "D"
+            || self
+                .entries
+                .values()
+                .any(|mapping| mapping.key.model_type == family && mapping.device == Device::Diode1)
+        {
+            diode_fields = structural
+                .into_iter()
+                .chain(model_kernel_diode::SOURCE_PARAMETERS.iter().copied())
+                .collect::<Vec<_>>();
+            diode_fields.as_slice()
+        } else {
+            &structural
+        };
+        let card = parse_model_card(text, line.first_line, positional)?;
         let level = one(&card.parameters, "LEVEL")?;
         let vlevel = if matches!(family.as_str(), "NMOS" | "PMOS") {
             one(&card.parameters, "VLEVEL")?
@@ -725,7 +741,8 @@ impl ModelSelection {
         );
         let original_family = self.card.family.to_ascii_uppercase();
         let (family, level) = match device {
-            Diode1 | Diode3 => ("D", device.source_level()),
+            Diode1 => (model_kernel_diode::MODEL_FAMILY, 1),
+            Diode3 => ("D", device.source_level()),
             Resistor => ("R", 0),
             Mos1 | Mos2 | Mos3 | Mos17 | Bsim3Berkeley | Bsim4 => {
                 ensure!(
@@ -752,7 +769,7 @@ impl ModelSelection {
         // Unchanged cards retain their original spelling, including
         // vendor-specific fields interpreted by downstream lowerers.
         let needs_level = self.declared_level.is_some()
-            || device == Diode3
+            || matches!(device, Diode1 | Diode3)
             || self.mapping.origin != SelectionOrigin::Builtin;
         let native_version = self.effective_version.as_deref();
         let original_version = self.declared_version.as_deref();
@@ -792,6 +809,7 @@ impl ModelSelection {
 
     fn validate_native_variant(&self) -> Result<()> {
         match self.mapping.device {
+            Device::Diode1 => self.validate_diode1()?,
             Device::Diode3 => {
                 for field in &self.card.parameters {
                     ensure!(
@@ -825,6 +843,49 @@ impl ModelSelection {
                 );
             }
             _ => (),
+        }
+        Ok(())
+    }
+
+    fn validate_diode1(&self) -> Result<()> {
+        let mut numeric = Vec::new();
+        let mut resolved = true;
+        for parameter in &self.card.parameters {
+            if parameter.name.eq_ignore_ascii_case("LEVEL") {
+                // An explicitly mapped source level is not the kernel's
+                // physical selector; the emitted selector is always 1.
+                continue;
+            }
+            ensure!(
+                model_kernel_diode::SOURCE_PARAMETERS
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&parameter.name)),
+                "unsupported SIMetrix level-1 diode parameter {}",
+                parameter.name
+            );
+            let expression = parameter
+                .expression
+                .as_deref()
+                .with_context(|| format!("missing SIMetrix diode parameter {}", parameter.name))?;
+            if let Ok(value) = parse_spice_constant(expression) {
+                if ["T_ABS", "TNOM", "T_MEASURED"]
+                    .iter()
+                    .any(|name| parameter.name.eq_ignore_ascii_case(name))
+                {
+                    ensure!(
+                        value > -273.15,
+                        "invalid SIMetrix model temperature {value}"
+                    );
+                }
+                numeric.push((parameter.name.as_str(), value));
+            } else {
+                resolved = false;
+            }
+        }
+        // Validate complete literal declarations here; parameterized models
+        // must be compiled only after instance-scoped expression resolution.
+        if resolved {
+            model_kernel_diode::compile_simetrix(numeric)?;
         }
         Ok(())
     }

@@ -38,12 +38,12 @@ impl Temperature {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned absolute temperature is an input to physical model laws"]
     pub const fn kelvin(self) -> f64 {
         self.kelvin
     }
 
-    #[must_use]
+    #[must_use = "the returned voltage scales the temperature-dependent exponential laws"]
     pub const fn thermal_voltage(self) -> f64 {
         self.thermal_voltage
     }
