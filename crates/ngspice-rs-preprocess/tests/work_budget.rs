@@ -513,3 +513,82 @@ fn pspice_model_inheritance_shares_cumulative_resource_budget() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn qspice_legacy_decoding_charges_expansion_before_allocation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut bytes = b"* ".to_vec();
+    bytes.extend(std::iter::repeat_n(0x80, 4096));
+    bytes.extend_from_slice(b"\nR1 a 0 1k\n.end\n");
+    let req = Request {
+        format: InputFormat::QspiceDeck,
+        input: SourceInput::Bytes {
+            origin: dir.path().join("cp1252.cir"),
+            bytes: Arc::from(bytes),
+        },
+        libraries: Vec::new(),
+        search_paths: Vec::new(),
+    };
+    fails(
+        &req,
+        WorkLimits {
+            emitted_bytes: 8192,
+            ..WorkLimits::default()
+        },
+        "EmittedBytes budget exceeded",
+    )?;
+    let result = run(&req, WorkLimits::default())?;
+    let text = std::str::from_utf8(&result.primary.bytes)?;
+    assert_eq!(text.matches('€').count(), 4096);
+    Ok(())
+}
+
+#[test]
+fn qspice_symbolic_waveform_points_use_cumulative_node_budget() -> Result<()> {
+    use std::fmt::Write as _;
+    let dir = tempfile::tempdir()?;
+    let mut source = String::from("* waveform budget\n.param a=1\nV1 a 0 PWL(0 {a}");
+    for _ in 0..512 {
+        write!(source, " +1n {{a}}")?;
+    }
+    source.push_str(")\nR1 a 0 1k\n.end\n");
+    let req = request(dir.path(), InputFormat::QspiceDeck, &source);
+    fails(
+        &req,
+        WorkLimits {
+            generated_nodes: 256,
+            ..WorkLimits::default()
+        },
+        "GeneratedNodes budget exceeded",
+    )?;
+    let bundle = run(&req, WorkLimits::default())?;
+    assert_eq!(bundle.waveforms.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn expanded_analysis_plan_charges_scope_metadata() -> Result<()> {
+    use std::fmt::Write as _;
+    let dir = tempfile::tempdir()?;
+    let name = "A".repeat(1024);
+    let mut source = format!(".subckt {name} a b\n");
+    for index in 0..64 {
+        writeln!(source, ".save V(n{index})")?;
+    }
+    source.push_str("R1 a b 1k\n.ends\n.end\n");
+    let req = request(dir.path(), InputFormat::ExpandedDeck, &source);
+    fails(
+        &req,
+        WorkLimits {
+            emitted_bytes: 16_384,
+            ..WorkLimits::default()
+        },
+        "EmittedBytes budget exceeded",
+    )?;
+    let bundle = run(&req, WorkLimits::default())?;
+    let plan = bundle
+        .analysis_plan
+        .context("missing expanded analysis plan")?;
+    assert_eq!(plan.entries.len(), 64);
+    Ok(())
+}

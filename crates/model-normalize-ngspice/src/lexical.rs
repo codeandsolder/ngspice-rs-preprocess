@@ -241,25 +241,40 @@ pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
 /// Top-level whitespace and assignment separators, with balanced expression
 /// delimiters and quotes kept intact as a single token.
 pub fn tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
-    tokens_with_separator(text, false)
+    separated_tokens(text, Commas::Literal)
 }
 
+/// Keep top-level commas as tokens for dialects with comma-sensitive syntax.
 pub fn comma_tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
-    tokens_with_separator(text, true)
+    separated_tokens(text, Commas::Token)
 }
 
-fn tokens_with_separator(text: &[u8], comma: bool) -> Result<Vec<Range<usize>>> {
+/// Waveform arguments accept commas between balanced scalar fields.
+pub fn waveform_tokens(text: &[u8]) -> Result<Vec<Range<usize>>> {
+    separated_tokens(text, Commas::Separator)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Commas {
+    Literal,
+    Separator,
+    Token,
+}
+
+fn separated_tokens(text: &[u8], comma: Commas) -> Result<Vec<Range<usize>>> {
     let mut ranges = Vec::new();
     let mut start = None;
     let mut context = Context::default();
     let mut stack = Vec::new();
     for (i, &b) in text.iter().enumerate() {
         if context.quote.is_none() {
-            if stack.is_empty() && (b.is_ascii_whitespace() || b == b'=' || comma && b == b',') {
+            if stack.is_empty()
+                && (b.is_ascii_whitespace() || b == b'=' || comma != Commas::Literal && b == b',')
+            {
                 if let Some(begin) = start.take() {
                     ranges.push(begin..i);
                 }
-                if b == b'=' || comma && b == b',' {
+                if b == b'=' || comma == Commas::Token && b == b',' {
                     ranges.push(i..i + 1);
                 }
                 continue;
@@ -349,6 +364,53 @@ pub fn replace_span(
                 Vec::new()
             },
         ));
+    }
+}
+
+pub fn remove_spans(
+    statement: &Statement,
+    input: &[u8],
+    spans: &[Range<usize>],
+    edits: &mut Vec<Edit>,
+) {
+    let replacements = spans
+        .iter()
+        .map(|span| {
+            let start = statement.text[..span.start].trim_ascii_end().len();
+            (start..span.end, Vec::new())
+        })
+        .collect::<Vec<_>>();
+    replace_spans(statement, input, &replacements, edits);
+}
+
+/// Replace logical fields and comment wholly consumed continuations.
+pub fn replace_spans(
+    statement: &Statement,
+    input: &[u8],
+    replacements: &[Edit],
+    edits: &mut Vec<Edit>,
+) {
+    let mut removed = Vec::new();
+    for (span, replacement) in replacements {
+        let ranges = statement.source_ranges(span.clone());
+        for (index, range) in ranges.into_iter().enumerate() {
+            if index == 0 && !replacement.is_empty() {
+                edits.push((range, replacement.clone()));
+            } else {
+                removed.push(range.clone());
+                edits.push((range, Vec::new()));
+            }
+        }
+    }
+    for (plus, code) in &statement.continuations {
+        if input[code.clone()].iter().enumerate().all(|(i, byte)| {
+            byte.is_ascii_whitespace()
+                || removed
+                    .iter()
+                    .any(|range| range.contains(&(code.start + i)))
+        }) {
+            edits.push((*plus..*plus + 1, vec![b'*']));
+        }
     }
 }
 

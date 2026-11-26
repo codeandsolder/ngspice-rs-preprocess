@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) mod declarations;
 pub mod topology;
 
 #[derive(Clone, Debug)]

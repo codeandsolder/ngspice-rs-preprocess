@@ -354,6 +354,7 @@ impl Parsed {
             scope: scope.to_vec(),
             source: self.name.clone(),
             spec: self.spec.clone(),
+            dc_override: None,
             idle_in_pop: self.idle_in_pop.clone(),
         }
     }

@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::linked_source::{
     external_library_reference, select_named_section_lines,
 };
-use model_preprocess_command::AdmissionConfig;
+use model_preprocess_command::{AdmissionConfig, WorkBudget};
 use model_preprocess_simplis::source_dialect::{
     DeviceIdentity, DialectContext, ScopedStatement, SourceKind,
     model_mapping::{DeviceConfiguration, MappingTable, ModelSelection},
@@ -989,7 +989,9 @@ pub fn prepare(
         | InputFormat::TinaDeck
         | InputFormat::TinaLibrary
         | InputFormat::PspiceDeck
-        | InputFormat::PspiceLibrary => {
+        | InputFormat::PspiceLibrary
+        | InputFormat::QspiceDeck
+        | InputFormat::QspiceLibrary => {
             bail!("native input is not a dialect translation request")
         }
     }
