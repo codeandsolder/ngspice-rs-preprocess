@@ -53,6 +53,7 @@ model-normalize-ngspice = { path = "crates/model-normalize-ngspice", version = "
 model-prepare-osdi = { path = "crates/model-prepare-osdi", version = "=0.1.0" }
 model-preprocess-command = { path = "crates/model-preprocess-command", version = "=0.1.0" }
 model-preprocess-simplis = { path = "crates/model-preprocess-simplis", version = "=0.1.0" }
+model-statistics = { path = "crates/model-statistics", version = "=0.1.0" }
 model-touchstone = { path = "crates/model-touchstone", version = "=0.1.0" }
 model-translate-simplis = { path = "crates/model-translate-simplis", version = "=0.1.0" }
 
