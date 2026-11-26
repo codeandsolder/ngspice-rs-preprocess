@@ -193,6 +193,17 @@ external-series mode); 432 native silicon model-card comparisons validate
 intrinsic current and saturation voltage across both polarities, all
 three depletion modes, four mobility modes, and heating/reversal.
 
+### BSIMSOI gate-induced junction leakage
+
+`prepare_gate_induced_leakage` binds both GIDLMOD formulations with
+asymmetric size-dependent GIDL/GISL coefficients, oxide/material scaling,
+native poly depletion and body-field corrections. Signed currents into
+physical drain and source are scaled by NF and M; all five physical
+partials follow the same constitutive function. Ideal FD disables both
+branches. Both 192-case finite-difference and 192-case native DC
+matrices pass, including silicon/generalized materials and reversed
+source/drain.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds

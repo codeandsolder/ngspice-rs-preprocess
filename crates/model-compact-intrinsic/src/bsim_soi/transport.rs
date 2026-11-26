@@ -162,6 +162,9 @@ pub struct PreparedBsimSoiTransport {
 }
 
 impl PreparedBsimSoiTransport {
+    pub(super) const fn source_drain_flatband(&self) -> f64 {
+        self.flatband
+    }
     #[must_use = "stress offsets are applied to the ambient electrostatic coefficients"]
     pub fn stress_offsets(&self) -> BsimSoiStressOffsets {
         self.stress

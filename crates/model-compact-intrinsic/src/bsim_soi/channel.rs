@@ -3,6 +3,8 @@
 mod current;
 pub use current::{BsimSoiDrainChannelPoint, PreparedBsimSoiDrainChannel};
 mod fd;
+mod leakage;
+pub use leakage::{BsimSoiGateInducedLeakage, PreparedBsimSoiGateInducedLeakage};
 mod jet;
 mod threshold;
 

@@ -12,16 +12,16 @@ mod hv;
 pub use bsim_soi::{
     BsimSoiBodyMode, BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar,
     BsimSoiCollectorCurrent, BsimSoiDrainChannelPoint, BsimSoiElectrostaticBase,
-    BsimSoiElectrostaticPoint, BsimSoiExternalSeries, BsimSoiGeometry, BsimSoiInstanceInput,
-    BsimSoiInternalResistance, BsimSoiJunctionCharge, BsimSoiJunctionCharges,
+    BsimSoiElectrostaticPoint, BsimSoiExternalSeries, BsimSoiGateInducedLeakage, BsimSoiGeometry,
+    BsimSoiInstanceInput, BsimSoiInternalResistance, BsimSoiJunctionCharge, BsimSoiJunctionCharges,
     BsimSoiJunctionCurrent, BsimSoiJunctionDensities, BsimSoiJunctionPoint, BsimSoiJunctionSide,
     BsimSoiJunctionStorage, BsimSoiNeutralBody, BsimSoiNode, BsimSoiSeriesBias,
     BsimSoiSeriesConductance, BsimSoiSeriesParameters, BsimSoiStressOffsets,
     BsimSoiTemperaturePoint, BsimSoiThermalNetwork, BsimSoiThermalScalar, BsimSoiTopology,
     BsimSoiTransportPoint, PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
-    PreparedBsimSoiElectrostatics, PreparedBsimSoiInstance, PreparedBsimSoiJunctions,
-    PreparedBsimSoiSetup, PreparedBsimSoiSize, PreparedBsimSoiTemperature,
-    PreparedBsimSoiTransport, prepare_bsim_soi_setup,
+    PreparedBsimSoiElectrostatics, PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiInstance,
+    PreparedBsimSoiJunctions, PreparedBsimSoiSetup, PreparedBsimSoiSize,
+    PreparedBsimSoiTemperature, PreparedBsimSoiTransport, prepare_bsim_soi_setup,
 };
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use hv::{

@@ -12,7 +12,8 @@ mod transport;
 
 pub use channel::{
     BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, BsimSoiDrainChannelPoint,
-    PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
+    BsimSoiGateInducedLeakage, PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
+    PreparedBsimSoiGateInducedLeakage,
 };
 pub use electrostatics::{
     BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint, PreparedBsimSoiElectrostatics,

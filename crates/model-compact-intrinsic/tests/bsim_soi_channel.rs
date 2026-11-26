@@ -437,3 +437,203 @@ fn native_intrinsic_drain_current() -> TestResult {
     }
     Ok(())
 }
+
+const GIDL_CARD: &str = "agidl=1e-8 bgidl=2e7 cgidl=.1 egidl=.15 rgidl=.9 kgidl=.2 fgidl=.8 agisl=3e-8 bgisl=3e7 cgisl=.2 egisl=.05 rgisl=.8 kgisl=.3 fgisl=.7";
+
+fn leakage_setup(
+    pmos: bool,
+    heat: bool,
+    soi: i32,
+    mode: i32,
+    material: bool,
+) -> Result<model_compact_intrinsic::PreparedBsimSoiGateInducedLeakage, Box<dyn std::error::Error>>
+{
+    let sign = if pmos { -1. } else { 1. };
+    let card: Vec<_> = CARD
+        .split_whitespace()
+        .chain(GIDL_CARD.split_whitespace())
+        .map(|part| -> Result<_, Box<dyn std::error::Error>> {
+            let (name, value) = part.split_once('=').ok_or("invalid card")?;
+            Ok((name, Real(value.parse()?)))
+        })
+        .collect::<Result<_, _>>()?;
+    let model = BoundParameters::bind(
+        ModelVariant::BsimSoi,
+        ParameterScope::Model,
+        card.into_iter().chain([
+            ("pmos", Flag(pmos)),
+            ("soimod", Integer(soi)),
+            ("fdmod", Integer(1)),
+            ("shmod", Integer(i32::from(heat))),
+            ("rth0", Real(0.005)),
+            ("vth0", Real(sign * 0.55)),
+            ("gidlmod", Integer(mode)),
+            ("mtrlmod", Integer(i32::from(material))),
+            ("eot", Real(8e-9)),
+            ("epsrsub", Real(11.7)),
+            ("phig", Real(4.1)),
+            ("easub", Real(4.05)),
+        ]),
+    )?;
+    let model = prepare_bsim_soi_model(&model, 300.15)?;
+    let raw = BoundParameters::bind(
+        ModelVariant::BsimSoi,
+        ParameterScope::Instance,
+        [
+            ("tnodeout", Flag(true)),
+            ("l", Real(5e-7)),
+            ("w", Real(4e-6)),
+            ("nf", Real(2.)),
+            ("nseg", Real(2.)),
+            ("m", Real(2.3)),
+        ],
+    )?;
+    let setup = prepare_bsim_soi_setup(
+        &model,
+        &[BsimSoiInstanceInput {
+            parameters: &raw,
+            terminal_count: if soi == 2 { 7 } else { 6 },
+            geometry_scale: 1.,
+        }],
+    )?;
+    Ok(setup.prepare_gate_induced_leakage(0, 300.15)?)
+}
+
+#[test]
+fn gate_induced_leakage_gradients() -> TestResult {
+    for pmos in [false, true] {
+        let sign = if pmos { -1. } else { 1. };
+        for heat in [false, true] {
+            for soi in 0..=2 {
+                for mode in 0..=1 {
+                    for material in [false, true] {
+                        let law = leakage_setup(pmos, heat, soi, mode, material)?;
+                        for (gate, drain, body, back) in [
+                            (-1.2, 0.6, -0.2, 0.3),
+                            (-1.8, -0.7, -0.9, -0.2),
+                            (1.5, 0.4, -0.1, 0.4),
+                            (0.2, 1.5, 0.3, 0.1),
+                        ] {
+                            let bias = BsimSoiChannelBias {
+                                gate: sign * gate,
+                                drain: sign * drain,
+                                body: sign * body,
+                                backgate: sign * back,
+                                kelvin: 320.15,
+                            };
+                            let point = law.evaluate(bias)?;
+                            for axis in 0..5 {
+                                let h = if axis == 4 { 1e-3 } else { 1e-5 };
+                                let hi = law.evaluate(perturb(bias, axis, h))?;
+                                let lo = law.evaluate(perturb(bias, axis, -h))?;
+                                for (actual, upper, lower) in [
+                                    (point.drain_to_body, hi.drain_to_body, lo.drain_to_body),
+                                    (point.source_to_body, hi.source_to_body, lo.source_to_body),
+                                ] {
+                                    let diff = (upper.value - lower.value) / (2. * h);
+                                    let expected = actual.gradient[axis];
+                                    let tol = 3e-5 * expected.abs().max(diff.abs())
+                                        + 64.
+                                            * upper.value.abs().max(lower.value.abs())
+                                            * f64::EPSILON
+                                            / h
+                                        + 1e-22;
+                                    assert!(
+                                        (expected - diff).abs() <= tol,
+                                        "{bias:?} soi={soi} mode={mode} material={material} axis={axis}: {expected:e} vs {diff:e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires local ngspice 47 binary"]
+fn native_gate_induced_leakage() -> TestResult {
+    use std::{fs, process::Command};
+    for pmos in [false, true] {
+        let sign = if pmos { -1. } else { 1. };
+        let polarity = if pmos { "pmos" } else { "nmos" };
+        for heat in [false, true] {
+            let shmod = i32::from(heat);
+            let rise = if heat { 20. } else { 0. };
+            for soi in 0..=2 {
+                let nodes = if soi == 2 {
+                    "d g 0 e b 0 t"
+                } else {
+                    "d g 0 e b t"
+                };
+                for mode in 0..=1 {
+                    for material in [false, true] {
+                        let mtrlmod = i32::from(material);
+                        let law = leakage_setup(pmos, heat, soi, mode, material)?;
+                        let vth0 = sign * 0.55;
+                        for (gate, drain, body, back) in [
+                            (-1.2, 0.6, -0.2, 0.3),
+                            (-1.8, -0.7, -0.9, -0.2),
+                            (1.5, 0.4, -0.1, 0.4),
+                            (0.2, 1.5, 0.3, 0.1),
+                        ] {
+                            let vg = sign * gate;
+                            let vd = sign * drain;
+                            let vb = sign * body;
+                            let ve = sign * back;
+                            let deck = format!(
+                                "BSIMSOI gate induced leakage reference\nVd d 0 {vd}\nVg g 0 {vg}\nVb b 0 {vb}\nVe e 0 {ve}\nVt t 0 {rise}\nM1 {nodes} soi tnodeout l=.5u w=4u nf=2 nseg=2 m=2.3 pd=4u ps=4u\n.model soi {polarity} level=10 soimod={soi} fdmod=1 shmod={shmod} rth0=.005 vth0={vth0} gidlmod={mode} mtrlmod={mtrlmod} eot=8e-9 epsrsub=11.7 phig=4.1 easub=4.05\n+ {CARD}\n+ {GIDL_CARD}\n.temp 27\n.options gmin=1e-18 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.control\nset numdgt=17\nset wr_singlescale\nop\nwrdata out.dat @m1[igidl] @m1[igisl]\nquit\n.endc\n.end\n"
+                            );
+                            let dir = tempfile::tempdir()?;
+                            fs::write(dir.path().join("test.cir"), deck)?;
+                            let output = Command::new("ngspice")
+                                .args(["-b", "test.cir"])
+                                .current_dir(dir.path())
+                                .output()?;
+                            if !output.status.success() {
+                                return Err(format!(
+                                    "ngspice: {}",
+                                    String::from_utf8_lossy(&output.stderr)
+                                )
+                                .into());
+                            }
+                            let data = fs::read_to_string(dir.path().join("out.dat"))?;
+                            let values = data
+                                .split_whitespace()
+                                .map(str::parse::<f64>)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            assert_eq!(values.len(), 3);
+                            let bias = BsimSoiChannelBias {
+                                gate: vg,
+                                drain: vd,
+                                body: vb,
+                                backgate: ve,
+                                kelvin: 300.15 + rise,
+                            };
+                            let point = law.evaluate(bias)?;
+                            let (expected_drain, expected_source) = if drain < 0. {
+                                (values[2], values[1])
+                            } else {
+                                (values[1], values[2])
+                            };
+                            for (actual, reference) in [
+                                (point.drain_to_body.value, sign * 2.3 * expected_drain),
+                                (point.source_to_body.value, sign * 2.3 * expected_source),
+                            ] {
+                                assert!(
+                                    (actual - reference).abs() <= 3e-6 * reference.abs() + 1e-20,
+                                    "pmos={pmos} heat={heat} soi={soi} mode={mode} material={material} {bias:?}: {actual:e} vs {reference:e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
