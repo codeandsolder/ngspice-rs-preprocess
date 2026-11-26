@@ -915,6 +915,25 @@ fn resolve_deck(
     })
 }
 
+fn attach_initial_conditions(
+    bundle: &mut PreparedBundle,
+    initial_conditions: Option<super::passive_ic::InitialConditions>,
+    format: InputFormat,
+    budget: &WorkBudget,
+) -> Result<()> {
+    if let Some(initialization) = &initial_conditions {
+        for artifact in bundle.artifacts() {
+            initialization.validate_artifact(&artifact.filename, &artifact.bytes, budget)?;
+        }
+    }
+    bundle.initial_conditions = initial_conditions.filter(|policy| {
+        format == InputFormat::SimetrixDeck
+            || !policy.devices.is_empty()
+            || !policy.nodes.is_empty()
+    });
+    Ok(())
+}
+
 fn linked(
     root: &AdmittedSource,
     request: &Request,
@@ -1010,20 +1029,12 @@ fn linked(
     bundle.device_identities = device_identities;
     bundle.model_selections = model_selections;
     bundle.analysis_plan = Some(plan);
-    if let Some(initialization) = &initial_conditions {
-        for artifact in bundle.artifacts() {
-            initialization.validate_artifact(
-                &artifact.filename,
-                &artifact.bytes,
-                session.budget(),
-            )?;
-        }
-    }
-    bundle.initial_conditions = initial_conditions.filter(|policy| {
-        request.format == InputFormat::SimetrixDeck
-            || !policy.devices.is_empty()
-            || !policy.nodes.is_empty()
-    });
+    attach_initial_conditions(
+        &mut bundle,
+        initial_conditions,
+        request.format,
+        session.budget(),
+    )?;
     bundle.waveforms = waveforms;
     bundle.pwl_resistors = pwl_resistors;
     Ok(bundle)
