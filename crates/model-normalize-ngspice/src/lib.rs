@@ -16,6 +16,7 @@ pub mod model_card;
 pub mod param_expression;
 pub mod parameter_scope;
 pub mod passive_ic;
+pub mod passive_storage;
 pub mod pspice;
 pub mod pwl_resistor;
 pub mod qspice;

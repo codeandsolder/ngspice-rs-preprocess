@@ -678,19 +678,124 @@ quit
 }
 
 #[test]
-fn nonlinear_passive_coefficients_are_not_silently_discarded() -> Result<()> {
+fn nonlinear_passive_models_preserve_scope_temperature_and_initial_coordinates() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    let source = br"Polynomial passive declaration binding
+.param a=0.2
+.model CM CAP(C=2 VC1={a} VC2=0.07 TC1=0.001 T_MEASURED=0 T_ABS=25)
+.model LM IND(L=3 IL1=-0.1 IL2=0.02 TC2=0.001 T_REL_GLOBAL=5)
+C1 c 0 CM 1n IC=-2
+L1 l 0 LM 1m IC=-0.5
+.subckt cell p n params: a=0.4 base=2
+.model CM CAP(C={base} VC1={a})
+C2 p n CM {base*1n} IC={-a}
+.ends cell
+X1 c 0 cell a=0.1 base=3
+X2 l 0 cell a=0 base=4
+.end
+";
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    let text = std::str::from_utf8(&prepared.primary.bytes)?.to_ascii_lowercase();
+    let cards = model_normalize_ngspice::model_card::parse_model_cards(&prepared.primary.bytes)?;
+    let model = cards
+        .iter()
+        .find(|card| card.name.eq_ignore_ascii_case("CM"))
+        .context("missing original capacitor model")?;
+    assert_eq!(model.family, "pspice_cap");
+    assert_eq!(
+        cards
+            .iter()
+            .filter(|card| card.family == "pspice_cap")
+            .count(),
+        2
+    );
+    assert_eq!(
+        cards
+            .iter()
+            .filter(|card| card.family == "pspice_ind")
+            .count(),
+        1
+    );
+    for field in [
+        "vc1={a}",
+        "vc2=0.07",
+        "tc1=0.001",
+        "tnom=0",
+        "temp=25",
+        "il1=-0.1",
+        "il2=0.02",
+        "tc2=0.001",
+        "dtemp=5",
+    ] {
+        assert!(text.contains(field), "{field}: {text}");
+    }
+    assert!(text.contains("c1 c 0 cm 1n ic=-2"), "{text}");
+    assert!(text.contains("l1 l 0 lm 1m ic=-0.5"), "{text}");
+    assert!(text.contains("c2 p n cm {base*1n} ic={-a}"), "{text}");
+    assert!(!text.contains("__ps_passive_"), "{text}");
+    Ok(())
+}
+
+#[test]
+fn nonlinear_passive_coefficients_require_values_and_compatible_instances() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("source.lib");
-    for input in [
-        ".model CM CAP(C=2 VC1=0.1)\n",
-        ".model LM IND(L=3 IL2={nonlinear})\n",
+    for source in [
+        ".model CM CAP(VC1)\n",
+        ".model CM CAP(VC2=0.1 C)\n",
+        ".model LM IND(IL2)\n",
+        ".model LM IND(IL1=0.1)\nC1 a b LM 1n\n",
+        ".model CM CAP(VC1=0.1)\nC1 a b CM IC=1\n",
     ] {
-        fs::write(&path, input)?;
+        fs::write(&path, source)?;
         assert!(
             prepare_source(&path, InputFormat::PspiceLibrary).is_err(),
-            "{input}"
+            "{source}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn ako_nonlinear_storage_inherits_coefficients_and_local_temperature() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.lib");
+    fs::write(
+        &path,
+        br".model base CAP(C=2 VC1=0.1 VC2=0.02 T_ABS=25)
+.model child AKO:base CAP(VC2=0.03 T_REL_LOCAL=5)
+.model linear AKO:base CAP(VC1=0 VC2=0)
+",
+    )?;
+    let prepared = prepare_source(&path, InputFormat::PspiceLibrary)?;
+    let text = std::str::from_utf8(&prepared.primary.bytes)?.to_ascii_lowercase();
+    let cards = model_normalize_ngspice::model_card::parse_model_cards(&prepared.primary.bytes)?;
+    let child = cards
+        .iter()
+        .find(|card| card.name.eq_ignore_ascii_case("child"))
+        .context("missing inherited storage model")?;
+    assert_eq!(child.family, "pspice_cap");
+    let field = |name: &str| {
+        child
+            .parameters
+            .iter()
+            .rev()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .and_then(|p| p.expression.as_deref())
+    };
+    assert_eq!(field("vc1"), Some("0.1"));
+    assert_eq!(field("vc2"), Some("0.03"));
+    assert!(
+        field("temp").is_some_and(|temp| temp.contains("25") && temp.contains("5")),
+        "{text}"
+    );
+    let linear = cards
+        .iter()
+        .find(|card| card.name.eq_ignore_ascii_case("linear"))
+        .context("missing linear override")?;
+    assert!(linear.family.eq_ignore_ascii_case("c"), "{text}");
     Ok(())
 }
 

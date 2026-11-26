@@ -6,6 +6,7 @@ use super::{parameter, scope::Scopes, temperature::expression};
 use crate::{
     IdentifierAllocator, lexical,
     model_card::{ModelCard, parse_spice_constant},
+    passive_storage::{PSPICE_CAPACITOR, PSPICE_INDUCTOR},
 };
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, fmt::Write as _};
@@ -35,6 +36,14 @@ impl Kind {
         }
     }
 
+    const fn prepared(self) -> &'static str {
+        match self {
+            Self::Capacitor => PSPICE_CAPACITOR,
+            Self::Inductor => PSPICE_INDUCTOR,
+            Self::Resistor => "R",
+        }
+    }
+
     const fn nonlinear(self) -> &'static [&'static str] {
         match self {
             Self::Resistor => &[],
@@ -52,6 +61,7 @@ struct Multiplier {
 struct PassiveModel {
     kind: Kind,
     multiplier: Option<Multiplier>,
+    polynomial: bool,
 }
 
 #[derive(Default)]
@@ -67,16 +77,29 @@ impl PassiveModels {
                 continue;
             };
             let card = scopes.model(line)?;
-            for name in kind.nonlinear() {
-                if let Some(value) = parameter(&card, name) {
+            for field in &card.parameters {
+                if field.name.eq_ignore_ascii_case(kind.native())
+                    || kind
+                        .nonlinear()
+                        .iter()
+                        .any(|name| field.name.eq_ignore_ascii_case(name))
+                {
                     ensure!(
-                        matches!(parse_spice_constant(expression(&value)), Ok(0.0)),
-                        "PSpice model {} uses nonlinear coefficient {name}; charge/flux lowering required",
-                        card.name
+                        field.expression.is_some(),
+                        "PSpice model {} requires a value for {}",
+                        card.name,
+                        field.name
                     );
                 }
             }
-            let multiplier = if let Some(value) = parameter(&card, kind.native()) {
+            // A symbolic coefficient may be zero in one occurrence and
+            // nonzero in another; retain the typed polynomial in both.
+            let polynomial = kind.nonlinear().iter().any(|name| {
+                parameter(&card, name).is_some_and(|value| {
+                    !matches!(parse_spice_constant(expression(&value)), Ok(0.0))
+                })
+            });
+            let multiplier = if !polynomial && let Some(value) = parameter(&card, kind.native()) {
                 let mut base = String::from("__ps_passive_");
                 for byte in card.name.bytes().map(|byte| byte.to_ascii_lowercase()) {
                     write!(base, "{byte:02x}")?;
@@ -86,9 +109,14 @@ impl PassiveModels {
             } else {
                 None
             };
-            result
-                .models
-                .insert(line, PassiveModel { kind, multiplier });
+            result.models.insert(
+                line,
+                PassiveModel {
+                    kind,
+                    multiplier,
+                    polynomial,
+                },
+            );
         }
         Ok(result)
     }
@@ -101,6 +129,12 @@ impl PassiveModels {
         card: &mut ModelCard,
     ) -> Option<(String, String)> {
         let model = self.models.get(&line)?;
+        if model.polynomial {
+            // Keep source identity and declaration-scoped parameters.
+            // The engine binds the integrated law at candidate preparation.
+            model.kind.prepared().clone_into(&mut card.family);
+            return None;
+        }
         model.kind.native().clone_into(&mut card.family);
         card.parameters.retain(|field| {
             !field.name.eq_ignore_ascii_case(model.kind.native())
