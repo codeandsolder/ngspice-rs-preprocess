@@ -102,7 +102,7 @@ impl LegacyBsimChannel {
             Self::Bsim2(c) => (c.vfb, c.phi, c.k1, c.k2),
         };
         finite(
-            vfb + phi + k1 * phi.sqrt() - k2 * phi,
+            k2.mul_add(-phi, k1.mul_add(phi.sqrt(), vfb + phi)),
             "zero-bias threshold",
         )
     }
@@ -191,11 +191,15 @@ fn bsim1(bin: &Binning<'_>) -> Result<Bsim1Coefficients, ModelError> {
     })
 }
 
-fn bsim2_mobility(
-    bin: &Binning<'_>,
-    vdd: f64,
-    vbb: f64,
-) -> Result<([f64; 2], [f64; 2], [f64; 3], [f64; 3], f64), ModelError> {
+struct Bsim2Mobility {
+    beta_zero: [f64; 2],
+    beta_saturation: [f64; 2],
+    beta3: [f64; 3],
+    beta4: [f64; 3],
+    beta_body_argument: f64,
+}
+
+fn bsim2_mobility(bin: &Binning<'_>, vdd: f64, vbb: f64) -> Result<Bsim2Mobility, ModelError> {
     let beta_zero = [
         bin.model.real("mu0")?,
         bin.value(["mu0b", "lmu0b", "wmu0b"])?,
@@ -203,7 +207,7 @@ fn bsim2_mobility(
     let mut beta_saturation =
         bin.series([["mus0", "lmus0", "wmus0"], ["musb", "lmusb", "wmusb"]])?;
     beta_saturation[0] = beta_saturation[0].max(1.01 * beta_zero[0]);
-    let tmp = beta_saturation[0] - beta_zero[0] - beta_zero[1] * vbb;
+    let tmp = beta_zero[1].mul_add(-vbb, beta_saturation[0] - beta_zero[0]);
     if -beta_saturation[1] * vbb > tmp {
         beta_saturation[1] = finite(-tmp / vbb, "saturation mobility body coefficient")?;
     }
@@ -220,10 +224,19 @@ fn bsim2_mobility(
         ["mu4g", "lmu4g", "wmu4g"],
     ])?)?;
     let arg = finite(
-        beta_saturation[1] - beta_zero[1] - vdd * (beta3[1] - vdd * beta4[1]),
+        vdd.mul_add(
+            -vdd.mul_add(-beta4[1], beta3[1]),
+            beta_saturation[1] - beta_zero[1],
+        ),
         "beta body argument",
     )?;
-    Ok((beta_zero, beta_saturation, beta3, beta4, arg))
+    Ok(Bsim2Mobility {
+        beta_zero,
+        beta_saturation,
+        beta3,
+        beta4,
+        beta_body_argument: arg,
+    })
 }
 
 fn bsim2(bin: &Binning<'_>) -> Result<Bsim2Coefficients, ModelError> {
@@ -240,8 +253,13 @@ fn bsim2(bin: &Binning<'_>) -> Result<Bsim2Coefficients, ModelError> {
     for voltage in [vdd, vgg, vbb] {
         finite(2. * voltage, "voltage anchor")?;
     }
-    let (beta_zero, beta_saturation, beta3, beta4, beta_body_argument) =
-        bsim2_mobility(bin, vdd, vbb)?;
+    let Bsim2Mobility {
+        beta_zero,
+        beta_saturation,
+        beta3,
+        beta4,
+        beta_body_argument,
+    } = bsim2_mobility(bin, vdd, vbb)?;
     let mut subthreshold = bin.series([
         ["n0", "ln0", "wn0"],
         ["nb", "lnb", "wnb"],

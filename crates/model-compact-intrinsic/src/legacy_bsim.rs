@@ -155,7 +155,7 @@ fn positive(value: f64, name: &'static str) -> Result<f64, ModelError> {
     }
 }
 
-fn finite(value: f64, name: &'static str) -> Result<f64, ModelError> {
+const fn finite(value: f64, name: &'static str) -> Result<f64, ModelError> {
     if value.is_finite() {
         Ok(value)
     } else {
@@ -284,9 +284,14 @@ impl PreparedLegacyBsimModel {
     fn geometry(&self, source: &BoundParameters) -> Result<LegacyBsimGeometry, ModelError> {
         let length = positive(real_input(source, "l", 5e-6)?, "l")?;
         let width = positive(real_input(source, "w", 5e-6)?, "w")?;
-        let effective_length =
-            positive(length - self.real("dl")? * 1e-6, "effective channel length")?;
-        let effective_width = positive(width - self.real("dw")? * 1e-6, "effective channel width")?;
+        let effective_length = positive(
+            self.real("dl")?.mul_add(-1e-6, length),
+            "effective channel length",
+        )?;
+        let effective_width = positive(
+            self.real("dw")?.mul_add(-1e-6, width),
+            "effective channel width",
+        )?;
         let multiplier = positive(real_input(source, "m", 1.)?, "m")?;
         Ok(LegacyBsimGeometry {
             length,
