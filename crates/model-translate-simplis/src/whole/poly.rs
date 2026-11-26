@@ -49,11 +49,44 @@ pub(super) fn header(tokens: &[String], at: usize) -> Result<Option<(usize, usiz
     Ok(Some((dimension, end)))
 }
 
+/// A statement token already has balanced braces and quotes, but may mix
+/// group punctuation and braced coefficient expressions. Do not split the
+/// latter at arithmetic whitespace, commas or parentheses.
+#[derive(Clone, Default)]
+struct FieldContext {
+    braces: usize,
+    quoted: bool,
+}
+
+impl FieldContext {
+    fn expression(&mut self, c: char) -> bool {
+        match c {
+            '\'' => {
+                self.quoted = !self.quoted;
+                true
+            }
+            '{' if !self.quoted => {
+                // Bounded by the number of characters in the input token.
+                self.braces += 1;
+                true
+            }
+            '}' if !self.quoted => {
+                self.braces = self.braces.saturating_sub(1);
+                true
+            }
+            _ => self.quoted || self.braces != 0,
+        }
+    }
+}
+
 /// Remaining POLY operands admit whitespace, commas and grouping parentheses.
 pub(super) fn fields(tokens: &[String]) -> impl Iterator<Item = &str> + Clone {
     tokens.iter().flat_map(|token| {
+        let mut context = FieldContext::default();
         token
-            .split(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | '(' | ')'))
+            .split(move |c: char| {
+                !context.expression(c) && (c.is_ascii_whitespace() || matches!(c, ',' | '(' | ')'))
+            })
             .filter(|field| !field.is_empty())
     })
 }
@@ -66,14 +99,18 @@ pub(super) fn operands<'a>(
     let mut depth = 0_usize;
     for token in tokens {
         budget.charge(Resource::ScannedBytes, token.len())?;
-        for byte in token.bytes() {
-            match byte {
-                b'(' => {
+        let mut context = FieldContext::default();
+        for c in token.chars() {
+            if context.expression(c) {
+                continue;
+            }
+            match c {
+                '(' => {
                     depth = depth
                         .checked_add(1)
                         .context("POLY operand nesting overflow")?
                 }
-                b')' => {
+                ')' => {
                     depth = depth
                         .checked_sub(1)
                         .context("unmatched POLY operand parenthesis")?
@@ -302,6 +339,24 @@ mod tests {
             },
         )?;
         Ok((crate::parse_numeric(&output)?, output))
+    }
+
+    #[test]
+    fn operand_groups_preserve_constant_expression_boundaries() -> Result<()> {
+        let tokens = crate::syntax::statement_tokens(
+            "POLY ( 2 ) (a, 0) (b,0) (0, {2 * (3 + 1)}, 'min(4, 7)')",
+        )?;
+        let (dimension, start) = header(&tokens, 0)?.context("POLY header")?;
+        assert_eq!(dimension, 2);
+        let budget = WorkBudget::default();
+        let mut operands = operands(&tokens[start..], 4, &budget)?;
+        assert_eq!(
+            operands.by_ref().take(4).collect::<Vec<_>>(),
+            ["a", "0", "b", "0"]
+        );
+        let coefficients = coefficients(operands, &budget)?;
+        assert_eq!(coefficients, [0., 8., 4.]);
+        Ok(())
     }
 
     #[test]
