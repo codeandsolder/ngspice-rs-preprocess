@@ -214,8 +214,13 @@ mod native {
         let sign = if polarity == "nmos" { 1.0 } else { -1.0 };
         let tmp = tempfile::tempdir()?;
         let debug = if level == 57 { 1 } else { 2 };
+        let terminals = if level == 57 {
+            "d g 0 e b 0 b"
+        } else {
+            "d g 0 e b"
+        };
         let deck = format!(
-            "BSIM3SOI junction witness\n.temp {ambient}\n.options reltol=1e-9 abstol=1e-19 vntol=1e-11\n.model m {polarity} level={level} {card}\nVd d 0 {}\nVg g 0 {}\nVb b 0 0\nVe e 0 0\nM1 d g 0 e b m {instance} debug={debug}\n.control\nset num_threads=1\nset numdgt=17\nset wr_vecnames\nset wr_singlescale\nsave all @m1[vbs] @m1[vds]\ndc Vb {} {} {}\nwrdata witness.tsv @m1[vbs] @m1[vds] v(m1#ibs) v(m1#ibd) v(m1#ic)\nquit\n.endc\n.end\n",
+            "BSIM3SOI junction witness\n.temp {ambient}\n.options reltol=1e-9 abstol=1e-19 vntol=1e-11\n.model m {polarity} level={level} {card}\nVd d 0 {}\nVg g 0 {}\nVb b 0 0\nVe e 0 0\nM1 {terminals} m {instance} debug={debug}\n.control\nset num_threads=1\nset numdgt=17\nset wr_vecnames\nset wr_singlescale\nsave all @m1[vbs] @m1[vds]\ndc Vb {} {} {}\nwrdata witness.tsv @m1[vbs] @m1[vds] v(m1#ibs) v(m1#ibd) v(m1#ic)\nquit\n.endc\n.end\n",
             0.3 * sign,
             -0.5 * sign,
             -0.5 * sign,
@@ -241,9 +246,13 @@ mod native {
                 .split_whitespace()
                 .map(str::parse::<f64>)
                 .collect::<Result<Vec<_>, _>>()?;
-            let [_, vbs, vds, ibs, ibd, ic] = values.as_slice() else {
+            let [sweep, vbs, vds, ibs, ibd, ic] = values.as_slice() else {
                 return Err("bad native junction row".into());
             };
+            assert!(
+                (*vbs - sweep * sign).abs() < 1e-9,
+                "native body bias was not forced: {vbs} vs {sweep}"
+            );
             let a = j.evaluate(*vbs, *vds, ambient + 273.15)?;
             // PD's debug node FLOG is abs(current)+1e-14, not the
             // signed current. DD exposes the actual signed value.
@@ -320,9 +329,14 @@ mod native {
         let j = evaluator(family, &card, instance, polarity, ambient + 273.15)?;
         let sign = if polarity == "nmos" { 1.0 } else { -1.0 };
         let debug = if level == 57 { 1 } else { 2 };
+        let terminals = if level == 57 {
+            "d g 0 e b 0 b"
+        } else {
+            "d g 0 e b"
+        };
         let tmp = tempfile::tempdir()?;
         let deck = format!(
-            "BSIM3SOI intrinsic charge witness\n.temp {ambient}\n.options reltol=1e-9 abstol=1e-19 vntol=1e-11\n.model m {polarity} level={level} {card}\nVd d 0 {}\nVg g 0 {}\nVb b 0 PWL(0 {} 1u {})\nVe e 0 0\nM1 d g 0 e b m {instance} debug={debug}\n.control\nset num_threads=1\nset numdgt=17\nset wr_vecnames\nset wr_singlescale\nsave all @m1[vbs] @m1[vds]\ntran 2n 1u 0 2n\nwrdata witness.tsv @m1[vbs] @m1[vds] v(m1#qjs) v(m1#qjd)\nquit\n.endc\n.end\n",
+            "BSIM3SOI intrinsic charge witness\n.temp {ambient}\n.options reltol=1e-9 abstol=1e-19 vntol=1e-11\n.model m {polarity} level={level} {card}\nVd d 0 {}\nVg g 0 {}\nVb b 0 PWL(0 {} 1u {})\nVe e 0 0\nM1 {terminals} m {instance} debug={debug}\n.control\nset num_threads=1\nset numdgt=17\nset wr_vecnames\nset wr_singlescale\nsave all @m1[vbs] @m1[vds]\ntran 2n 1u 0 2n\nwrdata witness.tsv @m1[vbs] @m1[vds] v(m1#qjs) v(m1#qjd)\nquit\n.endc\n.end\n",
             0.17 * sign,
             -0.5 * sign,
             -0.5 * sign,
@@ -348,9 +362,13 @@ mod native {
                 .split_whitespace()
                 .map(str::parse::<f64>)
                 .collect::<Result<Vec<_>, _>>()?;
-            let [_, vbs, vds, qs, qd] = values.as_slice() else {
+            let [time, vbs, vds, qs, qd] = values.as_slice() else {
                 return Err("bad native charge row".into());
             };
+            assert!(
+                (*vbs - (time * 1.15e6 - 0.5)).abs() < 1e-8,
+                "native body ramp was not forced: {vbs} at {time}"
+            );
             let a = j.evaluate(*vbs, *vds, ambient + 273.15)?;
             for (actual, expected) in [
                 (a.source_charge.charge_c, *qs),

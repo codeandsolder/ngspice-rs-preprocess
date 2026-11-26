@@ -6,6 +6,8 @@ use crate::{
     ModelError, ModelVariant, MosPolarity,
     preparation::{integer, positive, real, slot},
 };
+mod channel;
+pub use channel::{PdChannelEvaluation, PreparedPdChannel};
 mod differential;
 mod junction;
 mod substrate;
@@ -133,6 +135,8 @@ pub struct PhysicalTemperature {
     pub junctions: JunctionDensities,
     /// Bias-local junction and parasitic bipolar current evaluator.
     pub junction_currents: PreparedJunctions,
+    /// Channel transport evaluator for the partially depleted family.
+    pub pd_channel: Option<PreparedPdChannel>,
     /// Electrostatic state.
     pub electrostatics: Electrostatics,
     /// Drain/source gate overlap and backgate overlap capacitances, before M.
@@ -552,11 +556,18 @@ pub fn prepare_temperature(
     let substrate_charge = substrate::prepare(&c, electrostatics, substrate_sidewall)?;
     let density = junction::DensityLaw::prepare(&c)?;
     let junction_currents = junction::prepare(&c, density)?;
+    let transport = transport(&c)?;
+    let pd_channel = if c.pd() {
+        Some(PreparedPdChannel::prepare(&c, electrostatics, transport)?)
+    } else {
+        None
+    };
     Ok(PhysicalTemperature {
         material,
-        transport: transport(&c)?,
+        transport,
         junctions: density.ambient(&c)?,
         junction_currents,
+        pd_channel,
         electrostatics,
         substrate_charge,
         overlaps: overlaps(&c)?,

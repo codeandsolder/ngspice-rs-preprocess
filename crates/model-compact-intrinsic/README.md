@@ -965,3 +965,28 @@ uses temperature-dependent sidewall potential/capacitance, a 90 percent
 potential continuation and TT times effective bipolar diffusion. Both
 use the finite logarithmic primitive at unity grading. FD has no
 intrinsic junction charge in its load routine.
+
+The PD 2.2.3 channel evaluator is exposed as
+`PhysicalTemperature.pd_channel`. It retains the family's body-potential
+smoothing, poly-gate depletion, threshold and subthreshold shifts,
+bias-dependent width and intrinsic resistance, bulk charge factor, all
+three mobility modes, velocity saturation, DIBL and channel-length
+modulation. The evaluation uses normalized forward-oriented VGS, VDS
+and VBS with an analytic four-coordinate gradient including absolute
+temperature. Self-heated evaluation takes a caller-owned accepted
+surface potential; isothermal evaluation uses the prepared ambient
+state. It returns channel current separately from junction/bipolar
+currents and exposes threshold, overdrive, mobility, effective/saturation
+drain voltage, intrinsic series resistance and bulk factor. The
+quadratic saturation root is rationalized to avoid cancellation.
+
+The isolated native PD channel matrix compares 11,988 scalar values
+(Ids, gm, gds, gmb, threshold and saturation voltage), with maximum
+absolute errors of 8.48e-20 A, 4.41e-19 S and 2.06e-14 V. Both polarities,
+all three mobility modes, nonzero resistance and geometry corrections,
+and independently imposed body/gate/drain bias are represented.
+There are also 3,240 analytic derivative checks at fixed accepted
+surface potential. The explicit seven native terminal slots are
+required to avoid an unintended floating internal body in the legacy
+parser; this also strengthens the junction-current and charge
+qualification to 3,384 and 12,820 comparisons at imposed body bias.

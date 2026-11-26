@@ -84,7 +84,7 @@ pub(super) fn prepare(c: &Context<'_>) -> Result<ChargeLaw, ModelError> {
 fn depletion(voltage: D, potential: D, grading: f64) -> D {
     let log = (D::constant(1.0) - voltage / potential).ln();
     // The exact logarithmic limit is well-defined at unity grading.
-    let integral = if grading == 1.0 {
+    let integral = if (1.0 - grading).abs() == 0.0 {
         -log
     } else {
         -log.scale(1.0 - grading)

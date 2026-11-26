@@ -369,7 +369,7 @@ struct Bias {
 
 fn output(
     b: &Bias,
-    sides: [Components; 2],
+    sides: &[Components; 2],
     collector: D,
 ) -> Result<JunctionEvaluation, ModelError> {
     Ok(JunctionEvaluation {
@@ -414,7 +414,7 @@ fn dd_currents(p: Dd, b: &Bias, j: Densities, off: bool) -> Result<JunctionEvalu
         }
         collector = (D::constant(1.0) - loss) * injection * (exponents[0] - exponents[1]);
     }
-    output(b, sides, collector)
+    output(b, &sides, collector)
 }
 
 fn reverse_exp(voltage: D, scale: D, limit: f64) -> (D, bool) {
@@ -512,7 +512,7 @@ fn pd_currents(
             collector = injection.scale(p.alpha) * (forward[0] - forward[1]) * second_order;
         }
     }
-    output(b, sides, collector)
+    output(b, &sides, collector)
 }
 
 impl PreparedJunctions {

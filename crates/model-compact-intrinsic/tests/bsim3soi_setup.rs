@@ -500,3 +500,6 @@ mod substrate;
 
 #[path = "bsim3soi_setup/junction.rs"]
 mod junction;
+
+#[path = "bsim3soi_setup/channel.rs"]
+mod channel;
