@@ -2,7 +2,16 @@
 //! Copyright 2010 Regents of the University of California. See package LICENSE.
 mod current;
 pub use current::{BsimSoiDrainChannelPoint, PreparedBsimSoiDrainChannel};
+mod extrinsic;
 mod fd;
+mod impact;
+pub use extrinsic::{
+    BsimSoiExtrinsicChargeBias, BsimSoiExtrinsicCharges, PreparedBsimSoiExtrinsicCharges,
+};
+pub use impact::{
+    BsimSoiImpactBias, BsimSoiImpactBranch, BsimSoiImpactIonization,
+    PreparedBsimSoiImpactIonization,
+};
 mod leakage;
 pub use leakage::{BsimSoiGateInducedLeakage, PreparedBsimSoiGateInducedLeakage};
 mod jet;

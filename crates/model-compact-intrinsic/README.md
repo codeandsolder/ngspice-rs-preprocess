@@ -204,6 +204,27 @@ branches. Both 192-case finite-difference and 192-case native DC
 matrices pass, including silicon/generalized materials and reversed
 source/drain.
 
+### BSIMSOI extrinsic terminal storage
+
+`prepare_extrinsic_charges` binds nonlinear gate-to-drain/source overlap,
+linear gate-to-backgate overlap, and the source/drain bottom-film and fringe
+charges. The five pairwise charges have opposite signs at their second
+terminal, so their contributions conserve charge exactly. The overlap node
+is resolved from the gate-resistance topology (including gate-mid for
+RGATEMOD=3); bottom-film storage remains active in ideal FD. Bottom-film
+transition endpoints and capacitance densities are derived at preparation
+from the ambient substrate state or explicit model overrides.
+
+### BSIMSOI impact ionization
+
+`prepare_impact_ionization` binds both IIIMOD formulations, including the
+MOS avalanche ratio and the shared-ratio or independent bipolar avalanche
+contribution. The high-field branch follows physical source/drain reversal.
+It is disabled in ideal FD. The five channel-coordinate derivatives hold the
+physical body-source and body-drain junction voltages fixed; two additional
+partials support independently resolved body-resistance nodes. Currents include
+physical polarity and instance multiplicity.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds
