@@ -343,6 +343,7 @@ fn native_internal_temperature_coefficients() -> Result<(), Box<dyn Error>> {
     let mut checked = 0;
     let mut cases = 0;
     let mut max_rel = 0.0_f64;
+    let mut failures = Vec::new();
     let mut lines = include_str!("fixtures/bsim3soi-thermal/thermal.tsv")
         .lines()
         .peekable();
@@ -453,10 +454,11 @@ fn native_internal_temperature_coefficients() -> Result<(), Box<dyn Error>> {
             let residual = (actual - expected).abs();
             let relative = residual / expected.abs().max(1e-100);
             max_rel = max_rel.max(relative);
-            assert!(
-                relative < 2e-10,
-                "{family:?} {name} {key}: {actual:e} != {expected:e}, relative {relative:e}"
-            );
+            if !relative.is_finite() || relative >= 2e-10 {
+                failures.push(format!(
+                    "{family:?} {name} {key}: {actual:e} != {expected:e}, relative {relative:e}"
+                ));
+            }
             checked += 1;
         }
         assert!(
@@ -467,8 +469,31 @@ fn native_internal_temperature_coefficients() -> Result<(), Box<dyn Error>> {
     }
     assert_eq!(cases, 18);
     assert_eq!(checked, 1026);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
     println!(
         "{cases} native C setup/temp cases, {checked} scalar coefficients, maximum relative deviation {max_rel:e}"
     );
     Ok(())
 }
+
+#[test]
+fn physical_temperature_rejects_mismatched_preparation() -> Result<(), Box<dyn Error>> {
+    use model_compact_intrinsic::bsim3soi::prepare_temperature;
+    let family = ModelVariant::Bsim3SoiPd;
+    let a = model(family, "", "nmos")?;
+    let b = model(family, "", "nmos")?;
+    let i = prepare_instance(
+        &a,
+        &bind(family, ParameterScope::Instance, "l=5e-6 w=3e-6", None)?,
+    )?;
+    assert!(matches!(
+        prepare_temperature(&b, &i, 300.15),
+        Err(ModelError::MismatchedPreparedContext)
+    ));
+    assert!(prepare_temperature(&a.clone(), &i, 300.15).is_ok());
+    assert!(prepare_temperature(&a, &i, 0.0).is_err());
+    Ok(())
+}
+
+#[path = "bsim3soi_setup/substrate.rs"]
+mod substrate;

@@ -163,7 +163,7 @@ cbox	0.00011510443333333334
 rbodyext	0
 drainConductance	0
 sourceConductance	0
-case	fd	bins	310	nmos=1 nch=2e17 lnch=1e16 lint=1e-7 wint=2e-7 dlc=1.5e-7 dwc=2.5e-7 vth0=0.6 lvth0=0.05 wvth0=0.01 pvth0=0.03 ua=3e-9 lua=2e-10 rdsw=100 wr=0.8 cgdo=1e-10 cgso=2e-10 cgeo=3e-10 vsdfb=-0.2 vsdth=0.5 csdmin=1e-4	l=2e-6 w=4e-6 pd=8e-6 ps=10e-6
+case	fd	bins	310	nmos=1 nch=2e17 lnch=1e16 lint=1e-7 wint=2e-7 dlc=1.5e-7 dwc=2.5e-7 vth0=0.6 lvth0=0.05 wvth0=0.01 pvth0=0.03 ua=3e-9 lua=2e-10 rdsw=100 wr=0.8 cgdo=1e-10 cgso=2e-10 cgeo=3e-10 csdesw=3e-10 vsdfb=-0.2 vsdth=0.5 csdmin=1e-4	l=2e-6 w=4e-6 pd=8e-6 ps=10e-6
 leff	1.7999999999999999e-06
 weff	3.5999999999999998e-06
 leffCV	1.6999999999999998e-06
@@ -209,8 +209,8 @@ vfb	-1.7643382723924028
 vth0	0.63518518518518519
 theta0vb0	2.0418307330629461e-05
 thetaRout	0.0086079631398589453
-csesw	0
-cdesw	0
+csesw	5.5234957910741934e-16
+cdesw	3.797403356363507e-16
 eg0	1.1150877422185135
 vtm	0.026712969700000002
 csdmin	0.0001
@@ -493,7 +493,7 @@ cbox	0.00011510443333333334
 rbodyext	0
 drainConductance	0
 sourceConductance	0
-case	dd	bins	310	nmos=1 nch=2e17 lnch=1e16 lint=1e-7 wint=2e-7 dlc=1.5e-7 dwc=2.5e-7 vth0=0.6 lvth0=0.05 wvth0=0.01 pvth0=0.03 ua=3e-9 lua=2e-10 rdsw=100 wr=0.8 cgdo=1e-10 cgso=2e-10 cgeo=3e-10 vsdfb=-0.2 vsdth=0.5 csdmin=1e-4	l=2e-6 w=4e-6 pd=8e-6 ps=10e-6
+case	dd	bins	310	nmos=1 nch=2e17 lnch=1e16 lint=1e-7 wint=2e-7 dlc=1.5e-7 dwc=2.5e-7 vth0=0.6 lvth0=0.05 wvth0=0.01 pvth0=0.03 ua=3e-9 lua=2e-10 rdsw=100 wr=0.8 cgdo=1e-10 cgso=2e-10 cgeo=3e-10 csdesw=3e-10 vsdfb=-0.2 vsdth=0.5 csdmin=1e-4	l=2e-6 w=4e-6 pd=8e-6 ps=10e-6
 leff	1.7999999999999999e-06
 weff	3.5999999999999998e-06
 leffCV	1.6999999999999998e-06
@@ -539,8 +539,8 @@ vfb	-1.7643382723924028
 vth0	0.63518518518518519
 theta0vb0	2.0418307330629461e-05
 thetaRout	0.0086079631398589453
-csesw	0
-cdesw	0
+csesw	5.5234957910741934e-16
+cdesw	3.797403356363507e-16
 eg0	1.1150877422185135
 vtm	0.026712969700000002
 csdmin	0.0001
@@ -850,7 +850,7 @@ drainConductance	0
 sourceConductance	0
 csesw	0
 cdesw	0
-case	pd	bins	310	nmos=1 nch=2e17 lnch=1e16 lint=1e-7 wint=2e-7 dlc=1.5e-7 dwc=2.5e-7 vth0=0.6 lvth0=0.05 wvth0=0.01 pvth0=0.03 ua=3e-9 lua=2e-10 rdsw=100 wr=0.8 cgdo=1e-10 cgso=2e-10 cgeo=3e-10 vsdfb=-0.2 vsdth=0.5 csdmin=1e-4 wth0=1e-7 rhalo=2e8 k1w1=2e-7 k1w2=1e-7 ahli=0.03 toxqm=2e-9	l=2e-6 w=4e-6 pd=8e-6 ps=10e-6 nseg=2 nbc=1 pdbcp=1e-7 psbcp=3e-7 frbody=0.7
+case	pd	bins	310	nmos=1 nch=2e17 lnch=1e16 lint=1e-7 wint=2e-7 dlc=1.5e-7 dwc=2.5e-7 vth0=0.6 lvth0=0.05 wvth0=0.01 pvth0=0.03 ua=3e-9 lua=2e-10 rdsw=100 wr=0.8 cgdo=1e-10 cgso=2e-10 cgeo=3e-10 csdesw=3e-10 vsdfb=-0.2 vsdth=0.5 csdmin=1e-4 wth0=1e-7 rhalo=2e8 k1w1=2e-7 k1w2=1e-7 ahli=0.03 toxqm=2e-9	l=2e-6 w=4e-6 pd=8e-6 ps=10e-6 nseg=2 nbc=1 pdbcp=1e-7 psbcp=3e-7 frbody=0.7
 leff	1.7999999999999999e-06
 weff	3.8e-06
 leffCV	1.6999999999999998e-06
@@ -912,8 +912,8 @@ cbox	0.00011510443333333334
 rbodyext	0
 drainConductance	0
 sourceConductance	0
-csesw	0
-cdesw	0
+csesw	5.1782773041320553e-16
+cdesw	3.4521848694213699e-16
 case	pd	one_k	300.15	pmos=1 k1=0.6 nsub=-6e16 vth0=-0.5	l=1e-6 w=2e-6
 leff	9.9999999999999995e-07
 weff	1.9999999999999999e-06

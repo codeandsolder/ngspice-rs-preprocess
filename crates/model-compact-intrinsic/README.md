@@ -902,3 +902,38 @@ transient for depletion charge and capacitance (native transient current
 and conductance include the integration companion). Across both
 polarities, DVT modes and ambient/thermal-rise combinations, 100 DC and
 889 transient rows agree in 3,956 scalar comparisons.
+
+`bsim3soi::prepare_temperature` binds the size prelude to its original
+model identity and resolves mobility, velocity saturation, intrinsic and
+external resistances, thermal RC coefficients, junction saturation
+densities, substrate and channel electrostatics, threshold and DIBL
+factors, and overlap capacitances. FD/DD and PD retain their different
+junction activation and thermal scaling laws; PD includes quantum-oxide,
+width-dependent K1 and high-level-injection corrections. Instance-local
+derived substrate capacitance avoids the native shared-model mutation.
+
+The native C setup/temperature fixture in
+`tests/fixtures/bsim3soi-thermal` contains 1,026 internal coefficients from
+18 independent cases across all three families. The original compiled
+C routines supply the values; a small harness substitutes only node,
+matrix and allocation plumbing. The regular Rust regression test reads
+this full-precision reference without requiring ngspice. Regeneration
+instructions accompany the fixture.
+
+The resulting `substrate_charge` evaluates drain/source-to-backgate
+charge and differential capacitance using physical terminal voltage
+differences, including multiplicity. The two cubic transition segments
+and their constant-capacitance tails share a continuous charge primitive.
+PD retains the CSDMIN=0 linear branch; FD/DD use effective width for
+sidewall fringing, PD drawn width. A zero-length transition segment is
+evaluated through its finite limiting form. Invalid reversed endpoints
+or out-of-range ASD are rejected.
+
+The independent transient/AC matrix checks 80,134 capacitance values,
+integrated charge, and finite-difference derivatives at the transition
+boundaries. FD/DD use transient qualification because the original
+FD/DD AC loaders omit these extrinsic capacitances; PD uses differential
+AC. The C reference circuits use separate model records to avoid the
+legacy size cache's sharing of area-dependent coefficients. Rust
+preparation keeps them local to each instance and provides the physical
+charge and derivative consistently for both AC and transient assembly.

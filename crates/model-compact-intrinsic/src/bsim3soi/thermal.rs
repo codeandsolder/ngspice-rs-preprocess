@@ -6,6 +6,9 @@ use crate::{
     ModelError, ModelVariant, MosPolarity,
     preparation::{integer, positive, real, slot},
 };
+mod substrate;
+pub use substrate::{PreparedSubstrateCharge, SubstrateCharge};
+
 use std::sync::Arc;
 
 const K_OVER_Q: f64 = 8.617_087e-5;
@@ -133,6 +136,8 @@ pub struct PhysicalTemperature {
     pub series_conductances: [f64; 2],
     /// External body resistance.
     pub external_body_resistance: f64,
+    /// Extrinsic drain/source-to-substrate charge laws.
+    pub substrate_charge: PreparedSubstrateCharge,
 }
 
 struct Context<'a> {
@@ -150,11 +155,9 @@ impl Context<'_> {
     }
     fn binned(&self, name: &str) -> Result<f64, ModelError> {
         let id = slot(self.model.parameters(), name)?;
-        if let Some(raw) = self.instance.raw_binned_slot(id) {
-            Ok(raw.prelude_value())
-        } else {
-            self.model(name)
-        }
+        self.instance
+            .raw_binned_slot(id)
+            .map_or_else(|| self.model(name), |raw| Ok(raw.prelude_value()))
     }
     fn given(&self, name: &str) -> Result<bool, ModelError> {
         Ok(self
@@ -218,7 +221,7 @@ fn thermal_layout(c: &Context<'_>) -> Result<[f64; 3], ModelError> {
         let resistance = if body == 0.0 {
             0.0
         } else {
-            c.instance("frbody")? * body * halo / (body + body + halo * g.length_m) * g.width_m
+            c.instance("frbody")? * body * halo / halo.mul_add(g.length_m, body + body) * g.width_m
                 / segments
         };
         (
@@ -534,7 +537,11 @@ fn overlaps(c: &Context<'_>) -> Result<[f64; 3], ModelError> {
 }
 
 fn extrinsic(c: &Context<'_>) -> Result<([f64; 2], [f64; 2], f64), ModelError> {
-    let width = c.instance.geometry().width_m;
+    let width = if c.pd() {
+        c.instance("w")?
+    } else {
+        c.instance.geometry().width_m
+    };
     let scale = c.model("csdesw")? * (c.model("tsi")? / c.model("tbox")?).ln_1p();
     let sidewall = |name| -> Result<f64, ModelError> {
         finite(
@@ -581,11 +588,14 @@ pub fn prepare_temperature(
         material,
     };
     let (substrate_sidewall, series_conductances, external_body_resistance) = extrinsic(&c)?;
+    let electrostatics = electrostatics(&c)?;
+    let substrate_charge = substrate::prepare(&c, electrostatics, substrate_sidewall)?;
     Ok(PhysicalTemperature {
         material,
         transport: transport(&c)?,
         junctions: junctions(&c)?,
-        electrostatics: electrostatics(&c)?,
+        electrostatics,
+        substrate_charge,
         overlaps: overlaps(&c)?,
         substrate_sidewall,
         series_conductances,
