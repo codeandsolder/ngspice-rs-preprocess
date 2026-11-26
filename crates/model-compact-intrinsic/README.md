@@ -15,8 +15,7 @@ solver topology or solver-ready native device kernels. Source-derived
 **BSIMSOI 4.x and HiSIM-HV1/HV2 model setup defaults** are implemented.
 HiSIM-HV1/HV2 additionally have source-derived **instance defaults, binning,
 metallurgical channel geometry and leading temperature-dependent bandgap,
-thermal-voltage and carrier-density inputs**. Other families still
-need dedicated setup and per-instance preparation.
+thermal-voltage and carrier-density inputs**. Legacy BSIM1/2 have complete model defaults and size-dependent preparation; other families still need dedicated setup and per-instance preparation.
 `ModelVariant::KERNEL_STATUS` explicitly advertises `NotImplemented`. Downstream
 must not substitute generic MOS laws for these devices or interpret successfully
 bound parameters as physical model support.
@@ -46,8 +45,7 @@ numerically validated.
 | BSIM3 v33 | 8/49, 3.3.x/default | `bsim3/b3.c` | 429 | 19 |
 
 Legacy BSIM input-only catalog facts use ngspice reference revision
-`fa6c2a236507fd440c671de237cad4f49a4e6b68`. These are distinct schemas,
-not prepared numerical kernels. Native BSIM3 v3.3 remains owned by the
+`fa6c2a236507fd440c671de237cad4f49a4e6b68`. These are distinct schemas, not prepared numerical kernels. BSIM1/2 additionally implement the immutable physical preparation described in the linked document. Native BSIM3 v3.3 remains owned by the
 existing solver until coordinated extraction and numerical acceptance.
 See [legacy BSIM preparation and ownership](../../docs/legacy-bsim.md)
 for the audit, supported-mode boundary and reproducible generator.

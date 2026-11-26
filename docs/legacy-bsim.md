@@ -54,8 +54,7 @@ Existing v3.3 numerical evidence includes `c_bsim3_dc_reference`,
 BSIM3 unit and integration suites. Native BSIM4 remains a separate,
 extensively tested 4.8.x device and is not an alias for BSIM3.
 
-The catalogs in this crate are an input schema only. No legacy-BSIM
-producer artifact or numerical kernel is advertised. In particular the
+The catalogs are an input schema only. BSIM1 and BSIM2 additionally have immutable model and size-dependent instance preparation (see below). No legacy-BSIM solver-ready artifact or complete numerical kernel is advertised. In particular the
 new v33 input metadata does not transfer ownership of the existing
 working solver implementation. The producer should eventually own
 immutable physical preparation, while the consuming solver continues
@@ -107,3 +106,48 @@ The generator copies only interface facts (name, type, access and alias
 identity), not formulas or source descriptions. The schema tests check
 revision selection, counts, sorted unique names, dense canonical slots,
 ordered aliases, rejected ask-only inputs and version-specific types.
+
+
+## BSIM1/2 immutable preparation
+
+`prepare_legacy_bsim_model` resolves every model scalar and polarity, retaining
+both the original given value and the effective defaulted/clamped value.
+`PreparedLegacyBsimModel::prepare_instance` produces a typed
+`PreparedLegacyBsimInstance` with a distinct BSIM1 or BSIM2 coefficient block.
+It validates effective dimensions and positive finite oxide thickness,
+applies DL/DW in micrometres, calculates all size-dependent mobility,
+threshold and weak-inversion coefficients, and derives junction saturation
+currents, capacitances and series conductances. Geometry input is in SI
+units and multiplicity remains separate. No global scale is applied:
+neither legacy C instance setter scales its dimensions. Initial-condition
+assignment precedence and OFF remain solver concerns.
+
+The two families differ materially: BSIM1 clamps phi/K1/K2, interpolates
+mobility at zero and VDD, and bounds the VDD drain slope; BSIM2 has a
+separate saturation-mobility body constraint, unscaled beta2, a distinct
+model TEMP thermal voltage and low-field/impact-ionization coefficients.
+BSIM1's source-default oxide thickness is zero and must be explicitly
+supplied before physical instance preparation. Both source temperature
+routines ignore circuit ambient, and BSIM2 computes its thermal voltage
+from model TEMP + 273 rather than ambient Kelvin. Noise temperature and
+junction thermal voltage are separate from this model preparation.
+
+The prepared overlap values reproduce the C temperature-stage outputs.
+There is an upstream inconsistency: the AC/PZ routines use these prepared
+values, while the transient load recomputes overlap using drawn width
+and corrected length. A single generalized charge law must not switch
+geometry based on analysis kind. Resolve that explicitly at kernel
+integration and qualify AC and transient against independent physical
+derivatives, distinguishing the native reference discrepancy. BSIM2
+also declares XPART as a real but reads the integer member of IFvalue;
+the raw source value remains in the model block, pending a physically
+qualified charge-mode contract. No alternate B2 charge mode is inferred
+from the union representation.
+
+Verification: 3 nontrivial parameter/geometry cases per family compare
+261 size-dependent values against the actual C setters and temperature
+routines; 214 scalar default values come from independent ngspice 47
+showmod output. Candidate changes, wrong family, nonphysical dimensions
+and repeated preparation are exercised by source-free tests. The C
+harness and numeric witnesses are in the intrinsic crate's tools and
+tests/fixtures/legacy-bsim directories.

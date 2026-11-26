@@ -7,8 +7,15 @@
 mod catalog;
 mod defaults;
 mod hv;
+mod legacy_bsim;
 
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
+pub use legacy_bsim::{
+    Bsim1Coefficients, Bsim2Coefficients, LegacyBsimChannel, LegacyBsimGeometry,
+    LegacyBsimJunction, LegacyBsimJunctionLaw, LegacyBsimOverlap, PreparedLegacyBsimInstance,
+    PreparedLegacyBsimModel, prepare_legacy_bsim_model,
+};
+
 pub use hv::{
     HiSimHvBinningGeometry, HiSimHvDepletionTransport, HiSimHvDrainBias, HiSimHvDrainCurrent,
     HiSimHvEdgeTunnelingCurrent, HiSimHvEdgeTunnelingCurrents, HiSimHvEffectiveGeometry,
