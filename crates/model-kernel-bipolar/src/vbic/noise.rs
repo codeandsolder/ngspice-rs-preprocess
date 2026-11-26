@@ -45,7 +45,7 @@ pub struct Conductances {
 /// Already-scaled branch currents from the accepted or trial operating point.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Currents {
-    /// Forward transport current Itzf, not the net Itzf-Itzr.
+    /// Collector transfer current (delayed forward minus reverse).
     pub ic: f64,
     pub ibe: f64,
     pub ibep: f64,

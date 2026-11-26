@@ -4,6 +4,7 @@
 //! model. Depletion charges and derivatives must be computed by their own
 //! physical laws, not silently omitted for nonzero model junction capacitance.
 
+use super::temperature::{self, Coefficient as C};
 use crate::{
     EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
     validate_positive,
@@ -43,6 +44,8 @@ pub struct Depletion {
     pub qdbc: f64,
     /// Derivative of qdbc wrt intrinsic Vbci, dimensionless.
     pub cbc: f64,
+    pub d_qdbe_temperature: f64,
+    pub d_qdbc_temperature: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +60,7 @@ pub struct ValueAndGradient {
     pub value: f64,
     pub d_vbei: f64,
     pub d_vbci: f64,
+    pub d_temperature: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -76,10 +80,14 @@ pub struct Output {
 #[derive(Clone, Copy, Debug)]
 pub struct Prepared {
     params: Parameters,
-    vt: f64,
+    vt: Gradient,
+    saturation: Gradient,
+    nf: Gradient,
+    nr: Gradient,
+    isrr: Gradient,
     inverse_vef: f64,
     inverse_ver: f64,
-    inverse_ikf: f64,
+    inverse_ikf: Gradient,
     inverse_ikr: f64,
 }
 
@@ -107,16 +115,20 @@ impl Prepared {
         let reciprocal = |value: f64| if value == 0.0 { 0.0 } else { 1.0 / value };
         let prepared = Self {
             params: parameters,
-            vt: (1.380_662e-23 / 1.602_189e-19) * temperature.kelvin(),
+            vt: Gradient::constant(temperature::thermal_voltage(temperature)),
+            saturation: Gradient::constant(parameters.is),
+            nf: Gradient::constant(parameters.nf),
+            nr: Gradient::constant(parameters.nr),
+            isrr: Gradient::constant(parameters.isrr),
             inverse_vef: reciprocal(parameters.vef),
             inverse_ver: reciprocal(parameters.ver),
-            inverse_ikf: reciprocal(parameters.ikf),
+            inverse_ikf: Gradient::constant(reciprocal(parameters.ikf)),
             inverse_ikr: reciprocal(parameters.ikr),
         };
         if [
             prepared.inverse_vef,
             prepared.inverse_ver,
-            prepared.inverse_ikf,
+            prepared.inverse_ikf.value,
             prepared.inverse_ikr,
         ]
         .iter()
@@ -126,6 +138,17 @@ impl Prepared {
                 "reciprocal transport parameter",
             ));
         }
+        Ok(prepared)
+    }
+
+    pub(super) fn from_temperature(t: &temperature::Prepared) -> Result<Self, ModelError> {
+        let mut prepared = Self::new(t.transport_parameters(), t.temperature())?;
+        prepared.vt = t.voltage_jet();
+        prepared.saturation = t.jet(C::Is);
+        prepared.nf = t.jet(C::Nf);
+        prepared.nr = t.jet(C::Nr);
+        prepared.isrr = t.jet(C::Isrr);
+        prepared.inverse_ikf = temperature::inverse_enabled(t.jet(C::Ikf));
         Ok(prepared)
     }
 
@@ -140,6 +163,8 @@ impl Prepared {
             depletion.cbe,
             depletion.qdbc,
             depletion.cbc,
+            depletion.d_qdbe_temperature,
+            depletion.d_qdbc_temperature,
         ]
         .iter()
         .all(|v| v.is_finite())
@@ -147,25 +172,29 @@ impl Prepared {
             return Err(EvaluationError::NonFiniteBias);
         }
         let p = self.params;
-        let emitter_voltage = Gradient::new(bias.vbei, 1.0, 0.0);
-        let collector_voltage = Gradient::new(bias.vbci, 0.0, 1.0);
-        let forward = (emitter_voltage / (p.nf * self.vt)).exp_m1() * p.is;
-        let reverse = (collector_voltage / (p.nr * self.vt)).exp_m1() * (p.is * p.isrr);
-        let be = Gradient::new(depletion.qdbe, depletion.cbe, 0.0);
-        let bc = Gradient::new(depletion.qdbc, 0.0, depletion.cbc);
+        let emitter_voltage = Gradient::emitter(bias.vbei);
+        let collector_voltage = Gradient::collector(bias.vbci);
+        let forward = (emitter_voltage / (self.nf * self.vt)).exp_m1() * self.saturation;
+        let reverse =
+            (collector_voltage / (self.nr * self.vt)).exp_m1() * (self.saturation * self.isrr);
+        let be = Gradient::new(depletion.qdbe, depletion.cbe, 0.0, 0.0)
+            .with_temperature(depletion.d_qdbe_temperature);
+        let bc = Gradient::new(depletion.qdbc, 0.0, depletion.cbc, 0.0)
+            .with_temperature(depletion.d_qdbc_temperature);
 
         let q1z = Gradient::constant(1.0) + be * self.inverse_ver + bc * self.inverse_vef;
         let centered = q1z - Gradient::constant(1e-4);
-        let q1 = ((centered * centered + Gradient::constant(1e-8)).sqrt()? + centered) * 0.5
+        let q1 = ((centered * centered + Gradient::constant(1e-8)).checked_sqrt()? + centered)
+            * 0.5
             + Gradient::constant(1e-4);
         let q2 = forward * self.inverse_ikf + reverse * self.inverse_ikr;
         let qb = match p.base_charge_form {
             BaseChargeForm::Coupled => {
-                let radicand = q1.powf(1.0 / p.nkf)? + q2 * 4.0;
-                (q1 + radicand.powf(p.nkf)?) * 0.5
+                let radicand = q1.checked_powf(1.0 / p.nkf)? + q2 * 4.0;
+                (q1 + radicand.checked_powf(p.nkf)?) * 0.5
             }
             BaseChargeForm::Factorized => {
-                let injection = (Gradient::constant(1.0) + q2 * 4.0).powf(p.nkf)?;
+                let injection = (Gradient::constant(1.0) + q2 * 4.0).checked_powf(p.nkf)?;
                 q1 * (Gradient::constant(1.0) + injection) * 0.5
             }
         };
@@ -185,30 +214,16 @@ impl Prepared {
             qb: qb.into(),
         };
         if ![
-            output.ideal_forward.value,
-            output.ideal_forward.d_vbei,
-            output.ideal_forward.d_vbci,
-            output.ideal_reverse.value,
-            output.ideal_reverse.d_vbei,
-            output.ideal_reverse.d_vbci,
-            output.q1.value,
-            output.q1.d_vbei,
-            output.q1.d_vbci,
-            output.forward.value,
-            output.forward.d_vbei,
-            output.forward.d_vbci,
-            output.reverse.value,
-            output.reverse.d_vbei,
-            output.reverse.d_vbci,
-            output.net.value,
-            output.net.d_vbei,
-            output.net.d_vbci,
-            output.qb.value,
-            output.qb.d_vbei,
-            output.qb.d_vbci,
+            forward,
+            reverse,
+            q1,
+            forward_current,
+            reverse_current,
+            net,
+            qb,
         ]
-        .iter()
-        .all(|v| v.is_finite())
+        .into_iter()
+        .all(Gradient::is_finite)
         {
             return Err(EvaluationError::NonFiniteResult);
         }
@@ -230,74 +245,32 @@ impl Prepared {
     }
 }
 
-/// Two-dimensional analytic forward differentiation without a runtime tape.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Gradient {
-    pub(super) value: f64,
-    pub(super) emitter_slope: f64,
-    pub(super) collector_slope: f64,
+pub(super) use crate::hicum2::transport::jet::Jet as Gradient;
+
+pub(super) trait CheckedGradient: Sized {
+    fn checked_ln(self) -> Result<Self, EvaluationError>;
+    fn checked_sqrt(self) -> Result<Self, EvaluationError>;
+    fn checked_powf(self, exponent: f64) -> Result<Self, EvaluationError>;
 }
 
-impl Gradient {
-    pub(super) const fn new(value: f64, emitter_slope: f64, collector_slope: f64) -> Self {
-        Self {
-            value,
-            emitter_slope,
-            collector_slope,
-        }
-    }
-    pub(super) const fn constant(value: f64) -> Self {
-        Self::new(value, 0.0, 0.0)
-    }
-    pub(super) fn exp(self) -> Self {
-        let value = self.value.exp();
-        Self::new(
-            value,
-            value * self.emitter_slope,
-            value * self.collector_slope,
-        )
-    }
-    pub(super) fn exp_m1(self) -> Self {
-        let slope = self.value.exp();
-        Self::new(
-            self.value.exp_m1(),
-            slope * self.emitter_slope,
-            slope * self.collector_slope,
-        )
-    }
-    pub(super) fn ln(self) -> Result<Self, EvaluationError> {
+impl CheckedGradient for Gradient {
+    fn checked_ln(self) -> Result<Self, EvaluationError> {
         if self.value <= 0.0 {
             return Err(EvaluationError::InvalidPhysicalDomain);
         }
-        let inv = 1.0 / self.value;
-        Ok(Self::new(
-            self.value.ln(),
-            self.emitter_slope * inv,
-            self.collector_slope * inv,
-        ))
+        Ok(self.ln())
     }
-    pub(super) fn sqrt(self) -> Result<Self, EvaluationError> {
+    fn checked_sqrt(self) -> Result<Self, EvaluationError> {
         if self.value <= 0.0 {
             return Err(EvaluationError::InvalidPhysicalDomain);
         }
-        let root = self.value.sqrt();
-        Ok(Self::new(
-            root,
-            self.emitter_slope * (0.5 / root),
-            self.collector_slope * (0.5 / root),
-        ))
+        Ok(self.sqrt())
     }
-    pub(super) fn powf(self, power: f64) -> Result<Self, EvaluationError> {
+    fn checked_powf(self, exponent: f64) -> Result<Self, EvaluationError> {
         if self.value <= 0.0 {
             return Err(EvaluationError::InvalidPhysicalDomain);
         }
-        let value = self.value.powf(power);
-        let slope = value * power / self.value;
-        Ok(Self::new(
-            value,
-            slope * self.emitter_slope,
-            slope * self.collector_slope,
-        ))
+        Ok(self.powf(exponent))
     }
 }
 
@@ -305,68 +278,9 @@ impl From<Gradient> for ValueAndGradient {
     fn from(value: Gradient) -> Self {
         Self {
             value: value.value,
-            d_vbei: value.emitter_slope,
-            d_vbci: value.collector_slope,
+            d_vbei: value.be,
+            d_vbci: value.bc,
+            d_temperature: value.temperature,
         }
-    }
-}
-
-impl std::ops::Add for Gradient {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self::new(
-            self.value + rhs.value,
-            self.emitter_slope + rhs.emitter_slope,
-            self.collector_slope + rhs.collector_slope,
-        )
-    }
-}
-impl std::ops::Sub for Gradient {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        Self::new(
-            self.value - rhs.value,
-            self.emitter_slope - rhs.emitter_slope,
-            self.collector_slope - rhs.collector_slope,
-        )
-    }
-}
-impl std::ops::Mul for Gradient {
-    type Output = Self;
-    fn mul(self, rhs: Self) -> Self {
-        Self::new(
-            self.value * rhs.value,
-            self.emitter_slope
-                .mul_add(rhs.value, rhs.emitter_slope * self.value),
-            self.collector_slope
-                .mul_add(rhs.value, rhs.collector_slope * self.value),
-        )
-    }
-}
-impl std::ops::Mul<f64> for Gradient {
-    type Output = Self;
-    fn mul(self, rhs: f64) -> Self {
-        Self::new(
-            self.value * rhs,
-            self.emitter_slope * rhs,
-            self.collector_slope * rhs,
-        )
-    }
-}
-impl std::ops::Div<f64> for Gradient {
-    type Output = Self;
-    fn div(self, rhs: f64) -> Self {
-        self * (1.0 / rhs)
-    }
-}
-impl std::ops::Div for Gradient {
-    type Output = Self;
-    fn div(self, rhs: Self) -> Self {
-        let inv = 1.0 / rhs.value;
-        Self::new(
-            self.value * inv,
-            (self.value * inv).mul_add(-rhs.emitter_slope, self.emitter_slope) * inv,
-            (self.value * inv).mul_add(-rhs.collector_slope, self.collector_slope) * inv,
-        )
     }
 }

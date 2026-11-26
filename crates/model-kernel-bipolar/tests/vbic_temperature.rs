@@ -487,3 +487,27 @@ fn temperature_adjusted_diode_current_and_gpi_match_ngspice_47() -> TestResult {
     assert_eq!(count, 24);
     Ok(())
 }
+
+#[test]
+fn every_transformed_coefficient_has_analytic_thermal_slope() -> TestResult {
+    let mut nominal = nominal_values();
+    nominal[C::Dtemp.index()] = 12.;
+    let model = Nominal::new(&nominal)?;
+    for ambient in [253.15, 300.15, 373.15] {
+        let baseline = model.prepare(Temperature::new(ambient)?)?;
+        for rise in [-5., 0., 10., 35.] {
+            let p = baseline.at_rise(rise)?;
+            close(p.temperature().kelvin(), ambient + 12. + rise, 0., 1e-12);
+            let step = 1e-3;
+            let above = baseline.at_rise(rise + step)?;
+            let below = baseline.at_rise(rise - step)?;
+            for index in 0..nominal.len() {
+                let c = coefficient_at(index)?;
+                let slope = (above.value(c) - below.value(c)) / (2. * step);
+                let magnitude = above.value(c).abs().max(below.value(c).abs());
+                close(p.slope(c), slope, 2e-6, magnitude * 1e-10);
+            }
+        }
+    }
+    Ok(())
+}

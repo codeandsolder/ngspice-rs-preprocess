@@ -1,18 +1,25 @@
-//! VBIC 1.1.5 intrinsic and parasitic base-junction current laws.
+//! VBIC 1.1.5 prepared bipolar device and constitutive laws.
 //!
 //! Based on the publicly documented VBIC pseudo-code and ngspice's VBIC
-//! level-9 equations. All current parameters are *temperature-adjusted*
-//! values, rather than uncorrected .MODEL-card values. This module does not
-//! expose a complete VBIC device kernel.
+//! level-9 equations. The binding module resolves native model and instance
+//! cards, device assembles the coupled residual and Jacobian, and shared
+//! exports the prepared-model ABI. Constitutive-law inputs are temperature
+//! adjusted unless explicitly identified as nominal.
 
 pub mod avalanche;
+pub mod binding;
 pub mod charge;
 pub mod depletion;
+pub mod device;
 pub mod noise;
 pub mod parasitic;
 pub mod resistance;
+pub mod shared;
 pub mod temperature;
 pub mod transport;
+
+use temperature::Coefficient as C;
+use transport::Gradient;
 
 use crate::{
     Branch, EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
@@ -62,12 +69,26 @@ pub struct Currents {
     pub ibcj: Branch,
     pub ibep: Branch,
     pub ibcp: Branch,
+    /// Temperature derivatives of the five junction currents in A/K.
+    pub temperature: JunctionSlopes,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct JunctionSlopes {
+    pub ibe: f64,
+    pub ibex: f64,
+    pub ibcj: f64,
+    pub ibep: f64,
+    pub ibcp: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Prepared {
     parameters: Parameters,
-    vt: f64,
+    vt: Gradient,
+    junctions: [Gradient; 8],
+    vbbe: Gradient,
+    nbbe: Gradient,
 }
 
 impl Prepared {
@@ -109,8 +130,40 @@ impl Prepared {
         }
         Ok(Self {
             parameters,
-            vt: (1.380_662e-23 / 1.602_189e-19) * temperature.kelvin(),
+            vt: Gradient::constant(temperature::thermal_voltage(temperature)),
+            junctions: [
+                parameters.ibei,
+                parameters.iben,
+                parameters.ibci,
+                parameters.ibcn,
+                parameters.ibeip,
+                parameters.ibenp,
+                parameters.ibcip,
+                parameters.ibcnp,
+            ]
+            .map(Gradient::constant),
+            vbbe: Gradient::constant(parameters.vbbe),
+            nbbe: Gradient::constant(parameters.nbbe),
         })
+    }
+
+    pub(super) fn from_temperature(t: &temperature::Prepared) -> Result<Self, ModelError> {
+        let mut prepared = Self::new(t.branch_parameters(), t.temperature())?;
+        prepared.vt = t.voltage_jet();
+        prepared.junctions = [
+            C::Ibei,
+            C::Iben,
+            C::Ibci,
+            C::Ibcn,
+            C::Ibeip,
+            C::Ibenp,
+            C::Ibcip,
+            C::Ibcnp,
+        ]
+        .map(|c| t.jet(c));
+        prepared.vbbe = t.jet(C::Vbbe);
+        prepared.nbbe = t.jet(C::Nbbe);
+        Ok(prepared)
     }
 
     /// All diode derivatives are analytic. No state mutation or allocations.
@@ -124,42 +177,53 @@ impl Prepared {
             return Err(EvaluationError::NonFiniteBias);
         }
         let p = &self.parameters;
-        let intrinsic = self.be_junction(bias.vbei)?;
-        let external = self.be_junction(bias.vbex)?;
+        let intrinsic = self.be_junction(bias.vbei) * p.wbe;
+        let external = self.be_junction(bias.vbex) * (1.0 - p.wbe);
+        let [
+            _,
+            _,
+            ideal_collector,
+            recombination_collector,
+            ideal_peripheral,
+            recombination_peripheral,
+            ideal_substrate,
+            recombination_substrate,
+        ] = self.junctions;
+        let bc = junction(ideal_collector, p.nci, self.vt, bias.vbci)
+            + junction(recombination_collector, p.ncn, self.vt, bias.vbci);
+        let bep = junction(ideal_peripheral, p.nci, self.vt, bias.vbep)
+            + junction(recombination_peripheral, p.ncn, self.vt, bias.vbep);
+        let bcp = junction(ideal_substrate, p.ncip, self.vt, bias.vbcp)
+            + junction(recombination_substrate, p.ncnp, self.vt, bias.vbcp);
         Ok(Currents {
-            ibe: scale(intrinsic, p.wbe),
-            ibex: scale(external, 1.0 - p.wbe),
-            ibcj: sum(
-                junction(p.ibci, p.nci, self.vt, bias.vbci)?,
-                junction(p.ibcn, p.ncn, self.vt, bias.vbci)?,
-            )?,
-            ibep: sum(
-                junction(p.ibeip, p.nci, self.vt, bias.vbep)?,
-                junction(p.ibenp, p.ncn, self.vt, bias.vbep)?,
-            )?,
-            ibcp: sum(
-                junction(p.ibcip, p.ncip, self.vt, bias.vbcp)?,
-                junction(p.ibcnp, p.ncnp, self.vt, bias.vbcp)?,
-            )?,
+            ibe: branch(intrinsic)?,
+            ibex: branch(external)?,
+            ibcj: branch(bc)?,
+            ibep: branch(bep)?,
+            ibcp: branch(bcp)?,
+            temperature: JunctionSlopes {
+                ibe: intrinsic.temperature,
+                ibex: external.temperature,
+                ibcj: bc.temperature,
+                ibep: bep.temperature,
+                ibcp: bcp.temperature,
+            },
         })
     }
 
-    fn be_junction(&self, voltage: f64) -> Result<Branch, EvaluationError> {
+    fn be_junction(&self, voltage: f64) -> Gradient {
         let p = &self.parameters;
-        let ideal = junction(p.ibei, p.nei, self.vt, voltage)?;
-        let nonideal = junction(p.iben, p.nen, self.vt, voltage)?;
-        let sum = sum(ideal, nonideal)?;
+        let [ideal, recombination, ..] = self.junctions;
+        let sum = junction(ideal, p.nei, self.vt, voltage)
+            + junction(recombination, p.nen, self.vt, voltage);
         if p.vbbe == 0.0 || p.ibbe == 0.0 {
-            return Ok(sum);
+            return sum;
         }
-        let vt = p.nbbe * self.vt;
-        // Reverse-breakdown source, anchored to exactly zero at zero bias.
-        let exp = ((-p.vbbe - voltage) / vt).exp();
-        let zero = (-p.vbbe / vt).exp();
-        Branch::validated(
-            p.ibbe.mul_add(-(exp - zero), sum.amperes),
-            sum.siemens + p.ibbe * exp / vt,
-        )
+        let vt = self.nbbe * self.vt;
+        // Reverse breakdown anchored at zero bias, with exact thermal derivative.
+        let exp = ((-self.vbbe - Gradient::emitter(voltage)) / vt).exp();
+        let zero = (-self.vbbe / vt).exp();
+        sum - (exp - zero) * p.ibbe
     }
 
     /// Evaluate a homogeneous batch into caller-owned storage. Can be used on
@@ -179,33 +243,16 @@ impl Prepared {
     }
 }
 
-fn junction(
-    saturation: f64,
-    ideality: f64,
-    vt: f64,
-    voltage: f64,
-) -> Result<Branch, EvaluationError> {
-    if saturation == 0.0 {
-        return Ok(Branch::default());
+fn junction(saturation: Gradient, ideality: f64, vt: Gradient, voltage: f64) -> Gradient {
+    if saturation.value == 0.0 {
+        return Gradient::constant(0.0);
     }
-    let exponent = voltage / (ideality * vt);
-    let exponential = exponent.exp();
-    Branch::validated(
-        saturation * exponent.exp_m1(),
-        saturation * exponential / (ideality * vt),
-    )
+    saturation * (Gradient::emitter(voltage) / (vt * ideality)).exp_m1()
 }
 
-fn sum(first: Branch, second: Branch) -> Result<Branch, EvaluationError> {
-    Branch::validated(
-        first.amperes + second.amperes,
-        first.siemens + second.siemens,
-    )
-}
-
-fn scale(branch: Branch, factor: f64) -> Branch {
-    Branch {
-        amperes: branch.amperes * factor,
-        siemens: branch.siemens * factor,
+fn branch(value: Gradient) -> Result<Branch, EvaluationError> {
+    if !value.is_finite() {
+        return Err(EvaluationError::NonFiniteResult);
     }
+    Branch::validated(value.value, value.be)
 }

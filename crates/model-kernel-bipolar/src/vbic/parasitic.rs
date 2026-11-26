@@ -4,6 +4,10 @@
 //! It is a distinct parasitic physics path with three voltage derivatives,
 //! not a substitution of the intrinsic BJT's base-charge transport.
 
+use super::{
+    temperature::{self, Coefficient as C},
+    transport::{CheckedGradient, Gradient},
+};
 use crate::{
     EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
     validate_positive,
@@ -37,21 +41,25 @@ pub struct Output {
     pub ideal_forward_vbep: f64,
     /// Partial of Ifp wrt intrinsic Vbci.
     pub ideal_forward_vbci: f64,
+    pub ideal_forward_temperature: f64,
     pub iccp: f64,
     pub d_vbep: f64,
     pub d_vbci: f64,
     pub d_vbcp: f64,
+    pub d_temperature: f64,
     pub qb: f64,
     /// d(qbp)/d(Vbep), used by the nonlinear peripheral base resistor.
     pub qb_vbep: f64,
     /// d(qbp)/d(Vbci), used by the nonlinear peripheral base resistor.
     pub qb_vbci: f64,
+    pub qb_temperature: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Prepared {
     params: Parameters,
-    inverse_voltage: f64,
+    inverse_voltage: Gradient,
+    saturation: Gradient,
     inverse_ikp: f64,
 }
 
@@ -76,9 +84,18 @@ impl Prepared {
         }
         Ok(Self {
             params: parameters,
-            inverse_voltage: inv,
+            inverse_voltage: Gradient::constant(inv),
+            saturation: Gradient::constant(parameters.isp),
             inverse_ikp: inv_ikp,
         })
+    }
+
+    pub(super) fn from_temperature(t: &temperature::Prepared) -> Result<Self, ModelError> {
+        let mut prepared = Self::new(t.parasitic_parameters(), t.temperature())?;
+        prepared.inverse_voltage =
+            Gradient::constant(1.0) / (t.voltage_jet() * prepared.params.nfp);
+        prepared.saturation = t.jet(C::Isp);
+        Ok(prepared)
     }
 
     /// # Errors
@@ -98,47 +115,36 @@ impl Prepared {
             });
         }
         let scale = self.inverse_voltage;
-        let (emitter, emitter_slope) = exponential_branch(p.isp * p.wsp, bias.vbep * scale, scale);
-        let (collector, collector_slope) =
-            exponential_branch(p.isp * (1.0 - p.wsp), bias.vbci * scale, scale);
+        let emitter = exponential_branch(
+            self.saturation * p.wsp,
+            Gradient::emitter(bias.vbep) * scale,
+        );
+        let collector = exponential_branch(
+            self.saturation * (1.0 - p.wsp),
+            Gradient::collector(bias.vbci) * scale,
+        );
         let forward = emitter + collector;
-        let (reverse, reverse_slope) = exponential_branch(p.isp, bias.vbcp * scale, scale);
-        let radical = 4.0_f64.mul_add(forward * self.inverse_ikp, 1.0);
-        if radical <= 0.0 {
-            return Err(EvaluationError::InvalidPhysicalDomain);
-        }
-        let root = radical.sqrt();
-        let qb = 1.0_f64.midpoint(root);
-        let numerator = forward - reverse;
-        let iccp = numerator / qb;
-        let q_slope = self.inverse_ikp / root;
-        let transfer_slope = (-iccp).mul_add(q_slope, 1.0) / qb;
+        let reverse = exponential_branch(self.saturation, Gradient::charge(bias.vbcp) * scale);
+        let qb = ((forward * (4.0 * self.inverse_ikp) + 1.0).checked_sqrt()? + 1.0) * 0.5;
+        let iccp = (forward - reverse) / qb;
         let output = Output {
-            ideal_forward: forward,
-            ideal_forward_vbep: emitter_slope,
-            ideal_forward_vbci: collector_slope,
-            iccp,
-            d_vbep: emitter_slope * transfer_slope,
-            d_vbci: collector_slope * transfer_slope,
-            d_vbcp: -reverse_slope / qb,
-            qb,
-            qb_vbep: q_slope * emitter_slope,
-            qb_vbci: q_slope * collector_slope,
+            ideal_forward: forward.value,
+            ideal_forward_vbep: forward.be,
+            ideal_forward_vbci: forward.bc,
+            ideal_forward_temperature: forward.temperature,
+            iccp: iccp.value,
+            d_vbep: iccp.be,
+            d_vbci: iccp.bc,
+            d_vbcp: iccp.hole,
+            d_temperature: iccp.temperature,
+            qb: qb.value,
+            qb_vbep: qb.be,
+            qb_vbci: qb.bc,
+            qb_temperature: qb.temperature,
         };
-        if ![
-            output.ideal_forward,
-            output.ideal_forward_vbep,
-            output.ideal_forward_vbci,
-            output.iccp,
-            output.d_vbep,
-            output.d_vbci,
-            output.d_vbcp,
-            output.qb,
-            output.qb_vbep,
-            output.qb_vbci,
-        ]
-        .iter()
-        .all(|value| value.is_finite())
+        if ![forward, reverse, qb, iccp]
+            .into_iter()
+            .all(Gradient::is_finite)
         {
             return Err(EvaluationError::NonFiniteResult);
         }
@@ -160,12 +166,9 @@ impl Prepared {
     }
 }
 
-fn exponential_branch(saturation: f64, exponent: f64, inverse_voltage: f64) -> (f64, f64) {
-    if saturation == 0.0 {
-        return (0.0, 0.0);
+fn exponential_branch(saturation: Gradient, exponent: Gradient) -> Gradient {
+    if saturation.value == 0.0 {
+        return Gradient::constant(0.0);
     }
-    (
-        saturation * exponent.exp_m1(),
-        saturation * exponent.exp() * inverse_voltage,
-    )
+    saturation * exponent.exp_m1()
 }
