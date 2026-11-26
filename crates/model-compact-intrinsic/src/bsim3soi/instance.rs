@@ -1,6 +1,8 @@
 //! Source setup and size-bin arithmetic for the three BSIM3SOI implementations.
 //! Copyright 1999/1990 Regents of the University of California. See package LICENSE.
 
+use std::sync::Arc;
+
 use super::{PreparedModel, rules};
 use crate::preparation::{default, integer, positive, real, slot};
 use crate::{BoundParameters, ModelError, ModelVariant, ParameterScope, ParameterValue};
@@ -67,6 +69,7 @@ pub struct PreparedInstance {
     given: Box<[bool]>,
     binned: Box<[Option<RawBinned>]>,
     initial_conditions: [Option<f64>; 5],
+    pub(super) model_identity: Arc<()>,
 }
 
 impl PreparedInstance {
@@ -311,5 +314,6 @@ pub fn prepare_instance(
         given: source.values.iter().map(Option::is_some).collect(),
         binned,
         initial_conditions,
+        model_identity: Arc::clone(&model.identity),
     })
 }

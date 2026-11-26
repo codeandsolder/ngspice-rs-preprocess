@@ -336,3 +336,139 @@ mod native {
         Ok(())
     }
 }
+
+#[test]
+fn native_internal_temperature_coefficients() -> Result<(), Box<dyn Error>> {
+    use model_compact_intrinsic::bsim3soi::prepare_temperature;
+    let mut checked = 0;
+    let mut cases = 0;
+    let mut max_rel = 0.0_f64;
+    let mut lines = include_str!("fixtures/bsim3soi-thermal/thermal.tsv")
+        .lines()
+        .peekable();
+    while let Some(header) = lines.next() {
+        let columns = header.split('\t').collect::<Vec<_>>();
+        let ["case", family, name, temp, model, instance] = columns.as_slice() else {
+            return Err("invalid oracle header".into());
+        };
+        let family = match *family {
+            "fd" => ModelVariant::Bsim3SoiFd,
+            "dd" => ModelVariant::Bsim3SoiDd,
+            "pd" => ModelVariant::Bsim3SoiPd,
+            _ => return Err("unknown oracle family".into()),
+        };
+        let model = prepare_model(&bind(family, ParameterScope::Model, model, None)?, 300.15)?;
+        let instance = prepare_instance(
+            &model,
+            &bind(family, ParameterScope::Instance, instance, None)?,
+        )?;
+        let t = prepare_temperature(&model, &instance, temp.parse()?)?;
+        let g = instance.geometry();
+        let e = t.electrostatics;
+        let j = t.junctions;
+        let tr = t.transport;
+        let mat = t.material;
+        let mut values = std::collections::BTreeMap::from([
+            ("leff", g.length_m),
+            ("weff", g.width_m),
+            ("leffCV", g.cv_length_m),
+            ("weffCV", g.cv_width_m),
+            ("abulkCVfactor", g.abulk_cv_factor),
+            ("ua", tr.mobility_coefficients[0]),
+            ("ub", tr.mobility_coefficients[1]),
+            ("uc", tr.mobility_coefficients[2]),
+            ("uatemp", tr.nominal_mobility_coefficients[0]),
+            ("ubtemp", tr.nominal_mobility_coefficients[1]),
+            ("uctemp", tr.nominal_mobility_coefficients[2]),
+            ("u0", tr.nominal_mobility),
+            ("u0temp", tr.mobility),
+            ("vsattemp", tr.saturation_velocity),
+            ("rds0denom", tr.resistance_denominator),
+            ("rds0", tr.series_resistance),
+            ("rth", tr.thermal_resistance),
+            ("cth", tr.thermal_capacitance),
+            ("rbody", tr.body_resistance),
+            ("cgdo", t.overlaps[0]),
+            ("cgso", t.overlaps[1]),
+            ("cgeo", t.overlaps[2]),
+            ("npeak", e.channel_doping),
+            ("jbjt", j.bipolar),
+            ("jdif", j.diffusion),
+            ("jrec", j.recombination),
+            ("jtun", j.tunneling),
+            ("vfbb", e.back_flatband),
+            ("vsdfb", e.substrate_flatband),
+            ("vsdth", e.substrate_threshold),
+            ("phi", e.phi),
+            ("sqrtPhi", e.phi.sqrt()),
+            ("phis3", e.phi * e.phi.sqrt()),
+            ("Xdep0", e.depletion_depth),
+            ("sqrtXdep0", e.depletion_depth.sqrt()),
+            ("litl", e.lateral_length),
+            ("vbi", e.built_in_potential),
+            ("cdep0", e.depletion_capacitance),
+            ("k1", e.k1),
+            ("k2", e.k2),
+            ("vbsc", e.body_bias_limit),
+            ("vfb", e.flatband),
+            ("vth0", e.threshold),
+            ("theta0vb0", e.short_channel_factor),
+            ("thetaRout", e.output_resistance_factor),
+            ("eg0", mat.nominal_gap),
+            ("vtm", mat.thermal_voltage),
+            ("csdmin", e.substrate_minimum_capacitance),
+            ("cbox", e.buried_oxide_capacitance),
+            ("rbodyext", t.external_body_resistance),
+            ("drainConductance", t.series_conductances[0]),
+            ("sourceConductance", t.series_conductances[1]),
+            ("csesw", t.substrate_sidewall[1]),
+            ("cdesw", t.substrate_sidewall[0]),
+        ]);
+        if let Some(pd) = g.pd {
+            values.extend([
+                ("k1eff", e.effective_k1),
+                (
+                    "oxideRatio",
+                    tr.oxide_ratio.ok_or("PD oxide ratio missing")?,
+                ),
+                (
+                    "ahli0",
+                    j.high_level_injection.ok_or("PD injection missing")?,
+                ),
+                ("wdiod", pd.drain_diode_width),
+                ("wdios", pd.source_diode_width),
+                ("wdiodCV", pd.drain_diode_cv_width),
+                ("wdiosCV", pd.source_diode_cv_width),
+                ("leffCVb", pd.body_cv_length),
+                ("leffCVbg", pd.backgate_cv_length),
+            ]);
+        }
+        while lines.peek().is_some_and(|line| !line.starts_with("case\t")) {
+            let line = lines.next().ok_or("missing value")?;
+            let (key, value) = line.split_once('\t').ok_or("invalid oracle value")?;
+            let expected = value.parse::<f64>()?;
+            let actual = values
+                .remove(key)
+                .ok_or_else(|| format!("unknown coefficient {key}"))?;
+            let residual = (actual - expected).abs();
+            let relative = residual / expected.abs().max(1e-100);
+            max_rel = max_rel.max(relative);
+            assert!(
+                relative < 2e-10,
+                "{family:?} {name} {key}: {actual:e} != {expected:e}, relative {relative:e}"
+            );
+            checked += 1;
+        }
+        assert!(
+            values.is_empty(),
+            "{family:?} {name}: missing reference {values:?}"
+        );
+        cases += 1;
+    }
+    assert_eq!(cases, 18);
+    assert_eq!(checked, 1026);
+    println!(
+        "{cases} native C setup/temp cases, {checked} scalar coefficients, maximum relative deviation {max_rel:e}"
+    );
+    Ok(())
+}

@@ -2,6 +2,12 @@
 //! Copyright 1999/1990 Regents of the University of California. See package LICENSE.
 
 mod instance;
+mod thermal;
+
+pub use thermal::{
+    Electrostatics, JunctionDensities, PhysicalTemperature, TemperatureMaterial, Transport,
+    prepare_temperature,
+};
 
 pub use instance::{Geometry, PdGeometry, PreparedInstance, RawBinned, prepare_instance};
 mod rules;
@@ -9,6 +15,8 @@ mod rules;
 use crate::{
     BoundParameters, ModelError, ModelVariant, MosPolarity, ParameterScope, ParameterValue,
 };
+
+use std::sync::Arc;
 
 use crate::preparation::{assign, flag, given, integer, positive, real, value};
 
@@ -48,6 +56,7 @@ pub struct PreparedModel {
     polarity: MosPolarity,
     oxide_capacitance_f_per_m2: f64,
     diffusion_temperature_exponent: f64,
+    identity: Arc<()>,
 }
 
 impl PreparedModel {
@@ -238,5 +247,6 @@ pub fn prepare_model(
         given: source.values.iter().map(Option::is_some).collect(),
         oxide_capacitance_f_per_m2,
         diffusion_temperature_exponent,
+        identity: Arc::new(()),
     })
 }
