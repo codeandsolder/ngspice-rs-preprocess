@@ -47,7 +47,8 @@ pub(super) fn scope_prefix<'a>(
             .checked_add(1)
             .context("namespace ordinal overflow")?;
     }
-    Ok(format!("{initial}{ordinal}_"))
+    let separator = if initial.ends_with('_') { "" } else { "_" };
+    Ok(format!("{initial}{separator}{ordinal}_"))
 }
 
 #[derive(Default)]
@@ -69,6 +70,13 @@ impl OccupiedNamespaces {
             }
             self.base = true;
             let suffix = &bytes[start + prefix.len()..];
+            let suffix = if initial.ends_with('_') {
+                suffix
+            } else if let Some(suffix) = suffix.strip_prefix(b"_") {
+                suffix
+            } else {
+                continue;
+            };
             let digits = suffix
                 .iter()
                 .take_while(|byte| byte.is_ascii_digit())
@@ -119,24 +127,24 @@ impl SpiceExpressionContext for Unbound {
     }
 }
 
-pub(super) fn constant(expression: &str) -> Result<Option<f64>> {
-    let compiled = SpiceExpression::parse(expression)?;
+pub(super) fn constant(expression: &str, budget: &WorkBudget) -> Result<Option<f64>> {
+    let compiled = SpiceExpression::parse_with_budget(expression, budget)?;
     let mut resolver = Unbound::default();
-    match compiled.evaluate_with(&mut resolver) {
+    match compiled.evaluate_with_budget(&mut resolver, budget) {
         Ok(value) => Ok(Some(value)),
         Err(_) if resolver.0 => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-pub(super) fn expression_text(text: &str) -> Result<String> {
+pub(super) fn expression_text(text: &str, budget: &WorkBudget) -> Result<String> {
     let text = text.trim();
     let inner = text
         .strip_prefix('{')
         .and_then(|rest| rest.strip_suffix('}'))
         .unwrap_or(text);
-    let text = lower_simetrix_behavioral_expression(inner)?;
-    SpiceExpression::parse(&text)?;
+    let text = lower_simetrix_behavioral_expression(inner, budget)?;
+    SpiceExpression::parse_with_budget(&text, budget)?;
     Ok(text)
 }
 
@@ -165,14 +173,16 @@ impl std::fmt::Display for Scalar {
     }
 }
 
-struct Parameters {
+struct Parameters<'a> {
+    budget: &'a WorkBudget,
     prefix: String,
     output: String,
 }
 
-impl Parameters {
+impl Parameters<'_> {
     fn define(&mut self, name: &str, expression: &str) -> Result<Scalar> {
-        let value = constant(expression).with_context(|| format!("invalid PWLS PUL {name}"))?;
+        let value = constant(expression, self.budget)
+            .with_context(|| format!("invalid PWLS PUL {name}"))?;
         let text = if let Some(value) = value {
             format!("{value:.17e}")
         } else {
@@ -196,7 +206,7 @@ struct Pulse {
 }
 
 impl Pulse {
-    fn prepare(spec: &PulseSpec, params: &mut Parameters) -> Result<Self> {
+    fn prepare(spec: &PulseSpec, params: &mut Parameters<'_>) -> Result<Self> {
         let low = params.define("v1", &spec.first)?;
         let high = params.define("v2", &spec.second)?;
         let period = match &spec.period {
@@ -256,7 +266,7 @@ impl Pulse {
         name: &str,
         positive: &str,
         negative: &str,
-        params: &mut Parameters,
+        params: &mut Parameters<'_>,
     ) -> Result<()> {
         let Self {
             low,
@@ -334,7 +344,7 @@ impl Pulse {
     }
 }
 
-pub(super) fn translate(parsed: &Parsed, scope: &str) -> Result<Translation> {
+pub(super) fn translate(parsed: &Parsed, scope: &str, budget: &WorkBudget) -> Result<Translation> {
     let WaveformSpec::Pulse(spec) = &parsed.spec else {
         bail!("PWLS requires pulse forcing")
     };
@@ -344,6 +354,7 @@ pub(super) fn translate(parsed: &Parsed, scope: &str) -> Result<Translation> {
     }
     prefix.push('_');
     let mut params = Parameters {
+        budget,
         prefix,
         output: String::new(),
     };
@@ -396,8 +407,9 @@ mod tests {
     }
 
     fn lower(source: &str) -> Result<String> {
-        let result = super::super::waveforms::translate(source, "pulse_test_")?
-            .context("missing translation")?;
+        let result =
+            super::super::waveforms::translate(source, "pulse_test_", &WorkBudget::default())?
+                .context("missing translation")?;
         assert_eq!(result.kind, TranslationKind::PulseSource);
         Ok(String::from_utf8(result.bytes)?)
     }

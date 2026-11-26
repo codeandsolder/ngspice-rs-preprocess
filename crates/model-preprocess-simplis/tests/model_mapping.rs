@@ -226,7 +226,9 @@ fn diode_alias_uses_the_selected_kernel_parameter_grammar() -> Result<()> {
 .model a DTEST (LEVEL 69 IS {local_is} RS 2 T_ABS {local_temp})
 ",
     );
-    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source)?.apply(&source)?;
+    let budget = WorkBudget::default();
+    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source, &budget)?
+        .apply(&source, &budget)?;
     assert_eq!(mapped.selections.len(), 1);
     let card = &mapped
         .statements

@@ -1,5 +1,6 @@
 //! Shared lexical source syntax for electrical translation and explicit compilers.
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::collections::BTreeMap;
 
 /// Validate a dialect electrical node identifier.
@@ -468,6 +469,12 @@ fn subcircuit_name(statement: &str) -> Result<String> {
 /// # Errors
 /// Returns an error for unmatched or malformed subcircuit delimiters.
 pub fn parse_items(input: &str) -> Result<Vec<Item>> {
+    parse_items_with_budget(input, &WorkBudget::default())
+}
+
+pub(crate) fn parse_items_with_budget(input: &str, budget: &WorkBudget) -> Result<Vec<Item>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    budget.charge(Resource::Statements, input.lines().count())?;
     let mut roots = Vec::new();
     let mut stack: Vec<Subcircuit> = Vec::new();
     let mut embedded = false;
@@ -486,7 +493,7 @@ pub fn parse_items(input: &str) -> Result<Vec<Item>> {
                 .get(7..8)
                 .is_some_and(|value| value.as_bytes().iter().all(u8::is_ascii_whitespace))
         {
-            anyhow::ensure!(stack.len() < 64, "translation subcircuit depth exceeded 64");
+            budget.check_depth(stack.len().saturating_add(1))?;
             let name = subcircuit_name(&statement)?;
             stack.push(Subcircuit {
                 header: statement,

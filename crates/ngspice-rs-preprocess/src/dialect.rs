@@ -633,6 +633,7 @@ fn expanded(
         &mut source,
         if include { "model.lib" } else { "deck.cir" },
         &mut waveforms,
+        budget,
     )?;
     let translated = if include {
         translate_simplis_expanded_library_with_budget(&source, budget)?
@@ -673,7 +674,12 @@ fn translate_companions(
     for (library, mut translated) in linked.libraries.iter().zip(translated_libraries) {
         budget.charge(super::Resource::ScannedBytes, translated.bytes.len())?;
         if let Some(policy) = &mut *initial_conditions {
-            capture_artifact_initial_conditions(&mut translated.bytes, &library.filename, policy)?;
+            capture_artifact_initial_conditions(
+                &mut translated.bytes,
+                &library.filename,
+                policy,
+                budget,
+            )?;
         }
         check_closed_includes(&translated.bytes, known)?;
         remaining = remaining
@@ -856,12 +862,15 @@ fn linked(
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
     let plan = capture_linked_plan(&mut linked, root, request.format, &declarations)?;
     let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
-        lower_simetrix_linked_runtime(&mut linked)?;
-        Some(capture_passive_initial_conditions(&mut linked)?)
+        lower_simetrix_linked_runtime(&mut linked, session.budget())?;
+        Some(capture_passive_initial_conditions(
+            &mut linked,
+            session.budget(),
+        )?)
     } else {
         None
     };
-    let waveforms = capture_linked_waveforms(&mut linked)?;
+    let waveforms = capture_linked_waveforms(&mut linked, session.budget())?;
     let known = linked
         .libraries
         .iter()
@@ -876,7 +885,12 @@ fn linked(
         });
     }
     if let Some(policy) = &mut initial_conditions {
-        capture_artifact_initial_conditions(&mut translated_root.bytes, "deck.cir", policy)?;
+        capture_artifact_initial_conditions(
+            &mut translated_root.bytes,
+            "deck.cir",
+            policy,
+            session.budget(),
+        )?;
     }
     plan.append_native_options(&mut translated_root.bytes)?;
     check_closed_includes(&translated_root.bytes, &known)?;

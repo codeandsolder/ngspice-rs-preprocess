@@ -18,12 +18,12 @@ use super::{
     translate_charge_capacitor, translate_flux_inductor, translate_ipwlr, translate_vpwlr,
     validate_node, validate_resistor_end_slopes, write_number,
 };
-#[cfg(test)]
-use crate::syntax::logical_statements;
 use crate::syntax::{
     Item, Subcircuit, electrical_statements, file_boundary, matching_behavioral_delimiter,
-    model_header, parse_items, simple_assignment_span, simple_assignment_value,
+    model_header, parse_items_with_budget, simple_assignment_span, simple_assignment_value,
 };
+#[cfg(test)]
+use crate::syntax::{logical_statements, parse_items};
 use anyhow::{Context, Result, bail};
 use model_normalize_ngspice::passive_ic::PassiveKind;
 use model_preprocess_command::{Resource, WorkBudget};
@@ -50,43 +50,52 @@ pub struct SplitDeckTranslation {
     pub flattened_subcircuits: usize,
 }
 
-fn render_native_subcircuit(block: &Subcircuit, output: &mut String) -> Result<()> {
-    output.push_str(&block.header);
-    output.push('\n');
+fn render_native_subcircuit(
+    block: &Subcircuit,
+    output: &mut String,
+    budget: &WorkBudget,
+) -> Result<()> {
+    let _depth = budget.enter()?;
+    append_format_budgeted(output, budget, format_args!("{}\n", block.header))?;
     for item in &block.body {
         match item {
             Item::Statement(statement) => {
-                output.push_str(statement);
-                output.push('\n');
+                append_format_budgeted(output, budget, format_args!("{statement}\n"))?;
             }
-            Item::Subcircuit(child) => render_native_subcircuit(child, output)?,
+            Item::Subcircuit(child) => render_native_subcircuit(child, output, budget)?,
         }
     }
-    writeln!(output, ".ends {}", block.name)?;
-    output.push('\n');
+    append_format_budgeted(output, budget, format_args!(".ends {}\n\n", block.name))?;
     Ok(())
 }
 
 fn capture_artifact_items(
     bytes: &mut Vec<u8>,
+    budget: &WorkBudget,
     capture: impl FnOnce(&mut [Item]) -> Result<bool>,
 ) -> Result<()> {
-    let mut items = parse_items(std::str::from_utf8(bytes)?)?;
+    let mut items = parse_deck_items(bytes, budget)?;
     if !capture(&mut items)? {
         return Ok(());
     }
     let mut text = String::new();
     for item in items {
         match item {
-            Item::Statement(statement) => writeln!(text, "{statement}")?,
-            Item::Subcircuit(block) => render_native_subcircuit(&block, &mut text)?,
+            Item::Statement(statement) => {
+                append_format_budgeted(&mut text, budget, format_args!("{statement}\n"))?
+            }
+            Item::Subcircuit(block) => render_native_subcircuit(&block, &mut text, budget)?,
         }
     }
     *bytes = text.into_bytes();
     Ok(())
 }
 
-fn split_native_deck(input: &[u8], include_path: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+fn split_native_deck(
+    input: &[u8],
+    include_path: &str,
+    budget: &WorkBudget,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     if include_path.is_empty()
         || include_path
             .as_bytes()
@@ -95,11 +104,14 @@ fn split_native_deck(input: &[u8], include_path: &str) -> Result<(Vec<u8>, Vec<u
     {
         bail!("invalid ngspice include path");
     }
-    let text = std::str::from_utf8(input).context("translated ngspice deck is not UTF-8")?;
-    let items = parse_items(text)?;
+    let items = parse_deck_items(input, budget)?;
     let mut deck = String::new();
-    let mut library =
-        String::from("* ngspice-rs-preprocess: translated SIMPLIS generated subcircuits\n");
+    let mut library = String::new();
+    append_budgeted(
+        &mut library,
+        "* ngspice-rs-preprocess: translated SIMPLIS generated subcircuits\n",
+        budget,
+    )?;
     let mut inserted_include = false;
     let mut subcircuits = 0usize;
     for item in &items {
@@ -108,15 +120,18 @@ fn split_native_deck(input: &[u8], include_path: &str) -> Result<(Vec<u8>, Vec<u
                 if directive_name(statement).as_deref() == Some(".END") {
                     continue;
                 }
-                deck.push_str(statement);
-                deck.push('\n');
+                append_format_budgeted(&mut deck, budget, format_args!("{statement}\n"))?;
             }
             Item::Subcircuit(block) => {
                 if !inserted_include {
-                    writeln!(deck, ".include \"{include_path}\"")?;
+                    append_format_budgeted(
+                        &mut deck,
+                        budget,
+                        format_args!(".include \"{include_path}\"\n"),
+                    )?;
                     inserted_include = true;
                 }
-                render_native_subcircuit(block, &mut library)?;
+                render_native_subcircuit(block, &mut library, budget)?;
                 subcircuits = subcircuits.saturating_add(1);
             }
         }
@@ -124,7 +139,7 @@ fn split_native_deck(input: &[u8], include_path: &str) -> Result<(Vec<u8>, Vec<u
     if subcircuits == 0 {
         bail!("translated ngspice deck contains no subcircuits to split");
     }
-    deck.push_str(".end\n");
+    append_budgeted(&mut deck, ".end\n", budget)?;
     Ok((deck.into_bytes(), library.into_bytes()))
 }
 
@@ -1657,13 +1672,90 @@ fn matching_behavioral_bracket(input: &str, open: usize) -> Result<usize> {
     )
 }
 
-fn lower_simetrix_table_expression(input: &str, open: usize) -> Result<(String, usize)> {
+// Reserve exact materialized bytes before formatting expressions. Counting
+// first is essential where a lowered child appears more than once.
+#[derive(Default)]
+struct TextLength(usize);
+
+impl std::fmt::Write for TextLength {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn append_budgeted(output: &mut String, text: &str, budget: &WorkBudget) -> Result<()> {
+    budget.charge(Resource::EmittedBytes, text.len())?;
+    output.push_str(text);
+    Ok(())
+}
+
+fn append_format_budgeted(
+    output: &mut String,
+    budget: &WorkBudget,
+    args: std::fmt::Arguments<'_>,
+) -> Result<()> {
+    let mut length = TextLength::default();
+    length.write_fmt(args)?;
+    budget.charge(Resource::EmittedBytes, length.0)?;
+    output.write_fmt(args)?;
+    Ok(())
+}
+
+fn format_budgeted(budget: &WorkBudget, args: std::fmt::Arguments<'_>) -> Result<String> {
+    let mut output = String::new();
+    append_format_budgeted(&mut output, budget, args)?;
+    Ok(output)
+}
+
+// Preserve untouched source in contiguous spans rather than locking the
+// shared budget for every source character.
+struct ExpressionWriter<'a> {
+    source: &'a str,
+    budget: &'a WorkBudget,
+    pending: usize,
+    output: String,
+}
+
+impl<'a> ExpressionWriter<'a> {
+    const fn new(source: &'a str, budget: &'a WorkBudget) -> Self {
+        Self {
+            source,
+            budget,
+            pending: 0,
+            output: String::new(),
+        }
+    }
+
+    fn replace(&mut self, start: usize, end: usize, replacement: &str) -> Result<()> {
+        append_budgeted(
+            &mut self.output,
+            &self.source[self.pending..start],
+            self.budget,
+        )?;
+        append_budgeted(&mut self.output, replacement, self.budget)?;
+        self.pending = end;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<String> {
+        append_budgeted(&mut self.output, &self.source[self.pending..], self.budget)?;
+        Ok(self.output)
+    }
+}
+
+fn lower_simetrix_table_expression(
+    input: &str,
+    open: usize,
+    budget: &WorkBudget,
+) -> Result<(String, usize)> {
     let close_bracket = matching_behavioral_bracket(input, open)?;
     let values = behavioral_function_arguments(&input[open + 1..close_bracket])?;
     if values.len() < 4 || values.len() % 2 != 0 {
         bail!("SIMetrix TABLE[...] requires at least two x,y point pairs");
     }
 
+    budget.charge(Resource::GeneratedNodes, values.len() / 2)?;
     let mut points = Vec::with_capacity(values.len() / 2);
     let mut previous_x = None;
     for pair in values.as_chunks::<2>().0 {
@@ -1690,47 +1782,54 @@ fn lower_simetrix_table_expression(input: &str, open: usize) -> Result<(String, 
         bail!("SIMetrix TABLE[...] has no input expression");
     }
     let close = matching_behavioral_parenthesis(input, argument_open)?;
-    let expression = lower_simetrix_behavioral_expression(input[argument_open + 1..close].trim())?;
+    let expression =
+        lower_simetrix_behavioral_expression(input[argument_open + 1..close].trim(), budget)?;
 
     let mut point_text = String::new();
     for (index, (x, y)) in points.iter().enumerate() {
-        if index != 0 {
-            point_text.push(',');
-        }
-        write_number(&mut point_text, *x)?;
-        point_text.push(',');
-        write_number(&mut point_text, *y)?;
+        let separator = if index == 0 { "" } else { "," };
+        append_format_budgeted(
+            &mut point_text,
+            budget,
+            format_args!("{separator}{x:.17e},{y:.17e}"),
+        )?;
     }
     let (first_x, _) = points[0];
     let (last_x, _) = points[points.len() - 1];
-    let mut lower_bound_text = String::new();
-    let mut upper_bound_text = String::new();
-    write_number(&mut lower_bound_text, first_x)?;
-    write_number(&mut upper_bound_text, last_x)?;
-
     Ok((
-        format!("pwl(max({lower_bound_text},min({upper_bound_text},{expression})),{point_text})"),
+        format_budgeted(
+            budget,
+            format_args!("pwl(max({first_x:.17e},min({last_x:.17e},{expression})),{point_text})"),
+        )?,
         close.saturating_add(1),
     ))
 }
 
-fn lower_simetrix_behavioral_expression(input: &str) -> Result<String> {
-    lower_simetrix_expression_regions(input, true)
+fn lower_simetrix_behavioral_expression(input: &str, budget: &WorkBudget) -> Result<String> {
+    lower_simetrix_expression_regions(input, true, budget)
 }
 
-fn lower_simetrix_conditional(input: &str, name: &str, open: usize) -> Result<(String, usize)> {
+fn lower_simetrix_conditional(
+    input: &str,
+    name: &str,
+    open: usize,
+    budget: &WorkBudget,
+) -> Result<(String, usize)> {
     let close = matching_behavioral_parenthesis(input, open)?;
     let arguments = behavioral_function_arguments(&input[open + 1..close])?;
     let [first, second, third] = arguments.as_slice() else {
         bail!("{name} behavioral function requires exactly three arguments");
     };
-    let first = lower_simetrix_behavioral_expression(first)?;
-    let second = lower_simetrix_behavioral_expression(second)?;
-    let third = lower_simetrix_behavioral_expression(third)?;
+    let first = lower_simetrix_behavioral_expression(first, budget)?;
+    let second = lower_simetrix_behavioral_expression(second, budget)?;
+    let third = lower_simetrix_behavioral_expression(third, budget)?;
     let lowered = if name.eq_ignore_ascii_case("IF") || name.eq_ignore_ascii_case("IFF") {
-        format!("(({first}) ? ({second}) : ({third}))")
+        format_budgeted(budget, format_args!("(({first}) ? ({second}) : ({third}))"))?
     } else {
-        format!("min(max({first},min({second},{third})),max({second},{third}))")
+        format_budgeted(
+            budget,
+            format_args!("min(max({first},min({second},{third})),max({second},{third}))"),
+        )?
     };
     Ok((lowered, close + 1))
 }
@@ -1754,16 +1853,21 @@ fn source_operator(bytes: &[u8], offset: usize, expression: bool) -> Option<(&'s
     }
 }
 
-fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<String> {
+fn lower_simetrix_expression_regions(
+    input: &str,
+    expression: bool,
+    budget: &WorkBudget,
+) -> Result<String> {
+    let _depth = budget.enter()?;
+    budget.charge(Resource::EvaluationSteps, input.len())?;
     let bytes = input.as_bytes();
-    let mut output = String::with_capacity(input.len());
+    let mut output = ExpressionWriter::new(input, budget);
     let mut offset = 0usize;
     let mut quote = false;
     let mut brace_depth = 0usize;
     while offset < bytes.len() {
         if bytes[offset] == b'\'' {
             quote = !quote;
-            output.push('\'');
             offset += 1;
             continue;
         }
@@ -1789,7 +1893,6 @@ fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<St
                 && (name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I"))
             {
                 let close = matching_behavioral_parenthesis(input, open)?;
-                output.push_str(&input[name_start..=close]);
                 offset = close + 1;
                 continue;
             }
@@ -1798,13 +1901,13 @@ fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<St
                 && bytes.get(open) != Some(&b'(')
                 && bytes.get(open) != Some(&b'=')
             {
-                output.push_str("temper");
+                output.replace(name_start, name_end, "temper")?;
                 offset = name_end;
                 continue;
             }
             if name.eq_ignore_ascii_case("TABLE") && bytes.get(open) == Some(&b'[') {
-                let (lowered, next) = lower_simetrix_table_expression(input, open)?;
-                output.push_str(&lowered);
+                let (lowered, next) = lower_simetrix_table_expression(input, open, budget)?;
+                output.replace(name_start, next, &lowered)?;
                 offset = next;
                 continue;
             }
@@ -1813,8 +1916,8 @@ fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<St
                     || name.eq_ignore_ascii_case("IFF")
                     || name.eq_ignore_ascii_case("LIMIT"))
             {
-                let (lowered, next) = lower_simetrix_conditional(input, name, open)?;
-                output.push_str(&lowered);
+                let (lowered, next) = lower_simetrix_conditional(input, name, open, budget)?;
+                output.replace(name_start, next, &lowered)?;
                 offset = next;
                 continue;
             }
@@ -1834,17 +1937,16 @@ fn lower_simetrix_expression_regions(input: &str, expression: bool) -> Result<St
             && let Some((operator, width)) =
                 source_operator(bytes, offset, expression || brace_depth > 0)
         {
-            output.push_str(operator);
+            output.replace(offset, offset + width, operator)?;
             offset += width;
             continue;
         }
-        output.push(character);
         offset = offset.saturating_add(character.len_utf8());
     }
-    Ok(output)
+    output.finish()
 }
 
-fn lower_simetrix_behavioral_statement(statement: &str) -> Result<String> {
+fn lower_simetrix_behavioral_statement(statement: &str, budget: &WorkBudget) -> Result<String> {
     let trimmed = statement.trim_start();
     if trimmed
         .get(..6)
@@ -1890,12 +1992,12 @@ fn lower_simetrix_behavioral_statement(statement: &str) -> Result<String> {
     if let Some((prefix, expression)) = simetrix_runtime::behavioral_rhs(statement) {
         return Ok(format!(
             "{prefix}{}",
-            lower_simetrix_behavioral_expression(expression)?
+            lower_simetrix_behavioral_expression(expression, budget)?
         ));
     }
     // Only explicit expression regions may contain a temperature symbol on
     // ordinary device cards: terminals and model names are electrical names.
-    lower_simetrix_expression_regions(statement, false)
+    lower_simetrix_expression_regions(statement, false, budget)
 }
 
 fn translate_device_voltage_controlled_source(
@@ -2244,6 +2346,7 @@ fn write_current_controlled_gain(
 fn translate_current_controlled_source(
     statement: &str,
     branches: &std::collections::BTreeMap<String, String>,
+    budget: &WorkBudget,
 ) -> Result<Option<Translation>> {
     let trimmed = statement.trim_start();
     let Some(kind) = trimmed.as_bytes().first().map(u8::to_ascii_uppercase) else {
@@ -2296,7 +2399,7 @@ fn translate_current_controlled_source(
             .strip_prefix('{')
             .and_then(|inner| inner.strip_suffix('}'))
             .context("PSpice VALUE source expression must be braced")?;
-        output.push_str(&lower_simetrix_behavioral_expression(expression)?);
+        output.push_str(&lower_simetrix_behavioral_expression(expression, budget)?);
     } else if let Some((dimension, control_start)) = poly {
         if dimension == 0 || dimension > 16 {
             bail!("unsupported PSpice POLY dimension {dimension}");
@@ -3774,6 +3877,7 @@ fn allocate_branch_identifier(
 }
 
 struct ScopeAnalysis<'a> {
+    budget: &'a WorkBudget,
     pwls_prefix: String,
     init: std::collections::BTreeMap<String, String>,
     pwl: std::collections::BTreeMap<String, RawPwlModel>,
@@ -3816,9 +3920,10 @@ impl<'a> ScopeAnalysis<'a> {
         items: &[Item],
         header: Option<&str>,
         level17: &'a level17::Scope<'a>,
-        budget: &WorkBudget,
+        budget: &'a WorkBudget,
     ) -> Result<Self> {
         let mut models = Self {
+            budget,
             pwls_prefix: pwls::scope_prefix([items], header, "sr_pwls_", budget)?,
             init: init_overrides(items)?,
             pwl: std::collections::BTreeMap::new(),
@@ -4353,8 +4458,8 @@ fn translate_deck_primitive(
         translate_inline_schematic_x(statement),
         translate_legacy_voltage_poly_source(statement),
         translate_device_voltage_controlled_source(statement, &models.voltage_branches),
-        translate_current_controlled_source(statement, &models.current_branches),
-        waveforms::translate(statement, &models.pwls_prefix),
+        translate_current_controlled_source(statement, &models.current_branches, models.budget),
+        waveforms::translate(statement, &models.pwls_prefix, models.budget),
         translate_raw_transformer(statement),
         translate_raw_mutual_inductance(statement, &models.inductors),
         translate_raw_pwl_device(statement, &models.pwl),
@@ -4749,7 +4854,8 @@ fn emit_deck_statement_inner(
         &models.simetrix_diode_temperatures,
         &models.simetrix_resistor_temperatures,
     )?;
-    let behavior_adjusted = lower_simetrix_behavioral_statement(&temperature_adjusted)?;
+    let behavior_adjusted =
+        lower_simetrix_behavioral_statement(&temperature_adjusted, models.budget)?;
     let area_adjusted = rewrite_pspice_positional_area(&behavior_adjusted)?;
     let native = sanitize_native_passive(&area_adjusted)?;
     output.push_str(&native);
@@ -5082,14 +5188,9 @@ pub fn translate_simplis_deck_with_budget(
 }
 
 fn parse_deck_items(input: &[u8], budget: &WorkBudget) -> Result<Vec<Item>> {
-    budget.charge(Resource::ScannedBytes, input.len())?;
-    budget.charge(
-        Resource::Statements,
-        input.split(|byte| *byte == b'\n').count(),
-    )?;
     let text =
         std::str::from_utf8(input).context("SIMPLIS deck translation requires UTF-8/ASCII")?;
-    parse_items(text)
+    parse_items_with_budget(text, budget)
 }
 
 /// Translate a complete linked source graph with one model binding namespace.
@@ -5242,8 +5343,9 @@ pub fn translate_simplis_deck_split(
     input: &[u8],
     include_path: &str,
 ) -> Result<SplitDeckTranslation> {
-    let translated = translate_simplis_deck(input)?;
-    let (deck_bytes, library_bytes) = split_native_deck(&translated.bytes, include_path)?;
+    let budget = WorkBudget::default();
+    let translated = translate_simplis_deck_with_budget(input, &budget)?;
+    let (deck_bytes, library_bytes) = split_native_deck(&translated.bytes, include_path, &budget)?;
     Ok(SplitDeckTranslation {
         deck_bytes,
         library_bytes,
@@ -5257,6 +5359,38 @@ pub fn translate_simplis_deck_split(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lower_simetrix_behavioral_statement(statement: &str) -> Result<String> {
+        super::lower_simetrix_behavioral_statement(statement, &WorkBudget::default())
+    }
+
+    #[test]
+    fn nested_limit_expansion_is_charged_before_materialization() -> Result<()> {
+        use model_preprocess_command::{Cancellation, WorkLimits};
+        let expression = (0..26).fold("v(in)".to_owned(), |value, _| format!("LIMIT(0,{value},1)"));
+        let budget = WorkBudget::new(
+            WorkLimits {
+                emitted_bytes: 16_384,
+                ..WorkLimits::default()
+            },
+            Cancellation::default(),
+        );
+        let error = super::lower_simetrix_behavioral_expression(&expression, &budget)
+            .err()
+            .context("nested LIMIT must exceed its emission budget")?;
+        assert!(format!("{error:#}").contains("EmittedBytes budget exceeded"));
+        assert!(budget.check().is_err());
+        let depth = WorkBudget::new(
+            WorkLimits {
+                depth: 8,
+                ..WorkLimits::default()
+            },
+            Cancellation::default(),
+        );
+        assert!(super::lower_simetrix_behavioral_expression(&expression, &depth).is_err());
+        assert!(depth.check().is_err());
+        Ok(())
+    }
 
     #[test]
     fn expanded_library_preserves_dependency_include_without_end() -> Result<()> {
