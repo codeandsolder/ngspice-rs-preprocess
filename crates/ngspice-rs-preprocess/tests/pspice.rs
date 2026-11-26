@@ -793,7 +793,7 @@ fn laplace_source_dialects_preserve_rational_numerator_and_poles() -> Result<()>
                 };
                 // Evaluate the second-order rational function independently at s=jω.
                 let omega = std::f64::consts::TAU * frequency * 0.001;
-                let dr = 1. - omega * omega;
+                let dr = omega.mul_add(-omega, 1.);
                 let di = 2. * omega;
                 let ni = 3. * omega;
                 let scale = dr.mul_add(dr, di * di);
