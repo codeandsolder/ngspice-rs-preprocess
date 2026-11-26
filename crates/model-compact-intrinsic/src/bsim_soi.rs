@@ -2,6 +2,7 @@
 //! This is source topology and parameter preparation, not a physical kernel.
 
 mod binning;
+mod channel;
 mod electrostatics;
 mod geometry;
 mod junction;
@@ -9,6 +10,9 @@ mod stress;
 mod temperature;
 mod transport;
 
+pub use channel::{
+    BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, PreparedBsimSoiChannel,
+};
 pub use electrostatics::{
     BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint, PreparedBsimSoiElectrostatics,
 };

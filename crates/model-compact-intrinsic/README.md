@@ -164,6 +164,18 @@ The focused tests compare 32 native access conductances and 128 native
 operating points with explicitly resolved transport or electrostatic cards,
 in addition to finite-difference and stress-sum checks.
 
+### BSIMSOI bias-dependent channel electrostatics
+
+`prepare_channel` binds the native poly depletion, PD/FD body potentials
+(both FD formulations), body limiting, threshold, subthreshold slope, noise
+carrier density and effective gate overdrive. The five-component forward-mode
+gradient follows physical Vgs, Vds, Vbs, Ves and absolute kelvin even when
+native source/drain orientation reverses. Outputs are normalized to the
+native conduction orientation; this is electrostatics, not yet a complete
+terminal current/charge stamp. Finite differences cover 192 operating points;
+96 native threshold comparisons cover both polarities, both thermal modes
+and all three depletion modes.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds

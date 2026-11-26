@@ -10,15 +10,17 @@ mod defaults;
 mod hv;
 
 pub use bsim_soi::{
-    BsimSoiBodyMode, BsimSoiCollectorCurrent, BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint,
+    BsimSoiBodyMode, BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar,
+    BsimSoiCollectorCurrent, BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint,
     BsimSoiExternalSeries, BsimSoiGeometry, BsimSoiInstanceInput, BsimSoiInternalResistance,
     BsimSoiJunctionCharge, BsimSoiJunctionCharges, BsimSoiJunctionCurrent,
     BsimSoiJunctionDensities, BsimSoiJunctionPoint, BsimSoiJunctionSide, BsimSoiJunctionStorage,
     BsimSoiNeutralBody, BsimSoiNode, BsimSoiSeriesBias, BsimSoiSeriesConductance,
     BsimSoiSeriesParameters, BsimSoiStressOffsets, BsimSoiTemperaturePoint, BsimSoiThermalNetwork,
-    BsimSoiThermalScalar, BsimSoiTopology, BsimSoiTransportPoint, PreparedBsimSoiElectrostatics,
-    PreparedBsimSoiInstance, PreparedBsimSoiJunctions, PreparedBsimSoiSetup, PreparedBsimSoiSize,
-    PreparedBsimSoiTemperature, PreparedBsimSoiTransport, prepare_bsim_soi_setup,
+    BsimSoiThermalScalar, BsimSoiTopology, BsimSoiTransportPoint, PreparedBsimSoiChannel,
+    PreparedBsimSoiElectrostatics, PreparedBsimSoiInstance, PreparedBsimSoiJunctions,
+    PreparedBsimSoiSetup, PreparedBsimSoiSize, PreparedBsimSoiTemperature,
+    PreparedBsimSoiTransport, prepare_bsim_soi_setup,
 };
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use hv::{
