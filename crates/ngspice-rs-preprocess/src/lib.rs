@@ -10,7 +10,7 @@ use model_normalize_ngspice::{
     linked_source::{LibrarySyntax, LinkLimits, LinkedSource, RootKind, SourceLinker},
     normalize_mapped,
 };
-pub use model_normalize_ngspice::{passive_ic, pwl_resistor, waveform};
+pub use model_normalize_ngspice::{passive_ic, passive_storage, pwl_resistor, waveform};
 pub use model_preprocess_command::{
     AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, Resource,
     SourceSession, WorkBudget, WorkLimits,
