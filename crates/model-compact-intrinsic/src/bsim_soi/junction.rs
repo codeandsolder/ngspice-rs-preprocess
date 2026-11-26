@@ -8,10 +8,10 @@ pub use charge::{BsimSoiJunctionCharge, BsimSoiJunctionCharges, BsimSoiJunctionS
 pub use neutral::{BsimSoiCollectorCurrent, BsimSoiNeutralBody};
 
 use super::{
-    BsimSoiNode, BsimSoiThermalScalar, K_OVER_Q, PreparedBsimSoiSetup, PreparedBsimSoiSize,
-    integer, positive, real, slot,
+    BsimSoiNode, BsimSoiThermalScalar, K_OVER_Q, PreparedBsimSoiSetup, PreparedBsimSoiSize, binned,
+    integer, positive, real,
 };
-use crate::{ModelError, MosPolarity, ParameterScope};
+use crate::{ModelError, MosPolarity};
 
 const EXP_MAX: f64 = 2.688_117_142e43;
 const EXP_MIN: f64 = 3.720_075_976e-44;
@@ -423,12 +423,6 @@ impl PreparedBsimSoiJunctions {
             charges,
         })
     }
-}
-
-fn binned(size: &PreparedBsimSoiSize, name: &str) -> Result<f64, ModelError> {
-    let id = slot(ParameterScope::Model, name)?;
-    size.binned_model_slot(id)
-        .ok_or(ModelError::MissingDefaultDependency(id))
 }
 
 struct SideNames {

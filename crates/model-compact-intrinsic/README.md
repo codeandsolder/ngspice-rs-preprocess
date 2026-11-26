@@ -146,6 +146,24 @@ electrical bias, including multiplicity, finger count, segmentation,
 thermal width and effective geometry. Run
 `cargo +nightly test -p model-compact-intrinsic --test bsim_soi_temperature -- --include-ignored`.
 
+### BSIMSOI transport and electrostatic preparation
+
+`PreparedBsimSoiSetup::prepare_transport` binds temperature-scaled mobility,
+saturation velocity, UA/UB/UC, layout stress and both series resistance modes.
+The external access conductance includes parallel multiplicity; the internal
+series resistance uses the complete parallel channel width. Local temperature
+and bias partials are analytic. Layout sums preserve the native fractional NF
+loop convention, using a bounded-cost reciprocal progression for large NF.
+
+`prepare_electrostatics` binds ambient-dependent body coefficients, threshold
+and flatband presence rules, layout/DELVTO adjustments, oxide capacitance,
+effective inversion factors and Debye length. Its live evaluation supplies
+the temperature-dependent DIBL/output resistance factors.
+
+The focused tests compare 32 native access conductances and 128 native
+operating points with explicitly resolved transport or electrostatic cards,
+in addition to finite-difference and stress-sum checks.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds

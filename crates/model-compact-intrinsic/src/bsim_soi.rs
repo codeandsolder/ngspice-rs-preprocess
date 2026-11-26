@@ -2,10 +2,16 @@
 //! This is source topology and parameter preparation, not a physical kernel.
 
 mod binning;
+mod electrostatics;
 mod geometry;
 mod junction;
+mod stress;
 mod temperature;
+mod transport;
 
+pub use electrostatics::{
+    BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint, PreparedBsimSoiElectrostatics,
+};
 pub use geometry::BsimSoiGeometry;
 pub use junction::{
     BsimSoiCollectorCurrent, BsimSoiJunctionCharge, BsimSoiJunctionCharges, BsimSoiJunctionCurrent,
@@ -15,6 +21,12 @@ pub use junction::{
 pub use temperature::{
     BsimSoiTemperaturePoint, BsimSoiThermalNetwork, BsimSoiThermalScalar,
     PreparedBsimSoiTemperature,
+};
+
+pub use stress::BsimSoiStressOffsets;
+pub use transport::{
+    BsimSoiExternalSeries, BsimSoiInternalResistance, BsimSoiSeriesBias, BsimSoiSeriesConductance,
+    BsimSoiSeriesParameters, BsimSoiTransportPoint, PreparedBsimSoiTransport,
 };
 
 use crate::{
@@ -197,6 +209,12 @@ impl PreparedBsimSoiSetup {
     pub fn instances(&self) -> &[PreparedBsimSoiInstance] {
         &self.instances
     }
+}
+
+fn binned(size: &PreparedBsimSoiSize, name: &str) -> Result<f64, ModelError> {
+    let id = slot(ParameterScope::Model, name)?;
+    size.binned_model_slot(id)
+        .ok_or(ModelError::MissingDefaultDependency(id))
 }
 
 fn slot(scope: ParameterScope, name: &str) -> Result<u16, ModelError> {

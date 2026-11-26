@@ -15,14 +15,14 @@ pub struct BsimSoiThermalScalar {
 }
 
 impl BsimSoiThermalScalar {
-    const fn new(value: f64, d_temperature: f64) -> Self {
+    pub(super) const fn new(value: f64, d_temperature: f64) -> Self {
         Self {
             value,
             d_temperature,
         }
     }
 
-    const fn checked(self, name: &'static str) -> Result<Self, ModelError> {
+    pub(super) const fn checked(self, name: &'static str) -> Result<Self, ModelError> {
         if self.value.is_finite() && self.d_temperature.is_finite() {
             Ok(self)
         } else {
@@ -131,6 +131,22 @@ impl PreparedBsimSoiTemperature {
     #[must_use = "absolute thermal coordinates use this zero-rise reference"]
     pub const fn ambient_kelvin(&self) -> f64 {
         self.ambient
+    }
+
+    pub(super) fn ambient_point(self) -> Result<BsimSoiTemperaturePoint, ModelError> {
+        Self {
+            network: None,
+            ..self
+        }
+        .evaluate(self.ambient)
+    }
+
+    pub(super) const fn doping(&self) -> [f64; 2] {
+        [self.channel_doping, self.substrate_doping]
+    }
+
+    pub(super) const fn substrate_permittivity(&self) -> f64 {
+        self.material.permittivity
     }
 
     /// Evaluate the live or isothermal material laws at an absolute temperature.
