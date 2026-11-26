@@ -665,7 +665,7 @@ fn translate_companions(
     linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
     translated_libraries: Vec<WholeModelTranslation>,
     known: &BTreeSet<&str>,
-    origins: CompanionOrigins<'_>,
+    origins: &CompanionOrigins<'_>,
     initial_conditions: &mut Option<super::passive_ic::InitialConditions>,
     mut remaining: usize,
     budget: &model_preprocess_command::WorkBudget,
@@ -877,15 +877,18 @@ fn linked(
             },
     } = resolve_deck(root, request, options, cancellation, session)?;
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
-    let plan = capture_linked_plan(
+    let mut plan = capture_linked_plan(
         &mut linked,
         root,
         request.format,
         &declarations,
         session.budget(),
     )?;
+    if request.format == InputFormat::SimetrixDeck {
+        plan.select_statistical_sample(options.statistical_sample, session.budget())?;
+    }
     let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
-        lower_simetrix_linked_runtime(&mut linked, session.budget())?;
+        lower_simetrix_linked_runtime(&mut linked, options.statistical_sample, session.budget())?;
         Some(capture_passive_initial_conditions(
             &mut linked,
             session.budget(),
@@ -925,7 +928,7 @@ fn linked(
         &linked,
         translated_libraries,
         &known,
-        CompanionOrigins {
+        &CompanionOrigins {
             sources: &sources,
             root: &root_sources,
         },
