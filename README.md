@@ -14,6 +14,12 @@ The simulator owns numerical circuit orchestration. Source admission is
 handled by `model-preprocess-command` before normalization, linking or model
 preparation. The default does not launch any external process.
 
+## Distribution
+
+See [standalone package qualification](docs/package-release.md) for release
+metadata, licenses, and registry-format verification. The tracked workspace
+remains publication-disabled until a reviewed and authorized release.
+
 ## Unified library and CLI
 
 Use the `ngspice-rs-preprocess` package for source preparation. The library

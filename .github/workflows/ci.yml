@@ -46,3 +46,11 @@ jobs:
     with:
       test-impact-mode: none
       command: bash .github/scripts/verify-source.sh
+
+  package-qualification:
+    name: Standalone registry packages and install
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'tag')
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
+    with:
+      test-impact-mode: none
+      command: bash .github/scripts/verify-packages.sh
