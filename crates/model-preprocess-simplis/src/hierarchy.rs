@@ -50,6 +50,7 @@ struct Alias {
 pub enum LibrarySimulator {
     Simplis,
     Simetrix,
+    Hspice,
 }
 
 impl LibrarySimulator {
@@ -58,6 +59,7 @@ impl LibrarySimulator {
         match self {
             Self::Simplis => "simplis",
             Self::Simetrix => "simetrix",
+            Self::Hspice => "hspice",
         }
     }
 }
@@ -107,6 +109,10 @@ impl ParsedLibrary {
         Self,
         Vec<crate::source_dialect::model_mapping::ModelSelection>,
     )> {
+        anyhow::ensure!(
+            self.simulator != LibrarySimulator::Hspice,
+            "standalone HSPICE library requires deck binding"
+        );
         let Some(dialect) = self.dialect else {
             return Ok((self.clone(), Vec::new()));
         };
@@ -145,8 +151,15 @@ impl ParsedLibrary {
     }
 
     #[must_use = "the count reports the parsed definitions"]
-    pub const fn definitions(&self) -> usize {
-        self.definitions.len()
+    pub fn definitions(&self) -> usize {
+        if self.simulator == LibrarySimulator::Hspice {
+            self.scoped_statements
+                .iter()
+                .filter(|line| is_subcircuit_header(&line.text))
+                .count()
+        } else {
+            self.definitions.len()
+        }
     }
 
     /// Serialize this parsed library to the stable JSON interchange form.
@@ -173,7 +186,7 @@ impl ParsedLibrary {
     fn validate(&self) -> Result<()> {
         if self.format_version != PARSED_LIBRARY_FORMAT_VERSION {
             bail!(
-                "unsupported parsed SIMPLIS library format version {}",
+                "unsupported parsed source library format version {}",
                 self.format_version
             );
         }
@@ -362,6 +375,10 @@ impl SubcircuitCatalog {
     /// Returns an error if the parsed artifact fails its integrity/version check.
     pub fn add_parsed_library(&mut self, parsed: &ParsedLibrary) -> Result<usize> {
         parsed.validate()?;
+        anyhow::ensure!(
+            parsed.simulator != LibrarySimulator::Hspice,
+            "standalone HSPICE library requires native deck binding"
+        );
         if let Some(existing) = self.simulator {
             if existing != parsed.simulator {
                 bail!(
@@ -753,6 +770,27 @@ pub fn parse_library_for_simulator(
     };
     let source_name = source.into();
     let sources = BTreeSet::from([source_name.clone()]);
+    if simulator == LibrarySimulator::Hspice {
+        let (context, lines) = project_spice_resource(
+            input,
+            DialectContext {
+                language: crate::source_dialect::SourceLanguage::Hspice,
+                separator: None,
+            },
+            SourceKind::Include,
+        )?;
+        let statements = lines
+            .into_iter()
+            .map(|line| ScopedStatement {
+                source: source_name.clone(),
+                context,
+                first_line: line.first_line,
+                last_line: line.last_line,
+                text: line.text,
+            })
+            .collect();
+        return parse_standalone_library(source_name, sources, context, statements);
+    }
     if simulator == LibrarySimulator::Simetrix {
         let (context, view) = project_resource(
             input,
@@ -788,6 +826,73 @@ pub fn parse_library_for_simulator(
         Vec::new(),
         Vec::new(),
     )
+}
+
+/// Archive a linked standalone HSPICE source graph without caller-specific
+/// model selection or parameter binding.
+///
+/// Reuse the parsed library identity
+/// and admitted source span contract; do not run SIMPLIS specialization.
+///
+/// # Errors
+/// Incomplete source graph, malformed hierarchy or unresolved resources.
+pub fn parse_standalone_library(
+    source_name: String,
+    source_names: BTreeSet<String>,
+    context: crate::source_dialect::DialectContext,
+    statements: Vec<crate::source_dialect::ScopedStatement>,
+) -> Result<ParsedLibrary> {
+    let mut scopes = Vec::new();
+    for line in &statements {
+        let mut fields = line.text.split_ascii_whitespace();
+        let command = fields.next().unwrap_or_default().to_ascii_uppercase();
+        match command.as_str() {
+            ".SUBCKT" => {
+                anyhow::ensure!(
+                    scopes.len() < 128,
+                    "HSPICE library hierarchy depth exceeded"
+                );
+                scopes.push(fields.next().context("missing HSPICE subcircuit name")?);
+            }
+            ".ENDS" => {
+                let name = scopes.pop().context("unmatched HSPICE .ENDS")?;
+                anyhow::ensure!(
+                    fields
+                        .next()
+                        .is_none_or(|closing| closing.eq_ignore_ascii_case(name)),
+                    "mismatched HSPICE .ENDS {name}"
+                );
+            }
+            ".INC" | ".INCLUDE" | ".INCPSLT" | ".LIB" | ".ENDL" => bail!(
+                "unresolved standalone HSPICE library resource at {}:{}",
+                line.source,
+                line.first_line
+            ),
+            ".CONTROL" | ".ENDC" | ".FILE" | ".ENDF" | ".END" => {
+                bail!("invalid HSPICE library directive {command}")
+            }
+            _ => (),
+        }
+    }
+    anyhow::ensure!(scopes.is_empty(), "unclosed HSPICE library hierarchy");
+    let simulator = LibrarySimulator::Hspice;
+    let dialect = Some(context);
+    let source_id = parsed_library_digest(simulator, dialect, &[], &statements, &[], &[], &[]);
+    let parsed = ParsedLibrary {
+        format_version: PARSED_LIBRARY_FORMAT_VERSION,
+        simulator,
+        dialect,
+        device_identities: Vec::new(),
+        source_id,
+        scoped_statements: statements,
+        source_name,
+        source_names,
+        support_lines: Vec::new(),
+        aliases: Vec::new(),
+        definitions: Vec::new(),
+    };
+    parsed.validate()?;
+    Ok(parsed)
 }
 
 /// Parse an admitted, scoped source graph whose individual resources have
@@ -966,6 +1071,9 @@ pub fn project_resource(
     Vec<crate::source_dialect::ProjectedStatement>,
 )> {
     use crate::source_dialect::{DialectContext, SourceKind, logical_source};
+    if simulator == LibrarySimulator::Hspice {
+        return project_spice_resource(input, inherited, kind);
+    }
     let decoded = if kind == SourceKind::Deck && simulator == LibrarySimulator::Simetrix {
         // A title is data, even when it looks like a directive or a device.
         let mut protected = Vec::with_capacity(input.len().saturating_add(2));
@@ -999,6 +1107,69 @@ pub fn project_resource(
             .filter_map(|(i, line)| selected.contains(&i).then_some(line))
             .collect(),
     ))
+}
+
+/// Project a standalone SPICE-family resource.
+///
+/// Unlike multi-simulator projection, the deck title is retained verbatim
+/// and cannot participate in comment, continuation, or directive processing.
+///
+/// # Errors
+/// Invalid text or orphan continuation in the resource.
+pub fn project_spice_resource(
+    input: &[u8],
+    inherited: crate::source_dialect::DialectContext,
+    kind: crate::source_dialect::SourceKind,
+) -> Result<(
+    crate::source_dialect::DialectContext,
+    Vec<crate::source_dialect::ProjectedStatement>,
+)> {
+    use crate::source_dialect::{DialectContext, ProjectedStatement, SourceKind, logical_source};
+    let decoded = decode_simplis_text(input)?;
+    let context = DialectContext::resolve(&decoded, inherited, kind);
+    if kind == SourceKind::Include {
+        return Ok((context, logical_source(&decoded, context)?));
+    }
+    let mut lines = decoded.splitn(2, '\n');
+    let title = lines.next().context("SPICE deck has no title")?;
+    ensure!(!input.is_empty(), "SPICE deck has no title");
+    let mut statements = vec![ProjectedStatement {
+        text: title.trim_end_matches('\r').to_owned(),
+        first_line: 1,
+        last_line: 1,
+    }];
+    for mut statement in logical_source(lines.next().unwrap_or_default(), context)? {
+        statement.first_line += 1;
+        statement.last_line += 1;
+        statements.push(statement);
+    }
+    Ok((context, statements))
+}
+
+/// Rewrite parameter references in an expression or device value field list,
+/// excluding assignment destinations, function names and electrical probes.
+///
+/// # Errors
+/// Malformed strings or probe syntax.
+pub fn rewrite_parameter_symbols(
+    expression: &str,
+    names: &BTreeMap<String, String>,
+    preserve_assignments: bool,
+) -> Result<String> {
+    runtime_params::rewrite_symbols(expression, names, preserve_assignments)
+}
+
+/// Lower an expression in its original resource dialect. The caller must
+/// isolate value syntax from device, node, model and resource identifiers.
+///
+/// # Errors
+/// Invalid expression syntax or exceeded output byte budget.
+pub fn lower_spice_expression(
+    expression: &str,
+    context: crate::source_dialect::DialectContext,
+    limit: usize,
+) -> Result<String> {
+    crate::source_dialect::lower_expression(expression, context.language, limit)
 }
 
 /// Lower expressions only after simulator and named-section selection.

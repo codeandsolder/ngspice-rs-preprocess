@@ -129,6 +129,7 @@ pub enum SelectionOrigin {
     Builtin,
     DeviceConfiguration,
     HspicePreset,
+    StandaloneHspice,
     NetlistMap,
     LegacyMos17Signature,
 }
@@ -518,6 +519,43 @@ impl MappingTable {
             .cloned()
             .or_else(|| self.base(&key))
             .is_some_and(|mapping| mapping.device == Device::HspiceResistor)
+    }
+
+    /// Select a qualified standalone HSPICE model, not a `SIMetrix` deck preset.
+    ///
+    /// # Errors
+    /// The family, level or version has no qualified native lowering.
+    pub fn select_standalone_hspice(
+        line: &ScopedStatement,
+        scope: &[String],
+    ) -> Result<ModelSelection> {
+        let table = Self {
+            hspice_models: true,
+            ..Self::default()
+        };
+        let mut selection = table
+            .select_card(line, scope)?
+            .context("HSPICE model has no qualified native mapping")?;
+        let diode = selection.mapping.device == Device::Diode3
+            && selection.mapping.key.model_type == "D"
+            && selection.mapping.key.level <= 1
+            && selection.declared_version.is_none();
+        let bsim4 = selection.mapping.device == Device::Bsim4
+            && selection.mapping.key.level == 54
+            && matches!(
+                selection
+                    .declared_version
+                    .as_deref()
+                    .map(|v| v.trim_matches(['\'', '"'])),
+                Some("4.5" | "4.50" | "4.5.0" | "4.64" | "4.6.4" | "4.7" | "4.70" | "4.7.0")
+            );
+        ensure!(
+            diode || bsim4,
+            "HSPICE model {} has no qualified native mapping (BSIM4 requires an exact supported VERSION)",
+            selection.card.name
+        );
+        selection.mapping.origin = SelectionOrigin::StandaloneHspice;
+        Ok(selection)
     }
 
     /// Resolve an admitted card before source-family lowering. Other
