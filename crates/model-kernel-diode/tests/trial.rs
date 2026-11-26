@@ -373,3 +373,92 @@ fn difficult_bias_and_transient_against_independent_load_line() -> Result<()> {
     assert!(limited > 1000, "test must exercise the limiter: {limited}");
     Ok(())
 }
+
+fn ngspice_output(fixture: &str) -> Result<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture);
+    let output = std::process::Command::new("ngspice")
+        .args(["-n", "-b"])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn measured(output: &str, name: &str) -> Result<f64> {
+    for line in output.lines() {
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim() == name
+        {
+            return Ok(value.trim().parse()?);
+        }
+    }
+    Err(format!("missing ngspice measure {name}").into())
+}
+
+#[test]
+#[ignore = "requires an installed ngspice C reference"]
+fn difficult_load_line_and_ramp_against_ngspice() -> Result<()> {
+    let compiled = artifact(
+        compile_simetrix([("IS", 1e-14), ("N", 1.)])?,
+        Instance::default(),
+        [5; 16],
+    )?;
+    let prepared = compiled.prepare(&PARAMS, 300.15)?;
+    let dc = LoadLine {
+        artifact: &compiled,
+        prepared: &prepared,
+        source: 1000.,
+        capacitance_over_dt: 0.,
+        accepted: 0.,
+    };
+    let actual = dc.solve(true)?.0;
+    let expected = measured(&ngspice_output("trial-load-line.cir")?, "v(out)")?;
+    // SIMetrix uses historical k/q constants, not ngspice's constants.
+    assert!(
+        (actual - expected).abs() < 5e-5,
+        "dc actual={actual} C={expected}"
+    );
+    let output = ngspice_output("trial-transient.cir")?;
+    let observations = [
+        (2100, "ramp_up"),
+        (4000, "high"),
+        (6100, "ramp_down"),
+        (7000, "recovery1"),
+        (8000, "recovery2"),
+        (14000, "low"),
+    ];
+    let mut accepted = -2.;
+    for tick in 1..=16000 {
+        let source = match tick {
+            1..=2000 => -2.,
+            2001..=2200 => -2. + 1002. * f64::from(tick - 2000) / 200.,
+            2201..=6000 => 1000.,
+            6001..=6200 => 1000. - 1002. * f64::from(tick - 6000) / 200.,
+            _ => -2.,
+        };
+        let load = LoadLine {
+            artifact: &compiled,
+            prepared: &prepared,
+            source,
+            capacitance_over_dt: 2.,
+            accepted,
+        };
+        accepted = load.solve(false)?.0;
+        for (at, name) in observations {
+            if tick == at {
+                let expected = measured(&output, name)?;
+                // Fixed-step backward Euler versus adaptive Gear, in addition
+                // to different physical constants.
+                assert!(
+                    (accepted - expected).abs() < 0.002,
+                    "{name}: actual={accepted} C={expected}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

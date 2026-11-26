@@ -78,3 +78,10 @@ The tests use an independent monotone load-line bisection of a Shockley
 junction with external resistor and capacitor, including extreme forward
 steps and backward-Euler transients. They also exercise reverse avalanche,
 series topology, rejected trials, and scalar/tile equivalence.
+
+An opt-in C-reference test uses ngspice on the tracked
+`trial-load-line.cir` and `trial-transient.cir` fixtures (1000 V extreme DC
+bias; ramp from -2 to 1000 V and back with external capacitance). It
+compares the accepted DC point and six transient observations. DC tolerance
+accounts for the historical physical constants; transient tolerance also
+accounts for fixed backward-Euler versus adaptive Gear integration.
