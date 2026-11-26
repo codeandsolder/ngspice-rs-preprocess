@@ -20,7 +20,8 @@ The shared external-dependency release-age quarantine remains in force.
 Every production package carries its actual license text. Packages with an
 SPDX license retain that metadata and include a local LICENSE. MIT texts must
 match the root LICENSE; the MIT/BSD packages carry the root third-party notices
-(including the MIT text and relevant upstream attributions). The Touchstone
+(including the MIT text and relevant upstream attributions). The bipolar package also
+retains the Apache-2.0 IHP Open PDK fixture license. The Touchstone
 codec has its own BSD license. The intrinsic compact-model package has a
 non-SPDX license-file preserving the HiSIM/HiSIM-HV attribution and noncharging
 conditions, Berkeley BSD notices, and STAG DERA licence. The latter requires

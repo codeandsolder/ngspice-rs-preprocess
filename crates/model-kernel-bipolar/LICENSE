@@ -109,7 +109,18 @@ ngspice implementations carry the modified BSD terms reproduced above.
 The crate's README records the specific equation references and independently
 generated ngspice numerical witnesses.
 
-## HiSIM-HV1/HV2 intrinsic compact-model preparations
+## IHP Open PDK nominal VBIC fixture
+
+The resolved nominal Nx=4 npn13G2 parameter realization and corresponding
+numerical observations in `crates/model-kernel-bipolar/tests/fixtures/vbic_ihp_*`
+are derived from IHP Open PDK, revision
+[`af6b1ebc82c36daf30516a46d3a0a6a5777df0c1`](https://github.com/IHP-GmbH/IHP-Open-PDK/tree/af6b1ebc82c36daf30516a46d3a0a6a5777df0c1).
+Copyright 2023 IHP PDK Authors; Apache-2.0. The package retains the
+[upstream licence](crates/model-kernel-bipolar/tests/fixtures/LICENSE-IHP)
+and the fixture README describes the resolution and measurements. The
+external model library itself is not included.
+
+## Intrinsic compact-model preparations
 
 `crates/model-compact-intrinsic` derives HiSIM-HV1/HiSIM-HV2 source-order
 setup rules, binning, geometry, and physical subkernel equations from the
@@ -119,7 +130,10 @@ Hiroshima University & STARC (HV1) and 2014 Hiroshima University & STARC
 including attribution, redistribution and charging conditions, and the
 original-code MIT license are reproduced in
 [`crates/model-compact-intrinsic/LICENSE`](crates/model-compact-intrinsic/LICENSE).
-The top-level MIT license does not supersede these terms.
+The package license also preserves HiSIM2's corresponding upstream terms,
+the modified BSD notices for BSIMSOI and BSIM3SOI, and the DERA licence
+for the SOI3 (STAG) catalog. The top-level MIT license does not supersede
+these terms.
 
 ## MIT license for project-authored code
 

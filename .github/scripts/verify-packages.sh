@@ -41,7 +41,7 @@ check_licenses() {
         test -s "$(dirname "$path")/$source"
         case "$(jq -r .license <<<"$item")" in
             MIT) cmp -- LICENSE "$(dirname "$path")/$source" ;;
-            'MIT AND BSD-3-Clause') cmp -- THIRD_PARTY_NOTICES.md "$(dirname "$path")/$source" ;;
+            'MIT AND BSD-3-Clause'|'MIT AND BSD-3-Clause AND Apache-2.0') cmp -- THIRD_PARTY_NOTICES.md "$(dirname "$path")/$source" ;;
         esac
         test -s "$(dirname "$path")/$(jq -r .readme <<<"$item")"
     done < <(jq -c '.[]' <<<"$selection")
