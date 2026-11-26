@@ -793,7 +793,7 @@ fn laplace_source_dialects_preserve_rational_numerator_and_poles() -> Result<()>
                 };
                 // Evaluate the second-order rational function independently at s=jω.
                 let omega = std::f64::consts::TAU * frequency * 0.001;
-                let dr = 1. - omega * omega;
+                let dr = omega.mul_add(-omega, 1.);
                 let di = 2. * omega;
                 let ni = 3. * omega;
                 let scale = dr.mul_add(dr, di * di);
@@ -802,6 +802,45 @@ fn laplace_source_dialects_preserve_rational_numerator_and_poles() -> Result<()>
                 close(*current_real, -*real);
                 close(*current_imaginary, -*imaginary);
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singleton_polynomial_gain_survives_native_pspice_admission() -> Result<()> {
+    let source = br"PSpice singleton polynomial
+V1 in 0 -2
+Vs sense 0 0
+Is 0 sense -2
+E1 e 0 POLY(1) in 0 7
+H1 h 0 POLY(1) Vs 7
+G1 0 g POLY(1) in 0 7
+F1 0 f POLY(1) Vs 7
+Rg g 0 1
+Rf f 0 1
+.control
+set wr_singlescale
+set wr_vecnames
+op
+wrdata response.dat v(e) v(h) v(g) v(f)
+quit
+.endc
+.end
+";
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    if let Some(values) = rows(
+        &directory.path().join("native"),
+        &prepared.primary.bytes,
+        false,
+    )? {
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].len(), 5);
+        for &value in &values[0][1..] {
+            close(value, -14.);
         }
     }
     Ok(())
