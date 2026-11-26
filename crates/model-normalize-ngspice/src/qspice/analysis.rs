@@ -203,49 +203,7 @@ impl Settings<'_> {
         Ok(())
     }
 
-    fn tran(
-        &self,
-        statement: &Statement,
-        origin: &SourceOrigin,
-        fields: &[Range<usize>],
-        edits: &mut Vec<Edit>,
-        input: &[u8],
-    ) -> Result<()> {
-        let text = &statement.text;
-        let mut args = &fields[1..];
-        if args
-            .last()
-            .is_some_and(|span| text[span.clone()].eq_ignore_ascii_case(b"uic"))
-        {
-            args = &args[..args.len() - 1];
-        }
-        if !(1..=4).contains(&args.len()) {
-            return Err(reject(
-                origin,
-                Feature::TransientTiming,
-                "expected stop, or step stop [start [maxstep]], optionally followed by UIC",
-            ));
-        }
-        let values = args
-            .iter()
-            .map(|span| {
-                Scalar::parse(
-                    std::str::from_utf8(&text[span.clone()])?,
-                    origin,
-                    self.budget,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if values
-            .iter()
-            .any(|value| value.value.is_some_and(|v| v < 0.0))
-        {
-            return Err(reject(
-                origin,
-                Feature::TransientTiming,
-                "negative transient time field",
-            ));
-        }
+    fn native_times(&self, values: &[Scalar], origin: &SourceOrigin) -> Result<[String; 4]> {
         let stop = match values.get(1) {
             Some(duration) => values[0].copy(self.budget)?.select(
                 duration.copy(self.budget)?,
@@ -293,12 +251,58 @@ impl Settings<'_> {
         let interval =
             stop.copy(self.budget)?
                 .select(maximum.copy(self.budget)?, false, self.budget)?;
-        let native = [
+        Ok([
             interval.emit(self.budget)?,
             stop.emit(self.budget)?,
             start.emit(self.budget)?,
             maximum.emit(self.budget)?,
-        ];
+        ])
+    }
+
+    fn tran(
+        &self,
+        statement: &Statement,
+        origin: &SourceOrigin,
+        fields: &[Range<usize>],
+        edits: &mut Vec<Edit>,
+        input: &[u8],
+    ) -> Result<()> {
+        let text = &statement.text;
+        let mut args = &fields[1..];
+        if args
+            .last()
+            .is_some_and(|span| text[span.clone()].eq_ignore_ascii_case(b"uic"))
+        {
+            args = &args[..args.len() - 1];
+        }
+        if !(1..=4).contains(&args.len()) {
+            return Err(reject(
+                origin,
+                Feature::TransientTiming,
+                "expected stop, or step stop [start [maxstep]], optionally followed by UIC",
+            ));
+        }
+        let values = args
+            .iter()
+            .map(|span| {
+                Scalar::parse(
+                    std::str::from_utf8(&text[span.clone()])?,
+                    origin,
+                    self.budget,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if values
+            .iter()
+            .any(|value| value.value.is_some_and(|v| v < 0.0))
+        {
+            return Err(reject(
+                origin,
+                Feature::TransientTiming,
+                "negative transient time field",
+            ));
+        }
+        let native = self.native_times(&values, origin)?;
         let replacements = args
             .iter()
             .enumerate()
