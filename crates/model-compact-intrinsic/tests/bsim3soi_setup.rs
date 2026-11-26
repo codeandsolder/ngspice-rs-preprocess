@@ -503,3 +503,10 @@ mod junction;
 
 #[path = "bsim3soi_setup/channel.rs"]
 mod channel;
+
+#[path = "bsim3soi_setup/leakage.rs"]
+mod leakage;
+
+#[cfg(target_os = "linux")]
+#[path = "bsim3soi_setup/pd_thermal.rs"]
+mod pd_thermal;

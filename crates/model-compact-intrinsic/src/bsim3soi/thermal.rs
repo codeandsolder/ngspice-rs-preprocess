@@ -7,7 +7,7 @@ use crate::{
     preparation::{integer, positive, real, slot},
 };
 mod channel;
-pub use channel::{PdChannelEvaluation, PreparedPdChannel};
+pub use channel::{PdChannelEvaluation, PdCurrent, PdLeakage, PreparedPdChannel};
 mod differential;
 mod junction;
 mod substrate;

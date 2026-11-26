@@ -1,6 +1,7 @@
 //! Partially depleted BSIM3SOI 2.2.3 channel transport.
 //! Copyright 1999/1990 Regents of the University of California. See package LICENSE.
 
+mod leakage;
 mod threshold;
 mod transport;
 
@@ -9,6 +10,8 @@ use crate::{
     ModelError,
     preparation::{integer, positive},
 };
+use leakage::Leakage;
+pub use leakage::{PdCurrent, PdLeakage};
 use threshold::Threshold;
 use transport::ChannelTransport;
 
@@ -42,6 +45,8 @@ pub struct PdChannelEvaluation {
     pub series_resistance_ohm: f64,
     /// Bulk charge factor.
     pub bulk_factor: f64,
+    /// Gate-induced, gate-body, and impact-ionization contributions.
+    pub leakage: PdLeakage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +62,7 @@ pub(super) struct Bias {
 
 #[derive(Clone, Copy)]
 pub(super) struct State {
+    gate_effective: D,
     body_high: D,
     body: D,
     root: D,
@@ -84,6 +90,7 @@ pub struct PreparedPdChannel {
     transport: Transport,
     threshold: Threshold,
     channel: ChannelTransport,
+    leakage: Leakage,
     temperature: TemperatureCoefficients,
     length: f64,
     width: f64,
@@ -111,6 +118,7 @@ impl PreparedPdChannel {
             transport,
             threshold: Threshold::prepare(c)?,
             channel: ChannelTransport::prepare(c)?,
+            leakage: Leakage::prepare(c, transport.oxide_ratio)?,
             temperature: TemperatureCoefficients {
                 ambient: c.material.kelvin,
                 nominal: positive(c.model("tnom")?, "tnom")?,
@@ -138,6 +146,26 @@ impl PreparedPdChannel {
     #[must_use]
     pub const fn initial_surface_potential(&self) -> f64 {
         self.electrostatics.phi
+    }
+
+    /// Calculate the accepted/predictor surface potential from the last
+    /// solved device temperature, using the native load-time material law.
+    /// The solver owns when to commit this value; trial evaluation does not
+    /// mutate it.
+    ///
+    /// # Errors
+    /// Nonpositive temperature or surface potential.
+    pub fn accepted_surface_potential(&self, kelvin: f64) -> Result<f64, ModelError> {
+        if !self.temperature.selfheat {
+            return Ok(self.electrostatics.phi);
+        }
+        let temperature = D::constant(positive(kelvin, "accepted temperature")?);
+        let thermal = temperature.scale(K_OVER_Q);
+        let ni = intrinsic_density(temperature, thermal);
+        positive(
+            2.0 * thermal.value * (self.electrostatics.channel_doping / ni.value).ln(),
+            "accepted phi",
+        )
     }
 
     /// Evaluate a PD channel at forward-oriented normalized terminal bias.
@@ -192,9 +220,13 @@ impl PreparedPdChannel {
     }
 }
 
-fn built_in(temp: D, thermal: D, doping: f64) -> D {
+fn intrinsic_density(temp: D, thermal: D) -> D {
     let gap = D::constant(1.16) - (temp * temp).scale(7.02e-4) / (temp + D::constant(1108.0));
-    let density = (temp * temp.sqrt()).scale(1.45e10 * 1.923_058_4e-4)
-        * (D::constant(21.556_598_1) - gap / thermal.scale(2.0)).exp();
+    (temp * temp.sqrt()).scale(1.45e10 * 1.923_058_4e-4)
+        * (D::constant(21.556_598_1) - gap / thermal.scale(2.0)).exp()
+}
+
+fn built_in(temp: D, thermal: D, doping: f64) -> D {
+    let density = intrinsic_density(temp, thermal);
     thermal * (D::constant(1e20 * doping) / (density * density)).ln()
 }

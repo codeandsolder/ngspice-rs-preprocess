@@ -326,6 +326,7 @@ impl PreparedPdChannel {
             effective_drain_voltage_v: sat.effective.value,
             series_resistance_ohm: geometry.resistance.value,
             bulk_factor: geometry.bulk.value,
+            leakage: self.leakage(b, s, geometry.width)?,
         })
     }
 }

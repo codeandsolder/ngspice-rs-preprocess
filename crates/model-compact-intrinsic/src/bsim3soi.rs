@@ -6,9 +6,9 @@ mod thermal;
 
 pub use thermal::{
     Electrostatics, JunctionCharge, JunctionComponents, JunctionCurrent, JunctionDensities,
-    JunctionEvaluation, PdChannelEvaluation, PhysicalTemperature, PreparedJunctions,
-    PreparedPdChannel, PreparedSubstrateCharge, SubstrateCharge, TemperatureMaterial, Transport,
-    prepare_temperature,
+    JunctionEvaluation, PdChannelEvaluation, PdCurrent, PdLeakage, PhysicalTemperature,
+    PreparedJunctions, PreparedPdChannel, PreparedSubstrateCharge, SubstrateCharge,
+    TemperatureMaterial, Transport, prepare_temperature,
 };
 
 pub use instance::{Geometry, PdGeometry, PreparedInstance, RawBinned, prepare_instance};

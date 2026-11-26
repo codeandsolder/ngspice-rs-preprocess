@@ -990,3 +990,22 @@ surface potential. The explicit seven native terminal slots are
 required to avoid an unintended floating internal body in the legacy
 parser; this also strengthens the junction-current and charge
 qualification to 3,384 and 12,820 comparisons at imposed body bias.
+
+The PD channel result additionally exposes source/drain gate-induced leakage,
+signed gate-body tunnelling, and the impact-ionization coefficient. Impact
+ionization is composed with the channel and independently evaluated parasitic
+collector current at the same normalized bias. All four contributions have
+analytic VGS/VDS/VBS/temperature gradients. The gate tunnelling gradient includes
+the effective-width product derivative and the poly-depletion chain in the
+accumulation branch, which the native handwritten Jacobian omits. The native
+leakage-value oracle compares 7,128 drain-GIDL, gate current, impact-ionization
+and body-terminal KCL values with independent terminal biases; its worst
+body-terminal residual is 7.40e-17 A. Native current debug-node sign/magnitude
+conventions are applied only inside the oracle.
+
+The externally imposed temperature oracle uses fresh operating points, an
+explicit native temperature node, and independently controlled body bias. It
+checks 180 channel/threshold/saturation/junction values over -20 to +60 K
+relative to ambient. `accepted_surface_potential` computes the predictor's
+next surface potential from the last accepted temperature, without mutating
+trial state. The solver owns the predictor and source/drain reversal.

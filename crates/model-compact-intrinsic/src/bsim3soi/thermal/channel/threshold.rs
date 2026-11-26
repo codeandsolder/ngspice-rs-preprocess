@@ -161,6 +161,7 @@ impl PreparedPdChannel {
             self.oxide,
         );
         Ok(State {
+            gate_effective: gate,
             body_high,
             body,
             root,
