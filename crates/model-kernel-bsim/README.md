@@ -32,3 +32,30 @@ is moved by this package.
 The junction regularization is included exactly once. Noise uses the physical
 current and gate derivative rather than the native state-slot indices.
 Independent DC references and finite differences validate these decisions.
+
+## BSIMSOI 4.4 prepared assembly
+
+The `soi::BsimSoiGroup` API binds ordered source instances to an immutable
+prepared model. Each selected artifact binds the supplied terminals in source
+order and allocates only the active hidden roles. Every candidate replays the
+entire ordered model group, including the shared model mutations and CV oxide
+cache; instance parameter names use `i{index}_{source_name}`. Numeric
+geometry slots are expressed in physical SI units. Source flags, initial
+condition vectors and original parameter presence remain intact. Structural
+changes require a new artifact. A consumer changing a group candidate must
+prepare all affected instances from the same parameter vector.
+
+The residual and storage assembly uses physical electrical coordinate
+differences and absolute-Kelvin thermal coordinates. Channel, neutral-body,
+junction, leakage, gate tunneling, contact, access and RF paths have explicit
+conservative incidence. Intrinsic and overlap charge derivatives use their
+respective gate coordinates; distributed junctions use their own local body
+nodes. Heat balance and stored thermal energy occupy the thermal row. Noise
+sources are independent PSDs with explicit terminal-pair injections. No
+integration history or heap allocation belongs to the Newton evaluation.
+
+The assembled artifact has compile/strict qualification; executable
+Jacobian, topology, model-group and native noise reference tests are separate
+from the previously validated intrinsic subkernels. Native DC distributed-body
+and reverse gate-current Jacobian omissions are not copied into the physical
+conservative assembly.

@@ -318,40 +318,50 @@ impl BoundParameters {
             .map(|entry| usize::from(entry.slot))
             .max()
             .map_or(0, |max| max + 1);
-        let mut values = vec![None; slots].into_boxed_slice();
-        let mut bsim_soi_ic = [None; 5];
-        for (name, value) in inputs {
-            let entry = variant
-                .parameter(scope, name)
-                .ok_or_else(|| ModelError::UnknownParameter(name.to_owned()))?;
-            if value.kind() != entry.kind {
-                return Err(ModelError::WrongType {
-                    name: name.to_owned(),
-                    expected: entry.kind,
-                });
-            }
-            if !value.finite() {
-                return Err(ModelError::NonFinite(name.to_owned()));
-            }
-            if variant == ModelVariant::BsimSoi
-                && scope == ParameterScope::Instance
-                && entry.name == "ic"
-                && let ParameterValue::RealVector(ref vector) = value
-            {
-                let length = vector.len();
-                if !(1..=5).contains(&length) {
-                    return Err(ModelError::InvalidInitialConditions(length));
-                }
-                bsim_soi_ic[length - 1] = vector.last().copied();
-            }
-            values[usize::from(entry.slot)] = Some(value);
-        }
-        Ok(Self {
+        let mut bound = Self {
             variant,
             scope,
-            values,
-            bsim_soi_ic,
-        })
+            values: vec![None; slots].into_boxed_slice(),
+            bsim_soi_ic: [None; 5],
+        };
+        for (name, value) in inputs {
+            bound.assign(name, value)?;
+        }
+        Ok(bound)
+    }
+
+    /// Apply one more source assignment, preserving prior presence and ordered
+    /// initial-condition setters. This is a preparation-time operation.
+    ///
+    /// # Errors
+    /// Unknown parameter, wrong type, nonfinite value or invalid IC vector.
+    pub fn assign(&mut self, name: &str, value: ParameterValue) -> Result<(), ModelError> {
+        let entry = self
+            .variant
+            .parameter(self.scope, name)
+            .ok_or_else(|| ModelError::UnknownParameter(name.to_owned()))?;
+        if value.kind() != entry.kind {
+            return Err(ModelError::WrongType {
+                name: name.to_owned(),
+                expected: entry.kind,
+            });
+        }
+        if !value.finite() {
+            return Err(ModelError::NonFinite(name.to_owned()));
+        }
+        if self.variant == ModelVariant::BsimSoi
+            && self.scope == ParameterScope::Instance
+            && entry.name == "ic"
+            && let ParameterValue::RealVector(ref vector) = value
+        {
+            let length = vector.len();
+            if !(1..=5).contains(&length) {
+                return Err(ModelError::InvalidInitialConditions(length));
+            }
+            self.bsim_soi_ic[length - 1] = vector.last().copied();
+        }
+        self.values[usize::from(entry.slot)] = Some(value);
+        Ok(())
     }
 
     /// Retrieve a prepared parameter by slot, without names or allocations.

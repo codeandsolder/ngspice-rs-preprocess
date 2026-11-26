@@ -11,6 +11,7 @@
 
 mod junction;
 mod noise;
+pub mod soi;
 
 use std::sync::Arc;
 
