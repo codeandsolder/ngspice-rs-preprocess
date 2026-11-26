@@ -186,11 +186,11 @@ pub fn instance_fields(input: &str, ic_arity: usize) -> Result<Vec<ModelParamete
             return Ok(parsed);
         }
         let mut field = source.field(&[])?;
-        // Keep a family-sized unparenthesized IC vector; a balanced
+        // Keep a family-sized IC vector; a multi-component
         // parenthesized value already contains the whole vector.
         if input[field.name.clone()].eq_ignore_ascii_case("ic")
             && let Some(value) = &mut field.value
-            && !input[value.clone()].starts_with('(')
+            && instance_vector_fields(&input[value.clone()])?.len() == 1
         {
             for _ in 1..ic_arity {
                 let end = value.end;
@@ -213,6 +213,44 @@ pub fn instance_fields(input: &str, ic_arity: usize) -> Result<Vec<ModelParamete
         }
         parsed.push(ModelParameter::from_span(input, field));
     }
+}
+
+/// Split an instance vector into balanced scalar expressions.
+///
+/// Delimiters and quoted expressions are preserved. Commas and whitespace separate
+/// components; an optional outer parenthesis groups the entire vector.
+///
+/// # Errors
+/// Unbalanced expressions, empty components or an assignment inside a vector.
+pub fn instance_vector_fields(input: &str) -> Result<Vec<&str>> {
+    let mut input = input.trim();
+    let mut spans = crate::lexical::comma_tokens(input.as_bytes())?;
+    if spans.len() == 1
+        && let Some(group) = input
+            .strip_prefix('(')
+            .and_then(|tail| tail.strip_suffix(')'))
+    {
+        input = group;
+        spans = crate::lexical::comma_tokens(input.as_bytes())?;
+    }
+    let mut fields = Vec::new();
+    let mut comma_allowed = false;
+    for span in spans {
+        let field = &input[span];
+        match field {
+            "," => {
+                ensure!(comma_allowed, "empty instance vector component");
+                comma_allowed = false;
+            }
+            "=" => bail!("assignment inside an instance vector"),
+            _ => {
+                fields.push(field);
+                comma_allowed = true;
+            }
+        }
+    }
+    ensure!(comma_allowed, "empty instance vector component");
+    Ok(fields)
 }
 
 fn is_model_start(line: &[u8]) -> bool {
@@ -691,6 +729,32 @@ mod tests {
         ] {
             assert!(parse_model_card(source, 1, &["USER"]).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn instance_vectors_preserve_balanced_scalar_fields() -> Result<()> {
+        for input in [
+            "(1, {max(a, b)}, 'c + d')",
+            "1 {max(a, b)} 'c + d'",
+            "1, {max(a, b)} 'c + d'",
+        ] {
+            assert_eq!(
+                instance_vector_fields(input)?,
+                ["1", "{max(a, b)}", "'c + d'"]
+            );
+        }
+        assert_eq!(
+            instance_vector_fields("(a),(b),(c)")?,
+            ["(a)", "(b)", "(c)"]
+        );
+        let fields = instance_fields("ic=(a),(b),(c) w=1u", 3)?;
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].expression.as_deref(), Some("(a),(b),(c)"));
+        assert_eq!(fields[1].name, "w");
+        for input in ["", "()", ",1", "1,", "1,,2", "1, ,2", "1, a=2", "(1,{2)"] {
+            assert!(instance_vector_fields(input).is_err(), "{input}");
+        }
+        Ok(())
     }
 
     #[test]

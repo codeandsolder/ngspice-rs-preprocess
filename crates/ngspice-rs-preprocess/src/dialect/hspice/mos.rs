@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
     linked_source::RootKind,
     model_card::{
-        ModelCard, ModelParameter, instance_fields, parse_model_card, parse_spice_constant,
+        ModelCard, ModelParameter, instance_fields, instance_vector_fields, parse_model_card,
+        parse_spice_constant,
     },
     parameter_scope::ModelLibrary,
     statement_token_spans,
@@ -281,6 +282,25 @@ fn select<'a>(
     )
 }
 
+// Native ngspice parses grouped IC differently from its documented comma
+// vector. Emit individual scalar expressions in VDS, VGS, VBS order.
+fn initial_vector(expression: &str) -> Result<String> {
+    let fields = instance_vector_fields(expression)?;
+    ensure!(
+        (1..=3).contains(&fields.len()),
+        "HSPICE MOS IC needs one to three voltages"
+    );
+    let mut native = Vec::with_capacity(fields.len());
+    for field in fields {
+        if parse_spice_constant(field).is_ok() || field.starts_with('{') && field.ends_with('}') {
+            native.push(field.to_owned());
+        } else {
+            native.push(format!("{{{field}}}"));
+        }
+    }
+    Ok(native.join(","))
+}
+
 fn bind_instance(
     text: &str,
     model_end: usize,
@@ -303,7 +323,11 @@ fn bind_instance(
             "unqualified HSPICE BSIM4 instance parameter {name}"
         );
         if let Some(value) = expression {
-            write!(out, " {name}={value}")?;
+            if name == "IC" {
+                write!(out, " IC={}", initial_vector(&value)?)?;
+            } else {
+                write!(out, " {name}={value}")?;
+            }
         } else {
             ensure!(name == "OFF", "missing HSPICE MOS instance value {name}");
             write!(out, " {name}")?;

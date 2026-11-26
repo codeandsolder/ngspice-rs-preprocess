@@ -197,7 +197,9 @@ fn measure_native(path: &Path, text: &str, script: &str) -> Result<()> {
     let deck = text.strip_suffix(".end\n").context("missing terminator")?;
     fs::write(
         path.join("run.cir"),
-        format!("{deck}.control\nset numdgt=17\nset wr_singlescale\n{script}\nquit\n.endc\n.end\n"),
+        format!(
+            "{deck}.control\nset numdgt=17\nset num_threads=1\nset wr_singlescale\n{script}\nquit\n.endc\n.end\n"
+        ),
     )?;
     let result = Command::new("ngspice")
         .current_dir(path)
@@ -683,5 +685,64 @@ fn dc_sweep_target_must_be_an_independent_source() -> Result<()> {
         format!("{error:#}").contains("not a root independent source"),
         "{error:#}"
     );
+    Ok(())
+}
+
+#[test]
+fn bsim4_initial_vector_preserves_all_three_startup_voltages() -> Result<()> {
+    // HSPICE User Guide: Simulation and Analysis, B-2008.09, active
+    // elements, specifies IC in external VDS, VGS, VBS order. Native
+    // ngspice 47 interprets a parenthesized vector differently, so the
+    // preparation stage must emit a comma vector of individual scalars.
+    let reference = tempfile::tempdir()?;
+    let circuit = r#"MOS vector initial condition
+Vdd supply 0 1
+Vg g 0 PULSE(0 1 2n 1n 1n 5n 20n)
+R1 supply d 1k
+C1 d 0 1p IC=0.15
+M1 d g 0 0 selected L=1u W=2u IC=0.15,0.85,-0.05
+.model selected NMOS LEVEL=14 VERSION=4.70 VTH0=0.4
+.end
+"#;
+    let script = "tran 0.1n 12n uic\nwrdata tran.dat v(d) i(vdd)";
+    let expected = circuit.replacen('\n', "\n.options TNOM=25\n.temp 25\n", 1);
+    measure_native(reference.path(), &expected, script)?;
+    let expected = values(reference.path(), "tran.dat")?;
+    ensure!(expected.len() > 100, "missing reference trajectory");
+    for vector in [
+        "0.15,0.85,-0.05",
+        "0.15 0.85 -0.05",
+        "(0.15,0.85,-0.05)",
+        "(0.15),(0.85),(-0.05)",
+        "'vd0','vg0','vb0'",
+        "('vd0','vg0','vb0')",
+    ] {
+        let dir = tempfile::tempdir()?;
+        let source = circuit
+            .replacen('\n', "\n.param vd0=0.15 vg0=0.85 vb0=-0.05\n", 1)
+            .replace("LEVEL=14 VERSION=4.70", "LEVEL=54 VERSION=4.7")
+            .replace("IC=0.15,0.85,-0.05", &format!("IC={vector}"));
+        let text = numeric_deck(dir.path(), &source, script)?;
+        let actual = values(dir.path(), "tran.dat")?;
+        assert_eq!(actual.len(), expected.len(), "{vector}\n{text}");
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.len(), expected.len());
+            for (&a, &e) in actual.iter().zip(expected) {
+                ensure!(
+                    (a - e).abs() <= e.abs() * 1e-9 + 1e-15,
+                    "{vector}: {a:e} != {e:e}\n{text}"
+                );
+            }
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    for vector in ["(0.15,0.85,-0.05,1)", "(0.15,,0.85)", "0.15,,0.85"] {
+        let source = circuit
+            .replace("LEVEL=14 VERSION=4.70", "LEVEL=54 VERSION=4.7")
+            .replace("IC=0.15,0.85,-0.05", &format!("IC={vector}"));
+        fs::write(&root, source)?;
+        assert!(compile(&root, InputFormat::HspiceDeck).is_err(), "{vector}");
+    }
     Ok(())
 }

@@ -8,7 +8,7 @@ use super::{
     assignments, lexical_lookup,
 };
 use crate::{
-    model_card::{ModelParameter, instance_fields, positional_prefix},
+    model_card::{ModelParameter, instance_fields, instance_vector_fields, positional_prefix},
     vdmos_card::{VdmosLiterals, VdmosPolarity, vdmos_resolved},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -658,7 +658,7 @@ fn apply_instance(
     }
     let expr = expr.with_context(|| format!("VDMOS instance parameter {name} requires a value"))?;
     if name == "ic" {
-        let vector = vector_fields(expr)?;
+        let vector = instance_vector_fields(expr)?;
         ensure!(
             (1..=2).contains(&vector.len()),
             "VDMOS IC requires one or two voltages"
@@ -678,53 +678,6 @@ fn apply_instance(
         _ => bail!("unknown VDMOS instance parameter {name}"),
     }
     Ok(())
-}
-
-// Split an initial-condition vector without splitting expressions or
-// function arguments. Braces and apostrophes quote scalar expressions.
-fn vector_fields(input: &str) -> Result<Vec<&str>> {
-    let input = input.trim();
-    let input = input
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or(input);
-    let mut fields = Vec::new();
-    let mut start = 0;
-    let mut depth = 0usize;
-    let mut quoted = false;
-    for (index, ch) in input.char_indices() {
-        match ch {
-            '\'' => quoted = !quoted,
-            '(' | '{' if !quoted => depth += 1,
-            ')' | '}' if !quoted => {
-                depth = depth.checked_sub(1).context("unbalanced IC expression")?;
-            }
-            ',' if !quoted && depth == 0 => {
-                let field = input[start..index].trim();
-                if !field.is_empty() {
-                    fields.push(field);
-                }
-                start = index + 1;
-            }
-            c if c.is_whitespace() && !quoted && depth == 0 => {
-                let field = input[start..index].trim();
-                if !field.is_empty() {
-                    fields.push(field);
-                }
-                start = index + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    let tail = input[start..].trim();
-    if !tail.is_empty() {
-        fields.push(tail);
-    }
-    ensure!(
-        depth == 0 && !quoted && fields.iter().all(|f| !f.is_empty()),
-        "invalid VDMOS IC vector"
-    );
-    Ok(fields)
 }
 
 #[cfg(test)]
