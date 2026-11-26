@@ -74,7 +74,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn group(&mut self) -> Result<(char, &'a str, char)> {
+    fn group(&mut self, budget: &WorkBudget) -> Result<(char, &'a str, char)> {
         let open = self.offset;
         let (opener, closer) = match self.byte() {
             Some(b'(') => ('(', ')'),
@@ -82,7 +82,7 @@ impl<'a> Cursor<'a> {
             Some(b'[') => ('[', ']'),
             _ => bail!("expected source power operand group"),
         };
-        let end = group_end(self.input, open)?;
+        let end = group_end(self.input, open, budget)?;
         self.offset = end + 1;
         Ok((opener, &self.input[open + 1..end], closer))
     }
@@ -100,7 +100,7 @@ impl<'a> Cursor<'a> {
 
 impl Lowerer<'_> {
     fn group(&self, cursor: &mut Cursor<'_>) -> Result<String> {
-        let (open, body, close) = cursor.group()?;
+        let (open, body, close) = cursor.group(self.budget)?;
         let body = self.expression(body)?;
         self.budget
             .charge(Resource::EmittedBytes, body.len().saturating_add(2))?;
@@ -126,7 +126,7 @@ impl Lowerer<'_> {
                 && (name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I"))
             {
                 // Probe arguments are electrical names, not arithmetic.
-                let close = group_end(cursor.input, cursor.offset)?;
+                let close = group_end(cursor.input, cursor.offset, self.budget)?;
                 self.budget
                     .charge(Resource::EmittedBytes, close + 1 - before_space)?;
                 output.push_str(&cursor.input[before_space..=close]);

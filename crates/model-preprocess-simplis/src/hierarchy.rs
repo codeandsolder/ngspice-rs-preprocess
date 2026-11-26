@@ -407,6 +407,44 @@ impl SubcircuitCatalog {
         } else {
             self.simulator = Some(parsed.simulator);
         }
+        self.register_source_metadata(parsed)?;
+        let source_id = &parsed.source_id;
+        let source_name = &parsed.source_name;
+        let mut added = 0usize;
+        for definition in &parsed.definitions {
+            let key = definition.name.to_ascii_uppercase();
+            let definitions = self.definitions.entry(key).or_default();
+            if has_equivalent_definition(definitions, definition, source_id, &self.budget)? {
+                continue;
+            }
+            self.budget
+                .charge(Resource::EmittedBytes, definition.bytes.len())?;
+            for text in [
+                &definition.name,
+                &definition.scope_id,
+                source_id,
+                source_name,
+            ] {
+                self.budget.charge(Resource::EmittedBytes, text.len())?;
+            }
+            if let Some(owner) = &definition.owner_scope_id {
+                self.budget.charge(Resource::EmittedBytes, owner.len())?;
+            }
+            definitions.push(Definition {
+                name: definition.name.clone(),
+                bytes: definition.bytes.clone(),
+                parameterized: definition.parameterized,
+                scope_id: definition.scope_id.clone(),
+                owner_scope_id: definition.owner_scope_id.clone(),
+                source_id: Some(source_id.clone()),
+                source_name: Some(source_name.clone()),
+            });
+            added = added.saturating_add(1);
+        }
+        Ok(added)
+    }
+
+    fn register_source_metadata(&mut self, parsed: &ParsedLibrary) -> Result<()> {
         self.budget.charge(
             Resource::EmittedBytes,
             parsed
@@ -414,9 +452,9 @@ impl SubcircuitCatalog {
                 .len()
                 .saturating_add(parsed.source_name.len()),
         )?;
-        let source_id = parsed.source_id.clone();
-        let source_name = parsed.source_name.clone();
-        if !self.sources.contains_key(&source_id) {
+        let source_id = &parsed.source_id;
+        let source_name = &parsed.source_name;
+        if !self.sources.contains_key(source_id) {
             for line in &parsed.support_lines {
                 self.budget.charge(Resource::EmittedBytes, line.len())?;
             }
@@ -449,10 +487,19 @@ impl SubcircuitCatalog {
             self.budget
                 .charge(Resource::EvaluationSteps, bindings.len())?;
             if !bindings.iter().any(|binding| {
-                binding.source_id == source_id
+                binding.source_id == *source_id
                     && binding.target.eq_ignore_ascii_case(&alias.target)
                     && binding.kind.eq_ignore_ascii_case(&alias.kind)
             }) {
+                self.budget.charge(Resource::GeneratedNodes, 1)?;
+                self.budget.charge(
+                    Resource::EmittedBytes,
+                    alias
+                        .target
+                        .len()
+                        .saturating_add(alias.kind.len())
+                        .saturating_add(source_id.len()),
+                )?;
                 bindings.push(AliasBinding {
                     target: alias.target.clone(),
                     kind: alias.kind.clone(),
@@ -460,38 +507,7 @@ impl SubcircuitCatalog {
                 });
             }
         }
-        let mut added = 0usize;
-        for definition in &parsed.definitions {
-            let key = definition.name.to_ascii_uppercase();
-            let definitions = self.definitions.entry(key).or_default();
-            if has_equivalent_definition(definitions, definition, &source_id, &self.budget)? {
-                continue;
-            }
-            self.budget
-                .charge(Resource::EmittedBytes, definition.bytes.len())?;
-            for text in [
-                &definition.name,
-                &definition.scope_id,
-                &source_id,
-                &source_name,
-            ] {
-                self.budget.charge(Resource::EmittedBytes, text.len())?;
-            }
-            if let Some(owner) = &definition.owner_scope_id {
-                self.budget.charge(Resource::EmittedBytes, owner.len())?;
-            }
-            definitions.push(Definition {
-                name: definition.name.clone(),
-                bytes: definition.bytes.clone(),
-                parameterized: definition.parameterized,
-                scope_id: definition.scope_id.clone(),
-                owner_scope_id: definition.owner_scope_id.clone(),
-                source_id: Some(source_id.clone()),
-                source_name: Some(source_name.clone()),
-            });
-            added = added.saturating_add(1);
-        }
-        Ok(added)
+        Ok(())
     }
 
     #[must_use = "the returned identities enumerate registered libraries"]

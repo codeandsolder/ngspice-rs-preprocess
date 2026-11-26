@@ -311,7 +311,8 @@ fn control_references(text: &str, identity: &DeviceIdentity, scope: &Scope) -> R
     Ok(output)
 }
 
-fn expression_references(text: &str, scope: &Scope) -> Result<String> {
+fn expression_references(text: &str, scope: &Scope, budget: &WorkBudget) -> Result<String> {
+    budget.charge(Resource::EmittedBytes, text.len())?;
     let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
     let mut offset = 0;
@@ -327,9 +328,13 @@ fn expression_references(text: &str, scope: &Scope) -> Result<String> {
                 open += 1;
             }
             if bytes.get(open) == Some(&b'(') {
-                let close = super::group_end(text, open)?;
+                let close = super::group_end(text, open, budget)?;
                 let reference = text[open + 1..close].trim();
                 let target = scope.resolve(reference)?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    target.len().saturating_sub(close - open - 1),
+                )?;
                 output.push_str(&text[offset..=open]);
                 output.push_str(target);
                 output.push(')');
@@ -367,11 +372,11 @@ pub fn resolve_device_identities(
             let tail = &text[identity.declared.len()..];
             let rewritten =
                 control_references(&format!("{}{tail}", identity.linked), identity, scope)?;
-            expression_references(&rewritten, scope)?
+            expression_references(&rewritten, scope, budget)?
         } else if first_token(&line.text).is_some_and(|first| {
             first.eq_ignore_ascii_case(".param") || first.eq_ignore_ascii_case(".func")
         }) {
-            expression_references(&line.text, scope)?
+            expression_references(&line.text, scope, budget)?
         } else {
             line.text.clone()
         };

@@ -291,7 +291,7 @@ const fn symbol_byte(byte: u8) -> bool {
 }
 
 /// Find a complete function call or expression group, retaining nesting.
-fn group_end(input: &str, start: usize) -> Result<usize> {
+fn group_end(input: &str, start: usize, budget: &WorkBudget) -> Result<usize> {
     let mut stack = Vec::new();
     let mut quote = None;
     for (relative, ch) in input[start..].char_indices() {
@@ -303,9 +303,14 @@ fn group_end(input: &str, start: usize) -> Result<usize> {
         }
         match ch {
             '"' | '\'' => quote = Some(ch),
-            '(' => stack.push(')'),
-            '{' => stack.push('}'),
-            '[' => stack.push(']'),
+            '(' | '{' | '[' => {
+                budget.check_depth(stack.len().saturating_add(1))?;
+                stack.push(match ch {
+                    '(' => ')',
+                    '{' => '}',
+                    _ => ']',
+                });
+            }
             ')' | '}' | ']' => {
                 ensure!(
                     stack.pop() == Some(ch),
@@ -321,7 +326,7 @@ fn group_end(input: &str, start: usize) -> Result<usize> {
     bail!("unterminated expression group in {input}")
 }
 
-fn split_arguments(input: &str) -> Result<Vec<&str>> {
+fn split_arguments<'a>(input: &'a str, budget: &WorkBudget) -> Result<Vec<&'a str>> {
     let mut args = Vec::new();
     let mut start = 0;
     let mut offset = 0;
@@ -331,7 +336,7 @@ fn split_arguments(input: &str) -> Result<Vec<&str>> {
             .next()
             .context("expression boundary")?;
         match ch {
-            '(' | '{' | '[' => offset = group_end(input, offset)? + 1,
+            '(' | '{' | '[' => offset = group_end(input, offset, budget)? + 1,
             '"' | '\'' => {
                 let end = input[offset + 1..]
                     .find(ch)
@@ -339,6 +344,7 @@ fn split_arguments(input: &str) -> Result<Vec<&str>> {
                 offset += end + 2;
             }
             ',' => {
+                budget.charge(Resource::GeneratedNodes, 1)?;
                 args.push(input[start..offset].trim());
                 offset += 1;
                 start = offset;
@@ -346,6 +352,7 @@ fn split_arguments(input: &str) -> Result<Vec<&str>> {
             _ => offset += ch.len_utf8(),
         }
     }
+    budget.charge(Resource::GeneratedNodes, 1)?;
     args.push(input[start..].trim());
     Ok(args)
 }
@@ -359,7 +366,7 @@ fn lower_call(
     budget: &WorkBudget,
 ) -> Result<String> {
     if name.eq_ignore_ascii_case("LOG") {
-        let args = split_arguments(body)?;
+        let args = split_arguments(body, budget)?;
         ensure!(
             args.len() == 1 && !args[0].is_empty(),
             "LOG requires one argument"
@@ -379,7 +386,7 @@ fn lower_call(
         )?;
         return Ok(format!("{target}({argument})"));
     }
-    let args = split_arguments(body)?;
+    let args = split_arguments(body, budget)?;
     let [base, exponent] = args.as_slice() else {
         bail!("PWR requires two arguments")
     };
@@ -476,6 +483,56 @@ pub(super) fn lower_expression(
     rewrite_expression(input, language, false, limit, true, budget)
 }
 
+fn append_expression_identifier(
+    input: &str,
+    start: usize,
+    output: &mut String,
+    language: SourceLanguage,
+    limit: usize,
+    numeric_suffixes: bool,
+    budget: &WorkBudget,
+) -> Result<usize> {
+    let bytes = input.as_bytes();
+    let mut offset = start + 1;
+    while bytes.get(offset).copied().is_some_and(symbol_byte) {
+        offset += 1;
+    }
+    let name = &input[start..offset];
+    let mut open = offset;
+    while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+        open += 1;
+    }
+    if bytes.get(open) == Some(&b'(')
+        && ["LOG", "PWR", "V", "I"]
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        let end = group_end(input, open, budget)?;
+        if name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I") {
+            // Electrical names, not parameter expressions.
+            output.push_str(&input[start..=end]);
+        } else {
+            let lowered = lower_call(
+                name,
+                &input[open + 1..end],
+                language,
+                limit.saturating_sub(output.len()),
+                numeric_suffixes,
+                budget,
+            )?;
+            budget.charge(
+                Resource::EmittedBytes,
+                lowered.len().saturating_sub(end + 1 - start),
+            )?;
+            output.push_str(&lowered);
+        }
+        offset = end + 1;
+    } else {
+        output.push_str(name);
+    }
+    Ok(offset)
+}
+
 fn rewrite_expression(
     input: &str,
     language: SourceLanguage,
@@ -515,7 +572,7 @@ fn rewrite_expression(
                     + offset
                     + 1
             } else {
-                group_end(input, offset)?
+                group_end(input, offset, budget)?
             };
             // A nested braced expression is a mathematical group, not a
             // second ngspice substitution. Canonicalize mixed quote forms.
@@ -545,44 +602,15 @@ fn rewrite_expression(
         } else if (ch.is_ascii_alphabetic() || ch == '_')
             && (offset == 0 || !symbol_byte(bytes[offset - 1]))
         {
-            let start = offset;
-            offset += 1;
-            while bytes.get(offset).copied().is_some_and(symbol_byte) {
-                offset += 1;
-            }
-            let name = &input[start..offset];
-            let mut open = offset;
-            while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
-                open += 1;
-            }
-            if bytes.get(open) == Some(&b'(')
-                && ["LOG", "PWR", "V", "I"]
-                    .iter()
-                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
-            {
-                let end = group_end(input, open)?;
-                if name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I") {
-                    // Electrical names, not parameter expressions.
-                    output.push_str(&input[start..=end]);
-                } else {
-                    let lowered = lower_call(
-                        name,
-                        &input[open + 1..end],
-                        language,
-                        limit.saturating_sub(output.len()),
-                        numeric_suffixes,
-                        budget,
-                    )?;
-                    budget.charge(
-                        Resource::EmittedBytes,
-                        lowered.len().saturating_sub(end + 1 - start),
-                    )?;
-                    output.push_str(&lowered);
-                }
-                offset = end + 1;
-            } else {
-                output.push_str(name);
-            }
+            offset = append_expression_identifier(
+                input,
+                offset,
+                &mut output,
+                language,
+                limit,
+                numeric_suffixes,
+                budget,
+            )?;
         } else {
             output.push(ch);
             offset += ch.len_utf8();
@@ -644,7 +672,7 @@ pub(super) fn lower_statement_with_budget(
             }
             ".FUNC" => {
                 let open = trimmed.find('(').context("missing function arguments")?;
-                group_end(trimmed, open)? + 1
+                group_end(trimmed, open, budget)? + 1
             }
             ".SUBCKT" => token_end(trimmed, 2),
             _ => return Ok(statement.to_owned()),
