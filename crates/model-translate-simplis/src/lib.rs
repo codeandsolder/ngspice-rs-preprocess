@@ -10,6 +10,8 @@ use std::fmt::Write as _;
 
 pub mod syntax;
 use syntax::{normalized_statement, parse_numeric, statement_tokens, validate_node};
+mod digital_output;
+use digital_output::{OutputDrive, OutputPins, OutputSignal, OutputStage, emit_logic_voltage};
 mod whole;
 pub use whole::{
     SplitDeckTranslation, WholeModelTranslation, capture_artifact_initial_conditions,
@@ -635,15 +637,7 @@ struct DigitalBufferSpec {
 fn emit_digital_buffer(spec: &DigitalBufferSpec) -> Result<Translation> {
     let diff = format!("__{}_DIFF", spec.stem);
     let state = format!("__{}_STATE", spec.stem);
-    let delayed = if spec.delay == 0.0 {
-        state.clone()
-    } else {
-        format!("__{}_DELAYED", spec.stem)
-    };
-    let out_int = format!("__{}_OUT_INT", spec.stem);
-    let out_bar_int = format!("__{}_OUTB_INT", spec.stem);
     let hyst_model = format!("__{}_HYST_M", spec.stem);
-    let delay_model = format!("__{}_DELAY_M", spec.stem);
     let mut output = String::new();
     write!(
         output,
@@ -692,40 +686,25 @@ fn emit_digital_buffer(spec: &DigitalBufferSpec) -> Result<Translation> {
     output.push_str(" hyst=");
     write_number(&mut output, spec.hystwd / 2.0)?;
     output.push_str(" out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)\n");
-    if spec.delay != 0.0 {
-        writeln!(
-            output,
-            "A__{}_DELAY {state} {delayed} 0 {delay_model}",
-            spec.stem
-        )?;
-        write!(output, ".model {delay_model} delay(delay=")?;
-        write_number(&mut output, spec.delay)?;
-        output.push_str(" buffer_size=2048)\n");
+    OutputStage {
+        stem: &spec.stem,
+        rtn: &spec.rtn,
+        pins: OutputPins {
+            primary: &spec.out,
+            complement: Some(&spec.out_bar),
+        },
+        drive: OutputDrive {
+            low: spec.vol,
+            high: spec.voh,
+            resistance: spec.rout,
+        },
+        polarity: LogicPolarity::Positive,
+        signal: OutputSignal::Analog {
+            state: &state,
+            delay: spec.delay,
+        },
     }
-    write!(output, "B__{}_OUTV {out_int} {} V='", spec.stem, spec.rtn)?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*v({delayed})'")?;
-    write!(output, "R__{}_OUT {out_int} {} ", spec.stem, spec.out)?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
-    write!(
-        output,
-        "B__{}_OUTBV {out_bar_int} {} V='",
-        spec.stem, spec.rtn
-    )?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*(1-v({delayed}))'")?;
-    write!(
-        output,
-        "R__{}_OUTB {out_bar_int} {} ",
-        spec.stem, spec.out_bar
-    )?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
+    .emit(&mut output)?;
     Ok(Translation {
         bytes: output.into_bytes(),
         kind: match spec.kind {
@@ -832,10 +811,10 @@ impl LogicGateMode {
         }
     }
 
-    const fn output_negative(self) -> bool {
+    const fn output_polarity(self) -> LogicPolarity {
         match self {
-            Self::Classic { polarity, .. } => polarity.negative(),
-            Self::Digital1 { .. } => false,
+            Self::Classic { polarity, .. } => polarity,
+            Self::Digital1 { .. } => LogicPolarity::Positive,
         }
     }
 }
@@ -972,60 +951,6 @@ fn emit_logic_event(
     Ok(state)
 }
 
-#[derive(Clone, Copy, Debug)]
-struct LogicOutput {
-    negative: bool,
-    complement: bool,
-}
-
-fn emit_logic_voltage(
-    output: &mut String,
-    stem: &str,
-    out: &str,
-    rtn: &str,
-    state: &str,
-    rails: [f64; 2],
-) -> Result<()> {
-    let model = format!("__{stem}_M");
-    writeln!(output, "A__{stem}V {state} %vd({out} {rtn}) {model}")?;
-    write!(output, ".model {model} preprocess_logic_voltage(out_low=")?;
-    write_number(output, rails[0])?;
-    output.push_str(" out_high=");
-    write_number(output, rails[1])?;
-    output.push_str(")\n");
-    Ok(())
-}
-
-fn emit_logic_output(
-    output: &mut String,
-    io: LogicIo,
-    stem: &str,
-    out: &str,
-    rtn: &str,
-    state: &str,
-    output_mode: LogicOutput,
-) -> Result<()> {
-    let suffix = if output_mode.complement { "B" } else { "" };
-    let internal = format!("__{stem}_OUT{suffix}_INT");
-    let rails = if output_mode.complement ^ output_mode.negative {
-        [io.voh, io.vol]
-    } else {
-        [io.vol, io.voh]
-    };
-    emit_logic_voltage(
-        output,
-        &format!("{stem}_OUT{suffix}"),
-        &internal,
-        rtn,
-        state,
-        rails,
-    )?;
-    write!(output, "R__{stem}_OUT{suffix} {internal} {out} ")?;
-    write_number(output, io.rout)?;
-    output.push('\n');
-    Ok(())
-}
-
 fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
     let mut output = String::new();
     let receivers = (0..spec.inputs.len())
@@ -1052,33 +977,18 @@ fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
             initial: false,
         },
     )?;
-    let output_negative = spec.mode.output_negative();
-    emit_logic_output(
-        &mut output,
-        spec.io,
-        &spec.stem,
-        &spec.out,
-        &spec.rtn,
-        &state,
-        LogicOutput {
-            negative: output_negative,
-            complement: false,
+    OutputStage {
+        stem: &spec.stem,
+        rtn: &spec.rtn,
+        pins: OutputPins {
+            primary: &spec.out,
+            complement: spec.out_bar.as_deref(),
         },
-    )?;
-    if let Some(out_bar) = &spec.out_bar {
-        emit_logic_output(
-            &mut output,
-            spec.io,
-            &spec.stem,
-            out_bar,
-            &spec.rtn,
-            &state,
-            LogicOutput {
-                negative: output_negative,
-                complement: true,
-            },
-        )?;
+        drive: spec.io.into(),
+        polarity: spec.mode.output_polarity(),
+        signal: OutputSignal::Event(&state),
     }
+    .emit(&mut output)?;
     Ok(Translation {
         bytes: output.into_bytes(),
         kind: if spec.kind.conjunction() {
