@@ -2,6 +2,7 @@ mod classic_state;
 mod level17;
 use classic_state::{ClassicStateModel, classic_state_model, translate_classic_state_device};
 mod passive_ic;
+mod poly;
 use level17::{emit_level17_core_model, translate_level17_mos};
 mod pwls;
 mod waveforms;
@@ -1684,6 +1685,7 @@ impl std::fmt::Write for TextLength {
 
 fn append_budgeted(output: &mut String, text: &str, budget: &WorkBudget) -> Result<()> {
     budget.charge(Resource::EmittedBytes, text.len())?;
+    output.try_reserve(text.len())?;
     output.push_str(text);
     Ok(())
 }
@@ -1696,6 +1698,7 @@ fn append_format_budgeted(
     let mut length = TextLength::default();
     length.write_fmt(args)?;
     budget.charge(Resource::EmittedBytes, length.0)?;
+    output.try_reserve(length.0)?;
     output.write_fmt(args)?;
     Ok(())
 }
@@ -2136,128 +2139,10 @@ fn translated_current_branches(
     Ok(branches)
 }
 
-fn poly_dimension(token: &str) -> Option<usize> {
-    let upper = token.to_ascii_uppercase();
-    upper
-        .strip_prefix("POLY(")
-        .and_then(|value| value.strip_suffix(')'))
-        .and_then(|value| value.parse::<usize>().ok())
-}
-
-fn parse_poly_coefficients(tokens: &[String]) -> Result<Vec<f64>> {
-    let joined = tokens.join(" ");
-    let coefficients = joined
-        .split(|character: char| {
-            character.is_ascii_whitespace() || matches!(character, ',' | '(' | ')')
-        })
-        .filter(|token| !token.is_empty())
-        .map(crate::parse_numeric)
-        .collect::<Result<Vec<_>>>()?;
-    if coefficients.is_empty() {
-        bail!("PSpice POLY source has no coefficients");
-    }
-    if coefficients.len() > 256 {
-        bail!(
-            "PSpice POLY source has too many coefficients: {}",
-            coefficients.len()
-        );
-    }
-    if coefficients.iter().any(|value| !value.is_finite()) {
-        bail!("PSpice POLY source has non-finite coefficient");
-    }
-    Ok(coefficients)
-}
-
-fn append_poly_monomials(
-    monomials: &mut Vec<Vec<usize>>,
-    current: &mut Vec<usize>,
-    dimension: usize,
-    degree: usize,
-    start: usize,
-    needed: usize,
-) {
-    if monomials.len() >= needed {
-        return;
-    }
-    if current.len() == degree {
-        monomials.push(current.clone());
-        return;
-    }
-    for index in start..dimension {
-        current.push(index);
-        append_poly_monomials(monomials, current, dimension, degree, index, needed);
-        current.pop();
-        if monomials.len() >= needed {
-            return;
-        }
-    }
-}
-
-fn poly_monomials(dimension: usize, count: usize) -> Result<Vec<Vec<usize>>> {
-    if dimension == 0 || dimension > 16 {
-        bail!("unsupported PSpice POLY dimension {dimension}");
-    }
-    let mut monomials = Vec::with_capacity(count);
-    let mut current = Vec::new();
-    for degree in 1..=32 {
-        append_poly_monomials(&mut monomials, &mut current, dimension, degree, 0, count);
-        if monomials.len() >= count {
-            return Ok(monomials);
-        }
-    }
-    bail!("PSpice POLY expansion exceeds supported degree 32")
-}
-
-fn write_poly_expression_with(
-    output: &mut String,
-    dimension: usize,
-    coefficients: &[f64],
-    mut write_factor: impl FnMut(&mut String, usize) -> Result<()>,
-) -> Result<()> {
-    write_number(output, coefficients[0])?;
-    let monomials = poly_monomials(dimension, coefficients.len().saturating_sub(1))?;
-    for (coefficient, monomial) in coefficients.iter().skip(1).zip(monomials) {
-        output.push_str("+(");
-        write_number(output, *coefficient)?;
-        output.push(')');
-        for index in monomial {
-            write_factor(output, index)?;
-        }
-    }
-    Ok(())
-}
-
-fn write_poly_expression(
-    output: &mut String,
-    controls: &[String],
-    coefficients: &[f64],
-) -> Result<()> {
-    write_poly_expression_with(output, controls.len(), coefficients, |output, index| {
-        write!(output, "*i({})", controls[index])?;
-        Ok(())
-    })
-}
-
-fn write_voltage_poly_expression(
-    output: &mut String,
-    controls: &[(String, String)],
-    coefficients: &[f64],
-) -> Result<()> {
-    write_poly_expression_with(output, controls.len(), coefficients, |output, index| {
-        write!(output, "*v({},{})", controls[index].0, controls[index].1)?;
-        Ok(())
-    })
-}
-
-fn legacy_poly_dimension(tokens: &[String], index: usize) -> Option<(usize, usize)> {
-    if !tokens.get(index)?.eq_ignore_ascii_case("POLY") {
-        return None;
-    }
-    let dimension = tokens.get(index.saturating_add(1))?.parse::<usize>().ok()?;
-    Some((dimension, index.saturating_add(2)))
-}
-
-fn translate_legacy_voltage_poly_source(statement: &str) -> Result<Option<Translation>> {
+fn translate_legacy_voltage_poly_source(
+    statement: &str,
+    budget: &WorkBudget,
+) -> Result<Option<Translation>> {
     let tokens = statement_tokens(&normalized_statement(statement))?;
     let Some(kind) = tokens
         .first()
@@ -2270,43 +2155,49 @@ fn translate_legacy_voltage_poly_source(statement: &str) -> Result<Option<Transl
     if !matches!(kind, b'E' | b'G') {
         return Ok(None);
     }
-    let Some((dimension, control_start)) = legacy_poly_dimension(&tokens, 3) else {
+    let Some((dimension, control_start)) = poly::header(&tokens, 3)? else {
         return Ok(None);
     };
-    if dimension == 0 || dimension > 16 {
-        bail!("unsupported PSpice POLY dimension {dimension}");
-    }
     let control_tokens = dimension
         .checked_mul(2)
         .context("PSpice voltage POLY control count overflow")?;
-    let control_end = control_start
-        .checked_add(control_tokens)
-        .context("PSpice voltage POLY control index overflow")?;
-    if tokens.len() <= control_end {
-        bail!(
-            "PSpice POLY {dimension} voltage source has too few controls or coefficients: {statement}"
-        );
-    }
+    let mut operands = poly::operands(&tokens[control_start..], control_tokens, budget)?;
     validate_node(&tokens[1])?;
     validate_node(&tokens[2])?;
-    let mut controls = Vec::with_capacity(dimension);
-    for pair in tokens[control_start..control_end].as_chunks::<2>().0 {
-        validate_node(&pair[0])?;
-        validate_node(&pair[1])?;
-        controls.push((pair[0].clone(), pair[1].clone()));
+    budget.charge(Resource::GeneratedNodes, control_tokens)?;
+    let mut controls = Vec::new();
+    controls.try_reserve_exact(dimension)?;
+    for _ in 0..dimension {
+        let positive = operands.next().context("POLY missing positive control")?;
+        let negative = operands.next().context("POLY missing negative control")?;
+        validate_node(positive)?;
+        validate_node(negative)?;
+        controls.push((positive, negative));
     }
-    let coefficients = parse_poly_coefficients(&tokens[control_end..])?;
-    let stem = sanitized_name(&tokens[0]);
+    let coefficients = poly::coefficients(operands, budget)?;
+    let stem = escaped_device_stem(&tokens[0]);
     let mut output = String::new();
-    write!(
-        output,
-        "B__{stem} {} {} {}='",
-        tokens[1],
-        tokens[2],
-        if kind == b'E' { "V" } else { "I" }
+    append_format_budgeted(
+        &mut output,
+        budget,
+        format_args!(
+            "B__{stem} {} {} {}='",
+            tokens[1],
+            tokens[2],
+            if kind == b'E' { "V" } else { "I" }
+        ),
     )?;
-    write_voltage_poly_expression(&mut output, &controls, &coefficients)?;
-    output.push_str("'\n");
+    poly::write_expression(
+        &mut output,
+        dimension,
+        &coefficients,
+        budget,
+        |output, index| {
+            let (positive, negative) = controls[index];
+            append_format_budgeted(output, budget, format_args!("v({positive},{negative})"))
+        },
+    )?;
+    append_budgeted(&mut output, "'\n", budget)?;
     Ok(Some(Translation {
         bytes: output.into_bytes(),
         kind: TranslationKind::DeviceVoltageControlledSource,
@@ -2374,12 +2265,15 @@ fn translate_current_controlled_source(
             .context("current-controlled source has no name")?,
     );
     let mut output = String::new();
-    write!(
-        output,
-        "B__{stem} {} {} {}='",
-        tokens[1],
-        tokens[2],
-        if kind == b'F' { "I" } else { "V" }
+    append_format_budgeted(
+        &mut output,
+        budget,
+        format_args!(
+            "B__{stem} {} {} {}='",
+            tokens[1],
+            tokens[2],
+            if kind == b'F' { "I" } else { "V" }
+        ),
     )?;
 
     let value_expression = tokens.get(3).and_then(|token| {
@@ -2388,11 +2282,7 @@ fn translate_current_controlled_source(
             .filter(|(key, _)| key.eq_ignore_ascii_case("VALUE"))
             .map(|(_, value)| value)
     });
-    let poly = tokens
-        .get(3)
-        .and_then(|token| poly_dimension(token))
-        .map(|dimension| (dimension, 4usize))
-        .or_else(|| legacy_poly_dimension(&tokens, 3));
+    let poly = poly::header(&tokens, 3)?;
     if let Some(value) = value_expression {
         if tokens.len() != 4 {
             bail!("unsupported PSpice VALUE current-controlled source syntax: {statement}");
@@ -2403,28 +2293,25 @@ fn translate_current_controlled_source(
             .context("PSpice VALUE source expression must be braced")?;
         output.push_str(&lower_simetrix_behavioral_expression(expression, budget)?);
     } else if let Some((dimension, control_start)) = poly {
-        if dimension == 0 || dimension > 16 {
-            bail!("unsupported PSpice POLY dimension {dimension}");
+        let mut operands = poly::operands(&tokens[control_start..], dimension, budget)?;
+        budget.charge(Resource::GeneratedNodes, dimension)?;
+        let mut controls = Vec::new();
+        controls.try_reserve_exact(dimension)?;
+        for control in operands.by_ref().take(dimension) {
+            budget.charge(Resource::ScannedBytes, control.len())?;
+            let key = control.to_ascii_uppercase();
+            controls.push(branches.get(&key).map_or(control, String::as_str));
         }
-        let control_end = control_start
-            .checked_add(dimension)
-            .context("PSpice POLY control count overflow")?;
-        if tokens.len() <= control_end {
-            bail!(
-                "PSpice POLY({dimension}) source has too few controls or coefficients: {statement}"
-            );
-        }
-        let controls = tokens[control_start..control_end]
-            .iter()
-            .map(|control| {
-                branches
-                    .get(&control.to_ascii_uppercase())
-                    .cloned()
-                    .unwrap_or_else(|| control.clone())
-            })
-            .collect::<Vec<_>>();
-        let coefficients = parse_poly_coefficients(&tokens[control_end..])?;
-        write_poly_expression(&mut output, &controls, &coefficients)?;
+        let coefficients = poly::coefficients(operands, budget)?;
+        poly::write_expression(
+            &mut output,
+            dimension,
+            &coefficients,
+            budget,
+            |output, index| {
+                append_format_budgeted(output, budget, format_args!("i({})", controls[index]))
+            },
+        )?;
     } else {
         write_current_controlled_gain(&mut output, &tokens, branches)?;
     }
@@ -3157,13 +3044,13 @@ fn translate_raw_mutual_inductance(
 }
 
 #[derive(Clone, Debug)]
-struct TransformerWinding {
-    p: String,
-    n: String,
+struct TransformerWinding<'a> {
+    p: &'a str,
+    n: &'a str,
     turns: f64,
 }
 
-fn translate_raw_transformer(statement: &str) -> Result<Option<Translation>> {
+fn translate_raw_transformer(statement: &str, budget: &WorkBudget) -> Result<Option<Translation>> {
     if !statement.trim_start().starts_with("!T") {
         return Ok(None);
     }
@@ -3178,21 +3065,25 @@ fn translate_raw_transformer(statement: &str) -> Result<Option<Translation>> {
     if !nwind_name.eq_ignore_ascii_case("N_WIND") {
         bail!("SIMPLIS transformer first parameter must be N_WIND");
     }
-    let winding_count_f = crate::parse_numeric(nwind_value)?;
-    if winding_count_f.fract() != 0.0 || !(2.0..=32.0).contains(&winding_count_f) {
-        bail!("SIMPLIS transformer N_WIND must be an integer in 2..=32");
+    let winding_count_f =
+        pwls::constant(nwind_value, budget)?.context("SIMPLIS N_WIND must be constant")?;
+    if winding_count_f.fract() != 0.0 || !(2.0..=255.0).contains(&winding_count_f) {
+        bail!("SIMPLIS transformer N_WIND must be an integer in 2..=255");
     }
     let winding_count: usize = winding_count_f.to_string().parse()?;
-    if tokens.len() != 2 + winding_count.saturating_mul(3) {
+    // The documented maximum 255 makes this product representable.
+    if tokens.len() != 2 + winding_count * 3 {
         bail!("SIMPLIS transformer token count does not match N_WIND");
     }
-    let mut windings = Vec::with_capacity(winding_count);
+    budget.charge(Resource::GeneratedNodes, winding_count)?;
+    let mut windings = Vec::new();
+    windings.try_reserve_exact(winding_count)?;
     for index in 0..winding_count {
         let base = 2 + index * 3;
-        let p = tokens[base].clone();
-        let n = tokens[base + 1].clone();
-        validate_node(&p)?;
-        validate_node(&n)?;
+        let p = tokens[base].as_str();
+        let n = tokens[base + 1].as_str();
+        validate_node(p)?;
+        validate_node(n)?;
         let turns_token = &tokens[base + 2];
         let Some((turn_name, turn_value)) = turns_token.split_once('=') else {
             bail!("SIMPLIS transformer winding is missing turns assignment");
@@ -3200,35 +3091,38 @@ fn translate_raw_transformer(statement: &str) -> Result<Option<Translation>> {
         if !turn_name.eq_ignore_ascii_case(&format!("N{}", index + 1)) {
             bail!("SIMPLIS transformer winding turns are out of order");
         }
-        let turns = crate::parse_numeric(turn_value)?;
+        let turns =
+            pwls::constant(turn_value, budget)?.context("SIMPLIS turns must be constant")?;
         if !(turns.is_finite() && turns > 0.0) {
             bail!("SIMPLIS transformer turns must be positive");
         }
         windings.push(TransformerWinding { p, n, turns });
     }
     let primary = &windings[0];
-    let stem = sanitized_name(tokens[0].trim_start_matches('!'));
+    // Check every ratio before producing any generated device.
+    for secondary in &windings[1..] {
+        let ratio = secondary.turns / primary.turns;
+        anyhow::ensure!(
+            ratio.is_finite() && ratio > 0.,
+            "SIMPLIS transformer turns ratio is not representable"
+        );
+    }
+    let stem = escaped_device_stem(tokens[0].trim_start_matches('!'));
     let mut output = String::new();
+    budget.charge(Resource::GeneratedNodes, 4 * (winding_count - 1))?;
     for (index, secondary) in windings.iter().enumerate().skip(1) {
         let id = index + 1;
         let ratio = secondary.turns / primary.turns;
-        let middle = format!("__{stem}_W{id}_MID");
-        let sense = format!("V__{stem}_W{id}_SENSE");
-        writeln!(output, "{sense} {} {middle} 0", secondary.p)?;
-        write!(
-            output,
-            "E__{stem}_W{id} {middle} {} {} {} ",
-            secondary.n, primary.p, primary.n
+        // The zero-voltage source senses current into the dotted secondary
+        // terminal; the reversed primary CCCS enforces ampere-turn balance.
+        append_format_budgeted(
+            &mut output,
+            budget,
+            format_args!(
+                "V__{stem}_W{id}_SENSE {} __{stem}_W{id}_MID 0\nE__{stem}_W{id} __{stem}_W{id}_MID {} {} {} {ratio:.17e}\nF__{stem}_W{id}_PRI {} {} V__{stem}_W{id}_SENSE {ratio:.17e}\n",
+                secondary.p, secondary.n, primary.p, primary.n, primary.n, primary.p
+            ),
         )?;
-        write_number(&mut output, ratio)?;
-        output.push('\n');
-        write!(
-            output,
-            "F__{stem}_W{id}_PRI {} {} {sense} ",
-            primary.n, primary.p
-        )?;
-        write_number(&mut output, ratio)?;
-        output.push('\n');
     }
     Ok(Some(Translation {
         bytes: output.into_bytes(),
@@ -3971,22 +3865,15 @@ impl<'a> ScopeAnalysis<'a> {
             if matches!(kind, b'F' | b'H') {
                 // Traditional linear and POLY sources name physical device
                 // branches. VALUE expressions are resolved independently.
-                let poly = tokens
-                    .get(3)
-                    .and_then(|token| poly_dimension(token))
-                    .map(|dimension| (dimension, 4usize))
-                    .or_else(|| legacy_poly_dimension(&tokens, 3));
-                let controls = if let Some((dimension, start)) = poly {
-                    let end = start
-                        .checked_add(dimension)
-                        .context("current control count overflow")?;
-                    tokens.get(start..end).unwrap_or_default()
-                } else if tokens.len() == 5 {
-                    &tokens[3..4]
-                } else {
-                    &[]
-                };
-                for control in controls {
+                let poly = poly::header(&tokens, 3)?;
+                let (start, count) = poly.unwrap_or((3, usize::from(tokens.len() == 5)));
+                let tail = tokens.get(start..).unwrap_or_default();
+                if poly.is_some() {
+                    // Validate the same token boundaries as electrical lowering.
+                    let _validated = poly::operands(tail, count, self.budget)?;
+                }
+                for control in poly::fields(tail).take(count) {
+                    self.budget.charge(Resource::ScannedBytes, control.len())?;
                     let target = control.to_ascii_uppercase();
                     if self.voltage_branches.contains_key(&target)
                         || self.current_branches.contains_key(&target)
@@ -4456,7 +4343,7 @@ fn translate_deck_primitive(
         translate_adc_schmitt_device(statement, &models.adc_schmitt),
         translate_pspice_mos_series_resistance(statement, &models.pspice_mos_series_resistances),
         translate_inline_schematic_x(statement),
-        translate_legacy_voltage_poly_source(statement),
+        translate_legacy_voltage_poly_source(statement, models.budget),
         translate_device_voltage_controlled_source(
             statement,
             &models.voltage_branches,
@@ -4464,7 +4351,7 @@ fn translate_deck_primitive(
         ),
         translate_current_controlled_source(statement, &models.current_branches, models.budget),
         waveforms::translate(statement, &models.pwls_prefix, models.budget),
-        translate_raw_transformer(statement),
+        translate_raw_transformer(statement, models.budget),
         translate_raw_mutual_inductance(statement, &models.inductors),
         translate_raw_pwl_device(statement, &models.pwl),
         translate_raw_reactive_device(statement, &models.reactive),
@@ -6197,15 +6084,16 @@ H1 d 0 !RX 3
     }
 
     #[test]
-    fn pspice_poly_single_coefficient_is_constant_term() -> Result<()> {
+    fn pspice_poly_single_coefficient_is_linear_gain() -> Result<()> {
         let source = br"V1 a 0 0
 F1 out 0 POLY(1) V1 2
 .end
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("B__F1 out 0 I='2.00000000000000000e0'"));
-        assert!(!text.contains("*i(V1)"));
+        assert!(
+            text.contains("B__F1 out 0 I='0.00000000000000000e0+(2.00000000000000000e0)*i(V1)'")
+        );
         Ok(())
     }
 
@@ -6280,8 +6168,9 @@ H1 out 0 POLY(2) V1 V2 (0, 11.317k, 0, 0, -28.29Meg)
 ";
         let translated = translate_simplis_deck(source)?;
         let text = std::str::from_utf8(&translated.bytes)?;
-        assert!(text.contains("+(0.00000000000000000e0)*i(V1)*i(V1)"));
-        assert!(text.contains("+(-2.82900000000000000e7)*i(V1)*i(V2)"));
+        assert!(text.contains("+(1.13170000000000000e4)*i(V1)"));
+        assert!(text.contains("+(-2.82900000000000000e7)*(i(V1)*i(V2))"));
+        assert!(!text.contains("i(V1)*i(V1)"));
         assert!(!text.contains("i(V2)*i(V2)"));
         Ok(())
     }
