@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use model_kernel_api::{
     Binding, EquationKind, Error, PointBuffer, Result,
-    batch::{BatchOutput, PreparedTile},
+    batch::{BatchOutput, LaneUpdate, PreparedTile},
     noise::{Sink, Source},
 };
 use model_kernel_vdmos::{Bias, Instance, Model, Polarity, QuasiSaturation, artifact::artifact};
@@ -263,6 +263,66 @@ fn artifact_tiles_and_noise_preserve_native_model_laws()
             ("flicker".into(), densities.flicker)
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn selective_lanes_reuse_actual_vdmos_physics_and_noise()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    for polarity in [Polarity::N, Polarity::P] {
+        let sign = polarity.sign();
+        let artifact = artifact(
+            Arc::new(Model::defaults(polarity).prepare()?),
+            false,
+            [9; 16],
+        )?;
+        let x = [2. * sign, 5. * sign, 0.];
+        let coords = x.repeat(3);
+        let unchanged = artifact.prepare(&[1.], 300.)?;
+        let changed = artifact.prepare(&[2.], 310.)?;
+        let expected = artifact.prepare(&[3.], 375.)?;
+        let mut out = BatchOutput::new(3, 3)?;
+        let mut point = PointBuffer::new(3)?;
+        let mut tile = PreparedTile::from_prepared(
+            &artifact,
+            vec![
+                artifact.prepare(&[1.], 300.)?,
+                changed,
+                artifact.prepare(&[1.], 300.)?,
+            ],
+        )?;
+        tile.stage_replacements(
+            &artifact,
+            &[LaneUpdate {
+                lane: 1,
+                values: &[3.],
+                ambient_kelvin: 375.,
+            }],
+        )?
+        .commit();
+        tile.evaluate(&coords, &mut out)?;
+        for (lane, reference) in [&unchanged, &expected, &unchanged].into_iter().enumerate() {
+            artifact.evaluate(reference, &x, &mut point.point())?;
+            let scalar = point.point();
+            let batch = out.point(lane)?;
+            assert_eq!(scalar.current, batch.current);
+            assert_eq!(scalar.conductance, batch.conductance);
+            assert_eq!(scalar.charge, batch.charge);
+            assert_eq!(scalar.capacitance, batch.capacitance);
+            let mut other = PointBuffer::new(3)?;
+            tile.evaluate_lane(lane, &x, &mut other.point())?;
+            let other = other.point();
+            assert_eq!(scalar.current, other.current);
+            assert_eq!(scalar.conductance, other.conductance);
+            assert_eq!(scalar.charge, other.charge);
+            assert_eq!(scalar.capacitance, other.capacitance);
+            let mut expected_noise = Collect::default();
+            artifact.evaluate_noise(reference, &x, 1e3, &mut expected_noise)?;
+            let mut lane_noise = Collect::default();
+            tile.evaluate_lane_noise(lane, &x, 1e3, &mut lane_noise)?;
+            assert_eq!(expected_noise.0, lane_noise.0);
+        }
+    }
     Ok(())
 }
 

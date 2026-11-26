@@ -35,6 +35,20 @@ Source-level parameter parsing is not part of this interface.
   `batch::PreparedTile` owns contiguous, homogeneous prepared lanes.
   The default traversal can be replaced by a generated or SIMD kernel.
   No allocation is required on a successful numerical path.
+- At candidate boundaries, `PreparedTile::stage_replacements` takes
+  an exact artifact reference and changed lane recipes. It checks all
+  ordinals, prepares only the changed lanes, and returns an exclusive
+  transaction. Commit installs the prepared values in the existing
+  contiguous storage. Dropping a transaction aborts without changing the
+  tile. Stage disjoint tiles before committing any of them when the engine
+  changes several tiles together. A failed preparation must not publish a
+  partial candidate; structural edits still need a new artifact.
+- `PreparedTile::from_prepared` transfers already prepared standalone
+  instances into the tile without invoking physical preparation again.
+  Scalar and noise evaluation of grouped instances use `evaluate_lane`
+  and `evaluate_lane_noise` on that same tile, with the same validation as
+  standalone evaluation. No lane handle can outlive its tile or be
+  retained across a replacement; ordinals are local to the owning tile.
 - Static residual and Jacobian are mandatory. Charge/flux and noise can be
   computed, explicitly zero, or unavailable; unavailable is never
   interpreted as zero. Outputs are reset to missing sentinels and validated.
