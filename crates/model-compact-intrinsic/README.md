@@ -282,6 +282,21 @@ reference therefore compares the actual native stamped equivalent sources
 and separately checks the physical junction currents. A solver must use the
 physical junction residual and its full Jacobian, not the native DC omission.
 
+### BSIMSOI noise spectra
+
+The source-referred noise preparation supplies the three `TNOIMOD`
+channel models, both `FNOIMOD` flicker laws (including width normalization),
+source/drain access and gate-electrode thermal noise, distributed body and
+contact thermal noise, and gate and floating-body excess shot noise. Each
+result is a one-sided current PSD in A²/Hz, before circuit transfer. It
+preserves native multiplicity, the ambient-only source-body resistor noise,
+and the native unswapped channel partition used by reversed gate shot noise.
+Invalid negative/nonfinite densities are rejected; a zero raw body-contact
+resistance uses the actual finite physical resistor rather than infinite
+noise. The native clamped-terminal differential fixtures cover thermal and
+flicker selectors, frequency, polarity, temperature and reversal; numerical
+qualification is required before advertising a complete solver kernel.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds

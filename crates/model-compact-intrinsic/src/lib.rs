@@ -19,15 +19,16 @@ pub use bsim_soi::{
     BsimSoiImpactIonization, BsimSoiInstanceInput, BsimSoiInternalResistance,
     BsimSoiIntrinsicCharges, BsimSoiJunctionCharge, BsimSoiJunctionCharges, BsimSoiJunctionCurrent,
     BsimSoiJunctionDensities, BsimSoiJunctionPoint, BsimSoiJunctionSide, BsimSoiJunctionStorage,
-    BsimSoiNeutralBody, BsimSoiNode, BsimSoiParasiticPoint, BsimSoiSeriesBias,
-    BsimSoiSeriesConductance, BsimSoiSeriesParameters, BsimSoiStressOffsets,
+    BsimSoiNeutralBody, BsimSoiNode, BsimSoiNoiseBias, BsimSoiNoisePoint, BsimSoiParasiticPoint,
+    BsimSoiSeriesBias, BsimSoiSeriesConductance, BsimSoiSeriesParameters, BsimSoiStressOffsets,
     BsimSoiTemperaturePoint, BsimSoiThermalNetwork, BsimSoiThermalScalar, BsimSoiTopology,
     BsimSoiTransportPoint, PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
     PreparedBsimSoiElectrostatics, PreparedBsimSoiExtrinsicCharges,
     PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiGateTunneling,
     PreparedBsimSoiImpactIonization, PreparedBsimSoiInstance, PreparedBsimSoiIntrinsicCharges,
-    PreparedBsimSoiJunctions, PreparedBsimSoiParasitics, PreparedBsimSoiSetup, PreparedBsimSoiSize,
-    PreparedBsimSoiTemperature, PreparedBsimSoiTransport, prepare_bsim_soi_setup,
+    PreparedBsimSoiJunctions, PreparedBsimSoiNoise, PreparedBsimSoiParasitics,
+    PreparedBsimSoiSetup, PreparedBsimSoiSize, PreparedBsimSoiTemperature,
+    PreparedBsimSoiTransport, prepare_bsim_soi_setup,
 };
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use legacy_bsim::{

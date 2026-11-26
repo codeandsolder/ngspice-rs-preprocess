@@ -23,6 +23,8 @@ pub struct BsimSoiDrainChannelPoint {
     pub channel_conductance: Jet,
     /// Effective beta, including finger and instance multiplicity (A/V²).
     pub beta: Jet,
+    /// Internal access resistance of the full parallel instance.
+    pub internal_resistance: Jet,
     /// IDS / VDSEFF, evaluated without dividing by VDSEFF at zero drain bias.
     pub output_conductance_ratio: Jet,
 }
@@ -384,6 +386,8 @@ impl PreparedBsimSoiDrainChannel {
             effective_drain_voltage: saturation.effective.checked("effective drain voltage")?,
             early_voltage: early.checked("channel early voltage")?,
             beta: (beta * self.geometry.parallel).checked("channel beta")?,
+            internal_resistance: (resistance / self.geometry.parallel)
+                .checked("internal access resistance")?,
             output_conductance_ratio: ratio.checked("channel output ratio")?,
             channel_conductance: (channel_conductance
                 * (self.geometry.parallel / self.geometry.segments))

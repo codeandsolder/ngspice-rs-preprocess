@@ -14,10 +14,11 @@ pub use channel::{
     BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, BsimSoiDrainChannelPoint,
     BsimSoiExtrinsicChargeBias, BsimSoiExtrinsicCharges, BsimSoiGateBias, BsimSoiGateCurrents,
     BsimSoiGateInducedLeakage, BsimSoiHeatPoint, BsimSoiImpactBias, BsimSoiImpactBranch,
-    BsimSoiImpactIonization, BsimSoiIntrinsicCharges, BsimSoiParasiticPoint,
-    PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel, PreparedBsimSoiExtrinsicCharges,
-    PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiGateTunneling,
-    PreparedBsimSoiImpactIonization, PreparedBsimSoiIntrinsicCharges, PreparedBsimSoiParasitics,
+    BsimSoiImpactIonization, BsimSoiIntrinsicCharges, BsimSoiNoiseBias, BsimSoiNoisePoint,
+    BsimSoiParasiticPoint, PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
+    PreparedBsimSoiExtrinsicCharges, PreparedBsimSoiGateInducedLeakage,
+    PreparedBsimSoiGateTunneling, PreparedBsimSoiImpactIonization, PreparedBsimSoiIntrinsicCharges,
+    PreparedBsimSoiNoise, PreparedBsimSoiParasitics,
 };
 pub use electrostatics::{
     BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint, PreparedBsimSoiElectrostatics,

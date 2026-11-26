@@ -62,11 +62,27 @@ pub struct PreparedBsimSoiParasitics {
     temperature: PreparedBsimSoiTemperature,
     gate: GateLaw,
     body_contact: f64,
+    body_contact_noise: f64,
     drain_body: f64,
     source_body: f64,
 }
 
 impl PreparedBsimSoiParasitics {
+    pub(super) fn gate_noise_conductance(&self, point: &BsimSoiParasiticPoint) -> f64 {
+        match self.gate.mode {
+            1 | 3 => self.gate.electrode,
+            2 => {
+                self.gate.electrode
+                    / (1. + self.gate.electrode / point.gate_relaxation.value).powi(2)
+            }
+            _ => 0.,
+        }
+    }
+
+    pub(super) const fn body_contact_noise(&self) -> f64 {
+        self.body_contact_noise
+    }
+
     /// Evaluate the parasitics at the physical channel bias.
     /// # Errors
     /// Invalid physical bias or nonfinite constitutive output.
@@ -150,36 +166,39 @@ impl PreparedBsimSoiSetup {
                 1e3
             }
         };
-        let body_contact = if instance.topology().body_mode == BsimSoiBodyMode::Resistive {
-            let rbody = real(model, "rbody")?;
-            let halo = real(model, "rhalo")?;
-            let key = super::super::native_size_key(instance)?;
-            let mut owner = index;
-            for (candidate, other) in self.instances[..index].iter().enumerate() {
-                if super::super::native_size_key(other)? == key {
-                    owner = candidate;
-                    break;
+        let (body_contact, body_contact_noise) =
+            if instance.topology().body_mode == BsimSoiBodyMode::Resistive {
+                let rbody = real(model, "rbody")?;
+                let halo = real(model, "rhalo")?;
+                let key = super::super::native_size_key(instance)?;
+                let mut owner = index;
+                for (candidate, other) in self.instances[..index].iter().enumerate() {
+                    if super::super::native_size_key(other)? == key {
+                        owner = candidate;
+                        break;
+                    }
                 }
-            }
-            let cached = self.instances[owner].parameters();
-            let internal = if rbody == 0. {
-                0.
+                let cached = self.instances[owner].parameters();
+                let internal = if rbody == 0. {
+                    0.
+                } else {
+                    real(cached, "frbody")? * rbody * halo / halo.mul_add(geometry.leff, 2. * rbody)
+                        * geometry.weff
+                        / real(cached, "nseg")?
+                        / nf
+                };
+                let external = real(params, "nrb")? * real(model, "rbsh")?;
+                let resistance = if internal < 1e-3 {
+                    external.max(1e-3)
+                } else {
+                    internal + external
+                };
+                let physical = m / positive(resistance, "body contact resistance")?;
+                let raw = internal + external;
+                (physical, if raw > 0. { m / raw } else { physical })
             } else {
-                real(cached, "frbody")? * rbody * halo / halo.mul_add(geometry.leff, 2. * rbody)
-                    * geometry.weff
-                    / real(cached, "nseg")?
-                    / nf
+                (0., 0.)
             };
-            let external = real(params, "nrb")? * real(model, "rbsh")?;
-            let resistance = if internal < 1e-3 {
-                external.max(1e-3)
-            } else {
-                internal + external
-            };
-            m / positive(resistance, "body contact resistance")?
-        } else {
-            0.
-        };
         let body = |name| -> Result<f64, ModelError> {
             if integer(params, "rbodymod")? == 0 {
                 return Ok(0.);
@@ -202,6 +221,7 @@ impl PreparedBsimSoiSetup {
             temperature: self.prepare_temperature(index, ambient)?,
             gate,
             body_contact,
+            body_contact_noise,
             drain_body: body("rbdb")?,
             source_body: body("rbsb")?,
         })

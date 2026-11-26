@@ -1,6 +1,8 @@
 //! Bias-dependent BSIMSOI 4.4 channel electrostatics.
 //! Copyright 2010 Regents of the University of California. See package LICENSE.
 mod centroid;
+mod noise;
+pub use noise::{BsimSoiNoiseBias, BsimSoiNoisePoint, PreparedBsimSoiNoise};
 mod parasitic;
 pub use parasitic::{BsimSoiHeatPoint, BsimSoiParasiticPoint, PreparedBsimSoiParasitics};
 mod charge;
