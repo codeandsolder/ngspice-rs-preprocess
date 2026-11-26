@@ -162,6 +162,8 @@ pub struct AnalysisPlan {
     pub title: Option<String>,
     /// Declarations in source/linked scope order.
     pub entries: Vec<PlanEntry>,
+    /// Explicit selected realization; a sampled circuit requires occurrence binding.
+    pub statistical_sample: Option<model_statistics::Realization>,
 }
 
 impl AnalysisPlan {
@@ -175,6 +177,7 @@ impl AnalysisPlan {
             kind,
             title,
             entries: Vec::new(),
+            statistical_sample: None,
         }
     }
 
@@ -230,8 +233,93 @@ impl AnalysisPlan {
     /// Whether source-specific execution/output binding is required.
     #[must_use = "the consumer must handle deferred analysis semantics"]
     pub fn requires_binding(&self) -> bool {
-        self.entries.iter().any(|entry| entry.disposition == Disposition::RequiresBinding
+        self.statistical_sample.is_some() || self.entries.iter().any(|entry| entry.disposition == Disposition::RequiresBinding
             || matches!(&entry.directive, Directive::Options { settings } if settings.iter().any(|setting| setting.disposition == Disposition::RequiresBinding)))
+    }
+
+    // Select an actual member of a Monte Carlo sweep, not a nominal
+    // substitute for the source analysis. Keep the original source statement
+    // in the manifest and normalize only its selected electrical request.
+    pub(crate) fn select_statistical_sample(
+        &mut self,
+        selected: Option<model_statistics::Realization>,
+    ) -> Result<()> {
+        self.statistical_sample = selected;
+        for entry in &mut self.entries {
+            if let Directive::Options { settings } = &entry.directive {
+                ensure!(
+                    !settings.iter().any(|option| option.name == "MCHSPICE"),
+                    "MCHSPICE statistical semantics require explicit source normalization"
+                );
+            }
+            let Directive::Analysis { arguments, uic, .. } = &entry.directive else {
+                ensure!(
+                    !matches!(
+                        entry.command.as_str(),
+                        ".MC" | ".MONTE" | ".WCASE" | ".WORSTCASE"
+                    ),
+                    "SIMetrix statistical analysis is not implemented for {}",
+                    entry.command
+                );
+                continue;
+            };
+            let Some(sweep) = arguments.windows(2).position(|pair| {
+                pair[0].eq_ignore_ascii_case("SWEEP") && pair[1].eq_ignore_ascii_case("MONTE")
+            }) else {
+                continue;
+            };
+            let realization = selected
+                .context("Monte Carlo sweep requires explicit statistical sample SEED:INDEX")?;
+            let tail = &arguments[sweep + 2..];
+            let count = tail
+                .first()
+                .context("missing Monte Carlo sample count")?
+                .parse::<u64>()?;
+            ensure!(
+                count > 0 && realization.sample < count,
+                "statistical sample {} outside sweep of {count}",
+                realization.sample
+            );
+            // NUMCORES affects scheduling of the original sweep only. All
+            // nested sweeps and other modifiers still require orchestration.
+            match &tail[1..] {
+                [] => {}
+                [name, equals, cores] if name.eq_ignore_ascii_case("NUMCORES") && equals == "=" => {
+                    ensure!(cores.parse::<u64>()? > 0, "invalid NUMCORES");
+                }
+                [setting] => {
+                    let (name, cores) = setting
+                        .split_once('=')
+                        .context("unsupported Monte Carlo sweep modifier")?;
+                    ensure!(
+                        name.eq_ignore_ascii_case("NUMCORES") && cores.parse::<u64>()? > 0,
+                        "unsupported Monte Carlo sweep modifier"
+                    );
+                }
+                _ => anyhow::bail!(
+                    "nested or extended Monte Carlo sweep requires explicit orchestration"
+                ),
+            }
+            ensure!(
+                entry.scope.is_empty(),
+                "scoped statistical analysis is not executable"
+            );
+            let mut single = format!("{} {}", entry.command, arguments[..sweep].join(" "));
+            if *uic {
+                single.push_str(" UIC");
+            }
+            let (directive, disposition) = classify(&entry.command, &single, self.dialect, false)?;
+            ensure!(
+                disposition != Disposition::Unsupported,
+                "unsupported selected Monte Carlo analysis: {single}"
+            );
+            entry.directive = directive;
+            entry.disposition = disposition;
+        }
+        if selected.is_some() {
+            self.validate_supported()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn append_native_options(&self, bytes: &mut Vec<u8>) -> Result<()> {
