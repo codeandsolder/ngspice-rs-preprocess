@@ -750,7 +750,10 @@ pub struct LoweredSources {
 /// Control commands, ordinary E/G cards and comments are not transformed.
 /// # Errors
 /// Malformed transfer cards, invalid text, or identifier allocation failure.
-pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
+pub fn lower_sources(
+    input: &[u8],
+    source_line: impl Fn(usize) -> Result<usize>,
+) -> Result<Option<LoweredSources>> {
     if !input.windows(4).any(|w| w.eq_ignore_ascii_case(b"freq"))
         && !input.windows(5).any(|w| w.eq_ignore_ascii_case(b"table"))
         && !input.windows(7).any(|w| w.eq_ignore_ascii_case(b"laplace"))
@@ -783,8 +786,9 @@ pub fn lower_sources(input: &[u8]) -> Result<Option<LoweredSources>> {
         }
         let source =
             std::str::from_utf8(text).context("controlled transfer source is not UTF-8")?;
+        let line = source_line(statement.line)?;
         let Some((transfer, wrapped)) = parse_with_layout(source)
-            .with_context(|| format!("line {}: controlled transfer", statement.line))?
+            .with_context(|| format!("line {line}: controlled transfer"))?
         else {
             continue;
         };
