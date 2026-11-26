@@ -17,6 +17,7 @@ pub mod param_expression;
 pub mod parameter_scope;
 pub mod passive_ic;
 pub mod pspice;
+pub mod pwl_resistor;
 pub mod qspice;
 pub mod tina;
 pub mod vdmos_card;

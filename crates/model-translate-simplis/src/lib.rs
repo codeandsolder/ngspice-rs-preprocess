@@ -5,6 +5,7 @@
 //! unsupported primitive/model variants fail closed.
 
 use anyhow::{Context, Result, bail};
+use model_normalize_ngspice::pwl_resistor::{Axis, Knot, NativeBinding, validate_curve};
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -190,34 +191,38 @@ fn write_pwl(output: &mut String, node_p: &str, node_n: &str, points: &[Point]) 
     Ok(())
 }
 
+fn resistor_knots(points: &[Point]) -> impl Iterator<Item = Knot> + '_ {
+    points.iter().map(|point| Knot {
+        voltage: point.voltage,
+        current: point.value,
+    })
+}
+
 fn validate_resistor_end_slopes(points: &[Point], current_defined: bool) -> Result<()> {
-    validate_finite_points(points)?;
-    let independent = |point: &Point| {
+    validate_curve(
         if current_defined {
-            point.value
+            Axis::Current
         } else {
-            point.voltage
+            Axis::Voltage
+        },
+        resistor_knots(points),
+    )
+}
+
+fn resistor_binding(name: &str, axis: Axis) -> NativeBinding {
+    match axis {
+        Axis::Voltage => NativeBinding::CurrentLaw {
+            source: format!("B{name}"),
+        },
+        Axis::Current => {
+            let stem = sanitized_name(name);
+            NativeBinding::VoltageLaw {
+                sensor: format!("V__{stem}_IPWLR_SENSE"),
+                source: format!("B__{stem}_IPWLR"),
+                intermediate: format!("__{stem}_IPWLR_MID"),
+            }
         }
-    };
-    let dependent = |point: &Point| {
-        if current_defined {
-            point.voltage
-        } else {
-            point.value
-        }
-    };
-    anyhow::ensure!(
-        points
-            .windows(2)
-            .all(|pair| independent(&pair[0]) < independent(&pair[1])),
-        "piecewise-linear resistor independent coordinates must be strictly increasing"
-    );
-    anyhow::ensure!(
-        dependent(&points[0]) < dependent(&points[1])
-            && dependent(&points[points.len() - 2]) < dependent(&points[points.len() - 1]),
-        "piecewise-linear resistor end segments require positive differential resistance"
-    );
-    Ok(())
+    }
 }
 
 /// Translate a SIMPLIS `VPWLR` two-terminal V-I primitive to an ngspice
@@ -239,7 +244,10 @@ pub fn translate_vpwlr(
     validate_resistor_end_slopes(points, false)?;
 
     let mut output = String::new();
-    write!(output, "B{name} {node_p} {node_n} I=")?;
+    let NativeBinding::CurrentLaw { source } = resistor_binding(name, Axis::Voltage) else {
+        bail!("incorrect voltage-defined resistor binding");
+    };
+    write!(output, "{source} {node_p} {node_n} I=")?;
     write_pwl(&mut output, node_p, node_n, points)?;
     output.push('\n');
     Ok(Translation {
@@ -269,12 +277,17 @@ pub fn translate_ipwlr(
     validate_node(node_n)?;
     validate_resistor_end_slopes(points, true)?;
 
-    let stem = sanitized_name(name);
-    let sense = format!("V__{stem}_IPWLR_SENSE");
-    let middle = format!("__{stem}_IPWLR_MID");
+    let NativeBinding::VoltageLaw {
+        sensor,
+        source,
+        intermediate,
+    } = resistor_binding(name, Axis::Current)
+    else {
+        bail!("incorrect current-defined resistor binding");
+    };
     let mut output = String::new();
-    writeln!(output, "{sense} {node_p} {middle} 0")?;
-    write!(output, "B__{stem}_IPWLR {middle} {node_n} V=pwl(i({sense})")?;
+    writeln!(output, "{sensor} {node_p} {intermediate} 0")?;
+    write!(output, "{source} {intermediate} {node_n} V=pwl(i({sensor})")?;
     for point in points {
         output.push_str(", ");
         write_number(&mut output, point.value)?;

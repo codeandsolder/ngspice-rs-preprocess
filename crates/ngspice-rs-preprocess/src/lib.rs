@@ -10,7 +10,7 @@ use model_normalize_ngspice::{
     linked_source::{LibrarySyntax, LinkLimits, LinkedSource, RootKind, SourceLinker},
     normalize_mapped,
 };
-pub use model_normalize_ngspice::{passive_ic, waveform};
+pub use model_normalize_ngspice::{passive_ic, pwl_resistor, waveform};
 pub use model_preprocess_command::{
     AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, Resource,
     SourceSession, WorkBudget, WorkLimits,
@@ -264,6 +264,9 @@ pub struct PreparedBundle {
     /// elaborated occurrence and parameter candidate. Electrical cards
     /// retain the source identity but may contain only a DC placeholder.
     pub waveforms: Vec<waveform::PreparedWaveform>,
+    /// Exact resistor laws with occurrence-local advisory startup segments.
+    /// A consumer must bind the emitted branch anchors before solving.
+    pub pwl_resistors: Vec<pwl_resistor::PreparedPwlResistor>,
 }
 
 impl PreparedBundle {
@@ -502,6 +505,7 @@ fn native_bundle(
         initial_conditions: None,
         analysis_plan: None,
         waveforms,
+        pwl_resistors: Vec::new(),
     })
 }
 
@@ -595,10 +599,24 @@ pub fn prepare(
             declaration.artifact
         );
     }
+    for declaration in &result.pwl_resistors {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        ensure!(
+            artifact_names.contains(declaration.artifact.as_str()),
+            "missing PWL resistor artifact {}",
+            declaration.artifact
+        );
+    }
     budget.check()?;
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
         budget.charge(Resource::EmittedBytes, artifact.bytes.len())?;
+        pwl_resistor::validate_artifact(
+            &result.pwl_resistors,
+            &artifact.filename,
+            &artifact.bytes,
+            &budget,
+        )?;
         waveform::validate_artifact(
             &result.waveforms,
             &artifact.filename,
