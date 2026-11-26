@@ -97,13 +97,7 @@ fn every_reduced_topology_reuses_native_physics() -> TestResult {
                         x[row] = value;
                     }
                 }
-                let expected = direct
-                    .prepare(0.)?
-                    .evaluate(Trial {
-                        unknowns: &x,
-                        electrothermal: None,
-                    })?
-                    .local;
+                let expected = direct.prepare(0.)?.evaluate(Trial { unknowns: &x })?.local;
                 let mut buffer = PointBuffer::new(x.len())?;
                 let mut point = buffer.point();
                 artifact.evaluate(&instance, &x, &mut point)?;
@@ -166,12 +160,7 @@ fn correlated_noise_preserves_complex_spectrum_and_physical_nodes() -> TestResul
         };
     }
     let prepared = direct.prepare(0.)?;
-    let operating = prepared
-        .evaluate(Trial {
-            unknowns: &x,
-            electrothermal: None,
-        })?
-        .operating;
+    let operating = prepared.evaluate(Trial { unknowns: &x })?.operating;
     for frequency in [1., 1e6, 1e9, 1e12] {
         let expected = prepared.evaluate_noise(&operating, frequency)?;
         let mut sink = Noise::default();
@@ -215,7 +204,7 @@ fn correlated_noise_preserves_complex_spectrum_and_physical_nodes() -> TestResul
 }
 
 #[test]
-fn topology_changing_candidates_and_live_thermal_models_are_rejected() -> TestResult {
+fn topology_changing_candidates_rejected_and_live_thermal_models_supported() -> TestResult {
     let mut nominal = nominal(0, false, Polarity::Npn);
     nominal.auxiliary.rcx = 0.002;
     let ambient = Temperature::new(300.15)?;
@@ -233,9 +222,302 @@ fn topology_changing_candidates_and_live_thermal_models_are_rejected() -> TestRe
     nominal.auxiliary.flsh = 2;
     nominal.auxiliary.rth = 250.;
     let thermal = Model::new(&nominal, None)?;
-    assert!(matches!(
-        shared::artifact(&thermal, ambient, reference),
-        Err(Error::Unsupported(_))
-    ));
+    let thermal_artifact = shared::artifact(&thermal, ambient, reference)?;
+    assert!(
+        thermal_artifact
+            .descriptor()
+            .equations
+            .iter()
+            .any(|row| row.kind == EquationKind::Thermal)
+    );
+    thermal_artifact.prepare(&[1., 1., 0., 40.], 350.)?;
+    Ok(())
+}
+
+#[path = "fixtures/hicum2_baseline.rs"]
+mod baseline;
+
+fn thermal_model(mask: u8, nqs: bool, polarity: Polarity, mode: u8) -> Nominal {
+    let mut model = nominal(mask, nqs, polarity);
+    model.transport = baseline::parameters();
+    model.transport.t0 = 5e-12;
+    model.transport.tbhrec = 2e-11;
+    model.auxiliary.flsh = mode;
+    model.auxiliary.rth = 200.;
+    model.auxiliary.cth = 2e-9;
+    model.auxiliary.favl = 0.04;
+    model.auxiliary.qavl = 1e-15;
+    model.auxiliary.kavl = 0.01;
+    model.auxiliary.itss = 1e-16;
+    model.auxiliary.tsf = 2e-12;
+    model.auxiliary.ibets = 1e-15;
+    model.auxiliary.abet = 10.;
+    model.auxiliary.fcrbi = 0.2;
+    model.auxiliary.fdqr0 = 0.2;
+    model.auxiliary.fgeo = 0.5;
+    model.auxiliary.fqi = 0.5;
+    model.coefficients.dt = 3.;
+    model.coefficients.zetarbi = 0.7;
+    model.coefficients.zetarbx = 0.5;
+    model.coefficients.zetare = 0.8;
+    model.coefficients.zetarcx = -0.3;
+    model.coefficients.zetarth = 0.2;
+    model.coefficients.alrth = 1e-4;
+    model.coefficients.alt0 = 1e-3;
+    model.coefficients.kt0 = 1e-6;
+    model.coefficients.alfav = 1e-3;
+    model.coefficients.alqav = 1e-3;
+    model.coefficients.alkav = 1e-3;
+    model
+}
+
+#[test]
+fn complete_thermal_column_matches_independent_trial_repreparation() -> TestResult {
+    for polarity in [Polarity::Npn, Polarity::Pnp] {
+        for mask in 0..32 {
+            for nqs in [false, true] {
+                for mode in [1, 2] {
+                    let model = Model::new(&thermal_model(mask, nqs, polarity, mode), None)?;
+                    let ambient = Temperature::new(300.15)?;
+                    let options = Options {
+                        area: 1.3,
+                        multiplicity: 2.,
+                        dt_kelvin: 4.,
+                        temp_celsius: Some(42.),
+                        ..Options::default()
+                    };
+                    let direct = model.bind(ambient, options)?;
+                    let layout = direct.layout();
+                    let width = layout.count();
+                    let thermal = layout.thermal_slot().ok_or("thermal slot missing")?;
+                    let artifact = shared::artifact(&model, ambient, options)?;
+                    let instance = artifact.prepare(&[1.3, 2., 4., 42.], ambient.kelvin())?;
+                    assert_eq!(
+                        artifact.descriptor().equations[thermal].kind,
+                        EquationKind::Thermal
+                    );
+                    assert_eq!(
+                        artifact.descriptor().equations[thermal].binding,
+                        Binding::Terminal
+                    );
+                    let sign = if polarity == Polarity::Npn { 1. } else { -1. };
+                    for (vbe, vce, kelvin) in [
+                        (0.73, 1.2, 335.),
+                        (0.82, 0.1, 360.),
+                        (-0.3, 2.5, 300.),
+                        (0.55, 1.2, 160.),
+                        (0.45, 1.2, 620.),
+                    ] {
+                        let mut x = vec![0.; width];
+                        // Assign terminals last so each ideal short has one physical voltage.
+                        for node in Node::ALL.into_iter().rev() {
+                            x[layout.node(node)] = sign
+                                * match node {
+                                    Node::B => vbe,
+                                    Node::Bp => vbe - 0.001,
+                                    Node::Bi => vbe - 0.002,
+                                    Node::C => vce,
+                                    Node::Ci => vce - 0.003,
+                                    Node::E => 0.,
+                                    Node::Ei => 0.001,
+                                    Node::S => -0.1,
+                                    Node::Si => -0.099,
+                                };
+                        }
+                        for (index, value) in [2e-5, 3e-5, 2e-15].into_iter().enumerate() {
+                            if let Some(row) = layout.nqs_slot(index) {
+                                x[row] = value;
+                            }
+                        }
+                        x[thermal] = kelvin;
+                        let mut center = PointBuffer::new(width)?;
+                        let mut above = PointBuffer::new(width)?;
+                        let mut below = PointBuffer::new(width)?;
+                        let mut point = center.point();
+                        artifact.evaluate(&instance, &x, &mut point)?;
+                        let mut high = x.clone();
+                        let mut low = x.clone();
+                        let step = 1e-3;
+                        high[thermal] += step;
+                        low[thermal] -= step;
+                        let mut high_point = above.point();
+                        let mut low_point = below.point();
+                        artifact.evaluate(&instance, &high, &mut high_point)?;
+                        artifact.evaluate(&instance, &low, &mut low_point)?;
+                        for row in 0..width {
+                            for (name, exact, numeric, floor) in [
+                                (
+                                    "G",
+                                    point.conductance[row * width + thermal],
+                                    (high_point.current[row] - low_point.current[row])
+                                        / (2. * step),
+                                    1e-10,
+                                ),
+                                (
+                                    "C",
+                                    point.capacitance[row * width + thermal],
+                                    (high_point.charge[row] - low_point.charge[row]) / (2. * step),
+                                    1e-21,
+                                ),
+                            ] {
+                                let tolerance =
+                                    5e-3_f64.mul_add(exact.abs().max(numeric.abs()), floor);
+                                assert!(
+                                    (exact - numeric).abs() <= tolerance,
+                                    "polarity={polarity:?} mask={mask} nqs={nqs} mode={mode} T={kelvin} VBE={vbe} VCE={vce} row={row} {name}={exact:e} numeric={numeric:e} tol={tolerance:e}"
+                                );
+                            }
+                        }
+                        let rise = kelvin - direct.thermal_reference_kelvin();
+                        let mut source = x;
+                        source[thermal] = rise;
+                        let prepared = direct.prepare(rise)?;
+                        let frame = prepared.evaluate(Trial { unknowns: &source })?;
+                        assert_eq!(point.current, &frame.local.current[..width]);
+                        assert_eq!(point.charge, &frame.local.charge[..width]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dynamic_model(mode: u8, correlated: bool) -> Nominal {
+    let mut nominal = Nominal::source_defaults();
+    nominal.transport.flcomp = 2.3;
+    nominal.transport.t0 = 5e-12;
+    nominal.transport.tr = 1e-12;
+    nominal.auxiliary.flsh = mode;
+    nominal.auxiliary.rth = 200.;
+    nominal.auxiliary.cth = 1e-9;
+    nominal.coefficients.alrth = 0.0003;
+    nominal.coefficients.zetarth = 0.5;
+    nominal.noise.correlated = correlated;
+    nominal.noise.alit = 0.5;
+    nominal.noise.alqf = 0.5;
+    nominal
+}
+
+#[test]
+fn native_ngspice47_hot_collector_noise() -> TestResult {
+    let mut count = 0;
+    for line in include_str!("fixtures/hicum2_ngspice47_device_noise.csv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let fields: Vec<_> = line.split(',').collect();
+        let number = |index: usize| fields[index].parse::<f64>();
+        let ambient = Temperature::new(number(0)? + 273.15)?;
+        let model = Model::new(&dynamic_model(2, fields[3] == "1"), None)?;
+        let artifact = shared::artifact(&model, ambient, Options::default())?;
+        let candidate = artifact.prepare(&[1., 1., 0.], ambient.kelvin())?;
+        let x = [1.2, number(2)?, 0., -0.1, ambient.kelvin() + number(1)?];
+        let mut sink = Noise::default();
+        artifact.evaluate_noise(&candidate, &x, number(4)?, &mut sink)?;
+        let spectrum = sink
+            .0
+            .iter()
+            .map(|(_, density, injections)| {
+                let (re, im) = injections
+                    .iter()
+                    .filter(|entry| entry.row == 0)
+                    .fold((0., 0.), |(re, im), entry| (re + entry.re, im + entry.im));
+                density * re.mul_add(re, im * im)
+            })
+            .sum::<f64>();
+        let expected = number(5)?;
+        assert!(
+            (spectrum - expected).abs() <= 5e-4 * spectrum.abs().max(expected.abs()) + 1e-32,
+            "hot collector PSD: {spectrum:e} vs {expected:e}; {line}"
+        );
+        count += 1;
+    }
+    assert_eq!(count, 144);
+    Ok(())
+}
+
+/// Independent trapezoidal integration of the producer's heat-current
+/// and energy equations. All electrical terminals are ideal drives.
+#[test]
+fn native_ngspice47_free_thermal_transient() -> TestResult {
+    let reference = include_str!("fixtures/hicum2_ngspice47_device_transient.csv");
+    let rows: Vec<_> = reference
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    assert_eq!(rows.len(), 3006);
+    for series in rows.chunks_exact(501) {
+        let first: Vec<_> = series[0].split(',').collect();
+        let ambient = Temperature::new(first[1].parse::<f64>()? + 273.15)?;
+        let model = Model::new(&dynamic_model(first[0].parse()?, false), None)?;
+        let artifact = shared::artifact(&model, ambient, Options::default())?;
+        let candidate = artifact.prepare(&[1., 1., 0.], ambient.kelvin())?;
+        let mut x = [1.2, 0.68, 0., -0.1, ambient.kelvin()];
+        let mut buffer = PointBuffer::new(x.len())?;
+        let mut previous_time = 0.;
+        let mut previous_heat = 0.;
+        let mut previous_energy = 0.;
+        for (index, line) in series.iter().enumerate() {
+            let fields: Vec<_> = line.split(',').collect();
+            let number = |i: usize| fields[i].parse::<f64>();
+            let time = number(2)?;
+            let bias = number(3)?;
+            let previous_bias = x[1];
+            // Resolve the exponential current change within the drive ramp;
+            // the independently sampled reference has 2 ns spacing.
+            let subdivisions = if index > 0 && time <= 22e-9 { 16 } else { 1 };
+            let inverse_step = if index == 0 {
+                0.
+            } else {
+                2. * f64::from(subdivisions) / (time - previous_time)
+            };
+            for substep in 1..=subdivisions {
+                x[1] = (bias - previous_bias)
+                    .mul_add(f64::from(substep) / f64::from(subdivisions), previous_bias);
+                let mut converged = false;
+                for _ in 0..30 {
+                    let mut point = buffer.point();
+                    artifact.evaluate(&candidate, &x, &mut point)?;
+                    let heat = point.current[4];
+                    let energy = point.charge[4];
+                    let residual = if index == 0 {
+                        heat
+                    } else {
+                        inverse_step.mul_add(energy - previous_energy, heat + previous_heat)
+                    };
+                    if residual.abs() < 1e-11 {
+                        previous_heat = heat;
+                        previous_energy = energy;
+                        converged = true;
+                        break;
+                    }
+                    let slope = inverse_step.mul_add(point.capacitance[24], point.conductance[24]);
+                    x[4] -= (residual / slope).clamp(-10., 10.);
+                }
+                assert!(converged, "thermal trapezoidal step failed: {line}");
+            }
+            let rise = x[4] - ambient.kelvin();
+            let expected = number(4)?;
+            assert!(
+                (rise - expected).abs() <= 2e-4 * rise.abs().max(expected.abs()) + 2e-7,
+                "thermal transient rise: {rise:e} vs {expected:e}; {line}"
+            );
+            // Away from the driven ramp, terminal current is DC plus
+            // a negligible temperature-induced displacement current.
+            if time >= 30e-9 {
+                let mut point = buffer.point();
+                artifact.evaluate(&candidate, &x, &mut point)?;
+                let expected_ic = number(5)?;
+                let actual_ic = point.current[0];
+                assert!(
+                    (actual_ic - expected_ic).abs()
+                        <= 5e-4 * actual_ic.abs().max(expected_ic.abs()) + 2e-10,
+                    "transient collector current: {actual_ic:e} vs {expected_ic:e}; {line}"
+                );
+            }
+            previous_time = time;
+        }
+    }
     Ok(())
 }
