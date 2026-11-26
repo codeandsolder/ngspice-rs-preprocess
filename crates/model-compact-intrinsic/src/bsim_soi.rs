@@ -12,10 +12,11 @@ mod transport;
 
 pub use channel::{
     BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, BsimSoiDrainChannelPoint,
-    BsimSoiExtrinsicChargeBias, BsimSoiExtrinsicCharges, BsimSoiGateInducedLeakage,
-    BsimSoiImpactBias, BsimSoiImpactBranch, BsimSoiImpactIonization, PreparedBsimSoiChannel,
-    PreparedBsimSoiDrainChannel, PreparedBsimSoiExtrinsicCharges,
-    PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiImpactIonization,
+    BsimSoiExtrinsicChargeBias, BsimSoiExtrinsicCharges, BsimSoiGateBias, BsimSoiGateCurrents,
+    BsimSoiGateInducedLeakage, BsimSoiImpactBias, BsimSoiImpactBranch, BsimSoiImpactIonization,
+    PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel, PreparedBsimSoiExtrinsicCharges,
+    PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiGateTunneling,
+    PreparedBsimSoiImpactIonization,
 };
 pub use electrostatics::{
     BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint, PreparedBsimSoiElectrostatics,

@@ -225,6 +225,23 @@ physical body-source and body-drain junction voltages fixed; two additional
 partials support independently resolved body-resistance nodes. Currents include
 physical polarity and instance multiplicity.
 
+### BSIMSOI gate tunneling
+
+`prepare_gate_tunneling` binds the six physical gate-current branches:
+channel partition to source/drain, the two asymmetric edge currents,
+body tunneling (accumulation/inversion), and body-contact tunneling. The
+ordinary five physical partials are accompanied by an independent contact
+partial. Native NF/M scaling, ideal-FD suppression of body tunneling, and
+the separate contact area are preserved. The test matrix covers 768
+derivative cases and 768 native DC cases, both materials, both polarities,
+all depletion modes, both thermal modes, all gate-current selector pairs,
+asymmetric contacts and reversed conduction. The native reverse IGC
+stamp omits the backgate column while folding that derivative into its
+effective source column; the test explicitly removes the resulting
+`-Vds * dIgc/dVes` offset from the native terminal-current reference.
+The Rust law uses the physical derivative instead. Native individual
+IGS/IGD/IGCS/IGCD accessors are compared without a correction.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds

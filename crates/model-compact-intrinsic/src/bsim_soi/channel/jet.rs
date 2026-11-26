@@ -40,6 +40,16 @@ impl Jet {
         let exp = self.value.exp();
         self.map(exp, exp)
     }
+    pub(super) fn exp_m1(self) -> Self {
+        self.map(self.value.exp_m1(), self.value.exp())
+    }
+    pub(super) fn bounded_exp(self) -> Self {
+        if self.value > 100. {
+            Self::constant(2.688_117_142e43)
+        } else {
+            self.floor_exp()
+        }
+    }
     pub(super) fn ln(self) -> Self {
         self.map(self.value.ln(), self.value.recip())
     }

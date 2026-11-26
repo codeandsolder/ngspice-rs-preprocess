@@ -51,13 +51,6 @@ struct MosLaw {
     drain_slope: f64,
 }
 
-fn bounded_exp(argument: Jet) -> Jet {
-    if argument.value > 100. {
-        Jet::constant(2.688_117_142e43)
-    } else {
-        argument.floor_exp()
-    }
-}
 impl MosLaw {
     fn ratio(self, point: &BsimSoiChannelPoint, rise: Jet) -> Jet {
         if self.alpha <= 0. {
@@ -76,7 +69,7 @@ impl MosLaw {
         } else {
             denominator
         };
-        let ratio = self.alpha * bounded_exp(difference / denominator);
+        let ratio = self.alpha * (difference / denominator).bounded_exp();
         if ratio.value > 10. {
             Jet::constant(10.)
         } else {
@@ -113,7 +106,7 @@ impl BipolarLaw {
                 } else {
                     -activation * (exponent * difference.ln()).exp()
                 };
-                scale * difference * bounded_exp(argument)
+                scale * difference * argument.bounded_exp()
             }
         }
     }

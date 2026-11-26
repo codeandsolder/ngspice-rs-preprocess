@@ -16,6 +16,8 @@ mod leakage;
 pub use leakage::{BsimSoiGateInducedLeakage, PreparedBsimSoiGateInducedLeakage};
 mod jet;
 mod threshold;
+mod tunneling;
+pub use tunneling::{BsimSoiGateBias, BsimSoiGateCurrents, PreparedBsimSoiGateTunneling};
 
 use super::{
     BsimSoiElectrostaticBase, CHARGE, EPS_0, EPS_OX, EPS_SI, PreparedBsimSoiElectrostatics,
