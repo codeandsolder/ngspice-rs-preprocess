@@ -456,7 +456,7 @@ impl Binder<'_> {
             target.0
         );
         let _depth = self.budget.enter()?;
-        self.budget.charge(Resource::SourceVisits, 1)?;
+        self.budget.charge(Resource::EvaluationSteps, 1)?;
         let mut actuals = Parameters::new();
         collect_parameters(fields, line, true, &mut actuals, self.budget)?;
         let local_multiplier = actuals

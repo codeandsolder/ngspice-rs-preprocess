@@ -106,7 +106,7 @@ impl Default for WorkBudget {
 
 impl WorkBudget {
     /// Start one request's counters.
-    #[must_use]
+    #[must_use = "the returned handle owns the cumulative request counters"]
     pub fn new(limits: WorkLimits, cancellation: Cancellation) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {

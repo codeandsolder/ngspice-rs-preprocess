@@ -111,13 +111,13 @@ impl SubcircuitIndex {
     }
 
     /// Later declarations that conflict with an earlier lexical declaration.
-    #[must_use]
+    #[must_use = "the returned declarations identify duplicate lexical names"]
     pub fn duplicates(&self) -> &[usize] {
         &self.duplicates
     }
 
     /// Find the visible subcircuit from a lexical calling scope.
-    #[must_use]
+    #[must_use = "the returned scope identifies the visible subcircuit"]
     pub fn resolve(&self, source: &ModelLibrary, scope: usize, name: &str) -> Option<usize> {
         lexical_lookup(source, scope, name, &self.declarations)
     }

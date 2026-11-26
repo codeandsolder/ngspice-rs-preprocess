@@ -142,7 +142,7 @@ impl SourceSession {
     }
 
     /// Start an admission cache sharing a complete request budget.
-    #[must_use]
+    #[must_use = "the session owns the shared admission cache"]
     pub fn with_budget(
         config: AdmissionConfig,
         cancellation: Cancellation,
@@ -157,7 +157,7 @@ impl SourceSession {
     }
 
     /// Shared counters for downstream preparation stages.
-    #[must_use]
+    #[must_use = "the handle shares the request work counters"]
     pub const fn budget(&self) -> &WorkBudget {
         &self.budget
     }

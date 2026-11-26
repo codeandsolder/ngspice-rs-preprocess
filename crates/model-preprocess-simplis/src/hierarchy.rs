@@ -324,7 +324,7 @@ impl SubcircuitCatalog {
     }
 
     /// Use the same counters as source admission and all other graph stages.
-    #[must_use]
+    #[must_use = "the returned catalog carries the shared request budget"]
     pub fn with_budget(mut self, budget: WorkBudget) -> Self {
         self.budget = budget;
         self

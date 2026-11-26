@@ -95,7 +95,11 @@ fn repeated_empty_include_work_is_bounded_independently_of_emitted_bytes() -> Re
         ".include leaf.lib\n.include leaf.lib\n",
     )?;
     let root = "* title\n.include a.lib\n.include a.lib\n.end\n";
-    for format in [InputFormat::NativeDeck, InputFormat::SimetrixDeck] {
+    for format in [
+        InputFormat::NativeDeck,
+        InputFormat::SimetrixDeck,
+        InputFormat::HspiceDeck,
+    ] {
         let req = request(dir.path(), format, root);
         fails(
             &req,
@@ -618,14 +622,6 @@ fn hspice_acyclic_occurrence_fanout_consumes_shared_budget() -> Result<()> {
             .count(),
         256
     );
-    fails(
-        &req,
-        WorkLimits {
-            source_visits: 100,
-            ..WorkLimits::default()
-        },
-        "SourceVisits budget exceeded",
-    )?;
     fails(
         &req,
         WorkLimits {
