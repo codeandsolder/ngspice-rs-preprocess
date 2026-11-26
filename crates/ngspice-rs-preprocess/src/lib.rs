@@ -6,8 +6,8 @@ mod dialect;
 
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
-    NormalizationPass,
-    linked_source::{LinkLimits, RootKind, SourceLinker},
+    MappedNormalization, NormalizationPass,
+    linked_source::{LibrarySyntax, LinkLimits, LinkedSource, RootKind, SourceLinker},
     normalize_mapped,
 };
 pub use model_normalize_ngspice::{passive_ic, waveform};
@@ -30,10 +30,18 @@ pub enum InputFormat {
     NativeDeck,
     /// Native-compatible library; emit include-safe text.
     NativeLibrary,
+    /// TINA plaintext SPICE deck.
+    TinaDeck,
+    /// TINA plaintext SPICE library; emit include-safe native SPICE.
+    TinaLibrary,
     /// Standalone `PSpice` deck lowered to native SPICE.
     PspiceDeck,
     /// Standalone `PSpice` library lowered to include-safe native SPICE.
     PspiceLibrary,
+    /// QSPICE plaintext circuit deck.
+    QspiceDeck,
+    /// QSPICE plaintext model library.
+    QspiceLibrary,
     /// SIMPLIS source deck with optional library catalog.
     SimplisDeck,
     /// `SIMetrix` source deck with optional library catalog.
@@ -57,8 +65,12 @@ impl InputFormat {
         match value {
             "native-deck" => Ok(Self::NativeDeck),
             "native-library" => Ok(Self::NativeLibrary),
+            "tina-deck" => Ok(Self::TinaDeck),
+            "tina-library" => Ok(Self::TinaLibrary),
             "pspice-deck" => Ok(Self::PspiceDeck),
             "pspice-library" => Ok(Self::PspiceLibrary),
+            "qspice-deck" => Ok(Self::QspiceDeck),
+            "qspice-library" => Ok(Self::QspiceLibrary),
             "simplis-deck" => Ok(Self::SimplisDeck),
             "simetrix-deck" => Ok(Self::SimetrixDeck),
             "expanded-deck" => Ok(Self::ExpandedDeck),
@@ -127,6 +139,9 @@ pub enum ConditioningPolicy {
     PrivateDifferentiators,
 }
 
+/// Explicit deterministic statistical sample selection.
+pub use model_statistics::Realization as StatisticalSample;
+
 /// Admission, conditioning and artifact publication options.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -140,6 +155,8 @@ pub struct Options {
     /// Explicit request-local device configuration file for `SIMetrix` decks.
     /// It is admitted as data, without the source transformation command.
     pub device_config: Option<PathBuf>,
+    /// Explicit experiment seed and sample; absent means nominal.
+    pub statistical_sample: Option<StatisticalSample>,
 }
 
 impl Default for Options {
@@ -149,6 +166,7 @@ impl Default for Options {
             output_bytes: 128 * 1024 * 1024,
             conditioning: ConditioningPolicy::default(),
             device_config: None,
+            statistical_sample: None,
         }
     }
 }
@@ -262,6 +280,73 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+struct NativeProjection {
+    normalized: MappedNormalization,
+    device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
+    waveforms: Vec<waveform::PreparedWaveform>,
+}
+
+fn project_native(
+    linked: &LinkedSource,
+    kind: RootKind,
+    format: InputFormat,
+) -> Result<NativeProjection> {
+    match format {
+        InputFormat::PspiceDeck
+        | InputFormat::PspiceLibrary
+        | InputFormat::TinaDeck
+        | InputFormat::TinaLibrary => {
+            let normalized = if matches!(format, InputFormat::TinaDeck | InputFormat::TinaLibrary) {
+                model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind)?
+            } else {
+                model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?
+            };
+            let identities = normalized
+                .renamed
+                .into_iter()
+                .map(|device| {
+                    let origin = linked
+                        .origin(device.input_line)
+                        .context("missing renamed device origin")?;
+                    Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
+                        source: display_path(&origin.path),
+                        scope: device.scope,
+                        displayed: device.declared.clone(),
+                        declared: device.declared,
+                        linked: device.linked,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(NativeProjection {
+                normalized: normalized.mapped,
+                device_identities: identities,
+                waveforms: Vec::new(),
+            })
+        }
+        InputFormat::QspiceDeck | InputFormat::QspiceLibrary => {
+            let lowered = model_normalize_ngspice::qspice::lower_linked(linked, kind)?;
+            let mut normalized =
+                normalize_mapped(lowered.bytes.as_deref().unwrap_or(&linked.bytes), kind)?;
+            if lowered.bytes.is_some() {
+                normalized
+                    .model
+                    .passes
+                    .insert(0, NormalizationPass::QspiceSource);
+            }
+            Ok(NativeProjection {
+                normalized,
+                device_identities: Vec::new(),
+                waveforms: lowered.waveforms,
+            })
+        }
+        _ => Ok(NativeProjection {
+            normalized: normalize_mapped(&linked.bytes, kind)?,
+            device_identities: Vec::new(),
+            waveforms: Vec::new(),
+        }),
+    }
+}
+
 fn native(
     root: &AdmittedSource,
     request: &Request,
@@ -270,50 +355,47 @@ fn native(
 ) -> Result<PreparedBundle> {
     let kind = if matches!(
         request.format,
-        InputFormat::NativeDeck | InputFormat::PspiceDeck
+        InputFormat::NativeDeck
+            | InputFormat::PspiceDeck
+            | InputFormat::QspiceDeck
+            | InputFormat::TinaDeck
     ) {
         RootKind::Deck
     } else {
         RootKind::Include
     };
     let origin = root.path.clone();
-    let source_resolver = SourceLinker {
-        search_paths: request.search_paths.clone(),
-    };
-    let limits = LinkLimits {
-        output_bytes: options.output_bytes,
-    };
-    let pspice = matches!(
+    if matches!(
         request.format,
-        InputFormat::PspiceDeck | InputFormat::PspiceLibrary
-    );
-    let linked = if pspice {
-        source_resolver.link_pspice_admitted(root, kind, limits, session)?
-    } else {
-        source_resolver.link_admitted(root, kind, limits, session)?
+        InputFormat::TinaDeck | InputFormat::TinaLibrary
+    ) {
+        model_normalize_ngspice::tina::validate_plaintext(&root.bytes)?;
+    }
+    let syntax = match request.format {
+        InputFormat::PspiceDeck
+        | InputFormat::PspiceLibrary
+        | InputFormat::TinaDeck
+        | InputFormat::TinaLibrary => LibrarySyntax::Pspice,
+        InputFormat::QspiceDeck | InputFormat::QspiceLibrary => LibrarySyntax::Qspice,
+        _ => LibrarySyntax::NamedSections,
     };
-    let (normalized, device_identities) = if pspice {
-        let normalized = model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?;
-        let identities = normalized
-            .renamed
-            .into_iter()
-            .map(|device| {
-                let origin = linked
-                    .origin(device.input_line)
-                    .context("missing renamed device origin")?;
-                Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
-                    source: display_path(&origin.path),
-                    scope: device.scope,
-                    displayed: device.declared.clone(),
-                    declared: device.declared,
-                    linked: device.linked,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        (normalized.mapped, identities)
-    } else {
-        (normalize_mapped(&linked.bytes, kind)?, Vec::new())
-    };
+    let linked = SourceLinker {
+        search_paths: request.search_paths.clone(),
+        library_syntax: syntax,
+    }
+    .link_admitted(
+        root,
+        kind,
+        LinkLimits {
+            output_bytes: options.output_bytes,
+        },
+        session,
+    )?;
+    let NativeProjection {
+        normalized,
+        device_identities,
+        waveforms,
+    } = project_native(&linked, kind, request.format)?;
     let lines = normalized
         .input_lines
         .into_iter()
@@ -349,7 +431,7 @@ fn native(
         model_selections: Vec::new(),
         initial_conditions: None,
         analysis_plan: None,
-        waveforms: Vec::new(),
+        waveforms,
     })
 }
 
@@ -368,12 +450,16 @@ fn validate_request(request: &Request) -> Result<()> {
                 request.format,
                 InputFormat::NativeDeck
                     | InputFormat::NativeLibrary
+                    | InputFormat::TinaDeck
+                    | InputFormat::TinaLibrary
                     | InputFormat::PspiceDeck
                     | InputFormat::PspiceLibrary
+                    | InputFormat::QspiceDeck
+                    | InputFormat::QspiceLibrary
                     | InputFormat::SimetrixDeck
                     | InputFormat::SimetrixLibrary
             ),
-        "search paths require native or SIMetrix source linking"
+        "search paths require native, QSPICE or SIMetrix source linking"
     );
     Ok(())
 }
@@ -396,14 +482,22 @@ pub fn prepare(
         options.device_config.is_none() || request.format == InputFormat::SimetrixDeck,
         "device configuration is only valid for SIMetrix decks"
     );
+    ensure!(
+        options.statistical_sample.is_none() || request.format == InputFormat::SimetrixDeck,
+        "statistical sample selection is only valid for SIMetrix decks"
+    );
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
     let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
     let root = request.input.admit(&mut session)?;
     let mut result = match request.format {
         InputFormat::NativeDeck
         | InputFormat::NativeLibrary
+        | InputFormat::TinaDeck
+        | InputFormat::TinaLibrary
         | InputFormat::PspiceDeck
-        | InputFormat::PspiceLibrary => native(&root, request, options, &mut session),
+        | InputFormat::PspiceLibrary
+        | InputFormat::QspiceDeck
+        | InputFormat::QspiceLibrary => native(&root, request, options, &mut session),
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
     if request.format == InputFormat::SimetrixDeck

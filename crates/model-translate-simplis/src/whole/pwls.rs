@@ -12,10 +12,16 @@ use model_normalize_ngspice::{
 };
 use std::fmt::Write as _;
 
-pub(super) fn scope_prefix(items: &[Item], header: Option<&str>) -> String {
+pub(super) fn scope_prefix<'a>(
+    scopes: impl IntoIterator<Item = &'a [Item]>,
+    header: Option<&str>,
+    initial: &str,
+) -> String {
     let mut occupied = header.unwrap_or_default().to_ascii_lowercase();
-    collect_scope_text(items, &mut occupied);
-    let mut prefix = "sr_pwls_".to_owned();
+    for items in scopes {
+        collect_scope_text(items, &mut occupied);
+    }
+    let mut prefix = initial.to_owned();
     while occupied.contains(&prefix) {
         prefix.push('_');
     }

@@ -1,0 +1,8 @@
+* Synthetic TINA-style source, not a vendor model.
+.subckt filter input output PARAMS : rbase=500 .param scale={2}
++ gain={3-1}
+Edrive n 0 VALUE = {gain*V(input)}
+R1 n output {rbase*scale}
+C1 output 0 100n
+.ends filter
+.end

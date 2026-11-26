@@ -3,8 +3,8 @@ use model_preprocess_simplis::{
     LibrarySimulator, ParsedLibrary, SubcircuitCatalog, preprocess_netlist_linked,
 };
 use model_translate_simplis::{
-    capture_passive_initial_conditions, lower_simetrix_linked_runtime, translate_simplis_deck,
-    translate_simplis_expanded_library,
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime,
+    translate_simplis_linked_netlist,
 };
 use std::{
     env, fs,
@@ -169,7 +169,7 @@ fn main() -> Result<()> {
 
     let mut linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
     if simulator == LibrarySimulator::Simetrix {
-        lower_simetrix_linked_runtime(&mut linked)?;
+        lower_simetrix_linked_runtime(&mut linked, None)?;
         let initialization = capture_passive_initial_conditions(&mut linked)?;
         if !initialization.devices.is_empty() || !initialization.nodes.is_empty() {
             bail!(
@@ -177,7 +177,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    let translated_root = translate_simplis_deck(&linked.root_bytes)?;
+    let (translated_root, translated_libraries) = translate_simplis_linked_netlist(&linked)?;
     let output_dir = output_root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -187,9 +187,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("writing {}", output_root.display()))?;
 
     let mut translated_primitives = translated_root.primitives.len();
-    for library in &linked.libraries {
-        let translated = translate_simplis_expanded_library(&library.bytes)
-            .with_context(|| format!("translating linked library {}", library.source_id))?;
+    for (library, translated) in linked.libraries.iter().zip(translated_libraries) {
         translated_primitives = translated_primitives.saturating_add(translated.primitives.len());
         let path = output_dir.join(&library.filename);
         fs::write(&path, &translated.bytes)

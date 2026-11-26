@@ -13,6 +13,7 @@ use model_preprocess_simplis::{
     LinkedPreprocessedNetlist, active_statement_prefix, capacitor_charge_assignments,
     parameter_assignments, simetrix_constant, validate_simetrix_parameter_name,
 };
+use model_statistics::{Function, Invocation, PREPARED_PREFIX, Realization};
 use std::{collections::BTreeMap, fmt::Write as _};
 
 const LNCOSH_NAME: &str = "sr_simetrix_lncosh";
@@ -25,6 +26,8 @@ enum ExpressionContext {
 }
 
 struct Builtins {
+    realization: Option<Realization>,
+    next_call: u64,
     lncosh: bool,
     static_temp: bool,
     lncosh_name: String,
@@ -44,13 +47,15 @@ fn unused_identifier(base: &str, source: &str) -> String {
 }
 
 impl Builtins {
-    fn new(linked: &LinkedPreprocessedNetlist) -> Self {
+    fn new(linked: &LinkedPreprocessedNetlist, realization: Option<Realization>) -> Self {
         let mut source = String::from_utf8_lossy(&linked.root_bytes).to_ascii_lowercase();
         for library in &linked.libraries {
             source.push('\n');
             source.push_str(&String::from_utf8_lossy(&library.bytes).to_ascii_lowercase());
         }
         Self {
+            realization,
+            next_call: 0,
             lncosh: false,
             static_temp: false,
             lncosh_name: unused_identifier(LNCOSH_NAME, &source),
@@ -118,17 +123,56 @@ impl Builtins {
                 let close = matching_behavioral_parenthesis(input, open)?;
                 return Ok((input[start..=close].to_owned(), close + 1));
             }
-            if name.eq_ignore_ascii_case("GAUSS") || name.eq_ignore_ascii_case("LNCOSH") {
+            ensure!(
+                !name.to_ascii_lowercase().starts_with(PREPARED_PREFIX),
+                "reserved prepared statistical function {name} in source"
+            );
+            if let Some(distribution) = Function::simetrix(name) {
+                let close = matching_behavioral_parenthesis(input, open)?;
+                let args = behavioral_function_arguments(&input[open + 1..close])?;
+                distribution.validate_arity(args.len())?;
+                ensure!(
+                    args.iter().all(|arg| !arg.is_empty()),
+                    "empty statistical argument"
+                );
+                // Nominal distribution functions never evaluate tolerance expressions.
+                let Some(realization) = self.realization else {
+                    return Ok(("1".to_owned(), close + 1));
+                };
+                ensure!(
+                    distribution.sampled_supported(),
+                    "{} has no validated sampled law",
+                    distribution.name()
+                );
+                let invocation = Invocation {
+                    function: distribution,
+                    realization,
+                    site: self.next_call,
+                };
+                self.next_call = self
+                    .next_call
+                    .checked_add(1)
+                    .context("statistical source site overflow")?;
+                let mut rewritten = format!("{}(", invocation.marker_name());
+                for word in invocation.metadata() {
+                    write!(rewritten, "{word},")?;
+                }
+                for (index, arg) in args.iter().enumerate() {
+                    if index != 0 {
+                        rewritten.push(',');
+                    }
+                    rewritten.push_str(&self.expression(arg, ExpressionContext::Static)?);
+                }
+                rewritten.push(')');
+                return Ok((rewritten, close + 1));
+            }
+            if name.eq_ignore_ascii_case("LNCOSH") {
                 let close = matching_behavioral_parenthesis(input, open)?;
                 let args = behavioral_function_arguments(&input[open + 1..close])?;
                 ensure!(
                     args.len() == 1 && !args[0].is_empty(),
                     "SIMetrix {name} requires one argument"
                 );
-                if name.eq_ignore_ascii_case("GAUSS") {
-                    // Nominal GAUSS does not evaluate its argument, even if undefined.
-                    return Ok(("1".to_owned(), close + 1));
-                }
                 self.lncosh = true;
                 let value = self.expression(args[0], context)?;
                 return Ok((format!("{}({value})", self.lncosh_name), close + 1));
@@ -189,7 +233,29 @@ impl Builtins {
         Ok(output)
     }
 
+    fn model_parameters(&mut self, statement: &str) -> Result<String> {
+        let card = model_normalize_ngspice::model_card::parse_model_card(statement, 0, &[])?;
+        let mut result = String::with_capacity(statement.len());
+        let mut cursor = 0;
+        for field in card.parameters {
+            let Some(span) = field.span.value else {
+                continue;
+            };
+            result.push_str(&self.braced_regions(&statement[cursor..span.start])?);
+            let value = self.expression(&statement[span.clone()], ExpressionContext::Static)?;
+            result.push_str(&lower_simetrix_behavioral_expression(&value)?);
+            cursor = span.end;
+        }
+        result.push_str(&self.braced_regions(&statement[cursor..])?);
+        Ok(result)
+    }
+
     fn statement(&mut self, statement: &str) -> Result<String> {
+        // The occurrence binder combines this declaration-local ordinal
+        // with the bound declaration and macro call path. Unrelated
+        // statements, library order, and traversal scheduling cannot
+        // move a call site to a different random stream.
+        self.next_call = 0;
         let trimmed = statement.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('*') {
             return Ok(statement.to_owned());
@@ -219,7 +285,7 @@ impl Builtins {
             return Ok(output);
         }
         match directive_name(trimmed).as_deref() {
-            Some(".MODEL") => self.braced_regions(&materialize_jfet_defaults(active)?),
+            Some(".MODEL") => self.model_parameters(&materialize_jfet_defaults(active)?),
             Some(".PARAM") => {
                 let tail = active
                     .split_once(char::is_whitespace)
@@ -234,7 +300,11 @@ impl Builtins {
                     .split_whitespace()
                     .next_back()
                     .context("missing function name")?;
-                if name.eq_ignore_ascii_case("LNCOSH") || name.eq_ignore_ascii_case("GAUSS") {
+                ensure!(
+                    !name.to_ascii_lowercase().starts_with(PREPARED_PREFIX),
+                    "reserved prepared statistical function {name} in source"
+                );
+                if name.eq_ignore_ascii_case("LNCOSH") || Function::simetrix(name).is_some() {
                     return Ok(format!(
                         "* ignored definition of predefined SIMetrix function {name}"
                     ));
@@ -519,11 +589,14 @@ fn render_items(items: &[Item]) -> Result<Vec<u8>> {
     Ok(output.into_bytes())
 }
 
-/// Prepare a linked `SIMetrix` deck for a nominal native analysis.
+/// Prepare a linked `SIMetrix` deck for a nominal or explicitly sampled analysis.
 ///
 /// # Errors
 /// Rejects unsupported statistical analysis and invalid expressions or temperatures.
-pub fn lower_simetrix_linked_runtime(linked: &mut LinkedPreprocessedNetlist) -> Result<()> {
+pub fn lower_simetrix_linked_runtime(
+    linked: &mut LinkedPreprocessedNetlist,
+    realization: Option<Realization>,
+) -> Result<()> {
     let mut root = parse_items(std::str::from_utf8(&linked.root_bytes)?)?;
     let mut libraries = linked
         .libraries
@@ -536,7 +609,7 @@ pub fn lower_simetrix_linked_runtime(linked: &mut LinkedPreprocessedNetlist) -> 
         collect_model_temperatures(items, &mut globals)?;
     }
     let temp = root_temperature(&root)?;
-    let mut builtins = Builtins::new(linked);
+    let mut builtins = Builtins::new(linked, realization);
     lower_scope(&mut root, &globals, &mut builtins)?;
     for items in &mut libraries {
         lower_scope(items, &globals, &mut builtins)?;
