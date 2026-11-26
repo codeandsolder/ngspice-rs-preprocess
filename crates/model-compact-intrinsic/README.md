@@ -16,7 +16,8 @@ solver topology or solver-ready native device kernels. Source-derived
 HiSIM-HV1/HV2 additionally have source-derived **instance defaults, binning,
 metallurgical channel geometry and leading temperature-dependent bandgap,
 thermal-voltage and carrier-density inputs**. Other families still
-need dedicated setup and per-instance preparation.
+need dedicated setup and per-instance preparation, except HiSIM2's
+source-derived setup and binning described below.
 `ModelVariant::KERNEL_STATUS` explicitly advertises `NotImplemented`. Downstream
 must not substitute generic MOS laws for these devices or interpret successfully
 bound parameters as physical model support.
@@ -52,6 +53,40 @@ The terminal arrays preserve the upstream positions rather than collapsing to fo
 MOS terminals. HiSIM-HV adds substrate and temperature; BSIMSOI/BSIM3SOI have
 additional backgate, body, thermal and charge terminals with a reserved blank
 fifth position; SOI3 has separate front/back gates and a thermal terminal.
+
+## HiSIM2 2.80 setup, geometry and topology
+
+The `hisim2` module implements the source-derived setup for level 68, version
+280. It reuses the existing registration catalog, covering 528 constant
+defaults, dependent polarity/mode defaults, original source-given flags,
+depletion/reciprocity adjustments, forced noise enable and upstream range
+resets. Invalid explicit versions and checked mode selectors are rejected
+instead of silently falling back to another physical configuration.
+
+- `hisim2::prepare_model` returns prepared model-card values in their original
+  units, including Celsius TNOM.
+- `hisim2::prepare_instance` takes a bound instance and the circuit temperature
+  in Kelvin. It resolves model-inherited values, source IC ordering, effective
+  device temperature, and all 72 source binning terms with the VFBC length
+  correction. Values remain in source units; SI conversion and effective
+  channel geometry are separate future physical preparation stages.
+- The topology identifies distinct drain, source, gate and body-network nodes
+  and NQS state selection without allocating solver nodes. It does not imply a
+  complete numerical kernel.
+
+Source-backed setup tests and a live native ngspice 47 reference matrix:
+
+```sh
+cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup
+cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup -- --include-ignored --nocapture
+```
+
+The native reference compares all 544 numeric model-table fields and 31
+numeric instance inputs. The native display truncates two groups of parameter
+names to eleven characters; the test maps their occurrences using the source
+registration order. The original HiSIM2 Distribution Statement and Copyright
+Notice (Copyright (C) 2014 Hiroshima University & STARC) is reproduced in
+the package LICENSE.
 
 ## BSIMSOI 4.x source-derived model preparation
 

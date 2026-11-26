@@ -120,3 +120,8 @@ including attribution, redistribution and charging conditions, and the
 original-code MIT license are reproduced in
 [`crates/model-compact-intrinsic/LICENSE`](crates/model-compact-intrinsic/LICENSE).
 The top-level MIT license does not supersede these terms.
+
+
+## HiSIM2 2.80 intrinsic compact-model preparation
+
+The HiSIM2 setup, defaults, binning and topology in `crates/model-compact-intrinsic` derive from the Hiroshima University/STARC HiSIM2 2.80 implementation in ngspice 47 (Copyright (C) 2014 Hiroshima University & STARC). The upstream HiSIM2 Distribution Statement and Copyright Notice, including attribution, redistribution and charging conditions, are reproduced in [the package LICENSE](crates/model-compact-intrinsic/LICENSE).
