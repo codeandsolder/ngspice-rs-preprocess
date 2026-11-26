@@ -14,7 +14,8 @@ pub use channel::{
     BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, BsimSoiDrainChannelPoint,
     BsimSoiExtrinsicChargeBias, BsimSoiExtrinsicCharges, BsimSoiGateBias, BsimSoiGateCurrents,
     BsimSoiGateInducedLeakage, BsimSoiImpactBias, BsimSoiImpactBranch, BsimSoiImpactIonization,
-    PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel, PreparedBsimSoiExtrinsicCharges,
+    BsimSoiIntrinsicCharges, PreparedBsimSoiCapmod2, PreparedBsimSoiChannel,
+    PreparedBsimSoiDrainChannel, PreparedBsimSoiExtrinsicCharges,
     PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiGateTunneling,
     PreparedBsimSoiImpactIonization,
 };

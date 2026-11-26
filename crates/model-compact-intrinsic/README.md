@@ -242,6 +242,17 @@ effective source column; the test explicitly removes the resulting
 The Rust law uses the physical derivative instead. Native individual
 IGS/IGD/IGCS/IGCD accessors are compared without a correction.
 
+### BSIMSOI classical intrinsic charge (CAPMOD=2)
+
+`prepare_capmod2` resolves the three native CV overdrive selectors and
+three charge partitions, including body, backgate, opposite-type contact
+area and inversion charge. It shares the zero-overdrive bulk factor with
+the intrinsic drain law. Physical terminal charges and five-coordinate
+Jacobians conserve charge and preserve physical drain/source orientation.
+The native intrinsic QB/QD/QS values and finite differences pass 1,728
+cases each across material, polarity, thermal, depletion, CV overdrive,
+partition and contact-area selectors.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds

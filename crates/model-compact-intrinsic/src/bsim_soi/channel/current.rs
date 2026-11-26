@@ -55,7 +55,7 @@ const fn thermal(value: BsimSoiThermalScalar) -> Jet {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Geometry {
+pub(super) struct Geometry {
     width: f64,
     length: f64,
     width_scale: f64,
@@ -83,10 +83,10 @@ impl Geometry {
         }
     }
 
-    fn bulk(&self, point: &BsimSoiChannelPoint, phi: Jet) -> Jet {
+    pub(super) fn bulk_factors(&self, point: &BsimSoiChannelPoint, phi: Jet) -> (Jet, Jet) {
         let [a0, ags, b0, b1] = self.bulk;
         if a0 == 0. {
-            return Jet::constant(1.);
+            return (Jet::constant(1.), Jet::constant(1.));
         }
         let body = point.body_limited;
         let corrected = body / lower_one(self.keta * body) / (phi + self.ketas);
@@ -98,7 +98,12 @@ impl Geometry {
         let factor = self.k1_lpe * factor / (phi + self.ketas).sqrt();
         let length = self.length / (self.length + 2. * (self.xj * point.depletion_width).sqrt());
         let base = 1. + factor * (a0 * length + b0 / (self.width + b1));
-        bulk_limit(base - factor * ags * a0 * length * length * length * point.effective_overdrive)
+        (
+            bulk_limit(base),
+            bulk_limit(
+                base - factor * ags * a0 * length * length * length * point.effective_overdrive,
+            ),
+        )
     }
 }
 
@@ -319,7 +324,7 @@ impl PreparedBsimSoiDrainChannel {
         );
         let root = point.surface_potential.sqrt() - phi.sqrt();
         let width = self.geometry.width(&point, root);
-        let bulk = self.geometry.bulk(&point, phi);
+        let bulk = self.geometry.bulk_factors(&point, phi).1;
         let mobility = self
             .mobility
             .evaluate(&point, &transport, thermal(material.bandgap), ratio);
@@ -380,7 +385,7 @@ impl PreparedBsimSoiDrainChannel {
     }
 }
 
-fn prepare_geometry(
+pub(super) fn prepare_geometry(
     model: &BoundParameters,
     instance: &BoundParameters,
     size: &PreparedBsimSoiSize,
