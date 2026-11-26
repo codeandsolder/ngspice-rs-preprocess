@@ -187,3 +187,111 @@ fn linked_occurrences_keep_local_initial_segments() -> Result<()> {
     assert_eq!(bundle.pwl_resistors.len(), 3);
     Ok(())
 }
+
+#[test]
+fn allocated_branches_do_not_alias_distinct_resistors_or_source_nodes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("collision.cir");
+    let bundle = compile(
+        &path,
+        InputFormat::ExpandedDeck,
+        "* collision\n!R$A p n MC IC=1\n!R_A q n MC IC=2\nB__R_A_IPWLR dummy 0 I=0\nV__R_A_IPWLR_SENSE t 0 0\nRkeep __R_A_IPWLR_MID 0 1k\nF1 out 0 !R$A 1\nF2 other 0 !R_A 1\n.model MC IPWLR NSEG=2 X0=0 Y0=0 X1=1 Y1=2 X2=2 Y2=3\n.end\n",
+    )?;
+    let [a, b] = bundle.pwl_resistors.as_slice() else {
+        anyhow::bail!("expected two resistors");
+    };
+    assert_eq!(a.device, "!R$A");
+    assert_eq!(b.device, "!R_A");
+    assert_eq!(a.initial_segment, Some(1));
+    assert_eq!(b.initial_segment, Some(2));
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    let mut names = std::collections::BTreeSet::from([
+        "V__R_A_IPWLR_SENSE".to_owned(),
+        "B__R_A_IPWLR".to_owned(),
+        "__R_A_IPWLR_MID".to_owned(),
+    ]);
+    for (resistor, control) in [(a, "B__F1"), (b, "B__F2")] {
+        let NativeBinding::VoltageLaw {
+            sensor,
+            source,
+            intermediate,
+        } = &resistor.binding
+        else {
+            anyhow::bail!("incorrect current-defined law binding");
+        };
+        for name in [sensor, source, intermediate] {
+            assert!(
+                names.insert(name.to_ascii_uppercase()),
+                "{name} aliases another identifier"
+            );
+        }
+        let card = native
+            .lines()
+            .find(|line| line.starts_with(control))
+            .with_context(|| format!("missing {control}: {native}"))?;
+        assert!(card.contains(&format!("i({sensor})")), "{card}");
+    }
+    Ok(())
+}
+
+#[test]
+fn floating_resistor_physics_matches_independent_dc_laws() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("floating.cir");
+    let bundle = compile(
+        &path,
+        InputFormat::ExpandedDeck,
+        &format!(
+            "* floating branch laws\nVREF n 0 5\nVDRIVE p n 0\nIFORCE n q 0\n!R1 p n MR IC=2\n!R2 q n MC IC=3\n{MODEL}\n.model MC IPWLR NSEG=4 X0=-1 Y0=-1 X1=2 Y1=0 X2=0 Y2=1 X3=2 Y3=2 X4=3 Y4=3\n.end\n"
+        ),
+    )?;
+    let body = bundle
+        .primary
+        .bytes
+        .strip_suffix(b".end\n")
+        .context("missing deck terminator")?;
+    let mut deck = body.to_vec();
+    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\ndc VDRIVE -2 4 0.5\nwrdata voltage.dat i(VDRIVE)\ndc IFORCE -2 4 0.5\nwrdata current.dat v(q,n)\nquit\n.endc\n.end\n");
+    fs::write(&path, deck)?;
+    let run = std::process::Command::new("ngspice")
+        .args(["-b", "-n", "floating.cir"])
+        .current_dir(dir.path())
+        .output()?;
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    ensure!(
+        run.status.success() && !log.to_ascii_lowercase().contains("error:"),
+        "{log}"
+    );
+    for (file, sign) in [("voltage.dat", -1.0), ("current.dat", 1.0)] {
+        let data = fs::read_to_string(dir.path().join(file))?;
+        assert_eq!(data.lines().count(), 13);
+        for line in data.lines() {
+            let values = line
+                .split_whitespace()
+                .map(str::parse::<f64>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let [coordinate, result] = values.as_slice() else {
+                anyhow::bail!("unexpected DC output {line}");
+            };
+            let x = *coordinate;
+            let expected = if x <= 0.0 {
+                3.0 * x + 2.0
+            } else if x <= 1.0 {
+                2.0 - 2.0 * x
+            } else if x <= 2.0 {
+                2.0 * (x - 1.0)
+            } else {
+                x
+            };
+            ensure!(
+                (sign * result - expected).abs() < 1e-8,
+                "{file}: {x} -> {result}, expected {expected}"
+            );
+        }
+    }
+    Ok(())
+}

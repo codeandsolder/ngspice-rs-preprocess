@@ -16,8 +16,8 @@ use super::{
     emit_logic_input_loads, emit_logic_voltage, indexed_points, integer_parameter,
     normalized_statement, numeric_parameter, parse_assignments, read_indexed_points,
     resistor_binding, resistor_knots, sanitized_name, statement_tokens, translate_charge_capacitor,
-    translate_flux_inductor, translate_ipwlr, translate_vpwlr, validate_node,
-    validate_resistor_end_slopes, write_number,
+    translate_flux_inductor, translate_pwl_resistor, validate_node, validate_resistor_end_slopes,
+    write_number,
 };
 use crate::syntax::{
     Item, Subcircuit, electrical_statements, file_boundary, matching_behavioral_delimiter,
@@ -28,7 +28,7 @@ use crate::syntax::{logical_statements, parse_items};
 use anyhow::{Context, Result, bail};
 use model_normalize_ngspice::{
     passive_ic::PassiveKind,
-    pwl_resistor::{Axis, PreparedPwlResistor},
+    pwl_resistor::{Axis, NativeBinding, PreparedPwlResistor},
 };
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::Serialize;
@@ -380,6 +380,15 @@ fn reject_residual_simplis(output: &str) -> Result<()> {
 enum RawPwlKind {
     Vpwlr,
     Ipwlr,
+}
+
+impl RawPwlKind {
+    const fn axis(self) -> Axis {
+        match self {
+            Self::Vpwlr => Axis::Voltage,
+            Self::Ipwlr => Axis::Current,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2092,7 +2101,6 @@ fn escaped_device_stem(name: &str) -> String {
 
 fn translated_current_branches(
     items: &[Item],
-    pwl_models: &std::collections::BTreeMap<String, RawPwlModel>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
     let mut branches = std::collections::BTreeMap::new();
     for item in items {
@@ -2100,22 +2108,6 @@ fn translated_current_branches(
             continue;
         };
         let trimmed = statement.trim_start();
-        if trimmed.starts_with('!') {
-            let tokens = statement_tokens(&normalized_statement(statement))?;
-            if tokens.len() >= 4
-                && let Some(model) = pwl_models.get(&tokens[3].to_ascii_uppercase())
-            {
-                let instance = tokens[0].trim_start_matches('!');
-                let branch = match model.kind {
-                    RawPwlKind::Vpwlr => format!("B{instance}"),
-                    RawPwlKind::Ipwlr => {
-                        format!("V__{}_IPWLR_SENSE", sanitized_name(instance))
-                    }
-                };
-                branches.insert(tokens[0].to_ascii_uppercase(), branch);
-            }
-            continue;
-        }
         let Some(first) = trimmed.as_bytes().first().map(u8::to_ascii_uppercase) else {
             continue;
         };
@@ -2463,7 +2455,7 @@ struct PwlDeclarations {
 
 fn translate_raw_pwl_device(
     statement: &str,
-    models: &std::collections::BTreeMap<String, RawPwlModel>,
+    models: &ScopeAnalysis<'_>,
     scope: &[String],
     declarations: &mut PwlDeclarations,
 ) -> Result<Option<Translation>> {
@@ -2479,9 +2471,12 @@ fn translate_raw_pwl_device(
         return Ok(None);
     }
 
+    let Some(binding) = models.pwl_bindings.get(&name.to_ascii_uppercase()) else {
+        return Ok(None);
+    };
     let instance = name.trim_start_matches('!');
     let (kind, points, initial_segment) =
-        if let Some(model) = models.get(&tokens[3].to_ascii_uppercase()) {
+        if let Some(model) = models.pwl.get(&tokens[3].to_ascii_uppercase()) {
             let parameters = parse_assignments(&tokens[4..])?;
             anyhow::ensure!(
                 parameters.keys().all(|name| name == "IC"),
@@ -2493,12 +2488,7 @@ fn translate_raw_pwl_device(
                 Cow::Borrowed(model.points.as_slice()),
                 Some(initial),
             )
-        } else if name
-            .as_bytes()
-            .get(1)
-            .is_some_and(|byte| matches!(*byte, b'R' | b'r'))
-            && tokens[3].contains('=')
-        {
+        } else {
             let parameters = parse_assignments(&tokens[3..])?;
             let segments = integer_parameter(&parameters, "NSEG")?;
             validate_pwl_segment_count(segments)?;
@@ -2509,20 +2499,22 @@ fn translate_raw_pwl_device(
                 .then(|| validate_pwl_segment_hint(&parameters, segments))
                 .transpose()?;
             (RawPwlKind::Vpwlr, Cow::Owned(points), initial)
-        } else {
-            return Ok(None);
         };
-
-    let (axis, translation) = match kind {
-        RawPwlKind::Vpwlr => (
-            Axis::Voltage,
-            translate_vpwlr(instance, &tokens[1], &tokens[2], &points)?,
-        ),
-        RawPwlKind::Ipwlr => (
-            Axis::Current,
-            translate_ipwlr(instance, &tokens[1], &tokens[2], &points)?,
-        ),
-    };
+    let axis = kind.axis();
+    models
+        .budget
+        .charge(Resource::GeneratedNodes, points.len().saturating_add(1))?;
+    models
+        .budget
+        .charge(Resource::EvaluationSteps, points.len())?;
+    models.budget.charge(
+        Resource::EmittedBytes,
+        declarations.artifact.len().saturating_add(normalized.len()),
+    )?;
+    for part in scope {
+        models.budget.charge(Resource::EmittedBytes, part.len())?;
+    }
+    let translation = translate_pwl_resistor(instance, &tokens[1], &tokens[2], &points, binding)?;
     let declaration = PreparedPwlResistor {
         artifact: declarations.artifact.clone(),
         scope: scope.to_vec(),
@@ -2532,7 +2524,7 @@ fn translate_raw_pwl_device(
         axis,
         knots: resistor_knots(&points).collect(),
         initial_segment,
-        binding: resistor_binding(instance, axis),
+        binding: binding.clone(),
         series_sensor: None,
     };
     declaration.validate()?;
@@ -3905,19 +3897,71 @@ struct CurrentSensor {
     node: String,
 }
 
-fn allocate_branch_identifier(
-    requested: &str,
-    reserved: &mut std::collections::BTreeSet<String>,
-) -> Result<String> {
-    let mut candidate = requested.to_owned();
-    let mut suffix = 0usize;
-    while !reserved.insert(candidate.to_ascii_uppercase()) {
-        suffix = suffix
-            .checked_add(1)
-            .context("current sensor identifier suffix overflow")?;
-        candidate = format!("{requested}_{suffix}");
+struct BranchNames {
+    reserved: std::collections::BTreeSet<String>,
+    suffixes: std::collections::BTreeMap<String, usize>,
+}
+
+impl BranchNames {
+    fn allocate(&mut self, requested: &str, budget: &WorkBudget) -> Result<String> {
+        let key = requested.to_ascii_uppercase();
+        let mut candidate = requested.to_owned();
+        let suffix = self.suffixes.entry(key).or_default();
+        loop {
+            budget.charge(Resource::EvaluationSteps, 1)?;
+            if self.reserved.insert(candidate.to_ascii_uppercase()) {
+                return Ok(candidate);
+            }
+            *suffix = suffix
+                .checked_add(1)
+                .context("branch identifier suffix overflow")?;
+            candidate = format!("{requested}_{suffix}");
+        }
     }
-    Ok(candidate)
+
+    fn allocate_pwl(
+        &mut self,
+        name: &str,
+        axis: Axis,
+        budget: &WorkBudget,
+    ) -> Result<NativeBinding> {
+        Ok(match resistor_binding(name, axis) {
+            NativeBinding::CurrentLaw { source } => NativeBinding::CurrentLaw {
+                source: self.allocate(&source, budget)?,
+            },
+            NativeBinding::VoltageLaw {
+                sensor,
+                source,
+                intermediate,
+            } => NativeBinding::VoltageLaw {
+                sensor: self.allocate(&sensor, budget)?,
+                source: self.allocate(&source, budget)?,
+                intermediate: self.allocate(&intermediate, budget)?,
+            },
+        })
+    }
+}
+
+fn pwl_device_kind(
+    tokens: &[String],
+    models: &std::collections::BTreeMap<String, RawPwlModel>,
+) -> Option<RawPwlKind> {
+    let name = tokens.first()?;
+    let model = tokens.get(3)?;
+    if !name.starts_with('!') {
+        return None;
+    }
+    models
+        .get(&model.to_ascii_uppercase())
+        .map(|value| value.kind)
+        .or_else(|| {
+            (name
+                .as_bytes()
+                .get(1)
+                .is_some_and(|byte| matches!(*byte, b'R' | b'r'))
+                && model.contains('='))
+            .then_some(RawPwlKind::Vpwlr)
+        })
 }
 
 struct ScopeAnalysis<'a> {
@@ -3925,6 +3969,7 @@ struct ScopeAnalysis<'a> {
     pwls_prefix: String,
     init: std::collections::BTreeMap<String, String>,
     pwl: std::collections::BTreeMap<String, RawPwlModel>,
+    pwl_bindings: std::collections::BTreeMap<String, NativeBinding>,
     reactive: std::collections::BTreeMap<String, RawReactiveModel>,
     inductors: std::collections::BTreeMap<String, f64>,
     current_branches: std::collections::BTreeMap<String, String>,
@@ -3971,6 +4016,7 @@ impl<'a> ScopeAnalysis<'a> {
             pwls_prefix: pwls::scope_prefix([items], header, "sr_pwls_", budget)?,
             init: init_overrides(items)?,
             pwl: std::collections::BTreeMap::new(),
+            pwl_bindings: std::collections::BTreeMap::new(),
             reactive: std::collections::BTreeMap::new(),
             inductors: raw_inductor_values(items)?,
             current_branches: std::collections::BTreeMap::new(),
@@ -3992,7 +4038,8 @@ impl<'a> ScopeAnalysis<'a> {
         };
         models.collect_raw_models(items)?;
         validate_native_bridge_outputs(items, header, &models.native_bridges)?;
-        models.current_branches = translated_current_branches(items, &models.pwl)?;
+        models.current_branches = translated_current_branches(items)?;
+        models.prepare_pwl_bindings(items, header)?;
         models.prepare_current_sensors(items, header)?;
         Ok(models)
     }
@@ -4062,16 +4109,16 @@ impl<'a> ScopeAnalysis<'a> {
         Ok(targets)
     }
 
-    fn prepare_current_sensors(&mut self, items: &[Item], header: Option<&str>) -> Result<()> {
-        let targets = self.current_targets(items)?;
-        if targets.is_empty() {
-            return Ok(());
-        }
-
+    fn reserved_branch_names(&self, items: &[Item], header: Option<&str>) -> Result<BranchNames> {
         // The generated node/source namespace is local to a source scope.
         // Reserve original names even if they occur only in a subcircuit
         // header or a controlling-node expression.
-        let mut reserved = electrical_statements(items)
+        let statements = electrical_statements(items);
+        for statement in statements.iter().copied().chain(header) {
+            self.budget
+                .charge(Resource::ScannedBytes, statement.len())?;
+        }
+        let mut reserved = statements
             .into_iter()
             .chain(header)
             .flat_map(|statement| {
@@ -4087,6 +4134,67 @@ impl<'a> ScopeAnalysis<'a> {
                     .map(|name| name.to_ascii_uppercase()),
             )
             .collect::<std::collections::BTreeSet<_>>();
+        for binding in self.pwl_bindings.values() {
+            match binding {
+                NativeBinding::CurrentLaw { source } => {
+                    reserved.insert(source.to_ascii_uppercase());
+                }
+                NativeBinding::VoltageLaw {
+                    sensor,
+                    source,
+                    intermediate,
+                } => {
+                    reserved.extend(
+                        [sensor, source, intermediate].map(|name| name.to_ascii_uppercase()),
+                    );
+                }
+            }
+        }
+        Ok(BranchNames {
+            reserved,
+            suffixes: std::collections::BTreeMap::new(),
+        })
+    }
+
+    fn prepare_pwl_bindings(&mut self, items: &[Item], header: Option<&str>) -> Result<()> {
+        let mut names = None;
+        for statement in electrical_statements(items) {
+            if !statement.trim_start().starts_with('!') {
+                continue;
+            }
+            self.budget
+                .charge(Resource::ScannedBytes, statement.len())?;
+            let tokens = statement_tokens(&normalized_statement(statement))?;
+            let Some(kind) = pwl_device_kind(&tokens, &self.pwl) else {
+                continue;
+            };
+            let name = tokens.first().context("missing PWL resistor name")?;
+            let names = match &mut names {
+                Some(names) => names,
+                slot @ None => slot.insert(self.reserved_branch_names(items, header)?),
+            };
+            let binding =
+                names.allocate_pwl(name.trim_start_matches('!'), kind.axis(), self.budget)?;
+            let branch = match &binding {
+                NativeBinding::CurrentLaw { source } => source,
+                NativeBinding::VoltageLaw { sensor, .. } => sensor,
+            };
+            let key = name.to_ascii_uppercase();
+            self.current_branches.insert(key.clone(), branch.clone());
+            anyhow::ensure!(
+                self.pwl_bindings.insert(key, binding).is_none(),
+                "duplicate PWL resistor {name}"
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare_current_sensors(&mut self, items: &[Item], header: Option<&str>) -> Result<()> {
+        let targets = self.current_targets(items)?;
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut reserved = self.reserved_branch_names(items, header)?;
         for target in targets {
             if self
                 .current_branches
@@ -4099,8 +4207,8 @@ impl<'a> ScopeAnalysis<'a> {
                 bail!("SIMPLIS switch references unknown current branch {target}");
             }
             let stem = format!("V__{}_CONTROL_SENSE", escaped_device_stem(&target));
-            let source = allocate_branch_identifier(&stem, &mut reserved)?;
-            let node = allocate_branch_identifier(&format!("__{source}_NODE"), &mut reserved)?;
+            let source = reserved.allocate(&stem, self.budget)?;
+            let node = reserved.allocate(&format!("__{source}_NODE"), self.budget)?;
             self.current_branches.insert(target.clone(), source.clone());
             self.sensed_branches
                 .insert(target, CurrentSensor { source, node });
@@ -4512,7 +4620,7 @@ fn translate_deck_primitive(
         waveforms::translate(statement, &models.pwls_prefix, models.budget),
         translate_raw_transformer(statement),
         translate_raw_mutual_inductance(statement, &models.inductors),
-        translate_raw_pwl_device(statement, &models.pwl, scope, pwl),
+        translate_raw_pwl_device(statement, models, scope, pwl),
         translate_raw_reactive_device(statement, &models.reactive),
         translate_classic_state_device(statement, &models.srff),
         translate_raw_comp_device(statement, &models.comp),
