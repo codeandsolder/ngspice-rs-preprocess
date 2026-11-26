@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::{Artifact, Capability, Descriptor, Error, Kernel, Point, Result, allocate};
+use crate::{Artifact, Capability, Descriptor, Error, Kernel, Point, Result, allocate, noise};
 
 /// Persistent contiguous output buffers for a homogeneous tile.
 #[derive(Debug)]
@@ -134,6 +134,80 @@ impl<K: Kernel> PreparedTile<K> {
             artifact: Arc::clone(artifact),
             data,
         })
+    }
+
+    /// Replace selected lanes atomically, retaining every unchanged preparation.
+    /// The supplied artifact must be the exact immutable instance that owns
+    /// this tile. Each ordinal must occur at most once. No work is performed
+    /// for an empty replacement set.
+    ///
+    /// # Errors
+    /// Foreign artifact, invalid or duplicate ordinal, allocation failure,
+    /// structural parameter change or any invalid candidate.
+    pub fn replace(
+        &mut self,
+        artifact: &Arc<Artifact<K>>,
+        candidates: &[(usize, &[f64], f64)],
+    ) -> Result<()> {
+        if !Arc::ptr_eq(artifact, &self.artifact) {
+            return Err(Error::ForeignArtifact);
+        }
+        let mut ordered = Vec::new();
+        ordered
+            .try_reserve_exact(candidates.len())
+            .map_err(|_| Error::Allocation)?;
+        ordered.extend_from_slice(candidates);
+        ordered.sort_unstable_by_key(|&(lane, _, _)| lane);
+        if ordered
+            .last()
+            .is_some_and(|&(lane, _, _)| lane >= self.data.len())
+            || ordered.windows(2).any(|pair| pair[0].0 == pair[1].0)
+        {
+            return Err(Error::Shape("replacement lane"));
+        }
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(ordered.len())
+            .map_err(|_| Error::Allocation)?;
+        for (lane, values, temperature) in ordered {
+            staged.push((lane, artifact.prepare_data(values, temperature)?));
+        }
+        // All indices and candidates were validated before editing the tile.
+        for (lane, data) in staged {
+            self.data[lane] = data;
+        }
+        Ok(())
+    }
+
+    /// Evaluate an existing tile lane into reusable scalar output storage.
+    /// This borrows the same typed preparation used by batch evaluation.
+    ///
+    /// # Errors
+    /// Invalid lane, coordinate, output shape or family physics.
+    pub fn evaluate_lane(
+        &self,
+        lane: usize,
+        coordinates: &[f64],
+        out: &mut Point<'_>,
+    ) -> Result<()> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        self.artifact.evaluate_data(data, coordinates, out)
+    }
+
+    /// Evaluate noise using the same preparation as the constitutive tile.
+    ///
+    /// # Errors
+    /// Invalid lane, bias, frequency or unsupported/invalid noise.
+    pub fn evaluate_lane_noise(
+        &self,
+        lane: usize,
+        coordinates: &[f64],
+        frequency: f64,
+        sink: &mut dyn noise::Sink,
+    ) -> Result<()> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        self.artifact
+            .evaluate_noise_data(data, coordinates, frequency, sink)
     }
 
     /// Evaluate contiguous lanes with no new allocation.

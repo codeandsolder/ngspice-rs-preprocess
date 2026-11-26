@@ -176,3 +176,148 @@ fn metadata_structural_edits_and_noise() -> Result<()> {
     assert!(Artifact::new(d, Linear).is_err());
     Ok(())
 }
+
+#[derive(Debug)]
+struct CountedLinear(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Kernel for CountedLinear {
+    type Prepared = f64;
+
+    fn prepare(&self, values: &[f64], ambient: f64) -> Result<f64> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if values[0] <= 0. {
+            return Err(Error::Domain("nonpositive conductance".into()));
+        }
+        Ok(values[0] * ambient / 300.)
+    }
+
+    fn evaluate(&self, data: &f64, x: &[f64], out: &mut Point<'_>) -> Result<()> {
+        Linear.evaluate(data, x, out)
+    }
+
+    fn evaluate_noise(
+        &self,
+        data: &f64,
+        x: &[f64],
+        frequency: f64,
+        sink: &mut dyn Sink,
+    ) -> Result<()> {
+        Linear.evaluate_noise(data, x, frequency, sink)
+    }
+}
+
+#[derive(Default)]
+struct Density(Option<f64>);
+
+impl Sink for Density {
+    fn push(&mut self, source: Source<'_>) -> Result<()> {
+        self.0 = Some(source.density);
+        Ok(())
+    }
+}
+
+#[test]
+fn selective_replacement_is_transactional_and_shares_scalar_and_noise() -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const LANES: usize = 128;
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut d = descriptor();
+    d.parameters.push(Parameter {
+        name: "topology".into(),
+        default: 1.,
+        changes_topology: true,
+    });
+    let model = Artifact::new(d.clone(), CountedLinear(Arc::clone(&count)))?;
+    let foreign = Artifact::new(d, CountedLinear(Arc::clone(&count)))?;
+    let values = [2., 1.];
+    let candidates = [(values.as_slice(), 300.); LANES];
+    let mut tile = PreparedTile::new(&model, &candidates)?;
+    assert_eq!(count.load(Ordering::Relaxed), LANES);
+    let x = [2., 1., 310.];
+    let coordinates = x.repeat(LANES);
+    let mut batch = BatchOutput::new(3, LANES)?;
+    tile.evaluate(&coordinates, &mut batch)?;
+    let original = batch.current.clone();
+    let mut scalar = PointBuffer::new(3)?;
+
+    tile.replace(&model, &[(37, &[3., 1.], 300.)])?;
+    assert_eq!(count.load(Ordering::Relaxed), LANES + 1);
+    tile.evaluate(&coordinates, &mut batch)?;
+    for lane in 0..LANES {
+        let point = batch.point(lane)?;
+        let expected = if lane == 37 { 3. } else { original[lane * 3] };
+        assert_eq!(point.current[0].to_bits(), expected.to_bits());
+        tile.evaluate_lane(lane, &x, &mut scalar.point())?;
+        let single = scalar.point();
+        for (left, right) in [
+            (&*point.current, &*single.current),
+            (&*point.conductance, &*single.conductance),
+            (&*point.charge, &*single.charge),
+            (&*point.capacitance, &*single.capacitance),
+        ] {
+            assert!(
+                left.iter()
+                    .zip(right)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+        let mut noise = Density::default();
+        tile.evaluate_lane_noise(lane, &x, 1e3, &mut noise)?;
+        assert_eq!(noise.0.map(f64::to_bits), Some(expected.to_bits()));
+    }
+    assert_eq!(count.load(Ordering::Relaxed), LANES + 1);
+    let before = batch.current.clone();
+
+    // A valid preparation staged before a failing one must not be published.
+    assert!(
+        tile.replace(&model, &[(0, &[4., 1.], 300.), (1, &[-1., 1.], 300.)])
+            .is_err()
+    );
+    tile.evaluate(&coordinates, &mut batch)?;
+    assert_eq!(batch.current, before);
+    assert_eq!(count.load(Ordering::Relaxed), LANES + 3);
+    // Invalid indices and duplicate ordinals are rejected before preparation.
+    assert!(
+        tile.replace(&model, &[(0, &values, 300.), (LANES, &values, 300.)])
+            .is_err()
+    );
+    assert!(
+        tile.replace(&model, &[(0, &values, 300.), (0, &values, 310.)])
+            .is_err()
+    );
+    assert_eq!(
+        tile.replace(&foreign, &[(0, &values, 300.)]),
+        Err(Error::ForeignArtifact)
+    );
+    assert!(tile.replace(&model, &[(0, &[2., 2.], 300.)]).is_err());
+    assert!(tile.replace(&model, &[(0, &values, 0.)]).is_err());
+    assert!(tile.replace(&model, &[(0, &[2.], 300.)]).is_err());
+    assert!(tile.replace(&model, &[(0, &[f64::NAN, 1.], 300.)]).is_err());
+    tile.replace(&model, &[])?;
+    assert_eq!(count.load(Ordering::Relaxed), LANES + 3);
+    tile.evaluate(&coordinates, &mut batch)?;
+    assert_eq!(batch.current, before);
+
+    tile.replace(&model, &[(37, &[3., 1.], 400.)])?;
+    assert_eq!(count.load(Ordering::Relaxed), LANES + 4);
+    tile.evaluate_lane(37, &x, &mut scalar.point())?;
+    assert_eq!(scalar.point().current[0].to_bits(), 4_f64.to_bits());
+    assert!(tile.evaluate_lane(LANES, &x, &mut scalar.point()).is_err());
+    assert!(
+        tile.evaluate_lane(0, &[1., 0.], &mut scalar.point())
+            .is_err()
+    );
+    assert!(
+        tile.evaluate_lane_noise(0, &x, 0., &mut Density::default())
+            .is_err()
+    );
+    assert!(
+        tile.evaluate_lane_noise(LANES, &x, 1e3, &mut Density::default())
+            .is_err()
+    );
+    Ok(())
+}
