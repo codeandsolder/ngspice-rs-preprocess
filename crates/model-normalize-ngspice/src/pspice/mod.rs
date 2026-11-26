@@ -755,7 +755,7 @@ pub struct PspiceNormalization {
 /// # Errors
 /// Malformed statements, unsupported physical source semantics or invalid provenance.
 pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<PspiceNormalization> {
-    let shared = super::normalize_mapped(input, kind)?;
+    let shared = super::normalize_mapped(input, kind, super::NormalizationDialect::Native)?;
     let first = usize::from(kind == RootKind::Deck);
     let title_end = if first != 0 {
         shared
@@ -804,6 +804,7 @@ pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<PspiceNormalizat
     Ok(PspiceNormalization {
         mapped: MappedNormalization {
             model: crate::NormalizedModel { bytes, passes },
+            waveforms: shared.waveforms,
             input_lines,
         },
         renamed,

@@ -6,7 +6,7 @@ mod dialect;
 
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
-    MappedNormalization, NormalizationPass,
+    MappedNormalization, NormalizationDialect, NormalizationPass,
     linked_source::{LibrarySyntax, LinkLimits, LinkedSource, RootKind, SourceLinker},
     normalize_mapped,
 };
@@ -34,6 +34,10 @@ pub enum InputFormat {
     TinaDeck,
     /// TINA plaintext SPICE library; emit include-safe native SPICE.
     TinaLibrary,
+    /// Complete `LTspice` source deck, emitted in native syntax.
+    LtspiceDeck,
+    /// `LTspice` source library, emitted as include-safe native syntax.
+    LtspiceLibrary,
     /// Standalone `PSpice` deck lowered to native SPICE.
     PspiceDeck,
     /// Standalone `PSpice` library lowered to include-safe native SPICE.
@@ -67,6 +71,8 @@ impl InputFormat {
             "native-library" => Ok(Self::NativeLibrary),
             "tina-deck" => Ok(Self::TinaDeck),
             "tina-library" => Ok(Self::TinaLibrary),
+            "ltspice-deck" => Ok(Self::LtspiceDeck),
+            "ltspice-library" => Ok(Self::LtspiceLibrary),
             "pspice-deck" => Ok(Self::PspiceDeck),
             "pspice-library" => Ok(Self::PspiceLibrary),
             "qspice-deck" => Ok(Self::QspiceDeck),
@@ -311,16 +317,21 @@ fn project_native(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let mut mapped = normalized.mapped;
+            let waveforms = std::mem::take(&mut mapped.waveforms);
             Ok(NativeProjection {
-                normalized: normalized.mapped,
+                normalized: mapped,
                 device_identities: identities,
-                waveforms: Vec::new(),
+                waveforms,
             })
         }
         InputFormat::QspiceDeck | InputFormat::QspiceLibrary => {
             let lowered = model_normalize_ngspice::qspice::lower_linked(linked, kind)?;
-            let mut normalized =
-                normalize_mapped(lowered.bytes.as_deref().unwrap_or(&linked.bytes), kind)?;
+            let mut normalized = normalize_mapped(
+                lowered.bytes.as_deref().unwrap_or(&linked.bytes),
+                kind,
+                NormalizationDialect::Native,
+            )?;
             if lowered.bytes.is_some() {
                 normalized
                     .model
@@ -333,11 +344,23 @@ fn project_native(
                 waveforms: lowered.waveforms,
             })
         }
-        _ => Ok(NativeProjection {
-            normalized: normalize_mapped(&linked.bytes, kind)?,
-            device_identities: Vec::new(),
-            waveforms: Vec::new(),
-        }),
+        _ => {
+            let dialect = if matches!(
+                format,
+                InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary
+            ) {
+                NormalizationDialect::Ltspice
+            } else {
+                NormalizationDialect::Native
+            };
+            let mut normalized = normalize_mapped(&linked.bytes, kind, dialect)?;
+            let waveforms = std::mem::take(&mut normalized.waveforms);
+            Ok(NativeProjection {
+                normalized,
+                device_identities: Vec::new(),
+                waveforms,
+            })
+        }
     }
 }
 
@@ -350,6 +373,7 @@ fn native(
     let kind = if matches!(
         request.format,
         InputFormat::NativeDeck
+            | InputFormat::LtspiceDeck
             | InputFormat::PspiceDeck
             | InputFormat::QspiceDeck
             | InputFormat::TinaDeck
@@ -366,6 +390,7 @@ fn native(
         model_normalize_ngspice::tina::validate_plaintext(&root.bytes)?;
     }
     let syntax = match request.format {
+        InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary => LibrarySyntax::Ltspice,
         InputFormat::PspiceDeck
         | InputFormat::PspiceLibrary
         | InputFormat::TinaDeck
@@ -446,6 +471,8 @@ fn validate_request(request: &Request) -> Result<()> {
                     | InputFormat::NativeLibrary
                     | InputFormat::TinaDeck
                     | InputFormat::TinaLibrary
+                    | InputFormat::LtspiceDeck
+                    | InputFormat::LtspiceLibrary
                     | InputFormat::PspiceDeck
                     | InputFormat::PspiceLibrary
                     | InputFormat::QspiceDeck
@@ -484,6 +511,8 @@ pub fn prepare(
         | InputFormat::NativeLibrary
         | InputFormat::TinaDeck
         | InputFormat::TinaLibrary
+        | InputFormat::LtspiceDeck
+        | InputFormat::LtspiceLibrary
         | InputFormat::PspiceDeck
         | InputFormat::PspiceLibrary
         | InputFormat::QspiceDeck
