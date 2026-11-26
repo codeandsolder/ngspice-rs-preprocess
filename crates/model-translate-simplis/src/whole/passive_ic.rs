@@ -2,7 +2,7 @@
 
 use super::{Item, capture_artifact_items};
 use anyhow::Result;
-use model_normalize_ngspice::passive_ic::{InitialConditions, capture_statement};
+use model_normalize_ngspice::passive_ic::{Capture, InitialConditions};
 use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::LinkedPreprocessedNetlist;
 use std::fmt::Write as _;
@@ -80,9 +80,8 @@ fn apply_local_reactive_overrides(items: &mut [Item]) -> Result<bool> {
 
 fn capture_items(
     items: &mut [Item],
-    artifact: &str,
     scope: &[String],
-    conditions: &mut InitialConditions,
+    capture: &mut Capture<'_>,
     budget: &WorkBudget,
 ) -> Result<bool> {
     let _depth = budget.enter()?;
@@ -104,7 +103,7 @@ fn capture_items(
                 } else if first.eq_ignore_ascii_case(".endc") {
                     control = false;
                 } else if !embedded && !control {
-                    let rewritten = capture_statement(conditions, artifact, scope, statement)?;
+                    let rewritten = capture.statement(scope, statement)?;
                     if rewritten != *statement {
                         *statement = rewritten;
                         changed = true;
@@ -114,9 +113,8 @@ fn capture_items(
             Item::Subcircuit(block) => {
                 changed |= capture_items(
                     &mut block.body,
-                    artifact,
                     std::slice::from_ref(&block.name),
-                    conditions,
+                    capture,
                     budget,
                 )?;
             }
@@ -135,8 +133,9 @@ pub fn capture_artifact_initial_conditions(
     conditions: &mut InitialConditions,
     budget: &WorkBudget,
 ) -> Result<()> {
+    let mut capture = Capture::new(conditions, filename, budget)?;
     capture_artifact_items(bytes, budget, |items| {
-        capture_items(items, filename, &[], conditions, budget)
+        capture_items(items, &[], &mut capture, budget)
     })
 }
 

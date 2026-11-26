@@ -6,7 +6,9 @@
 
 use crate::param_expression::SpiceExpression;
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Enclosing analysis, independent of the instantaneous Newton load mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,7 +181,6 @@ impl InitialConditions {
     /// # Errors
     /// Missing or duplicate device identities, or missing node-hint scope.
     pub fn validate_artifact(&self, filename: &str, bytes: &[u8]) -> Result<()> {
-        use std::collections::{BTreeMap, BTreeSet};
         let canonical = |scope: &[String]| {
             scope
                 .iter()
@@ -384,127 +385,189 @@ pub fn evaluate_expression(
     })
 }
 
-/// Parse one logical source statement in its already linked lexical scope.
-///
-/// Returns a statement with all source-specific passive IC fields removed.
-/// The typed policy owns both storage IC and node hints; native IC semantics
-/// must not also be applied.
-///
-/// # Errors
-/// Malformed/duplicate fields or invalid scalar syntax.
-pub fn capture_statement(
-    conditions: &mut InitialConditions,
-    artifact: &str,
-    scope: &[String],
-    statement: &str,
-) -> Result<String> {
-    use crate::lexical;
-    let Some(first) = statement.split_whitespace().next() else {
-        return Ok(statement.to_owned());
-    };
-    if !matches!(
-        first.as_bytes().first().map(u8::to_ascii_uppercase),
-        Some(b'C' | b'L')
-    ) && ![".ic", ".opt", ".option", ".options"]
-        .iter()
-        .any(|name| first.eq_ignore_ascii_case(name))
-    {
-        return Ok(statement.to_owned());
-    }
-    let active = lexical::statements(statement.as_bytes())?;
-    let [logical] = active.as_slice() else {
-        return Ok(statement.to_owned());
-    };
-    let text = std::str::from_utf8(&logical.text)?;
-    let spans = lexical::tokens(&logical.text)?;
-    let fields = spans
-        .iter()
-        .map(|span| &text[span.clone()])
-        .collect::<Vec<_>>();
-    let Some(first) = fields.first() else {
-        return Ok(statement.to_owned());
-    };
-    if first.eq_ignore_ascii_case(".ic") {
-        return capture_nodes(conditions, artifact, scope, &fields[1..]);
-    }
-    if [".opt", ".option", ".options"]
-        .iter()
-        .any(|name| first.eq_ignore_ascii_case(name))
-    {
-        let retained = capture_options(conditions, scope, &fields[1..])?;
-        return Ok(if retained.is_empty() {
-            "* source initialization options recorded in typed policy".to_owned()
-        } else {
-            format!("{first} {}", retained.join(" "))
-        });
-    }
-    let kind = match first.as_bytes().first().map(u8::to_ascii_uppercase) {
-        Some(b'C') => PassiveKind::Capacitor,
-        Some(b'L') => PassiveKind::Inductor,
-        _ => return Ok(statement.to_owned()),
-    };
-    let mut target = None;
-    let mut branch = None;
-    let mut mode = None;
-    let mut retained = fields.iter().take(3).copied().collect::<Vec<_>>();
-    let mut i = 3;
-    while let Some(field) = fields.get(i) {
-        if fields.get(i + 1) != Some(&"=") {
-            // A positional model name can itself be IC or BRANCH.
-            retained.push(field);
-            i += 1;
-            continue;
+/// Request-local capture state for one artifact. The serialized policy
+/// retains declaration order; the auxiliary index makes first-wins node
+/// insertion independent of the number of previous hints.
+pub struct Capture<'a> {
+    conditions: &'a mut InitialConditions,
+    artifact: &'a str,
+    budget: &'a WorkBudget,
+    nodes: BTreeMap<Vec<String>, BTreeSet<String>>,
+}
+
+impl<'a> Capture<'a> {
+    /// Initialize the index from previously captured declarations.
+    /// # Errors
+    /// Cancellation or exhausted cumulative work budget.
+    pub fn new(
+        conditions: &'a mut InitialConditions,
+        artifact: &'a str,
+        budget: &'a WorkBudget,
+    ) -> Result<Self> {
+        let mut nodes = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
+        for node in &conditions.nodes {
+            budget.charge(Resource::EvaluationSteps, 1)?;
+            budget.charge(Resource::ScannedBytes, node.artifact.len())?;
+            if node.artifact == artifact {
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                charge_identity(&node.scope, node.node.len(), budget)?;
+                nodes
+                    .entry(node.scope.clone())
+                    .or_default()
+                    .insert(node.node.to_ascii_uppercase());
+            }
         }
-        let value = fields
-            .get(i + 2)
-            .context("missing passive assignment value")?;
-        let slot = if field.eq_ignore_ascii_case("IC") {
-            Some(&mut target)
-        } else if field.eq_ignore_ascii_case("BRANCH") {
-            Some(&mut branch)
-        } else if field.eq_ignore_ascii_case("ICMODE") {
-            Some(&mut mode)
-        } else {
-            None
+        Ok(Self {
+            conditions,
+            artifact,
+            budget,
+            nodes,
+        })
+    }
+
+    /// Parse one logical source statement in its linked lexical scope.
+    /// Returns text without source-specific passive initialization fields.
+    /// # Errors
+    /// Malformed fields, invalid scalars or exhausted work allowance.
+    pub fn statement(&mut self, scope: &[String], statement: &str) -> Result<String> {
+        use crate::lexical;
+        self.budget
+            .charge(Resource::ScannedBytes, statement.len())?;
+        self.budget.charge(Resource::Statements, 1)?;
+        let Some(first) = statement.split_whitespace().next() else {
+            return Ok(statement.to_owned());
         };
-        if let Some(slot) = slot {
-            let value = normalized_scalar(value)?;
-            ensure!(slot.replace(value).is_none(), "{first}: duplicate {field}");
-        } else {
-            retained.extend([*field, "=", *value]);
+        if !matches!(
+            first.as_bytes().first().map(u8::to_ascii_uppercase),
+            Some(b'C' | b'L')
+        ) && ![".ic", ".opt", ".option", ".options"]
+            .iter()
+            .any(|name| first.eq_ignore_ascii_case(name))
+        {
+            return Ok(statement.to_owned());
         }
-        i += 3;
-    }
-    if target.is_none() && branch.is_none() && mode.is_none() {
-        return Ok(statement.to_owned());
-    }
-    ensure!(fields.len() >= 4, "incomplete passive declaration {first}");
-    // All ICs are bound by the typed policy, including analysis-dependent
-    // explicit storage values. Do not leave an unbound ANALYSIS expression
-    // in the ordinary native device parser, or duplicate the native hint.
-    conditions.devices.push(PassiveInitialCondition {
-        artifact: artifact.to_owned(),
-        scope: scope.to_vec(),
-        device: (*first).to_owned(),
-        kind,
-        target,
-        branch,
-        mode,
-    });
-    // Rejoin top-level '=' pairs in the compact form expected by translation.
-    let mut output = String::new();
-    for (index, field) in retained.iter().enumerate() {
-        if index != 0 && *field != "=" && retained[index - 1] != "=" {
-            output.push(' ');
+        let active = lexical::statements(statement.as_bytes())?;
+        let [logical] = active.as_slice() else {
+            return Ok(statement.to_owned());
+        };
+        let text = std::str::from_utf8(&logical.text)?;
+        let spans = lexical::tokens(&logical.text)?;
+        let fields = spans
+            .iter()
+            .map(|span| &text[span.clone()])
+            .collect::<Vec<_>>();
+        let Some(first) = fields.first() else {
+            return Ok(statement.to_owned());
+        };
+        if first.eq_ignore_ascii_case(".ic") {
+            return self.capture_nodes(scope, &fields[1..]);
         }
-        output.push_str(field);
+        if [".opt", ".option", ".options"]
+            .iter()
+            .any(|name| first.eq_ignore_ascii_case(name))
+        {
+            let retained = capture_options(self.conditions, scope, &fields[1..], self.budget)?;
+            return Ok(if retained.is_empty() {
+                "* source initialization options recorded in typed policy".to_owned()
+            } else {
+                format!("{first} {}", retained.join(" "))
+            });
+        }
+        self.capture_device(scope, statement, &fields)
     }
-    Ok(output)
+
+    fn capture_device(
+        &mut self,
+        scope: &[String],
+        statement: &str,
+        fields: &[&str],
+    ) -> Result<String> {
+        let Some(first) = fields.first() else {
+            return Ok(statement.to_owned());
+        };
+        let kind = match first.as_bytes().first().map(u8::to_ascii_uppercase) {
+            Some(b'C') => PassiveKind::Capacitor,
+            Some(b'L') => PassiveKind::Inductor,
+            _ => return Ok(statement.to_owned()),
+        };
+        let mut target = None;
+        let mut branch = None;
+        let mut mode = None;
+        let mut retained = fields.iter().take(3).copied().collect::<Vec<_>>();
+        let mut i = 3;
+        while let Some(field) = fields.get(i) {
+            if fields.get(i + 1) != Some(&"=") {
+                // A positional model name can itself be IC or BRANCH.
+                retained.push(field);
+                i += 1;
+                continue;
+            }
+            let value = fields
+                .get(i + 2)
+                .context("missing passive assignment value")?;
+            let slot = if field.eq_ignore_ascii_case("IC") {
+                Some(&mut target)
+            } else if field.eq_ignore_ascii_case("BRANCH") {
+                Some(&mut branch)
+            } else if field.eq_ignore_ascii_case("ICMODE") {
+                Some(&mut mode)
+            } else {
+                None
+            };
+            if let Some(slot) = slot {
+                let value = normalized_scalar(value, self.budget)?;
+                ensure!(slot.replace(value).is_none(), "{first}: duplicate {field}");
+            } else {
+                retained.extend([*field, "=", *value]);
+            }
+            i += 3;
+        }
+        if target.is_none() && branch.is_none() && mode.is_none() {
+            return Ok(statement.to_owned());
+        }
+        ensure!(fields.len() >= 4, "incomplete passive declaration {first}");
+        // All ICs are bound by the typed policy, including analysis-dependent
+        // explicit storage values. Do not leave an unbound ANALYSIS expression
+        // in the ordinary native device parser, or duplicate the native hint.
+        self.budget.charge(Resource::GeneratedNodes, 1)?;
+        charge_identity(
+            scope,
+            self.artifact.len().saturating_add(first.len()),
+            self.budget,
+        )?;
+        self.conditions.devices.push(PassiveInitialCondition {
+            artifact: self.artifact.to_owned(),
+            scope: scope.to_vec(),
+            device: (*first).to_owned(),
+            kind,
+            target,
+            branch,
+            mode,
+        });
+        // Rejoin top-level '=' pairs in the compact form expected by translation.
+        let mut output = String::new();
+        for (index, field) in retained.iter().enumerate() {
+            if index != 0 && *field != "=" && retained[index - 1] != "=" {
+                output.push(' ');
+            }
+            output.push_str(field);
+        }
+        Ok(output)
+    }
+}
+
+fn charge_identity(scope: &[String], bytes: usize, budget: &WorkBudget) -> Result<()> {
+    budget.charge(Resource::EmittedBytes, bytes)?;
+    for part in scope {
+        budget.charge(Resource::EmittedBytes, part.len())?;
+    }
+    budget.charge(Resource::GeneratedNodes, scope.len())
 }
 
 /// Normalize scalar comparison spelling. Other function/operator lowering
 /// is performed by the source dialect pass before reaching this boundary.
-fn normalized_scalar(raw: &str) -> Result<String> {
+fn normalized_scalar(raw: &str, budget: &WorkBudget) -> Result<String> {
+    budget.charge(Resource::EmittedBytes, raw.len())?;
     let mut output = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     for (i, ch) in raw.char_indices() {
@@ -515,11 +578,12 @@ fn normalized_scalar(raw: &str) -> Result<String> {
             )
             && bytes.get(i + 1) != Some(&b'=')
         {
+            budget.charge(Resource::EmittedBytes, 1)?;
             output.push('=');
         }
         output.push(ch);
     }
-    SpiceExpression::parse(&output)?;
+    SpiceExpression::parse_with_budget(&output, budget)?;
     Ok(output)
 }
 
@@ -527,6 +591,7 @@ fn capture_options<'a>(
     conditions: &mut InitialConditions,
     scope: &[String],
     fields: &[&'a str],
+    budget: &WorkBudget,
 ) -> Result<Vec<&'a str>> {
     let mut retained = Vec::new();
     let mut i = 0;
@@ -547,7 +612,7 @@ fn capture_options<'a>(
             let value = fields
                 .get(i + 2)
                 .context("missing initialization option value")?;
-            *slot = Some(normalized_scalar(value)?);
+            *slot = Some(normalized_scalar(value, budget)?);
             i += 3;
         } else if fields.get(i + 1) == Some(&"=") {
             retained.extend([
@@ -564,51 +629,112 @@ fn capture_options<'a>(
     Ok(retained)
 }
 
-fn capture_nodes(
-    conditions: &mut InitialConditions,
-    artifact: &str,
-    scope: &[String],
-    fields: &[&str],
-) -> Result<String> {
-    let mut i = 0;
-    while let Some(field) = fields.get(i) {
-        let node = if field
-            .get(..2)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("v("))
-        {
+impl Capture<'_> {
+    fn capture_nodes(&mut self, scope: &[String], fields: &[&str]) -> Result<String> {
+        let mut i = 0;
+        while let Some(field) = fields.get(i) {
+            let node = if field
+                .get(..2)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("v("))
+            {
+                ensure!(
+                    fields.get(i + 1) == Some(&"="),
+                    ".IC voltage target requires '='"
+                );
+                i += 2;
+                field[2..]
+                    .strip_suffix(')')
+                    .context("invalid .IC node reference")?
+                    .trim()
+            } else {
+                i += 1;
+                *field
+            };
             ensure!(
-                fields.get(i + 1) == Some(&"="),
-                ".IC voltage target requires '='"
+                !node.is_empty() && !node.contains(',') && !node.contains(char::is_whitespace),
+                "invalid .IC node {node}"
             );
-            i += 2;
-            field[2..]
-                .strip_suffix(')')
-                .context("invalid .IC node reference")?
-                .trim()
-        } else {
+            let target =
+                normalized_scalar(fields.get(i).context("missing .IC target")?, self.budget)?;
+            self.budget.charge(Resource::EvaluationSteps, 1)?;
+            self.budget.charge(Resource::EmittedBytes, node.len())?;
+            let key = node.to_ascii_uppercase();
+            // Scope is usually already indexed; charge potential map key and
+            // node admission before allocation, including duplicate attempts.
+            charge_identity(scope, 0, self.budget)?;
+            self.budget.charge(Resource::GeneratedNodes, 1)?;
+            let names = self.nodes.entry(scope.to_vec()).or_default();
+            if names.insert(key) {
+                charge_identity(
+                    scope,
+                    self.artifact.len().saturating_add(node.len()),
+                    self.budget,
+                )?;
+                self.budget.charge(Resource::GeneratedNodes, 1)?;
+                self.conditions.nodes.push(NodeInitialCondition {
+                    artifact: self.artifact.to_owned(),
+                    scope: scope.to_vec(),
+                    node: node.to_owned(),
+                    target,
+                });
+            }
             i += 1;
-            *field
-        };
-        ensure!(
-            !node.is_empty() && !node.contains(',') && !node.contains(char::is_whitespace),
-            "invalid .IC node {node}"
-        );
-        let target = normalized_scalar(fields.get(i).context("missing .IC target")?)?;
-        if !conditions.nodes.iter().any(|existing| {
-            existing.artifact == artifact
-                && existing.scope == scope
-                && existing.node.eq_ignore_ascii_case(node)
-        }) {
-            conditions.nodes.push(NodeInitialCondition {
-                artifact: artifact.to_owned(),
-                scope: scope.to_vec(),
-                node: node.to_owned(),
-                target,
-            });
         }
-        i += 1;
+        // Node hints are kept exclusively in the typed policy so native
+        // last-wins / row-replacement rules cannot run as well.
+        Ok("* source node initialization recorded in typed policy".to_owned())
     }
-    // Node hints are kept exclusively in the typed policy so native
-    // last-wins / row-replacement rules cannot run as well.
-    Ok("* source node initialization recorded in typed policy".to_owned())
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use model_preprocess_command::{Cancellation, WorkLimits};
+
+    #[test]
+    fn many_node_hints_preserve_first_wins_across_capture_passes() -> Result<()> {
+        let budget = WorkBudget::default();
+        let mut policy = InitialConditions::default();
+        {
+            let mut capture = Capture::new(&mut policy, "deck.cir", &budget)?;
+            for index in 0..10_000 {
+                capture.statement(&[], &format!(".ic V(n{index})={index}"))?;
+            }
+            capture.statement(&[], ".ic V(N0)=99")?;
+            capture.statement(&["cell".to_owned()], ".ic V(n0)=3")?;
+        }
+        {
+            let mut capture = Capture::new(&mut policy, "deck.cir", &budget)?;
+            capture.statement(&[], ".ic V(N9999)=0")?;
+        }
+        Capture::new(&mut policy, "companion.lib", &budget)?.statement(&[], ".ic V(n0)=7")?;
+        assert_eq!(policy.nodes.len(), 10_002);
+        assert_eq!(policy.nodes[0].target, "0");
+        assert_eq!(policy.nodes[9999].target, "9999");
+        assert_eq!(policy.nodes[10000].scope, ["cell"]);
+        assert_eq!(policy.nodes[10001].artifact, "companion.lib");
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_initialization_metadata_uses_the_same_budget() -> Result<()> {
+        let budget = WorkBudget::new(
+            WorkLimits {
+                generated_nodes: 5,
+                ..WorkLimits::default()
+            },
+            Cancellation::default(),
+        );
+        let mut policy = InitialConditions::default();
+        let mut capture = Capture::new(&mut policy, "deck.cir", &budget)?;
+        capture.statement(&[], ".ic V(a)=1 V(b)=2")?;
+        let error = capture
+            .statement(&[], ".ic V(c)=3")
+            .err()
+            .context("expected node metadata budget failure")?;
+        assert!(format!("{error:#}").contains("GeneratedNodes budget exceeded"));
+        assert!(budget.check().is_err());
+        assert_eq!(policy.nodes.len(), 2);
+        Ok(())
+    }
 }

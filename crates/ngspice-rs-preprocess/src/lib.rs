@@ -448,11 +448,14 @@ pub fn prepare(
         condition_generated_bundle(&mut result, &budget)?;
     }
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
+    let artifact_names = result
+        .artifacts()
+        .map(|artifact| artifact.filename.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     for declaration in &result.waveforms {
+        budget.charge(Resource::EvaluationSteps, 1)?;
         ensure!(
-            result
-                .artifacts()
-                .any(|artifact| artifact.filename == declaration.artifact),
+            artifact_names.contains(declaration.artifact.as_str()),
             "missing waveform artifact {}",
             declaration.artifact
         );
