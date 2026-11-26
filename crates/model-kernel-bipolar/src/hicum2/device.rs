@@ -84,6 +84,8 @@ pub struct Output {
 pub struct Prepared {
     polarity: Polarity,
     collector_potential: f64,
+    collector_potential_slope: f64,
+    t0_slope: f64,
     diode: super::Prepared,
     junction: junction::Prepared,
     transport: transport::Prepared,
@@ -105,6 +107,8 @@ impl Prepared {
         Ok(Self {
             polarity: p.polarity,
             collector_potential: p.transport.junction.intrinsic_collector.potential,
+            collector_potential_slope: p.junction_parameter_slopes.intrinsic_collector.potential,
+            t0_slope: p.transport_temperature_slopes.t0,
             diode: p.diode_kernel()?,
             junction: p.junction_kernel()?,
             transport: p.transport_kernel()?,
@@ -516,6 +520,173 @@ impl Prepared {
         operating: &Output,
     ) -> Result<external::CurrentSensitivity, EvaluationError> {
         self.external.temperature_sensitivity(operating.external)
+    }
+
+    /// Analytic thermal column in reduced local coordinates, using the
+    /// same physical branch incidence as the electrical/charge residual.
+    /// # Errors
+    /// Invalid constitutive derivative or nonfinite coupled result.
+    pub(super) fn temperature_coupling(
+        &self,
+        layout: super::nodal::Layout,
+        op: &Output,
+    ) -> Result<super::nodal::TemperatureCoupling, EvaluationError> {
+        use super::topology::Branch;
+        let diode = self.diode_temperature_sensitivity(op)?;
+        let junction = self.junction_temperature_sensitivity(op)?;
+        let avalanche = self.avalanche_temperature_sensitivity(op)?.generation;
+        let tunnel = self.tunneling_temperature_sensitivity(op)?;
+        let base = self.internal_base_temperature_sensitivity(op)?;
+        let external = self.external_temperature_sensitivity(op)?;
+        let substrate = self.substrate_temperature_sensitivity(op)?;
+        let transfer = op.transfer.temperature_sensitivity;
+        let sign = if matches!(self.polarity, Polarity::Npn) {
+            1.
+        } else {
+            -1.
+        };
+        let slope = op.thermal.d_tdev_d_rise;
+        let mut result = super::nodal::TemperatureCoupling {
+            current: [0.; super::nodal::MAX_UNKNOWN],
+            charge: [0.; super::nodal::MAX_UNKNOWN],
+            d_tf_d_rise: slope * transfer.forward_transit_time,
+            d_thermal_current_d_rise_from_power: 0.,
+        };
+        let (intrinsic_tunnel, peripheral_tunnel) = match self.tunneling_location {
+            tunneling::Location::Intrinsic => (tunnel, 0.),
+            tunneling::Location::Peripheral => (0., tunnel),
+        };
+        let (delayed_current, delayed_charge) = if op.nqs.active {
+            (0., 0.)
+        } else {
+            (transfer.forward_current, transfer.forward_diffusion_charge)
+        };
+        let emitters = junction.emitters;
+        let collectors = junction.collectors;
+        for (branch, current, charge) in [
+            (Branch::Rbx, external.external_base, 0.),
+            (Branch::Rbi, base.resistor_current, base.hf_shunt_charge),
+            (Branch::Rcx, external.external_collector, 0.),
+            (Branch::Re, external.emitter, 0.),
+            (Branch::Rsu, external.substrate, 0.),
+            (
+                Branch::IntrinsicEmitter,
+                sign * (diode.ibei + diode.irei + transfer.barrier_base_current + intrinsic_tunnel),
+                sign * (emitters.intrinsic.charge + delayed_charge),
+            ),
+            (
+                Branch::PeripheralEmitter,
+                sign * (diode.ibep + diode.irep + peripheral_tunnel),
+                sign * emitters.peripheral.charge,
+            ),
+            (
+                Branch::IntrinsicCollector,
+                sign * diode.ibci,
+                sign * (collectors.intrinsic.charge + transfer.reverse_diffusion_charge),
+            ),
+            (
+                Branch::ExternalCollectorJunction,
+                0.,
+                sign * collectors.external.charge,
+            ),
+            (
+                Branch::PeripheralCollector,
+                sign * diode.ijbcx,
+                sign * (collectors.peripheral.charge + substrate.diffusion_charge),
+            ),
+            (Branch::TransferForward, sign * delayed_current, 0.),
+            (Branch::TransferReverse, sign * transfer.reverse_current, 0.),
+            (
+                Branch::SubstrateJunction,
+                sign * diode.ijsc,
+                sign * collectors.substrate.charge,
+            ),
+            (
+                Branch::PeripheralSubstrateJunction,
+                0.,
+                sign * collectors.peripheral_substrate.charge,
+            ),
+            (Branch::SubstrateTransfer, sign * substrate.current, 0.),
+            (Branch::Avalanche, sign * avalanche, 0.),
+        ] {
+            let (from, to) = branch.nodes();
+            let from = layout.node(from);
+            let to = layout.node(to);
+            if from != to {
+                result.current[from] += slope * current;
+                result.current[to] -= slope * current;
+                result.charge[from] += slope * charge;
+                result.charge[to] -= slope * charge;
+            }
+        }
+        let (current, charge) = self
+            .nqs
+            .temperature_partials(&op.nqs, &op.transfer, self.t0_slope);
+        for (index, (current, charge)) in current.into_iter().zip(charge).enumerate() {
+            if let Some(row) = layout.nqs_slot(index) {
+                result.current[row] = slope * current;
+                result.charge[row] = slope * charge;
+            }
+        }
+        result.d_thermal_current_d_rise_from_power = -slope
+            * self.power_temperature_slope(
+                op,
+                &diode,
+                transfer.net_transfer_current,
+                avalanche,
+                base.resistance,
+                external,
+            );
+        Ok(result)
+    }
+
+    fn power_temperature_slope(
+        &self,
+        op: &Output,
+        diode: &super::CurrentSensitivity,
+        transfer: f64,
+        avalanche: f64,
+        base_resistance: f64,
+        external: external::CurrentSensitivity,
+    ) -> f64 {
+        let power = op.thermal.electrical;
+        let product = [
+            (power.transport, transfer),
+            (power.avalanche, avalanche),
+            (power.intrinsic_emitter, diode.ibei),
+            (power.intrinsic_collector, diode.ibci),
+            (power.peripheral_emitter, diode.ibep),
+            (power.peripheral_collector, diode.ijbcx),
+            (power.substrate, diode.ijsc),
+        ]
+        .into_iter()
+        .map(|(term, current)| term.d_current * current)
+        .sum::<f64>();
+        // The source avalanche headroom is Vdci(T)-Vbici. Its explicit
+        // temperature derivative is independent of the generation slope.
+        let avalanche_headroom = power.avalanche.d_voltage * self.collector_potential_slope;
+        let internal = power.intrinsic_base.d_resistance * base_resistance;
+        // A present resistor contributes V*dI/dT. Its independent
+        // voltage partial is zero for disabled heat modes or zero drive.
+        let nodes = op.nodes;
+        let external = [
+            (
+                power.external_base,
+                nodes.b - nodes.bp,
+                external.external_base,
+            ),
+            (
+                power.external_collector,
+                nodes.ci - nodes.c,
+                external.external_collector,
+            ),
+            (power.external_emitter, nodes.ei - nodes.e, external.emitter),
+        ]
+        .into_iter()
+        .filter(|(term, _, _)| term.d_voltage != 0.)
+        .map(|(_, voltage, current)| voltage * current)
+        .sum::<f64>();
+        product + avalanche_headroom + internal + external
     }
 
     /// Source-referred noise spectra for the evaluated physical operating
