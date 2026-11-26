@@ -1,4 +1,4 @@
-//! Typed source-derived schemas for intrinsic `HiSIM` and SOI MOS compact models.
+//! Typed source-derived schemas for intrinsic `HiSIM`, SOI and bulk BSIM MOS compact models.
 //!
 //! This crate provides **model/instance parameter binding**, not nonlinear device
 //! equations. A solver must not treat successful binding as proof that DC, AC,
@@ -43,10 +43,22 @@ pub enum ModelVariant {
     Bsim3SoiPd,
     /// Southampton STAG SOI3, level 60.
     Soi3,
+    /// Berkeley BSIM1, level 4.
+    Bsim1,
+    /// Berkeley BSIM2, level 5.
+    Bsim2,
+    /// BSIM3 3.0.x implementation, levels 8/49.
+    Bsim3V0,
+    /// BSIM3 3.1.x implementation, levels 8/49.
+    Bsim3V1,
+    /// BSIM3 3.2.x implementation, levels 8/49.
+    Bsim3V32,
+    /// BSIM3 3.3.x or default implementation, levels 8/49.
+    Bsim3V33,
 }
 
 /// Source registration information for all intrinsic model implementations.
-pub const VARIANTS: [ModelVariant; 8] = [
+pub const VARIANTS: [ModelVariant; 14] = [
     ModelVariant::HiSim2,
     ModelVariant::HiSimHv1,
     ModelVariant::HiSimHv2,
@@ -55,9 +67,15 @@ pub const VARIANTS: [ModelVariant; 8] = [
     ModelVariant::Bsim3SoiDd,
     ModelVariant::Bsim3SoiPd,
     ModelVariant::Soi3,
+    ModelVariant::Bsim1,
+    ModelVariant::Bsim2,
+    ModelVariant::Bsim3V0,
+    ModelVariant::Bsim3V1,
+    ModelVariant::Bsim3V32,
+    ModelVariant::Bsim3V33,
 ];
 
-/// Known model inputs are a parsed schema only; no valid numerical kernel exists yet.
+/// Kernel availability within this producer crate, not in a consuming simulator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelStatus {
     /// Requires a separate, verified physical current/charge/derivative implementation.
@@ -71,6 +89,8 @@ pub enum ModelError {
     UnknownLevel(i32),
     /// The specific HiSIM-HV version has no matching source-family implementation.
     UnknownHiSimHvVersion(String),
+    /// The literal BSIM3 version has no matching upstream implementation.
+    UnknownBsim3Version(String),
     /// The input parameter name does not appear in the upstream table.
     UnknownParameter(String),
     /// The provided typed parameter value differs from the upstream declaration.
@@ -117,6 +137,9 @@ impl std::fmt::Display for ModelError {
             Self::UnknownLevel(level) => write!(f, "unsupported intrinsic MOS level {level}"),
             Self::UnknownHiSimHvVersion(version) => {
                 write!(f, "unsupported HiSIM-HV version '{version}'")
+            }
+            Self::UnknownBsim3Version(version) => {
+                write!(f, "unsupported BSIM3 version '{version}'")
             }
             Self::UnknownParameter(name) => write!(f, "unrecognized model parameter '{name}'"),
             Self::WrongType { name, expected } => {
@@ -309,13 +332,24 @@ impl BoundParameters {
 impl ModelVariant {
     /// Resolve the source-family dispatch in ngspice's `inpdomod.c`.
     ///
-    /// Only HiSIM-HV dispatches between different implementations by version;
+    /// HiSIM-HV and BSIM3 dispatch between different implementations by version;
     /// other families select by level and leave version handling to model physics.
+    /// Pass the first literal version token, not the final ordered setter.
     ///
     /// # Errors
-    /// Returns an error for an unknown level or unsupported HiSIM-HV version.
+    /// Returns an error for an unknown level or unsupported HiSIM-HV/BSIM3 version.
     pub fn from_level_version(level: i32, version: Option<&str>) -> Result<Self, ModelError> {
         match level {
+            4 => Ok(Self::Bsim1),
+            5 => Ok(Self::Bsim2),
+            8 | 49 => match version {
+                None | Some("default") => Ok(Self::Bsim3V33),
+                Some(ver) if ver.starts_with("3.0") => Ok(Self::Bsim3V0),
+                Some(ver) if ver.starts_with("3.1") => Ok(Self::Bsim3V1),
+                Some(ver) if ver.starts_with("3.2") => Ok(Self::Bsim3V32),
+                Some(ver) if ver.starts_with("3.3") => Ok(Self::Bsim3V33),
+                Some(ver) => Err(ModelError::UnknownBsim3Version(ver.to_owned())),
+            },
             68 => Ok(Self::HiSim2),
             73 => match version {
                 None => Ok(Self::HiSimHv2),
@@ -358,7 +392,13 @@ impl ModelVariant {
             "Thermal",
         ];
         match self {
-            Self::HiSim2 => MOS,
+            Self::HiSim2
+            | Self::Bsim1
+            | Self::Bsim2
+            | Self::Bsim3V0
+            | Self::Bsim3V1
+            | Self::Bsim3V32
+            | Self::Bsim3V33 => MOS,
             Self::HiSimHv1 | Self::HiSimHv2 => HV,
             Self::BsimSoi | Self::Bsim3SoiFd | Self::Bsim3SoiDd | Self::Bsim3SoiPd => SOI,
             Self::Soi3 => STAG,
