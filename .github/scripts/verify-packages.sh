@@ -84,7 +84,7 @@ done < <(jq -c '.[]' <<<"$selection")
 # Require Cargo to assemble and build every tarball in dependency order.
 # A dry run contacts the public registry but cannot upload anything.
 cargo publish --dry-run --locked "${packages[@]}" \
-    --target-dir "$temporary/package-target" --config "build.build-dir='$CARGO_TARGET_DIR'"
+    --target-dir "$temporary/package-target" --config "build.build-dir='$temporary/package-target'"
 
 # A fresh directory source supplies the exact public locked dependencies,
 # plus our registry-format archives. It is not a path-patched workspace.
