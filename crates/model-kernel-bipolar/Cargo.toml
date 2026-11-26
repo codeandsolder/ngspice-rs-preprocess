@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT AND BSD-3-Clause"
+license-file = "../../THIRD_PARTY_NOTICES.md"
 repository.workspace = true
 publish.workspace = true
+description = "Prepared VBIC and HICUM2 bipolar model equations and numerical kernels"
 
 [dependencies]
-model-kernel-api = { path = "../model-kernel-api" }
+model-kernel-api.workspace = true
 sha2 = "0.11"
 
 [lints]

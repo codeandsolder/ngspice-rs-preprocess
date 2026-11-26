@@ -36,8 +36,23 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/codeandsolder/ngspice-rs-preprocess"
 publish = false
+
+[workspace.dependencies]
+model-alb-experimental = { path = "crates/model-alb-experimental", version = "=0.1.0" }
+model-compact-intrinsic = { path = "crates/model-compact-intrinsic", version = "=0.1.0" }
+model-kernel-api = { path = "crates/model-kernel-api", version = "=0.1.0" }
+model-kernel-bipolar = { path = "crates/model-kernel-bipolar", version = "=0.1.0" }
+model-kernel-diode = { path = "crates/model-kernel-diode", version = "=0.1.0" }
+model-kernel-vdmos = { path = "crates/model-kernel-vdmos", version = "=0.1.0" }
+model-normalize-ngspice = { path = "crates/model-normalize-ngspice", version = "=0.1.0" }
+model-prepare-osdi = { path = "crates/model-prepare-osdi", version = "=0.1.0" }
+model-preprocess-command = { path = "crates/model-preprocess-command", version = "=0.1.0" }
+model-preprocess-simplis = { path = "crates/model-preprocess-simplis", version = "=0.1.0" }
+model-touchstone = { path = "crates/model-touchstone", version = "=0.1.0" }
+model-translate-simplis = { path = "crates/model-translate-simplis", version = "=0.1.0" }
 
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -1 }

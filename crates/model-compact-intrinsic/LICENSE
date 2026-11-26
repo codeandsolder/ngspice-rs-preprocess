@@ -1,9 +1,11 @@
 The following licenses and notices apply to different portions of this package.
 
 Original codeandsolder Rust code is available under the MIT license below.
-Source-derived HiSIM-HV1/HV2 rules and numerical expressions are subject to
-Hiroshima University / STARC's upstream HiSIM_HV Distribution Statement and
-Copyright Notice, reproduced after the MIT text. The repository's root MIT
+Source-derived HiSIM-HV1/HV2 and HiSIM2 rules, catalogs and numerical
+expressions are subject to Hiroshima University / STARC distribution terms.
+BSIM SOI catalogs and rules retain the ngspice modified BSD terms.
+The SOI3 (STAG) catalog retains the DERA licence terms.
+The corresponding notices are reproduced after the MIT text. The repository's root MIT
 license does not override those third-party rights and conditions.
 
 === MIT license for independently authored code ===
@@ -74,3 +76,162 @@ src/spicelib/devices/hisimhv1/hsmhvtemp_eval.h
 src/spicelib/devices/hisimhv2/hsmhv2set.c
 src/spicelib/devices/hisimhv2/hsmhv2temp.c
 src/spicelib/devices/hisimhv2/hsmhv2temp_eval.h
+
+=== HiSIM2 upstream source notice and terms ===
+
+Copyright (C) 2014 Hiroshima University & STARC
+HiSIM 2.8.0, hsm2.c (2014-06-05)
+
+The following source code, and all copyrights, trade secrets or other
+intellectual property rights in and to the source code in its entirety,
+is owned by the Hiroshima University and the STARC organization.
+
+All users need to follow the "HiSIM2 Distribution Statement and
+Copyright Notice" attached to HiSIM2 model.
+
+-----HiSIM2 Distribution Statement and Copyright Notice--------------
+
+Software is distributed as is, completely without warranty or service
+support. Hiroshima University or STARC and its employees are not liable
+for the condition or performance of the software.
+
+Hiroshima University and STARC own the copyright and grant users a perpetual,
+irrevocable, worldwide, non-exclusive, royalty-free license with respect
+to the software as set forth below.
+
+Hiroshima University and STARC hereby disclaim all implied warranties.
+
+Hiroshima University and STARC grant the users the right to modify, copy,
+and redistribute the software and documentation, both within the user's
+organization and externally, subject to the following restrictions
+
+1. The users agree not to charge for Hiroshima University and STARC code
+itself but may charge for additions, extensions, or support.
+
+2. In any product based on the software, the users agree to acknowledge
+Hiroshima University and STARC that developed the software. This
+acknowledgment shall appear in the product documentation.
+
+3. The users agree to reproduce any copyright notice which appears on
+the software on any copy or modification of such made available
+to others."
+
+
+=== BSIM SOI and BSIM3 SOI upstream notices and ngspice modified BSD ===
+
+BSIMSOI 4.x: Copyright 2010 Regents of the University of California.
+All rights reserved. Authors: Samuel Fung, Dennis Sinitsky, Stephen Tang,
+Pin Su, Hui Wan, Wei Jin, Xuemei Xi, Ali Niknejad, Chenming Hu, Wenwei Yang,
+Chung-Hsun Lin and Tanvir Morshed. Modified by Darsen Lu and the listed authors.
+
+BSIM3SOI FD/DD 2.1: Copyright 1999 Regents of the University of California.
+All rights reserved. Authors: Weidong Liu, Pin Su, Samuel Fung, Dennis
+Sinitsky and Stephen Tang. Modified by Wei Jin and Paolo Nenzi.
+
+BSIM3SOI PD 2.2.3: Copyright 1990 Regents of the University of California.
+All rights reserved. Authors: Samuel Fung, Dennis Sinitsky and Stephen Tang.
+Modified by Pin Su, Jan Feng, Wei Jin and Paolo Nenzi.
+
+Copyright 1985 - 2018, Regents of the University of California and others
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from this
+software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+=== SOI3 (STAG) upstream copyright and DERA licence ===
+
+STAG version 2.7
+Copyright 2000 owned by the United Kingdom Secretary of State for Defence
+acting through the Defence Evaluation and Research Agency.
+Developed by :     Jim Benson,
+                   Department of Electronics and Computer Science,
+                   University of Southampton,
+                   United Kingdom.
+With help from :   Nele D'Halleweyn, Ketan Mistry, Bill Redman-White, and Craig Easson.
+
+Based on STAG version 2.1
+Developed by :     Mike Lee,
+With help from :   Bernard Tenbroek, Bill Redman-White, Mike Uren, Chris Edwards
+                   and John Bunyan.
+Acknowledgements : Rupert Howes and Pete Mole.
+
+Licence Agreement (STAG) from DERA
+
+1. The STAG Computer Model is subject to Copyright owned by the United Kingdom
+Secretary of State for Defence acting through the Defence Evaluation and Research Agency
+(DERA). It is made available to licensee (hereinafter LICENSEE) on the following conditions:-
+
+2. Downloading the STAG Model deems acceptance of the terms of the licence.
+
+3. DERA grants to LICENSEE a royalty free non-exclusive licence to use the furnished STAG
+Model. LICENSEE is permitted to copy, distribute, and transfer the STAG Model to
+customers for their royalty free use on the same licence terms.
+
+4. LICENSEE acknowledges that STAG is a research tool still in the development stage, that
+it is being supplied "as is", without any accompanying services or improvements from
+DERA.
+
+5. LICENSEE acknowledges that STAG is a Model developed by the Department of
+Electronics and Computer Science at the University of Southampton (UOS), England, and is
+incorporated within SPICE 3f5, a program developed by the Department of Electrical
+Engineering and Computer Science at the University of California, Berkeley, California
+(UCB). As such, LICENSEE acknowledges that in addition to the rights licensed by DERA,
+UCB itself imposes restrictions on use, copying, and distribution of the SPICE 3f5 program
+and its derivatives.
+
+6. LICENSEE undertakes to obtain any separate licence required for the use of SPICE 3f5
+from UCB.
+
+7. DERA make no representations or warranties, express or implied. DERA shall not be held
+liable for any liability nor for any direct, indirect, or consequential damages with respect to
+any claim by LICENSEE or any third party on account of or arising from this Agreement or
+use of STAG.
+
+8. Title to copyright of all portions of STAG developed at UOS and/or DERA together with
+associated documentation shall at all times remain with DERA, and LICENSEE agrees to
+preserve same. LICENSEE agrees to ensure that this information and appropriate copyright
+notice is reproduced with any copies of STAG or any modified versions derived from it.
+
+9. This agreement shall be construed, interpreted, and applied in accordance with the laws
+of England.
+
+for DERA by:
+
+J B EDWARDS
+IPD5A
+10 NOV 1997
+
+Intellectual Property Department
+Defence Evaluation and Research Agency
+St Andrews Road
+Malvern
+WR14 3PS
+United Kingdom
+
+phone: +44 - 1684 - 894234
+fax: +44 - 1684 - 894146
+
+Upstream reference: ngspice 47, a80f6e3e95d51534905b1f23410a951802666656;
+src/spicelib/devices/{bsimsoi,bsim3soi_fd,bsim3soi_dd,bsim3soi_pd,hisim2,soi3}.

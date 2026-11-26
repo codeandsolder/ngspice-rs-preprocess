@@ -6,6 +6,7 @@ rust-version.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
 publish.workspace = true
+description = "Source-backed compact semiconductor model catalogs and intrinsic preparation kernels"
 
 [lints]
 workspace = true

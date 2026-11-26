@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+license-file.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 publish.workspace = true
+description = "Experimental XSPICE foreign-function bindings for ALB models"
 
 [lib]
 crate-type = ["staticlib"]
@@ -16,4 +19,4 @@ workspace = true
 [dependencies]
 anyhow = "1"
 hex = "0.4"
-model-alb-experimental = { path = "../model-alb-experimental" }
+model-alb-experimental.workspace = true
