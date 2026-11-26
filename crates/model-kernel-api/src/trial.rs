@@ -53,8 +53,8 @@ pub enum TrialReference<'a> {
 }
 
 impl<'a> TrialReference<'a> {
-    #[must_use]
-    pub fn coordinates(self) -> &'a [f64] {
+    #[must_use = "the reference coordinates are required for trial limiting"]
+    pub const fn coordinates(self) -> &'a [f64] {
         match self {
             Self::PreviousNewton(coordinates) | Self::AcceptedStep(coordinates) => coordinates,
         }
@@ -88,7 +88,9 @@ pub struct TrialSample<'a> {
     pub jacobian: &'a [f64],
 }
 
-/// Additional family convergence test. Previous is the previous Newton load,
+/// Additional family convergence test.
+///
+/// Previous is the previous Newton load,
 /// not the last accepted time step; candidate must be an exact load to pass.
 /// Absolute tolerances are in each row's residual units (A, W, or family
 /// defined internal units); the relative tolerance is dimensionless.

@@ -24,7 +24,7 @@ impl ExponentialLimit {
         }
         // Compute the critical voltage in the log domain, including
         // saturation currents whose linear representations underflow.
-        let critical = scale * (scale.ln() - std::f64::consts::LN_2 * 0.5 - log_current);
+        let critical = scale * (std::f64::consts::LN_2.mul_add(-0.5, scale.ln()) - log_current);
         Some(Self {
             scale,
             critical: critical.max(0.),
