@@ -3,7 +3,7 @@
 //! Compiling a scalar model card establishes immutable parameter identity.
 //! Binding scales and freezes independent instance geometry and topology.
 //! Trial evaluation borrows solver-owned local unknowns and returns the
-//! physical I/Q and complete isothermal G/C Jacobians, without runtime
+//! physical I/Q and complete electrothermal G/C Jacobians, without runtime
 //! parsing, dispatch, allocation or accepted-step state mutation.
 //! The circuit owns netlist syntax, global sparse matrix, accepted state,
 //! analysis policy, integration and frequency/noise transfer.
@@ -51,8 +51,8 @@ pub enum LocalPhysics {
 pub enum Electrothermal {
     /// Source thermal branch is structurally absent.
     NotPresent,
-    /// The full thermal-column Jacobian must be supplied by the circuit.
-    ExternalCouplingRequired,
+    /// Complete coupled thermal residual and Jacobian.
+    Computed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,11 +252,19 @@ impl Instance {
             local: LocalPhysics::CurrentsChargesNoise,
             vertical_nqs: self.layout.topology().nqs_state_count() > 0,
             electrothermal: if self.layout.thermal_slot().is_some() {
-                Electrothermal::ExternalCouplingRequired
+                Electrothermal::Computed
             } else {
                 Electrothermal::NotPresent
             },
         }
+    }
+
+    /// Absolute unclamped zero-rise temperature, including model and
+    /// instance offsets. The constitutive temperature clamp is applied
+    /// inside preparation, not to the thermal-network coordinate.
+    #[must_use = "the value maps absolute thermal coordinates to source rise"]
+    pub fn thermal_reference_kelvin(&self) -> f64 {
+        self.bound.ambient.kelvin() + self.bound.nominal.coefficients.dt
     }
 
     /// Prepare a temperature-dependent physical kernel once per temperature
@@ -282,7 +290,6 @@ impl Instance {
 #[derive(Clone, Copy, Debug)]
 pub struct Trial<'a> {
     pub unknowns: &'a [f64],
-    pub electrothermal: Option<nodal::TemperatureCoupling>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -305,11 +312,11 @@ impl Prepared {
     }
 
     /// Borrowed trial evaluation; analytically completes implicit transit
-    /// time chain rule and demands a live thermal derivative when needed.
+    /// time chain rule and the complete live thermal derivative.
     ///
     /// # Errors
     /// Wrong vector size, stale thermal coefficients or failed physical
-    /// law, including explicit missing electrothermal coupling.
+    /// law or coupled derivative.
     pub fn evaluate(&self, trial: Trial<'_>) -> Result<Frame, EvaluationError> {
         if trial.unknowns.len() != self.layout.count() {
             return Err(EvaluationError::LengthMismatch);
@@ -346,10 +353,15 @@ impl Prepared {
         };
         let operating = self.kernel.evaluate(&bias)?;
         let source = self.kernel.source_stamps(&operating)?;
+        let thermal = if self.layout.thermal_slot().is_some() {
+            Some(self.kernel.temperature_coupling(self.layout, &operating)?)
+        } else {
+            None
+        };
         let local = self
             .layout
             .reduce(&source)?
-            .complete_from_operating(&operating, trial.electrothermal)?;
+            .complete_from_operating(&operating, thermal)?;
         Ok(Frame { operating, local })
     }
 
