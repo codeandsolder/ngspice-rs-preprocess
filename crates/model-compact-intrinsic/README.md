@@ -16,7 +16,8 @@ solver topology or solver-ready native device kernels. Source-derived
 HiSIM-HV1/HV2 additionally have source-derived **instance defaults, binning,
 metallurgical channel geometry and leading temperature-dependent bandgap,
 thermal-voltage and carrier-density inputs**. Other families still
-need dedicated setup and per-instance preparation.
+need dedicated setup and per-instance preparation, except HiSIM2's
+source-derived setup and binning described below.
 `ModelVariant::KERNEL_STATUS` explicitly advertises `NotImplemented`. Downstream
 must not substitute generic MOS laws for these devices or interpret successfully
 bound parameters as physical model support.
@@ -52,6 +53,57 @@ The terminal arrays preserve the upstream positions rather than collapsing to fo
 MOS terminals. HiSIM-HV adds substrate and temperature; BSIMSOI/BSIM3SOI have
 additional backgate, body, thermal and charge terminals with a reserved blank
 fifth position; SOI3 has separate front/back gates and a thermal terminal.
+
+## HiSIM2 2.80 setup, geometry and topology
+
+The `hisim2` module implements the source-derived setup for level 68, version
+280. It reuses the existing registration catalog, covering 528 constant
+defaults, dependent polarity/mode defaults, original source-given flags,
+depletion/reciprocity adjustments, forced noise enable and upstream range
+resets. Invalid explicit versions and checked mode selectors are rejected
+instead of silently falling back to another physical configuration.
+
+- `hisim2::prepare_model` returns prepared model-card values in their original
+  units, including Celsius TNOM.
+- `hisim2::prepare_instance` takes a bound instance and the circuit temperature
+  in Kelvin. It resolves model-inherited values, source IC ordering, effective
+  device temperature, and all 72 source binning terms with the VFBC length
+  correction. Values remain in source units.
+- `hisim2::prepare_physical` checks model/instance identity and applies the
+  source temperature-routine geometry corrections, evaluator-unit conversion
+  of binned coefficients, and drain/source, gate and body parasitics. The
+  external series conductances are checked against native DC internal-node
+  voltage drops and branch currents.
+- `hisim2::prepare_temperature` computes nominal and actual band gap, inverse
+  thermal voltage and intrinsic carrier density with the original constants.
+- `hisim2::prepare_junctions` binds saturation, reverse leakage, linear
+  continuation, and area/sidewall/gate-sidewall charge coefficients once per
+  prepared instance. Evaluation accepts normalized drain/source junction
+  voltages and circuit GMIN; returns multiplicity-scaled current, charge and
+  analytic voltage derivatives. The source uses instance TEMP for saturation
+  preparation and circuit temperature plus DTEMP for capacitance scaling.
+  The logarithmic limit at grading=1 is evaluated analytically, avoiding the
+  original expression's removable singularity.
+- The topology identifies distinct drain, source, gate and body-network nodes
+  and NQS state selection without allocating solver nodes. It does not imply a
+  complete numerical kernel.
+
+Source-backed setup tests and a live native ngspice 47 reference matrix:
+
+```sh
+cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup
+cargo +nightly test --locked -p model-compact-intrinsic --test hisim2_setup --test hisim2_junction -- --include-ignored --nocapture
+```
+
+The native reference compares all 544 numeric model-table fields and 31
+numeric instance inputs. The native display truncates two groups of parameter
+names to eleven characters; the test maps their occurrences using the source
+registration order. A second native matrix checks 936 junction current,
+conductance and capacitance values across 156 bias points (NMOS and PMOS,
+-20 to 100 C, explicit TEMP/DTEMP, geometry and multiplicity). Charge
+derivatives are independently checked by finite differences. The original HiSIM2 Distribution Statement and Copyright
+Notice (Copyright (C) 2014 Hiroshima University & STARC) is reproduced in
+the package LICENSE.
 
 ## BSIMSOI 4.x source-derived model preparation
 
@@ -778,3 +830,62 @@ Likewise the v1/v2 HiSIM-HV **instance** tables are identical and shared, while
 their **model** tables remain version-specific. Physical equations, defaults and
 state structures are **not** assumed interchangeable just because the registration
 metadata matches; future kernels must preserve their exact source-family behavior.
+
+
+### BSIM3SOI FD/DD/PD setup and instance preparation
+
+`bsim3soi::prepare_model` evaluates the ordered default programs shared by FD
+and DD (2.1), or the distinct PD 2.2.3 program. It preserves original given
+flags for later size-dependent derivation. In FD/DD the registered XDIF name
+aliases XBJT, whereas the internal diffusion exponent defaults to 2. PD has
+a separate XDIF input with an XBJT-dependent default.
+
+`bsim3soi::prepare_instance` supplies source defaults, five-component initial
+conditions, effective IV and CV dimensions, and the raw length/width/cross
+bin program. PD retains its independent CV corrections, body-contact widths,
+segment geometry and body/backgate CV lengths. Deferred physical coefficients
+remain distinguishable from explicit zero. These are preparation APIs, not
+a complete current/charge kernel.
+
+The ignored native setup test compares 2,422 model and 100 instance getter
+values across FD/DD/PD NMOS and PMOS cases against ngspice 47. Six FD/DD native
+mask getters (LDVBD0/1, WDVBD0/1, PDVBD0/1) return the corresponding base DVBD
+rather than the stored coefficient. The test checks the actual getter
+mapping separately from the source default of 1 for each bin coefficient.
+Eight size-derived model fields are intentionally deferred. Native showmod
+values are compared only where the source exposes a usable getter.
+
+Source references: `bsim3soi_{fd,dd,pd}/b3soi{fd,dd,pd}{set,mpar,par,temp,mask}.c`.
+
+
+### STAG SOI3 2.7 preparation
+
+`soi3::prepare_model` derives nominal film and surface-state capacitance,
+mobility/KP, doping-derived surface potential, body factors and flat-band
+voltages; it preserves explicit VT0/VTEX precedence and the source's
+LAMBDA versus LX/VP/MEXP mode selection. TOF, TOB and TB are mandatory.
+CHID/CHID1 are deferred until the instance temperature is known.
+
+`soi3::prepare_instance` takes circuit geometry and ambient-temperature
+defaults. It resolves source/drain series conductance by explicit RD/RS,
+then RSH and squares, then width-scaled RDW/RSW. The source's explicit zero
+precedence is retained; topology is based on the effective conductance,
+rather than creating an unconnected prime node. Thermal area uses drawn
+dimensions before LD correction. Explicit instance RT/CT override the
+model's explicit RTA/CTA scaling, otherwise material parameters set the
+values. Up to five thermal ladder sections stop at the first zero RT;
+resistance divides by M and capacitance multiplies by M. RT=0 requires
+a thermal-ground constraint; an active ladder uses ambient circuit
+temperature even when instance TEMP is present.
+
+The temperature prelude retains native band-gap constants, thermal
+voltage, mobility, surface potential, front/back flat-band and threshold,
+saturation-current scaling, critical voltage and zero-bias junction
+capacitances. Absent CHID/CHID1 are instance-local instead of mutating
+the shared model. Conflicting overlapping vector/scalar IC assignments
+are rejected because the typed slot buffer does not encode input order.
+The API does not yet provide nonlinear terminal currents or charges.
+
+Source references: `soi3/{soi3set,soi3temp,soi3mpar,soi3par,soi3mask,soi3ask}.c`.
+STAG's separate DERA licence and original notices are in the package
+LICENSE.
