@@ -3,6 +3,7 @@
 //! voltages are sampled during polynomial extraction.
 use super::{Expr, SpiceExpression, parse_spice_constant};
 use anyhow::{Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 
 // Bound expansion of hostile input, independently of the simulator's state
 // dimension. This is an expression-expansion resource limit, not a fit order.
@@ -13,22 +14,31 @@ const MAX_COEFFICIENT_BYTES: usize = 1024 * 1024;
 struct Scalar(String);
 
 impl Scalar {
-    fn number(value: f64) -> Self {
-        Self(format!("{value:e}"))
+    fn number(value: f64, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::EmittedBytes, 32)?;
+        Ok(Self(format!("{value:e}")))
     }
 
-    fn from_expr(expr: &Expr) -> Result<Self> {
-        Ok(expr
-            .known_value()?
-            .map_or_else(|| Self(scalar_text(expr)), Self::number))
+    fn from_expr(expr: &Expr, budget: &WorkBudget) -> Result<Self> {
+        if let Some(value) = expr.known_value(budget)? {
+            return Self::number(value, budget);
+        }
+        let mut text = String::new();
+        scalar_text(expr, &mut text, budget)?;
+        Ok(Self(text))
     }
 
-    fn zero() -> Self {
-        Self::number(0.)
+    fn zero(budget: &WorkBudget) -> Result<Self> {
+        Self::number(0., budget)
     }
 
-    fn one() -> Self {
-        Self::number(1.)
+    fn one(budget: &WorkBudget) -> Result<Self> {
+        Self::number(1., budget)
+    }
+
+    fn copy(&self, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::EmittedBytes, self.0.len())?;
+        Ok(self.clone())
     }
 
     fn value(&self) -> Option<f64> {
@@ -39,7 +49,12 @@ impl Scalar {
         self.value().is_some_and(|value| value == 0.)
     }
 
-    fn binary(&self, op: &str, rhs: &Self) -> Result<Self> {
+    fn binary(&self, op: &str, rhs: &Self, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        budget.charge(
+            Resource::ScannedBytes,
+            self.0.len().saturating_add(rhs.0.len()),
+        )?;
         if let (Some(left), Some(right)) = (self.value(), rhs.value()) {
             let value = match op {
                 "+" => left + right,
@@ -59,24 +74,24 @@ impl Scalar {
                 !matches!(op, "*" | "/") || left == 0. || right == 0. || value != 0.,
                 "Laplace polynomial coefficient underflow"
             );
-            return Ok(Self::number(value));
+            return Self::number(value, budget);
         }
         match op {
-            "+" if self.is_zero() => return Ok(rhs.clone()),
-            "+" | "-" if rhs.is_zero() => return Ok(self.clone()),
-            "-" if self == rhs => return Ok(Self::zero()),
-            "*" if self.is_zero() || rhs.is_zero() => return Ok(Self::zero()),
+            "+" if self.is_zero() => return rhs.copy(budget),
+            "+" | "-" if rhs.is_zero() => return self.copy(budget),
+            "-" if self == rhs => return Self::zero(budget),
+            "*" if self.is_zero() || rhs.is_zero() => return Self::zero(budget),
             "*" if self
                 .value()
                 .is_some_and(|value| value.to_bits() == 1_f64.to_bits()) =>
             {
-                return Ok(rhs.clone());
+                return rhs.copy(budget);
             }
             "*" if rhs
                 .value()
                 .is_some_and(|value| value.to_bits() == 1_f64.to_bits()) =>
             {
-                return Ok(self.clone());
+                return self.copy(budget);
             }
             _ => {}
         }
@@ -84,54 +99,105 @@ impl Scalar {
             self.0.len() + rhs.0.len() + 5 <= MAX_COEFFICIENT_BYTES,
             "Laplace coefficient expansion exceeds resource limit"
         );
+        budget.charge(
+            Resource::EmittedBytes,
+            self.0
+                .len()
+                .saturating_add(rhs.0.len())
+                .saturating_add(op.len())
+                .saturating_add(2),
+        )?;
         Ok(Self(format!("({}{op}{})", self.0, rhs.0)))
     }
 }
 
-fn contains_s(expr: &Expr) -> bool {
-    match expr {
+fn contains_s(expr: &Expr, budget: &WorkBudget) -> Result<bool> {
+    budget.charge(Resource::EvaluationSteps, 1)?;
+    Ok(match expr {
         Expr::Number(_) => false,
         Expr::Symbol(name) => name == "s",
-        Expr::Unary(_, value) => contains_s(value),
-        Expr::Binary(_, left, right) => contains_s(left) || contains_s(right),
+        Expr::Unary(_, value) => contains_s(value, budget)?,
+        Expr::Binary(_, left, right) => contains_s(left, budget)? || contains_s(right, budget)?,
         Expr::Conditional(condition, yes, no) => {
-            contains_s(condition) || contains_s(yes) || contains_s(no)
+            contains_s(condition, budget)? || contains_s(yes, budget)? || contains_s(no, budget)?
         }
-        Expr::Call(_, args) => args.iter().any(contains_s),
-    }
+        Expr::Call(_, args) => {
+            for arg in args {
+                if contains_s(arg, budget)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+    })
 }
 
-fn scalar_text(expr: &Expr) -> String {
+fn append_scalar(text: &mut String, value: &str, budget: &WorkBudget) -> Result<()> {
+    ensure!(
+        text.len().saturating_add(value.len()) <= MAX_COEFFICIENT_BYTES,
+        "Laplace coefficient expansion exceeds resource limit"
+    );
+    budget.charge(Resource::EmittedBytes, value.len())?;
+    text.push_str(value);
+    Ok(())
+}
+
+fn scalar_text(expr: &Expr, text: &mut String, budget: &WorkBudget) -> Result<()> {
+    budget.charge(Resource::EvaluationSteps, 1)?;
     match expr {
-        Expr::Number(value) => format!("{value:e}"),
-        Expr::Symbol(name) => name.clone(),
-        Expr::Unary(op, value) => format!("({op}{})", scalar_text(value)),
-        Expr::Binary(op, left, right) => {
-            format!("({}{op}{})", scalar_text(left), scalar_text(right))
+        Expr::Number(value) => {
+            let scalar = Scalar::number(*value, budget)?;
+            append_scalar(text, &scalar.0, budget)?;
         }
-        Expr::Conditional(condition, yes, no) => format!(
-            "({}?{}:{})",
-            scalar_text(condition),
-            scalar_text(yes),
-            scalar_text(no)
-        ),
+        Expr::Symbol(name) => append_scalar(text, name, budget)?,
+        Expr::Unary(op, value) => {
+            append_scalar(text, "(", budget)?;
+            append_scalar(text, op, budget)?;
+            scalar_text(value, text, budget)?;
+            append_scalar(text, ")", budget)?;
+        }
+        Expr::Binary(op, left, right) => {
+            append_scalar(text, "(", budget)?;
+            scalar_text(left, text, budget)?;
+            append_scalar(text, op, budget)?;
+            scalar_text(right, text, budget)?;
+            append_scalar(text, ")", budget)?;
+        }
+        Expr::Conditional(condition, yes, no) => {
+            append_scalar(text, "(", budget)?;
+            scalar_text(condition, text, budget)?;
+            append_scalar(text, "?", budget)?;
+            scalar_text(yes, text, budget)?;
+            append_scalar(text, ":", budget)?;
+            scalar_text(no, text, budget)?;
+            append_scalar(text, ")", budget)?;
+        }
         Expr::Call(name, args) => {
-            let args = args.iter().map(scalar_text).collect::<Vec<_>>().join(",");
-            format!("{name}({args})")
+            append_scalar(text, name, budget)?;
+            append_scalar(text, "(", budget)?;
+            for (index, arg) in args.iter().enumerate() {
+                if index != 0 {
+                    append_scalar(text, ",", budget)?;
+                }
+                scalar_text(arg, text, budget)?;
+            }
+            append_scalar(text, ")", budget)?;
         }
     }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Polynomial(Vec<Scalar>); // ascending powers internally
 
 impl Polynomial {
-    fn constant(value: Scalar) -> Self {
-        Self(vec![value])
+    fn constant(value: Scalar, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        Ok(Self(vec![value]))
     }
 
-    fn one() -> Self {
-        Self::constant(Scalar::one())
+    fn one(budget: &WorkBudget) -> Result<Self> {
+        Self::constant(Scalar::one(budget)?, budget)
     }
 
     fn is_zero(&self) -> bool {
@@ -145,39 +211,72 @@ impl Polynomial {
         Self(coefficients)
     }
 
-    fn add(&self, op: &str, rhs: &Self) -> Result<Self> {
-        let zero = Scalar::zero();
+    fn add(&self, op: &str, rhs: &Self, budget: &WorkBudget) -> Result<Self> {
+        let zero = Scalar::zero(budget)?;
+        budget.charge(Resource::GeneratedNodes, self.0.len().max(rhs.0.len()))?;
         let coefficients = (0..self.0.len().max(rhs.0.len()))
             .map(|i| {
                 self.0
                     .get(i)
                     .unwrap_or(&zero)
-                    .binary(op, rhs.0.get(i).unwrap_or(&zero))
+                    .binary(op, rhs.0.get(i).unwrap_or(&zero), budget)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self::trim(coefficients))
     }
 
-    fn multiply(&self, rhs: &Self) -> Result<Self> {
+    fn multiply(&self, rhs: &Self, budget: &WorkBudget) -> Result<Self> {
         if self.is_zero() || rhs.is_zero() {
-            return Ok(Self::constant(Scalar::zero()));
+            return Self::constant(Scalar::zero(budget)?, budget);
         }
         let count = self.0.len() + rhs.0.len() - 1;
         ensure!(
             count <= MAX_DEGREE + 1,
             "Laplace polynomial degree exceeds resource limit"
         );
-        let mut coefficients = vec![Scalar::zero(); count];
+        budget.charge(Resource::GeneratedNodes, count)?;
+        let mut coefficients = (0..count)
+            .map(|_| Scalar::zero(budget))
+            .collect::<Result<Vec<_>>>()?;
         for (i, left) in self.0.iter().enumerate() {
             for (j, right) in rhs.0.iter().enumerate() {
-                coefficients[i + j] = coefficients[i + j].binary("+", &left.binary("*", right)?)?;
+                coefficients[i + j] =
+                    coefficients[i + j].binary("+", &left.binary("*", right, budget)?, budget)?;
             }
         }
         Ok(Self::trim(coefficients))
     }
 
-    fn descending(self) -> Vec<String> {
-        self.0.into_iter().rev().map(|value| value.0).collect()
+    fn copy(&self, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::GeneratedNodes, self.0.len())?;
+        Ok(Self(
+            self.0
+                .iter()
+                .map(|value| value.copy(budget))
+                .collect::<Result<Vec<_>>>()?,
+        ))
+    }
+
+    fn equal(&self, rhs: &Self, budget: &WorkBudget) -> Result<bool> {
+        if self.0.len() != rhs.0.len() {
+            return Ok(false);
+        }
+        for (left, right) in self.0.iter().zip(&rhs.0) {
+            budget.charge(Resource::EvaluationSteps, 1)?;
+            budget.charge(
+                Resource::ScannedBytes,
+                left.0.len().saturating_add(right.0.len()),
+            )?;
+            if left != right {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn descending(self, budget: &WorkBudget) -> Result<Vec<String>> {
+        budget.charge(Resource::GeneratedNodes, self.0.len())?;
+        Ok(self.0.into_iter().rev().map(|value| value.0).collect())
     }
 }
 
@@ -187,17 +286,17 @@ struct Rational {
 }
 
 impl Rational {
-    fn constant(value: Scalar) -> Self {
-        Self {
-            numerator: Polynomial::constant(value),
-            denominator: Polynomial::one(),
-        }
+    fn constant(value: Scalar, budget: &WorkBudget) -> Result<Self> {
+        Ok(Self {
+            numerator: Polynomial::constant(value, budget)?,
+            denominator: Polynomial::one(budget)?,
+        })
     }
 
-    fn multiply(&self, rhs: &Self) -> Result<Self> {
+    fn multiply(&self, rhs: &Self, budget: &WorkBudget) -> Result<Self> {
         Ok(Self {
-            numerator: self.numerator.multiply(&rhs.numerator)?,
-            denominator: self.denominator.multiply(&rhs.denominator)?,
+            numerator: self.numerator.multiply(&rhs.numerator, budget)?,
+            denominator: self.denominator.multiply(&rhs.denominator, budget)?,
         })
     }
 
@@ -209,26 +308,30 @@ impl Rational {
         })
     }
 
-    fn add(&self, op: &str, rhs: &Self) -> Result<Self> {
-        if self.denominator == rhs.denominator {
+    fn add(&self, op: &str, rhs: &Self, budget: &WorkBudget) -> Result<Self> {
+        if self.denominator.equal(&rhs.denominator, budget)? {
             return Ok(Self {
-                numerator: self.numerator.add(op, &rhs.numerator)?,
-                denominator: self.denominator.clone(),
+                numerator: self.numerator.add(op, &rhs.numerator, budget)?,
+                denominator: self.denominator.copy(budget)?,
             });
         }
         Ok(Self {
-            numerator: self
-                .numerator
-                .multiply(&rhs.denominator)?
-                .add(op, &rhs.numerator.multiply(&self.denominator)?)?,
-            denominator: self.denominator.multiply(&rhs.denominator)?,
+            numerator: self.numerator.multiply(&rhs.denominator, budget)?.add(
+                op,
+                &rhs.numerator.multiply(&self.denominator, budget)?,
+                budget,
+            )?,
+            denominator: self.denominator.multiply(&rhs.denominator, budget)?,
         })
     }
 
-    fn power(mut self, exponent: &Expr) -> Result<Self> {
-        let value = exponent.evaluate(&mut |name: &str| {
-            bail!("Laplace power requires a constant integer exponent, not {name}")
-        })?;
+    fn power(mut self, exponent: &Expr, budget: &WorkBudget) -> Result<Self> {
+        let value = exponent.evaluate(
+            &mut |name: &str| {
+                bail!("Laplace power requires a constant integer exponent, not {name}")
+            },
+            budget,
+        )?;
         ensure!(
             value.fract() == 0. && value.abs() <= 256.,
             "Laplace power requires an integer exponent within the resource limit"
@@ -243,48 +346,57 @@ impl Rational {
         )]
         #[expect(clippy::cast_sign_loss, reason = "absolute value is nonnegative")]
         let mut exponent = value.abs() as usize;
-        let mut result = Self::constant(Scalar::one());
+        let mut result = Self::constant(Scalar::one(budget)?, budget)?;
         while exponent != 0 {
             if exponent & 1 != 0 {
-                result = result.multiply(&self)?;
+                result = result.multiply(&self, budget)?;
             }
             exponent >>= 1;
             if exponent != 0 {
-                self = self.multiply(&self)?;
+                self = self.multiply(&self, budget)?;
             }
         }
         Ok(result)
     }
 
-    fn compile(expr: &Expr) -> Result<Self> {
-        if !contains_s(expr) {
-            return Ok(Self::constant(Scalar::from_expr(expr)?));
+    fn compile(expr: &Expr, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        if !contains_s(expr, budget)? {
+            return Self::constant(Scalar::from_expr(expr, budget)?, budget);
         }
         match expr {
-            Expr::Symbol(_) => Ok(Self {
-                numerator: Polynomial(vec![Scalar::zero(), Scalar::one()]),
-                denominator: Polynomial::one(),
-            }),
-            Expr::Unary("+", value) => Self::compile(value),
-            Expr::Unary("-", value) => {
-                Self::constant(Scalar::zero()).add("-", &Self::compile(value)?)
+            Expr::Symbol(_) => {
+                budget.charge(Resource::GeneratedNodes, 2)?;
+                Ok(Self {
+                    numerator: Polynomial(vec![Scalar::zero(budget)?, Scalar::one(budget)?]),
+                    denominator: Polynomial::one(budget)?,
+                })
             }
+            Expr::Unary("+", value) => Self::compile(value, budget),
+            Expr::Unary("-", value) => Self::constant(Scalar::zero(budget)?, budget)?.add(
+                "-",
+                &Self::compile(value, budget)?,
+                budget,
+            ),
             Expr::Binary(op @ ("+" | "-"), left, right) => {
-                Self::compile(left)?.add(op, &Self::compile(right)?)
+                Self::compile(left, budget)?.add(op, &Self::compile(right, budget)?, budget)
             }
-            Expr::Binary("*", left, right) => Self::compile(left)?.multiply(&Self::compile(right)?),
-            Expr::Binary("/", left, right) if !contains_s(right) => {
+            Expr::Binary("*", left, right) => {
+                Self::compile(left, budget)?.multiply(&Self::compile(right, budget)?, budget)
+            }
+            Expr::Binary("/", left, right) if !contains_s(right, budget)? => {
                 // Keep scalar division in the coefficient domain. Clearing a
                 // parameter-valued scalar divisor could otherwise make an
                 // undefined instance (e.g. p=0 in s/p) appear valid.
-                let divisor = Scalar::from_expr(right)?;
-                let reciprocal = Scalar::one().binary("/", &divisor)?;
-                Self::compile(left)?.multiply(&Self::constant(reciprocal))
+                let divisor = Scalar::from_expr(right, budget)?;
+                let reciprocal = Scalar::one(budget)?.binary("/", &divisor, budget)?;
+                Self::compile(left, budget)?.multiply(&Self::constant(reciprocal, budget)?, budget)
             }
-            Expr::Binary("/", left, right) => {
-                Self::compile(left)?.multiply(&Self::compile(right)?.reciprocal()?)
+            Expr::Binary("/", left, right) => Self::compile(left, budget)?
+                .multiply(&Self::compile(right, budget)?.reciprocal()?, budget),
+            Expr::Binary("**", base, exponent) => {
+                Self::compile(base, budget)?.power(exponent, budget)
             }
-            Expr::Binary("**", base, exponent) => Self::compile(base)?.power(exponent),
             _ => bail!("nonrational Laplace expression (unsupported operation on s)"),
         }
     }
@@ -293,16 +405,16 @@ impl Rational {
 /// Extract descending numerator and denominator coefficient expressions from
 /// a proper rational transfer. The scalar subexpressions retain lexical
 /// parameter names and are bound by the native model at occurrence preparation.
-pub fn coefficients(raw: &str) -> Result<(Vec<String>, Vec<String>)> {
-    let expression = SpiceExpression::parse(raw)?;
-    let result = Rational::compile(&expression.0)?;
+pub fn coefficients(raw: &str, budget: &WorkBudget) -> Result<(Vec<String>, Vec<String>)> {
+    let expression = SpiceExpression::parse_with_budget(raw, budget)?;
+    let result = Rational::compile(&expression.0, budget)?;
     ensure!(!result.denominator.is_zero(), "zero Laplace denominator");
     ensure!(
         result.numerator.0.len() <= result.denominator.0.len(),
         "improper Laplace transfer requires explicit derivative operators"
     );
     Ok((
-        result.numerator.descending(),
-        result.denominator.descending(),
+        result.numerator.descending(budget)?,
+        result.denominator.descending(budget)?,
     ))
 }

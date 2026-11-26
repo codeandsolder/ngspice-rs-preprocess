@@ -5,6 +5,7 @@
 //! parameter expressions use the containing source's declared language.
 
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 
 /// Default bound for the standalone source projection.
@@ -290,7 +291,7 @@ const fn symbol_byte(byte: u8) -> bool {
 }
 
 /// Find a complete function call or expression group, retaining nesting.
-pub(super) fn group_end(input: &str, start: usize) -> Result<usize> {
+pub(super) fn group_end(input: &str, start: usize, budget: &WorkBudget) -> Result<usize> {
     let mut stack = Vec::new();
     let mut quote = None;
     for (relative, ch) in input[start..].char_indices() {
@@ -302,9 +303,14 @@ pub(super) fn group_end(input: &str, start: usize) -> Result<usize> {
         }
         match ch {
             '"' | '\'' => quote = Some(ch),
-            '(' => stack.push(')'),
-            '{' => stack.push('}'),
-            '[' => stack.push(']'),
+            '(' | '{' | '[' => {
+                budget.check_depth(stack.len().saturating_add(1))?;
+                stack.push(match ch {
+                    '(' => ')',
+                    '{' => '}',
+                    _ => ']',
+                });
+            }
             ')' | '}' | ']' => {
                 ensure!(
                     stack.pop() == Some(ch),
@@ -320,7 +326,7 @@ pub(super) fn group_end(input: &str, start: usize) -> Result<usize> {
     bail!("unterminated expression group in {input}")
 }
 
-pub(super) fn split_arguments(input: &str) -> Result<Vec<&str>> {
+pub(super) fn split_arguments<'a>(input: &'a str, budget: &WorkBudget) -> Result<Vec<&'a str>> {
     let mut args = Vec::new();
     let mut start = 0;
     let mut offset = 0;
@@ -330,7 +336,7 @@ pub(super) fn split_arguments(input: &str) -> Result<Vec<&str>> {
             .next()
             .context("expression boundary")?;
         match ch {
-            '(' | '{' | '[' => offset = group_end(input, offset)? + 1,
+            '(' | '{' | '[' => offset = group_end(input, offset, budget)? + 1,
             '"' | '\'' => {
                 let end = input[offset + 1..]
                     .find(ch)
@@ -338,6 +344,7 @@ pub(super) fn split_arguments(input: &str) -> Result<Vec<&str>> {
                 offset += end + 2;
             }
             ',' => {
+                budget.charge(Resource::GeneratedNodes, 1)?;
                 args.push(input[start..offset].trim());
                 offset += 1;
                 start = offset;
@@ -345,6 +352,7 @@ pub(super) fn split_arguments(input: &str) -> Result<Vec<&str>> {
             _ => offset += ch.len_utf8(),
         }
     }
+    budget.charge(Resource::GeneratedNodes, 1)?;
     args.push(input[start..].trim());
     Ok(args)
 }
@@ -353,12 +361,12 @@ fn lower_call(
     name: &str,
     body: &str,
     language: SourceLanguage,
-    depth: usize,
     limit: usize,
     numeric_suffixes: bool,
+    budget: &WorkBudget,
 ) -> Result<String> {
     if name.eq_ignore_ascii_case("LOG") {
-        let args = split_arguments(body)?;
+        let args = split_arguments(body, budget)?;
         ensure!(
             args.len() == 1 && !args[0].is_empty(),
             "LOG requires one argument"
@@ -368,12 +376,17 @@ fn lower_call(
         } else {
             "ln"
         };
-        return Ok(format!(
-            "{target}({})",
-            rewrite_expression(body, language, depth + 1, true, limit, numeric_suffixes)?
-        ));
+        let argument = rewrite_expression(body, language, true, limit, numeric_suffixes, budget)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            target
+                .len()
+                .saturating_add(argument.len())
+                .saturating_add(2),
+        )?;
+        return Ok(format!("{target}({argument})"));
     }
-    let args = split_arguments(body)?;
+    let args = split_arguments(body, budget)?;
     let [base, exponent] = args.as_slice() else {
         bail!("PWR requires two arguments")
     };
@@ -381,11 +394,10 @@ fn lower_call(
         !base.is_empty() && !exponent.is_empty(),
         "PWR requires two arguments"
     );
-    let base = rewrite_expression(base, language, depth + 1, true, limit, numeric_suffixes)?;
-    let exponent =
-        rewrite_expression(exponent, language, depth + 1, true, limit, numeric_suffixes)?;
+    let base = rewrite_expression(base, language, true, limit, numeric_suffixes, budget)?;
+    let exponent = rewrite_expression(exponent, language, true, limit, numeric_suffixes, budget)?;
     if language == SourceLanguage::Simetrix {
-        return power::guarded(&base, &exponent, limit);
+        return power::guarded(&base, &exponent, limit, budget);
     }
     // ngspice's behavioral PWR is signed, but its static PWR is unsigned.
     // Use the same explicit mathematical operators in both contexts.
@@ -402,6 +414,7 @@ fn lower_call(
         expansion <= limit,
         "source expression expansion byte budget exceeded"
     );
+    budget.charge(Resource::EmittedBytes, expansion)?;
     let power = format!("pow(abs({base}),{exponent})");
     if language == SourceLanguage::Hspice {
         Ok(format!("(sgn({base})*{power})"))
@@ -441,17 +454,23 @@ fn numeric_literal(bytes: &[u8], start: usize) -> (usize, usize) {
     (end, suffix)
 }
 
-fn append_hspice_number(input: &str, start: usize, output: &mut String) -> usize {
+fn append_hspice_number(
+    input: &str,
+    start: usize,
+    output: &mut String,
+    budget: &WorkBudget,
+) -> Result<usize> {
     let bytes = input.as_bytes();
     let (end, suffix) = numeric_literal(bytes, start);
     if matches!(bytes.get(suffix), Some(b'x' | b'X')) {
+        budget.charge(Resource::EmittedBytes, 2)?;
         output.push_str(&input[start..suffix]);
         output.push_str("meg");
         output.push_str(&input[suffix + 1..end]);
     } else {
         output.push_str(&input[start..end]);
     }
-    end
+    Ok(end)
 }
 
 /// Lower one expression region of a standalone SPICE dialect.
@@ -459,23 +478,76 @@ pub(super) fn lower_expression(
     input: &str,
     language: SourceLanguage,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<String> {
-    rewrite_expression(input, language, 0, false, limit, true)
+    rewrite_expression(input, language, false, limit, true, budget)
+}
+
+fn append_expression_identifier(
+    input: &str,
+    start: usize,
+    output: &mut String,
+    language: SourceLanguage,
+    limit: usize,
+    numeric_suffixes: bool,
+    budget: &WorkBudget,
+) -> Result<usize> {
+    let bytes = input.as_bytes();
+    let mut offset = start + 1;
+    while bytes.get(offset).copied().is_some_and(symbol_byte) {
+        offset += 1;
+    }
+    let name = &input[start..offset];
+    let mut open = offset;
+    while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+        open += 1;
+    }
+    if bytes.get(open) == Some(&b'(')
+        && ["LOG", "PWR", "V", "I"]
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        let end = group_end(input, open, budget)?;
+        if name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I") {
+            // Electrical names, not parameter expressions.
+            output.push_str(&input[start..=end]);
+        } else {
+            let lowered = lower_call(
+                name,
+                &input[open + 1..end],
+                language,
+                limit.saturating_sub(output.len()),
+                numeric_suffixes,
+                budget,
+            )?;
+            budget.charge(
+                Resource::EmittedBytes,
+                lowered.len().saturating_sub(end + 1 - start),
+            )?;
+            output.push_str(&lowered);
+        }
+        offset = end + 1;
+    } else {
+        output.push_str(name);
+    }
+    Ok(offset)
 }
 
 fn rewrite_expression(
     input: &str,
     language: SourceLanguage,
-    depth: usize,
     grouped: bool,
     limit: usize,
     numeric_suffixes: bool,
+    budget: &WorkBudget,
 ) -> Result<String> {
-    ensure!(depth < 128, "source expression nesting exceeds 128");
+    let _frame = budget.enter()?;
+    budget.charge(Resource::EvaluationSteps, input.len())?;
     ensure!(
         input.len() <= limit,
         "source expression byte budget exceeded"
     );
+    budget.charge(Resource::EmittedBytes, input.len())?;
     let mut output = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut offset = 0;
@@ -500,19 +572,24 @@ fn rewrite_expression(
                     + offset
                     + 1
             } else {
-                group_end(input, offset)?
+                group_end(input, offset, budget)?
             };
             // A nested braced expression is a mathematical group, not a
             // second ngspice substitution. Canonicalize mixed quote forms.
             output.push(if grouped { '(' } else { '{' });
-            output.push_str(&rewrite_expression(
+            let lowered = rewrite_expression(
                 &input[offset + 1..end],
                 language,
-                depth + 1,
                 true,
                 limit.saturating_sub(output.len()),
                 numeric_suffixes,
-            )?);
+                budget,
+            )?;
+            budget.charge(
+                Resource::EmittedBytes,
+                lowered.len().saturating_sub(end - offset - 1),
+            )?;
+            output.push_str(&lowered);
             output.push(if grouped { ')' } else { '}' });
             offset = end + 1;
         } else if numeric_suffixes
@@ -521,43 +598,19 @@ fn rewrite_expression(
             && (ch.is_ascii_digit()
                 || (ch == '.' && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit)))
         {
-            offset = append_hspice_number(input, offset, &mut output);
+            offset = append_hspice_number(input, offset, &mut output, budget)?;
         } else if (ch.is_ascii_alphabetic() || ch == '_')
             && (offset == 0 || !symbol_byte(bytes[offset - 1]))
         {
-            let start = offset;
-            offset += 1;
-            while bytes.get(offset).copied().is_some_and(symbol_byte) {
-                offset += 1;
-            }
-            let name = &input[start..offset];
-            let mut open = offset;
-            while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
-                open += 1;
-            }
-            if bytes.get(open) == Some(&b'(')
-                && ["LOG", "PWR", "V", "I"]
-                    .iter()
-                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
-            {
-                let end = group_end(input, open)?;
-                if name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I") {
-                    // Electrical names, not parameter expressions.
-                    output.push_str(&input[start..=end]);
-                } else {
-                    output.push_str(&lower_call(
-                        name,
-                        &input[open + 1..end],
-                        language,
-                        depth,
-                        limit.saturating_sub(output.len()),
-                        numeric_suffixes,
-                    )?);
-                }
-                offset = end + 1;
-            } else {
-                output.push_str(name);
-            }
+            offset = append_expression_identifier(
+                input,
+                offset,
+                &mut output,
+                language,
+                limit,
+                numeric_suffixes,
+                budget,
+            )?;
         } else {
             output.push(ch);
             offset += ch.len_utf8();
@@ -568,7 +621,7 @@ fn rewrite_expression(
         );
     }
     if grouped && language == SourceLanguage::Simetrix {
-        power::lower(&output, limit)
+        power::lower_with_budget(&output, limit, budget)
     } else {
         Ok(output)
     }
@@ -589,10 +642,16 @@ fn token_end(input: &str, count: usize) -> usize {
 ///
 /// # Errors
 /// Invalid function arity or unbalanced expression delimiters.
-pub(super) fn lower_statement(
+#[cfg(test)]
+fn lower_statement(statement: &str, context: DialectContext, limit: usize) -> Result<String> {
+    lower_statement_with_budget(statement, context, limit, &WorkBudget::default())
+}
+
+pub(super) fn lower_statement_with_budget(
     statement: &str,
     context: DialectContext,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<String> {
     let trimmed = statement.trim_start();
     let Some(first) = trimmed.split_whitespace().next() else {
@@ -613,7 +672,7 @@ pub(super) fn lower_statement(
             }
             ".FUNC" => {
                 let open = trimmed.find('(').context("missing function arguments")?;
-                group_end(trimmed, open)? + 1
+                group_end(trimmed, open, budget)? + 1
             }
             ".SUBCKT" => token_end(trimmed, 2),
             _ => return Ok(statement.to_owned()),
@@ -642,10 +701,10 @@ pub(super) fn lower_statement(
     output.push_str(&rewrite_expression(
         &trimmed[prefix_end..],
         language,
-        0,
         false,
         limit.saturating_sub(prefix_end),
         false,
+        budget,
     )?);
     if language == SourceLanguage::Simetrix && output.contains("**") {
         let start = match upper.as_str() {
@@ -655,7 +714,8 @@ pub(super) fn lower_statement(
             }
             _ => output.find('=').map_or(output.len(), |index| index + 1),
         };
-        let lowered = power::lower(&output[start..], limit.saturating_sub(start))?;
+        let lowered =
+            power::lower_with_budget(&output[start..], limit.saturating_sub(start), budget)?;
         output.truncate(start);
         output.push_str(&lowered);
     }
@@ -728,6 +788,44 @@ mod tests {
             lower_statement("R1 p**q n 1k", native, 4096)?,
             "R1 p**q n 1k"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn intermediate_power_expansion_consumes_the_request_ledger() -> Result<()> {
+        use model_preprocess_command::{Cancellation, WorkLimits};
+        let hspice = DialectContext {
+            language: SourceLanguage::Hspice,
+            separator: None,
+        };
+        let mut nested = "2".to_owned();
+        for _ in 0..10 {
+            nested = format!("PWR({nested},1)");
+        }
+        for (expression, context) in [
+            (nested, hspice),
+            (format!("{}1", "2**".repeat(10)), DialectContext::default()),
+        ] {
+            let source = format!(".param gain={{{expression}}}");
+            let budget = WorkBudget::new(
+                WorkLimits {
+                    emitted_bytes: 4096,
+                    ..WorkLimits::default()
+                },
+                Cancellation::default(),
+            );
+            let error =
+                lower_statement_with_budget(&source, context, DEFAULT_PROJECTION_BYTES, &budget)
+                    .err()
+                    .context("intermediate expression expansion bypassed the request limit")?;
+            assert!(
+                error.to_string().contains("EmittedBytes budget exceeded"),
+                "{error:#}"
+            );
+            assert!(budget.check().is_err());
+            let lowered = lower_statement(&source, context, DEFAULT_PROJECTION_BYTES)?;
+            assert!(lowered.len() > source.len());
+        }
         Ok(())
     }
 

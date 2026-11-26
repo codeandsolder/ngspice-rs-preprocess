@@ -9,6 +9,7 @@ use crate::{
     waveform::{QspicePoint, QspiceWaveform},
 };
 use anyhow::{Context, Result};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -285,7 +286,8 @@ pub(super) struct Binding {
     pub dc_override: Option<String>,
 }
 
-fn scalar_expression(raw: &[u8], origin: &SourceOrigin) -> Result<String> {
+fn scalar_expression(raw: &[u8], origin: &SourceOrigin, budget: &WorkBudget) -> Result<String> {
+    budget.charge(Resource::EmittedBytes, raw.len())?;
     let text = std::str::from_utf8(raw)?;
     let text = text
         .strip_prefix('{')
@@ -293,7 +295,7 @@ fn scalar_expression(raw: &[u8], origin: &SourceOrigin) -> Result<String> {
         .or_else(|| text.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
         .unwrap_or(text);
     if literal(text.as_bytes()).is_none() {
-        SpiceExpression::parse(text).map_err(|error| {
+        SpiceExpression::parse_with_budget(text, budget).map_err(|error| {
             reject(
                 origin,
                 Feature::Waveform,
@@ -309,6 +311,7 @@ fn bound_waveform(
     shape: Shape,
     args: &Arguments,
     origin: &SourceOrigin,
+    budget: &WorkBudget,
 ) -> Result<QspiceWaveform> {
     match shape {
         Shape::Pwl => {
@@ -319,6 +322,7 @@ fn bound_waveform(
                     "PWL requires at least two time/value pairs",
                 ));
             }
+            budget.charge(Resource::GeneratedNodes, args.fields.len() / 2)?;
             let points = args
                 .fields
                 .as_chunks::<2>()
@@ -329,9 +333,9 @@ fn bound_waveform(
                     let relative = time.starts_with(b"+");
                     let time = time.strip_prefix(b"+").unwrap_or(time);
                     Ok(QspicePoint {
-                        time: scalar_expression(time, origin)?,
+                        time: scalar_expression(time, origin, budget)?,
                         relative,
-                        value: scalar_expression(&text[pair[1].clone()], origin)?,
+                        value: scalar_expression(&text[pair[1].clone()], origin, budget)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -345,7 +349,8 @@ fn bound_waveform(
                     "implicit or finite-repetition PULSE timing requires a separately qualified law",
                 ));
             };
-            let scalar = |field: &Range<usize>| scalar_expression(&text[field.clone()], origin);
+            let scalar =
+                |field: &Range<usize>| scalar_expression(&text[field.clone()], origin, budget);
             Ok(QspiceWaveform::Pulse {
                 first: scalar(first)?,
                 second: scalar(second)?,
@@ -420,18 +425,19 @@ fn prepare_binding(
     statement: &Statement,
     origin: &SourceOrigin,
     fields: &[Range<usize>],
-    shape: Shape,
-    args: &Arguments,
+    waveform: (Shape, &Arguments),
     edits: &mut Vec<Edit>,
     input: &[u8],
+    budget: &WorkBudget,
 ) -> Result<Binding> {
+    let (shape, args) = waveform;
     let text = &statement.text;
-    let waveform = bound_waveform(text, shape, args, origin)?;
+    let waveform = bound_waveform(text, shape, args, origin, budget)?;
     let span = waveform_span(args)?;
     let dc = dc_field(text, fields, &span, origin)?;
     let dc_override = dc
         .as_ref()
-        .map(|field| scalar_expression(&text[field.clone()], origin))
+        .map(|field| scalar_expression(&text[field.clone()], origin, budget))
         .transpose()?;
     let mut replacements = Vec::new();
     if let Some(dc) = dc {
@@ -457,6 +463,7 @@ pub(super) fn rewrite(
     fields: &[Range<usize>],
     edits: &mut Vec<Edit>,
     input: &[u8],
+    budget: &WorkBudget,
 ) -> Result<Option<Binding>> {
     let text = &statement.text;
     if fields
@@ -475,14 +482,23 @@ pub(super) fn rewrite(
         };
         let args = arguments(text, fields, index, name_len)
             .map_err(|error| reject(origin, Feature::Waveform, &error.to_string()))?;
+        budget.charge(Resource::EvaluationSteps, args.fields.len())?;
         validate_modifiers(statement, origin, &args, fields)?;
         if args
             .fields
             .iter()
             .any(|span| literal(&text[span.clone()]).is_none())
         {
-            return prepare_binding(statement, origin, fields, shape, &args, edits, input)
-                .map(Some);
+            return prepare_binding(
+                statement,
+                origin,
+                fields,
+                (shape, &args),
+                edits,
+                input,
+                budget,
+            )
+            .map(Some);
         }
         match shape {
             Shape::Pwl => pwl(statement, origin, &args, edits)?,

@@ -3,8 +3,8 @@
 //! compatibility flag is set by this producer.
 use super::{SourceExpansion, analysis_plan};
 use crate::{
-    AdmittedSource, Cancellation, NativeProjection, Options, PreparedBundle, Request,
-    SourceSession, native_bundle,
+    AdmittedSource, Cancellation, NativeProjection, Options, PreparedBundle, Request, Resource,
+    SourceSession, WorkBudget, native_bundle,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
@@ -42,7 +42,7 @@ struct DeckOptions {
     mos: mos::Options,
 }
 
-fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
+fn normalize_options(text: &str, state: &mut DeckOptions, budget: &WorkBudget) -> Result<String> {
     let tail = text
         .split_once(char::is_whitespace)
         .map_or("", |(_, tail)| tail);
@@ -100,6 +100,7 @@ fn normalize_options(text: &str, state: &mut DeckOptions) -> Result<String> {
                         .as_deref()
                         .or_else(|| (key == "WL").then_some("1"))
                         .context("missing MOS option value")?,
+                    budget,
                 )?;
                 continue;
             }
@@ -227,8 +228,11 @@ fn controlled_value_start(
 fn map_values(
     text: &str,
     limit: usize,
+    budget: &WorkBudget,
     mut map: impl FnMut(&str, usize) -> Result<String>,
 ) -> Result<String> {
+    budget.charge(Resource::ScannedBytes, text.len())?;
+    budget.charge(Resource::EmittedBytes, text.len())?;
     let ranges = statement_token_spans(text)?;
     let command = analysis_plan::command(text);
     let start = |index: usize| ranges.get(index).map_or(text.len(), |range| range.start);
@@ -255,7 +259,12 @@ fn map_values(
                 let begin = start(index);
                 let end = start(index + 3);
                 output.push_str(&text[previous..begin]);
-                output.push_str(&map(&text[begin..end], limit.saturating_sub(output.len()))?);
+                let mapped = map(&text[begin..end], limit.saturating_sub(output.len()))?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    mapped.len().saturating_sub(end - begin),
+                )?;
+                output.push_str(&mapped);
                 previous = end;
             }
             output.push_str(&text[previous..]);
@@ -277,7 +286,12 @@ fn map_values(
         },
     };
     let mut output = text[..offset].to_owned();
-    output.push_str(&map(&text[offset..], limit.saturating_sub(offset))?);
+    let mapped = map(&text[offset..], limit.saturating_sub(offset))?;
+    budget.charge(
+        Resource::EmittedBytes,
+        mapped.len().saturating_sub(text.len() - offset),
+    )?;
+    output.push_str(&mapped);
     ensure!(
         output.len() <= limit,
         "source expression byte budget exceeded"
@@ -290,14 +304,31 @@ fn lower_function(
     body: &str,
     context: DialectContext,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<String> {
+    budget.charge(Resource::ScannedBytes, body.len())?;
     let body = body.trim().trim_start_matches('=').trim();
     ensure!(!body.is_empty(), "empty HSPICE function body");
-    let value = lower_spice_expression(body, context, limit)?;
+    let value = lower_spice_expression(body, context, limit, budget)?;
     let value = value
         .strip_prefix('{')
         .and_then(|inner| inner.strip_suffix('}'))
         .unwrap_or(&value);
+    budget.charge(
+        Resource::EmittedBytes,
+        signature
+            .name
+            .len()
+            .saturating_add(value.len())
+            .saturating_add(
+                signature
+                    .formals
+                    .iter()
+                    .map(|formal| formal.len().saturating_add(1))
+                    .sum::<usize>(),
+            )
+            .saturating_add(12),
+    )?;
     let output = format!(
         ".func {}({}) {{{value}}}",
         signature.name,
@@ -314,12 +345,15 @@ fn lower_parameter_functions(
     text: &str,
     context: DialectContext,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<Option<Vec<String>>> {
     let tail = text
         .split_once(char::is_whitespace)
         .context("empty parameter declaration")?
         .1;
+    budget.charge(Resource::ScannedBytes, tail.len())?;
     let declarations = parse_parameter_declarations(tail)?;
+    budget.charge(Resource::GeneratedNodes, declarations.len())?;
     if declarations
         .iter()
         .all(|declaration| declaration.function.is_none())
@@ -334,9 +368,9 @@ fn lower_parameter_functions(
             .expression
             .context("missing HSPICE parameter value")?;
         let line = if let Some(signature) = declaration.function {
-            lower_function(&signature, &value, context, remaining)?
+            lower_function(&signature, &value, context, remaining, budget)?
         } else {
-            let lowered = lower_spice_expression(&value, context, remaining)?;
+            let lowered = lower_spice_expression(&value, context, remaining, budget)?;
             format!(".param {}={lowered}", declaration.field.name)
         };
         remaining = remaining
@@ -352,6 +386,7 @@ fn lower_card(
     context: DialectContext,
     state: &mut DeckOptions,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<String> {
     let text = text.trim();
     if text.is_empty() || text.starts_with('*') {
@@ -362,6 +397,7 @@ fn lower_card(
     let fields = statement_token_spans(text)?;
     if command == ".SUBCKT" {
         state.depth += 1;
+        budget.check_depth(state.depth)?;
     } else if command == ".ENDS" {
         state.depth = state.depth.checked_sub(1).context("unmatched .ENDS")?;
     }
@@ -376,8 +412,10 @@ fn lower_card(
             .split_once(char::is_whitespace)
             .context("empty function declaration")?
             .1;
+        budget.charge(Resource::ScannedBytes, tail.len())?;
         let (signature, body) = parse_function_signature(tail)?;
-        return lower_function(&signature, body, context, limit);
+        budget.charge(Resource::GeneratedNodes, signature.formals.len())?;
+        return lower_function(&signature, body, context, limit, budget);
     }
     if !command.starts_with('.') {
         let kind = command.as_bytes()[0];
@@ -412,7 +450,7 @@ fn lower_card(
         }
     }
     let mut source = match command.as_str() {
-        ".OPTION" | ".OPTIONS" | ".OPT" if hspice => normalize_options(text, state)?,
+        ".OPTION" | ".OPTIONS" | ".OPT" if hspice => normalize_options(text, state, budget)?,
         ".TEMP" => {
             ensure!(
                 fields.len() == 2,
@@ -427,8 +465,8 @@ fn lower_card(
         _ if command.starts_with('.') => bail!("unqualified HSPICE directive {command}"),
         _ => lower_source(text)?,
     };
-    source = map_values(&source, limit, |value, remaining| {
-        lower_spice_expression(value, context, remaining)
+    source = map_values(&source, limit, budget, |value, remaining| {
+        lower_spice_expression(value, context, remaining, budget)
     })?;
     if matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN") {
         source = analysis::lower(&source)?;
@@ -438,9 +476,12 @@ fn lower_card(
 
 fn depletion_mode(
     statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
+    budget: &WorkBudget,
 ) -> Result<u8> {
     let mut mode = None;
     for statement in statements {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
         if !matches!(
             analysis_plan::command(&statement.text).as_str(),
             ".OPTION" | ".OPTIONS" | ".OPT"
@@ -476,18 +517,48 @@ type LoweredExpansion = (
     DeckOptions,
 );
 
+fn append_lowered_line(
+    bytes: &mut Vec<u8>,
+    origins: &mut Vec<crate::OriginLine>,
+    text: &str,
+    origin: crate::OriginLine,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<()> {
+    ensure!(
+        text.len().saturating_add(1) <= limit.saturating_sub(bytes.len()),
+        "standalone SPICE output byte budget exceeded"
+    );
+    budget.charge(Resource::EmittedBytes, text.len().saturating_add(1))?;
+    budget.charge(Resource::GeneratedNodes, 1)?;
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.push(b'\n');
+    origins.push(origin);
+    Ok(())
+}
+
 fn lower_expansion(
     statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
     input_origins: Vec<crate::OriginLine>,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<LoweredExpansion> {
-    let dcap = depletion_mode(statements.get(1..).context("missing HSPICE deck title")?)?;
+    let dcap = depletion_mode(
+        statements.get(1..).context("missing HSPICE deck title")?,
+        budget,
+    )?;
+    ensure!(
+        statements.len() == input_origins.len(),
+        "HSPICE statement origin mismatch"
+    );
     let mut selections = Vec::new();
     let mut scope = Vec::new();
     let mut bytes = Vec::new();
     let mut origins = Vec::new();
     let mut state = DeckOptions::default();
     for (index, (statement, origin)) in statements.iter().zip(input_origins).enumerate() {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
         if index != 0
             && statement.context.language == SourceLanguage::Hspice
             && analysis_plan::command(&statement.text) == ".PARAM"
@@ -495,13 +566,20 @@ fn lower_expansion(
                 &statement.text,
                 statement.context,
                 limit.saturating_sub(bytes.len()),
+                budget,
             )
             .with_context(|| format!("{}:{}", statement.source, statement.first_line))?
         {
             for line in lines {
-                bytes.extend_from_slice(line.as_bytes());
-                bytes.push(b'\n');
-                origins.push(origin.clone());
+                budget.charge(Resource::EmittedBytes, origin.source.as_os_str().len())?;
+                append_lowered_line(
+                    &mut bytes,
+                    &mut origins,
+                    &line,
+                    origin.clone(),
+                    limit,
+                    budget,
+                )?;
             }
             continue;
         }
@@ -514,9 +592,14 @@ fn lower_expansion(
                 statement.text.clone()
             }
         } else if analysis_plan::command(&statement.text) == ".MODEL" {
-            let (text, selection) =
-                models::lower(statement, &scope, dcap, limit.saturating_sub(bytes.len()))
-                    .with_context(|| format!("{}:{}", statement.source, statement.first_line))?;
+            let (text, selection) = models::lower(
+                statement,
+                &scope,
+                dcap,
+                limit.saturating_sub(bytes.len()),
+                budget,
+            )
+            .with_context(|| format!("{}:{}", statement.source, statement.first_line))?;
             selections.push(selection);
             text
         } else {
@@ -539,6 +622,7 @@ fn lower_expansion(
                 statement.context,
                 &mut state,
                 limit.saturating_sub(bytes.len()),
+                budget,
             )
             .with_context(|| {
                 format!(
@@ -547,13 +631,7 @@ fn lower_expansion(
                 )
             })?
         };
-        ensure!(
-            text.len().saturating_add(1) <= limit.saturating_sub(bytes.len()),
-            "standalone SPICE output byte budget exceeded"
-        );
-        bytes.extend_from_slice(text.as_bytes());
-        bytes.push(b'\n');
-        origins.push(origin);
+        append_lowered_line(&mut bytes, &mut origins, &text, origin, limit, budget)?;
     }
     ensure!(state.depth == 0, "unclosed HSPICE subcircuit");
     Ok((bytes, origins, selections, state))
@@ -562,8 +640,9 @@ fn lower_expansion(
 fn add_catalog(
     statements: &mut Vec<model_preprocess_simplis::source_dialect::ScopedStatement>,
     origins: &mut Vec<crate::OriginLine>,
-    members: Vec<(crate::ParsedLibrary, String)>,
+    members: Vec<(std::borrow::Cow<'_, crate::ParsedLibrary>, String)>,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<()> {
     let mut linked = Vec::new();
     let mut linked_origins = Vec::new();
@@ -573,21 +652,27 @@ fn add_catalog(
         .map(|statement| statement.text.len().saturating_add(1))
         .sum::<usize>();
     for (member, _) in members {
+        budget.charge(Resource::SourceVisits, 1)?;
+        budget.charge(Resource::EvaluationSteps, 1)?;
         if !seen.insert(member.source_id().to_owned()) {
             continue;
         }
         for statement in member.scoped_statements() {
+            budget.charge(Resource::Statements, 1)?;
+            budget.charge(Resource::ScannedBytes, statement.text.len())?;
             size = size.saturating_add(statement.text.len()).saturating_add(1);
             ensure!(
                 size <= limit,
                 "HSPICE catalog expansion byte budget exceeded"
             );
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(Resource::EmittedBytes, statement.source.len())?;
             linked_origins.push(crate::OriginLine {
                 source: std::path::PathBuf::from(&statement.source),
                 line: statement.first_line,
                 last_line: statement.last_line,
             });
-            linked.push(statement.clone());
+            linked.push(statement.clone_with_budget(budget)?);
         }
     }
     // Catalog support declarations precede root declarations. Explicit root
@@ -616,9 +701,16 @@ pub(super) fn prepare(
         ..
     } = expansion;
     let members = super::catalog_members(request, options, cancellation, session, context)?;
-    add_catalog(&mut statements, &mut origins, members, options.output_bytes)?;
+    let budget = session.budget();
+    add_catalog(
+        &mut statements,
+        &mut origins,
+        members,
+        options.output_bytes,
+        budget,
+    )?;
     let (mut bytes, mut origins, selections, state) =
-        lower_expansion(&statements, origins, options.output_bytes)?;
+        lower_expansion(&statements, origins, options.output_bytes, budget)?;
     {
         (bytes, origins) = hierarchy::bind(
             &bytes,
@@ -627,6 +719,7 @@ pub(super) fn prepare(
             state.xmult_in_exp.unwrap_or_default(),
             &state.mos,
             options.output_bytes,
+            budget,
         )?;
 
         // HSPICE defaults to 25 C for both device nominal and analysis
@@ -653,16 +746,23 @@ pub(super) fn prepare(
             bytes.len().saturating_add(default_text.len()) <= options.output_bytes,
             "standalone SPICE output byte budget exceeded"
         );
+        budget.charge(Resource::EmittedBytes, default_text.len())?;
+        budget.charge(Resource::GeneratedNodes, defaults.len())?;
+        budget.charge(
+            Resource::EmittedBytes,
+            root.path.as_os_str().len().saturating_mul(defaults.len()),
+        )?;
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
     }
-    bytes = models::resolve_breakdown(&bytes, RootKind::Deck, options.output_bytes)?;
+    bytes = models::resolve_breakdown(&bytes, RootKind::Deck, options.output_bytes, budget)?;
     let mut bundle = native_bundle(
         root.path.clone(),
         request.format,
         RootKind::Deck,
-        NativeProjection::plain(&bytes, RootKind::Deck)?,
+        NativeProjection::plain(&bytes, RootKind::Deck, budget)?,
         &origins,
+        budget,
     )?;
     bundle.model_selections = selections;
     Ok(bundle)

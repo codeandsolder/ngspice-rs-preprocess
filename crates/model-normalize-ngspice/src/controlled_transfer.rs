@@ -5,6 +5,7 @@ use crate::{
     param_expression::{SpiceExpression, rational_coefficients},
 };
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputKind {
@@ -73,14 +74,18 @@ const fn eq(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
-fn scalar(text: &str) -> Result<String> {
-    SpiceExpression::parse(text).with_context(|| format!("invalid transfer scalar {text}"))?;
+fn scalar(text: &str, budget: &WorkBudget) -> Result<String> {
+    SpiceExpression::parse_with_budget(text, budget)
+        .with_context(|| format!("invalid transfer scalar {text}"))?;
+    budget.charge(Resource::EmittedBytes, text.len())?;
+    budget.charge(Resource::GeneratedNodes, 1)?;
     Ok(text.to_owned())
 }
 
 /// Scan point lists without splitting quoted/braced parameter expressions.
 /// Parentheses and brackets delimit complete rows or groups of complete rows.
-fn points<const N: usize>(text: &str) -> Result<Vec<[String; N]>> {
+fn points<const N: usize>(text: &str, budget: &WorkBudget) -> Result<Vec<[String; N]>> {
+    budget.charge(Resource::ScannedBytes, text.len())?;
     let mut values = Vec::new();
     let mut groups = Vec::new();
     let mut start = None;
@@ -106,6 +111,7 @@ fn points<const N: usize>(text: &str) -> Result<Vec<[String; N]>> {
         if byte == b'{' {
             start.get_or_insert(index);
             braces += 1;
+            budget.check_depth(braces.saturating_add(groups.len()))?;
             continue;
         }
         if byte == b'}' {
@@ -119,7 +125,7 @@ fn points<const N: usize>(text: &str) -> Result<Vec<[String; N]>> {
         }
         if byte.is_ascii_whitespace() || matches!(byte, b',' | b'(' | b')' | b'[' | b']') {
             if let Some(begin) = start.take() {
-                values.push(scalar(&text[begin..index])?);
+                values.push(scalar(&text[begin..index], budget)?);
             }
             match byte {
                 b'(' | b'[' => {
@@ -127,6 +133,7 @@ fn points<const N: usize>(text: &str) -> Result<Vec<[String; N]>> {
                         values.len().is_multiple_of(N),
                         "transfer group starts inside a row"
                     );
+                    budget.check_depth(groups.len().saturating_add(1))?;
                     groups.push((byte, values.len()));
                 }
                 b')' | b']' => {
@@ -152,12 +159,13 @@ fn points<const N: usize>(text: &str) -> Result<Vec<[String; N]>> {
         "unterminated transfer list"
     );
     if let Some(begin) = start {
-        values.push(scalar(&text[begin..])?);
+        values.push(scalar(&text[begin..], budget)?);
     }
     ensure!(
         !values.is_empty() && values.len().is_multiple_of(N),
         "expected complete transfer rows of {N} values"
     );
+    budget.charge(Resource::GeneratedNodes, values.len() / N)?;
     let mut rows = Vec::with_capacity(values.len() / N);
     let mut values = values.into_iter();
     while values.len() != 0 {
@@ -196,6 +204,7 @@ fn table(
     fields: &[&str],
     control_nodes: bool,
     output: OutputKind,
+    budget: &WorkBudget,
 ) -> Result<(Control, Transfer, bool)> {
     let (control, rest) = if control_nodes {
         ensure!(
@@ -225,7 +234,7 @@ fn table(
             output == OutputKind::Current,
             "multiplier is only valid for G TABLE"
         );
-        (rows, Some(scalar(value)?))
+        (rows, Some(scalar(value, budget)?))
     } else {
         (rest, None)
     };
@@ -239,14 +248,14 @@ fn table(
     Ok((
         control,
         Transfer::Table {
-            points: points(wrapped.unwrap_or(&list))?,
+            points: points(wrapped.unwrap_or(&list), budget)?,
             multiplier,
         },
         wrapped.is_some(),
     ))
 }
 
-fn frequency(fields: &[&str]) -> Result<(Control, Transfer)> {
+fn frequency(fields: &[&str], budget: &WorkBudget) -> Result<(Control, Transfer)> {
     let fields = fields.strip_prefix(&["="]).unwrap_or(fields);
     let (expression, rest) = fields.split_first().context("missing FREQ control")?;
     let control = control_expression(expression, true)?;
@@ -283,12 +292,16 @@ fn frequency(fields: &[&str]) -> Result<(Control, Transfer)> {
         control,
         Transfer::Frequency {
             encoding,
-            points: points(&rest.join(" "))?,
+            points: points(&rest.join(" "), budget)?,
         },
     ))
 }
 
-fn laplace(fields: &[&str], differential: bool) -> Result<(Control, Transfer)> {
+fn laplace(
+    fields: &[&str],
+    differential: bool,
+    budget: &WorkBudget,
+) -> Result<(Control, Transfer)> {
     let (control, rest) = if differential {
         let [positive, negative, _, rest @ ..] = fields else {
             bail!("missing differential LAPLACE control");
@@ -310,7 +323,7 @@ fn laplace(fields: &[&str], differential: bool) -> Result<(Control, Transfer)> {
     // transforms use the physical variable s, not frequency in Hz.
     ensure!(!rest.is_empty(), "missing LAPLACE transform");
     let expression = rest.join(" ");
-    let (numerator, denominator) = rational_coefficients(&expression).context(
+    let (numerator, denominator) = rational_coefficients(&expression, budget).context(
         "invalid rational LAPLACE transform (delay/convolution options are not supported)",
     )?;
     Ok((
@@ -330,10 +343,23 @@ fn laplace(fields: &[&str], differential: bool) -> Result<(Control, Transfer)> {
 /// # Errors
 /// Invalid transfer grammar, ambiguous hybrid syntax or malformed points.
 pub fn parse(statement: &str) -> Result<Option<ControlledTransfer>> {
-    Ok(parse_with_layout(statement)?.map(|(transfer, _)| transfer))
+    parse_with_budget(statement, &WorkBudget::default())
 }
 
-fn parse_with_layout(statement: &str) -> Result<Option<(ControlledTransfer, bool)>> {
+/// Recognize a transfer using the caller's shared cumulative request budget.
+/// # Errors
+/// Invalid source grammar or exhausted work allowance.
+pub fn parse_with_budget(
+    statement: &str,
+    budget: &WorkBudget,
+) -> Result<Option<ControlledTransfer>> {
+    Ok(parse_with_layout(statement, budget)?.map(|(transfer, _)| transfer))
+}
+
+fn parse_with_layout(
+    statement: &str,
+    budget: &WorkBudget,
+) -> Result<Option<(ControlledTransfer, bool)>> {
     let first = statement
         .trim_start()
         .as_bytes()
@@ -344,6 +370,8 @@ fn parse_with_layout(statement: &str) -> Result<Option<(ControlledTransfer, bool
         Some(b'g') => OutputKind::Current,
         _ => return Ok(None),
     };
+    budget.charge(Resource::ScannedBytes, statement.len())?;
+    budget.charge(Resource::EmittedBytes, statement.len())?;
     let spans = lexical::tokens(statement.as_bytes())?;
     let fields = spans
         .into_iter()
@@ -355,23 +383,23 @@ fn parse_with_layout(statement: &str) -> Result<Option<(ControlledTransfer, bool
     let (negative, control, transfer, wrapped) = if eq(third, "freq")
         && rest.first().is_some_and(|s| s.starts_with('{'))
     {
-        let (control, transfer) = frequency(rest)?;
+        let (control, transfer) = frequency(rest, budget)?;
         ("0", control, transfer, false)
     } else if let Some((keyword, tail)) = rest.split_first() {
         if eq(keyword, "table") && !ordinary_control_tail(tail) {
-            let (control, transfer, wrapped) = table(tail, false, output)?;
+            let (control, transfer, wrapped) = table(tail, false, output, budget)?;
             (*third, control, transfer, wrapped)
         } else if eq(keyword, "freq") && !ordinary_control_tail(tail) {
-            let (control, transfer) = frequency(tail)?;
+            let (control, transfer) = frequency(tail, budget)?;
             (*third, control, transfer, false)
         } else if rest.len() > 3 && rest.get(2).is_some_and(|s| eq(s, "laplace")) {
-            let (control, transfer) = laplace(rest, true)?;
+            let (control, transfer) = laplace(rest, true, budget)?;
             (*third, control, transfer, false)
         } else if eq(keyword, "laplace") && (tail.len() != 2 || tail[0].starts_with(['{', '='])) {
-            let (control, transfer) = laplace(tail, false)?;
+            let (control, transfer) = laplace(tail, false, budget)?;
             (*third, control, transfer, false)
         } else if rest.len() > 3 && rest.get(2).is_some_and(|s| eq(s, "table")) {
-            let (control, transfer, wrapped) = table(rest, true, output)?;
+            let (control, transfer, wrapped) = table(rest, true, output, budget)?;
             (*third, control, transfer, wrapped)
         } else {
             return Ok(None);
@@ -379,7 +407,7 @@ fn parse_with_layout(statement: &str) -> Result<Option<(ControlledTransfer, bool
     } else {
         return Ok(None);
     };
-    validate_known(&transfer)?;
+    validate_known(&transfer, budget)?;
     Ok(Some((
         ControlledTransfer {
             name: (*name).to_owned(),
@@ -393,19 +421,23 @@ fn parse_with_layout(statement: &str) -> Result<Option<(ControlledTransfer, bool
     )))
 }
 
-fn known_scalar(text: &str) -> Result<Option<f64>> {
-    SpiceExpression::parse(text)?
-        .known_value()
+fn known_scalar(text: &str, budget: &WorkBudget) -> Result<Option<f64>> {
+    SpiceExpression::parse_with_budget(text, budget)?
+        .known_value(budget)
         .with_context(|| format!("invalid transfer scalar {text}"))
 }
 
-fn known_points<const N: usize>(rows: &[[String; N]]) -> Result<Vec<[Option<f64>; N]>> {
+fn known_points<const N: usize>(
+    rows: &[[String; N]],
+    budget: &WorkBudget,
+) -> Result<Vec<[Option<f64>; N]>> {
+    budget.charge(Resource::GeneratedNodes, rows.len())?;
     let mut result = Vec::with_capacity(rows.len());
     let mut previous = None;
     for row in rows {
         let mut values = [None; N];
         for (slot, text) in values.iter_mut().zip(row) {
-            *slot = known_scalar(text)?;
+            *slot = known_scalar(text, budget)?;
         }
         if let Some(x) = values[0] {
             ensure!(
@@ -419,16 +451,16 @@ fn known_points<const N: usize>(rows: &[[String; N]]) -> Result<Vec<[Option<f64>
     Ok(result)
 }
 
-fn validate_known(transfer: &Transfer) -> Result<()> {
+fn validate_known(transfer: &Transfer, budget: &WorkBudget) -> Result<()> {
     match transfer {
         Transfer::Table { points, multiplier } => {
-            known_points(points)?;
+            known_points(points, budget)?;
             if let Some(value) = multiplier {
-                known_scalar(value)?;
+                known_scalar(value, budget)?;
             }
         }
         Transfer::Frequency { encoding, points } => {
-            for [frequency, a, _] in known_points(points)? {
+            for [frequency, a, _] in known_points(points, budget)? {
                 ensure!(
                     frequency.is_none_or(|value| value >= 0.),
                     "negative transfer frequency"
@@ -453,11 +485,11 @@ fn validate_known(transfer: &Transfer) -> Result<()> {
             denominator,
         } => {
             for value in numerator {
-                known_scalar(value)?;
+                known_scalar(value, budget)?;
             }
             let leading = denominator
                 .iter()
-                .map(|value| known_scalar(value))
+                .map(|value| known_scalar(value, budget))
                 .collect::<Result<Vec<_>>>()?;
             ensure!(
                 leading
@@ -644,12 +676,12 @@ fn emit_table(
 fn emit_transfer_network(
     source: &ControlledTransfer,
     kind: &str,
-    used: &mut std::collections::BTreeSet<Vec<u8>>,
+    used: &mut super::IdentifierAllocator,
     serial: usize,
 ) -> Result<(String, String)> {
     use std::fmt::Write;
     let mut fresh = |base: &[u8]| -> Result<String> {
-        let name = super::fresh_identifier(used, base).context("transfer identifier overflow")?;
+        let name = used.fresh(base)?;
         Ok(String::from_utf8(name)?)
     };
     let model = fresh(format!("__{kind}_{serial}_model").as_bytes())?;
@@ -682,7 +714,7 @@ fn emit_frequency(
     source: &ControlledTransfer,
     encoding: FrequencyEncoding,
     points: &[[String; 3]],
-    used: &mut std::collections::BTreeSet<Vec<u8>>,
+    used: &mut super::IdentifierAllocator,
     serial: usize,
 ) -> Result<String> {
     use std::fmt::Write;
@@ -714,25 +746,92 @@ fn emit_rational(
     source: &ControlledTransfer,
     numerator: &[String],
     denominator: &[String],
-    used: &mut std::collections::BTreeSet<Vec<u8>>,
+    used: &mut super::IdentifierAllocator,
     serial: usize,
+    budget: &WorkBudget,
 ) -> Result<String> {
-    use std::fmt::Write;
+    use std::fmt::Write as _;
+    for value in numerator.iter().chain(denominator) {
+        budget.charge(Resource::EmittedBytes, value.len().saturating_add(3))?;
+    }
     let (mut text, model) = emit_transfer_network(source, "laplace", used, serial)?;
-    let coefficients = |values: &[String]| {
-        values
-            .iter()
-            .map(|value| native_scalar(value).into_owned())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    write!(
-        text,
-        ".model {model} s_xfer(num_coeff=[{}] den_coeff=[{}] denormalized_freq=1)",
-        coefficients(numerator),
-        coefficients(denominator)
-    )?;
+    write!(text, ".model {model} s_xfer(num_coeff=[")?;
+    for (index, values) in [numerator, denominator].into_iter().enumerate() {
+        if index != 0 {
+            text.push_str("] den_coeff=[");
+        }
+        for (i, value) in values.iter().enumerate() {
+            if i != 0 {
+                text.push(' ');
+            }
+            text.push_str(&native_scalar(value));
+        }
+    }
+    text.push_str("] denormalized_freq=1)");
     Ok(text)
+}
+
+fn emit_lowered_transfer(
+    transfer: &ControlledTransfer,
+    wrapped: bool,
+    input: &[u8],
+    used: &mut Option<super::IdentifierAllocator>,
+    serial: usize,
+    budget: &WorkBudget,
+) -> Result<Option<String>> {
+    let generated = match &transfer.transfer {
+        Transfer::Table { points, multiplier } => {
+            budget.charge(Resource::GeneratedNodes, points.len())?;
+            // ngspice parses adjacent tuples containing braced ordinates
+            // incorrectly. Separate the tuples even when already braced.
+            let symbolic_expression_table = matches!(transfer.control, Control::Expression(_))
+                && points
+                    .iter()
+                    .flatten()
+                    .any(|value| crate::model_card::parse_spice_constant(value).is_err());
+            if !wrapped
+                && !symbolic_expression_table
+                && !table_needs_rewrite(points, multiplier.as_deref())
+            {
+                return Ok(None);
+            }
+            emit_table(transfer, points, multiplier.as_deref())?
+        }
+        Transfer::Frequency { encoding, points } => {
+            budget.charge(Resource::GeneratedNodes, points.len())?;
+            if used.is_none() {
+                *used = Some(super::IdentifierAllocator::new(input, budget)?);
+            }
+            emit_frequency(
+                transfer,
+                *encoding,
+                points,
+                used.as_mut().context("missing identifier allocator")?,
+                serial,
+            )?
+        }
+        Transfer::Rational {
+            numerator,
+            denominator,
+        } => {
+            budget.charge(
+                Resource::GeneratedNodes,
+                numerator.len().saturating_add(denominator.len()),
+            )?;
+            if used.is_none() {
+                *used = Some(super::IdentifierAllocator::new(input, budget)?);
+            }
+            emit_rational(
+                transfer,
+                numerator,
+                denominator,
+                used.as_mut().context("missing identifier allocator")?,
+                serial,
+                budget,
+            )?
+        }
+    };
+    Ok(Some(generated))
 }
 
 /// Native source transformation with one physical input-line reference for
@@ -753,7 +852,9 @@ pub struct LoweredSources {
 pub fn lower_sources(
     input: &[u8],
     source_line: impl Fn(usize) -> Result<usize>,
+    budget: &model_preprocess_command::WorkBudget,
 ) -> Result<Option<LoweredSources>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
     if !input.windows(4).any(|w| w.eq_ignore_ascii_case(b"freq"))
         && !input.windows(5).any(|w| w.eq_ignore_ascii_case(b"table"))
         && !input.windows(7).any(|w| w.eq_ignore_ascii_case(b"laplace"))
@@ -765,6 +866,7 @@ pub fn lower_sources(
     let mut inserted_lines = Vec::new();
     let mut in_control = false;
     for statement in lexical::statements(input)? {
+        budget.charge(Resource::Statements, 1)?;
         let text = &statement.text;
         let first = text
             .split(u8::is_ascii_whitespace)
@@ -787,46 +889,17 @@ pub fn lower_sources(
         let source =
             std::str::from_utf8(text).context("controlled transfer source is not UTF-8")?;
         let line = source_line(statement.line)?;
-        let Some((transfer, wrapped)) = parse_with_layout(source)
+        let Some((transfer, wrapped)) = parse_with_layout(source, budget)
             .with_context(|| format!("line {line}: controlled transfer"))?
         else {
             continue;
         };
-        let generated = match &transfer.transfer {
-            Transfer::Table { points, multiplier } => {
-                // ngspice parses adjacent tuples containing braced ordinates
-                // incorrectly. Separate the tuples even when already braced.
-                let symbolic_expression_table = matches!(transfer.control, Control::Expression(_))
-                    && points
-                        .iter()
-                        .flatten()
-                        .any(|value| crate::model_card::parse_spice_constant(value).is_err());
-                if !wrapped
-                    && !symbolic_expression_table
-                    && !table_needs_rewrite(points, multiplier.as_deref())
-                {
-                    continue;
-                }
-                emit_table(&transfer, points, multiplier.as_deref())?
-            }
-            Transfer::Frequency { encoding, points } => emit_frequency(
-                &transfer,
-                *encoding,
-                points,
-                used.get_or_insert_with(|| super::source_identifiers(input)),
-                statement.line,
-            )?,
-            Transfer::Rational {
-                numerator,
-                denominator,
-            } => emit_rational(
-                &transfer,
-                numerator,
-                denominator,
-                used.get_or_insert_with(|| super::source_identifiers(input)),
-                statement.line,
-            )?,
+        let Some(generated) =
+            emit_lowered_transfer(&transfer, wrapped, input, &mut used, statement.line, budget)?
+        else {
+            continue;
         };
+        budget.charge(Resource::EmittedBytes, generated.len())?;
         if generated.as_bytes() == text {
             continue;
         }
@@ -837,6 +910,11 @@ pub fn lower_sources(
         let (_, ending) = lexical::split_line_ending(physical);
         let newline = if ending == b"\r\n" { "\r\n" } else { "\n" };
         let extra = generated.bytes().filter(|b| *b == b'\n').count();
+        budget.charge(Resource::GeneratedNodes, extra)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            generated.len().saturating_add(extra),
+        )?;
         inserted_lines.extend(std::iter::repeat_n(statement.line, extra));
         let generated = generated.replace('\n', newline);
         lexical::replace_span(&statement, 0..text.len(), generated.as_bytes(), &mut edits);
@@ -845,7 +923,7 @@ pub fn lower_sources(
         }
     }
     Ok(
-        lexical::apply_edits(input, edits).map(|bytes| LoweredSources {
+        lexical::apply_budgeted_edits(input, edits, budget)?.map(|bytes| LoweredSources {
             bytes,
             inserted_lines,
         }),
@@ -977,14 +1055,22 @@ mod tests {
     #[test]
     fn lowering_preserves_comments_source_map_and_branch_names() -> Result<()> {
         let input = b"title\r\nL1 a b 1u Rser=1\r\nE1 out 0 FREQ {v(a,b)*2}=MAG RAD\r\n+ (10,2,0)\r\n+ (20,2,1.57) ; tail\r\nR1 __freq_3_out 0 1k\r\nE2 q 0 TABLE {v(a)}=(0,0)(1,1)\r\n.end\r\n";
-        let result = normalize_mapped(input, RootKind::Deck)?;
+        let result = normalize_mapped(
+            input,
+            RootKind::Deck,
+            &model_preprocess_command::WorkBudget::default(),
+        )?;
         let text = std::str::from_utf8(&result.model.bytes)?;
         assert!(text.contains("E1 out 0 __freq_3_out_1 0 1\r\n"));
         assert!(text.contains("db=false rad=true table=[10 2 0 20 2 1.57]"));
         assert!(text.contains("E2 q 0 TABLE {v(a)}=(0,0)(1,1)"));
         assert!(text.contains("; tail"));
         assert_eq!(result.input_lines, [1, 2, 2, 3, 3, 3, 3, 4, 5, 6, 7, 8]);
-        let repeated = normalize_mapped(&result.model.bytes, RootKind::Deck)?;
+        let repeated = normalize_mapped(
+            &result.model.bytes,
+            RootKind::Deck,
+            &model_preprocess_command::WorkBudget::default(),
+        )?;
         assert_eq!(repeated.model.bytes, result.model.bytes);
         assert_eq!(
             normalize_ngspice(b"E1 out 0 TABLE {v(a)}=(0,0)(1,1)")?.bytes,
@@ -1010,7 +1096,11 @@ mod tests {
     fn native_xfer_reference_complex_interpolation_and_current_polarity() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let source = b"Frequency transfer reference\n.param f0=100 f1=300 gain=2\nV1 in 0 dc 1 ac 1\nV2 ref 0 dc 0.25 ac 0.25\nEout out 0 FREQ {V(in,ref)*2} MAG RAD ({f0},{gain},0) ({f1},{gain},1.5707963267948966)\nRload out 0 1k\nGout gout 0 FREQ {V(in,ref)*2} R_I (f0,gain,0) (f1,0,gain)\nRg gout 0 1\n.control\nset wr_singlescale\nset wr_vecnames\nac lin 5 50 350\nwrdata response.dat v(out) v(gout)\nquit\n.endc\n.end\n";
-        let normalized = normalize_mapped(source, RootKind::Deck)?;
+        let normalized = normalize_mapped(
+            source,
+            RootKind::Deck,
+            &model_preprocess_command::WorkBudget::default(),
+        )?;
         fs::write(
             directory.path().join("reference.cir"),
             normalized.model.bytes,

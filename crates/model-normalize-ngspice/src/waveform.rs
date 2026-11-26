@@ -5,6 +5,7 @@
 //! without changing the compatibility semantics of native PULSE/PWL.
 
 use anyhow::{Context, Result, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 
 mod qspice;
@@ -554,10 +555,14 @@ pub fn validate_artifact(
     declarations: &[PreparedWaveform],
     artifact: &str,
     bytes: &[u8],
+    budget: &WorkBudget,
 ) -> Result<()> {
     use std::collections::BTreeMap;
+    budget.charge(Resource::EvaluationSteps, declarations.len())?;
     let mut expected = BTreeMap::new();
     for declaration in declarations.iter().filter(|item| item.artifact == artifact) {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        charge_scope(&declaration.scope, declaration.source.len(), budget)?;
         let scope = declaration
             .scope
             .iter()
@@ -575,7 +580,9 @@ pub fn validate_artifact(
     }
     let mut scope = Vec::new();
     let mut control = false;
+    budget.charge(Resource::ScannedBytes, bytes.len())?;
     for statement in crate::lexical::statements(bytes)? {
+        budget.charge(Resource::Statements, 1)?;
         let text = std::str::from_utf8(&statement.text)?;
         let mut fields = text.split_ascii_whitespace();
         let Some(first) = fields.next() else { continue };
@@ -584,6 +591,7 @@ pub fn validate_artifact(
         } else if first.eq_ignore_ascii_case(".endc") {
             control = false;
         } else if !control && first.eq_ignore_ascii_case(".subckt") {
+            budget.check_depth(scope.len().saturating_add(1))?;
             scope.push(
                 fields
                     .next()
@@ -598,6 +606,7 @@ pub fn validate_artifact(
                 .first()
                 .is_some_and(|byte| matches!(byte.to_ascii_uppercase(), b'V' | b'I'))
         {
+            charge_scope(&scope, first.len(), budget)?;
             let key = (scope.clone(), first.to_ascii_lowercase());
             if let Some(seen) = expected.get_mut(&key) {
                 ensure!(!*seen, "ambiguous waveform source {first} in {scope:?}");
@@ -610,6 +619,15 @@ pub fn validate_artifact(
             seen,
             "missing emitted waveform source {source} in {scope:?} ({artifact})"
         );
+    }
+    Ok(())
+}
+
+fn charge_scope(scope: &[String], name_bytes: usize, budget: &WorkBudget) -> Result<()> {
+    budget.charge(Resource::EmittedBytes, name_bytes)?;
+    budget.charge(Resource::GeneratedNodes, scope.len())?;
+    for part in scope {
+        budget.charge(Resource::EmittedBytes, part.len())?;
     }
     Ok(())
 }

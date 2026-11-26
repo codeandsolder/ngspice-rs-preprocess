@@ -10,34 +10,103 @@ use model_normalize_ngspice::{
     param_expression::{SpiceExpression, SpiceExpressionContext},
     waveform::{Period, PulseEdges, PulseSpec, WaveformSpec},
 };
-use std::fmt::Write as _;
+use model_preprocess_command::{Resource, WorkBudget};
+use std::{collections::BTreeSet, fmt::Write as _};
 
+/// Select a compact namespace absent from the entire source scope.
+/// Scan each source statement once; a collision does not cause another
+/// whole-source search or make every generated name arbitrarily long.
 pub(super) fn scope_prefix<'a>(
     scopes: impl IntoIterator<Item = &'a [Item]>,
     header: Option<&str>,
     initial: &str,
-) -> String {
-    let mut occupied = header.unwrap_or_default().to_ascii_lowercase();
+    budget: &WorkBudget,
+) -> Result<String> {
+    ensure!(
+        !initial.is_empty() && initial.is_ascii(),
+        "invalid generated namespace stem"
+    );
+    let mut occupied = OccupiedNamespaces::default();
+    if let Some(header) = header {
+        occupied.scan(header, initial, budget)?;
+    }
     for items in scopes {
-        collect_scope_text(items, &mut occupied);
+        occupied.scan_items(items, initial, budget)?;
     }
-    let mut prefix = initial.to_owned();
-    while occupied.contains(&prefix) {
-        prefix.push('_');
+    if !occupied.base {
+        return Ok(initial.to_owned());
     }
-    prefix
+    // The ordered set contains only canonical decimal suffixes. The
+    // first missing integer is bounded by the number of source matches.
+    let mut ordinal = 0_usize;
+    for used in occupied.ordinals {
+        if used != ordinal {
+            break;
+        }
+        ordinal = ordinal
+            .checked_add(1)
+            .context("namespace ordinal overflow")?;
+    }
+    let separator = if initial.ends_with('_') { "" } else { "_" };
+    Ok(format!("{initial}{separator}{ordinal}_"))
 }
 
-fn collect_scope_text(items: &[Item], occupied: &mut String) {
-    for item in items {
-        match item {
-            Item::Statement(statement) => occupied.push_str(&statement.to_ascii_lowercase()),
-            Item::Subcircuit(block) => {
-                occupied.push_str(&block.header.to_ascii_lowercase());
-                collect_scope_text(&block.body, occupied);
+#[derive(Default)]
+struct OccupiedNamespaces {
+    base: bool,
+    ordinals: BTreeSet<usize>,
+}
+
+impl OccupiedNamespaces {
+    fn scan(&mut self, text: &str, initial: &str, budget: &WorkBudget) -> Result<()> {
+        budget.charge(Resource::ScannedBytes, text.len())?;
+        budget.charge(Resource::Statements, 1)?;
+        let bytes = text.as_bytes();
+        let prefix = initial.as_bytes();
+        // Both namespace stems are fixed, nonempty ASCII identifiers.
+        for (start, window) in bytes.windows(prefix.len()).enumerate() {
+            if !window.eq_ignore_ascii_case(prefix) {
+                continue;
+            }
+            self.base = true;
+            let suffix = &bytes[start + prefix.len()..];
+            let suffix = if initial.ends_with('_') {
+                suffix
+            } else if let Some(suffix) = suffix.strip_prefix(b"_") {
+                suffix
+            } else {
+                continue;
+            };
+            let digits = suffix
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if digits == 0 || suffix.get(digits) != Some(&b'_') || digits > 1 && suffix[0] == b'0' {
+                continue;
+            }
+            // Values too large for usize cannot collide with a candidate.
+            let Ok(ordinal) = std::str::from_utf8(&suffix[..digits])?.parse::<usize>() else {
+                continue;
+            };
+            budget.charge(Resource::EvaluationSteps, 1)?;
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            self.ordinals.insert(ordinal);
+        }
+        Ok(())
+    }
+
+    fn scan_items(&mut self, items: &[Item], initial: &str, budget: &WorkBudget) -> Result<()> {
+        let _depth = budget.enter()?;
+        for item in items {
+            match item {
+                Item::Statement(statement) => self.scan(statement, initial, budget)?,
+                Item::Subcircuit(block) => {
+                    self.scan(&block.header, initial, budget)?;
+                    self.scan_items(&block.body, initial, budget)?;
+                }
             }
         }
-        occupied.push('\n');
+        Ok(())
     }
 }
 
@@ -56,24 +125,24 @@ impl SpiceExpressionContext for Unbound {
     }
 }
 
-pub(super) fn constant(expression: &str) -> Result<Option<f64>> {
-    let compiled = SpiceExpression::parse(expression)?;
+pub(super) fn constant(expression: &str, budget: &WorkBudget) -> Result<Option<f64>> {
+    let compiled = SpiceExpression::parse_with_budget(expression, budget)?;
     let mut resolver = Unbound::default();
-    match compiled.evaluate_with(&mut resolver) {
+    match compiled.evaluate_with_budget(&mut resolver, budget) {
         Ok(value) => Ok(Some(value)),
         Err(_) if resolver.0 => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-pub(super) fn expression_text(text: &str) -> Result<String> {
+pub(super) fn expression_text(text: &str, budget: &WorkBudget) -> Result<String> {
     let text = text.trim();
     let inner = text
         .strip_prefix('{')
         .and_then(|rest| rest.strip_suffix('}'))
         .unwrap_or(text);
-    let text = lower_simetrix_behavioral_expression(inner)?;
-    SpiceExpression::parse(&text)?;
+    let text = lower_simetrix_behavioral_expression(inner, budget)?;
+    SpiceExpression::parse_with_budget(&text, budget)?;
     Ok(text)
 }
 
@@ -102,14 +171,16 @@ impl std::fmt::Display for Scalar {
     }
 }
 
-struct Parameters {
+struct Parameters<'a> {
+    budget: &'a WorkBudget,
     prefix: String,
     output: String,
 }
 
-impl Parameters {
+impl Parameters<'_> {
     fn define(&mut self, name: &str, expression: &str) -> Result<Scalar> {
-        let value = constant(expression).with_context(|| format!("invalid PWLS PUL {name}"))?;
+        let value = constant(expression, self.budget)
+            .with_context(|| format!("invalid PWLS PUL {name}"))?;
         let text = if let Some(value) = value {
             format!("{value:.17e}")
         } else {
@@ -133,7 +204,7 @@ struct Pulse {
 }
 
 impl Pulse {
-    fn prepare(spec: &PulseSpec, params: &mut Parameters) -> Result<Self> {
+    fn prepare(spec: &PulseSpec, params: &mut Parameters<'_>) -> Result<Self> {
         let low = params.define("v1", &spec.first)?;
         let high = params.define("v2", &spec.second)?;
         let period = match &spec.period {
@@ -193,7 +264,7 @@ impl Pulse {
         name: &str,
         positive: &str,
         negative: &str,
-        params: &mut Parameters,
+        params: &mut Parameters<'_>,
     ) -> Result<()> {
         let Self {
             low,
@@ -271,7 +342,7 @@ impl Pulse {
     }
 }
 
-pub(super) fn translate(parsed: &Parsed, scope: &str) -> Result<Translation> {
+pub(super) fn translate(parsed: &Parsed, scope: &str, budget: &WorkBudget) -> Result<Translation> {
     let WaveformSpec::Pulse(spec) = &parsed.spec else {
         bail!("PWLS requires pulse forcing")
     };
@@ -281,6 +352,7 @@ pub(super) fn translate(parsed: &Parsed, scope: &str) -> Result<Translation> {
     }
     prefix.push('_');
     let mut params = Parameters {
+        budget,
         prefix,
         output: String::new(),
     };
@@ -301,9 +373,41 @@ pub(super) fn translate(parsed: &Parsed, scope: &str) -> Result<Translation> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compact_namespace_is_case_insensitive_and_budgeted() -> Result<()> {
+        use model_preprocess_command::{Cancellation, WorkLimits};
+        let source = format!(
+            "* __L17_{}\n.subckt __l17_0_cell a b\nR1 a b {{__L17_1_value}}\n.ends\n* __l17_03_ __l17_4_\n",
+            "_".repeat(100_000)
+        );
+        let items = crate::syntax::parse_items(&source)?;
+        let budget = WorkBudget::default();
+        assert_eq!(
+            scope_prefix([items.as_slice()], None, "__l17_", &budget)?,
+            "__l17_2_"
+        );
+        let header = ".subckt __L17_2_cell a b";
+        assert_eq!(
+            scope_prefix([items.as_slice()], Some(header), "__l17_", &budget)?,
+            "__l17_3_"
+        );
+        let limited = WorkBudget::new(
+            WorkLimits {
+                scanned_bytes: 64,
+                ..WorkLimits::default()
+            },
+            Cancellation::default(),
+        );
+        assert!(scope_prefix([items.as_slice()], None, "__l17_", &limited).is_err());
+        assert!(limited.check().is_err());
+        assert_eq!(scope_prefix([&[][..]], None, "__l17_", &budget)?, "__l17_");
+        Ok(())
+    }
+
     fn lower(source: &str) -> Result<String> {
-        let result = super::super::waveforms::translate(source, "pulse_test_")?
-            .context("missing translation")?;
+        let result =
+            super::super::waveforms::translate(source, "pulse_test_", &WorkBudget::default())?
+                .context("missing translation")?;
         assert_eq!(result.kind, TranslationKind::PulseSource);
         Ok(String::from_utf8(result.bytes)?)
     }

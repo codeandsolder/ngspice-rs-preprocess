@@ -14,6 +14,7 @@ use crate::{
     vdmos_card::{VdmosLiterals, vdmos_resolved},
 };
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) mod declarations;
@@ -68,6 +69,7 @@ pub struct ModelLibrary {
     pub models: Vec<ScopedModel>,
     globals: BTreeSet<String>,
     origins: Vec<SourceOrigin>,
+    budget: WorkBudget,
 }
 
 /// Shared declaration index for lexical subcircuit lookup, independently of
@@ -85,6 +87,9 @@ impl SubcircuitIndex {
     /// # Errors
     /// Invalid declaration parent or missing name.
     pub fn new(source: &ModelLibrary) -> Result<Self> {
+        source
+            .budget
+            .charge(Resource::GeneratedNodes, source.scopes.len())?;
         let mut result = Self {
             declarations: vec![BTreeMap::new(); source.scopes.len()],
             duplicates: Vec::new(),
@@ -92,6 +97,8 @@ impl SubcircuitIndex {
         for (id, scope) in source.scopes.iter().enumerate().skip(1) {
             let parent = scope.parent.context("non-root scope without parent")?;
             let name = scope.name.as_deref().context("unnamed subcircuit")?;
+            source.budget.charge(Resource::GeneratedNodes, 1)?;
+            source.budget.charge(Resource::EmittedBytes, name.len())?;
             let table = result
                 .declarations
                 .get_mut(parent)
@@ -107,13 +114,13 @@ impl SubcircuitIndex {
     }
 
     /// Later declarations that conflict with an earlier lexical declaration.
-    #[must_use]
+    #[must_use = "the returned declarations identify duplicate lexical names"]
     pub fn duplicates(&self) -> &[usize] {
         &self.duplicates
     }
 
     /// Find the visible subcircuit from a lexical calling scope.
-    #[must_use]
+    #[must_use = "the returned scope identifies the visible subcircuit"]
     pub fn resolve(&self, source: &ModelLibrary, scope: usize, name: &str) -> Option<usize> {
         lexical_lookup(source, scope, name, &self.declarations)
     }
@@ -197,7 +204,11 @@ fn reserved_parameter(name: &str) -> bool {
     )
 }
 
-fn assignments(source: &str, line: usize) -> Result<BTreeMap<String, SpiceExpression>> {
+fn assignments(
+    source: &str,
+    line: usize,
+    budget: &WorkBudget,
+) -> Result<BTreeMap<String, SpiceExpression>> {
     let mut definitions = BTreeMap::new();
     for field in parse_assignments(source).with_context(|| format!("line {line}"))? {
         let value = field
@@ -219,7 +230,7 @@ fn assignments(source: &str, line: usize) -> Result<BTreeMap<String, SpiceExpres
         );
         definitions.insert(
             name,
-            SpiceExpression::parse(value)
+            SpiceExpression::parse_with_budget(value, budget)
                 .with_context(|| format!("line {line}: parameter {}", field.name))?,
         );
     }
@@ -229,6 +240,7 @@ fn assignments(source: &str, line: usize) -> Result<BTreeMap<String, SpiceExpres
 fn subcircuit_header(
     input: &str,
     line: usize,
+    budget: &WorkBudget,
 ) -> Result<(String, Vec<String>, BTreeMap<String, SpiceExpression>)> {
     let (tokens, params) = positional_prefix(input);
     let (name, ports) = tokens
@@ -241,11 +253,16 @@ fn subcircuit_header(
     Ok((
         name.0.to_ascii_lowercase(),
         ports,
-        assignments(params, line)?,
+        assignments(params, line, budget)?,
     ))
 }
 
-fn parse_function(source: &str, line: usize) -> Result<(String, UserFunction)> {
+fn parse_function(
+    source: &str,
+    line: usize,
+    budget: &WorkBudget,
+) -> Result<(String, UserFunction)> {
+    budget.charge(Resource::ScannedBytes, source.len())?;
     let (signature, body) =
         parse_function_signature(source).with_context(|| format!("line {line}"))?;
     let name = signature.name.to_ascii_lowercase();
@@ -253,6 +270,7 @@ fn parse_function(source: &str, line: usize) -> Result<(String, UserFunction)> {
         !reserved_parameter(&name),
         "line {line}: builtin/reserved function identifier {name}"
     );
+    budget.charge(Resource::GeneratedNodes, signature.formals.len())?;
     let formals = signature
         .formals
         .into_iter()
@@ -263,8 +281,8 @@ fn parse_function(source: &str, line: usize) -> Result<(String, UserFunction)> {
         !body.is_empty(),
         "line {line}: empty user-defined function body"
     );
-    let body =
-        SpiceExpression::parse(body).with_context(|| format!("line {line}: function {name}"))?;
+    let body = SpiceExpression::parse_with_budget(body, budget)
+        .with_context(|| format!("line {line}: function {name}"))?;
     Ok((name, UserFunction { formals, body }))
 }
 
@@ -299,6 +317,22 @@ impl ModelLibrary {
     /// # Errors
     /// Invalid source declarations, as in [`Self::parse`].
     pub fn parse_source(source: &[u8], kind: RootKind) -> Result<Self> {
+        Self::parse_source_with_budget(source, kind, WorkBudget::default())
+    }
+
+    /// Parse and bind a model library under shared cumulative counters.
+    /// # Errors
+    /// Invalid declarations or resource exhaustion.
+    pub fn parse_source_with_budget(
+        source: &[u8],
+        kind: RootKind,
+        budget: WorkBudget,
+    ) -> Result<Self> {
+        budget.charge(Resource::ScannedBytes, source.len())?;
+        budget.charge(
+            Resource::Statements,
+            source.split_inclusive(|byte| *byte == b'\n').count(),
+        )?;
         let skip = if kind == RootKind::Deck {
             source
                 .split_inclusive(|&b| b == b'\n')
@@ -308,7 +342,7 @@ impl ModelLibrary {
         } else {
             0
         };
-        let mut library = Self::empty();
+        let mut library = Self::empty(budget);
         let mut stack = vec![0];
         let mut in_control = false;
         for (line, bytes) in logical_statements(&source[skip..])? {
@@ -335,7 +369,9 @@ impl ModelLibrary {
                 );
             }
             if let Some(rest) = directive(text, ".subckt") {
-                let (name, ports, defaults) = subcircuit_header(rest, line)?;
+                library.budget.check_depth(stack.len())?;
+                library.budget.charge(Resource::GeneratedNodes, 1)?;
+                let (name, ports, defaults) = subcircuit_header(rest, line, &library.budget)?;
                 let parent = *stack.last().context("missing root parameter scope")?;
                 let id = library.scopes.len();
                 library.scopes.push(ParameterScope {
@@ -377,12 +413,12 @@ impl ModelLibrary {
 
     fn record(&mut self, text: &str, line: usize, current: usize) -> Result<()> {
         if let Some(rest) = directive(text, ".func") {
-            let (name, function) = parse_function(rest, line)?;
+            let (name, function) = parse_function(rest, line, &self.budget)?;
             self.scopes[current].functions.insert(name, function);
             return Ok(());
         }
         if let Some(rest) = directive(text, ".param") {
-            let definitions = assignments(rest, line)?;
+            let definitions = assignments(rest, line, &self.budget)?;
             self.scopes[current].local.extend(definitions);
             return Ok(());
         }
@@ -407,7 +443,7 @@ impl ModelLibrary {
         Ok(())
     }
 
-    fn empty() -> Self {
+    fn empty(budget: WorkBudget) -> Self {
         Self {
             scopes: vec![ParameterScope {
                 name: None,
@@ -423,6 +459,7 @@ impl ModelLibrary {
             models: Vec::new(),
             globals: BTreeSet::new(),
             origins: Vec::new(),
+            budget,
         }
     }
 
@@ -447,7 +484,11 @@ impl ModelLibrary {
             "caller scope out of bounds"
         );
         let mut resolver = ScopeResolver::new(self, overrides)?;
-        resolver.evaluate(caller_scope, &SpiceExpression::parse(expression)?, None)
+        resolver.evaluate(
+            caller_scope,
+            &SpiceExpression::parse_with_budget(expression, &self.budget)?,
+            None,
+        )
     }
 
     /// Resolve a model's numeric SPICE expressions in their lexical context.
@@ -471,7 +512,11 @@ impl ModelLibrary {
             .context("model index out of bounds")?;
         let mut resolver = ScopeResolver::new(self, overrides)?;
         vdmos_resolved(&model.card, |expr| {
-            resolver.evaluate(model.scope, &SpiceExpression::parse(expr)?, None)
+            resolver.evaluate(
+                model.scope,
+                &SpiceExpression::parse_with_budget(expr, &self.budget)?,
+                None,
+            )
         })
     }
 }
@@ -546,12 +591,13 @@ impl<'a> ScopeResolver<'a> {
         expr: &SpiceExpression,
         frame: Option<usize>,
     ) -> Result<f64> {
+        let budget = self.source.budget.clone();
         let mut context = ScopedExpressionContext {
             resolver: self,
             scope,
             frame,
         };
-        expr.evaluate_with(&mut context)
+        expr.evaluate_with_budget(&mut context, &budget)
     }
 
     fn function(
@@ -563,6 +609,7 @@ impl<'a> ScopeResolver<'a> {
     ) -> Result<f64> {
         let mut current = Some(scope);
         while let Some(owner) = current {
+            self.source.budget.charge(Resource::EvaluationSteps, 1)?;
             if let Some(definition) = self.source.scopes[owner].functions.get(name).cloned() {
                 ensure!(
                     definition.formals.len() == args.len(),
@@ -571,7 +618,7 @@ impl<'a> ScopeResolver<'a> {
                     args.len()
                 );
                 ensure!(
-                    self.calls.len() < 512,
+                    self.calls.len() < 64,
                     "function {name}: recursive expression depth exceeded"
                 );
                 let arguments = definition
@@ -607,6 +654,7 @@ impl<'a> ScopeResolver<'a> {
         let name = name.to_ascii_lowercase();
         let mut current = Some(requested_scope);
         while let Some(scope) = current {
+            self.source.budget.charge(Resource::EvaluationSteps, 1)?;
             if let Some(value) = self
                 .overrides
                 .get(&scope)
@@ -642,7 +690,7 @@ impl<'a> ScopeResolver<'a> {
                     "cyclic parameter reference: {name} in scope {scope}"
                 );
                 ensure!(
-                    self.active.len() < 512,
+                    self.active.len() < 64,
                     "parameter expression depth exceeded"
                 );
                 self.active.push(key.clone());

@@ -120,3 +120,27 @@ including attribution, redistribution and charging conditions, and the
 original-code MIT license are reproduced in
 [`crates/model-compact-intrinsic/LICENSE`](crates/model-compact-intrinsic/LICENSE).
 The top-level MIT license does not supersede these terms.
+
+## Legacy bulk BSIM1/2 preparation
+
+The legacy BSIM1 and BSIM2 model and instance setup in
+`crates/model-compact-intrinsic/src/legacy_bsim` and `legacy_bsim.rs`
+implements the physical preparation rules of ngspice 47
+(`bsim1/b1set.c`, `bsim1/b1temp.c`, `bsim2/b2set.c`, `bsim2/b2temp.c`)
+at revision `fa6c2a236507fd440c671de237cad4f49a4e6b68`.
+Copyright 1990 Regents of the University of California. All rights reserved.
+Authors: Hong J. Park, Thomas L. Quarles and Min-Chie Jeng.
+The modified BSD notice reproduced above also applies to these preparations;
+the package LICENSE reproduces the terms for standalone distribution.
+
+The BSIM1 constitutive, junction, overlap and noise implementation in
+`model-compact-intrinsic/src/legacy_bsim/bsim1.rs` and `model-kernel-bsim`
+is based on ngspice 47 `bsim1/b1eval.c`, `b1ld.c`, and `b1noi.c`,
+Copyright 1990 Regents of the University of California; Hong J. Park and
+Thomas L. Quarles. See the respective crate licenses.
+
+
+The BSIM2 constitutive implementation is based on ngspice 47
+`bsim2/b2eval.c`, and the shared legacy BSIM kernel assembly also follows
+`bsim2/b2ld.c` and `b2noi.c`. Copyright 1990 Regents of the University of
+California; Min-Chie Jeng, Hong J. Park and Thomas L. Quarles.

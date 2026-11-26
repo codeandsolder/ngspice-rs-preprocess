@@ -7,6 +7,7 @@
 
 use crate::{NormalizationPass, lexical, linked_source::RootKind, pspice::PspiceNormalization};
 use anyhow::{Context, Result, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 
 /// A TINA source projection before the common SPICE normalization stage.
 struct Projection {
@@ -157,9 +158,15 @@ pub fn validate_plaintext(input: &[u8]) -> Result<()> {
 /// # Errors
 /// Invalid or non-text source, malformed inline declarations or downstream
 /// normalization errors.
-pub fn normalize_mapped(input: &[u8], kind: RootKind) -> Result<PspiceNormalization> {
+pub fn normalize_mapped(
+    input: &[u8],
+    kind: RootKind,
+    budget: &WorkBudget,
+) -> Result<PspiceNormalization> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
     let projection = Projection::build(input, kind)?;
-    let mut result = crate::pspice::normalize_mapped(&projection.bytes, kind)?;
+    budget.charge(Resource::EmittedBytes, projection.bytes.len())?;
+    let mut result = crate::pspice::normalize_mapped(&projection.bytes, kind, budget)?;
     for line in result.mapped.input_lines.iter_mut().chain(
         result
             .renamed
@@ -184,7 +191,7 @@ mod tests {
     #[test]
     fn local_parameters_preserve_title_comments_and_physical_provenance() -> Result<()> {
         let input = b".subckt title .param literal\r\n* .subckt comment .param nope\r\n.subckt one a b .PaRaM k={2 + 3}\r\n+ q=4\r\n.ends\r\n.subckt two a b\r\n+ .param k=2\r\n.ends\r\n.end\r\n";
-        let result = normalize_mapped(input, RootKind::Deck)?;
+        let result = normalize_mapped(input, RootKind::Deck, &WorkBudget::default())?;
         let text = std::str::from_utf8(&result.mapped.model.bytes)?;
         assert!(
             text.starts_with(".subckt title .param literal\r\n* .subckt comment .param nope\r\n")
@@ -202,7 +209,7 @@ mod tests {
     #[test]
     fn multiple_local_directives_compose_with_other_source_edits() -> Result<()> {
         let source = b".subckt cell a b .param r=20m .param l=1M\nL1 a b {l} Rser={r}\n.ends\n";
-        let result = normalize_mapped(source, RootKind::Include)?;
+        let result = normalize_mapped(source, RootKind::Include, &WorkBudget::default())?;
         let output = std::str::from_utf8(&result.mapped.model.bytes)?;
         let expected = [
             (".subckt cell a b", 1),
@@ -232,11 +239,20 @@ mod tests {
     #[test]
     fn quoted_and_grouped_tokens_are_not_directives() -> Result<()> {
         let input = b".subckt a b c PARAMS: p={f('.param')}\n.ends\n";
-        let result = normalize_mapped(input, RootKind::Include)?;
+        let result = normalize_mapped(input, RootKind::Include, &WorkBudget::default())?;
         assert_eq!(result.mapped.model.bytes, input);
         assert_eq!(result.mapped.model.passes, [] as [NormalizationPass; 0]);
-        assert!(normalize_mapped(b".subckt a b c .param\n", RootKind::Include).is_err());
-        assert!(normalize_mapped(b"PK\x03\x04abc", RootKind::Include).is_err());
+        assert!(
+            normalize_mapped(
+                b".subckt a b c .param\n",
+                RootKind::Include,
+                &WorkBudget::default()
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_mapped(b"PK\x03\x04abc", RootKind::Include, &WorkBudget::default()).is_err()
+        );
         Ok(())
     }
 }

@@ -420,11 +420,21 @@ fn waveform_identity_and_native_passthrough() -> Result<()> {
     assert!(!text.contains(" PWL("));
     let artifact = &bundle.primary.filename;
     let declarations = &bundle.waveforms;
-    ngspice_rs_preprocess::waveform::validate_artifact(declarations, artifact, b"v1 a 0 DC 1\n")?;
+    ngspice_rs_preprocess::waveform::validate_artifact(
+        declarations,
+        artifact,
+        b"v1 a 0 DC 1\n",
+        &model_preprocess_command::WorkBudget::default(),
+    )?;
     for invalid in [b"V2 a 0 1\n".as_slice(), b"V1 a 0 1\nv1 b 0 2\n".as_slice()] {
         assert!(
-            ngspice_rs_preprocess::waveform::validate_artifact(declarations, artifact, invalid)
-                .is_err()
+            ngspice_rs_preprocess::waveform::validate_artifact(
+                declarations,
+                artifact,
+                invalid,
+                &model_preprocess_command::WorkBudget::default()
+            )
+            .is_err()
         );
     }
     let native = prepared(
