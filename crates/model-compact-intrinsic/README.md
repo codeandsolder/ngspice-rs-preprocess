@@ -13,6 +13,8 @@ running the physical compact-model equations. It **does not** yet provide nonlin
 currents, terminal charges, capacitance Jacobians, noise, thermal dynamics,
 solver topology or solver-ready native device kernels. Source-derived
 **BSIMSOI 4.x and HiSIM-HV1/HV2 model setup defaults** are implemented.
+BSIMSOI 4.4 also has ordered instance setup, native terminal topology, and
+raw electrical/C–V effective geometry and 179 size-binning equations.
 HiSIM-HV1/HV2 additionally have source-derived **instance defaults, binning,
 metallurgical channel geometry and leading temperature-dependent bandgap,
 thermal-voltage and carrier-density inputs**. Other families still
@@ -76,9 +78,43 @@ values are not a ready-to-evaluate physical kernel.
   substitutes its defaults; we intentionally reject implicit changes of physics.
 - Parameters without a registered, source-derived default remain absent in the
   prepared buffer rather than being assigned an invented zero.
-- This represents **setup-stage defaults**, not the later size-dependent
-  `b4soitemp.c` preparation, instance topology, temperature laws, or numerical
-  current/charge/noise kernels.
+- This represents **model-card setup-stage defaults**. The next preparation
+  stage resolves instance topology and raw size-dependent parameters; it does
+  not yet constitute a complete temperature or numerical physical kernel.
+
+### BSIMSOI ordered instance and size preparation
+
+`prepare_bsim_soi_setup(&model, &[BsimSoiInstanceInput { ... }])` consumes
+instances in **native setup traversal order**, keeping the corrected shared
+model with its resolved instances and size records. This preserves the C
+source's shared `rbody=1` correction on an explicit nonideal body-contact
+device with otherwise zero contact resistance, including its ordering effect
+on later body aliases. The model-wide ideal-FD doping limit is applied only
+when the global SOIMOD is 2. Explicit instance mode 3 resolves with the native
+film/material-specific Vbs0t thresholds; ideal FD disables body and body
+resistance nodes. The 4–7 source terminals are mapped using the original
+`tnodeoutGiven` bit, including the ideal-FD exception, and gate, drain/source,
+body resistance and thermal internal nodes are independently resolved.
+Debug-only observation nodes are not numerical unknowns here.
+
+Model and instance original presence bits remain accessible. BSIMSOI's
+4.4 IC setter intentionally writes only the last element of each vector,
+selected by its length (1–5 for DS, GS, BS, ES, PS respectively); repeated
+ordered IC assignments to different lengths preserve each scalar. Frontend
+geometry scale affects only explicitly supplied L/W/PD/PS and AD/AS, not
+defaults or body-contact dimensions.
+
+`PreparedBsimSoiSize` evaluates the exact leading B4SOItemp effective
+electrical, C–V, body/backgate and diode-width geometry, the gate tunneling
+length correction and the 179 raw L/W/P size-binning equations. Both
+`BINUNIT` branches are supported. The four bases K1, K2, VSDFB and VSDTH
+without setup defaults use the source zero-initialized raw value for this
+intermediate stage; their Given flags remain intact for the subsequent
+temperature-dependent physical derivation. The native size cache omits NBC,
+NSEG, PDBCP and PSBCP despite using them in these equations. We compute
+independent size records, avoiding cross-instance reuse of incorrect
+dimensions. These are raw binned inputs, not final effective coefficients
+after temperature, stress, electrostatic and parameter-checking corrections.
 
 Independent reference test: on Linux with ngspice 47 installed, run:
 
@@ -748,7 +784,7 @@ cargo fmt --all -- --check
 1. Expand representative *actual PDK* model-card/mode/selector coverage, then
    prioritize HiSIM-HV and BSIMSOI numerical packages against measured usage.
 2. Extend defaults and selector checks to HiSIM2, BSIM3SOI and SOI3;
-   implement BSIMSOI per-instance preparation, and **temperature-dependent,
+   complete BSIMSOI temperature-dependent preparation and **temperature-dependent,
    remaining electrothermal and topology/state preparation** for both
    source-backed HiSIM-HV families. Verify real selector/parameter batches
    before building the numerical kernels; HV1/HV2 instance defaults, binning,

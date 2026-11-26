@@ -541,6 +541,7 @@ pub fn prepare_hisim_hv_model(
             variant,
             scope: ParameterScope::Model,
             values,
+            bsim_soi_ic: [None; 5],
         },
         polarity,
         original_given: source.values.iter().map(Option::is_some).collect(),
