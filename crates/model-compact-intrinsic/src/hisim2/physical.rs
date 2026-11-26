@@ -36,19 +36,19 @@ pub struct SeriesResistance {
     pub internal_noise_s: f64,
 }
 
-/// Conductances between nodes of the distributed body network.
+/// Conductances between nodes of the distributed body network, in siemens.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BodyConductance {
     /// External bulk to drain-body node.
-    pub drain_bulk_s: f64,
+    pub drain_bulk: f64,
     /// External bulk to source-body node.
-    pub source_bulk_s: f64,
+    pub source_bulk: f64,
     /// External bulk to bulk-prime node.
-    pub prime_bulk_s: f64,
+    pub prime_bulk: f64,
     /// Bulk-prime to drain-body node.
-    pub drain_prime_s: f64,
+    pub drain_prime: f64,
     /// Bulk-prime to source-body node.
-    pub source_prime_s: f64,
+    pub source_prime: f64,
 }
 
 /// Physical quantities independent of terminal voltages.
@@ -75,7 +75,7 @@ impl PreparedPhysical {
     }
 }
 
-fn finite(v: f64, name: &'static str) -> Result<f64, ModelError> {
+const fn finite(v: f64, name: &'static str) -> Result<f64, ModelError> {
     if v.is_finite() {
         Ok(v)
     } else {
@@ -106,11 +106,11 @@ fn effective_geometry(
         + (real(model, "ll")? / 100_f64.powf(lln)) / (l + real(model, "lld")?).powf(lln);
     let dw = real(model, "xwd")?
         + (real(model, "wl")? / 100_f64.powf(wln)) / (w + real(model, "wld")?).powf(wln);
-    let length_m = finite(l - 2.0 * dl, "leff")?;
+    let length_m = finite(l - (dl + dl), "leff")?;
     if length_m <= 1e-9 {
         return Err(ModelError::InvalidPhysicalParameter("leff"));
     }
-    let width_per_finger_m = positive(w - 2.0 * dw, "weff")?;
+    let width_per_finger_m = positive(w - (dw + dw), "weff")?;
     let total_width_m = positive(
         width_per_finger_m * real(instance.parameters(), "nf")?,
         "weff_nf",
@@ -131,7 +131,8 @@ fn effective_geometry(
         "wsti",
     )?;
     let channel_length_modulation = finite(
-        1.0 + lg.powf(real(model, "clm5")?) * real(model, "clm6")?,
+        lg.powf(real(model, "clm5")?)
+            .mul_add(real(model, "clm6")?, 1.0),
         "clmmod",
     )?;
     Ok(EffectiveGeometry {
@@ -156,7 +157,7 @@ fn series(
     let specific = real(model, resistance_name)?;
     let mut r = 0.0;
     if sheet > 0.0 {
-        r += sheet * real(instance, square_name)?;
+        r = sheet * real(instance, square_name)?;
     }
     if specific > 0.0 {
         r += specific / geometry.total_width_m;
@@ -223,11 +224,11 @@ fn body(
         )
     };
     Ok(Some(BodyConductance {
-        drain_bulk_s: g("rbdb")?,
-        source_bulk_s: g("rbsb")?,
-        prime_bulk_s: g("rbpb")?,
-        drain_prime_s: g("rbpd")?,
-        source_prime_s: g("rbps")?,
+        drain_bulk: g("rbdb")?,
+        source_bulk: g("rbsb")?,
+        prime_bulk: g("rbpb")?,
+        drain_prime: g("rbpd")?,
+        source_prime: g("rbps")?,
     }))
 }
 

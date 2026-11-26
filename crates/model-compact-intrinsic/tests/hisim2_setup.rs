@@ -489,7 +489,7 @@ fn physical_geometry_series_and_context() -> Result<(), ModelError> {
             < 1e-9
     );
     assert!(p.gate_s.unwrap() > 0.0);
-    assert!(p.body.unwrap().drain_bulk_s > 0.05);
+    assert!(p.body.unwrap().drain_bulk > 0.05);
     let other = model(&[])?;
     assert_eq!(
         model_compact_intrinsic::hisim2::prepare_physical(&other, &i),
