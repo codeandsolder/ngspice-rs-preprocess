@@ -64,7 +64,7 @@ temporary=$(mktemp -d "${RUNNER_TEMP:-$(dirname "$CARGO_TARGET_DIR")}/preprocess
 trap 'rm -rf -- "$temporary"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir "$temporary/source" "$temporary/vendor" "$temporary/install"
+mkdir "$temporary/source" "$temporary/vendor" "$temporary/install" "$temporary/package-target"
 git -C "$root" archive --format=tar HEAD | tar -xf - -C "$temporary/source"
 printf 'Qualifying revision %s\n' "$(git -C "$root" rev-parse HEAD)"
 cd "$temporary/source"
@@ -84,7 +84,7 @@ done < <(jq -c '.[]' <<<"$selection")
 # Require Cargo to assemble and build every tarball in dependency order.
 # A dry run contacts the public registry but cannot upload anything.
 cargo publish --dry-run --locked "${packages[@]}" \
-    --target-dir "$CARGO_TARGET_DIR" --config "build.build-dir='$CARGO_TARGET_DIR'"
+    --target-dir "$temporary/package-target" --config "build.build-dir='$CARGO_TARGET_DIR'"
 
 # A fresh directory source supplies the exact public locked dependencies,
 # plus our registry-format archives. It is not a path-patched workspace.
@@ -95,7 +95,10 @@ while IFS= read -r item; do
     name=$(jq -r .name <<<"$item")
     version=$(jq -r .version <<<"$item")
     manifest=$(jq -r .manifest_path <<<"$item")
-    archive="$CARGO_TARGET_DIR/package/$name-$version.crate"
+    # Cargo multi-package publish stages the verified tarballs in its
+    # temporary registry, not the cargo package output directory. The
+    # fresh target above prevents any prior archive from being selected.
+    archive="$temporary/package-target/package/tmp-registry/$name-$version.crate"
     extracted="$temporary/vendor/$name-$version"
     tar -xf "$archive" -C "$temporary/vendor"
     crate_path=$(dirname "${manifest#"$temporary/source/"}")
