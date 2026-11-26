@@ -4,11 +4,31 @@
 //! constitutive routines. Binding alone is not proof of complete device support.
 //! Solver-ready residual/charge artifacts are provided by separate kernel crates.
 
+mod bsim_soi;
 mod catalog;
 mod defaults;
 mod hv;
 mod legacy_bsim;
 
+pub use bsim_soi::{
+    BsimSoiBodyMode, BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar,
+    BsimSoiCollectorCurrent, BsimSoiDrainChannelPoint, BsimSoiElectrostaticBase,
+    BsimSoiElectrostaticPoint, BsimSoiExternalSeries, BsimSoiExtrinsicChargeBias,
+    BsimSoiExtrinsicCharges, BsimSoiGateBias, BsimSoiGateCurrents, BsimSoiGateInducedLeakage,
+    BsimSoiGeometry, BsimSoiHeatPoint, BsimSoiImpactBias, BsimSoiImpactBranch,
+    BsimSoiImpactIonization, BsimSoiInstanceInput, BsimSoiInternalResistance,
+    BsimSoiIntrinsicCharges, BsimSoiJunctionCharge, BsimSoiJunctionCharges, BsimSoiJunctionCurrent,
+    BsimSoiJunctionDensities, BsimSoiJunctionPoint, BsimSoiJunctionSide, BsimSoiJunctionStorage,
+    BsimSoiNeutralBody, BsimSoiNode, BsimSoiParasiticPoint, BsimSoiSeriesBias,
+    BsimSoiSeriesConductance, BsimSoiSeriesParameters, BsimSoiStressOffsets,
+    BsimSoiTemperaturePoint, BsimSoiThermalNetwork, BsimSoiThermalScalar, BsimSoiTopology,
+    BsimSoiTransportPoint, PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
+    PreparedBsimSoiElectrostatics, PreparedBsimSoiExtrinsicCharges,
+    PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiGateTunneling,
+    PreparedBsimSoiImpactIonization, PreparedBsimSoiInstance, PreparedBsimSoiIntrinsicCharges,
+    PreparedBsimSoiJunctions, PreparedBsimSoiParasitics, PreparedBsimSoiSetup, PreparedBsimSoiSize,
+    PreparedBsimSoiTemperature, PreparedBsimSoiTransport, prepare_bsim_soi_setup,
+};
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use legacy_bsim::{
     BSIM1_REFERENCE_THERMAL_VOLTAGE, Bsim1Coefficients, Bsim2Coefficients, LegacyBsimBias,
@@ -132,7 +152,7 @@ pub enum ModelError {
     InvalidPhysicalParameter(&'static str),
     /// A caller supplied an ignored/unsupported version-specific instance input.
     UnsupportedInstanceParameter(&'static str),
-    /// Initial condition vector must contain 1-3 finite VDS/VGS/VBS values.
+    /// Initial condition vector length is invalid for the selected source family.
     InvalidInitialConditions(usize),
     /// A size-binned parameter became non-finite during C-source arithmetic.
     InvalidBinningParameter(u16),
@@ -159,10 +179,9 @@ impl std::fmt::Display for ModelError {
                 f,
                 "model preparation requires a supported family and model parameter block"
             ),
-            Self::MismatchedPreparedContext => write!(
-                f,
-                "incompatible prepared HiSIM-HV model, instance, or thermal state"
-            ),
+            Self::MismatchedPreparedContext => {
+                write!(f, "incompatible prepared model, instance, or thermal state")
+            }
             Self::ConflictingPolarity => write!(f, "both NMOS and PMOS flags were set"),
             Self::InvalidNominalTemperature => {
                 write!(f, "invalid nominal model/circuit temperature")
@@ -181,10 +200,10 @@ impl std::fmt::Display for ModelError {
                 write!(f, "unsupported instance input '{name}'")
             }
             Self::InvalidInitialConditions(length) => {
-                write!(f, "invalid HiSIM-HV IC vector length {length}")
+                write!(f, "invalid IC vector length {length}")
             }
             Self::InvalidBinningParameter(slot) => {
-                write!(f, "non-finite HiSIM-HV binned model parameter slot {slot}")
+                write!(f, "non-finite binned model parameter slot {slot}")
             }
             Self::CorruptSourceCatalog(problem) => write!(f, "invalid source catalog: {problem}"),
         }
@@ -275,6 +294,8 @@ pub struct BoundParameters {
     variant: ModelVariant,
     scope: ParameterScope,
     values: Box<[Option<ParameterValue>]>,
+    // B4SOIparam writes only the final component of each IC vector.
+    bsim_soi_ic: [Option<f64>; 5],
 }
 
 impl BoundParameters {
@@ -297,6 +318,7 @@ impl BoundParameters {
             .max()
             .map_or(0, |max| max + 1);
         let mut values = vec![None; slots].into_boxed_slice();
+        let mut bsim_soi_ic = [None; 5];
         for (name, value) in inputs {
             let entry = variant
                 .parameter(scope, name)
@@ -310,12 +332,24 @@ impl BoundParameters {
             if !value.finite() {
                 return Err(ModelError::NonFinite(name.to_owned()));
             }
+            if variant == ModelVariant::BsimSoi
+                && scope == ParameterScope::Instance
+                && entry.name == "ic"
+                && let ParameterValue::RealVector(ref vector) = value
+            {
+                let length = vector.len();
+                if !(1..=5).contains(&length) {
+                    return Err(ModelError::InvalidInitialConditions(length));
+                }
+                bsim_soi_ic[length - 1] = vector.last().copied();
+            }
             values[usize::from(entry.slot)] = Some(value);
         }
         Ok(Self {
             variant,
             scope,
             values,
+            bsim_soi_ic,
         })
     }
 

@@ -469,6 +469,7 @@ pub fn prepare_hisim_hv_instance(
             variant: raw.variant(),
             scope: ParameterScope::Instance,
             values,
+            bsim_soi_ic: [None; 5],
         },
         geometry,
         effective_geometry,

@@ -20,7 +20,8 @@ pub enum MosPolarity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedBsimSoiModel {
     polarity: MosPolarity,
-    parameters: BoundParameters,
+    pub(super) parameters: BoundParameters,
+    original_given: Box<[bool]>,
 }
 
 impl PreparedBsimSoiModel {
@@ -35,6 +36,15 @@ impl PreparedBsimSoiModel {
     #[must_use = "the lookup result distinguishes an absent default from a bound value"]
     pub fn get_slot(&self, slot: u16) -> Option<&ParameterValue> {
         self.parameters.get_slot(slot)
+    }
+
+    /// Whether a source parameter was explicitly assigned before setup.
+    #[must_use = "source presence controls size-dependent physical defaults"]
+    pub fn was_given(&self, slot: u16) -> bool {
+        self.original_given
+            .get(usize::from(slot))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Borrow the complete prepared model parameter buffer.
@@ -274,10 +284,12 @@ pub fn prepare_bsim_soi_model(
     }
     Ok(PreparedBsimSoiModel {
         polarity,
+        original_given: source.values.iter().map(Option::is_some).collect(),
         parameters: BoundParameters {
             variant: ModelVariant::BsimSoi,
             scope: ParameterScope::Model,
             values,
+            bsim_soi_ic: [None; 5],
         },
     })
 }

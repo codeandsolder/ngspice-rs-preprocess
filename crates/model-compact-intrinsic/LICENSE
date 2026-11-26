@@ -3,7 +3,8 @@ The following licenses and notices apply to different portions of this package.
 Original codeandsolder Rust code is available under the MIT license below.
 Source-derived HiSIM-HV1/HV2 rules and numerical expressions are subject to
 Hiroshima University / STARC's upstream HiSIM_HV Distribution Statement and
-Copyright Notice, reproduced after the MIT text. The repository's root MIT
+Copyright Notice, reproduced after the MIT text. Source-derived BSIMSOI 4.4 preparations are subject to the upstream
+modified BSD terms below. The repository's root MIT
 license does not override those third-party rights and conditions.
 
 === MIT license for independently authored code ===
@@ -80,6 +81,13 @@ src/spicelib/devices/hisimhv2/hsmhv2temp_eval.h
 
 Copyright 1990 Regents of the University of California. All rights reserved.
 Authors: Hong J. Park, Thomas L. Quarles, Min-Chie Jeng.
+
+=== BSIMSOI 4.4 upstream source notice and terms ===
+
+Copyright 2010 Regents of the University of California. All rights reserved.
+Authors: Samuel Fung, Dennis Sinitsky, Stephen Tang, Pin Su, Hui Wan, Wei Jin,
+Xuemei Xi, Ali Niknejad, Chenming Hu, Wenwei Yang, Chung-Hsun Lin,
+Tanvir Morshed; modifications by Darsen Lu and other ngspice contributors.
 
 Copyright 1985 - 2018, Regents of the University of California and others
 
