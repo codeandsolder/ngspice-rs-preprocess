@@ -13,10 +13,11 @@ mod transport;
 pub use channel::{
     BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar, BsimSoiDrainChannelPoint,
     BsimSoiExtrinsicChargeBias, BsimSoiExtrinsicCharges, BsimSoiGateBias, BsimSoiGateCurrents,
-    BsimSoiGateInducedLeakage, BsimSoiImpactBias, BsimSoiImpactBranch, BsimSoiImpactIonization,
-    BsimSoiIntrinsicCharges, PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
-    PreparedBsimSoiExtrinsicCharges, PreparedBsimSoiGateInducedLeakage,
-    PreparedBsimSoiGateTunneling, PreparedBsimSoiImpactIonization, PreparedBsimSoiIntrinsicCharges,
+    BsimSoiGateInducedLeakage, BsimSoiHeatPoint, BsimSoiImpactBias, BsimSoiImpactBranch,
+    BsimSoiImpactIonization, BsimSoiIntrinsicCharges, BsimSoiParasiticPoint,
+    PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel, PreparedBsimSoiExtrinsicCharges,
+    PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiGateTunneling,
+    PreparedBsimSoiImpactIonization, PreparedBsimSoiIntrinsicCharges, PreparedBsimSoiParasitics,
 };
 pub use electrostatics::{
     BsimSoiElectrostaticBase, BsimSoiElectrostaticPoint, PreparedBsimSoiElectrostatics,
@@ -218,6 +219,16 @@ impl PreparedBsimSoiSetup {
     pub fn instances(&self) -> &[PreparedBsimSoiInstance] {
         &self.instances
     }
+}
+
+// The native temperature cache compares these five fields in traversal order.
+fn native_size_key(instance: &PreparedBsimSoiInstance) -> Result<[u64; 5], ModelError> {
+    let mut key = [0; 5];
+    for (slot, name) in key.iter_mut().zip(["l", "w", "rth0", "cth0", "nf"]) {
+        let value = real(instance.parameters(), name)?;
+        *slot = if value == 0. { 0 } else { value.to_bits() };
+    }
+    Ok(key)
 }
 
 fn binned(size: &PreparedBsimSoiSize, name: &str) -> Result<f64, ModelError> {

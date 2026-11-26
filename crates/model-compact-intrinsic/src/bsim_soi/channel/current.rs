@@ -21,6 +21,10 @@ pub struct BsimSoiDrainChannelPoint {
     pub effective_drain_voltage: Jet,
     pub early_voltage: Jet,
     pub channel_conductance: Jet,
+    /// Effective beta, including finger and instance multiplicity (A/V²).
+    pub beta: Jet,
+    /// IDS / VDSEFF, evaluated without dividing by VDSEFF at zero drain bias.
+    pub output_conductance_ratio: Jet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -364,10 +368,11 @@ impl PreparedBsimSoiDrainChannel {
             beta * point.effective_overdrive * (1. - 0.5 * bulk * saturation.effective / thermal)
                 / (1. + saturation.effective / drive.field_length);
         let channel_conductance = gche / (1. + gche * resistance);
-        let current = channel_conductance
-            * saturation.effective
+        let ratio = channel_conductance
             * (1. + (point.drain_voltage - saturation.effective) / early)
-            * (self.geometry.parallel / self.geometry.segments)
+            * (self.geometry.parallel / self.geometry.segments);
+        let current = ratio
+            * saturation.effective
             * self.channel.polarity
             * if point.reversed { -1. } else { 1. };
         Ok(BsimSoiDrainChannelPoint {
@@ -378,6 +383,8 @@ impl PreparedBsimSoiDrainChannel {
             saturation_voltage: saturation.voltage.checked("saturation voltage")?,
             effective_drain_voltage: saturation.effective.checked("effective drain voltage")?,
             early_voltage: early.checked("channel early voltage")?,
+            beta: (beta * self.geometry.parallel).checked("channel beta")?,
+            output_conductance_ratio: ratio.checked("channel output ratio")?,
             channel_conductance: (channel_conductance
                 * (self.geometry.parallel / self.geometry.segments))
                 .checked("channel conductance")?,

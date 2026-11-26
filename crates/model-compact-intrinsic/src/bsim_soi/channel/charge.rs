@@ -454,11 +454,7 @@ impl PreparedBsimSoiSetup {
         let mut last = 0.;
         let mut oxides = Vec::with_capacity(self.instances.len());
         for (index, instance) in self.instances.iter().enumerate() {
-            let mut key = [0_u64; 5];
-            for (slot, name) in key.iter_mut().zip(["l", "w", "rth0", "cth0", "nf"]) {
-                let value = real(instance.parameters(), name)?;
-                *slot = if value == 0. { 0 } else { value.to_bits() };
-            }
+            let key = super::super::native_size_key(instance)?;
             let size_oxide = match cache.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                 std::collections::hash_map::Entry::Vacant(entry) => {

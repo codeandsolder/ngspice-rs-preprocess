@@ -257,6 +257,23 @@ from TOX minus DTOXCV or the generalized-material EOT reference iteration,
 including the native ordered size cache. Batch preparation shares the final
 model-wide oxide and each size-specific zero-bias flatband reference.
 
+### BSIMSOI RF, body resistance and active self-heating
+
+Prepared gate electrode/relaxation conductances cover all four `RGATEMOD`
+selectors, with gate relaxation using the channel's bias-dependent beta and
+output conductance ratio. Body contact and distributed source/drain body
+resistances preserve the native size-cache order and multiplicity. The
+thermal residual is passive heat flow minus intrinsic channel dissipation
+`Ids * Vds`; stored heat follows the passive thermal law. The native model
+intentionally excludes bipolar and leakage power from this thermal row.
+Analytic derivatives accompany gate relaxation and active heat.
+
+The native DC distributed-body loading path clears `GGjsb` and `GGjdb`
+while retaining the linearized junction equivalent sources. The resistor
+reference therefore compares the actual native stamped equivalent sources
+and separately checks the physical junction currents. A solver must use the
+physical junction residual and its full Jacobian, not the native DC omission.
+
 ### BSIMSOI body junction transport and storage
 
 `PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds
