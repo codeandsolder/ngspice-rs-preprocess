@@ -7,6 +7,7 @@
 use super::{parameter, set_parameter};
 use crate::model_card::ModelCard;
 use anyhow::{Context, Result, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 
 const OPERATING: [&str; 3] = ["t_abs", "t_rel_global", "t_rel_local"];
 
@@ -67,11 +68,32 @@ pub(super) fn expression(value: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
-pub(super) fn inherit(card: &mut ModelCard, derived: &ModelCard) -> Result<()> {
+pub(super) fn inherit(
+    card: &mut ModelCard,
+    derived: &ModelCard,
+    budget: &WorkBudget,
+) -> Result<()> {
     let Some((name, delta)) = operating_field(derived)? else {
         card.parameters.extend(derived.parameters.iter().cloned());
         return Ok(());
     };
+    // The operating-field replacement scans the accumulated model and
+    // may retain a copy of its absolute temperature expression.
+    budget.charge(
+        Resource::EvaluationSteps,
+        card.parameters.len().saturating_mul(3),
+    )?;
+    if let Some(field) = card
+        .parameters
+        .iter()
+        .rev()
+        .find(|field| field.name.eq_ignore_ascii_case("t_abs"))
+    {
+        budget.charge(
+            Resource::EmittedBytes,
+            field.expression.as_ref().map_or(0, String::len),
+        )?;
+    }
     let absolute = parameter(card, "t_abs");
     remove_operating(card);
     card.parameters.extend(
@@ -84,7 +106,13 @@ pub(super) fn inherit(card: &mut ModelCard, derived: &ModelCard) -> Result<()> {
     if name.eq_ignore_ascii_case("t_rel_local")
         && let Some(base) = absolute
     {
-        let value = format!("{{({})+({})}}", expression(&base), expression(delta));
+        let base = expression(&base);
+        let delta = expression(delta);
+        budget.charge(
+            Resource::EmittedBytes,
+            base.len().saturating_add(delta.len()).saturating_add(7),
+        )?;
+        let value = format!("{{({base})+({delta})}}");
         set_parameter(card, "t_abs", &value)?;
     }
     // Without an absolute base, T_REL_LOCAL falls back to circuit temperature.

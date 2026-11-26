@@ -314,9 +314,13 @@ fn native(
         .charge(Resource::ScannedBytes, linked.bytes.len())?;
     let (normalized, device_identities) = if pspice || tina {
         let normalized = if tina {
-            model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind)?
+            model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind, session.budget())?
         } else {
-            model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?
+            model_normalize_ngspice::pspice::normalize_mapped(
+                &linked.bytes,
+                kind,
+                session.budget(),
+            )?
         };
         let identities = normalized
             .renamed

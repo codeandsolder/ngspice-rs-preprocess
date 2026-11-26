@@ -488,3 +488,28 @@ fn native_provenance_storage_is_charged_before_copying_paths() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn pspice_model_inheritance_shares_cumulative_resource_budget() -> Result<()> {
+    use std::fmt::Write as _;
+    let dir = tempfile::tempdir()?;
+    let mut source = String::from("* inherited model chain\n.model m0 D(IS=1p)\n");
+    for index in 1..200 {
+        writeln!(source, ".model m{index} AKO:m{} D (RS={index})", index - 1)?;
+    }
+    source.push_str("V1 a 0 1\nD1 a 0 m199\n.end\n");
+    for format in [InputFormat::PspiceDeck, InputFormat::TinaDeck] {
+        let req = request(dir.path(), format, &source);
+        fails(
+            &req,
+            WorkLimits {
+                evaluation_steps: 4096,
+                ..WorkLimits::default()
+            },
+            "EvaluationSteps budget exceeded",
+        )?;
+        let bundle = run(&req, WorkLimits::default())?;
+        assert!(std::str::from_utf8(&bundle.primary.bytes)?.contains(".model m199"));
+    }
+    Ok(())
+}

@@ -720,7 +720,8 @@ mod capture_tests {
     fn repeated_initialization_metadata_uses_the_same_budget() -> Result<()> {
         let budget = WorkBudget::new(
             WorkLimits {
-                generated_nodes: 5,
+                // Each hint consumes an expression AST node, an index entry, and a retained declaration.
+                generated_nodes: 8,
                 ..WorkLimits::default()
             },
             Cancellation::default(),
