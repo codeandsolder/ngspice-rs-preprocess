@@ -2001,9 +2001,13 @@ fn lower_simetrix_behavioral_statement(statement: &str, budget: &WorkBudget) -> 
 fn translate_device_voltage_controlled_source(
     statement: &str,
     branches: &std::collections::BTreeMap<String, (String, String)>,
+    budget: &WorkBudget,
 ) -> Result<Option<Translation>> {
-    if model_normalize_ngspice::controlled_transfer::parse(&normalized_statement(statement))?
-        .is_some()
+    if model_normalize_ngspice::controlled_transfer::parse_with_budget(
+        &normalized_statement(statement),
+        budget,
+    )?
+    .is_some()
     {
         return Ok(None);
     }
@@ -4453,7 +4457,11 @@ fn translate_deck_primitive(
         translate_pspice_mos_series_resistance(statement, &models.pspice_mos_series_resistances),
         translate_inline_schematic_x(statement),
         translate_legacy_voltage_poly_source(statement),
-        translate_device_voltage_controlled_source(statement, &models.voltage_branches),
+        translate_device_voltage_controlled_source(
+            statement,
+            &models.voltage_branches,
+            models.budget
+        ),
         translate_current_controlled_source(statement, &models.current_branches, models.budget),
         waveforms::translate(statement, &models.pwls_prefix, models.budget),
         translate_raw_transformer(statement),
@@ -5281,6 +5289,7 @@ fn translate_deck_items(
     reject_residual_simplis(&output)?;
     let bytes = match model_normalize_ngspice::controlled_transfer::lower_sources(
         output.as_bytes(),
+        Ok,
         budget,
     )? {
         Some(lowered) => lowered.bytes,

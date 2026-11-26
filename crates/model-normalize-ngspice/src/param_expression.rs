@@ -8,6 +8,8 @@ use crate::model_card::parse_spice_constant;
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::cmp::Ordering;
+mod rational;
+pub(crate) use rational::coefficients as rational_coefficients;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
@@ -330,6 +332,12 @@ impl SpiceExpression {
         Ok(Self(expr.tree))
     }
 
+    /// Evaluate constants without requiring occurrence-scoped parameters.
+    /// Invalid constant expressions remain errors.
+    pub(crate) fn known_value(&self, budget: &WorkBudget) -> Result<Option<f64>> {
+        self.0.known_value(budget)
+    }
+
     /// Evaluate a compiled expression against the provided symbol resolver.
     /// The callback is never asked to resolve a symbol in an unselected lazy
     /// branch (`? :`, `&&`, `||` or `ternary_fcn`).
@@ -372,6 +380,37 @@ const fn bool_value(value: bool) -> f64 {
 fn finite(value: f64) -> Result<f64> {
     ensure!(value.is_finite(), "non-finite ngspice expression result");
     Ok(value)
+}
+
+#[derive(Debug)]
+struct RequiresBinding;
+
+impl std::fmt::Display for RequiresBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("expression requires occurrence binding")
+    }
+}
+
+impl std::error::Error for RequiresBinding {}
+
+impl SpiceExpressionContext for RequiresBinding {
+    fn symbol(&mut self, _name: &str) -> Result<f64> {
+        Err(Self.into())
+    }
+
+    fn function(&mut self, _name: &str, _args: &[SpiceExpression]) -> Result<f64> {
+        Err(Self.into())
+    }
+}
+
+impl Expr {
+    fn known_value(&self, budget: &WorkBudget) -> Result<Option<f64>> {
+        match self.evaluate(&mut RequiresBinding, budget) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.downcast_ref::<RequiresBinding>().is_some() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl Expr {

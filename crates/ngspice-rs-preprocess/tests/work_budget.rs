@@ -668,3 +668,30 @@ fn hspice_nested_power_lowering_uses_shared_depth_limit() -> Result<()> {
     )?;
     Ok(())
 }
+
+#[test]
+fn rational_transfer_algebra_shares_preparation_budget() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let deck =
+        "* rational transfer\nV1 in 0 1\nE1 out 0 in 0 Laplace={1/(s+1)^32}\nR1 out 0 1k\n.end\n";
+    let req = request(dir.path(), InputFormat::NativeDeck, deck);
+    let bundle = run(&req, WorkLimits::default())?;
+    assert!(std::str::from_utf8(&bundle.primary.bytes)?.contains("s_xfer(num_coeff=[1e0]"));
+    fails(
+        &req,
+        WorkLimits {
+            evaluation_steps: 200,
+            ..WorkLimits::default()
+        },
+        "EvaluationSteps budget exceeded",
+    )?;
+    fails(
+        &req,
+        WorkLimits {
+            emitted_bytes: 4096,
+            ..WorkLimits::default()
+        },
+        "EmittedBytes budget exceeded",
+    )?;
+    Ok(())
+}

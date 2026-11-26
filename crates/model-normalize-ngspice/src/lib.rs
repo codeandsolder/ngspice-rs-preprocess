@@ -599,7 +599,7 @@ fn apply_optional<F>(
 /// Returns an error for binary input or source identified as SIMPLIS, which requires
 /// semantic translation rather than syntax normalization.
 pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
-    normalize_body(input, true, &mut Vec::new(), &WorkBudget::default())
+    normalize_body(input, true, 0, &mut Vec::new(), &WorkBudget::default())
 }
 
 /// Normalized bytes and one original input line for each emitted physical line.
@@ -633,14 +633,15 @@ pub fn normalize_mapped(
     } else {
         (&[][..], input)
     };
+    let title_lines = usize::from(!title.is_empty());
     let mut inserted = Vec::new();
     let mut model = normalize_body(
         body,
         kind == linked_source::RootKind::Include,
+        title_lines,
         &mut inserted,
         budget,
     )?;
-    let title_lines = usize::from(!title.is_empty());
     let mut input_lines = Vec::new();
     if title_lines != 0 {
         input_lines.push(1);
@@ -677,6 +678,7 @@ pub fn normalize_mapped(
 fn normalize_body(
     input: &[u8],
     strip_end: bool,
+    title_lines: usize,
     inserted_lines: &mut Vec<usize>,
     budget: &WorkBudget,
 ) -> Result<NormalizedModel> {
@@ -719,7 +721,16 @@ fn normalize_body(
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
-    if let Some(lowered) = controlled_transfer::lower_sources(&bytes, budget)? {
+    let origins = if inserted_lines.is_empty() {
+        None
+    } else {
+        budget.charge(
+            Resource::GeneratedNodes,
+            input
+                .split_inclusive(|byte| *byte == b'\n')
+                .count()
+                .saturating_add(inserted_lines.len()),
+        )?;
         let mut origins = Vec::new();
         let mut previous = inserted_lines.iter().copied().peekable();
         for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
@@ -729,12 +740,23 @@ fn normalize_body(
             }
             origins.push(line);
         }
+        Some(origins)
+    };
+    let original_line = |line: usize| {
+        origins.as_ref().map_or(Ok(line), |mapping| {
+            mapping
+                .get(line - 1)
+                .copied()
+                .context("missing transfer source line")
+        })
+    };
+    if let Some(lowered) = controlled_transfer::lower_sources(
+        &bytes,
+        |line| Ok(original_line(line)? + title_lines),
+        budget,
+    )? {
         for line in lowered.inserted_lines {
-            inserted_lines.push(
-                *origins
-                    .get(line - 1)
-                    .context("missing transfer source line")?,
-            );
+            inserted_lines.push(original_line(line)?);
         }
         inserted_lines.sort_unstable();
         bytes = lowered.bytes;
