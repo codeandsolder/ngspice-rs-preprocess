@@ -504,3 +504,14 @@ constant parameters, including ngspice's duplicate-knot PWL syntax; this
 is a reference representation, not the prepared solver contract. The
 native solver binding and exact event scheduling are tracked in
 ngspice-rs-fast issue 223.
+
+
+### Legacy Berkeley BSIM preparation
+
+[model-compact-intrinsic](crates/model-compact-intrinsic/) provides exact
+legacy BSIM1/2/3 source catalogs and independent BSIM1/2 preparation and
+constitutive equations. [model-kernel-bsim](crates/model-kernel-bsim/)
+assembles the BSIM1/2 generalized physical residual, charge and noise
+artifacts. Solver registration and additional BSIM3 revision physics are
+tracked separately; the existing native BSIM3 implementation remains
+the owner of its validated modes. See [the ownership audit](docs/legacy-bsim.md).

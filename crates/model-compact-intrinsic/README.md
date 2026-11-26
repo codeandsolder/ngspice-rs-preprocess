@@ -1,4 +1,4 @@
-# Intrinsic HiSIM/SOI compact-model package — preparation scaffold
+# Intrinsic HiSIM/SOI and legacy BSIM compact-model preparation
 
 This standalone crate provides source-backed compact-model preparation and physical subkernels.
 The package includes HiSIM-HV source-derived physical preparation and therefore
@@ -8,21 +8,17 @@ Rust MIT license. See the package [`LICENSE`](LICENSE) and the repository's
 
 ## Exact scope
 
-The crate binds **source-defined model and instance parameters**, without
-running the physical compact-model equations. It **does not** yet provide nonlinear
-currents, terminal charges, capacitance Jacobians, noise, thermal dynamics,
-solver topology or solver-ready native device kernels. Source-derived
+The crate binds **source-defined model and instance parameters** and implements family-specific physical subkernels. BSIM1 and BSIM2 provide nonlinear intrinsic currents, conservative terminal charges, and analytic Jacobians; their complete generalized residual/charge/noise assembly is in [model-kernel-bsim](../model-kernel-bsim/). Other families have their own explicitly documented implementation boundaries. Source-derived
 **BSIMSOI 4.x and HiSIM-HV1/HV2 model setup defaults** are implemented.
 HiSIM-HV1/HV2 additionally have source-derived **instance defaults, binning,
 metallurgical channel geometry and leading temperature-dependent bandgap,
-thermal-voltage and carrier-density inputs**. Other families still
-need dedicated setup and per-instance preparation.
+thermal-voltage and carrier-density inputs**. Legacy BSIM1/2 have complete model defaults, size-dependent preparation and intrinsic constitutive laws.
 `ModelVariant::KERNEL_STATUS` explicitly advertises `NotImplemented`. Downstream
 must not substitute generic MOS laws for these devices or interpret successfully
 bound parameters as physical model support.
 
-All parameter names, types, alias identities and terminal positions come from the
-ngspice reference checkout, commit
+The HiSIM/SOI parameter names, types, alias identities and terminal positions come
+from the ngspice reference checkout, commit
 `972dbf45db1e47d18bc4fda5d8bb829aff2d0e05`
 (`codeandsolder/ngspice`, tracking `imr/ngspice`). This is a reference source
 snapshot, not an independent claim that the model implementation is complete or
@@ -38,8 +34,20 @@ numerically validated.
 | BSIM3SOI DD | 56 | `bsim3soi_dd/b3soidd.c` | 393 | 16 |
 | BSIM3SOI PD | 57 | `bsim3soi_pd/b3soipd.c` | 470 | 25 |
 | SOI3 | 60 | `soi3/soi3.c` | 87 | 25 |
+| BSIM1 | 4 | `bsim1/b1.c` | 81 | 14 |
+| BSIM2 | 5 | `bsim2/b2.c` | 137 | 14 |
+| BSIM3 v0 | 8/49, 3.0.x | `bsim3v0/b3v0.c` | 354 | 12 |
+| BSIM3 v1 | 8/49, 3.1.x | `bsim3v1/b3v1.c` | 367 | 12 |
+| BSIM3 v32 | 8/49, 3.2.x | `bsim3v32/b3v32.c` | 428 | 15 |
+| BSIM3 v33 | 8/49, 3.3.x/default | `bsim3/b3.c` | 429 | 19 |
 
-`src/spicelib/parser/inpdomod.c` defines the level and HiSIM-HV version dispatch.
+Legacy BSIM input-only catalog facts use ngspice reference revision
+`fa6c2a236507fd440c671de237cad4f49a4e6b68`. These are distinct schemas, not prepared numerical kernels. BSIM1/2 additionally implement the immutable physical preparation described in the linked document. Native BSIM3 v3.3 remains owned by the
+existing solver until coordinated extraction and numerical acceptance.
+See [legacy BSIM preparation and ownership](../../docs/legacy-bsim.md)
+for the audit, supported-mode boundary and reproducible generator.
+
+`src/spicelib/parser/inpdomod.c` defines the level and HiSIM-HV/BSIM3 version dispatch.
 The C `IFparm` parameter IDs define canonical slots, so two names with one ID are
 aliases. Slots are valid only within a given `(variant, model-or-instance)` pair,
 not as cross-family stable identifiers. The tables are sorted lexicographically to
