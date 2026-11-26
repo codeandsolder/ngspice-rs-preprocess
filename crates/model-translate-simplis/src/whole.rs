@@ -5437,7 +5437,7 @@ fn translate_deck_items(
                             statement.trim()
                         )
                     },
-                )?
+                )?;
             }
         }
     }

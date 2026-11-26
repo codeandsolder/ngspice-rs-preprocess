@@ -187,17 +187,18 @@ impl PreparedPwlResistor {
 
     fn expected_cards(&self) -> Vec<(&str, &str, &str, CardKind)> {
         let mut cards = Vec::new();
-        let positive = if let Some(sensor) = &self.series_sensor {
-            cards.push((
-                sensor.source.as_str(),
-                self.positive.as_str(),
-                sensor.intermediate.as_str(),
-                CardKind::Sensor,
-            ));
-            &sensor.intermediate
-        } else {
-            &self.positive
-        };
+        let positive = self
+            .series_sensor
+            .as_ref()
+            .map_or(self.positive.as_str(), |sensor| {
+                cards.push((
+                    sensor.source.as_str(),
+                    self.positive.as_str(),
+                    sensor.intermediate.as_str(),
+                    CardKind::Sensor,
+                ));
+                sensor.intermediate.as_str()
+            });
         match &self.binding {
             NativeBinding::CurrentLaw { source } => {
                 cards.push((source, positive, &self.negative, CardKind::Current));
@@ -355,9 +356,7 @@ pub fn validate_artifact(
             control = true;
         } else if first.eq_ignore_ascii_case(".endc") {
             control = false;
-        } else if control {
-            continue;
-        } else if first.eq_ignore_ascii_case(".subckt") {
+        } else if !control && first.eq_ignore_ascii_case(".subckt") {
             budget.check_depth(scope.len().saturating_add(1))?;
             scope.push(
                 fields
@@ -365,9 +364,10 @@ pub fn validate_artifact(
                     .context("unnamed emitted subcircuit")?
                     .to_ascii_lowercase(),
             );
-        } else if first.eq_ignore_ascii_case(".ends") {
+        } else if !control && first.eq_ignore_ascii_case(".ends") {
             ensure!(scope.pop().is_some(), "unmatched emitted .ends");
-        } else if first.starts_with(['B', 'b', 'V', 'v'])
+        } else if !control
+            && first.starts_with(['B', 'b', 'V', 'v'])
             && let Some(cards) = expected.get_mut(&scope)
             && let Some(card) = cards.get_mut(&first.to_ascii_lowercase())
         {
