@@ -10,13 +10,14 @@ use model_normalize_ngspice::waveform::{
     Forcing, Knot, Period, PreparedWaveform, PulseEdges, PulseSpec, Repeat, ResolvedWaveform,
     Scalar, SineDelay, SymbolicPoint, WaveformSpec,
 };
+use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::{LinkedPreprocessedNetlist, parameter_assignments};
 use std::{collections::BTreeMap, fmt::Write as _};
 
-struct Fields(BTreeMap<String, String>);
+struct Fields<'a>(BTreeMap<String, String>, &'a WorkBudget);
 
-impl Fields {
-    fn parse(tokens: &[String]) -> Result<Self> {
+impl<'a> Fields<'a> {
+    fn parse(tokens: &[String], budget: &'a WorkBudget) -> Result<Self> {
         let mut fields = BTreeMap::new();
         let text = tokens.join(" ");
         for (name, value) in parameter_assignments(&text)? {
@@ -26,13 +27,13 @@ impl Fields {
                 "duplicate waveform field {name}"
             );
         }
-        Ok(Self(fields))
+        Ok(Self(fields, budget))
     }
 
     fn optional(&mut self, name: &str) -> Result<Option<Scalar>> {
         self.0
             .remove(name)
-            .map(|text| super::pwls::expression_text(&text))
+            .map(|text| super::pwls::expression_text(&text, self.1))
             .transpose()
     }
 
@@ -50,7 +51,7 @@ impl Fields {
         match raw.to_ascii_uppercase().as_str() {
             "YES" => Ok("1".to_owned()),
             "NO" => Ok("0".to_owned()),
-            _ => super::pwls::expression_text(&raw),
+            _ => super::pwls::expression_text(&raw, self.1),
         }
     }
 
@@ -72,7 +73,7 @@ impl Fields {
     }
 }
 
-fn pulse(fields: &mut Fields, pwls: bool) -> Result<WaveformSpec> {
+fn pulse(fields: &mut Fields<'_>, pwls: bool) -> Result<WaveformSpec> {
     let first = if pwls {
         fields.default("V1", "1")?
     } else {
@@ -113,7 +114,7 @@ fn pulse(fields: &mut Fields, pwls: bool) -> Result<WaveformSpec> {
     }))
 }
 
-fn saw(fields: &mut Fields) -> Result<WaveformSpec> {
+fn saw(fields: &mut Fields<'_>) -> Result<WaveformSpec> {
     Ok(WaveformSpec::Saw {
         first: fields.required("V1")?,
         last: fields.required("V2")?,
@@ -123,7 +124,7 @@ fn saw(fields: &mut Fields) -> Result<WaveformSpec> {
     })
 }
 
-fn sine(fields: &mut Fields) -> Result<WaveformSpec> {
+fn sine(fields: &mut Fields<'_>) -> Result<WaveformSpec> {
     let delay = match (fields.optional("TDELAY")?, fields.optional("PDELAY")?) {
         (Some(value), None) => SineDelay::Seconds(value),
         (None, Some(value)) => SineDelay::Degrees(value),
@@ -139,7 +140,7 @@ fn sine(fields: &mut Fields) -> Result<WaveformSpec> {
     })
 }
 
-fn pwl(fields: &mut Fields) -> Result<WaveformSpec> {
+fn pwl(fields: &mut Fields<'_>) -> Result<WaveformSpec> {
     let segments = fields.required("NSEG")?;
     // Structural arity is the number of supplied pairs. A symbolic NSEG is
     // checked at occurrence binding rather than allocating from a scalar.
@@ -148,6 +149,7 @@ fn pwl(fields: &mut Fields) -> Result<WaveformSpec> {
         "PWL requires complete time/value pairs"
     );
     let count = fields.0.len() / 2;
+    fields.1.charge(Resource::GeneratedNodes, count)?;
     let mut points = Vec::with_capacity(count);
     for index in 0..count {
         points.push(SymbolicPoint {
@@ -168,7 +170,7 @@ pub(super) struct Parsed {
     pwls: bool,
 }
 
-fn parse(statement: &str) -> Result<Option<Parsed>> {
+fn parse(statement: &str, budget: &WorkBudget) -> Result<Option<Parsed>> {
     // Avoid parsing unrelated device/model expressions merely to discover
     // that they are not named independent-source waveforms.
     let mut words = statement.split_ascii_whitespace();
@@ -219,9 +221,9 @@ fn parse(statement: &str) -> Result<Option<Parsed>> {
             pulse.eq_ignore_ascii_case("PUL") && end.eq_ignore_ascii_case("END"),
             "unsupported PWLS shape or missing END"
         );
-        Fields::parse(body)?
+        Fields::parse(body, budget)?
     } else {
-        Fields::parse(rest)?
+        Fields::parse(rest, budget)?
     };
     let idle_in_pop = match shape.as_str() {
         "PWLS" => "0".to_owned(),
@@ -357,10 +359,10 @@ impl Parsed {
         }
     }
 
-    fn constant(&self) -> Result<Option<ResolvedWaveform>> {
+    fn constant(&self, budget: &WorkBudget) -> Result<Option<ResolvedWaveform>> {
         let mut unbound = false;
         let result = self.declaration("", &[]).resolve(|text| {
-            if let Some(value) = super::pwls::constant(text)? {
+            if let Some(value) = super::pwls::constant(text, budget)? {
                 Ok(value)
             } else {
                 unbound = true;
@@ -456,15 +458,19 @@ impl Parsed {
 
 /// Low-level native reference lowering. Symbolic named sources require
 /// the unified prepared bundle, not an unresolved numeric approximation.
-pub(super) fn translate(statement: &str, scope: &str) -> Result<Option<Translation>> {
-    let Some(parsed) = parse(statement)? else {
+pub(super) fn translate(
+    statement: &str,
+    scope: &str,
+    budget: &WorkBudget,
+) -> Result<Option<Translation>> {
+    let Some(parsed) = parse(statement, budget)? else {
         return Ok(None);
     };
     if parsed.pwls {
-        return super::pwls::translate(&parsed, scope).map(Some);
+        return super::pwls::translate(&parsed, scope, budget).map(Some);
     }
     let resolved = parsed
-        .constant()?
+        .constant(budget)?
         .context("symbolic source requires the prepared waveform binding API")?;
     Ok(Some(Translation {
         bytes: parsed.write_reference(&resolved)?.into_bytes(),
@@ -477,13 +483,17 @@ fn capture_items(
     artifact: &str,
     scope: &[String],
     output: &mut Vec<PreparedWaveform>,
+    budget: &WorkBudget,
 ) -> Result<bool> {
+    let _depth = budget.enter()?;
     let mut changed = false;
     let mut embedded = false;
     let mut control = false;
     for item in items {
         match item {
             Item::Statement(statement) => {
+                budget.charge(Resource::Statements, 1)?;
+                budget.charge(Resource::ScannedBytes, statement.len())?;
                 if let Some(start) = crate::syntax::file_boundary(statement) {
                     embedded = start;
                     continue;
@@ -498,9 +508,20 @@ fn capture_items(
                     control = false;
                 } else if !embedded
                     && !control
-                    && let Some(parsed) = parse(statement)?
+                    && let Some(parsed) = parse(statement, budget)?
                 {
-                    let resolved = parsed.constant()?;
+                    let resolved = parsed.constant(budget)?;
+                    budget.charge(Resource::GeneratedNodes, 1)?;
+                    budget.charge(
+                        Resource::EmittedBytes,
+                        artifact
+                            .len()
+                            .saturating_add(parsed.name.len())
+                            .saturating_add(statement.len()),
+                    )?;
+                    for part in scope {
+                        budget.charge(Resource::EmittedBytes, part.len())?;
+                    }
                     output.push(parsed.declaration(artifact, scope));
                     if !parsed.pwls {
                         *statement = match resolved {
@@ -520,6 +541,7 @@ fn capture_items(
                     artifact,
                     std::slice::from_ref(&block.name),
                     output,
+                    budget,
                 )?;
             }
             Item::Subcircuit(_) => {}
@@ -542,8 +564,11 @@ pub fn capture_artifact_waveforms(
     bytes: &mut Vec<u8>,
     artifact: &str,
     output: &mut Vec<PreparedWaveform>,
+    budget: &WorkBudget,
 ) -> Result<()> {
-    capture_artifact_items(bytes, |items| capture_items(items, artifact, &[], output))
+    capture_artifact_items(bytes, budget, |items| {
+        capture_items(items, artifact, &[], output, budget)
+    })
 }
 
 /// Capture named source declarations across the linked artifact closure.
@@ -552,11 +577,17 @@ pub fn capture_artifact_waveforms(
 /// Invalid source grammar, static domain errors or malformed scope.
 pub fn capture_linked_waveforms(
     linked: &mut LinkedPreprocessedNetlist,
+    budget: &WorkBudget,
 ) -> Result<Vec<PreparedWaveform>> {
     let mut waveforms = Vec::new();
-    capture_artifact_waveforms(&mut linked.root_bytes, "deck.cir", &mut waveforms)?;
+    capture_artifact_waveforms(&mut linked.root_bytes, "deck.cir", &mut waveforms, budget)?;
     for library in &mut linked.libraries {
-        capture_artifact_waveforms(&mut library.bytes, &library.filename, &mut waveforms)?;
+        capture_artifact_waveforms(
+            &mut library.bytes,
+            &library.filename,
+            &mut waveforms,
+            budget,
+        )?;
     }
     Ok(waveforms)
 }

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use model_preprocess_command::WorkBudget;
 use model_preprocess_simplis::source_dialect::{
     DialectContext, ScopedStatement, SourceLanguage,
     model_mapping::{Device, DeviceConfiguration, MappingTable, SelectionOrigin},
@@ -19,7 +20,11 @@ fn statements(input: &str) -> Vec<ScopedStatement> {
 }
 
 fn table(input: &str) -> Result<MappingTable> {
-    MappingTable::resolve(&DeviceConfiguration::default(), &statements(input))
+    MappingTable::resolve(
+        &DeviceConfiguration::default(),
+        &statements(input),
+        &WorkBudget::default(),
+    )
 }
 
 #[test]
@@ -27,7 +32,12 @@ fn map_key_is_type_and_level_not_instance_name() -> Result<()> {
     let source = statements(
         ".MAP ModelName=d, Level=1, Device=Diode3 REPORT=ON\n.model a D(LEVEL=1 IS=2p)\n.model b D(IS=2p)\n.model c D(LEVEL=3 IS=2p)",
     );
-    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source)?.apply(&source)?;
+    let mapped = MappingTable::resolve(
+        &DeviceConfiguration::default(),
+        &source,
+        &WorkBudget::default(),
+    )?
+    .apply(&source, &WorkBudget::default())?;
     let selections = mapped.selections;
     assert_eq!(
         selections
@@ -50,7 +60,12 @@ fn level_selection_is_independent_of_lexical_dialect_and_scope() -> Result<()> {
     );
     source[1].context.language = SourceLanguage::Hspice;
     source[1].source = "nested.lib".into();
-    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source)?.apply(&source)?;
+    let mapped = MappingTable::resolve(
+        &DeviceConfiguration::default(),
+        &source,
+        &WorkBudget::default(),
+    )?
+    .apply(&source, &WorkBudget::default())?;
     assert_eq!(mapped.selections[0].scope, ["cell"]);
     assert_eq!(mapped.selections[0].source, "nested.lib");
     assert_eq!(
@@ -65,9 +80,14 @@ fn level_selection_is_independent_of_lexical_dialect_and_scope() -> Result<()> {
 
 #[test]
 fn precedence_and_request_local_configuration() -> Result<()> {
-    let config = DeviceConfiguration::parse("devices.dcf", "ModelName=D Level=1 Device=Diode1")?;
+    let config = DeviceConfiguration::parse(
+        "devices.dcf",
+        "ModelName=D Level=1 Device=Diode1",
+        &WorkBudget::default(),
+    )?;
     let source = statements(".options HSPICEMODELS=1\n.model a D LEVEL=1\n");
-    let configured = MappingTable::resolve(&config, &source)?.apply(&source)?;
+    let configured = MappingTable::resolve(&config, &source, &WorkBudget::default())?
+        .apply(&source, &WorkBudget::default())?;
     assert_eq!(configured.selections[0].mapping.device, Device::Diode1);
     assert_eq!(
         configured.selections[0].mapping.origin,
@@ -76,13 +96,14 @@ fn precedence_and_request_local_configuration() -> Result<()> {
     let source = statements(
         ".options HSPICEMODELS=1\n.map ModelName=D Level=1 Device=Diode3\n.model a D LEVEL=1\n",
     );
-    let mapped = MappingTable::resolve(&config, &source)?.apply(&source)?;
+    let mapped = MappingTable::resolve(&config, &source, &WorkBudget::default())?
+        .apply(&source, &WorkBudget::default())?;
     assert_eq!(
         mapped.selections[0].mapping.origin,
         SelectionOrigin::NetlistMap
     );
     assert_eq!(mapped.selections[0].mapping.device, Device::Diode3);
-    let fresh = table("")?.apply(&statements(".model a D LEVEL=1"))?;
+    let fresh = table("")?.apply(&statements(".model a D LEVEL=1"), &WorkBudget::default())?;
     assert_eq!(fresh.selections[0].mapping.device, Device::Diode1);
     Ok(())
 }
@@ -109,7 +130,12 @@ fn rejects_malformed_ambiguous_and_unqualified_selections() -> Result<()> {
         ".model a NPN(LEVEL=8)",
         ".model a NMOS(LEVEL=1 CGDMAX=2p)",
     ] {
-        assert!(table("")?.apply(&statements(card)).is_err(), "{card}");
+        assert!(
+            table("")?
+                .apply(&statements(card), &WorkBudget::default())
+                .is_err(),
+            "{card}"
+        );
     }
     Ok(())
 }
@@ -119,7 +145,12 @@ fn opaque_payloads_and_new_level_aliases() -> Result<()> {
     let source = statements(
         ".FILE payload\n.MAP broken\n.ENDF\n.CONTROL\n.MAP broken\n.ENDC\n.map ModelName=NMOS Level=69 Device=MOS3 Letter=M\n.model a NMOS LEVEL=69\n",
     );
-    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source)?.apply(&source)?;
+    let mapped = MappingTable::resolve(
+        &DeviceConfiguration::default(),
+        &source,
+        &WorkBudget::default(),
+    )?
+    .apply(&source, &WorkBudget::default())?;
     assert_eq!(mapped.selections.len(), 1);
     assert_eq!(mapped.selections[0].mapping.device, Device::Mos3);
     assert!(
@@ -139,7 +170,7 @@ fn legacy_discrete_mos_signature_and_exact_level_version() -> Result<()> {
     let source = statements(
         ".model legacy NMOS ( LEVEL = 7 CGDMIN=2p )\n.model explicit PMOS (VLEVEL=17 CGDMIN=3p)\n.model bsim NMOS (LEVEL=8 VERSION='3.3')\n",
     );
-    let mapped = table("")?.apply(&source)?;
+    let mapped = table("")?.apply(&source, &WorkBudget::default())?;
     assert_eq!(
         mapped.selections[0].mapping.origin,
         SelectionOrigin::LegacyMos17Signature
@@ -156,7 +187,12 @@ fn full_compatibility_cannot_silently_drop_other_physical_options() -> Result<()
     assert!(table(".options HSPICECOMPATIBILITY=1").is_err());
     assert!(table(".options HSPICEMODELS=1\n.options HSPICEMODELS=0").is_err());
     let source = statements(".options TEMP=85 HSPICEMODELS=1 RELTOL=1e-4");
-    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source)?.apply(&source)?;
+    let mapped = MappingTable::resolve(
+        &DeviceConfiguration::default(),
+        &source,
+        &WorkBudget::default(),
+    )?
+    .apply(&source, &WorkBudget::default())?;
     assert_eq!(
         mapped.statements[0].text,
         ".options TEMP=85 HSPICEMODELS=1 RELTOL=1e-4"
@@ -190,7 +226,9 @@ fn diode_alias_uses_the_selected_kernel_parameter_grammar() -> Result<()> {
 .model a DTEST (LEVEL 69 IS {local_is} RS 2 T_ABS {local_temp})
 ",
     );
-    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source)?.apply(&source)?;
+    let budget = WorkBudget::default();
+    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source, &budget)?
+        .apply(&source, &budget)?;
     assert_eq!(mapped.selections.len(), 1);
     let card = &mapped
         .statements

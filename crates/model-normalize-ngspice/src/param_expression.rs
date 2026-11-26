@@ -6,6 +6,7 @@
 
 use crate::model_card::parse_spice_constant;
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::cmp::Ordering;
 mod rational;
 pub(crate) use rational::coefficients as rational_coefficients;
@@ -168,14 +169,23 @@ enum Expr {
     Call(String, Vec<Self>),
 }
 
-struct Parser {
+struct Parsed {
+    tree: Expr,
+    height: usize,
+}
+
+struct Parser<'a> {
     tokens: Vec<Token>,
     offset: usize,
+    budget: &'a WorkBudget,
 }
-impl Parser {
+
+impl Parser<'_> {
     fn take(&mut self) -> Token {
         let token = self.tokens[self.offset].clone();
-        self.offset += 1;
+        if token != Token::End {
+            self.offset += 1;
+        }
         token
     }
     fn peek(&self) -> &Token {
@@ -189,18 +199,28 @@ impl Parser {
         );
         Ok(())
     }
-    fn prefix(&mut self) -> Result<Expr> {
+
+    fn node(&self, tree: Expr, height: usize) -> Result<Parsed> {
+        self.budget.check_depth(height)?;
+        self.budget.charge(Resource::GeneratedNodes, 1)?;
+        Ok(Parsed { tree, height })
+    }
+
+    fn prefix(&mut self) -> Result<Parsed> {
         match self.take() {
-            Token::Value(value) => Ok(Expr::Number(value)),
+            Token::Value(value) => self.node(Expr::Number(value), 1),
             Token::Name(name) => {
                 if self.peek() != &Token::Open {
-                    return Ok(Expr::Symbol(name));
+                    return self.node(Expr::Symbol(name), 1);
                 }
                 self.take();
                 let mut args = Vec::new();
+                let mut height = 0;
                 if self.peek() != &Token::Close {
                     loop {
-                        args.push(self.expression(0)?);
+                        let arg = self.expression(0)?;
+                        height = height.max(arg.height);
+                        args.push(arg.tree);
                         if self.peek() != &Token::Comma {
                             break;
                         }
@@ -208,13 +228,11 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::Close)?;
-                Ok(Expr::Call(name, args))
+                self.node(Expr::Call(name, args), height + 1)
             }
-            Token::Op("+" | "-" | "!") => {
-                let Token::Op(op) = self.tokens[self.offset - 1] else {
-                    unreachable!()
-                };
-                Ok(Expr::Unary(op, Box::new(self.expression(8)?)))
+            Token::Op(op @ ("+" | "-" | "!")) => {
+                let arg = self.expression(8)?;
+                self.node(Expr::Unary(op, Box::new(arg.tree)), arg.height + 1)
             }
             Token::Open => {
                 let value = self.expression(0)?;
@@ -224,7 +242,9 @@ impl Parser {
             other => bail!("expected ngspice expression atom, got {other:?}"),
         }
     }
-    fn expression(&mut self, minimum: u8) -> Result<Expr> {
+
+    fn expression(&mut self, minimum: u8) -> Result<Parsed> {
+        let _depth = self.budget.enter()?;
         let mut left = self.prefix()?;
         loop {
             if *self.peek() == Token::Question {
@@ -235,8 +255,15 @@ impl Parser {
                 let then_branch = self.expression(0)?;
                 self.expect(&Token::Colon)?;
                 let else_branch = self.expression(1)?;
-                left =
-                    Expr::Conditional(Box::new(left), Box::new(then_branch), Box::new(else_branch));
+                let height = left.height.max(then_branch.height).max(else_branch.height) + 1;
+                left = self.node(
+                    Expr::Conditional(
+                        Box::new(left.tree),
+                        Box::new(then_branch.tree),
+                        Box::new(else_branch.tree),
+                    ),
+                    height,
+                )?;
                 continue;
             }
             let Token::Op(op) = self.peek() else { break };
@@ -256,7 +283,11 @@ impl Parser {
                 unreachable!()
             };
             let right = self.expression(precedence + 1)?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            let height = left.height.max(right.height) + 1;
+            left = self.node(
+                Expr::Binary(op, Box::new(left.tree), Box::new(right.tree)),
+                height,
+            )?;
         }
         Ok(left)
     }
@@ -271,6 +302,14 @@ impl SpiceExpression {
     /// Rejects invalid numbers, unknown tokens, mismatched delimiters and
     /// incomplete expressions before any symbol evaluation.
     pub fn parse(raw: &str) -> Result<Self> {
+        Self::parse_with_budget(raw, &WorkBudget::default())
+    }
+
+    /// Compile while sharing the caller's cumulative work counters.
+    /// # Errors
+    /// Malformed syntax, cancellation, or exhausted work budget.
+    pub fn parse_with_budget(raw: &str, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::EvaluationSteps, raw.len().max(1))?;
         let raw = raw.trim();
         let inner = if (raw.starts_with('{') && raw.ends_with('}'))
             || (raw.starts_with('\'') && raw.ends_with('\''))
@@ -282,6 +321,7 @@ impl SpiceExpression {
         let mut parser = Parser {
             tokens: tokenize(inner)?,
             offset: 0,
+            budget,
         };
         let expr = parser.expression(0)?;
         ensure!(
@@ -289,13 +329,13 @@ impl SpiceExpression {
             "trailing ngspice expression tokens: {:?}",
             parser.peek()
         );
-        Ok(Self(expr))
+        Ok(Self(expr.tree))
     }
 
     /// Evaluate constants without requiring occurrence-scoped parameters.
     /// Invalid constant expressions remain errors.
-    pub(crate) fn known_value(&self) -> Result<Option<f64>> {
-        self.0.known_value()
+    pub(crate) fn known_value(&self, budget: &WorkBudget) -> Result<Option<f64>> {
+        self.0.known_value(budget)
     }
 
     /// Evaluate a compiled expression against the provided symbol resolver.
@@ -316,7 +356,18 @@ impl SpiceExpression {
     ///
     /// Rejects unresolved names/functions and invalid expressions.
     pub fn evaluate_with(&self, context: &mut impl SpiceExpressionContext) -> Result<f64> {
-        self.0.evaluate(context)
+        self.evaluate_with_budget(context, &WorkBudget::default())
+    }
+
+    /// Evaluate while sharing the caller's cumulative work counters.
+    /// # Errors
+    /// Invalid evaluation, cancellation, or exhausted work budget.
+    pub fn evaluate_with_budget(
+        &self,
+        context: &mut impl SpiceExpressionContext,
+        budget: &WorkBudget,
+    ) -> Result<f64> {
+        self.0.evaluate(context, budget)
     }
 }
 
@@ -353,8 +404,8 @@ impl SpiceExpressionContext for RequiresBinding {
 }
 
 impl Expr {
-    fn known_value(&self) -> Result<Option<f64>> {
-        match self.evaluate(&mut RequiresBinding) {
+    fn known_value(&self, budget: &WorkBudget) -> Result<Option<f64>> {
+        match self.evaluate(&mut RequiresBinding, budget) {
             Ok(value) => Ok(Some(value)),
             Err(error) if error.downcast_ref::<RequiresBinding>().is_some() => Ok(None),
             Err(error) => Err(error),
@@ -363,14 +414,20 @@ impl Expr {
 }
 
 impl Expr {
-    fn evaluate(&self, resolve: &mut impl SpiceExpressionContext) -> Result<f64> {
+    fn evaluate(
+        &self,
+        resolve: &mut impl SpiceExpressionContext,
+        budget: &WorkBudget,
+    ) -> Result<f64> {
+        let _depth = budget.enter()?;
+        budget.charge(Resource::EvaluationSteps, 1)?;
         let value = match self {
             Self::Number(value) => *value,
             Self::Symbol(name) => resolve
                 .symbol(name)
                 .with_context(|| format!("resolving parameter {name}"))?,
             Self::Unary(op, arg) => {
-                let arg = arg.evaluate(resolve)?;
+                let arg = arg.evaluate(resolve, budget)?;
                 match *op {
                     "+" => arg,
                     "-" => -arg,
@@ -379,21 +436,21 @@ impl Expr {
                 }
             }
             Self::Conditional(condition, positive, negative) => {
-                let selected = if truthy(condition.evaluate(resolve)?) {
+                let selected = if truthy(condition.evaluate(resolve, budget)?) {
                     positive
                 } else {
                     negative
                 };
-                return selected.evaluate(resolve);
+                return selected.evaluate(resolve, budget);
             }
             Self::Binary(op, lhs, rhs) => {
-                let l = lhs.evaluate(resolve)?;
+                let l = lhs.evaluate(resolve, budget)?;
                 match *op {
                     "&&" if !truthy(l) => return Ok(0.0),
                     "||" if truthy(l) => return Ok(1.0),
                     _ => {}
                 }
-                let r = rhs.evaluate(resolve)?;
+                let r = rhs.evaluate(resolve, budget)?;
                 match *op {
                     "+" => l + r,
                     "-" => l - r,
@@ -415,17 +472,17 @@ impl Expr {
             Self::Call(name, args) => {
                 if name == "ternary_fcn" {
                     ensure!(args.len() == 3, "ternary_fcn expects 3 arguments");
-                    let branch = if truthy(args[0].evaluate(resolve)?) {
+                    let branch = if truthy(args[0].evaluate(resolve, budget)?) {
                         &args[1]
                     } else {
                         &args[2]
                     };
-                    return branch.evaluate(resolve);
+                    return branch.evaluate(resolve, budget);
                 }
                 if let Some(builtin) = built_in(name) {
                     let values = args
                         .iter()
-                        .map(|arg| arg.evaluate(resolve))
+                        .map(|arg| arg.evaluate(resolve, budget))
                         .collect::<Result<Vec<_>>>()?;
                     builtin.evaluate(name, &values)?
                 } else {
@@ -519,6 +576,40 @@ mod tests {
             "b" => Ok(5.0),
             _ => bail!("undefined {name}"),
         })
+    }
+
+    #[test]
+    fn expression_depth_and_cumulative_steps_are_bounded() -> Result<()> {
+        use model_preprocess_command::{Cancellation, WorkLimits};
+        for expression in [
+            format!("{}1{}", "(".repeat(1000), ")".repeat(1000)),
+            format!("{}1", "1+".repeat(1000)),
+            format!("{}1", "-".repeat(1000)),
+        ] {
+            let error = SpiceExpression::parse(&expression)
+                .err()
+                .context("unbounded expression accepted")?;
+            ensure!(format!("{error:#}").contains("depth budget exceeded"));
+        }
+        let budget = WorkBudget::new(
+            WorkLimits {
+                evaluation_steps: 12,
+                ..WorkLimits::default()
+            },
+            Cancellation::default(),
+        );
+        let expression = SpiceExpression::parse_with_budget("1+2", &budget)?;
+        for _ in 0..3 {
+            let value = expression.evaluate_with_budget(&mut |_: &str| Ok(0.0), &budget)?;
+            ensure!((value - 3.0).abs() < f64::EPSILON);
+        }
+        ensure!(
+            expression
+                .evaluate_with_budget(&mut |_: &str| Ok(0.0), &budget)
+                .is_err()
+        );
+        ensure!(budget.check().is_err());
+        Ok(())
     }
 
     #[test]

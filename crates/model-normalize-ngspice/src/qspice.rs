@@ -4,13 +4,14 @@ mod bindings;
 mod numeric;
 mod sources;
 use crate::{
-    lexical::{Edit, Statement, apply_edits, remove_spans, statements, tokens},
+    lexical::{Edit, Statement, apply_budgeted_edits, remove_spans, statements, tokens},
     linked_source::{LinkedSource, RootKind, SourceOrigin},
     model_card::{ModelCard, parse_model_card, parse_spice_constant},
     parameter_scope::declarations::Declarations,
     waveform::{PreparedWaveform, WaveformSpec},
 };
 use anyhow::{Context, Result, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::{
     borrow::Cow,
     fmt,
@@ -166,7 +167,12 @@ const EXTENDED: [Option<char>; 32] = [
 // QSPICE documents Windows-1252 netlists. UTF-8 is accepted only with an
 // explicit BOM, avoiding heuristic reinterpretation of valid legacy bytes.
 // https://forum.qorvo.com/t/can-text-comment-support-chinese-utf8/16722/3
-pub(crate) fn decode_resource<'a>(path: &Path, input: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+pub(crate) fn decode_resource<'a>(
+    path: &Path,
+    input: &'a [u8],
+    budget: &WorkBudget,
+) -> Result<Cow<'a, [u8]>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
     validate_resource(path, input)?;
     if let Some(utf8) = input.strip_prefix(b"\xef\xbb\xbf") {
         if let Err(error) = std::str::from_utf8(utf8) {
@@ -185,7 +191,19 @@ pub(crate) fn decode_resource<'a>(path: &Path, input: &'a [u8]) -> Result<Cow<'a
     if input.is_ascii() {
         return Ok(Cow::Borrowed(input));
     }
-    let mut decoded = String::with_capacity(input.len());
+    let mut length = 0usize;
+    for &byte in input {
+        let width = match byte {
+            0..=0x7f => 1,
+            0x80..=0x9f => EXTENDED[usize::from(byte - 0x80)].map_or(1, char::len_utf8),
+            _ => 2,
+        };
+        length = length
+            .checked_add(width)
+            .context("QSPICE decoded length overflow")?;
+    }
+    budget.charge(Resource::EmittedBytes, length)?;
+    let mut decoded = String::with_capacity(length);
     let mut line = 1;
     for &byte in input {
         let character = if (0x80..=0x9f).contains(&byte) {
@@ -540,8 +558,9 @@ pub struct Lowered {
 /// physical line count, so every subsequent native pass retains provenance.
 /// # Errors
 /// Unsupported source semantics, malformed statements or invalid source map.
-pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Lowered> {
+pub fn lower_linked(linked: &LinkedSource, kind: RootKind, budget: &WorkBudget) -> Result<Lowered> {
     let input = &linked.bytes;
+    budget.charge(Resource::ScannedBytes, input.len())?;
     let title_len = if kind == RootKind::Deck {
         input
             .split_inclusive(|byte| *byte == b'\n')
@@ -553,7 +572,7 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Lowered> {
     };
     let body = &input[title_len..];
     let source_statements = statements(body)?;
-    let declarations = Declarations::new(&source_statements).map_err(|failure| {
+    let declarations = Declarations::new(&source_statements, budget).map_err(|failure| {
         linked
             .origin(failure.line + usize::from(title_len != 0))
             .map_or_else(
@@ -563,18 +582,22 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Lowered> {
     })?;
     let mut numeric_edits = Vec::new();
     for statement in source_statements {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
         let origin = linked
             .origin(statement.line + usize::from(title_len != 0))
             .context("missing QSPICE source location")?;
         numeric::rewrite(&statement, origin, &declarations, &mut numeric_edits)?;
     }
-    let lowered = apply_edits(body, numeric_edits);
+    let lowered = apply_budgeted_edits(body, numeric_edits, budget)?;
     let body = lowered.as_deref().unwrap_or(body);
     let mut edits = Vec::new();
     let mut waveforms = Vec::new();
     let source_statements = statements(body)?;
     let settings = analysis::collect(&source_statements, linked, title_len != 0, &declarations)?;
     for statement in source_statements {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
         let line = statement.line + usize::from(title_len != 0);
         let origin = linked
             .origin(line)
@@ -588,8 +611,11 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Lowered> {
                 .first()
                 .is_some_and(|byte| matches!(byte.to_ascii_lowercase(), b'v' | b'i'))
         {
-            if let Some(binding) = sources::rewrite(&statement, origin, &fields, &mut edits, body)?
+            if let Some(binding) =
+                sources::rewrite(&statement, origin, &fields, &mut edits, body, budget)?
             {
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                budget.charge(Resource::EmittedBytes, name.len().saturating_add(10))?;
                 waveforms.push(PreparedWaveform {
                     artifact: if kind == RootKind::Deck {
                         "deck.cir"
@@ -610,7 +636,10 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind) -> Result<Lowered> {
         lower_statement(&statement, origin, &fields, &mut edits, body)
             .with_context(|| format!("QSPICE source {}:{}", origin.path.display(), origin.line))?;
     }
-    let final_body = apply_edits(body, edits).or(lowered);
+    let final_body = apply_budgeted_edits(body, edits, budget)?.or(lowered);
+    if let Some(body) = &final_body {
+        budget.charge(Resource::EmittedBytes, title_len.saturating_add(body.len()))?;
+    }
     Ok(Lowered {
         bytes: final_body.map(|body| {
             let mut bytes = input[..title_len].to_vec();
