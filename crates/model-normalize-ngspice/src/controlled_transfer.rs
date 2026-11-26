@@ -850,14 +850,18 @@ mod tests {
     #[test]
     fn lowering_preserves_comments_source_map_and_branch_names() -> Result<()> {
         let input = b"title\r\nL1 a b 1u Rser=1\r\nE1 out 0 FREQ {v(a,b)*2}=MAG RAD\r\n+ (10,2,0)\r\n+ (20,2,1.57) ; tail\r\nR1 __freq_3_out 0 1k\r\nE2 q 0 TABLE {v(a)}=(0,0)(1,1)\r\n.end\r\n";
-        let result = normalize_mapped(input, RootKind::Deck)?;
+        let result = normalize_mapped(input, RootKind::Deck, crate::NormalizationDialect::Native)?;
         let text = std::str::from_utf8(&result.model.bytes)?;
         assert!(text.contains("E1 out 0 __freq_3_out_1 0 1\r\n"));
         assert!(text.contains("db=false rad=true table=[10 2 0 20 2 1.57]"));
         assert!(text.contains("E2 q 0 TABLE {v(a)}=(0,0)(1,1)"));
         assert!(text.contains("; tail"));
         assert_eq!(result.input_lines, [1, 2, 2, 3, 3, 3, 3, 4, 5, 6, 7, 8]);
-        let repeated = normalize_mapped(&result.model.bytes, RootKind::Deck)?;
+        let repeated = normalize_mapped(
+            &result.model.bytes,
+            RootKind::Deck,
+            crate::NormalizationDialect::Native,
+        )?;
         assert_eq!(repeated.model.bytes, result.model.bytes);
         assert_eq!(
             normalize_ngspice(b"E1 out 0 TABLE {v(a)}=(0,0)(1,1)")?.bytes,
@@ -883,7 +887,8 @@ mod tests {
     fn native_xfer_reference_complex_interpolation_and_current_polarity() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let source = b"Frequency transfer reference\n.param f0=100 f1=300 gain=2\nV1 in 0 dc 1 ac 1\nV2 ref 0 dc 0.25 ac 0.25\nEout out 0 FREQ {V(in,ref)*2} MAG RAD ({f0},{gain},0) ({f1},{gain},1.5707963267948966)\nRload out 0 1k\nGout gout 0 FREQ {V(in,ref)*2} R_I (f0,gain,0) (f1,0,gain)\nRg gout 0 1\n.control\nset wr_singlescale\nset wr_vecnames\nac lin 5 50 350\nwrdata response.dat v(out) v(gout)\nquit\n.endc\n.end\n";
-        let normalized = normalize_mapped(source, RootKind::Deck)?;
+        let normalized =
+            normalize_mapped(source, RootKind::Deck, crate::NormalizationDialect::Native)?;
         fs::write(
             directory.path().join("reference.cir"),
             normalized.model.bytes,
