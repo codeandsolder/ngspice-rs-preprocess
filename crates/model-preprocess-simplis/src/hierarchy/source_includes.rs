@@ -2,7 +2,7 @@
 //! preprocessing environment, independently of indexed model lookup.
 
 use super::{
-    Definition, Environment, Extracted, PreparedRoot, SubcircuitCatalog,
+    Definition, Environment, Extracted, IncludedSource, PreparedRoot, SubcircuitCatalog,
     extract_definitions_scoped, is_directive, is_subcircuit_header, logical_statements,
     normalized_source_path,
 };
@@ -21,7 +21,7 @@ pub(crate) struct RootIncludes<'a> {
     catalog: &'a SubcircuitCatalog,
     active: Vec<ActiveSource>,
     definitions: Vec<Definition>,
-    imported: BTreeSet<String>,
+    imported: BTreeSet<IncludedSource>,
     origin: Option<String>,
     owner: Option<String>,
 }
@@ -69,7 +69,7 @@ impl<'a> RootIncludes<'a> {
         false
     }
 
-    pub(super) fn into_captures(self) -> (Vec<Definition>, BTreeSet<String>) {
+    pub(super) fn into_captures(self) -> (Vec<Definition>, BTreeSet<IncludedSource>) {
         (self.definitions, self.imported)
     }
 
@@ -106,7 +106,10 @@ impl<'a> RootIncludes<'a> {
             name: name.to_owned(),
             ended: false,
         });
-        self.imported.insert(id.to_owned());
+        self.imported.insert(IncludedSource {
+            source_id: id.to_owned(),
+            source_name: name.to_owned(),
+        });
         Ok(Some(metadata.explicit_source.clone()))
     }
 
@@ -166,8 +169,13 @@ impl<'a> RootIncludes<'a> {
     }
 }
 
-pub(super) fn prepare_root(text: &str, external: &SubcircuitCatalog) -> Result<PreparedRoot> {
+pub(super) fn prepare_root(
+    text: &str,
+    external: &SubcircuitCatalog,
+    origin: Option<&str>,
+) -> Result<PreparedRoot> {
     let mut includes = RootIncludes::new(external);
+    includes.origin = origin.map(str::to_owned);
     let processed = run_preprocess_body_with_includes(
         text.as_bytes(),
         &Environment::with_budget(external.budget.clone()),

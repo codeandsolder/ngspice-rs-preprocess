@@ -15,16 +15,16 @@ use std::{
 mod hierarchy;
 pub mod source_dialect;
 pub use hierarchy::{
-    BoundExpression, FunctionAlias, LibrarySimulator, LinkedGeneratedLibrary,
-    LinkedPreprocessedNetlist, NetlistPreprocessStats, ParsedLibrary, PreprocessedNetlist,
-    SubcircuitCatalog, active_statement_prefix, capacitor_charge_assignments,
-    linked_library_filename, lower_scoped_statements, lower_simetrix_source_view,
-    lower_simetrix_source_view_with_budget, lower_spice_expression, parse_init_statement,
-    parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
-    parse_library_with_budget, parse_scoped_library, parse_standalone_library, preprocess_netlist,
-    preprocess_netlist_file, preprocess_netlist_linked, preprocess_netlist_linked_file,
-    project_resource, project_simetrix_source, project_source, project_spice_resource,
-    render_projection, rewrite_bound_symbols, rewrite_parameter_symbols, source_include_target,
+    BoundExpression, FunctionAlias, IncludedSource, LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist,
+    NetlistPreprocessStats, ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog,
+    active_statement_prefix, capacitor_charge_assignments, linked_library_filename,
+    lower_scoped_statements, lower_simetrix_source_view, lower_simetrix_source_view_with_budget,
+    lower_spice_expression, parse_init_statement, parse_init_target_path, parse_library,
+    parse_library_file, parse_library_for_simulator, parse_library_with_budget,
+    parse_scoped_library, parse_standalone_library, preprocess_netlist, preprocess_netlist_at,
+    preprocess_netlist_file, preprocess_netlist_linked, preprocess_netlist_linked_at,
+    preprocess_netlist_linked_file, project_resource, project_simetrix_source, project_source,
+    project_spice_resource, render_projection, rewrite_bound_symbols, rewrite_parameter_symbols, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {

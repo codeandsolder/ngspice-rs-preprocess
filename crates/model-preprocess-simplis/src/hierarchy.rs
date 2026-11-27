@@ -2096,6 +2096,10 @@ impl IncludeScope {
         }
         for item in &definitions {
             budget.charge(Resource::ScannedBytes, item.bytes.len())?;
+            if let Some(name) = &item.source_name {
+                hasher.update(name.as_bytes());
+                hasher.update([0]);
+            }
             if let Some(source) = &item.source_id {
                 hasher.update(source.as_bytes());
             }
@@ -2737,7 +2741,7 @@ struct OccurrenceSpecialization {
     bytes: Vec<u8>,
     globals: GlobalBindings,
     imports: Option<std::sync::Arc<IncludeScope>>,
-    source_ids: BTreeSet<String>,
+    source_ids: BTreeSet<IncludedSource>,
 }
 
 fn specialize_occurrence(
@@ -2901,7 +2905,11 @@ pub fn preprocess_netlist_file(
     admission: &mut SourceSession,
 ) -> Result<PreprocessedNetlist> {
     let source = admission.load(path)?;
-    preprocess_netlist(&source.bytes, external)
+    preprocess_netlist_at(
+        &source.bytes,
+        external,
+        Some(&source.path.to_string_lossy()),
+    )
 }
 
 /// Expand parameterized SIMPLIS subcircuit calls into static `$N` definitions.
@@ -2919,22 +2927,38 @@ pub fn preprocess_netlist(
     input: &[u8],
     external: &SubcircuitCatalog,
 ) -> Result<PreprocessedNetlist> {
+    preprocess_netlist_at(input, external, None)
+}
+
+/// Expand a source snapshot in its original path context, if known.
+///
+/// # Errors
+///
+/// Returns an error if source preprocessing or library resolution fails.
+pub fn preprocess_netlist_at(
+    input: &[u8],
+    external: &SubcircuitCatalog,
+    origin: Option<&str>,
+) -> Result<PreprocessedNetlist> {
     let PreparedRoot {
         mut extracted,
         statements: mut root_statements,
         globals,
         explicit_sources,
-    } = prepare_root(input, external)?;
+    } = prepare_root(input, external, origin)?;
     let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
     let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
     for definition in &mut extracted.definitions {
         if definition.source_id.is_none() {
             definition.source_id = Some(root_source_id.clone());
-            definition.source_name = Some("<root>".to_owned());
+            definition.source_name = Some(origin.unwrap_or("<root>").to_owned());
         }
     }
     let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
-    local.explicit_sources = explicit_sources;
+    local.explicit_sources = explicit_sources
+        .iter()
+        .map(|source| source.source_id.clone())
+        .collect();
     if external.simulator != Some(LibrarySimulator::Simetrix) {
         local.active_aliases = source_aliases::materialize(&mut root_statements, external)?;
     }
@@ -3255,7 +3279,7 @@ struct LinkedUnit {
     runtime: Option<RuntimeScope>,
     init: InitTree,
     imports: Option<std::sync::Arc<IncludeScope>>,
-    included_sources: BTreeSet<String>,
+    included_sources: BTreeSet<IncludedSource>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3264,8 +3288,17 @@ struct LinkedLibraryBuilder {
     support_lines: Vec<String>,
     support_materialized: bool,
     dependencies: BTreeSet<String>,
-    included_sources: BTreeSet<String>,
+    included_sources: BTreeSet<IncludedSource>,
     output: String,
+}
+
+/// A source resource actually selected by an executed include.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub struct IncludedSource {
+    /// Content identity of the admitted source program.
+    pub source_id: String,
+    /// Original path selected by relative include resolution.
+    pub source_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -3274,14 +3307,14 @@ pub struct LinkedGeneratedLibrary {
     pub source_name: String,
     pub filename: String,
     pub dependencies: Vec<String>,
-    pub included_sources: BTreeSet<String>,
+    pub included_sources: BTreeSet<IncludedSource>,
     pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LinkedPreprocessedNetlist {
     pub root_bytes: Vec<u8>,
-    pub included_sources: BTreeSet<String>,
+    pub included_sources: BTreeSet<IncludedSource>,
     pub libraries: Vec<LinkedGeneratedLibrary>,
     pub stats: NetlistPreprocessStats,
 }
@@ -3346,6 +3379,12 @@ fn linked_specialization_name(
     hasher.update([0]);
     hasher.update(definition.scope_id.as_bytes());
     hasher.update([0]);
+    if definition_has_include(definition)
+        && let Some(name) = &definition.source_name
+    {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+    }
     if let Some(bytes) = specialized {
         hasher.update(normalize_definition(bytes));
     } else {
@@ -3452,10 +3491,14 @@ struct PreparedRoot {
     extracted: Extracted,
     statements: Vec<String>,
     globals: GlobalBindings,
-    explicit_sources: BTreeSet<String>,
+    explicit_sources: BTreeSet<IncludedSource>,
 }
 
-fn prepare_root(input: &[u8], external: &SubcircuitCatalog) -> Result<PreparedRoot> {
+fn prepare_root(
+    input: &[u8],
+    external: &SubcircuitCatalog,
+    origin: Option<&str>,
+) -> Result<PreparedRoot> {
     let text = decode_simplis_text(input)?;
     // SIMetrix retains its existing admitted source expansion and runtime
     // mapping. SIMPLIS catalog includes are executable source programs.
@@ -3464,7 +3507,7 @@ fn prepare_root(input: &[u8], external: &SubcircuitCatalog) -> Result<PreparedRo
             .lines()
             .any(|line| is_directive(line, "INCLUDE") || is_directive(line, "INC"))
     {
-        return source_includes::prepare_root(&text, external);
+        return source_includes::prepare_root(&text, external, origin);
     }
     let extracted = extract_definitions_scoped(&text, None, &external.budget)?;
     let (statements, globals) =
@@ -4161,7 +4204,11 @@ pub fn preprocess_netlist_linked_file(
     admission: &mut SourceSession,
 ) -> Result<LinkedPreprocessedNetlist> {
     let source = admission.load(path)?;
-    preprocess_netlist_linked(&source.bytes, external)
+    preprocess_netlist_linked_at(
+        &source.bytes,
+        external,
+        Some(&source.path.to_string_lossy()),
+    )
 }
 
 /// Preprocess a SIMPLIS root netlist into independently linkable source-library artifacts.
@@ -4180,6 +4227,19 @@ pub fn preprocess_netlist_linked(
     input: &[u8],
     external: &SubcircuitCatalog,
 ) -> Result<LinkedPreprocessedNetlist> {
+    preprocess_netlist_linked_at(input, external, None)
+}
+
+/// Expand a source snapshot in its original path context, if known.
+///
+/// # Errors
+///
+/// Returns an error if source preprocessing or library resolution fails.
+pub fn preprocess_netlist_linked_at(
+    input: &[u8],
+    external: &SubcircuitCatalog,
+    origin: Option<&str>,
+) -> Result<LinkedPreprocessedNetlist> {
     use std::fmt::Write as _;
 
     let PreparedRoot {
@@ -4187,18 +4247,21 @@ pub fn preprocess_netlist_linked(
         statements: mut root_statements,
         globals,
         explicit_sources,
-    } = prepare_root(input, external)?;
+    } = prepare_root(input, external, origin)?;
     let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
     let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
     for definition in &mut extracted.definitions {
         if definition.source_id.is_none() {
             definition.source_id = Some(root_source_id.clone());
-            definition.source_name = Some("<root>".to_owned());
+            definition.source_name = Some(origin.unwrap_or("<root>").to_owned());
         }
     }
 
     let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
-    local.explicit_sources = explicit_sources;
+    local.explicit_sources = explicit_sources
+        .iter()
+        .map(|source| source.source_id.clone())
+        .collect();
     if external.simulator != Some(LibrarySimulator::Simetrix) {
         local.active_aliases = source_aliases::materialize(&mut root_statements, external)?;
     }
@@ -4282,7 +4345,7 @@ pub fn preprocess_netlist_linked(
     external.budget.check()?;
     Ok(LinkedPreprocessedNetlist {
         root_bytes: root_output.into_bytes(),
-        included_sources: local.explicit_sources,
+        included_sources: explicit_sources,
         libraries,
         stats: NetlistPreprocessStats {
             root_specializations,
