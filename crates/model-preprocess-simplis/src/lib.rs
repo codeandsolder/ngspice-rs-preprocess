@@ -1397,23 +1397,24 @@ fn process_range(
             .budget
             .charge(Resource::ScannedBytes, line.len())?;
         if let Some(includes) = state.includes.as_deref_mut() {
+            includes.set_position(index);
             if let Some(end_index) = includes.capture_definition(lines, index, end)? {
                 index = end_index;
                 continue;
             }
-            if let Some(target) = hierarchy::source_include_target(line)?
-                && let Some(source) = includes.enter(target)?
-            {
+            if let Some(target) = hierarchy::source_include_target(line)? {
+                let source = includes.enter(target)?;
                 state
                     .env
                     .budget
                     .charge(Resource::GeneratedNodes, source.lines().count())?;
                 let nested = source.lines().collect::<Vec<_>>();
                 let result = process_range(&nested, 0, nested.len(), state);
-                if let Some(includes) = state.includes.as_deref_mut() {
-                    includes.leave();
-                }
-                result.with_context(|| format!("executing SIMPLIS include {target:?}"))?;
+                state
+                    .includes
+                    .as_deref_mut()
+                    .context("missing include executor")?
+                    .leave(result)?;
                 index += 1;
                 continue;
             }
