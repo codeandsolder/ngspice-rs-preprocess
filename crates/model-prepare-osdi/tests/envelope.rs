@@ -207,7 +207,10 @@ esac
         cpu: "generic".into(),
         optimization: 3,
         process: ProcessLimits {
-            timeout: Duration::from_secs(5),
+            // This is a successful multi-process fixture, not a timing test.
+            // Keep a finite but load-tolerant deadline; the command crate
+            // separately tests intentional deadline expiry.
+            timeout: Duration::from_secs(60),
             ..ProcessLimits::default()
         },
         source_bytes: 1024,

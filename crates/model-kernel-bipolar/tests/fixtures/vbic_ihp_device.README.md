@@ -2,7 +2,8 @@
 
 The fixture is the nominal, resolved Nx=4 npn13G2 core parameter set from
 [IHP Open PDK](https://github.com/IHP-GmbH/IHP-Open-PDK/tree/af6b1ebc82c36daf30516a46d3a0a6a5777df0c1/ihp-sg13g2/libs.tech/ngspice/models).
-Copyright 2023 IHP PDK Authors; source licensed Apache-2.0. The numeric
+Copyright 2023 IHP PDK Authors; source licensed Apache-2.0. See the
+[original license](LICENSE-IHP), copied from the pinned source revision. The numeric
 realization and measured simulation outputs are stored, not the source model
 library. Resolve with native ngspice 47 listing e and showmod all; the
 nominal temperature-dependent TF expression is evaluated at 27 °C. The

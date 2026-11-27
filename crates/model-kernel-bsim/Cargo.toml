@@ -12,5 +12,5 @@ description = "Prepared Berkeley bulk BSIM generalized residual and charge kerne
 workspace = true
 
 [dependencies]
-model-compact-intrinsic = { path = "../model-compact-intrinsic" }
-model-kernel-api = { path = "../model-kernel-api" }
+model-compact-intrinsic.workspace = true
+model-kernel-api.workspace = true
