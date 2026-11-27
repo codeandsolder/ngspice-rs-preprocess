@@ -3,6 +3,7 @@
 pub mod conditioning;
 pub mod controlled_transfer;
 mod lexical;
+mod series;
 
 /// Token spans of a logical SPICE statement, with balanced expression groups
 /// and top-level assignment delimiters retained.
@@ -12,6 +13,7 @@ pub fn statement_token_spans(text: &str) -> anyhow::Result<Vec<std::ops::Range<u
     lexical::tokens(text.as_bytes())
 }
 pub mod linked_source;
+pub mod ltspice;
 pub mod model_card;
 pub mod param_expression;
 pub mod parameter_scope;
@@ -32,7 +34,6 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
     path::Path,
     sync::LazyLock,
     time::Duration,
@@ -68,6 +69,22 @@ pub enum NormalizationPass {
     LtspiceInductorRser,
     /// Normalize controlled TABLE syntax and lower FREQ to native xfer models.
     ControlledSourceTransfer,
+    /// Lower `LTspice` passive and voltage-source series loss, including uncoupled inductor defaults.
+    LtspiceSeriesParasitics,
+    /// Comment the schematic-only `LTspice` backannotation directive.
+    LtspiceBackannotation,
+    /// Disable native resistor noise for the explicit `LTspice` flag.
+    LtspiceNoiselessResistor,
+    /// Translate source-specific scalar intrinsic functions.
+    LtspiceIntrinsics,
+    /// Lower `LTspice`-specific operator precedence and Boolean coercion.
+    LtspiceOperators,
+    /// Resolve source-specific independent waveform timing defaults.
+    LtspiceSourceWaveforms,
+    /// Preserve the source idealized diode as an explicit native model family.
+    LtspiceIdealDiode,
+    /// Preserve source voltage-controlled switch physics as an explicit native family.
+    LtspiceSwitch,
     /// Map `PSpice` `arctan()` to ngspice `atan()`.
     PspiceArctan,
     /// Convert positional continued `PSpice` parameters to `name=value` form.
@@ -122,7 +139,7 @@ pub fn looks_like_simplis(input: &[u8]) -> bool {
         || SIMPLIS_PREPROCESSOR_RE.is_match(input)
 }
 
-use lexical::{ensure_textual, normalize_nbsp, split_line_ending};
+use lexical::{ensure_textual, normalize_nbsp};
 
 /// Reserve source identifiers, then allocate names with a monotonic cursor
 /// per canonical base. Scoped repetitions do not restart collision searches.
@@ -190,128 +207,6 @@ impl IdentifierAllocator {
             }
         }
     }
-}
-
-/// Find the unique top-level series-resistance assignment after the device
-/// name, two nodes and inductance. Names occurring within values are not keys.
-fn rser_assignment(
-    text: &[u8],
-    fields: &[std::ops::Range<usize>],
-    line: usize,
-) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
-    let mut rser = None;
-    for index in 4..fields.len() {
-        if !text[fields[index].clone()].eq_ignore_ascii_case(b"rser")
-            || text[fields[index - 1].clone()] == *b"="
-            || fields
-                .get(index + 1)
-                .is_none_or(|span| text[span.clone()] != *b"=")
-        {
-            continue;
-        }
-        let value = fields
-            .get(index + 2)
-            .filter(|span| text[(*span).clone()] != *b"=")
-            .filter(|_| {
-                fields
-                    .get(index + 3)
-                    .is_none_or(|span| text[span.clone()] != *b"=")
-            })
-            .with_context(|| format!("line {line}: Rser requires a value"))?;
-        anyhow::ensure!(rser.is_none(), "line {line}: duplicate Rser assignment");
-        rser = Some((fields[index].start..value.end, value.clone()));
-    }
-    Ok(rser)
-}
-
-fn rewrite_ltspice_inductor_rser(
-    input: &[u8],
-    inserted_lines: &mut Vec<usize>,
-    budget: &WorkBudget,
-) -> Result<Option<Vec<u8>>> {
-    use lexical::{replace_span, statements, tokens};
-    if !input
-        .windows(4)
-        .any(|word| word.eq_ignore_ascii_case(b"rser"))
-    {
-        return Ok(None);
-    }
-    let mut used = IdentifierAllocator::new(input, budget)?;
-    let mut edits = Vec::new();
-    let mut serial = 0;
-    let mut in_control = false;
-    for statement in statements(input)? {
-        let text = &statement.text;
-        let first = text
-            .split(u8::is_ascii_whitespace)
-            .next()
-            .unwrap_or_default();
-        if first.eq_ignore_ascii_case(b".control") {
-            in_control = true;
-        } else if first.eq_ignore_ascii_case(b".endc") {
-            in_control = false;
-        }
-        if in_control
-            || !matches!(first.first(), Some(b'l' | b'L'))
-            || !text
-                .windows(4)
-                .any(|word| word.eq_ignore_ascii_case(b"rser"))
-        {
-            continue;
-        }
-        let fields = tokens(text)?;
-        if fields.len() < 5 {
-            continue;
-        }
-        let Some((assignment, resistance)) = rser_assignment(text, &fields, statement.line)? else {
-            continue;
-        };
-        let ind = &text[fields[0].clone()];
-        let node = &text[fields[1].clone()];
-        let mut resistor_base = b"R__".to_vec();
-        resistor_base.extend_from_slice(ind);
-        resistor_base.extend_from_slice(b"_RSER");
-        let resistor = used.fresh(&resistor_base)?;
-        let mut internal_base = b"__".to_vec();
-        internal_base.extend_from_slice(ind);
-        write!(&mut internal_base, "_rser_{serial}")?;
-        let internal = used.fresh(&internal_base)?;
-        serial += 1;
-        let physical = input[statement.start..]
-            .split_inclusive(|b| *b == b'\n')
-            .next()
-            .unwrap_or_default();
-        let (body, ending) = split_line_ending(physical);
-        let mut line = body[..body.len() - body.trim_ascii_start().len()].to_vec();
-        for word in [&resistor[..], node, &internal, &text[resistance]] {
-            line.extend_from_slice(word);
-            line.push(b' ');
-        }
-        line.pop();
-        line.extend_from_slice(if ending.is_empty() { b"\n" } else { ending });
-        edits.push((statement.start..statement.start, line));
-        inserted_lines.push(statement.line);
-        replace_span(&statement, fields[1].clone(), &internal, &mut edits);
-        // Remove preceding horizontal separation on the same logical line.
-        // If the separator is synthetic its source range is empty.
-        let start = text[..assignment.start].trim_ascii_end().len();
-        let remove = start..assignment.end;
-        let removed = statement.source_ranges(remove.clone());
-        replace_span(&statement, remove, b"", &mut edits);
-        for (plus, code) in &statement.continuations {
-            if input[code.clone()].iter().enumerate().all(|(i, byte)| {
-                byte.is_ascii_whitespace()
-                    || removed
-                        .iter()
-                        .any(|range| range.contains(&(code.start + i)))
-            }) {
-                // A wholly consumed continuation remains a comment, retaining
-                // its physical location and any existing inline comment.
-                edits.push((*plus..*plus + 1, vec![b'*']));
-            }
-        }
-    }
-    lexical::apply_budgeted_edits(input, edits, budget)
 }
 
 fn params_header_end(text: &[u8], fields: &[std::ops::Range<usize>]) -> Option<usize> {
@@ -601,7 +496,14 @@ fn apply_optional<F>(
 /// Returns an error for binary input or source identified as SIMPLIS, which requires
 /// semantic translation rather than syntax normalization.
 pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
-    normalize_body(input, true, 0, &mut Vec::new(), &WorkBudget::default())
+    normalize_body(
+        input,
+        true,
+        0,
+        &mut Vec::new(),
+        NormalizationDialect::Native,
+        &WorkBudget::default(),
+    )
 }
 
 /// Normalized bytes and one original input line for each emitted physical line.
@@ -611,6 +513,17 @@ pub struct MappedNormalization {
     pub model: NormalizedModel,
     /// 1-based physical input lines; synthetic elements inherit the source line.
     pub input_lines: Vec<usize>,
+    /// Occurrence-bound source waveforms that require typed execution.
+    pub waveforms: Vec<waveform::PreparedWaveform>,
+}
+
+/// Explicit source dialect for the linked normalization path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NormalizationDialect {
+    /// Native ngspice source and the existing narrow compatibility rewrites.
+    Native,
+    /// Source-specific `LTspice` semantics.
+    Ltspice,
 }
 
 /// Normalize either an include or a complete deck, preserving the deck title
@@ -623,6 +536,7 @@ pub struct MappedNormalization {
 pub fn normalize_mapped(
     input: &[u8],
     kind: linked_source::RootKind,
+    dialect: NormalizationDialect,
     budget: &WorkBudget,
 ) -> Result<MappedNormalization> {
     ensure_textual(input)?;
@@ -642,6 +556,7 @@ pub fn normalize_mapped(
         kind == linked_source::RootKind::Include,
         title_lines,
         &mut inserted,
+        dialect,
         budget,
     )?;
     let mut input_lines = Vec::new();
@@ -674,7 +589,16 @@ pub fn normalize_mapped(
             && input_lines.len() == model.bytes.split_inclusive(|byte| *byte == b'\n').count(),
         "normalization source mapping is inconsistent"
     );
-    Ok(MappedNormalization { model, input_lines })
+    let mapped = MappedNormalization {
+        model,
+        input_lines,
+        waveforms: Vec::new(),
+    };
+    if dialect == NormalizationDialect::Ltspice {
+        ltspice::normalize(mapped, kind, budget)
+    } else {
+        Ok(mapped)
+    }
 }
 
 fn normalize_body(
@@ -682,6 +606,7 @@ fn normalize_body(
     strip_end: bool,
     title_lines: usize,
     inserted_lines: &mut Vec<usize>,
+    dialect: NormalizationDialect,
     budget: &WorkBudget,
 ) -> Result<NormalizedModel> {
     budget.charge(Resource::ScannedBytes, input.len())?;
@@ -703,9 +628,13 @@ fn normalize_body(
         NormalizationPass::NormalizeNbspWhitespace,
         normalize_nbsp,
     );
-    if let Some(rewritten) = rewrite_ltspice_inductor_rser(&bytes, inserted_lines, budget)? {
+    if let Some(rewritten) = series::rewrite(&bytes, inserted_lines, dialect, strip_end, budget)? {
         bytes = rewritten;
-        passes.push(NormalizationPass::LtspiceInductorRser);
+        passes.push(if dialect == NormalizationDialect::Ltspice {
+            NormalizationPass::LtspiceSeriesParasitics
+        } else {
+            NormalizationPass::LtspiceInductorRser
+        });
     }
     if let Some(rewritten) = rewrite_pspice_arctan(&bytes, budget)? {
         bytes = rewritten;
@@ -1094,6 +1023,7 @@ mod tests {
         let result = normalize_mapped(
             source,
             linked_source::RootKind::Include,
+            NormalizationDialect::Native,
             &WorkBudget::default(),
         )?;
         let actual = std::str::from_utf8(&result.model.bytes)?;

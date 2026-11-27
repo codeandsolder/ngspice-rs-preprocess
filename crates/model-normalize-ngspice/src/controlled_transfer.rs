@@ -1058,6 +1058,7 @@ mod tests {
         let result = normalize_mapped(
             input,
             RootKind::Deck,
+            crate::NormalizationDialect::Native,
             &model_preprocess_command::WorkBudget::default(),
         )?;
         let text = std::str::from_utf8(&result.model.bytes)?;
@@ -1069,6 +1070,7 @@ mod tests {
         let repeated = normalize_mapped(
             &result.model.bytes,
             RootKind::Deck,
+            crate::NormalizationDialect::Native,
             &model_preprocess_command::WorkBudget::default(),
         )?;
         assert_eq!(repeated.model.bytes, result.model.bytes);
@@ -1099,6 +1101,7 @@ mod tests {
         let normalized = normalize_mapped(
             source,
             RootKind::Deck,
+            crate::NormalizationDialect::Native,
             &model_preprocess_command::WorkBudget::default(),
         )?;
         fs::write(

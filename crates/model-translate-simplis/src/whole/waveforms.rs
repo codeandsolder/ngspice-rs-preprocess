@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::waveform::{
-    Forcing, Knot, Period, PreparedWaveform, PulseEdges, PulseSpec, Repeat, ResolvedWaveform,
+    Forcing, NativePwlReference, Period, PreparedWaveform, PulseEdges, PulseSpec, ResolvedWaveform,
     Scalar, SineDelay, SymbolicPoint, WaveformSpec,
 };
 use model_preprocess_command::{Resource, WorkBudget};
@@ -250,103 +250,6 @@ fn parse(statement: &str, budget: &WorkBudget) -> Result<Option<Parsed>> {
     }))
 }
 
-struct ReferencePwl {
-    knots: Vec<Knot>,
-    delay: f64,
-    repeat_at: Option<f64>,
-}
-
-impl ReferencePwl {
-    fn push(&mut self, knot: Knot) -> Result<()> {
-        ensure!(
-            knot.time.is_finite() && knot.time >= 0.,
-            "native PWL time shift overflows"
-        );
-        ensure!(
-            self.knots.last().is_none_or(|last| last.time < knot.time),
-            "native PWL cannot represent shifted knot times distinctly"
-        );
-        self.knots.push(knot);
-        Ok(())
-    }
-
-    fn build(knots: &[Knot], repeat: Option<Repeat>, dc: f64) -> Result<Self> {
-        let first = knots.first().context("missing waveform knots")?;
-        let Some(cycle) = repeat else {
-            let delay = first.time.min(0.);
-            let mut result = Self {
-                knots: Vec::new(),
-                delay,
-                repeat_at: None,
-            };
-            for knot in knots {
-                result.push(Knot {
-                    time: knot.time - delay,
-                    ..*knot
-                })?;
-            }
-            return Ok(result);
-        };
-        let prefix = cycle.hold.is_none() && cycle.origin > 0.;
-        let mut result = Self {
-            knots: Vec::new(),
-            delay: if prefix { 0. } else { cycle.origin },
-            repeat_at: Some(if prefix { cycle.origin } else { 0. }),
-        };
-        if prefix {
-            // Native PWL holds before TD. Emit the rest of the preceding
-            // cycle, then repeat from the actual positive boundary.
-            result.push(Knot {
-                time: 0.,
-                left: dc,
-                right: dc,
-            })?;
-            for knot in knots {
-                let time = cycle.origin + (knot.time - cycle.period);
-                if time > 0. {
-                    ensure!(time < cycle.origin, "native PWL prefix loses a knot");
-                    result.push(Knot { time, ..*knot })?;
-                }
-            }
-        }
-        let shift = if prefix { cycle.origin } else { 0. };
-        for (index, knot) in knots.iter().enumerate() {
-            let left = if index == 0 && !prefix {
-                cycle.hold.unwrap_or(knot.right)
-            } else {
-                knot.left
-            };
-            result.push(Knot {
-                time: knot.time + shift,
-                left,
-                ..*knot
-            })?;
-        }
-        result.push(Knot {
-            time: cycle.period + shift,
-            left: first.left,
-            right: first.left,
-        })?;
-        Ok(result)
-    }
-
-    fn write(&self, output: &mut String) -> Result<()> {
-        output.push_str(" PWL(");
-        for knot in &self.knots {
-            write!(output, " {:.17e} {:.17e}", knot.time, knot.left)?;
-            if knot.left.to_bits() != knot.right.to_bits() {
-                write!(output, " {:.17e} {:.17e}", knot.time, knot.right)?;
-            }
-        }
-        output.push(')');
-        if let Some(repeat) = self.repeat_at {
-            write!(output, " r={repeat:.17e}")?;
-        }
-        write!(output, " td={:.17e}", self.delay)?;
-        Ok(())
-    }
-}
-
 impl Parsed {
     fn declaration(&self, artifact: &str, scope: &[String]) -> PreparedWaveform {
         PreparedWaveform {
@@ -378,13 +281,10 @@ impl Parsed {
 
     fn strict_native_reference(resolved: &ResolvedWaveform) -> bool {
         match &resolved.forcing {
+            Forcing::Exponential(exp) => exp.native_reference().is_some(),
             Forcing::PiecewiseLinear { knots, repeat } => {
-                ReferencePwl::build(knots, *repeat, resolved.dc).is_ok_and(|reference| {
-                    reference
-                        .knots
-                        .iter()
-                        .all(|knot| knot.left.to_bits() == knot.right.to_bits())
-                })
+                NativePwlReference::build(knots, *repeat, resolved.dc)
+                    .is_ok_and(|reference| reference.is_continuous())
             }
             Forcing::Sine {
                 damping,
@@ -421,8 +321,16 @@ impl Parsed {
             self.name, self.positive, self.negative, resolved.dc
         )?;
         match &resolved.forcing {
+            Forcing::Exponential(exp) => {
+                write!(
+                    output,
+                    " {}",
+                    exp.native_reference()
+                        .context("exponential source requires typed execution")?
+                )?;
+            }
             Forcing::PiecewiseLinear { knots, repeat } => {
-                ReferencePwl::build(knots, *repeat, resolved.dc)?.write(&mut output)?;
+                NativePwlReference::build(knots, *repeat, resolved.dc)?.write(&mut output)?;
             }
             Forcing::Sine {
                 offset,
@@ -431,7 +339,13 @@ impl Parsed {
                 delay,
                 damping,
                 hold_before_delay,
+                phase,
+                stop_after,
             } => {
+                ensure!(
+                    stop_after.is_none(),
+                    "finite sine needs typed waveform binding"
+                );
                 let gated = *hold_before_delay && *delay > 0.;
                 let shift = if gated { *delay } else { 0. };
                 let elapsed = shift - delay;
@@ -440,7 +354,7 @@ impl Parsed {
                 } else {
                     amplitude * (-damping * elapsed).exp()
                 };
-                let phase = (elapsed * frequency % 1.) * 360.;
+                let phase = (elapsed * frequency % 1.).mul_add(360., *phase);
                 ensure!(
                     peak.is_finite() && phase.is_finite(),
                     "nonfinite native sine coefficients"
