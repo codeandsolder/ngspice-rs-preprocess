@@ -981,6 +981,24 @@ both versions, selector states, binning, multiplicity, field and body-bias
 regions, and temperatures. Tests check both currents and four partials,
 plus independent finite differences of the Rust values.
 
+### HiSIM-HV non-edge gate currents and intrinsic surface electrostatics
+
+The prepared non-edge gate tunneling law evaluates inversion-layer tunneling,
+direct body tunneling and Fowler–Nordheim tunneling from the actual intrinsic
+channel state and its four-coordinate derivatives. Partitioning into drain and
+source currents belongs to the channel assembly. The independent 80-case native
+oracle checks branch values and finite-difference gradients.
+
+The normal-mode Poisson solver evaluates the source/drain surface equations in
+the native D1/D2/D3 regions. It uses a safeguarded Newton solve with a finite
+exponential upper bound and implicit differentiation, including the flatband
+limit. The 960-case native reference uses an independent extended-precision
+bisection and finite differences. The accumulation law retains the version-
+specific surface confinement and source cubic equation, using a rationalized
+Cardano expression and a Newton refinement; 320 native cases cover its charge
+and gradient. These are intrinsic electrostatic primitives, not yet the complete
+coupled HiSIM-HV channel evaluation.
+
 ## Reference test coverage
 
 `tests/fixtures/*.names` contains **only parameter names** extracted from eight

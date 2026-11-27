@@ -2,9 +2,11 @@
 //!
 //! This is setup-stage parameter preparation, not a physical model implementation.
 
+mod accumulation;
 mod edge_tunneling;
 mod effective;
 mod fringing;
+mod gate_tunneling;
 mod gidl;
 mod heat;
 mod instance;
@@ -12,15 +14,23 @@ mod junction;
 mod junction_current;
 mod lateral_field;
 mod rules;
+mod surface;
 mod temperature;
 mod transport;
 
+pub use accumulation::{
+    HiSimHvAccumulationInputs, HiSimHvAccumulationPoint, evaluate_hisim_hv_accumulation,
+};
 pub use edge_tunneling::{
     HiSimHvEdgeTunnelingCurrent, HiSimHvEdgeTunnelingCurrents, PreparedHiSimHvEdgeTunneling,
     prepare_hisim_hv_edge_tunneling,
 };
 pub use effective::HiSimHvEffectiveGeometry;
 pub use fringing::{HiSimHvFringingCharges, PreparedHiSimHvFringing, prepare_hisim_hv_fringing};
+pub use gate_tunneling::{
+    HiSimHvGateChannelState, HiSimHvGateTunnelingCurrents, PreparedHiSimHvGateTunneling,
+    prepare_hisim_hv_gate_tunneling,
+};
 pub use gidl::{
     HiSimHvGidlCurrents, HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar, PreparedHiSimHvGidl,
     prepare_hisim_hv_gidl,
@@ -42,6 +52,7 @@ pub use lateral_field::{
     HiSimHvLateralFieldCharge, PreparedHiSimHvLateralFieldCharge,
     prepare_hisim_hv_lateral_field_charge,
 };
+pub use surface::{HiSimHvSurfaceInputs, HiSimHvSurfacePoint, evaluate_hisim_hv_surface};
 pub use temperature::{PreparedHiSimHvTemperature, prepare_hisim_hv_temperature};
 pub use transport::{
     HiSimHvDepletionTransport, HiSimHvThermalBranch, HiSimHvTransportGeometry,
