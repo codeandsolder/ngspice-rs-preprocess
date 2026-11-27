@@ -59,7 +59,7 @@ fn prepare(
     Ok(setup.prepare_channel(0, ambient)?)
 }
 
-fn scalar_values(point: BsimSoiChannelPoint) -> [BsimSoiChannelScalar; 13] {
+const fn scalar_values(point: &BsimSoiChannelPoint) -> [BsimSoiChannelScalar; 13] {
     [
         point.drain_voltage,
         point.gate_voltage,
@@ -110,11 +110,11 @@ fn physical_channel_bias_derivatives() -> TestResult {
                                 backgate: sign * back,
                                 kelvin: t,
                             };
-                            let point = scalar_values(law.evaluate(bias)?);
+                            let point = scalar_values(&law.evaluate(bias)?);
                             for axis in 0..5 {
                                 let h = if axis == 4 { 1e-3 } else { 1e-5 };
-                                let high = scalar_values(law.evaluate(perturb(bias, axis, h))?);
-                                let low = scalar_values(law.evaluate(perturb(bias, axis, -h))?);
+                                let high = scalar_values(&law.evaluate(perturb(bias, axis, h))?);
+                                let low = scalar_values(&law.evaluate(perturb(bias, axis, -h))?);
                                 for (i, ((a, hi), lo)) in
                                     point.iter().zip(high).zip(low).enumerate()
                                 {
@@ -125,7 +125,10 @@ fn physical_channel_bias_derivatives() -> TestResult {
                                         .max(1e-25);
                                     assert!(
                                         (expected - diff).abs()
-                                            <= 2e-5 * expected.abs().max(diff.abs()) + 64. * scale,
+                                            <= 64.0_f64.mul_add(
+                                                scale,
+                                                2e-5 * expected.abs().max(diff.abs())
+                                            ),
                                         "pmos={pmos} heat={heat} mode={mode} fdmod={fdmod} {bias:?} field={i} axis={axis}: {expected:e} vs {diff:e}"
                                     );
                                 }
@@ -201,7 +204,7 @@ fn native_channel_threshold() -> TestResult {
                         };
                         let actual = law.evaluate(bias)?.threshold.value;
                         assert!(
-                            (actual - reference).abs() <= 3e-7 * reference.abs() + 1e-8,
+                            (actual - reference).abs() <= 3e-7_f64.mul_add(reference.abs(), 1e-8),
                             "pmos={pmos} heat={heat} mode={mode} fdmod={fdmod} {bias:?}: {actual:e} vs {reference:e}"
                         );
                     }
@@ -217,11 +220,10 @@ fn drain_setup(
     heat: bool,
     soi: i32,
     mob: i32,
-    external: bool,
-    rdsw: f64,
-    a1: f64,
+    transport: (bool, f64, f64),
     material: bool,
 ) -> Result<model_compact_intrinsic::PreparedBsimSoiDrainChannel, Box<dyn std::error::Error>> {
+    let (external, rdsw, a1) = transport;
     let sign = if pmos { -1. } else { 1. };
     let card: Vec<_> = CARD
         .split_whitespace()
@@ -313,7 +315,7 @@ fn drain_channel_gradients() -> TestResult {
                     {
                         for material in [false, true] {
                             let law =
-                                drain_setup(pmos, heat, soi, mob, external, rdsw, a1, material)?;
+                                drain_setup(pmos, heat, soi, mob, (external, rdsw, a1), material)?;
                             for (gate, drain, body, back) in [
                                 (0.3, 0.02, -0.2, 0.3),
                                 (1.2, 0.6, -0.1, -0.2),
@@ -327,15 +329,17 @@ fn drain_channel_gradients() -> TestResult {
                                     kelvin: 320.15,
                                 };
                                 let point = law.evaluate(bias)?;
-                                for axis in 0..5 {
+                                for (axis, expected) in
+                                    point.current.gradient.into_iter().enumerate()
+                                {
                                     let h = if axis == 4 { 1e-3 } else { 1e-5 };
                                     let hi = law.evaluate(perturb(bias, axis, h))?.current.value;
                                     let lo = law.evaluate(perturb(bias, axis, -h))?.current.value;
                                     let diff = (hi - lo) / (2. * h);
-                                    let expected = point.current.gradient[axis];
-                                    let tol = 3e-5 * expected.abs().max(diff.abs())
-                                        + 64. * hi.abs().max(lo.abs()) * f64::EPSILON / h
-                                        + 1e-20;
+                                    let tol = 3e-5_f64.mul_add(
+                                        expected.abs().max(diff.abs()),
+                                        64. * hi.abs().max(lo.abs()) * f64::EPSILON / h,
+                                    ) + 1e-20;
                                     assert!(
                                         (expected - diff).abs() <= tol,
                                         "pmos={pmos} heat={heat} soi={soi} mob={mob} material={material} external={external} {bias:?} axis={axis}: {expected:e} vs {diff:e}"
@@ -378,7 +382,7 @@ fn native_intrinsic_drain_current() -> TestResult {
                     let ua = if mob == 4 { 0.06 } else { 1e-9 };
                     for (rdsw, a1) in [(0., 0.), (100., 0.15), (100., -0.15)] {
                         let a2 = if a1 == 0. { 1. } else { 0.8 };
-                        let law = drain_setup(pmos, heat, soi, mob, false, rdsw, a1, false)?;
+                        let law = drain_setup(pmos, heat, soi, mob, (false, rdsw, a1), false)?;
                         let rise = if heat { 20. } else { 0. };
                         let vth0 = sign * 0.55;
                         for (gate, drain, body, back) in [
@@ -425,7 +429,8 @@ fn native_intrinsic_drain_current() -> TestResult {
                                 ("vdsat", point.saturation_voltage.value, values[2] / 2.3),
                             ] {
                                 assert!(
-                                    (actual - reference).abs() <= 3e-6 * reference.abs() + 1e-13,
+                                    (actual - reference).abs()
+                                        <= 3e-6_f64.mul_add(reference.abs(), 1e-13),
                                     "{name} pmos={pmos} heat={heat} soi={soi} mob={mob} rdsw={rdsw} a1={a1} {bias:?}: {actual:e} vs {reference:e}"
                                 );
                             }
@@ -532,12 +537,12 @@ fn gate_induced_leakage_gradients() -> TestResult {
                                 ] {
                                     let diff = (upper.value - lower.value) / (2. * h);
                                     let expected = actual.gradient[axis];
-                                    let tol = 3e-5 * expected.abs().max(diff.abs())
-                                        + 64.
-                                            * upper.value.abs().max(lower.value.abs())
+                                    let tol = 3e-5_f64.mul_add(
+                                        expected.abs().max(diff.abs()),
+                                        64. * upper.value.abs().max(lower.value.abs())
                                             * f64::EPSILON
-                                            / h
-                                        + 1e-22;
+                                            / h,
+                                    ) + 1e-22;
                                     assert!(
                                         (expected - diff).abs() <= tol,
                                         "{bias:?} soi={soi} mode={mode} material={material} axis={axis}: {expected:e} vs {diff:e}"
@@ -625,7 +630,8 @@ fn native_gate_induced_leakage() -> TestResult {
                                 (point.source_to_body.value, sign * 2.3 * expected_source),
                             ] {
                                 assert!(
-                                    (actual - reference).abs() <= 3e-6 * reference.abs() + 1e-20,
+                                    (actual - reference).abs()
+                                        <= 3e-6_f64.mul_add(reference.abs(), 1e-20),
                                     "pmos={pmos} heat={heat} soi={soi} mode={mode} material={material} {bias:?}: {actual:e} vs {reference:e}"
                                 );
                             }
@@ -746,7 +752,7 @@ fn extrinsic_charge_gradients() -> TestResult {
                                         0 => b.overlap_gate += delta,
                                         1 => b.drain += delta,
                                         _ => b.backgate += delta,
-                                    };
+                                    }
                                     b
                                 };
                                 let h = 1e-5;
@@ -757,7 +763,8 @@ fn extrinsic_charge_gradients() -> TestResult {
                                     let expected = actual.gradient[axis];
                                     assert!(
                                         (expected - diff).abs()
-                                            <= 1e-5 * expected.abs().max(diff.abs()) + 1e-24,
+                                            <= 1e-5_f64
+                                                .mul_add(expected.abs().max(diff.abs()), 1e-24),
                                         "{bias:?} axis={axis} row={index}: {expected:e} vs {diff:e}"
                                     );
                                 }
@@ -857,7 +864,8 @@ fn check_native_extrinsic_storage(ideal_only: bool) -> TestResult {
                                 let expected = actual.gradient[axis];
                                 assert!(
                                     (expected - reference).abs()
-                                        <= 3e-6 * expected.abs().max(reference.abs()) + 1e-22,
+                                        <= 3e-6_f64
+                                            .mul_add(expected.abs().max(reference.abs()), 1e-22),
                                     "pmos={pmos} soi={soi} nsub={nsub:e} linear={linear} gate={vg} drain={vd} backgate={ve} axis={axis} row={index}: {expected:e} vs {reference:e}"
                                 );
                             }
@@ -961,7 +969,7 @@ fn impact_ionization_gradients() -> TestResult {
                                     0..=4 => b.channel = perturb(b.channel, axis, delta),
                                     5 => b.body_source_junction += delta,
                                     _ => b.body_drain_junction += delta,
-                                };
+                                }
                                 b
                             };
                             let hi = law.evaluate(adjust(h))?;
@@ -976,12 +984,12 @@ fn impact_ionization_gradients() -> TestResult {
                                     5 => actual.d_body_source_junction,
                                     _ => actual.d_body_drain_junction,
                                 };
-                                let tol = 3e-5 * expected.abs().max(diff.abs())
-                                    + 64.
-                                        * upper.current.value.abs().max(lower.current.value.abs())
+                                let tol = 3e-5_f64.mul_add(
+                                    expected.abs().max(diff.abs()),
+                                    64. * upper.current.value.abs().max(lower.current.value.abs())
                                         * f64::EPSILON
-                                        / h
-                                    + 1e-20;
+                                        / h,
+                                ) + 1e-20;
                                 assert!(
                                     (expected - diff).abs() <= tol,
                                     "{bias:?} soi={soi} mode={mode} axis={axis}: {expected:e} vs {diff:e}"
@@ -1064,7 +1072,7 @@ fn native_impact_ionization() -> TestResult {
                             point.drain_to_body.current.value + point.source_to_body.current.value;
                         let reference = sign * values[1];
                         assert!(
-                            (actual - reference).abs() <= 3e-6 * reference.abs() + 1e-19,
+                            (actual - reference).abs() <= 3e-6_f64.mul_add(reference.abs(), 1e-19),
                             "pmos={pmos} heat={heat} soi={soi} mode={mode} {bias:?}: {actual:e} vs {reference:e}"
                         );
                     }

@@ -1,7 +1,7 @@
 use ParameterValue::{Flag, Integer, Real};
 use model_compact_intrinsic::{
-    BoundParameters, BsimSoiInstanceInput, ModelVariant, ParameterScope, ParameterValue,
-    PreparedBsimSoiSetup, prepare_bsim_soi_model, prepare_bsim_soi_setup,
+    BoundParameters, BsimSoiInstanceInput, BsimSoiJunctionCharges, ModelVariant, ParameterScope,
+    ParameterValue, PreparedBsimSoiSetup, prepare_bsim_soi_model, prepare_bsim_soi_setup,
 };
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -74,7 +74,7 @@ fn setup_with(
 
 fn close(actual: f64, expected: f64, tol: f64) {
     assert!(
-        (actual - expected).abs() <= tol * actual.abs().max(expected.abs()) + 1e-18,
+        (actual - expected).abs() <= tol.mul_add(actual.abs().max(expected.abs()), 1e-18),
         "{actual:e} vs {expected:e}"
     );
 }
@@ -100,38 +100,38 @@ fn neutral_bipolar_analytic_derivatives() -> TestResult {
                         let point = eval(temp, bs, bd)?;
                         let h = 1e-6;
                         let ht = 1e-3;
-                        let high_bs = eval(temp, bs + h, bd)?;
-                        let low_bs = eval(temp, bs - h, bd)?;
-                        let high_bd = eval(temp, bs, bd + h)?;
-                        let low_bd = eval(temp, bs, bd - h)?;
+                        let source_upper = eval(temp, bs + h, bd)?;
+                        let source_lower = eval(temp, bs - h, bd)?;
+                        let drain_upper = eval(temp, bs, bd + h)?;
+                        let drain_lower = eval(temp, bs, bd - h)?;
                         let hot = eval(temp + ht, bs, bd)?;
                         let cold = eval(temp - ht, bs, bd)?;
                         for (a, b, c, d, e) in [
                             (
                                 point.source_recombination,
-                                high_bs.source_recombination,
-                                low_bs.source_recombination,
+                                source_upper.source_recombination,
+                                source_lower.source_recombination,
                                 hot.source_recombination,
                                 cold.source_recombination,
                             ),
                             (
                                 point.drain_recombination,
-                                high_bd.drain_recombination,
-                                low_bd.drain_recombination,
+                                drain_upper.drain_recombination,
+                                drain_lower.drain_recombination,
                                 hot.drain_recombination,
                                 cold.drain_recombination,
                             ),
                             (
                                 point.source_diffusion,
-                                high_bs.source_diffusion,
-                                low_bs.source_diffusion,
+                                source_upper.source_diffusion,
+                                source_lower.source_diffusion,
                                 hot.source_diffusion,
                                 cold.source_diffusion,
                             ),
                             (
                                 point.drain_diffusion,
-                                high_bd.drain_diffusion,
-                                low_bd.drain_diffusion,
+                                drain_upper.drain_diffusion,
+                                drain_lower.drain_diffusion,
                                 hot.drain_diffusion,
                                 cold.drain_diffusion,
                             ),
@@ -142,12 +142,14 @@ fn neutral_bipolar_analytic_derivatives() -> TestResult {
                         let collector = point.collector;
                         close(
                             collector.d_body_source,
-                            (high_bs.collector.current - low_bs.collector.current) / (2. * h),
+                            (source_upper.collector.current - source_lower.collector.current)
+                                / (2. * h),
                             1e-5,
                         );
                         close(
                             collector.d_body_drain,
-                            (high_bd.collector.current - low_bd.collector.current) / (2. * h),
+                            (drain_upper.collector.current - drain_lower.collector.current)
+                                / (2. * h),
                             1e-5,
                         );
                         close(
@@ -246,7 +248,7 @@ fn charge_parameters() -> Result<Vec<(&'static str, ParameterValue)>, Box<dyn st
 
 fn close_charge(actual: f64, expected: f64, tolerance: f64) {
     assert!(
-        (actual - expected).abs() <= tolerance * actual.abs().max(expected.abs()) + 1e-26,
+        (actual - expected).abs() <= tolerance.mul_add(actual.abs().max(expected.abs()), 1e-26),
         "{actual:e} vs {expected:e}"
     );
 }
@@ -319,7 +321,7 @@ fn junction_storage_analytic_derivatives() -> TestResult {
     let point = setup
         .prepare_junctions(0, 300.15)?
         .evaluate(325., 0.4, 0.2)?;
-    assert_eq!(point.charges, Default::default());
+    assert_eq!(point.charges, BsimSoiJunctionCharges::default());
     Ok(())
 }
 

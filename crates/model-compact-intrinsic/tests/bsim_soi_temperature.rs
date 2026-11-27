@@ -31,7 +31,7 @@ fn setup(
     )?)
 }
 
-fn quantities(p: BsimSoiTemperaturePoint) -> [BsimSoiThermalScalar; 10] {
+const fn quantities(p: BsimSoiTemperaturePoint) -> [BsimSoiThermalScalar; 10] {
     [
         p.thermal_voltage,
         p.bandgap,
@@ -84,7 +84,8 @@ fn material_and_heat_derivatives() -> TestResult {
                         let low = quantities(law.evaluate(temperature - step)?);
                         for ((exact, a), b) in quantities(point).into_iter().zip(high).zip(low) {
                             let numeric = (a.value - b.value) / (2. * step);
-                            let tol = 3e-6 * numeric.abs().max(exact.d_temperature.abs()) + 1e-28;
+                            let tol = 3e-6_f64
+                                .mul_add(numeric.abs().max(exact.d_temperature.abs()), 1e-28);
                             assert!(
                                 (numeric - exact.d_temperature).abs() <= tol,
                                 "material={material} pmos={pmos} substrate={substrate} T={temperature} exact={exact:?} numeric={numeric:e}"
@@ -108,7 +109,7 @@ fn inactive_thermal_coordinate_and_gamma_doping() -> TestResult {
     for q in quantities(point) {
         assert_eq!(q.d_temperature, 0.);
     }
-    let oxide = 3.453133e-11 / 1e-8;
+    let oxide = 3.453_133e-11 / 1e-8;
     let doping = 3.021e22_f64 * (0.5_f64 * oxide).powi(2);
     let derived = point.intrinsic_density.value
         * (point.surface_potential.value / (2. * point.thermal_voltage.value)).exp();
@@ -181,7 +182,7 @@ fn native_passive_heat_port() -> TestResult {
                     ),
                 ] {
                     assert!(
-                        (actual - reference).abs() <= 1e-9 * reference.abs() + 1e-20,
+                        (actual - reference).abs() <= 1e-9_f64.mul_add(reference.abs(), 1e-20),
                         "passive heat {actual:e} vs {reference:e}, pmos={pmos} nf={nf} nseg={nseg} m={m} T={ambient}"
                     );
                 }

@@ -74,18 +74,18 @@ impl Case {
         Ok(setup.prepare_noise(0, 300.15)?)
     }
     fn bias(self, g: f64, d: f64, b: f64, e: f64, frequency: f64) -> BsimSoiNoiseBias {
-        let s = self.sign();
+        let sign = self.sign();
         BsimSoiNoiseBias {
             channel: BsimSoiChannelBias {
-                gate: s * g,
-                drain: s * d,
-                body: s * b,
-                backgate: s * e,
+                gate: sign * g,
+                drain: sign * d,
+                body: sign * b,
+                backgate: sign * e,
                 kelvin: if self.heat { 325.15 } else { 300.15 },
             },
-            body_source_junction: s * b,
-            body_drain_junction: s * (b - d),
-            contact: s * b,
+            body_source_junction: sign * b,
+            body_drain_junction: sign * (b - d),
+            contact: sign * b,
             frequency,
         }
     }
@@ -116,7 +116,7 @@ fn cases() -> impl Iterator<Item = Case> {
 }
 fn compare(actual: f64, expected: f64, relative: f64, context: impl std::fmt::Debug) {
     assert!(
-        (actual - expected).abs() <= relative * actual.abs().max(expected.abs()) + 1e-37,
+        (actual - expected).abs() <= relative.mul_add(actual.abs().max(expected.abs()), 1e-37),
         "{context:?}: {actual:e} vs {expected:e}"
     );
 }
@@ -154,7 +154,7 @@ fn noise_scaling_and_frequency() -> TestResult {
             }
             compare(
                 first.channel_flicker,
-                second.channel_flicker * 2_f64.powf(0.9),
+                second.channel_flicker * 0.9_f64.exp2(),
                 1e-11,
                 (case, bias),
             );

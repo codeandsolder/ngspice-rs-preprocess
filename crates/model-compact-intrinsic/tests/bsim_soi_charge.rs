@@ -13,8 +13,8 @@ struct Case {
     soi: i32,
     cv: i32,
     partition: f64,
-    contact: bool,
-    material: bool,
+    contact_area: f64,
+    material: i32,
 }
 impl Case {
     const fn sign(self) -> f64 {
@@ -45,7 +45,7 @@ impl Case {
                     ("capmod", Integer(capmod)),
                     ("vgstcvmod", Integer(self.cv)),
                     ("xpart", Real(self.partition)),
-                    ("mtrlmod", Integer(i32::from(self.material))),
+                    ("mtrlmod", Integer(self.material)),
                     ("eot", Real(3e-9)),
                     ("epsrsub", Real(11.7)),
                     ("phig", Real(4.1)),
@@ -66,7 +66,7 @@ impl Case {
                 ("m", Real(2.3)),
                 ("agbcp", Real(1e-13)),
                 ("aebcp", Real(2e-13)),
-                ("agbcp2", Real(if self.contact { 2e-13 } else { 0. })),
+                ("agbcp2", Real(self.contact_area)),
             ],
         )?;
         let setup = prepare_bsim_soi_setup(
@@ -80,12 +80,12 @@ impl Case {
         Ok(setup.prepare_intrinsic_charges(0, 300.15)?)
     }
     fn bias(self, g: f64, d: f64, b: f64, e: f64, rise: f64) -> BsimSoiChannelBias {
-        let s = self.sign();
+        let sign = self.sign();
         BsimSoiChannelBias {
-            gate: s * g,
-            drain: s * d,
-            body: s * b,
-            backgate: s * e,
+            gate: sign * g,
+            drain: sign * d,
+            body: sign * b,
+            backgate: sign * e,
             kelvin: 300.15 + rise,
         }
     }
@@ -96,14 +96,14 @@ fn cases() -> impl Iterator<Item = Case> {
             (0..=2).flat_map(move |soi| {
                 (0..=2).flat_map(move |cv| {
                     [0.4, 0.5, 0.6].into_iter().flat_map(move |partition| {
-                        [false, true].into_iter().flat_map(move |contact| {
-                            [false, true].into_iter().map(move |material| Case {
+                        [0., 2e-13].into_iter().flat_map(move |contact_area| {
+                            [0, 1].into_iter().map(move |material| Case {
                                 pmos,
                                 heat,
                                 soi,
                                 cv,
                                 partition,
-                                contact,
+                                contact_area,
                                 material,
                             })
                         })
@@ -113,7 +113,7 @@ fn cases() -> impl Iterator<Item = Case> {
         })
     })
 }
-fn values(point: BsimSoiIntrinsicCharges) -> [BsimSoiChannelScalar; 6] {
+const fn values(point: &BsimSoiIntrinsicCharges) -> [BsimSoiChannelScalar; 6] {
     [
         point.gate,
         point.drain,
@@ -151,7 +151,7 @@ fn check_gradients_and_conservation(capmod: i32) -> TestResult {
             (2.4, 0.02, -0.4, 0.5),
         ] {
             let bias = case.bias(g, d, b, e, 20.);
-            let point = values(law.evaluate(bias)?);
+            let point = values(&law.evaluate(bias)?);
             let sum = point[..5]
                 .iter()
                 .copied()
@@ -161,14 +161,15 @@ fn check_gradients_and_conservation(capmod: i32) -> TestResult {
             assert!(sum.gradient.into_iter().all(|x| x.abs() <= 1e-28));
             for axis in 0..5 {
                 let h = if axis == 4 { 1e-3 } else { 1e-5 };
-                let hi = values(law.evaluate(perturb(bias, axis, h))?);
-                let lo = values(law.evaluate(perturb(bias, axis, -h))?);
+                let hi = values(&law.evaluate(perturb(bias, axis, h))?);
+                let lo = values(&law.evaluate(perturb(bias, axis, -h))?);
                 for (index, actual) in point.into_iter().enumerate() {
                     let diff = (hi[index].value - lo[index].value) / (2. * h);
                     let expected = actual.gradient[axis];
-                    let tol = 3e-5 * expected.abs().max(diff.abs())
-                        + 64. * hi[index].value.abs().max(lo[index].value.abs()) * f64::EPSILON / h
-                        + 1e-24;
+                    let tol = 3e-5_f64.mul_add(
+                        expected.abs().max(diff.abs()),
+                        64. * hi[index].value.abs().max(lo[index].value.abs()) * f64::EPSILON / h,
+                    ) + 1e-24;
                     assert!(
                         (expected - diff).abs() <= tol,
                         "{case:?} {bias:?} axis={axis} branch={index}: {expected:e} vs {diff:e}"
@@ -203,15 +204,15 @@ fn check_native_charges(capmod: i32, filter: impl Fn(&Case) -> bool) -> TestResu
             soi,
             cv,
             partition,
-            contact,
+            contact_area,
             material,
             ..
         } = case;
         let shmod = i32::from(heat);
-        let mtrlmod = i32::from(material);
+        let mtrlmod = material;
         let rise = if heat { 20. } else { 0. };
         let vth0 = sign * 0.55;
-        let area = if contact { 2e-13 } else { 0. };
+        let area = contact_area;
         for (g, d, b, e) in [
             (1.2, 0.6, -0.2, 0.1),
             (-1.4, 0.3, -0.1, 0.2),
@@ -258,7 +259,7 @@ fn check_native_charges(capmod: i32, filter: impl Fn(&Case) -> bool) -> TestResu
             .enumerate()
             {
                 assert!(
-                    (actual - reference).abs() <= 3e-6 * reference.abs() + 1e-23,
+                    (actual - reference).abs() <= 3e-6_f64.mul_add(reference.abs(), 1e-23),
                     "{case:?} {bias:?} branch={index}: {actual:e} vs {reference:e}"
                 );
             }
@@ -272,6 +273,6 @@ fn check_native_charges(capmod: i32, filter: impl Fn(&Case) -> bool) -> TestResu
 #[ignore = "requires local ngspice 47 binary"]
 fn native_capmod3_generalized_regression() -> TestResult {
     check_native_charges(3, |case| {
-        case.material && !case.heat && !case.pmos && case.soi == 0 && case.cv == 0
+        case.material != 0 && !case.heat && !case.pmos && case.soi == 0 && case.cv == 0
     })
 }

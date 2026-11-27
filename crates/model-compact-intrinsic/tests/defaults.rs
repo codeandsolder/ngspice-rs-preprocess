@@ -236,7 +236,9 @@ fn overlap_defaults_preserve_dlc_presence_and_material() -> Result<(), ModelErro
             for (name, lateral) in [("cgso", 1e-10), ("cgdo", 2e-10)] {
                 let expected = dlc
                     .filter(|length| *length > 0.0)
-                    .map_or(0.6 * 6e-8 * cox, |length| length * cox - lateral);
+                    .map_or(0.6 * 6e-8 * cox, |length| {
+                        f64::mul_add(length, cox, -lateral)
+                    });
                 assert!(
                     matches!(get(&model, name), Some(Real(actual)) if (*actual-expected).abs() < 1e-24)
                 );

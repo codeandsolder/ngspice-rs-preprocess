@@ -76,7 +76,7 @@ fn setup(
 }
 fn near(actual: f64, expected: f64, tol: f64, floor: f64) {
     assert!(
-        (actual - expected).abs() <= tol * actual.abs().max(expected.abs()) + floor,
+        (actual - expected).abs() <= tol.mul_add(actual.abs().max(expected.abs()), floor),
         "actual={actual:e}, expected={expected:e}"
     );
 }
@@ -243,7 +243,6 @@ fn native_parasitic_heat_and_gate() -> TestResult {
 #[test]
 #[ignore = "requires local ngspice 47 binary"]
 fn native_body_resistance() -> TestResult {
-    use std::{fs, process::Command};
     for pmos in [false, true] {
         for heat in [false, true] {
             for distributed in [0, 1] {
@@ -256,7 +255,7 @@ fn native_body_resistance() -> TestResult {
                 let thermal = i32::from(heat);
                 for (g, d, b, e) in [(1.2, 0.6, 0.05, 0.1), (1.8, -0.5, -0.7, -0.2)] {
                     let (gate, drain, body, backgate) = (sign * g, sign * d, sign * b, sign * e);
-                    let contact = body - sign * 0.1;
+                    let contact = f64::mul_add(sign, -0.1, body);
                     let sides = if distributed == 1 {
                         "v(m1#sbody) v(m1#dbody)"
                     } else {
@@ -265,26 +264,7 @@ fn native_body_resistance() -> TestResult {
                     let deck = format!(
                         "BSIMSOI body resistance reference\nVd d 0 {drain}\nVg g 0 {gate}\nVb b 0 {body}\nVe e 0 {backgate}\nVp p 0 {contact}\nVt t 0 25\nM1 d g 0 e p b t soi tnodeout l=.5u w=4u nf=2 nseg=2 m=2.3 nrb=1.2 pd=4u ps=4u\n.model soi {polarity} level=10 soimod=0 fdmod=1 shmod={thermal} rgatemod=0 rbodymod={distributed} vth0={threshold}\n+ {CARD} isbjt=0 idbjt=0\n.temp 27\n.options gmin=1e-18 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.control\nset numdgt=17\nset wr_singlescale\nsave all\nop\nwrdata out.dat {sides} i(vp) @m1[ibs] @m1[ibd]\nquit\n.endc\n.end\n"
                     );
-                    let dir = tempfile::tempdir()?;
-                    fs::write(dir.path().join("test.cir"), deck)?;
-                    let output = Command::new("ngspice")
-                        .args(["-b", "-n", "test.cir"])
-                        .current_dir(dir.path())
-                        .output()?;
-                    assert!(
-                        output.status.success(),
-                        "{}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    let diagnostics = String::from_utf8_lossy(&output.stderr);
-                    assert!(
-                        !diagnostics.contains("failed") && !diagnostics.contains("singular matrix"),
-                        "{diagnostics}"
-                    );
-                    let native = fs::read_to_string(dir.path().join("out.dat"))?
-                        .split_whitespace()
-                        .map(str::parse::<f64>)
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let native = native_body_values(&deck)?;
                     assert_eq!(native.len(), 6);
                     let point = law.evaluate(BsimSoiChannelBias {
                         gate,
@@ -322,7 +302,7 @@ fn native_body_resistance() -> TestResult {
                             native[1] + drain
                         };
                         let drain_voltage = if d >= 0. {
-                            native[2] - 2. * drain
+                            2.0_f64.mul_add(-drain, native[2])
                         } else {
                             native[2] - drain
                         };
@@ -338,9 +318,10 @@ fn native_body_resistance() -> TestResult {
                                 drain_voltage,
                             ),
                         ] {
-                            let equivalent = current.current
-                                - current.conductance * voltage
-                                - current.d_temperature * 25.;
+                            let equivalent = current.d_temperature.mul_add(
+                                -25.,
+                                current.conductance.mul_add(-voltage, current.current),
+                            );
                             near(actual, equivalent, 1e-5, 1e-13);
                         }
                     }
@@ -349,4 +330,30 @@ fn native_body_resistance() -> TestResult {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn native_body_values(deck: &str) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    use std::{fs, process::Command};
+    let dir = tempfile::tempdir()?;
+    fs::write(dir.path().join("test.cir"), deck)?;
+    let output = Command::new("ngspice")
+        .args(["-b", "-n", "test.cir"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !diagnostics.contains("failed") && !diagnostics.contains("singular matrix"),
+        "{diagnostics}"
+    );
+    let native = fs::read_to_string(dir.path().join("out.dat"))?
+        .split_whitespace()
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(native)
 }

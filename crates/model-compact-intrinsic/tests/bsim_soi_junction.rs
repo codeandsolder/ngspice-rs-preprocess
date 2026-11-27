@@ -57,7 +57,7 @@ fn setup(
 }
 
 fn check_derivative(actual: f64, numeric: f64) {
-    let tolerance = 1e-5 * actual.abs().max(numeric.abs()) + 1e-19;
+    let tolerance = 1e-5_f64.mul_add(actual.abs().max(numeric.abs()), 1e-19);
     assert!(
         (actual - numeric).abs() <= tolerance,
         "analytic {actual:e} numerical {numeric:e} tol {tolerance:e}"
@@ -175,7 +175,8 @@ fn native_asymmetric_junction_currents() -> TestResult {
                             (actual.drain, native[2] * sign),
                         ] {
                             let current = side.independent_current().current;
-                            let tolerance = 3e-7 * current.abs().max(expected.abs()) + 1e-16;
+                            let tolerance =
+                                3e-7_f64.mul_add(current.abs().max(expected.abs()), 1e-16);
                             assert!(
                                 (current - expected).abs() <= tolerance,
                                 "{polarity} heat={heat} T={ambient} Vd={vd} Vb={vb}: {current:e} vs {expected:e}; {side:?}"

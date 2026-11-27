@@ -160,7 +160,7 @@ mod tests {
             for step in [1e-9, 1e-6, 1e-3] {
                 for count in [1_u32, 63, 64, 65, 128, 1001, 10000] {
                     let expected: f64 = (0..count)
-                        .map(|i| (start + f64::from(i) * step).recip())
+                        .map(|i| f64::from(i).mul_add(step, start).recip())
                         .sum();
                     let actual = reciprocal_progression(start, step, f64::from(count) - 0.25)?;
                     assert!((actual - expected).abs() <= 2e-13 * expected);

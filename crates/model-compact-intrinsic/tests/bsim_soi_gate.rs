@@ -11,10 +11,10 @@ struct Case {
     pmos: bool,
     heat: bool,
     soi: i32,
-    igc: bool,
-    igb: bool,
-    material: bool,
-    contact: bool,
+    igc: i32,
+    igb: i32,
+    material: i32,
+    contact_area: f64,
 }
 impl Case {
     const fn sign(self) -> f64 {
@@ -39,9 +39,9 @@ impl Case {
                     ("shmod", Integer(i32::from(self.heat))),
                     ("rth0", Real(0.005)),
                     ("vth0", Real(self.sign() * 0.55)),
-                    ("igcmod", Integer(i32::from(self.igc))),
-                    ("igbmod", Integer(i32::from(self.igb))),
-                    ("mtrlmod", Integer(i32::from(self.material))),
+                    ("igcmod", Integer(self.igc)),
+                    ("igbmod", Integer(self.igb)),
+                    ("mtrlmod", Integer(self.material)),
                     ("eot", Real(3e-9)),
                     ("epsrsub", Real(11.7)),
                     ("phig", Real(4.1)),
@@ -63,7 +63,7 @@ impl Case {
                 ("psbcp", Real(1e-7)),
                 ("pdbcp", Real(2e-7)),
                 ("agbcpd", Real(1e-13)),
-                ("agbcp2", Real(if self.contact { 2e-13 } else { 0. })),
+                ("agbcp2", Real(self.contact_area)),
             ],
         )?;
         let setup = prepare_bsim_soi_setup(
@@ -76,17 +76,25 @@ impl Case {
         )?;
         Ok(setup.prepare_gate_tunneling(0, 300.15)?)
     }
-    fn bias(self, g: f64, d: f64, b: f64, e: f64, p: f64, rise: f64) -> BsimSoiGateBias {
-        let s = self.sign();
+    fn bias(
+        self,
+        g: f64,
+        d: f64,
+        b: f64,
+        e: f64,
+        contact_voltage: f64,
+        rise: f64,
+    ) -> BsimSoiGateBias {
+        let sign = self.sign();
         BsimSoiGateBias {
             channel: BsimSoiChannelBias {
-                gate: s * g,
-                drain: s * d,
-                body: s * b,
-                backgate: s * e,
+                gate: sign * g,
+                drain: sign * d,
+                body: sign * b,
+                backgate: sign * e,
                 kelvin: 300.15 + rise,
             },
-            contact: s * p,
+            contact: sign * contact_voltage,
         }
     }
 }
@@ -94,18 +102,18 @@ fn cases() -> impl Iterator<Item = Case> {
     [false, true].into_iter().flat_map(|pmos| {
         [false, true].into_iter().flat_map(move |heat| {
             (0..=2).flat_map(move |soi| {
-                [(false, false), (true, false), (false, true), (true, true)]
+                [(0, 0), (1, 0), (0, 1), (1, 1)]
                     .into_iter()
                     .flat_map(move |(igc, igb)| {
-                        [false, true].into_iter().flat_map(move |material| {
-                            [false, true].into_iter().map(move |contact| Case {
+                        [0, 1].into_iter().flat_map(move |material| {
+                            [0., 2e-13].into_iter().map(move |contact_area| Case {
                                 pmos,
                                 heat,
                                 soi,
                                 igc,
                                 igb,
                                 material,
-                                contact,
+                                contact_area,
                             })
                         })
                     })
@@ -113,7 +121,7 @@ fn cases() -> impl Iterator<Item = Case> {
         })
     })
 }
-fn values(point: BsimSoiGateCurrents) -> [BsimSoiChannelScalar; 6] {
+const fn values(point: &BsimSoiGateCurrents) -> [BsimSoiChannelScalar; 6] {
     [
         point.source_edge,
         point.drain_edge,
@@ -148,9 +156,9 @@ fn gate_tunneling_gradients() -> TestResult {
             let point = law.evaluate(bias)?;
             for axis in 0..6 {
                 let h = if axis == 4 { 1e-3 } else { 1e-5 };
-                let hi = values(law.evaluate(perturb(bias, axis, h))?);
-                let lo = values(law.evaluate(perturb(bias, axis, -h))?);
-                for (index, actual) in values(point).into_iter().enumerate() {
+                let hi = values(&law.evaluate(perturb(bias, axis, h))?);
+                let lo = values(&law.evaluate(perturb(bias, axis, -h))?);
+                for (index, actual) in values(&point).into_iter().enumerate() {
                     let diff = (hi[index].value - lo[index].value) / (2. * h);
                     let expected = if axis < 5 {
                         actual.gradient[axis]
@@ -159,9 +167,10 @@ fn gate_tunneling_gradients() -> TestResult {
                     } else {
                         0.
                     };
-                    let tol = 3e-5 * expected.abs().max(diff.abs())
-                        + 64. * hi[index].value.abs().max(lo[index].value.abs()) * f64::EPSILON / h
-                        + 1e-22;
+                    let tol = 3e-5_f64.mul_add(
+                        expected.abs().max(diff.abs()),
+                        64. * hi[index].value.abs().max(lo[index].value.abs()) * f64::EPSILON / h,
+                    ) + 1e-22;
                     assert!(
                         (expected - diff).abs() <= tol,
                         "{case:?} {bias:?} axis={axis} branch={index}: {expected:e} vs {diff:e}"
@@ -187,16 +196,16 @@ fn native_gate_tunneling() -> TestResult {
             igc,
             igb,
             material,
-            contact,
+            contact_area,
             ..
         } = case;
         let shmod = i32::from(heat);
-        let igcmod = i32::from(igc);
-        let igbmod = i32::from(igb);
-        let mtrlmod = i32::from(material);
+        let channel_selector = igc;
+        let body_selector = igb;
+        let mtrlmod = material;
         let rise = if heat { 20. } else { 0. };
         let vth0 = sign * 0.55;
-        let area = if contact { 2e-13 } else { 0. };
+        let area = contact_area;
         for (g, d, b, e, p) in [
             (1.2, 0.6, -0.2, 0.1, -0.3),
             (-1.4, 0.3, -0.1, 0.2, -0.4),
@@ -213,7 +222,7 @@ fn native_gate_tunneling() -> TestResult {
             } = bias.channel;
             let contact = bias.contact;
             let deck = format!(
-                "BSIMSOI gate tunneling reference\nVd d 0 {drain}\nVg g 0 {gate}\nVb b 0 {body}\nVe e 0 {backgate}\nVp p 0 {contact}\nVt t 0 {rise}\nM1 d g 0 e p b t soi tnodeout l=.5u w=4u nf=2 nseg=2 m=2.3 pd=4u ps=4u psbcp=1e-7 pdbcp=2e-7 agbcpd=1e-13 agbcp2={area}\n.model soi {polarity} level=10 soimod={soi} fdmod=1 shmod={shmod} rth0=.005 vth0={vth0} igcmod={igcmod} igbmod={igbmod} mtrlmod={mtrlmod} eot=3e-9 epsrsub=11.7 phig=4.1 easub=4.05\n+ {CARD}\n.temp 27\n.options gmin=1e-18 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.control\nset numdgt=17\nset wr_singlescale\nop\nwrdata out.dat @m1[igs] @m1[igd] @m1[igcs] @m1[igcd] i(vg)\nquit\n.endc\n.end\n"
+                "BSIMSOI gate tunneling reference\nVd d 0 {drain}\nVg g 0 {gate}\nVb b 0 {body}\nVe e 0 {backgate}\nVp p 0 {contact}\nVt t 0 {rise}\nM1 d g 0 e p b t soi tnodeout l=.5u w=4u nf=2 nseg=2 m=2.3 pd=4u ps=4u psbcp=1e-7 pdbcp=2e-7 agbcpd=1e-13 agbcp2={area}\n.model soi {polarity} level=10 soimod={soi} fdmod=1 shmod={shmod} rth0=.005 vth0={vth0} igcmod={channel_selector} igbmod={body_selector} mtrlmod={mtrlmod} eot=3e-9 epsrsub=11.7 phig=4.1 easub=4.05\n+ {CARD}\n.temp 27\n.options gmin=1e-18 reltol=1e-10 abstol=1e-18 vntol=1e-12\n.control\nset numdgt=17\nset wr_singlescale\nop\nwrdata out.dat @m1[igs] @m1[igd] @m1[igcs] @m1[igcd] i(vg)\nquit\n.endc\n.end\n"
             );
             let dir = tempfile::tempdir()?;
             fs::write(dir.path().join("test.cir"), deck)?;
@@ -229,7 +238,7 @@ fn native_gate_tunneling() -> TestResult {
                 .map(str::parse::<f64>)
                 .collect::<Result<Vec<_>, _>>()?;
             assert_eq!(native.len(), 6);
-            let point = values(law.evaluate(bias)?);
+            let point = values(&law.evaluate(bias)?);
             let (cs, cd) = if d < 0. {
                 (native[4], native[3])
             } else {
@@ -239,7 +248,7 @@ fn native_gate_tunneling() -> TestResult {
             for (index, reference) in references.into_iter().enumerate() {
                 let actual = point[index].value;
                 assert!(
-                    (actual - reference).abs() <= 3e-6 * reference.abs() + 1e-18,
+                    (actual - reference).abs() <= 3e-6_f64.mul_add(reference.abs(), 1e-18),
                     "{case:?} {bias:?} branch={index}: {actual:e} vs {reference:e}"
                 );
             }
@@ -255,7 +264,7 @@ fn native_gate_tunneling() -> TestResult {
             };
             let reference = -native[5] - correction;
             assert!(
-                (actual - reference).abs() <= 3e-6 * reference.abs() + 1e-17,
+                (actual - reference).abs() <= 3e-6_f64.mul_add(reference.abs(), 1e-17),
                 "{case:?} {bias:?} total: {actual:e} vs {reference:e}, body={:?} contact={:?}",
                 point[4],
                 point[5]

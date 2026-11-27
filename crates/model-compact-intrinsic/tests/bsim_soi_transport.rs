@@ -1,8 +1,8 @@
 use ParameterValue::{Flag, Integer, Real};
 use model_compact_intrinsic::{
     BoundParameters, BsimSoiInstanceInput, BsimSoiSeriesBias, BsimSoiSeriesParameters,
-    ModelVariant, ParameterScope, ParameterValue, PreparedBsimSoiSetup, prepare_bsim_soi_model,
-    prepare_bsim_soi_setup,
+    BsimSoiStressOffsets, ModelVariant, ParameterScope, ParameterValue, PreparedBsimSoiSetup,
+    PreparedBsimSoiTransport, prepare_bsim_soi_model, prepare_bsim_soi_setup,
 };
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -21,11 +21,11 @@ fn card(text: &str) -> Result<Vec<(&str, ParameterValue)>, Box<dyn std::error::E
 fn setup(
     pmos: bool,
     heat: bool,
-    external: bool,
-    layout: bool,
+    access_mode: (bool, bool),
     nf: f64,
     extra: &[(&str, ParameterValue)],
 ) -> Result<PreparedBsimSoiSetup, Box<dyn std::error::Error>> {
+    let (external, layout) = access_mode;
     let model = BoundParameters::bind(
         ModelVariant::BsimSoi,
         ParameterScope::Model,
@@ -71,7 +71,8 @@ fn setup(
 
 fn close(actual: f64, reference: f64, tolerance: f64, absolute: f64) {
     assert!(
-        (actual - reference).abs() <= tolerance * actual.abs().max(reference.abs()) + absolute,
+        (actual - reference).abs()
+            <= tolerance.mul_add(actual.abs().max(reference.abs()), absolute),
         "{actual:e} vs {reference:e}"
     );
 }
@@ -83,7 +84,7 @@ fn transport_derivatives_and_limits() -> TestResult {
             for external in [false, true] {
                 for layout in [false, true] {
                     for nf in [1., 2., 3.5] {
-                        let setup = setup(pmos, heat, external, layout, nf, &[])?;
+                        let setup = setup(pmos, heat, (external, layout), nf, &[])?;
                         let law = setup.prepare_transport(0, 300.15)?;
                         for t in [240., 300.15, 380.] {
                             let h = 1e-3;
@@ -103,85 +104,10 @@ fn transport_derivatives_and_limits() -> TestResult {
                             ] {
                                 close(a.d_temperature, (b.value - c.value) / (2. * h), 2e-6, 1e-28);
                             }
-                            if external {
-                                for (g, b) in [(-0.4, -0.2), (0.4, 0.3), (1.5, -0.5)] {
-                                    let bias = BsimSoiSeriesBias { gate: g, body: b };
-                                    let eval = |temp, gate, body| {
-                                        law.external_series(
-                                            temp,
-                                            BsimSoiSeriesBias { gate, body },
-                                            BsimSoiSeriesBias { gate, body },
-                                        )
-                                    };
-                                    let p = law.external_series(t, bias, bias)?;
-                                    let gp = eval(t, g + 1e-4, b)?;
-                                    let gm = eval(t, g - 1e-4, b)?;
-                                    let bp = eval(t, g, b + 1e-4)?;
-                                    let bm = eval(t, g, b - 1e-4)?;
-                                    let tp = eval(t + h, g, b)?;
-                                    let tm = eval(t - h, g, b)?;
-                                    for (a, c, d, e, f, j, k) in [
-                                        (
-                                            p.source, gp.source, gm.source, bp.source, bm.source,
-                                            tp.source, tm.source,
-                                        ),
-                                        (
-                                            p.drain, gp.drain, gm.drain, bp.drain, bm.drain,
-                                            tp.drain, tm.drain,
-                                        ),
-                                    ] {
-                                        close(
-                                            a.d_gate,
-                                            (c.conductance - d.conductance) / 2e-4,
-                                            2e-6,
-                                            1e-13,
-                                        );
-                                        close(
-                                            a.d_body,
-                                            (e.conductance - f.conductance) / 2e-4,
-                                            2e-6,
-                                            1e-13,
-                                        );
-                                        close(
-                                            a.d_temperature,
-                                            (j.conductance - k.conductance) / (2. * h),
-                                            2e-6,
-                                            1e-13,
-                                        );
-                                    }
-                                }
-                            } else {
-                                for (g, b) in [(0.2, -0.2), (-3., -0.5), (1.5, 0.2)] {
-                                    let p = law.internal_resistance(t, g, b)?;
-                                    close(
-                                        p.d_overdrive,
-                                        (law.internal_resistance(t, g + 1e-5, b)?.resistance
-                                            - law.internal_resistance(t, g - 1e-5, b)?.resistance)
-                                            / 2e-5,
-                                        2e-6,
-                                        1e-9,
-                                    );
-                                    close(
-                                        p.d_root_potential,
-                                        (law.internal_resistance(t, g, b + 1e-5)?.resistance
-                                            - law.internal_resistance(t, g, b - 1e-5)?.resistance)
-                                            / 2e-5,
-                                        2e-6,
-                                        1e-9,
-                                    );
-                                    close(
-                                        p.d_temperature,
-                                        (law.internal_resistance(t + h, g, b)?.resistance
-                                            - law.internal_resistance(t - h, g, b)?.resistance)
-                                            / (2. * h),
-                                        2e-6,
-                                        1e-9,
-                                    );
-                                }
-                            }
+                            check_resistance_derivatives(&law, t, h, external)?;
                         }
                         if !layout {
-                            assert_eq!(law.stress_offsets(), Default::default());
+                            assert_eq!(law.stress_offsets(), BsimSoiStressOffsets::default());
                         }
                     }
                 }
@@ -220,7 +146,7 @@ fn native_external_access_conductance() -> TestResult {
         let sign = if pmos { -1. } else { 1. };
         for heat in [false, true] {
             for mode in [false, true] {
-                let setup = setup(pmos, heat, mode, false, 2., &[])?;
+                let setup = setup(pmos, heat, (mode, false), 2., &[])?;
                 for temp in [-40., 85.] {
                     let ambient = temp + 273.15;
                     let law = setup.prepare_transport(0, ambient)?;
@@ -236,8 +162,8 @@ fn native_external_access_conductance() -> TestResult {
                         );
                         let values = native(&deck)?;
                         assert_eq!(values.len(), 6);
-                        let source = vg - sign * values[1];
-                        let drain = source + sign * values[2];
+                        let source = f64::mul_add(sign, -values[1], vg);
+                        let drain = f64::mul_add(sign, values[2], source);
                         let measured_source = values[5] / source;
                         let measured_drain = -values[4] / (vd - drain);
                         let point = law.external_series(
@@ -279,8 +205,7 @@ fn native_layout_and_transport_equivalent_card() -> TestResult {
                 let setup = setup(
                     pmos,
                     heat,
-                    false,
-                    true,
+                    (false, true),
                     nf,
                     &[
                         ("vth0", Real(vth)),
@@ -374,7 +299,7 @@ fn electrostatic_ambient_and_live_factors() -> TestResult {
                             ("vfb", Real(-0.8)),
                         ]);
                     }
-                    let prepared = setup(pmos, heat, false, true, 2., &extra)?;
+                    let prepared = setup(pmos, heat, (false, true), 2., &extra)?;
                     for ambient in [243.15, 300.15, 358.15] {
                         let law = prepared.prepare_electrostatics(0, ambient)?;
                         let base = law.base();
@@ -384,7 +309,7 @@ fn electrostatic_ambient_and_live_factors() -> TestResult {
                         // The native threshold is an ambient-derived coefficient
                         // (including stress), not a live thermal unknown.
                         let phi = if heat {
-                            let ambient_setup = setup(pmos, false, false, true, 2., &extra)?;
+                            let ambient_setup = setup(pmos, false, (false, true), 2., &extra)?;
                             ambient_setup
                                 .prepare_temperature(0, ambient)?
                                 .evaluate(ambient)?
@@ -395,7 +320,7 @@ fn electrostatic_ambient_and_live_factors() -> TestResult {
                         };
                         close(
                             sign * (base.threshold - stress.threshold),
-                            base.flatband + phi + base.k1_effective * phi.sqrt(),
+                            base.k1_effective.mul_add(phi.sqrt(), base.flatband + phi),
                             1e-12,
                             1e-15,
                         );
@@ -406,12 +331,12 @@ fn electrostatic_ambient_and_live_factors() -> TestResult {
                         for rise in [-10., 0., 40.] {
                             let t = ambient + rise;
                             let h = 1e-3;
-                            let a = law.evaluate(t)?;
-                            let b = law.evaluate(t + h)?;
-                            let c = law.evaluate(t - h)?;
+                            let center = law.evaluate(t)?;
+                            let upper = law.evaluate(t + h)?;
+                            let lower = law.evaluate(t - h)?;
                             for (a, b, c) in [
-                                (a.theta_body, b.theta_body, c.theta_body),
-                                (a.theta_output, b.theta_output, c.theta_output),
+                                (center.theta_body, upper.theta_body, lower.theta_body),
+                                (center.theta_output, upper.theta_output, lower.theta_output),
                             ] {
                                 close(a.d_temperature, (b.value - c.value) / (2. * h), 3e-6, 1e-16);
                             }
@@ -442,7 +367,7 @@ fn native_electrostatic_default_equivalence() -> TestResult {
                 "nch=1.7e17 nsub=6e16 vfb=-.8 vth0=.55",
             ] {
                 let extra = card(original_card)?;
-                let setup = setup(pmos, heat, false, false, 2., &extra)?;
+                let setup = setup(pmos, heat, (false, false), 2., &extra)?;
                 for temp in [-30., 75.] {
                     let ambient = temp + 273.15;
                     let base = setup.prepare_electrostatics(0, ambient)?.base();
@@ -466,6 +391,89 @@ fn native_electrostatic_default_equivalence() -> TestResult {
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn check_resistance_derivatives(
+    law: &PreparedBsimSoiTransport,
+    t: f64,
+    h: f64,
+    external: bool,
+) -> TestResult {
+    if external {
+        for (g, b) in [(-0.4, -0.2), (0.4, 0.3), (1.5, -0.5)] {
+            let bias = BsimSoiSeriesBias { gate: g, body: b };
+            let eval = |temp, gate, body| {
+                law.external_series(
+                    temp,
+                    BsimSoiSeriesBias { gate, body },
+                    BsimSoiSeriesBias { gate, body },
+                )
+            };
+            let p = law.external_series(t, bias, bias)?;
+            let gp = eval(t, g + 1e-4, b)?;
+            let gm = eval(t, g - 1e-4, b)?;
+            let bp = eval(t, g, b + 1e-4)?;
+            let bm = eval(t, g, b - 1e-4)?;
+            let tp = eval(t + h, g, b)?;
+            let tm = eval(t - h, g, b)?;
+            for (a, c, d, e, f, j, k) in [
+                (
+                    p.source, gp.source, gm.source, bp.source, bm.source, tp.source, tm.source,
+                ),
+                (
+                    p.drain, gp.drain, gm.drain, bp.drain, bm.drain, tp.drain, tm.drain,
+                ),
+            ] {
+                close(
+                    a.d_gate,
+                    (c.conductance - d.conductance) / 2e-4,
+                    2e-6,
+                    1e-13,
+                );
+                close(
+                    a.d_body,
+                    (e.conductance - f.conductance) / 2e-4,
+                    2e-6,
+                    1e-13,
+                );
+                close(
+                    a.d_temperature,
+                    (j.conductance - k.conductance) / (2. * h),
+                    2e-6,
+                    1e-13,
+                );
+            }
+        }
+    } else {
+        for (g, b) in [(0.2, -0.2), (-3., -0.5), (1.5, 0.2)] {
+            let p = law.internal_resistance(t, g, b)?;
+            close(
+                p.d_overdrive,
+                (law.internal_resistance(t, g + 1e-5, b)?.resistance
+                    - law.internal_resistance(t, g - 1e-5, b)?.resistance)
+                    / 2e-5,
+                2e-6,
+                1e-9,
+            );
+            close(
+                p.d_root_potential,
+                (law.internal_resistance(t, g, b + 1e-5)?.resistance
+                    - law.internal_resistance(t, g, b - 1e-5)?.resistance)
+                    / 2e-5,
+                2e-6,
+                1e-9,
+            );
+            close(
+                p.d_temperature,
+                (law.internal_resistance(t + h, g, b)?.resistance
+                    - law.internal_resistance(t - h, g, b)?.resistance)
+                    / (2. * h),
+                2e-6,
+                1e-9,
+            );
         }
     }
     Ok(())

@@ -1,8 +1,8 @@
 use ParameterValue::{Flag, Integer, Real, RealVector};
 use model_compact_intrinsic::{
-    BoundParameters, BsimSoiBodyMode, BsimSoiInstanceInput, BsimSoiNode, ModelError, ModelVariant,
-    ParameterScope, ParameterValue, PreparedBsimSoiModel, PreparedBsimSoiSetup,
-    prepare_bsim_soi_model, prepare_bsim_soi_setup,
+    BoundParameters, BsimSoiBodyMode, BsimSoiInstanceInput, BsimSoiNode, BsimSoiTopology,
+    ModelError, ModelVariant, ParameterScope, ParameterValue, PreparedBsimSoiModel,
+    PreparedBsimSoiSetup, prepare_bsim_soi_model, prepare_bsim_soi_setup,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -119,10 +119,7 @@ fn source_defaults_and_ordered_ic() -> TestResult {
 
 #[test]
 fn positional_topology_and_model_mutation() -> TestResult {
-    use BsimSoiNode::{
-        Body, DrainBody, DrainPrime, External, Gate, GateMid, Ground, SourceBody, SourcePrime,
-        Temperature,
-    };
+    use BsimSoiNode::{Body, External, Ground, Temperature};
     let model = model(&[
         ("soimod", Integer(0)),
         ("shmod", Integer(1)),
@@ -210,47 +207,9 @@ fn positional_topology_and_model_mutation() -> TestResult {
             ),
             (contact, body, temperature, mode, floating)
         );
-        assert_eq!(
-            (
-                topology.drain_prime,
-                topology.source_prime,
-                topology.gate,
-                topology.gate_mid,
-                topology.drain_body,
-                topology.source_body
-            ),
-            (
-                DrainPrime,
-                SourcePrime,
-                Gate,
-                GateMid,
-                DrainBody,
-                SourceBody
-            )
-        );
+        assert_internal_roles(topology);
     }
-    let group = prepare_bsim_soi_setup(
-        &model,
-        &[5, 6, 5].map(|terminal_count| BsimSoiInstanceInput {
-            parameters: &raw,
-            terminal_count,
-            geometry_scale: 1.,
-        }),
-    )?;
-    assert_eq!(
-        group
-            .instances()
-            .iter()
-            .map(|p| p.topology().body_mode)
-            .collect::<Vec<_>>(),
-        [
-            BsimSoiBodyMode::Ideal,
-            BsimSoiBodyMode::Resistive,
-            BsimSoiBodyMode::Resistive
-        ]
-    );
-    close(real_value(group.model().parameters(), "rbody")?, 1.);
-    close(real_value(model.parameters(), "rbody")?, 0.);
+    assert_ordered_model_mutation(&model, &raw)?;
     assert!(setup(&model, &raw, 8).is_err());
     Ok(())
 }
@@ -347,10 +306,10 @@ fn geometry_scale_binning_and_candidate_isolation() -> TestResult {
             close(real_value(p, "pd")?, 2e-6 * scale);
             let size = &group.sizes()[index];
             let g = size.geometry();
-            close(g.leff, 0.5e-6 * scale - 20e-9);
-            close(g.weff, 2e-6 * scale - 50e-9);
-            close(g.leff_cv, 0.5e-6 * scale - 24e-9);
-            close(g.weff_cv, 2e-6 * scale - 52e-9);
+            close(g.leff, 0.5e-6_f64.mul_add(scale, -20e-9));
+            close(g.weff, 2e-6_f64.mul_add(scale, -50e-9));
+            close(g.leff_cv, 0.5e-6_f64.mul_add(scale, -24e-9));
+            close(g.weff_cv, 2e-6_f64.mul_add(scale, -52e-9));
             close(g.drain_diode_width, g.weff / 2. + 2e-8);
             let unit = if binunit == 1 { 1e-6 } else { 1. };
             let expected = 0.4
@@ -458,4 +417,55 @@ fn native_setup_reference() -> TestResult {
     assert!(!stdout.contains("m1#drain ="));
     eprintln!("Validated {checked} native BSIMSOI instance parameters and RF/body topology");
     Ok(())
+}
+
+fn assert_ordered_model_mutation(
+    model: &PreparedBsimSoiModel,
+    raw: &BoundParameters,
+) -> TestResult {
+    let group = prepare_bsim_soi_setup(
+        model,
+        &[5, 6, 5].map(|terminal_count| BsimSoiInstanceInput {
+            parameters: raw,
+            terminal_count,
+            geometry_scale: 1.,
+        }),
+    )?;
+    assert_eq!(
+        group
+            .instances()
+            .iter()
+            .map(|p| p.topology().body_mode)
+            .collect::<Vec<_>>(),
+        [
+            BsimSoiBodyMode::Ideal,
+            BsimSoiBodyMode::Resistive,
+            BsimSoiBodyMode::Resistive
+        ]
+    );
+    close(real_value(group.model().parameters(), "rbody")?, 1.);
+    close(real_value(model.parameters(), "rbody")?, 0.);
+    Ok(())
+}
+
+fn assert_internal_roles(topology: BsimSoiTopology) {
+    use BsimSoiNode::{DrainBody, DrainPrime, Gate, GateMid, SourceBody, SourcePrime};
+    assert_eq!(
+        (
+            topology.drain_prime,
+            topology.source_prime,
+            topology.gate,
+            topology.gate_mid,
+            topology.drain_body,
+            topology.source_body
+        ),
+        (
+            DrainPrime,
+            SourcePrime,
+            Gate,
+            GateMid,
+            DrainBody,
+            SourceBody
+        )
+    );
 }
