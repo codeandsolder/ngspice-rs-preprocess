@@ -8,11 +8,13 @@ use anyhow::{Context, Result, bail};
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::Serialize;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
 mod hierarchy;
+use hierarchy::{ActiveAliases, record_include_alias};
 pub mod source_dialect;
 pub use hierarchy::{
     LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
@@ -22,9 +24,9 @@ pub use hierarchy::{
     parse_init_statement, parse_init_target_path, parse_library, parse_library_file,
     parse_library_for_simulator, parse_library_with_budget, parse_scoped_library,
     parse_standalone_library, preprocess_netlist, preprocess_netlist_file,
-    preprocess_netlist_linked, preprocess_netlist_linked_file, project_resource,
-    project_simetrix_source, project_source, project_spice_resource, render_projection,
-    rewrite_parameter_symbols, source_include_target,
+    preprocess_netlist_linked, preprocess_netlist_linked_at, preprocess_netlist_linked_file,
+    project_resource, project_simetrix_source, project_source, project_spice_resource,
+    render_projection, rewrite_parameter_symbols, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
@@ -246,6 +248,8 @@ pub struct Preprocessed {
     pub bytes: Vec<u8>,
     pub environment: Environment,
     pub stats: PreprocessStats,
+    included_sources: BTreeSet<String>,
+    active_aliases: ActiveAliases,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1308,6 +1312,12 @@ fn find_while_end(lines: &[&str], start: usize, end: usize, budget: &WorkBudget)
     bail!("unterminated SIMPLIS .WHILE at line {}", start + 1)
 }
 
+#[derive(Clone, Copy, Default)]
+struct IncludeContext<'a> {
+    catalog: Option<&'a SubcircuitCatalog>,
+    origin: Option<&'a str>,
+}
+
 struct PreprocessState<'a> {
     env: &'a mut Environment,
     output: &'a mut String,
@@ -1317,6 +1327,11 @@ struct PreprocessState<'a> {
     parameter_names: &'a mut BTreeSet<String>,
     substitution: Substitution,
     evaluate_parameters: bool,
+    includes: IncludeContext<'a>,
+    active_includes: Vec<(String, String)>,
+    included_sources: BTreeSet<String>,
+    emitted_declarations: BTreeSet<String>,
+    active_aliases: ActiveAliases,
 }
 
 fn process_while(
@@ -1366,6 +1381,103 @@ fn process_while(
     }
 }
 
+// Includes enter the same interpreter and environment as the importing
+// statement. The active stack detects recursion, not repeated execution.
+fn process_include(line: &str, state: &mut PreprocessState<'_>) -> Result<bool> {
+    let Some(catalog) = state.includes.catalog else {
+        return Ok(false);
+    };
+    if directive(line, "INCLUDE").is_none() && directive(line, "INC").is_none() {
+        return Ok(false);
+    }
+    let (rendered, _) = substitute_line(line, state.env, Substitution::All)?;
+    let include = source_include_target(&rendered)?.context("missing SIMPLIS include path")?;
+    let origin = state
+        .active_includes
+        .last()
+        .map(|(_, path)| path.as_str())
+        .or(state.includes.origin);
+    let (id, name, program) = catalog.include_program(include, origin)?;
+    anyhow::ensure!(
+        !state
+            .active_includes
+            .iter()
+            .any(|(active, path)| active == id && path == name),
+        "recursive SIMPLIS source include {name}"
+    );
+    let budget = state.env.budget.clone();
+    budget.charge(Resource::SourceVisits, 1)?;
+    budget.charge(Resource::GeneratedNodes, 1)?;
+    budget.charge(Resource::ScannedBytes, program.len())?;
+    budget.charge(Resource::EmittedBytes, id.len().saturating_add(name.len()))?;
+    state.included_sources.insert(id.to_owned());
+    state.active_includes.push((id.to_owned(), name.to_owned()));
+    let logical = include_logical_lines(program, &budget)?;
+    let lines = logical.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+    let result = process_range(&lines, 0, lines.len(), state);
+    state.active_includes.pop();
+    result.with_context(|| format!("executing SIMPLIS include {name}"))?;
+    Ok(true)
+}
+
+// Preserve the starting physical line for each logical statement, including
+// continuations separated by comment lines. An imported declaration is then
+// emitted or deduplicated as a whole, never as disconnected '+' fragments.
+fn include_logical_lines<'a>(program: &'a str, budget: &WorkBudget) -> Result<Vec<Cow<'a, str>>> {
+    let mut lines: Vec<Cow<'_, str>> = Vec::new();
+    let mut last = None;
+    for line in program.lines() {
+        budget.charge(Resource::Statements, 1)?;
+        let trimmed = line.trim_start();
+        if let Some(continuation) = trimmed.strip_prefix('+') {
+            let index: usize = last.context("orphan SIMPLIS include continuation")?;
+            let previous = &mut lines[index];
+            budget.charge(
+                Resource::EmittedBytes,
+                (if matches!(previous, Cow::Borrowed(_)) {
+                    previous.len()
+                } else {
+                    0
+                })
+                .saturating_add(continuation.len())
+                .saturating_add(1),
+            )?;
+            previous.to_mut().push(' ');
+            previous.to_mut().push_str(continuation.trim_start());
+            lines.push(Cow::Borrowed(""));
+            continue;
+        }
+        if !trimmed.is_empty() && !trimmed.starts_with(['*', ';', '$', '/']) {
+            last = Some(lines.len());
+        }
+        lines.push(Cow::Borrowed(line));
+    }
+    Ok(lines)
+}
+
+fn included_line<'a>(line: &'a str, state: &mut PreprocessState<'_>) -> Result<Option<&'a str>> {
+    let Some((id, _)) = state.active_includes.last() else {
+        return Ok(Some(line));
+    };
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with(['*', ';', '$', '/'])
+        || directive(line, "SYSTEMLIB").is_some()
+        || directive(line, "END").is_some()
+        || trimmed.eq_ignore_ascii_case(".subckt")
+    {
+        return Ok(None);
+    }
+    if directive(line, "ALIAS").is_some() {
+        if state.substitution != Substitution::None {
+            let (rendered, _) = substitute_line(line, state.env, Substitution::All)?;
+            record_include_alias(&mut state.active_aliases, id, &rendered, &state.env.budget)?;
+        }
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
 fn process_range(
     lines: &[&str],
     start: usize,
@@ -1411,66 +1523,87 @@ fn process_range(
         if directive(line, "ENDWHILE").is_some() {
             bail!("unexpected SIMPLIS .ENDWHILE at line {}", index + 1);
         }
-        if line.trim_start().starts_with('*') {
-            state
-                .env
-                .budget
-                .charge(Resource::EmittedBytes, line.len().saturating_add(1))?;
-            state.output.push_str(line);
-            state.output.push('\n');
-            index = index.saturating_add(1);
-            continue;
-        }
-        if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
-            let (name, value) = parse_assignment(assignment, state.env)
-                .with_context(|| format!("SIMPLIS assignment at line {}", index + 1))?;
-            if directive(line, "GLOBALVAR").is_some() {
-                state.env.set_global(&name, value)?;
-            } else {
-                state.env.ensure_local_name(&name)?;
-                state.env.set(name, value);
-            }
-            *state.assigned_variables = state.assigned_variables.saturating_add(1);
-            index = index.saturating_add(1);
-            continue;
-        }
-        if state.evaluate_parameters
-            && let Some(assignment) = directive(line, "PARAM")
+        if process_include(line, state)
+            .with_context(|| format!("SIMPLIS include at line {}", index + 1))?
         {
-            let (name, value) = parse_assignment(assignment, state.env)
-                .with_context(|| format!("SIMPLIS .PARAM assignment at line {}", index + 1))?;
-            state.env.set(&name, value);
-            state.parameter_names.insert(name);
-            *state.assigned_variables = state.assigned_variables.saturating_add(1);
-            index = index.saturating_add(1);
+            index += 1;
             continue;
         }
-        if let Some(message) = directive(line, "ERROR") {
-            let (message, _) = substitute_line(message, state.env, Substitution::All)?;
-            bail!("SIMPLIS .ERROR at line {}: {}", index + 1, message.trim());
-        }
-        for unsupported in ["FOR", "ENDFOR"] {
-            if directive(line, unsupported).is_some() {
-                bail!("unsupported SIMPLIS .{unsupported} at line {}", index + 1);
-            }
-        }
-        // A runtime parameter declaration must retain its expression and
-        // binding; control-flow expansion does not evaluate runtime parameters.
-        let mode = if !state.evaluate_parameters && directive(line, "PARAM").is_some() {
-            Substitution::None
-        } else {
-            state.substitution
+        let Some(line) = included_line(line, state)? else {
+            index += 1;
+            continue;
         };
-        let (rendered, count) = substitute_line(line, state.env, mode)
-            .with_context(|| format!("SIMPLIS substitution at line {}", index + 1))?;
-        *state.substituted_expressions = state.substituted_expressions.saturating_add(count);
+        process_active_line(line, index + 1, state)?;
+        index = index.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn process_active_line(
+    line: &str,
+    line_number: usize,
+    state: &mut PreprocessState<'_>,
+) -> Result<()> {
+    if line.trim_start().starts_with('*') {
         state
             .env
             .budget
-            .charge(Resource::EmittedBytes, rendered.len().saturating_add(1))?;
+            .charge(Resource::EmittedBytes, line.len().saturating_add(1))?;
+        state.output.push_str(line);
+        state.output.push('\n');
+        return Ok(());
+    }
+    if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
+        let (name, value) = parse_assignment(assignment, state.env)
+            .with_context(|| format!("SIMPLIS assignment at line {}", line_number))?;
+        if directive(line, "GLOBALVAR").is_some() {
+            state.env.set_global(&name, value)?;
+        } else {
+            state.env.ensure_local_name(&name)?;
+            state.env.set(name, value);
+        }
+        *state.assigned_variables = state.assigned_variables.saturating_add(1);
+        return Ok(());
+    }
+    if state.evaluate_parameters
+        && let Some(assignment) = directive(line, "PARAM")
+    {
+        let (name, value) = parse_assignment(assignment, state.env)
+            .with_context(|| format!("SIMPLIS .PARAM assignment at line {}", line_number))?;
+        state.env.set(&name, value);
+        state.parameter_names.insert(name);
+        *state.assigned_variables = state.assigned_variables.saturating_add(1);
+        return Ok(());
+    }
+    if let Some(message) = directive(line, "ERROR") {
+        let (message, _) = substitute_line(message, state.env, Substitution::All)?;
+        bail!("SIMPLIS .ERROR at line {}: {}", line_number, message.trim());
+    }
+    for unsupported in ["FOR", "ENDFOR"] {
+        if directive(line, unsupported).is_some() {
+            bail!("unsupported SIMPLIS .{unsupported} at line {}", line_number);
+        }
+    }
+    // A runtime parameter declaration must retain its expression and
+    // binding; control-flow expansion does not evaluate runtime parameters.
+    let mode = if !state.evaluate_parameters && directive(line, "PARAM").is_some() {
+        Substitution::None
+    } else {
+        state.substitution
+    };
+    let (rendered, count) = substitute_line(line, state.env, mode)
+        .with_context(|| format!("SIMPLIS substitution at line {}", line_number))?;
+    *state.substituted_expressions = state.substituted_expressions.saturating_add(count);
+    state
+        .env
+        .budget
+        .charge(Resource::EmittedBytes, rendered.len().saturating_add(1))?;
+    if state.active_includes.is_empty()
+        || directive(&rendered, "MODEL").is_none()
+        || state.emitted_declarations.insert(rendered.clone())
+    {
         state.output.push_str(&rendered);
         state.output.push('\n');
-        index = index.saturating_add(1);
     }
     Ok(())
 }
@@ -1489,7 +1622,7 @@ fn process_range(
 /// Returns an error on unsupported directives or expressions, malformed control
 /// flow, undefined variables, invalid arithmetic, or an active `.ERROR` directive.
 pub fn preprocess_body(input: &[u8], initial: &Environment) -> Result<Preprocessed> {
-    preprocess_body_with_mode(input, initial, true)
+    preprocess_body_with_mode(input, initial, true, IncludeContext::default())
 }
 
 fn run_preprocess_body(
@@ -1498,6 +1631,7 @@ fn run_preprocess_body(
     substitution: Substitution,
     evaluate_parameters: bool,
     parameter_names: &mut BTreeSet<String>,
+    includes: IncludeContext<'_>,
 ) -> Result<Preprocessed> {
     initial.budget.charge(Resource::ScannedBytes, input.len())?;
     let text = decode_simplis_text(input)?;
@@ -1507,24 +1641,39 @@ fn run_preprocess_body(
     let mut assigned_variables = 0usize;
     let mut evaluated_conditionals = 0usize;
     let mut substituted_expressions = 0usize;
-    process_range(
-        &lines,
-        0,
-        lines.len(),
-        &mut PreprocessState {
-            env: &mut env,
-            output: &mut output,
-            assigned_variables: &mut assigned_variables,
-            evaluated_conditionals: &mut evaluated_conditionals,
-            substituted_expressions: &mut substituted_expressions,
-            parameter_names,
-            substitution,
-            evaluate_parameters,
-        },
-    )?;
+    let mut state = PreprocessState {
+        env: &mut env,
+        output: &mut output,
+        assigned_variables: &mut assigned_variables,
+        evaluated_conditionals: &mut evaluated_conditionals,
+        substituted_expressions: &mut substituted_expressions,
+        parameter_names,
+        substitution,
+        evaluate_parameters,
+        includes,
+        active_includes: Vec::new(),
+        included_sources: BTreeSet::new(),
+        emitted_declarations: BTreeSet::new(),
+        active_aliases: ActiveAliases::new(),
+    };
+    process_range(&lines, 0, lines.len(), &mut state)?;
+    if let Some(catalog) = state.includes.catalog {
+        for alias in catalog.materialize_active_aliases(&state.active_aliases, state.output)? {
+            state
+                .env
+                .budget
+                .charge(Resource::EmittedBytes, alias.len().saturating_add(1))?;
+            state.output.push_str(&alias);
+            state.output.push('\n');
+        }
+    }
+    let included_sources = state.included_sources;
+    let active_aliases = state.active_aliases;
     Ok(Preprocessed {
         bytes: output.into_bytes(),
         environment: env,
+        included_sources,
+        active_aliases,
         stats: PreprocessStats {
             assigned_variables,
             evaluated_conditionals,
@@ -1536,13 +1685,18 @@ fn run_preprocess_body(
 // Execute source controls and substitute known compile-time expressions
 // without consuming native runtime .PARAM declarations or electrical
 // expressions. Used for root statements and plain subcircuits.
-fn preprocess_control_flow(input: &[u8], initial: &Environment) -> Result<Preprocessed> {
+fn preprocess_control_flow(
+    input: &[u8],
+    initial: &Environment,
+    includes: IncludeContext<'_>,
+) -> Result<Preprocessed> {
     run_preprocess_body(
         input,
         initial,
         Substitution::Known,
         false,
         &mut BTreeSet::new(),
+        includes,
     )
 }
 
@@ -1550,9 +1704,10 @@ fn preprocess_body_with_mode(
     input: &[u8],
     initial: &Environment,
     substitute_active_lines: bool,
+    includes: IncludeContext<'_>,
 ) -> Result<Preprocessed> {
     if !substitute_active_lines {
-        return preprocess_control_flow(input, initial);
+        return preprocess_control_flow(input, initial, includes);
     }
 
     let mut discovered_names = BTreeSet::new();
@@ -1562,6 +1717,7 @@ fn preprocess_body_with_mode(
         Substitution::None,
         true,
         &mut discovered_names,
+        includes,
     )?;
     let mut seeded = initial.charged_clone()?;
     for name in discovered_names {
@@ -1578,6 +1734,7 @@ fn preprocess_body_with_mode(
         Substitution::All,
         true,
         &mut BTreeSet::new(),
+        includes,
     )
 }
 
@@ -1779,7 +1936,7 @@ mod tests {
         let input = br".PARAM RUNTIME = {A + 1}
 R1 1 0 {RUNTIME}
 ";
-        let processed = preprocess_body_with_mode(input, &env, false)?;
+        let processed = preprocess_body_with_mode(input, &env, false, IncludeContext::default())?;
         assert_eq!(
             std::str::from_utf8(&processed.bytes)?,
             std::str::from_utf8(input)?
@@ -2359,6 +2516,8 @@ pub struct SpecializedSubcircuit {
     pub bytes: Vec<u8>,
     pub environment: Environment,
     pub stats: SpecializedSubcircuitStats,
+    included_sources: BTreeSet<String>,
+    active_aliases: ActiveAliases,
 }
 
 /// Specialize one standalone SIMPLIS `.SUBCKT ... VARS:` definition to concrete
@@ -2376,27 +2535,13 @@ pub fn specialize_subcircuit(
     input: &[u8],
     overrides: &Environment,
 ) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base(
+    specialize_subcircuit_with_base_mode(
         input,
         &Environment::with_budget(overrides.budget.clone()),
         overrides,
+        true,
+        IncludeContext::default(),
     )
-}
-
-fn specialize_subcircuit_with_base(
-    input: &[u8],
-    inherited: &Environment,
-    overrides: &Environment,
-) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base_mode(input, inherited, overrides, true)
-}
-
-fn specialize_subcircuit_control_flow_with_base(
-    input: &[u8],
-    inherited: &Environment,
-    overrides: &Environment,
-) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base_mode(input, inherited, overrides, false)
 }
 
 fn read_subcircuit_header(lines: &[&str]) -> Result<(String, usize)> {
@@ -2445,6 +2590,7 @@ fn specialize_subcircuit_with_base_mode(
     inherited: &Environment,
     overrides: &Environment,
     substitute_active_lines: bool,
+    includes: IncludeContext<'_>,
 ) -> Result<SpecializedSubcircuit> {
     inherited
         .budget
@@ -2497,7 +2643,12 @@ fn specialize_subcircuit_with_base_mode(
         body_source.push_str(line);
         body_source.push('\n');
     }
-    let body = preprocess_body_with_mode(body_source.as_bytes(), &env, substitute_active_lines)?;
+    let body = preprocess_body_with_mode(
+        body_source.as_bytes(),
+        &env,
+        substitute_active_lines,
+        includes,
+    )?;
 
     let mut output = format!(".SUBCKT {name} {nodes}\n");
     output.push_str(std::str::from_utf8(&body.bytes)?);
@@ -2505,6 +2656,8 @@ fn specialize_subcircuit_with_base_mode(
     Ok(SpecializedSubcircuit {
         bytes: output.into_bytes(),
         environment: body.environment,
+        included_sources: body.included_sources,
+        active_aliases: body.active_aliases,
         stats: SpecializedSubcircuitStats {
             default_parameters,
             overridden_parameters,

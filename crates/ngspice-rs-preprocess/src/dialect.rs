@@ -19,8 +19,8 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_scoped_statements, parse_library_with_budget, parse_scoped_library,
-    parse_standalone_library, preprocess_netlist_linked, project_resource, project_spice_resource,
-    source_include_target,
+    parse_standalone_library, preprocess_netlist_linked_at, project_resource,
+    project_spice_resource, source_include_target,
 };
 use model_translate_simplis::{
     WholeModelTranslation, capture_artifact_initial_conditions, capture_artifact_waveforms,
@@ -756,7 +756,16 @@ fn translate_companions(
         for origin in origin_set {
             budget.charge(super::Resource::EmittedBytes, origin.len())?;
         }
-        let origins = origin_set.iter().cloned().collect();
+        let mut artifact_origins = origin_set.clone();
+        for id in &library.included_sources {
+            if let Some(included) = origins.sources.get(id) {
+                for source in included {
+                    budget.charge(super::Resource::EmittedBytes, source.len())?;
+                    artifact_origins.insert(source.clone());
+                }
+            }
+        }
+        let origins = artifact_origins.into_iter().collect();
         dependencies.push(library.source_id.clone());
         companions.push(generated(
             library.filename.clone(),
@@ -943,7 +952,7 @@ fn linked(
 ) -> Result<PreparedBundle> {
     let ResolvedDeck {
         root: expanded_root,
-        root_sources,
+        mut root_sources,
         declarations,
         libraries:
             ResolvedLibraries {
@@ -953,7 +962,18 @@ fn linked(
                 model_selections,
             },
     } = resolve_deck(root, request, options, cancellation, session)?;
-    let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
+    let mut linked =
+        preprocess_netlist_linked_at(&expanded_root, &catalog, Some(&root.path.to_string_lossy()))?;
+    for id in &linked.root_includes {
+        if let Some(included) = sources.get(id) {
+            for source in included {
+                session
+                    .budget()
+                    .charge(super::Resource::EmittedBytes, source.len())?;
+                root_sources.insert(source.clone());
+            }
+        }
+    }
     let mut plan = capture_linked_plan(
         &mut linked,
         root,

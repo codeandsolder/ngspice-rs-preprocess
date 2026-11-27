@@ -265,6 +265,42 @@ fn explicit_library_paths_disambiguate_identical_basenames() -> Result<()> {
 }
 
 #[test]
+fn explicit_simplis_include_program_is_identical_for_raw_and_parsed_catalogs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let library = dir.path().join("parts.lb");
+    fs::write(&library, b".GLOBALVAR G=3\n.model DM D IS=1e-12\n.alias ALT DM D\n.subckt PART a b\nR2 a b {G}\nD2 a b ALT\n.ends PART\n")?;
+    let root = dir.path().join("root.net");
+    fs::write(
+        &root,
+        b"* includes\nRbefore a 0 {G}\nX1 a 0 PART\n.include parts.lb\nRafter a 0 {G}\n.end\n",
+    )?;
+    let mut req = request(InputFormat::SimplisDeck, &root);
+    req.libraries
+        .push(LibraryInput::Source(SourceInput::File(library.clone())));
+    let raw = prepare_default(&req)?;
+    let parsed_bundle = prepare_default(&request(InputFormat::SimplisLibrary, &library))?;
+    req.libraries = vec![LibraryInput::Parsed(ParsedLibrary::from_json(
+        &parsed_bundle.primary.bytes,
+    )?)];
+    let parsed = prepare_default(&req)?;
+    assert_eq!(raw.primary.bytes, parsed.primary.bytes);
+    assert_eq!(raw.companions.len(), 1);
+    assert_eq!(raw.companions[0].bytes, parsed.companions[0].bytes);
+    let root_text = std::str::from_utf8(&raw.primary.bytes)?;
+    let child_text = std::str::from_utf8(&raw.companions[0].bytes)?;
+    assert!(root_text.contains("Rbefore a 0 {G}"), "{root_text}");
+    assert!(root_text.contains("Rafter a 0 3"), "{root_text}");
+    assert!(child_text.contains("R2 a b 3"), "{child_text}");
+    assert!(!child_text.to_ascii_lowercase().contains(".model dm"));
+    assert!(!root_text.contains(".GLOBALVAR"));
+    let Provenance::Generated { sources, .. } = &raw.primary.provenance else {
+        anyhow::bail!("missing generated provenance");
+    };
+    assert_eq!(sources.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn equal_library_content_under_multiple_names_retains_all_include_aliases() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let first = dir.path().join("first.lb");

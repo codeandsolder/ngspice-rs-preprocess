@@ -1,7 +1,7 @@
 use super::{
-    Environment, GlobalBindings, Substitution, call_defaults, decode_simplis_text, eval_expression,
-    find_ascii_case_insensitive, parameter_assignments, preprocess_control_flow,
-    specialize_subcircuit_control_flow_with_base, specialize_subcircuit_with_base, substitute_line,
+    Environment, GlobalBindings, IncludeContext, Substitution, call_defaults, decode_simplis_text,
+    eval_expression, find_ascii_case_insensitive, parameter_assignments, preprocess_control_flow,
+    specialize_subcircuit_with_base_mode, substitute_line,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::SourceSession;
@@ -11,12 +11,13 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::Arc,
 };
 
 mod runtime_params;
 use runtime_params::RuntimeScope;
 
-const PARSED_LIBRARY_FORMAT_VERSION: u32 = 6;
+const PARSED_LIBRARY_FORMAT_VERSION: u32 = 7;
 
 fn lower_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -39,11 +40,46 @@ struct Definition {
     source_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Alias {
     name: String,
     target: String,
     kind: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ActiveAlias {
+    alias: Alias,
+    source_id: String,
+}
+pub(super) type ActiveAliases = BTreeMap<String, ActiveAlias>;
+
+pub(super) fn record_include_alias(
+    aliases: &mut ActiveAliases,
+    source_id: &str,
+    statement: &str,
+    budget: &WorkBudget,
+) -> Result<()> {
+    let alias = parse_alias(statement)?;
+    budget.charge(Resource::GeneratedNodes, 1)?;
+    budget.charge(
+        Resource::EmittedBytes,
+        statement.len().saturating_add(source_id.len()),
+    )?;
+    let key = alias.name.to_ascii_uppercase();
+    let active = ActiveAlias {
+        alias,
+        source_id: source_id.to_owned(),
+    };
+    if let Some(previous) = aliases.get(&key) {
+        ensure!(
+            previous == &active,
+            "conflicting active SIMPLIS alias {key}"
+        );
+    } else {
+        aliases.insert(key, active);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -76,6 +112,8 @@ pub struct ParsedLibrary {
     source_name: String,
     source_names: BTreeSet<String>,
     support_lines: Vec<String>,
+    // Ordered projected root program; blank lines retain source positions.
+    root_program: String,
     aliases: Vec<Alias>,
     definitions: Vec<Definition>,
 }
@@ -211,15 +249,7 @@ impl ParsedLibrary {
                     .all(|identity| self.source_names.contains(&identity.source)),
             "parsed library source provenance is incomplete"
         );
-        let actual = parsed_library_digest(
-            self.simulator,
-            self.dialect,
-            &self.device_identities,
-            &self.scoped_statements,
-            &self.support_lines,
-            &self.aliases,
-            &self.definitions,
-        );
+        let actual = parsed_library_digest(self);
         if actual != self.source_id {
             bail!("parsed library content-address mismatch");
         }
@@ -232,6 +262,8 @@ struct SourceMetadata {
     source_name: String,
     source_names: BTreeSet<String>,
     support_lines: Vec<String>,
+    // Ordered projected root program; blank lines retain source positions.
+    root_program: String,
     aliases: Vec<Alias>,
 }
 
@@ -306,6 +338,40 @@ fn path_suffix_matches(source: &str, include: &str) -> bool {
             .iter()
             .zip(source)
             .all(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+}
+
+// Catalog names can be native paths or literal Windows source paths. Resolve
+// relative imports in the importing resource's directory before relocated
+// suffix/basename fallback, without consulting the filesystem.
+fn normalize_include_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let absolute = normalized.starts_with('/');
+    let mut parts = Vec::new();
+    for part in normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        if part == ".." && parts.last().is_some_and(|last| *last != "..") {
+            parts.pop();
+        } else if part != ".." || !absolute {
+            parts.push(part);
+        }
+    }
+    format!("{}{}", if absolute { "/" } else { "" }, parts.join("/")).to_ascii_lowercase()
+}
+
+fn relative_include_path(origin: Option<&str>, include: &str) -> String {
+    let include = include.replace('\\', "/");
+    if include.starts_with('/') || include.as_bytes().get(1) == Some(&b':') {
+        return normalize_include_path(&include);
+    }
+    if let Some(parent) =
+        origin.and_then(|path| path.rsplit_once(['/', '\\']).map(|(parent, _)| parent))
+    {
+        normalize_include_path(&format!("{parent}/{include}"))
+    } else {
+        normalize_include_path(&include)
+    }
 }
 
 impl SubcircuitCatalog {
@@ -455,6 +521,8 @@ impl SubcircuitCatalog {
         let source_id = &parsed.source_id;
         let source_name = &parsed.source_name;
         if !self.sources.contains_key(source_id) {
+            self.budget
+                .charge(Resource::EmittedBytes, parsed.root_program.len())?;
             for line in &parsed.support_lines {
                 self.budget.charge(Resource::EmittedBytes, line.len())?;
             }
@@ -475,6 +543,7 @@ impl SubcircuitCatalog {
                 source_name: source_name.clone(),
                 source_names: BTreeSet::new(),
                 support_lines: parsed.support_lines.clone(),
+                root_program: parsed.root_program.clone(),
                 aliases: parsed.aliases.clone(),
             })
             .source_names
@@ -523,34 +592,71 @@ impl SubcircuitCatalog {
         path.rsplit(['/', '\\']).next().unwrap_or(path)
     }
 
-    fn matches_supplied_include(&self, statement: &str) -> Result<bool> {
-        let Some(include) = source_include_target(statement)? else {
-            return Ok(false);
-        };
+    fn supplied_include(
+        &self,
+        include: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<(&str, &str)>> {
+        let expected = relative_include_path(origin, include);
+        let mut exact_matches = BTreeSet::new();
         let mut suffix_matches = BTreeSet::new();
         let mut basename_matches = BTreeSet::new();
         for (identity, metadata) in &self.sources {
             for name in &metadata.source_names {
-                if path_suffix_matches(name, include) {
-                    suffix_matches.insert(identity);
-                }
-                if Self::path_basename(name).eq_ignore_ascii_case(Self::path_basename(include)) {
-                    basename_matches.insert(identity);
+                self.budget.charge(Resource::EvaluationSteps, 1)?;
+                self.budget.charge(Resource::ScannedBytes, name.len())?;
+                let candidate = (identity.as_str(), name.as_str());
+                if normalize_include_path(name) == expected {
+                    exact_matches.insert(candidate);
+                } else if path_suffix_matches(name, include) {
+                    suffix_matches.insert(candidate);
+                } else if Self::path_basename(name)
+                    .eq_ignore_ascii_case(Self::path_basename(include))
+                {
+                    basename_matches.insert(candidate);
                 }
             }
         }
-        // Explicit path suffixes distinguish same-name libraries; basename
-        // fallback supports relocated vendor source paths only when unique.
-        let candidates = if suffix_matches.is_empty() {
-            basename_matches
-        } else {
+        let candidates = if !exact_matches.is_empty() {
+            exact_matches
+        } else if !suffix_matches.is_empty() {
             suffix_matches
+        } else {
+            basename_matches
         };
         anyhow::ensure!(
             candidates.len() <= 1,
-            "ambiguous supplied library include {include:?}"
+            "ambiguous supplied library include {include:?} from {origin:?}"
         );
-        Ok(!candidates.is_empty())
+        Ok(candidates.into_iter().next())
+    }
+
+    fn matches_supplied_include(&self, statement: &str) -> Result<bool> {
+        match source_include_target(statement)? {
+            Some(include) => Ok(self.supplied_include(include, None)?.is_some()),
+            None => Ok(false),
+        }
+    }
+
+    pub(super) fn include_program(
+        &self,
+        include: &str,
+        origin: Option<&str>,
+    ) -> Result<(&str, &str, &str)> {
+        let (source_id, name) = self
+            .supplied_include(include, origin)?
+            .with_context(|| format!("unresolved supplied SIMPLIS include {include:?}"))?;
+        let source = self
+            .source_metadata(source_id)
+            .context("missing include source metadata")?;
+        Ok((source_id, name, &source.root_program))
+    }
+
+    fn include_context<'a>(&'a self, origin: Option<&'a str>) -> IncludeContext<'a> {
+        IncludeContext {
+            catalog: (self.simulator != Some(LibrarySimulator::Simetrix)).then_some(self),
+            origin,
+        }
     }
 
     fn model_statement<'a>(statement: &'a str, name: &str) -> Option<Vec<&'a str>> {
@@ -623,6 +729,136 @@ impl SubcircuitCatalog {
         Ok(Some((*source_id).clone()))
     }
 
+    fn alias_model(&self, alias: &Alias, source_id: &str) -> Result<Option<String>> {
+        if alias.kind.eq_ignore_ascii_case("subckt") {
+            return Ok(None);
+        }
+        let target = self.resolve_model_statement(&alias.target, source_id)?;
+        Ok(Some(Self::rename_model_alias(alias, &target)?))
+    }
+
+    fn rename_model_alias(alias: &Alias, target: &str) -> Result<String> {
+        let mut fields = Self::model_statement(target, &alias.target)
+            .context("resolved SIMPLIS model alias target is not a .MODEL statement")?;
+        let model_type = fields[2]
+            .split_once('(')
+            .map_or(fields[2], |(head, _)| head);
+        ensure!(
+            model_type.eq_ignore_ascii_case(&alias.kind),
+            "SIMPLIS alias {} expects {} but target {} is model type {model_type}",
+            alias.name,
+            alias.kind,
+            alias.target
+        );
+        fields[1] = &alias.name;
+        Ok(fields.join(" "))
+    }
+
+    // Active aliases bind to declarations emitted by the actual source
+    // program (including conditional/continued cards), not its raw index.
+    pub(super) fn materialize_active_aliases(
+        &self,
+        aliases: &ActiveAliases,
+        output: &str,
+    ) -> Result<Vec<String>> {
+        if aliases
+            .values()
+            .all(|binding| binding.alias.kind.eq_ignore_ascii_case("subckt"))
+        {
+            return Ok(Vec::new());
+        }
+        self.budget.charge(Resource::ScannedBytes, output.len())?;
+        let lines = output.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut models = BTreeMap::<String, String>::new();
+        for statement in logical_statements(&lines) {
+            let mut fields = statement.split_whitespace();
+            if fields
+                .next()
+                .is_some_and(|field| field.eq_ignore_ascii_case(".MODEL"))
+                && let Some(name) = fields.next()
+            {
+                let name = name.to_ascii_uppercase();
+                if let Some(existing) = models.get(&name) {
+                    ensure!(
+                        existing == &statement,
+                        "conflicting active SIMPLIS .MODEL {name}"
+                    );
+                } else {
+                    models.insert(name, statement);
+                }
+            }
+        }
+        let mut result = Vec::new();
+        let mut active = BTreeSet::new();
+        let mut resolved = BTreeSet::new();
+        for (name, alias) in aliases {
+            if !alias.alias.kind.eq_ignore_ascii_case("subckt") {
+                self.resolve_active_model(
+                    name,
+                    aliases,
+                    &mut models,
+                    &mut active,
+                    &mut resolved,
+                    &mut result,
+                )?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn resolve_active_model(
+        &self,
+        name: &str,
+        aliases: &ActiveAliases,
+        models: &mut BTreeMap<String, String>,
+        active: &mut BTreeSet<String>,
+        resolved: &mut BTreeSet<String>,
+        result: &mut Vec<String>,
+    ) -> Result<String> {
+        let _depth = self.budget.enter()?;
+        self.budget.charge(Resource::EvaluationSteps, 1)?;
+        if resolved.contains(name) {
+            return models
+                .get(name)
+                .cloned()
+                .context("missing resolved SIMPLIS model alias");
+        }
+        let binding = aliases
+            .get(name)
+            .context("missing active SIMPLIS model alias")?;
+        ensure!(
+            !binding.alias.kind.eq_ignore_ascii_case("subckt"),
+            "SIMPLIS model alias references subcircuit {name}"
+        );
+        ensure!(
+            active.insert(name.to_owned()),
+            "recursive active SIMPLIS model alias {name}"
+        );
+        let target_name = binding.alias.target.to_ascii_uppercase();
+        let target = if aliases.contains_key(&target_name) {
+            self.resolve_active_model(&target_name, aliases, models, active, resolved, result)?
+        } else if let Some(model) = models.get(&target_name) {
+            model.clone()
+        } else {
+            self.resolve_model_statement(&binding.alias.target, &binding.source_id)?
+        };
+        let rendered = Self::rename_model_alias(&binding.alias, &target)?;
+        self.budget
+            .charge(Resource::EmittedBytes, rendered.len().saturating_mul(2))?;
+        if let Some(existing) = models.get(name) {
+            ensure!(
+                existing == &rendered,
+                "conflicting active SIMPLIS model alias {name}"
+            );
+        } else {
+            models.insert(name.to_owned(), rendered.clone());
+            result.push(rendered.clone());
+        }
+        resolved.insert(name.to_owned());
+        active.remove(name);
+        Ok(rendered)
+    }
+
     fn materialized_support(&self, source_id: &str) -> Result<Vec<String>> {
         let metadata = self
             .sources
@@ -630,25 +866,7 @@ impl SubcircuitCatalog {
             .with_context(|| format!("missing SIMPLIS source metadata {source_id}"))?;
         let mut output = metadata.support_lines.clone();
         for alias in &metadata.aliases {
-            if alias.kind.eq_ignore_ascii_case("subckt") {
-                continue;
-            }
-            let target = self.resolve_model_statement(&alias.target, source_id)?;
-            let mut fields = Self::model_statement(&target, &alias.target)
-                .context("resolved SIMPLIS model alias target is not a .MODEL statement")?;
-            let model_type = fields[2]
-                .split_once('(')
-                .map_or(fields[2], |(head, _)| head);
-            if !model_type.eq_ignore_ascii_case(&alias.kind) {
-                bail!(
-                    "SIMPLIS alias {} expects {} but target {} is model type {model_type}",
-                    alias.name,
-                    alias.kind,
-                    alias.target
-                );
-            }
-            fields[1] = &alias.name;
-            output.push(fields.join(" "));
+            output.extend(self.alias_model(alias, source_id)?);
         }
         Ok(output)
     }
@@ -921,7 +1139,8 @@ pub fn parse_library_with_budget(
             budget,
         );
     }
-    let view = project_source(input, simulator)?;
+    let text = decode_simplis_text(input)?;
+    let view = select_library_view_with_positions(&text, simulator)?;
     budget.charge(Resource::EmittedBytes, view.len())?;
     parse_library_parts(
         source_name,
@@ -989,20 +1208,21 @@ pub fn parse_standalone_library(
     anyhow::ensure!(scopes.is_empty(), "unclosed HSPICE library hierarchy");
     let simulator = LibrarySimulator::Hspice;
     let dialect = Some(context);
-    let source_id = parsed_library_digest(simulator, dialect, &[], &statements, &[], &[], &[]);
-    let parsed = ParsedLibrary {
+    let mut parsed = ParsedLibrary {
         format_version: PARSED_LIBRARY_FORMAT_VERSION,
         simulator,
         dialect,
         device_identities: Vec::new(),
-        source_id,
+        source_id: String::new(),
         scoped_statements: statements,
         source_name,
         source_names,
         support_lines: Vec::new(),
+        root_program: String::new(),
         aliases: Vec::new(),
         definitions: Vec::new(),
     };
+    parsed.source_id = parsed_library_digest(&parsed);
     parsed.validate()?;
     Ok(parsed)
 }
@@ -1135,34 +1355,39 @@ fn parse_library_parts(
         scoped_statements,
     } = projection;
     let parsed = extract_definitions_scoped(selected_view, None, budget)?;
-    let (support_lines, aliases) = parse_library_root(&parsed.root_lines)?;
+    let indexed;
+    let root_lines = if simulator == LibrarySimulator::Simplis {
+        indexed = indexed_root_lines(&parsed.root_lines);
+        &indexed
+    } else {
+        &parsed.root_lines
+    };
+    let (support_lines, aliases) = parse_library_root(root_lines)?;
     let mut definitions = parsed.definitions;
     for definition in &mut definitions {
         definition.source_id = None;
         definition.source_name = None;
     }
-    let source_id = parsed_library_digest(
-        simulator,
-        dialect,
-        &device_identities,
-        &scoped_statements,
-        &support_lines,
-        &aliases,
-        &definitions,
-    );
-    Ok(ParsedLibrary {
+    let mut library = ParsedLibrary {
         format_version: PARSED_LIBRARY_FORMAT_VERSION,
         simulator,
         dialect,
         device_identities,
-        source_id,
+        source_id: String::new(),
         scoped_statements,
         source_name,
         source_names,
         support_lines,
+        root_program: if simulator == LibrarySimulator::Simplis {
+            parsed.root_program
+        } else {
+            String::new()
+        },
         aliases,
         definitions,
-    })
+    };
+    library.source_id = parsed_library_digest(&library);
+    Ok(library)
 }
 
 /// Select the requested simulator projection before source interpretation.
@@ -1379,6 +1604,22 @@ fn select_library_view(input: &str, simulator: LibrarySimulator) -> Result<Strin
     Ok(output)
 }
 
+// Keep original physical line numbers for explicit include execution. Inactive
+// simulator sections are empty lines rather than executable source.
+fn select_library_view_with_positions(input: &str, simulator: LibrarySimulator) -> Result<String> {
+    let selected = selected_library_lines(input.lines(), simulator)?;
+    let mut selected = selected.into_iter().peekable();
+    let mut output = String::new();
+    for (index, line) in input.lines().enumerate() {
+        if selected.peek() == Some(&index) {
+            output.push_str(line);
+            selected.next();
+        }
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 fn selected_library_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
     simulator: LibrarySimulator,
@@ -1443,6 +1684,44 @@ fn selected_library_lines<'a>(
     Ok(output)
 }
 
+fn parse_alias(statement: &str) -> Result<Alias> {
+    let fields = statement.split_whitespace().collect::<Vec<_>>();
+    ensure!(
+        fields.len() == 4,
+        "malformed SIMPLIS .ALIAS statement: {statement}"
+    );
+    Ok(Alias {
+        name: fields[1].to_owned(),
+        target: fields[2].to_owned(),
+        kind: fields[3].to_owned(),
+    })
+}
+
+fn indexed_root_lines(lines: &[String]) -> Vec<String> {
+    let mut depth = 0usize;
+    logical_statements(lines)
+        .into_iter()
+        .filter(|line| {
+            if is_directive(line, "IF") || is_directive(line, "WHILE") || is_directive(line, "FOR")
+            {
+                depth += 1;
+                return false;
+            }
+            if is_directive(line, "ENDIF")
+                || is_directive(line, "ENDWHILE")
+                || is_directive(line, "ENDFOR")
+            {
+                depth = depth.saturating_sub(1);
+                return false;
+            }
+            depth == 0
+                && !is_preprocessor_control(line)
+                && !is_directive(line, "INCLUDE")
+                && !is_directive(line, "INC")
+        })
+        .collect()
+}
+
 fn parse_library_root(root_lines: &[String]) -> Result<(Vec<String>, Vec<Alias>)> {
     let mut support_lines = Vec::new();
     let mut aliases = Vec::new();
@@ -1464,15 +1743,7 @@ fn parse_library_root(root_lines: &[String]) -> Result<(Vec<String>, Vec<Alias>)
             continue;
         }
         if is_directive(trimmed, "ALIAS") {
-            let fields = trimmed.split_whitespace().collect::<Vec<_>>();
-            if fields.len() != 4 {
-                bail!("malformed SIMPLIS .ALIAS statement: {trimmed}");
-            }
-            aliases.push(Alias {
-                name: fields[1].to_owned(),
-                target: fields[2].to_owned(),
-                kind: fields[3].to_owned(),
-            });
+            aliases.push(parse_alias(trimmed)?);
             continue;
         }
         support_lines.push(statement);
@@ -1480,18 +1751,21 @@ fn parse_library_root(root_lines: &[String]) -> Result<(Vec<String>, Vec<Alias>)
     Ok((support_lines, aliases))
 }
 
-fn parsed_library_digest(
-    simulator: LibrarySimulator,
-    dialect: Option<crate::source_dialect::DialectContext>,
-    identities: &[crate::source_dialect::DeviceIdentity],
-    statements: &[crate::source_dialect::ScopedStatement],
-    support_lines: &[String],
-    aliases: &[Alias],
-    definitions: &[Definition],
-) -> String {
+fn parsed_library_digest(parsed: &ParsedLibrary) -> String {
+    let ParsedLibrary {
+        simulator,
+        dialect,
+        device_identities: identities,
+        scoped_statements: statements,
+        support_lines,
+        aliases,
+        definitions,
+        root_program,
+        ..
+    } = parsed;
     let semantic_digest = library_digest(support_lines, aliases, definitions);
     let mut hasher = Sha256::new();
-    hasher.update(b"ngspice-rs-preprocess-parsed-library-v6\0");
+    hasher.update(b"ngspice-rs-preprocess-parsed-library-v7\0");
     if let Some(context) = dialect {
         hasher.update([match context.language {
             crate::source_dialect::SourceLanguage::Simetrix => 1,
@@ -1533,6 +1807,9 @@ fn parsed_library_digest(
         hasher.update([0]);
         hasher.update(statement.text.as_bytes());
     }
+    hasher.update(root_program.len().to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(root_program.as_bytes());
     hasher.update(simulator.as_str().as_bytes());
     hasher.update([0]);
     hasher.update(semantic_digest.as_bytes());
@@ -1618,6 +1895,7 @@ fn charge_catalog_scan(parsed: &ParsedLibrary, budget: &WorkBudget) -> Result<()
     for source in &parsed.source_names {
         budget.charge(Resource::ScannedBytes, source.len())?;
     }
+    budget.charge(Resource::ScannedBytes, parsed.root_program.len())?;
     for line in &parsed.support_lines {
         budget.charge(Resource::ScannedBytes, line.len())?;
         budget.charge(Resource::Statements, 1)?;
@@ -1714,6 +1992,7 @@ fn insert_local_definition(
 #[derive(Clone, Debug)]
 struct Extracted {
     root_lines: Vec<String>,
+    root_program: String,
     definitions: Vec<Definition>,
 }
 
@@ -1783,11 +2062,16 @@ fn extract_definitions_scoped(
     budget.charge(Resource::Statements, input.lines().count())?;
     let lines: Vec<&str> = input.lines().collect();
     let mut root_lines = Vec::new();
+    let mut root_program = String::new();
     let mut definitions = Vec::new();
     let mut index = 0usize;
     while index < lines.len() {
         if !is_subcircuit_header(lines[index]) {
             root_lines.push(lines[index].to_owned());
+            if owner_scope_id.is_none() {
+                root_program.push_str(lines[index]);
+                root_program.push('\n');
+            }
             index += 1;
             continue;
         }
@@ -1820,6 +2104,9 @@ fn extract_definitions_scoped(
                 }
             }
             index += 1;
+        }
+        if owner_scope_id.is_none() {
+            root_program.extend(std::iter::repeat_n('\n', index - start));
         }
         let end_index = index
             .checked_sub(1)
@@ -1864,6 +2151,7 @@ fn extract_definitions_scoped(
     }
     Ok(Extracted {
         root_lines,
+        root_program,
         definitions,
     })
 }
@@ -2126,6 +2414,41 @@ fn resolve_definition(
         .map(|definition| (definition.clone(), false)))
 }
 
+fn active_call_definition(
+    model: &str,
+    local: &SubcircuitCatalog,
+    external: &SubcircuitCatalog,
+    caller: (Option<&str>, Option<&str>),
+    root_aliases: &ActiveAliases,
+    scope_aliases: Option<&ActiveAliases>,
+) -> Result<Option<(Definition, bool)>> {
+    let mut name = model;
+    let mut source = caller.0;
+    let mut scope = caller.1;
+    let mut visited = BTreeSet::new();
+    loop {
+        let key = name.to_ascii_uppercase();
+        let Some(binding) = scope_aliases
+            .and_then(|aliases| aliases.get(&key))
+            .or_else(|| root_aliases.get(&key))
+        else {
+            break;
+        };
+        if !binding.alias.kind.eq_ignore_ascii_case("subckt") {
+            break;
+        }
+        external.budget.charge(Resource::EvaluationSteps, 1)?;
+        ensure!(
+            visited.insert(key),
+            "recursive active SIMPLIS subcircuit alias {model}"
+        );
+        name = &binding.alias.target;
+        source = Some(&binding.source_id);
+        scope = None;
+    }
+    resolve_definition(name, local, external, source, scope)
+}
+
 // A plain wrapper may call a parameterized or controlled helper several
 // levels down. Detect that reachability rather than only inspecting the
 // wrapper itself. The visited set also makes this query finite on cycles.
@@ -2180,14 +2503,20 @@ fn rewrite_call(
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
     state: &mut FlatExpansion,
-    caller: (Option<&str>, Option<&str>),
+    caller: (Option<&str>, Option<&str>, Option<&ActiveAliases>),
     inherited: GlobalBindings,
 ) -> Result<Option<(String, Pending)>> {
     let Some((model, override_text, explicit_vars)) = call_target(statement)? else {
         return Ok(None);
     };
-    let Some((definition, is_local)) =
-        resolve_definition(model, local, external, caller.0, caller.1)?
+    let Some((definition, is_local)) = active_call_definition(
+        model,
+        local,
+        external,
+        (caller.0, caller.1),
+        &state.root_aliases,
+        caller.2,
+    )?
     else {
         if explicit_vars {
             bail!("unresolved parameterized SIMPLIS subcircuit {model}");
@@ -2195,8 +2524,15 @@ fn rewrite_call(
         return Ok(None);
     };
     if inherited.is_empty()
+        && state.root_aliases.is_empty()
+        && caller.2.is_none_or(BTreeMap::is_empty)
         && !explicit_vars
         && let Some(plain) = plain_dependency_closure(&definition, local, external)?
+        && !plain.iter().any(|(source, _)| {
+            source
+                .as_ref()
+                .is_some_and(|id| state.imported_sources.contains(id))
+        })
     {
         state.plain.extend(plain);
         return Ok(None);
@@ -2402,6 +2738,8 @@ struct FlatExpansion {
     specialized_local: BTreeSet<String>,
     plain: BTreeSet<DefinitionIdentity>,
     active: Vec<SpecializationIdentity>,
+    imported_sources: BTreeSet<String>,
+    root_aliases: ActiveAliases,
 }
 
 fn emit_pending(
@@ -2432,21 +2770,20 @@ fn emit_pending(
     );
     state.active.push(identity);
     let inherited = Environment::inherited(pending.inherited.clone(), external.budget.clone());
-    let specialized = if pending.definition.parameterized || !pending.overrides.is_empty() {
-        specialize_subcircuit_with_base(&pending.definition.bytes, &inherited, &pending.overrides)
-    } else {
-        specialize_subcircuit_control_flow_with_base(
-            &pending.definition.bytes,
-            &inherited,
-            &pending.overrides,
-        )
-    }
+    let specialized = specialize_subcircuit_with_base_mode(
+        &pending.definition.bytes,
+        &inherited,
+        &pending.overrides,
+        pending.definition.parameterized || !pending.overrides.is_empty(),
+        external.include_context(pending.definition.source_name.as_deref()),
+    )
     .with_context(|| {
         format!(
             "specializing SIMPLIS subcircuit {}",
             pending.definition.name
         )
     })?;
+    state.imported_sources.extend(specialized.included_sources);
     let (header, body_lines) = rename_specialized(&specialized.bytes, &pending.generated_name)?;
     let body_statements = logical_statements(&body_lines);
     let mut rewritten_body = Vec::new();
@@ -2460,6 +2797,7 @@ fn emit_pending(
             (
                 pending.definition.source_id.as_deref(),
                 Some(&pending.definition.scope_id),
+                Some(&specialized.active_aliases),
             ),
             specialized.environment.globals.clone(),
         )? {
@@ -2513,7 +2851,11 @@ pub fn preprocess_netlist_file(
     admission: &mut SourceSession,
 ) -> Result<PreprocessedNetlist> {
     let source = admission.load(path)?;
-    preprocess_netlist(&source.bytes, external)
+    preprocess_netlist_at(
+        &source.bytes,
+        external,
+        Some(&source.path.to_string_lossy()),
+    )
 }
 
 /// Expand parameterized SIMPLIS subcircuit calls into static `$N` definitions.
@@ -2531,11 +2873,23 @@ pub fn preprocess_netlist(
     input: &[u8],
     external: &SubcircuitCatalog,
 ) -> Result<PreprocessedNetlist> {
+    preprocess_netlist_at(input, external, None)
+}
+
+fn preprocess_netlist_at(
+    input: &[u8],
+    external: &SubcircuitCatalog,
+    origin: Option<&str>,
+) -> Result<PreprocessedNetlist> {
     let text = decode_simplis_text(input)?;
     let mut extracted = extract_definitions_scoped(&text, None, &external.budget)?;
     let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
     let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
-    assign_local_source(&mut extracted.definitions, &root_source_id, "<root>");
+    assign_local_source(
+        &mut extracted.definitions,
+        &root_source_id,
+        origin.unwrap_or("<root>"),
+    );
     let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
     let mut retained_local = Vec::new();
     let mut removed_local = 0usize;
@@ -2553,12 +2907,20 @@ pub fn preprocess_netlist(
         }
     }
 
-    let (root_statements, globals) =
-        preprocess_root_statements(&extracted.root_lines, &external.budget)?;
+    let RootExpansion {
+        statements: root_statements,
+        globals,
+        included_sources,
+        active_aliases,
+    } = preprocess_root_statements(&extracted.root_program, external, origin)?;
     let mut output_root = Vec::new();
     let mut pending = Vec::new();
     let mut end_statement = None;
-    let mut state = FlatExpansion::default();
+    let mut state = FlatExpansion {
+        imported_sources: included_sources,
+        root_aliases: active_aliases,
+        ..FlatExpansion::default()
+    };
     for statement in root_statements {
         if is_directive(&statement, "END") {
             end_statement = Some(statement);
@@ -2569,7 +2931,7 @@ pub fn preprocess_netlist(
             &local,
             external,
             &mut state,
-            (None, None),
+            (None, None, None),
             globals.clone(),
         )? {
             if let Some(key) = &root_pending.local_key {
@@ -2852,6 +3214,9 @@ struct LinkedUnit {
     globals: GlobalBindings,
     runtime: Option<RuntimeScope>,
     init: InitTree,
+    included_sources: BTreeSet<String>,
+    root_aliases: Arc<ActiveAliases>,
+    active_aliases: ActiveAliases,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2859,6 +3224,7 @@ struct LinkedLibraryBuilder {
     source_name: String,
     support_lines: Vec<String>,
     dependencies: BTreeSet<String>,
+    included_sources: BTreeSet<String>,
     output: String,
 }
 
@@ -2868,12 +3234,14 @@ pub struct LinkedGeneratedLibrary {
     pub source_name: String,
     pub filename: String,
     pub dependencies: Vec<String>,
+    pub included_sources: BTreeSet<String>,
     pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LinkedPreprocessedNetlist {
     pub root_bytes: Vec<u8>,
+    pub root_includes: BTreeSet<String>,
     pub libraries: Vec<LinkedGeneratedLibrary>,
     pub stats: NetlistPreprocessStats,
 }
@@ -2927,6 +3295,7 @@ fn linked_specialization_name(
     overrides: &Environment,
     globals: &GlobalBindings,
     init: &InitTree,
+    aliases: &ActiveAliases,
 ) -> String {
     let mut hasher = Sha256::new();
     if let Some(source_id) = &definition.source_id {
@@ -2957,6 +3326,20 @@ fn linked_specialization_name(
             hasher.update([0]);
             update_value_hash(&mut hasher, value);
             hasher.update([0xff]);
+        }
+    }
+    if !aliases.is_empty() {
+        hasher.update(b"active-aliases\0");
+        for (name, binding) in aliases {
+            for field in [
+                name,
+                &binding.alias.target,
+                &binding.alias.kind,
+                &binding.source_id,
+            ] {
+                hasher.update(field.as_bytes());
+                hasher.update([0]);
+            }
         }
     }
     init.hash_into(&mut hasher);
@@ -3025,35 +3408,62 @@ fn is_preprocessor_control(line: &str) -> bool {
 fn definition_uses_preprocessor(definition: &Definition) -> bool {
     String::from_utf8_lossy(&definition.bytes)
         .lines()
-        .any(is_preprocessor_control)
+        .any(|line| {
+            is_preprocessor_control(line)
+                || is_directive(line, "INCLUDE")
+                || is_directive(line, "INC")
+        })
+}
+
+struct RootExpansion {
+    statements: Vec<String>,
+    globals: GlobalBindings,
+    included_sources: BTreeSet<String>,
+    active_aliases: ActiveAliases,
 }
 
 fn preprocess_root_statements(
-    root_lines: &[String],
-    budget: &WorkBudget,
-) -> Result<(Vec<String>, GlobalBindings)> {
-    if !root_lines.iter().any(|line| is_preprocessor_control(line)) {
-        return Ok((logical_statements(root_lines), GlobalBindings::default()));
+    program: &str,
+    external: &SubcircuitCatalog,
+    origin: Option<&str>,
+) -> Result<RootExpansion> {
+    let lines = program.lines().map(str::to_owned).collect::<Vec<_>>();
+    if !lines.iter().any(|line| {
+        is_preprocessor_control(line) || is_directive(line, "INCLUDE") || is_directive(line, "INC")
+    }) {
+        return Ok(RootExpansion {
+            statements: logical_statements(&lines),
+            globals: GlobalBindings::default(),
+            included_sources: BTreeSet::new(),
+            active_aliases: ActiveAliases::new(),
+        });
     }
     let processed = preprocess_control_flow(
-        root_lines.join("\n").as_bytes(),
-        &Environment::with_budget(budget.clone()),
+        program.as_bytes(),
+        &Environment::with_budget(external.budget.clone()),
+        external.include_context(origin),
     )
-    .context("preprocessing root SIMPLIS controls")?;
+    .context("preprocessing root SIMPLIS controls and includes")?;
     let text = std::str::from_utf8(&processed.bytes)?;
     let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
-    Ok((logical_statements(&lines), processed.environment.globals))
+    Ok(RootExpansion {
+        statements: logical_statements(&lines),
+        globals: processed.environment.globals,
+        included_sources: processed.included_sources,
+        active_aliases: processed.active_aliases,
+    })
 }
 
 fn make_linked_unit(
     definition: Definition,
     explicit_vars: bool,
     override_text: &str,
-    inherited: &Environment,
+    caller: &LinkCaller<'_>,
     init: InitTree,
-    parent_runtime: Option<&RuntimeScope>,
     external: &SubcircuitCatalog,
 ) -> Result<LinkedUnit> {
+    let inherited = &Environment::inherited(caller.globals.clone(), external.budget.clone());
+    let parent_runtime = caller.runtime;
     let overrides = if explicit_vars {
         bind_call_overrides(&definition, override_text, inherited)?
     } else {
@@ -3070,8 +3480,14 @@ fn make_linked_unit(
         if !init.is_empty() {
             bail!("SIMPLIS .INIT is not supported inside protected Microchip PWM replacement");
         }
-        let emitted_name =
-            linked_specialization_name(&definition, None, &overrides, &inherited.globals, &init);
+        let emitted_name = linked_specialization_name(
+            &definition,
+            None,
+            &overrides,
+            &inherited.globals,
+            &init,
+            &ActiveAliases::new(),
+        );
         return Ok(LinkedUnit {
             definition,
             emitted_name,
@@ -3079,6 +3495,9 @@ fn make_linked_unit(
             globals: inherited.globals.clone(),
             runtime: None,
             init,
+            included_sources: BTreeSet::new(),
+            root_aliases: caller.root_aliases.clone(),
+            active_aliases: ActiveAliases::new(),
         });
     }
 
@@ -3086,16 +3505,28 @@ fn make_linked_unit(
     let needs_substitution = definition.parameterized || explicit_vars;
     let needs_control_flow = definition_uses_preprocessor(&definition);
     let needs_preprocessing = needs_substitution || needs_control_flow || !inherited.is_empty();
-    let (bytes, globals) = if needs_preprocessing {
-        let specialized = if needs_substitution {
-            specialize_subcircuit_with_base(&definition.bytes, inherited, &overrides)
-        } else {
-            specialize_subcircuit_control_flow_with_base(&definition.bytes, inherited, &overrides)
-        }
+    let (bytes, globals, included_sources, active_aliases) = if needs_preprocessing {
+        let specialized = specialize_subcircuit_with_base_mode(
+            &definition.bytes,
+            inherited,
+            &overrides,
+            needs_substitution,
+            external.include_context(definition.source_name.as_deref()),
+        )
         .with_context(|| format!("specializing SIMPLIS subcircuit {}", definition.name))?;
-        (specialized.bytes, specialized.environment.globals)
+        (
+            specialized.bytes,
+            specialized.environment.globals,
+            specialized.included_sources,
+            specialized.active_aliases,
+        )
     } else {
-        (definition.bytes.clone(), inherited.globals.clone())
+        (
+            definition.bytes.clone(),
+            inherited.globals.clone(),
+            BTreeSet::new(),
+            ActiveAliases::new(),
+        )
     };
     external
         .budget
@@ -3119,7 +3550,14 @@ fn make_linked_unit(
     let specialized =
         needs_preprocessing || scoped || runtime.as_ref().is_some_and(RuntimeScope::has_bindings);
     let emitted_name = if specialized || !init.is_empty() {
-        linked_specialization_name(&definition, Some(&bytes), &overrides, &globals, &init)
+        linked_specialization_name(
+            &definition,
+            Some(&bytes),
+            &overrides,
+            &globals,
+            &init,
+            &active_aliases,
+        )
     } else {
         linked_plain_name(&definition)?
     };
@@ -3130,6 +3568,9 @@ fn make_linked_unit(
         globals,
         runtime,
         init,
+        included_sources,
+        root_aliases: caller.root_aliases.clone(),
+        active_aliases,
     })
 }
 
@@ -3139,6 +3580,8 @@ struct LinkCaller<'a> {
     scope: Option<&'a str>,
     globals: GlobalBindings,
     runtime: Option<&'a RuntimeScope>,
+    root_aliases: &'a Arc<ActiveAliases>,
+    scope_aliases: Option<&'a ActiveAliases>,
 }
 
 fn link_call(
@@ -3151,20 +3594,24 @@ fn link_call(
     let Some((model, override_text, explicit_vars)) = call_target(statement)? else {
         return Ok(None);
     };
-    let Some((definition, _is_local)) =
-        resolve_definition(model, local, external, caller.source, caller.scope)?
+    let Some((definition, _is_local)) = active_call_definition(
+        model,
+        local,
+        external,
+        (caller.source, caller.scope),
+        caller.root_aliases,
+        caller.scope_aliases,
+    )?
     else {
         bail!("unresolved SIMPLIS subcircuit {model} in linkable preprocessing");
     };
-    let inherited = Environment::inherited(caller.globals, external.budget.clone());
     let compile_time_vars = explicit_vars || definition.parameterized;
     let unit = make_linked_unit(
         definition,
         compile_time_vars,
         override_text,
-        &inherited,
+        &caller,
         init,
-        caller.runtime,
         external,
     )?;
     let rewritten = if !compile_time_vars
@@ -3189,10 +3636,11 @@ fn initialize_linked_builder(
     source_id: &str,
     source_name: &str,
     external: &SubcircuitCatalog,
+    root_includes: &BTreeSet<String>,
 ) -> Result<()> {
     if builder.source_name.is_empty() {
         source_name.clone_into(&mut builder.source_name);
-        if external.source_metadata(source_id).is_some() {
+        if !root_includes.contains(source_id) && external.source_metadata(source_id).is_some() {
             builder.support_lines = external.materialized_support(source_id)?;
         }
     }
@@ -3267,6 +3715,8 @@ fn rewrite_linked_body(
                 scope: Some(&unit.definition.scope_id),
                 globals: unit.globals.clone(),
                 runtime: unit.runtime.as_ref(),
+                root_aliases: &unit.root_aliases,
+                scope_aliases: Some(&unit.active_aliases),
             },
             child_init.clone(),
         )? {
@@ -3299,29 +3749,34 @@ fn rewrite_linked_body(
     })
 }
 
+struct LinkedEmission<'a> {
+    root_includes: &'a BTreeSet<String>,
+    builders: BTreeMap<String, LinkedLibraryBuilder>,
+    seen: BTreeSet<(String, String)>,
+    active: BTreeSet<(String, String)>,
+    generated_subcircuits: usize,
+}
+
 fn emit_linked_unit(
     unit: &LinkedUnit,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
-    builders: &mut BTreeMap<String, LinkedLibraryBuilder>,
-    seen: &mut BTreeSet<(String, String)>,
-    active: &mut BTreeSet<(String, String)>,
-    generated_subcircuits: &mut usize,
+    state: &mut LinkedEmission<'_>,
 ) -> Result<()> {
     let (source_id, source_name) = linked_source(unit)?;
     let source_id = source_id.to_owned();
     let source_name = source_name.to_owned();
     let seen_key = (source_id.clone(), unit.emitted_name.clone());
     anyhow::ensure!(
-        !active.contains(&seen_key),
+        !state.active.contains(&seen_key),
         "recursive SIMPLIS specialization of {} with unchanged actuals",
         unit.definition.name
     );
-    if seen.contains(&seen_key) {
+    if state.seen.contains(&seen_key) {
         return Ok(());
     }
     let _depth = external.budget.enter()?;
-    active.insert(seen_key.clone());
+    state.active.insert(seen_key.clone());
 
     if let LinkedBody::Microchip(overrides) = &unit.body {
         let pending = Pending {
@@ -3331,16 +3786,22 @@ fn emit_linked_unit(
             inherited: GlobalBindings::default(),
             local_key: None,
         };
-        let builder = builders.entry(source_id.clone()).or_default();
-        initialize_linked_builder(builder, &source_id, &source_name, external)?;
+        let builder = state.builders.entry(source_id.clone()).or_default();
+        initialize_linked_builder(
+            builder,
+            &source_id,
+            &source_name,
+            external,
+            state.root_includes,
+        )?;
         let before = builder.output.len();
         emit_microchip_complementary_pwm(&pending, &mut builder.output)?;
         external
             .budget
             .charge(Resource::EmittedBytes, builder.output.len() - before)?;
-        active.remove(&seen_key);
-        seen.insert(seen_key);
-        *generated_subcircuits = generated_subcircuits.saturating_add(1);
+        state.active.remove(&seen_key);
+        state.seen.insert(seen_key);
+        state.generated_subcircuits = state.generated_subcircuits.saturating_add(1);
         return Ok(());
     }
 
@@ -3353,9 +3814,18 @@ fn emit_linked_unit(
         children,
         dependencies,
     } = rewrite_linked_body(unit, bytes, &source_id, local, external)?;
-    let builder = builders.entry(source_id.clone()).or_default();
-    initialize_linked_builder(builder, &source_id, &source_name, external)?;
+    let builder = state.builders.entry(source_id.clone()).or_default();
+    initialize_linked_builder(
+        builder,
+        &source_id,
+        &source_name,
+        external,
+        state.root_includes,
+    )?;
     builder.dependencies.extend(dependencies);
+    builder
+        .included_sources
+        .extend(unit.included_sources.iter().cloned());
     append_linked_body(
         builder,
         &header,
@@ -3363,20 +3833,12 @@ fn emit_linked_unit(
         &unit.emitted_name,
         &external.budget,
     )?;
-    *generated_subcircuits = generated_subcircuits.saturating_add(1);
+    state.generated_subcircuits = state.generated_subcircuits.saturating_add(1);
     for child in children {
-        emit_linked_unit(
-            &child,
-            local,
-            external,
-            builders,
-            seen,
-            active,
-            generated_subcircuits,
-        )?;
+        emit_linked_unit(&child, local, external, state)?;
     }
-    active.remove(&seen_key);
-    seen.insert(seen_key);
+    state.active.remove(&seen_key);
+    state.seen.insert(seen_key);
     Ok(())
 }
 
@@ -3524,14 +3986,20 @@ fn validate_linked_model_namespace(
 }
 
 fn link_root_statements(
-    root_lines: &[String],
+    root: RootExpansion,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
     runtime: Option<&RuntimeScope>,
 ) -> Result<(String, Vec<LinkedUnit>, Option<String>)> {
     use std::fmt::Write as _;
 
-    let (root_statements, globals) = preprocess_root_statements(root_lines, &external.budget)?;
+    let RootExpansion {
+        statements: root_statements,
+        globals,
+        active_aliases,
+        ..
+    } = root;
+    let root_aliases = Arc::new(active_aliases);
     let mut root_init = InitTree::default();
     for statement in &root_statements {
         if let Some(assignments) = parse_init_statement(statement)? {
@@ -3571,6 +4039,8 @@ fn link_root_statements(
                 scope: None,
                 globals: globals.clone(),
                 runtime,
+                root_aliases: &root_aliases,
+                scope_aliases: None,
             },
             child_init.clone(),
         )? {
@@ -3609,6 +4079,7 @@ fn include_referenced_device_model_libraries(
     root_output: &str,
     builders: &mut BTreeMap<String, LinkedLibraryBuilder>,
     external: &SubcircuitCatalog,
+    root_includes: &BTreeSet<String>,
 ) -> Result<()> {
     // Device-model dependencies can appear directly in a root deck or
     // inside a specialized subcircuit supplied by another vendor library.
@@ -3644,13 +4115,16 @@ fn include_referenced_device_model_libraries(
         let Some(source_id) = external.source_for_model(&model)? else {
             continue;
         };
+        if root_includes.contains(&source_id) {
+            continue;
+        }
         let source_name = external
             .source_metadata(&source_id)
             .with_context(|| format!("missing SIMPLIS source metadata {source_id}"))?
             .source_name
             .clone();
         let builder = builders.entry(source_id.clone()).or_default();
-        initialize_linked_builder(builder, &source_id, &source_name, external)?;
+        initialize_linked_builder(builder, &source_id, &source_name, external, root_includes)?;
     }
     Ok(())
 }
@@ -3666,7 +4140,11 @@ pub fn preprocess_netlist_linked_file(
     admission: &mut SourceSession,
 ) -> Result<LinkedPreprocessedNetlist> {
     let source = admission.load(path)?;
-    preprocess_netlist_linked(&source.bytes, external)
+    preprocess_netlist_linked_at(
+        &source.bytes,
+        external,
+        Some(&source.path.to_string_lossy()),
+    )
 }
 
 /// Preprocess a SIMPLIS root netlist into independently linkable source-library artifacts.
@@ -3685,13 +4163,29 @@ pub fn preprocess_netlist_linked(
     input: &[u8],
     external: &SubcircuitCatalog,
 ) -> Result<LinkedPreprocessedNetlist> {
+    preprocess_netlist_linked_at(input, external, None)
+}
+
+/// Expand a linked source with its original path for relative catalog imports.
+///
+/// # Errors
+/// Invalid source, unresolved or ambiguous imports, or exceeded work budget.
+pub fn preprocess_netlist_linked_at(
+    input: &[u8],
+    external: &SubcircuitCatalog,
+    origin: Option<&str>,
+) -> Result<LinkedPreprocessedNetlist> {
     use std::fmt::Write as _;
 
     let text = decode_simplis_text(input)?;
     let mut extracted = extract_definitions_scoped(&text, None, &external.budget)?;
     let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
     let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
-    assign_local_source(&mut extracted.definitions, &root_source_id, "<root>");
+    assign_local_source(
+        &mut extracted.definitions,
+        &root_source_id,
+        origin.unwrap_or("<root>"),
+    );
 
     let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
     for definition in &extracted.definitions {
@@ -3701,29 +4195,36 @@ pub fn preprocess_netlist_linked(
     let runtime = (external.simulator == Some(LibrarySimulator::Simetrix))
         .then(|| RuntimeScope::root_with_symbols(&root_source_id, &root_support, &external.budget))
         .transpose()?;
+    let root = preprocess_root_statements(&extracted.root_program, external, origin)?;
+    let root_includes = root.included_sources.clone();
     let (mut root_output, root_units, end_statement) =
-        link_root_statements(&extracted.root_lines, &local, external, runtime.as_ref())?;
+        link_root_statements(root, &local, external, runtime.as_ref())?;
 
     let root_specializations = root_units
         .iter()
         .filter(|unit| unit.emitted_name.contains("_sp_"))
         .count();
-    let mut builders = BTreeMap::new();
-    let mut seen = BTreeSet::new();
-    let mut active = BTreeSet::new();
-    let mut generated_subcircuits = 0usize;
+    let mut emission = LinkedEmission {
+        root_includes: &root_includes,
+        builders: BTreeMap::new(),
+        seen: BTreeSet::new(),
+        active: BTreeSet::new(),
+        generated_subcircuits: 0,
+    };
     for unit in root_units {
-        emit_linked_unit(
-            &unit,
-            &local,
-            external,
-            &mut builders,
-            &mut seen,
-            &mut active,
-            &mut generated_subcircuits,
-        )?;
+        emit_linked_unit(&unit, &local, external, &mut emission)?;
     }
-    include_referenced_device_model_libraries(&root_output, &mut builders, external)?;
+    let LinkedEmission {
+        mut builders,
+        generated_subcircuits,
+        ..
+    } = emission;
+    include_referenced_device_model_libraries(
+        &root_output,
+        &mut builders,
+        external,
+        &root_includes,
+    )?;
 
     validate_linked_model_namespace(&builders)?;
 
@@ -3761,6 +4262,7 @@ pub fn preprocess_netlist_linked(
             source_id,
             source_name: builder.source_name,
             dependencies: builder.dependencies.into_iter().collect(),
+            included_sources: builder.included_sources,
             bytes: output.into_bytes(),
         });
     }
@@ -3773,6 +4275,7 @@ pub fn preprocess_netlist_linked(
     external.budget.check()?;
     Ok(LinkedPreprocessedNetlist {
         root_bytes: root_output.into_bytes(),
+        root_includes,
         libraries,
         stats: NetlistPreprocessStats {
             root_specializations,
@@ -4087,6 +4590,283 @@ R1 1 2 3
             combined.push_str(std::str::from_utf8(&library.bytes)?);
         }
         Ok([String::from_utf8(flat.bytes)?, combined])
+    }
+
+    fn explicit_fixture(source: &[u8], catalog: &SubcircuitCatalog) -> Result<[String; 2]> {
+        let flat = preprocess_netlist(source, catalog)?;
+        let linked = preprocess_netlist_linked(source, catalog)?;
+        let mut combined = String::from_utf8(linked.root_bytes)?;
+        for library in linked.libraries {
+            combined.push_str(std::str::from_utf8(&library.bytes)?);
+        }
+        Ok([String::from_utf8(flat.bytes)?, combined])
+    }
+
+    #[test]
+    fn explicit_include_executes_at_source_position_and_promotes_only_globals() -> Result<()> {
+        for (binding, child) in [(".VAR", "{G}"), (".GLOBALVAR", "3")] {
+            let mut catalog = SubcircuitCatalog::new();
+            let program = format!("{binding} G=3\n.SUBCKT CHILD 1 2\nR2 1 2 {{G}}\n.ENDS CHILD\n");
+            catalog.add_library_named("parts.lb", program.as_bytes())?;
+            for output in explicit_fixture(
+                b"R1 1 0 {G}\nX1 1 0 CHILD\n.include parts.lb\nR3 1 0 {G}\n.end\n",
+                &catalog,
+            )? {
+                assert!(output.contains("R1 1 0 {G}"), "{output}");
+                assert!(output.contains("R3 1 0 3"), "{output}");
+                assert!(output.contains(&format!("R2 1 2 {child}")), "{output}");
+                assert!(!output.contains(binding), "{output}");
+                assert!(!output.contains(".include parts.lb"), "{output}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nested_repeated_and_inactive_includes_share_the_active_local_scope() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named("increment.lb", b".VAR I={I+1}\n")?;
+        let middle = parse_library("middle.lb", b".inc increment.lb\nR{I} 1 0 {I}\n")?;
+        let restored = ParsedLibrary::from_json(&middle.to_json()?)?;
+        catalog.add_parsed_library(&restored)?;
+        let source = br".VAR I=0
+.IF {I>0}
+.include missing.lb
+.ENDIF
+.WHILE {I<3}
+.include middle.lb
+.ENDWHILE
+Rend 1 0 {I}
+.end
+";
+        for output in explicit_fixture(source, &catalog)? {
+            for expected in ["R1 1 0 1", "R2 1 0 2", "R3 1 0 3", "Rend 1 0 3"] {
+                assert!(output.contains(expected), "{output}");
+            }
+            assert!(!output.contains("missing.lb"), "{output}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_import_inside_child_does_not_change_parent_or_sibling_bindings() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named("child.lb", b".VAR V=9\n.GLOBALVAR G=7\n")?;
+        let source = br".VAR V=3
+Rroot 1 0 {V}
+X1 1 0 WRAP
+X2 1 0 LEAF
+.SUBCKT WRAP 1 2
+.include child.lb
+Rlocal 1 2 {V}
+XH 1 2 LEAF
+.ENDS WRAP
+.SUBCKT LEAF 1 2
+Rleaf 1 2 {G}
+.ENDS LEAF
+.end
+";
+        for output in explicit_fixture(source, &catalog)? {
+            for expected in [
+                "Rroot 1 0 3",
+                "Rlocal 1 2 9",
+                "Rleaf 1 2 7",
+                "Rleaf 1 2 {G}",
+            ] {
+                assert!(output.contains(expected), "{output}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_library_does_not_execute_its_root_program() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named(
+            "unused.lb",
+            b".GLOBALVAR G=3\n.ERROR unwanted\n.SUBCKT CHILD 1 2\nR2 1 2 {G}\n.ENDS CHILD\n",
+        )?;
+        let result = preprocess_netlist_linked(b"X1 1 0 CHILD\nR1 1 0 {G}\n.end\n", &catalog)?;
+        assert!(result.root_includes.is_empty());
+        assert!(std::str::from_utf8(&result.root_bytes)?.contains("R1 1 0 {G}"));
+        let library = std::str::from_utf8(&result.libraries[0].bytes)?;
+        assert!(library.contains("R2 1 2 {G}"));
+        assert!(!library.contains(".GLOBALVAR"));
+        assert!(!library.contains(".ERROR"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_include_cycles_and_missing_resources_fail_with_source_context() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named("a.lb", b".inc b.lb\n")?;
+        catalog.add_library_named("b.lb", b".inc a.lb\n")?;
+        for root in [
+            b".include a.lb\n.end\n".as_slice(),
+            b".include missing.lb\n.end\n",
+        ] {
+            let error = preprocess_netlist_linked(root, &catalog)
+                .err()
+                .context("active invalid include accepted")?;
+            assert!(
+                format!("{error:#}").contains(if root.starts_with(b".include a") {
+                    "recursive SIMPLIS source include"
+                } else {
+                    "unresolved supplied SIMPLIS include"
+                })
+            );
+            assert!(format!("{error:#}").contains("line 1"));
+        }
+        assert!(
+            preprocess_netlist_linked(b".IF 0\n.include a.lb\n.ENDIF\n.end\n", &catalog).is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn imported_support_and_aliases_are_emitted_once() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named("parts.lb", b".model DM D IS=1e-12\n.alias ALT DM D\n.alias ALTC CHILD subckt\n.SUBCKT CHILD 1 2\nD2 1 2 ALT\n.ENDS CHILD\n")?;
+        for output in explicit_fixture(
+            b".include parts.lb\n.include parts.lb\nX1 1 0 ALTC\nD1 1 0 DM\n.end\n",
+            &catalog,
+        )? {
+            assert_eq!(
+                output.matches(".model DM D IS=1e-12").count(),
+                1,
+                "{output}"
+            );
+            assert_eq!(
+                output.matches(".model ALT D IS=1e-12").count(),
+                1,
+                "{output}"
+            );
+            assert!(output.contains("D2 1 2 ALT"));
+            assert!(!output.contains(".alias"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn active_aliases_bind_executed_declarations_and_conditional_subcircuits() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named(
+            "choices.lb",
+            br".IF {CHOOSE}
+.model BASE D IS={CURRENT}
+.alias FIRST BASE D
+.alias SECOND FIRST D
+.alias SELECTED CHILD subckt
+.ELSE
+.alias INACTIVE CHILD subckt
+.ENDIF
+.SUBCKT CHILD 1 2
+D1 1 2 SECOND
+.ENDS
+",
+        )?;
+        for output in explicit_fixture(
+            b".VAR CHOOSE=1\n.VAR CURRENT=2e-12\n.inc choices.lb\nX1 1 0 SELECTED\n.end\n",
+            &catalog,
+        )? {
+            assert!(output.contains(".model FIRST D IS="), "{output}");
+            assert!(output.contains(".model SECOND D IS="), "{output}");
+            assert!(output.contains("D1 1 2 SECOND"), "{output}");
+            assert!(!output.contains("INACTIVE"), "{output}");
+            assert!(!output.contains("{CURRENT}"), "{output}");
+            assert!(!output.contains("X1 1 0 SELECTED"), "{output}");
+        }
+        let inactive = preprocess_netlist_linked(
+            b".VAR CHOOSE=1\n.VAR CURRENT=2e-12\n.inc choices.lb\nX1 1 0 INACTIVE\n.end\n",
+            &catalog,
+        );
+        assert!(inactive.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn active_model_alias_cycles_and_conflicts_are_rejected() -> Result<()> {
+        for program in [
+            ".alias FIRST SECOND D\n.alias SECOND FIRST D\n",
+            ".model BASE D IS=1e-12\n.model ALT D IS=2e-12\n.alias ALT BASE D\n",
+        ] {
+            let mut catalog = SubcircuitCatalog::new();
+            catalog.add_library_named("conflict.lb", program.as_bytes())?;
+            assert!(preprocess_netlist_linked(b".inc conflict.lb\n.end\n", &catalog).is_err());
+            assert!(preprocess_netlist(b".inc conflict.lb\n.end\n", &catalog).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nested_relative_includes_resolve_against_the_matched_source_name() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        // Both outer resources have the same content identity. Their relative
+        // includes still resolve against the actual importing path.
+        for (dir, value) in [("left", 3), ("right", 7)] {
+            catalog.add_library_named(format!("{dir}/outer.lb"), b".include common.lb\n")?;
+            catalog.add_library_named(
+                format!("{dir}/common.lb"),
+                format!(".VAR V={value}\n").as_bytes(),
+            )?;
+        }
+        for output in explicit_fixture(
+            b".include left/outer.lb\nRL 1 0 {V}\n.include right/outer.lb\nRR 1 0 {V}\n.end\n",
+            &catalog,
+        )? {
+            assert!(output.contains("RL 1 0 3"), "{output}");
+            assert!(output.contains("RR 1 0 7"), "{output}");
+        }
+        let linked = preprocess_netlist_linked_at(
+            b".include common.lb\nR1 1 0 {V}\n.end\n",
+            &catalog,
+            Some("right/deck.net"),
+        )?;
+        assert!(std::str::from_utf8(&linked.root_bytes)?.contains("R1 1 0 7"));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_multiline_support_has_no_orphan_continuations() -> Result<()> {
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_library_named(
+            "parts.lb",
+            b".model DM D IS=1e-12\n* comment\n+ N=2\n.alias ALT DM D\n",
+        )?;
+        for output in explicit_fixture(
+            b".inc parts.lb\n.inc parts.lb\nD1 1 0 ALT\n.end\n",
+            &catalog,
+        )? {
+            assert_eq!(
+                output.matches(".model DM D IS=1e-12 N=2").count(),
+                1,
+                "{output}"
+            );
+            assert_eq!(
+                output.matches(".model ALT D IS=1e-12 N=2").count(),
+                1,
+                "{output}"
+            );
+            assert!(!output.contains("+ N=2"), "{output}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn imported_source_archive_is_content_addressed_and_preserves_positions() -> Result<()> {
+        let source = b".SIMULATOR SIMETRIX\n.ERROR excluded\n.SIMULATOR SIMPLIS\n.SUBCKT UNUSED 1 2\nR1 1 2 3\n.ENDS\n.ERROR active\n";
+        let parsed = parse_library("fixture.lb", source)?;
+        let restored = ParsedLibrary::from_json(&parsed.to_json()?)?;
+        let mut catalog = SubcircuitCatalog::new();
+        catalog.add_parsed_library(&restored)?;
+        let err = preprocess_netlist_linked(b".include fixture.lb\n.end\n", &catalog)
+            .err()
+            .context("active error accepted")?;
+        assert!(format!("{err:#}").contains(".ERROR at line 7: active"));
+        let mut modified = restored;
+        modified.root_program.push_str(".VAR X=1\n");
+        assert!(ParsedLibrary::from_json(&modified.to_json()?).is_err());
+        Ok(())
     }
 
     #[test]
