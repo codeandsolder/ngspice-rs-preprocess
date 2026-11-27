@@ -3,7 +3,8 @@ The following licenses and notices apply to different portions of this package.
 Original codeandsolder Rust code is available under the MIT license below.
 Source-derived HiSIM-HV1/HV2 and HiSIM2 rules, catalogs and numerical
 expressions are subject to Hiroshima University / STARC distribution terms.
-BSIM SOI catalogs and rules retain the ngspice modified BSD terms.
+BSIM SOI catalogs and rules and legacy BSIM1/2 preparation and
+constitutive equations retain the ngspice modified BSD terms.
 The SOI3 (STAG) catalog retains the DERA licence terms.
 The corresponding notices are reproduced after the MIT text. The repository's root MIT
 license does not override those third-party rights and conditions.
@@ -117,7 +118,7 @@ the software on any copy or modification of such made available
 to others."
 
 
-=== BSIM SOI and BSIM3 SOI upstream notices and ngspice modified BSD ===
+=== BSIM SOI, BSIM3 SOI and legacy BSIM1/2 upstream notices and ngspice modified BSD ===
 
 BSIMSOI 4.x: Copyright 2010 Regents of the University of California.
 All rights reserved. Authors: Samuel Fung, Dennis Sinitsky, Stephen Tang,
@@ -131,6 +132,10 @@ Sinitsky and Stephen Tang. Modified by Wei Jin and Paolo Nenzi.
 BSIM3SOI PD 2.2.3: Copyright 1990 Regents of the University of California.
 All rights reserved. Authors: Samuel Fung, Dennis Sinitsky and Stephen Tang.
 Modified by Pin Su, Jan Feng, Wei Jin and Paolo Nenzi.
+
+Legacy BSIM1/2:
+Copyright 1990 Regents of the University of California. All rights reserved.
+Authors: Hong J. Park, Thomas L. Quarles, Min-Chie Jeng.
 
 Copyright 1985 - 2018, Regents of the University of California and others
 

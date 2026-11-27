@@ -73,7 +73,12 @@ fn order_independent_identity_and_lot_scope() -> Result<()> {
     );
     assert!(lot.sample(experiment, Site { lot: None, ..SITE }).is_err());
     let wider = function("gauss")?.prepare(&[0.4])?;
-    assert!((wider.sample(experiment, SITE)? - 1. - 2. * (first - 1.)).abs() < 1e-15);
+    assert!(
+        2.0f64
+            .mul_add(-(first - 1.), wider.sample(experiment, SITE)? - 1.)
+            .abs()
+            < 1e-15
+    );
     Ok(())
 }
 

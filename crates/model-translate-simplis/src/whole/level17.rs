@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::model_card::{
     ModelCard, ModelParameter, instance_fields, parse_model_card, parse_spice_constant,
 };
+use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeMap, fmt::Write as _};
 
 #[derive(Clone, Copy, Debug)]
@@ -517,7 +518,11 @@ pub(super) struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    pub(super) fn global(prefix: &'a str, scopes: &[Vec<super::Item>]) -> Result<Self> {
+    pub(super) fn global(
+        prefix: &'a str,
+        scopes: &[Vec<super::Item>],
+        budget: &WorkBudget,
+    ) -> Result<Self> {
         let mut result = Self {
             prefix,
             path: String::new(),
@@ -527,9 +532,12 @@ impl<'a> Scope<'a> {
         let mut texts = BTreeMap::new();
         for items in scopes {
             for statement in super::electrical_statements(items) {
+                budget.charge(Resource::ScannedBytes, statement.len())?;
+                budget.charge(Resource::Statements, 1)?;
                 let Some((name, _)) = model_header(statement) else {
                     continue;
                 };
+                budget.charge(Resource::GeneratedNodes, 1)?;
                 let model = result.bind(&name, statement)?;
                 if let Some(previous) = result.declarations.get(&name) {
                     // Identical library declarations can occur in multiple
@@ -550,7 +558,11 @@ impl<'a> Scope<'a> {
         Ok(result)
     }
 
-    pub(super) fn child<'b>(&'b self, block: &super::Subcircuit) -> Result<Scope<'b>> {
+    pub(super) fn child<'b>(
+        &'b self,
+        block: &super::Subcircuit,
+        budget: &WorkBudget,
+    ) -> Result<Scope<'b>> {
         let path = format!(
             "{}__{}",
             self.path,
@@ -563,9 +575,12 @@ impl<'a> Scope<'a> {
             declarations: BTreeMap::new(),
         };
         for statement in super::electrical_statements(&block.body) {
+            budget.charge(Resource::ScannedBytes, statement.len())?;
+            budget.charge(Resource::Statements, 1)?;
             let Some((name, _)) = model_header(statement) else {
                 continue;
             };
+            budget.charge(Resource::GeneratedNodes, 1)?;
             let model = result.bind(&name, statement)?;
             let selected = model.is_some();
             if let Some(previous) = result.declarations.insert(name.clone(), model) {
@@ -607,9 +622,16 @@ impl<'a> Scope<'a> {
     /// Nested source subcircuits are emitted as flat definitions. Copy
     /// only inherited lexical model definitions actually used here;
     /// global models remain shared through the normal include graph.
-    pub(super) fn emit_inherited(&self, items: &[super::Item], output: &mut String) -> Result<()> {
+    pub(super) fn emit_inherited(
+        &self,
+        items: &[super::Item],
+        output: &mut String,
+        budget: &WorkBudget,
+    ) -> Result<()> {
         let mut emitted = std::collections::BTreeSet::new();
         for statement in super::electrical_statements(items) {
+            budget.charge(Resource::ScannedBytes, statement.len())?;
+            budget.charge(Resource::Statements, 1)?;
             if !statement.trim_start().starts_with(['M', 'm']) {
                 continue;
             }
@@ -627,7 +649,10 @@ impl<'a> Scope<'a> {
                 continue;
             }
             if let Some(model) = self.lookup(&name).filter(|model| model.lexical) {
-                output.push_str(&emit_level17_core_model(&name, model)?);
+                let emitted = emit_level17_core_model(&name, model)?;
+                budget.charge(Resource::EmittedBytes, emitted.len())?;
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                output.push_str(&emitted);
             }
         }
         Ok(())

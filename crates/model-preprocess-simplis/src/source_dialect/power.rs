@@ -4,6 +4,7 @@
 
 use super::group_end;
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -24,8 +25,9 @@ struct Token {
     text: String,
 }
 
-struct Lowerer {
+struct Lowerer<'a> {
     limit: usize,
+    budget: &'a WorkBudget,
 }
 
 struct Cursor<'a> {
@@ -72,7 +74,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn group(&mut self) -> Result<(char, &'a str, char)> {
+    fn group(&mut self, budget: &WorkBudget) -> Result<(char, &'a str, char)> {
         let open = self.offset;
         let (opener, closer) = match self.byte() {
             Some(b'(') => ('(', ')'),
@@ -80,7 +82,7 @@ impl<'a> Cursor<'a> {
             Some(b'[') => ('[', ']'),
             _ => bail!("expected source power operand group"),
         };
-        let end = group_end(self.input, open)?;
+        let end = group_end(self.input, open, budget)?;
         self.offset = end + 1;
         Ok((opener, &self.input[open + 1..end], closer))
     }
@@ -96,17 +98,20 @@ impl<'a> Cursor<'a> {
     }
 }
 
-impl Lowerer {
-    fn group(&self, cursor: &mut Cursor<'_>, depth: usize) -> Result<String> {
-        let (open, body, close) = cursor.group()?;
-        let body = self.expression(body, depth + 1)?;
+impl Lowerer<'_> {
+    fn group(&self, cursor: &mut Cursor<'_>) -> Result<String> {
+        let (open, body, close) = cursor.group(self.budget)?;
+        let body = self.expression(body)?;
+        self.budget
+            .charge(Resource::EmittedBytes, body.len().saturating_add(2))?;
         Ok(format!("{open}{body}{close}"))
     }
 
-    fn identifier(&self, cursor: &mut Cursor<'_>, depth: usize) -> Result<String> {
+    fn identifier(&self, cursor: &mut Cursor<'_>) -> Result<String> {
         let start = cursor.offset;
         cursor.identifier();
         let name = &cursor.input[start..cursor.offset];
+        self.budget.charge(Resource::EmittedBytes, name.len())?;
         let mut output = name.to_owned();
         let mut first = true;
         loop {
@@ -121,31 +126,39 @@ impl Lowerer {
                 && (name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I"))
             {
                 // Probe arguments are electrical names, not arithmetic.
-                let close = group_end(cursor.input, cursor.offset)?;
+                let close = group_end(cursor.input, cursor.offset, self.budget)?;
+                self.budget
+                    .charge(Resource::EmittedBytes, close + 1 - before_space)?;
                 output.push_str(&cursor.input[before_space..=close]);
                 cursor.offset = close + 1;
             } else {
-                output.push_str(&cursor.input[before_space..cursor.offset]);
-                output.push_str(&self.group(cursor, depth)?);
+                let whitespace = &cursor.input[before_space..cursor.offset];
+                let group = self.group(cursor)?;
+                self.budget.charge(
+                    Resource::EmittedBytes,
+                    whitespace.len().saturating_add(group.len()),
+                )?;
+                output.push_str(whitespace);
+                output.push_str(&group);
             }
             first = false;
         }
         Ok(output)
     }
 
-    fn operand(&self, cursor: &mut Cursor<'_>, depth: usize) -> Result<Option<String>> {
+    fn operand(&self, cursor: &mut Cursor<'_>) -> Result<Option<String>> {
         let Some(byte) = cursor.byte() else {
             return Ok(None);
         };
         let value = match byte {
-            b'(' | b'{' | b'[' => self.group(cursor, depth)?,
+            b'(' | b'{' | b'[' => self.group(cursor)?,
             b'\'' | b'"' => {
                 let body = cursor.quoted(byte)?;
                 let quote = char::from(byte);
                 // Single quotes delimit electrical expressions; double
                 // quoted literal text is not an expression.
                 if byte == b'\'' {
-                    format!("{quote}{}{quote}", self.expression(body, depth + 1)?)
+                    format!("{quote}{}{quote}", self.expression(body)?)
                 } else {
                     format!("{quote}{body}{quote}")
                 }
@@ -156,14 +169,14 @@ impl Lowerer {
                 cursor.input[start..cursor.offset].to_owned()
             }
             byte if byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$' | b'@') => {
-                self.identifier(cursor, depth)?
+                self.identifier(cursor)?
             }
             _ => return Ok(None),
         };
         Ok(Some(value))
     }
 
-    fn tokens(&self, input: &str, depth: usize) -> Result<Vec<Token>> {
+    fn tokens(&self, input: &str) -> Result<Vec<Token>> {
         let mut cursor = Cursor::new(input);
         let mut tokens = Vec::new();
         let mut bytes = 0usize;
@@ -182,7 +195,7 @@ impl Lowerer {
                 }
             }
             let operand_start = cursor.offset;
-            if let Some(operand) = self.operand(&mut cursor, depth)? {
+            if let Some(operand) = self.operand(&mut cursor)? {
                 let prefix = &input[start..operand_start];
                 bytes = bytes
                     .saturating_add(prefix.len())
@@ -191,6 +204,11 @@ impl Lowerer {
                     bytes <= self.limit,
                     "source power expansion byte budget exceeded"
                 );
+                self.budget.charge(Resource::GeneratedNodes, 1)?;
+                self.budget.charge(
+                    Resource::EmittedBytes,
+                    prefix.len().saturating_add(operand.len()),
+                )?;
                 tokens.push(Token {
                     kind: Kind::Operand,
                     text: format!("{prefix}{operand}"),
@@ -213,6 +231,9 @@ impl Lowerer {
                 bytes <= self.limit,
                 "source power expansion byte budget exceeded"
             );
+            self.budget.charge(Resource::GeneratedNodes, 1)?;
+            self.budget
+                .charge(Resource::EmittedBytes, cursor.offset - start)?;
             tokens.push(Token {
                 kind,
                 text: input[start..cursor.offset].to_owned(),
@@ -231,7 +252,7 @@ impl Lowerer {
             ensure!(!first.kind.is_power(), "missing left source power operand");
             index += 1;
             if first.kind != Kind::Operand {
-                append(&mut output, &first.text, self.limit)?;
+                append(&mut output, &first.text, self.limit, self.budget)?;
                 continue;
             }
             let mut absolute = false;
@@ -247,7 +268,7 @@ impl Lowerer {
             }
             if !absolute {
                 for token in &tokens[start..index] {
-                    append(&mut output, &token.text, self.limit)?;
+                    append(&mut output, &token.text, self.limit, self.budget)?;
                 }
                 continue;
             }
@@ -256,42 +277,55 @@ impl Lowerer {
             let leading = &first.text[..first.text.len() - first.text.trim_start().len()];
             let mut lhs = first.text.trim().to_owned();
             for pair in tokens[start + 1..index].as_chunks::<2>().0 {
+                self.budget.charge(Resource::EvaluationSteps, lhs.len())?;
                 let rhs = pair[1].text.trim();
                 lhs = if pair[0].kind == Kind::AbsolutePower {
-                    guarded(&lhs, rhs, self.limit.saturating_sub(output.len()))?
+                    guarded(
+                        &lhs,
+                        rhs,
+                        self.limit.saturating_sub(output.len()),
+                        self.budget,
+                    )?
                 } else {
                     ensure!(
                         lhs.len().saturating_add(rhs.len()).saturating_add(8) <= self.limit,
                         "source power expansion byte budget exceeded"
                     );
+                    self.budget.charge(
+                        Resource::EmittedBytes,
+                        lhs.len().saturating_add(rhs.len()).saturating_add(8),
+                    )?;
                     format!("(({lhs})^({rhs}))")
                 };
             }
-            append(&mut output, leading, self.limit)?;
-            append(&mut output, &lhs, self.limit)?;
+            append(&mut output, leading, self.limit, self.budget)?;
+            append(&mut output, &lhs, self.limit, self.budget)?;
         }
         Ok(output)
     }
 
-    fn expression(&self, input: &str, depth: usize) -> Result<String> {
+    fn expression(&self, input: &str) -> Result<String> {
         ensure!(
             input.len() <= self.limit,
             "source power expansion byte budget exceeded"
         );
+        self.budget.charge(Resource::EmittedBytes, input.len())?;
         if !input.contains("**") {
             return Ok(input.to_owned());
         }
-        ensure!(depth <= 256, "source power expression nesting exceeds 256");
-        let tokens = self.tokens(input, depth)?;
+        let _frame = self.budget.enter()?;
+        self.budget.charge(Resource::EvaluationSteps, input.len())?;
+        let tokens = self.tokens(input)?;
         self.fold(&tokens)
     }
 }
 
-fn append(output: &mut String, text: &str, limit: usize) -> Result<()> {
+fn append(output: &mut String, text: &str, limit: usize, budget: &WorkBudget) -> Result<()> {
     ensure!(
         text.len() <= limit.saturating_sub(output.len()),
         "source power expansion byte budget exceeded"
     );
+    budget.charge(Resource::EmittedBytes, text.len())?;
     output.push_str(text);
     Ok(())
 }
@@ -299,7 +333,12 @@ fn append(output: &mut String, text: &str, limit: usize) -> Result<()> {
 /// The source zero-base derivative is zero for nonnegative powers, even
 /// where the ordinary native power derivative is singular. Keep a true
 /// negative-power singularity visible to the simulator.
-pub(super) fn guarded(base: &str, exponent: &str, limit: usize) -> Result<String> {
+pub(super) fn guarded(
+    base: &str,
+    exponent: &str,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<String> {
     let base = base.trim();
     let exponent = exponent.trim();
     let bound = base
@@ -311,13 +350,19 @@ pub(super) fn guarded(base: &str, exponent: &str, limit: usize) -> Result<String
         bound <= limit,
         "source power expansion byte budget exceeded"
     );
+    budget.charge(Resource::EmittedBytes, bound)?;
     Ok(format!(
         "((({base})==0)&&(({exponent})>=0)?(({exponent})==0?1:0):abs({base})^({exponent}))"
     ))
 }
 
-pub(super) fn lower(input: &str, limit: usize) -> Result<String> {
-    Lowerer { limit }.expression(input, 0)
+#[cfg(test)]
+fn lower(input: &str, limit: usize) -> Result<String> {
+    lower_with_budget(input, limit, &WorkBudget::default())
+}
+
+pub(super) fn lower_with_budget(input: &str, limit: usize, budget: &WorkBudget) -> Result<String> {
+    Lowerer { limit, budget }.expression(input)
 }
 
 #[cfg(test)]
@@ -327,15 +372,27 @@ mod tests {
     #[test]
     fn source_power_chains_and_unary_operands() -> Result<()> {
         let limit = 4096;
-        let first = guarded("2", "3", limit)?;
-        assert_eq!(lower("2**3**2", limit)?, guarded(&first, "2", limit)?);
-        assert_eq!(lower("-2**3", limit)?, guarded("-2", "3", limit)?);
-        assert_eq!(lower("2**-3", limit)?, guarded("2", "-3", limit)?);
-        assert_eq!(lower("2^3**2", limit)?, guarded("((2)^(3))", "2", limit)?);
+        let first = guarded("2", "3", limit, &WorkBudget::default())?;
+        assert_eq!(
+            lower("2**3**2", limit)?,
+            guarded(&first, "2", limit, &WorkBudget::default())?
+        );
+        assert_eq!(
+            lower("-2**3", limit)?,
+            guarded("-2", "3", limit, &WorkBudget::default())?
+        );
+        assert_eq!(
+            lower("2**-3", limit)?,
+            guarded("2", "-3", limit, &WorkBudget::default())?
+        );
+        assert_eq!(
+            lower("2^3**2", limit)?,
+            guarded("((2)^(3))", "2", limit, &WorkBudget::default())?
+        );
         assert_eq!(lower("2**3^2", limit)?, format!("(({first})^(2))"));
         assert_eq!(
             lower("V(a-b,c)**.5", limit)?,
-            guarded("V(a-b,c)", ".5", limit)?
+            guarded("V(a-b,c)", ".5", limit, &WorkBudget::default())?
         );
         for literal in ["V(node**name)", r#""PWR(x,2)""#, "a^b"] {
             // A voltage/current probe names electrical objects, not expressions.

@@ -7,6 +7,7 @@ members = [
     "crates/model-statistics",
     "crates/model-kernel-diode",
     "crates/model-kernel-bipolar",
+    "crates/model-kernel-bsim",
     "crates/model-compact-intrinsic",
     "crates/model-kernel-vdmos",
     "crates/model-normalize-ngspice",
@@ -22,6 +23,7 @@ default-members = [
     "crates/model-statistics",
     "crates/model-kernel-diode",
     "crates/model-kernel-bipolar",
+    "crates/model-kernel-bsim",
     "crates/model-compact-intrinsic",
     "crates/model-kernel-vdmos",
     "crates/model-normalize-ngspice",
@@ -46,6 +48,7 @@ model-alb-experimental = { path = "crates/model-alb-experimental", version = "=0
 model-compact-intrinsic = { path = "crates/model-compact-intrinsic", version = "=0.1.0" }
 model-kernel-api = { path = "crates/model-kernel-api", version = "=0.1.0" }
 model-kernel-bipolar = { path = "crates/model-kernel-bipolar", version = "=0.1.0" }
+model-kernel-bsim = { path = "crates/model-kernel-bsim", version = "=0.1.0" }
 model-kernel-diode = { path = "crates/model-kernel-diode", version = "=0.1.0" }
 model-kernel-vdmos = { path = "crates/model-kernel-vdmos", version = "=0.1.0" }
 model-normalize-ngspice = { path = "crates/model-normalize-ngspice", version = "=0.1.0" }

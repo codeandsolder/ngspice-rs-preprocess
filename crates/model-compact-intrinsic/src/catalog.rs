@@ -16,16 +16,30 @@ mod bsim_soi;
 mod hisim2;
 mod hisim_hv1;
 mod hisim_hv2;
+mod legacy_bsim;
 mod soi3;
 
 use crate::{ModelVariant, ParameterScope, ParameterSpec};
 
 pub fn table(variant: ModelVariant, scope: ParameterScope) -> &'static [ParameterSpec] {
     use ModelVariant::{
-        Bsim3SoiDd, Bsim3SoiFd, Bsim3SoiPd, BsimSoi, HiSim2, HiSimHv1, HiSimHv2, Soi3,
+        Bsim1, Bsim2, Bsim3SoiDd, Bsim3SoiFd, Bsim3SoiPd, Bsim3V0, Bsim3V1, Bsim3V32, Bsim3V33,
+        BsimSoi, HiSim2, HiSimHv1, HiSimHv2, Soi3,
     };
     use ParameterScope::{Instance, Model};
     match (variant, scope) {
+        (Bsim1, Model) => legacy_bsim::BSIM1_MODEL,
+        (Bsim1, Instance) => legacy_bsim::BSIM1_INSTANCE,
+        (Bsim2, Model) => legacy_bsim::BSIM2_MODEL,
+        (Bsim2, Instance) => legacy_bsim::BSIM2_INSTANCE,
+        (Bsim3V0, Model) => legacy_bsim::BSIM3_V0_MODEL,
+        (Bsim3V0, Instance) => legacy_bsim::BSIM3_V0_INSTANCE,
+        (Bsim3V1, Model) => legacy_bsim::BSIM3_V1_MODEL,
+        (Bsim3V1, Instance) => legacy_bsim::BSIM3_V1_INSTANCE,
+        (Bsim3V32, Model) => legacy_bsim::BSIM3_V32_MODEL,
+        (Bsim3V32, Instance) => legacy_bsim::BSIM3_V32_INSTANCE,
+        (Bsim3V33, Model) => legacy_bsim::BSIM3_V33_MODEL,
+        (Bsim3V33, Instance) => legacy_bsim::BSIM3_V33_INSTANCE,
         (HiSim2, Model) => hisim2::MODEL,
         (HiSim2, Instance) => hisim2::INSTANCE,
         (HiSimHv1, Model) => hisim_hv1::MODEL,

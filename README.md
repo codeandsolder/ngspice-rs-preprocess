@@ -245,7 +245,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 7 includes
+counts, dependencies and provenance. Manifest version 9 includes typed PWL resistor declarations as well as
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
 `Artifact::required_code_models` and `PreparedBundle::required_code_models()`.
@@ -266,8 +266,33 @@ their display spellings.
 The combined artifact/intermediate-link byte limit defaults to 128 MiB and
 is configurable with `--max-output-bytes`. Per-source and command limits are
 available with `--max-input-bytes`, `--max-command-output-bytes`,
-`--max-diagnostic-bytes`, and `--timeout-ms`. These do not replace the
-separate cumulative evaluation and hierarchy work limits.
+`--max-diagnostic-bytes`, and `--timeout-ms`. These do not replace the cumulative request limits in `Options::work`
+(`WorkLimits`), shared by the admission sessions, source linker, control-flow
+expander, specialization, scalar evaluation, and translation. Configure the
+following independently using the corresponding CLI switches:
+
+| Work limit | Default | CLI option |
+| --- | ---: | --- |
+| Original source bytes | 256 MiB | `--max-work-input-bytes` |
+| Admitted snapshot bytes | 256 MiB | `--max-work-admitted-bytes` |
+| Source identities | 16,384 | `--max-work-sources` |
+| Source visits (including cached includes) | 65,536 | `--max-work-source-visits` |
+| Scanned bytes | 1 GiB | `--max-work-scanned-bytes` |
+| Statement visits | 8,000,000 | `--max-work-statements` |
+| Expression work | 32,000,000 | `--max-work-evaluation-steps` |
+| Generated definitions, nodes and vector elements | 2,000,000 | `--max-work-generated-nodes` |
+| Intermediate and final emitted bytes | 512 MiB | `--max-work-emitted-bytes` |
+| Recursive preprocessing depth | 64 | `--max-work-depth` |
+
+These are cumulative work allowances, not exact heap-memory or wall-clock
+measurements: processing the same bytes again can consume additional work.
+Canonical repeated source admissions reuse their snapshots, but every expansion
+visit consumes work. Nested loops share the request allowance without changing
+the source-language iteration limit. Depth has an implementation ceiling of 64
+to bound native stack use. Recursive includes and unchanged-actuals recursive
+specializations are diagnosed separately from work exhaustion. A budget failure
+is sticky and rejects the entire request, including when an optional analysis
+would otherwise skip an unsupported expression.
 
 
 The SIMetrix `PWLS PUL` independent voltage/current waveform is lowered to
@@ -317,7 +342,7 @@ Cancellation uses a shared `Cancellation` token. On Unix, failed invocations
 terminate the child process group; on Windows, the direct child is terminated.
 Cleanup is separately bounded to five seconds. Ordinary filesystem reads
 are synchronous and may block at the OS/filesystem level. Cumulative graph
-budgets are a separate preprocessing policy.
+budgets also bound admission and expansion work across all invocations.
 
 `SourceLinker::link_with_session` applies the same session to the root,
 relative includes and named library sections. SIMPLIS callers use
@@ -449,6 +474,42 @@ Do not simulate the electrical text alone if this policy contains
 initialization declarations. Native decks have no source-specific
 initialization policy and retain their normal IC semantics.
 
+### SIMPLIS piecewise-linear resistor startup
+
+The `PreparedBundle::pwl_resistors` list and manifest v9 contain each
+translated resistor's signed voltage/current knots, independent axis,
+one-based optional `initial_segment`, emitted artifact and lexical scope,
+and original linked device and terminal names. A linked definition may be
+instantiated repeatedly; bind its declaration independently for each
+elaborated occurrence. Hierarchical snapshots specialize definitions
+before translation and the effective segment must be valid.
+
+The `binding` describes the exact native behavioral source and, for a
+current-defined law, its series zero-volt sensor and intermediate node.
+`series_sensor` describes additional instrumentation inserted to observe
+the current in another device's control law. Preserve these observation
+branches when replacing the behavioral stamp. The emitted electrical
+text represents the same physical law regardless of the startup hint.
+
+During an initial nonlinear bias attempt, an explicit hint selects
+the first linearized segment only. Recompute the segment from the
+actual solved independent coordinate, including end extrapolation;
+interior negative slopes are valid. Do not enforce terminal voltage or
+current as an initial constraint, and do not reset the hint during an
+ordinary Newton iteration or continuation step. A consumer that ignores
+this metadata cannot guarantee the source's multiroot startup choice.
+
+Generated branch and internal node names are allocated against the entire
+lexical scope, including subcircuit ports and current-control targets.
+Distinct linked devices therefore cannot alias through punctuation
+normalization. Artifact validation checks scoped electrical card identity,
+orientation and sensor/law type under the shared preparation work budget.
+
+References: [SIMPLIS device statements](https://simplis.com/documentation/simplis/simplis_reference/topics/devicestatements_simplisdevicetypes.htm),
+[resistor model laws](https://www.simplis.com/documentation/simplis/simplis_reference/topics/modelstatements_devicemodelsusedinsimplis.htm),
+and [initial-condition overrides](https://simplis.com/documentation/simetrix/simplis_reference/topics/controlstatements_controlstatementsforsettinginitialconditions.htm).
+
+
 ### SIMPLIS reactive startup and snapshots
 
 For linked SIMPLIS decks, `.INIT` assignments are resolved per instance
@@ -504,3 +565,14 @@ constant parameters, including ngspice's duplicate-knot PWL syntax; this
 is a reference representation, not the prepared solver contract. The
 native solver binding and exact event scheduling are tracked in
 ngspice-rs-fast issue 223.
+
+
+### Legacy Berkeley BSIM preparation
+
+[model-compact-intrinsic](crates/model-compact-intrinsic/) provides exact
+legacy BSIM1/2/3 source catalogs and independent BSIM1/2 preparation and
+constitutive equations. [model-kernel-bsim](crates/model-kernel-bsim/)
+assembles the BSIM1/2 generalized physical residual, charge and noise
+artifacts. Solver registration and additional BSIM3 revision physics are
+tracked separately; the existing native BSIM3 implementation remains
+the owner of its validated modes. See [the ownership audit](docs/legacy-bsim.md).

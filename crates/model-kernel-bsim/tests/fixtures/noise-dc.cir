@@ -1,0 +1,17 @@
+BSIM1 reference noise with fixed drain and 10k load
+.model b1 nmos(level=4 tox=0.024 vdd=5 vfb=-0.9 phi=0.75 k1=0.75 k2=0.02 mus=510 muz=400 n0=1.2 eta=0.02 u0=0.1 u1=0.06 dl=0.17 dw=0.28 rsh=0 js=2e-5 cj=1e-3 cjsw=2e-10 pb=0.74 pbsw=0.83 mj=0.5 mjsw=0.33 cgdo=1.5e-10 cgso=2e-10 cgbo=4e-11 kf=2e-25 af=1.2)
+M1 d g s b b1 l=8.3u w=17.6u m=2 ad=3e-11 as=4e-11 pd=13u ps=17u nrd=2.3 nrs=3.1
+vd d 0 1.2043007312345875
+vg g 0 1.7 ac 1
+vs s 0 0.1
+vb b 0 -0.3
+.options gmin=0 reltol=1e-10 abstol=1e-16 vntol=1e-12
+.control
+set numdgt=16
+op
+print v(d) i(vd) i(vb)
+dc vg 1.69999 1.70001 0.00001
+print i(vd)
+quit
+.endc
+.end

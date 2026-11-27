@@ -3,6 +3,7 @@
 
 use super::{DialectContext, OpaqueSource};
 use anyhow::{Context, Result, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt::Write as _};
 
@@ -21,6 +22,20 @@ pub struct ScopedStatement {
     pub text: String,
 }
 
+impl ScopedStatement {
+    /// Copy retained source text and provenance under the shared work limit.
+    /// # Errors
+    /// Cancellation or exhausted work budget.
+    pub fn clone_with_budget(&self, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            self.source.len().saturating_add(self.text.len()),
+        )?;
+        Ok(self.clone())
+    }
+}
+
 /// Source-level name mapping before subsequent primitive lowering and
 /// subcircuit specialization. Scope consists of source definition names.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -30,6 +45,20 @@ pub struct DeviceIdentity {
     pub declared: String,
     pub displayed: String,
     pub linked: String,
+}
+
+impl DeviceIdentity {
+    /// Copy retained device identity and scope metadata under the work limit.
+    /// # Errors
+    /// Cancellation or exhausted work budget.
+    pub fn clone_with_budget(&self, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        charge_scope_copy(&self.scope, budget)?;
+        for text in [&self.source, &self.declared, &self.displayed, &self.linked] {
+            budget.charge(Resource::EmittedBytes, text.len())?;
+        }
+        Ok(self.clone())
+    }
 }
 
 /// Rewritten source with source-level device identities.
@@ -134,13 +163,24 @@ struct Scan {
     identities: Vec<DeviceIdentity>,
 }
 
-fn collect(statements: &[ScopedStatement]) -> Result<Scan> {
+/// Account for a hierarchical path before copying it into owned metadata.
+pub(super) fn charge_scope_copy(path: &[String], budget: &WorkBudget) -> Result<()> {
+    budget.charge(Resource::GeneratedNodes, path.len())?;
+    for name in path {
+        budget.charge(Resource::EmittedBytes, name.len())?;
+    }
+    Ok(())
+}
+
+fn collect(statements: &[ScopedStatement], budget: &WorkBudget) -> Result<Scan> {
+    budget.charge(Resource::Statements, statements.len())?;
     let mut scopes = vec![Scope::default()];
     let mut stack = vec![0usize];
     let mut assignments = Vec::with_capacity(statements.len());
     let mut identities = Vec::new();
     let mut opaque = OpaqueSource::default();
     for line in statements {
+        budget.charge(Resource::ScannedBytes, line.text.len())?;
         let scope = *stack.last().context("missing root identity scope")?;
         if opaque.consume(&line.text) {
             assignments.push((scope, None));
@@ -152,6 +192,10 @@ fn collect(statements: &[ScopedStatement]) -> Result<Scan> {
         match upper.as_str() {
             ".SUBCKT" => {
                 if let Some(name) = line.text.split_whitespace().nth(1) {
+                    budget.check_depth(stack.len())?;
+                    budget.charge(Resource::GeneratedNodes, 1)?;
+                    charge_scope_copy(&scopes[scope].path, budget)?;
+                    budget.charge(Resource::EmittedBytes, name.len())?;
                     let mut path = scopes[scope].path.clone();
                     path.push(name.to_owned());
                     stack.push(scopes.len());
@@ -169,7 +213,21 @@ fn collect(statements: &[ScopedStatement]) -> Result<Scan> {
                 stack.pop();
             }
             _ if is_device(&line.text) => {
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                charge_scope_copy(&scopes[scope].path, budget)?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    line.source
+                        .len()
+                        .saturating_add(first.len().saturating_mul(3)),
+                )?;
                 let (displayed, linked) = device_name(first, line.context)?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    displayed
+                        .len()
+                        .saturating_add(linked.len().saturating_mul(4)),
+                )?;
                 let mapping = DeviceIdentity {
                     source: line.source.clone(),
                     scope: scopes[scope].path.clone(),
@@ -253,7 +311,8 @@ fn control_references(text: &str, identity: &DeviceIdentity, scope: &Scope) -> R
     Ok(output)
 }
 
-fn expression_references(text: &str, scope: &Scope) -> Result<String> {
+fn expression_references(text: &str, scope: &Scope, budget: &WorkBudget) -> Result<String> {
+    budget.charge(Resource::EmittedBytes, text.len())?;
     let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
     let mut offset = 0;
@@ -269,9 +328,13 @@ fn expression_references(text: &str, scope: &Scope) -> Result<String> {
                 open += 1;
             }
             if bytes.get(open) == Some(&b'(') {
-                let close = super::group_end(text, open)?;
+                let close = super::group_end(text, open, budget)?;
                 let reference = text[open + 1..close].trim();
                 let target = scope.resolve(reference)?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    target.len().saturating_sub(close - open - 1),
+                )?;
                 output.push_str(&text[offset..=open]);
                 output.push_str(target);
                 output.push(')');
@@ -290,28 +353,35 @@ fn expression_references(text: &str, scope: &Scope) -> Result<String> {
 ///
 /// # Errors
 /// Duplicate/ambiguous device identities or malformed circuit scopes.
-pub fn resolve_device_identities(statements: &[ScopedStatement]) -> Result<ResolvedDeviceSource> {
-    let scan = collect(statements)?;
+pub fn resolve_device_identities(
+    statements: &[ScopedStatement],
+    budget: &WorkBudget,
+) -> Result<ResolvedDeviceSource> {
+    let scan = collect(statements, budget)?;
     let mut output = String::new();
     let mut opaque = OpaqueSource::default();
     for (line, (scope, identity)) in statements.iter().zip(scan.assignments) {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, line.text.len())?;
         let scope = &scan.scopes[scope];
-        if opaque.consume(&line.text) {
-            writeln!(output, "{}", line.text)?;
+        let rewritten = if opaque.consume(&line.text) {
+            line.text.clone()
         } else if let Some(identity) = identity {
             let identity = &scan.identities[identity];
             let text = line.text.trim_start();
             let tail = &text[identity.declared.len()..];
             let rewritten =
                 control_references(&format!("{}{tail}", identity.linked), identity, scope)?;
-            writeln!(output, "{}", expression_references(&rewritten, scope)?)?;
+            expression_references(&rewritten, scope, budget)?
         } else if first_token(&line.text).is_some_and(|first| {
             first.eq_ignore_ascii_case(".param") || first.eq_ignore_ascii_case(".func")
         }) {
-            writeln!(output, "{}", expression_references(&line.text, scope)?)?;
+            expression_references(&line.text, scope, budget)?
         } else {
-            writeln!(output, "{}", line.text)?;
-        }
+            line.text.clone()
+        };
+        budget.charge(Resource::EmittedBytes, rewritten.len().saturating_add(1))?;
+        writeln!(output, "{rewritten}")?;
     }
     Ok(ResolvedDeviceSource {
         text: output,

@@ -678,19 +678,124 @@ quit
 }
 
 #[test]
-fn nonlinear_passive_coefficients_are_not_silently_discarded() -> Result<()> {
+fn nonlinear_passive_models_preserve_scope_temperature_and_initial_coordinates() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    let source = br"Polynomial passive declaration binding
+.param a=0.2
+.model CM CAP(C=2 VC1={a} VC2=0.07 TC1=0.001 T_MEASURED=0 T_ABS=25)
+.model LM IND(L=3 IL1=-0.1 IL2=0.02 TC2=0.001 T_REL_GLOBAL=5)
+C1 c 0 CM 1n IC=-2
+L1 l 0 LM 1m IC=-0.5
+.subckt cell p n params: a=0.4 base=2
+.model CM CAP(C={base} VC1={a})
+C2 p n CM {base*1n} IC={-a}
+.ends cell
+X1 c 0 cell a=0.1 base=3
+X2 l 0 cell a=0 base=4
+.end
+";
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    let text = std::str::from_utf8(&prepared.primary.bytes)?.to_ascii_lowercase();
+    let cards = model_normalize_ngspice::model_card::parse_model_cards(&prepared.primary.bytes)?;
+    let model = cards
+        .iter()
+        .find(|card| card.name.eq_ignore_ascii_case("CM"))
+        .context("missing original capacitor model")?;
+    assert_eq!(model.family, "pspice_cap");
+    assert_eq!(
+        cards
+            .iter()
+            .filter(|card| card.family == "pspice_cap")
+            .count(),
+        2
+    );
+    assert_eq!(
+        cards
+            .iter()
+            .filter(|card| card.family == "pspice_ind")
+            .count(),
+        1
+    );
+    for field in [
+        "vc1={a}",
+        "vc2=0.07",
+        "tc1=0.001",
+        "tnom=0",
+        "temp=25",
+        "il1=-0.1",
+        "il2=0.02",
+        "tc2=0.001",
+        "dtemp=5",
+    ] {
+        assert!(text.contains(field), "{field}: {text}");
+    }
+    assert!(text.contains("c1 c 0 cm 1n ic=-2"), "{text}");
+    assert!(text.contains("l1 l 0 lm 1m ic=-0.5"), "{text}");
+    assert!(text.contains("c2 p n cm {base*1n} ic={-a}"), "{text}");
+    assert!(!text.contains("__ps_passive_"), "{text}");
+    Ok(())
+}
+
+#[test]
+fn nonlinear_passive_coefficients_require_values_and_compatible_instances() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("source.lib");
-    for input in [
-        ".model CM CAP(C=2 VC1=0.1)\n",
-        ".model LM IND(L=3 IL2={nonlinear})\n",
+    for source in [
+        ".model CM CAP(VC1)\n",
+        ".model CM CAP(VC2=0.1 C)\n",
+        ".model LM IND(IL2)\n",
+        ".model LM IND(IL1=0.1)\nC1 a b LM 1n\n",
+        ".model CM CAP(VC1=0.1)\nC1 a b CM IC=1\n",
     ] {
-        fs::write(&path, input)?;
+        fs::write(&path, source)?;
         assert!(
             prepare_source(&path, InputFormat::PspiceLibrary).is_err(),
-            "{input}"
+            "{source}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn ako_nonlinear_storage_inherits_coefficients_and_local_temperature() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.lib");
+    fs::write(
+        &path,
+        br".model base CAP(C=2 VC1=0.1 VC2=0.02 T_ABS=25)
+.model child AKO:base CAP(VC2=0.03 T_REL_LOCAL=5)
+.model linear AKO:base CAP(VC1=0 VC2=0)
+",
+    )?;
+    let prepared = prepare_source(&path, InputFormat::PspiceLibrary)?;
+    let text = std::str::from_utf8(&prepared.primary.bytes)?.to_ascii_lowercase();
+    let cards = model_normalize_ngspice::model_card::parse_model_cards(&prepared.primary.bytes)?;
+    let child = cards
+        .iter()
+        .find(|card| card.name.eq_ignore_ascii_case("child"))
+        .context("missing inherited storage model")?;
+    assert_eq!(child.family, "pspice_cap");
+    let field = |name: &str| {
+        child
+            .parameters
+            .iter()
+            .rev()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .and_then(|p| p.expression.as_deref())
+    };
+    assert_eq!(field("vc1"), Some("0.1"));
+    assert_eq!(field("vc2"), Some("0.03"));
+    assert!(
+        field("temp").is_some_and(|temp| temp.contains("25") && temp.contains("5")),
+        "{text}"
+    );
+    let linear = cards
+        .iter()
+        .find(|card| card.name.eq_ignore_ascii_case("linear"))
+        .context("missing linear override")?;
+    assert!(linear.family.eq_ignore_ascii_case("c"), "{text}");
     Ok(())
 }
 
@@ -793,7 +898,7 @@ fn laplace_source_dialects_preserve_rational_numerator_and_poles() -> Result<()>
                 };
                 // Evaluate the second-order rational function independently at s=jω.
                 let omega = std::f64::consts::TAU * frequency * 0.001;
-                let dr = 1. - omega * omega;
+                let dr = omega.mul_add(-omega, 1.);
                 let di = 2. * omega;
                 let ni = 3. * omega;
                 let scale = dr.mul_add(dr, di * di);
@@ -802,6 +907,45 @@ fn laplace_source_dialects_preserve_rational_numerator_and_poles() -> Result<()>
                 close(*current_real, -*real);
                 close(*current_imaginary, -*imaginary);
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn singleton_polynomial_gain_survives_native_pspice_admission() -> Result<()> {
+    let source = br"PSpice singleton polynomial
+V1 in 0 -2
+Vs sense 0 0
+Is 0 sense -2
+E1 e 0 POLY(1) in 0 7
+H1 h 0 POLY(1) Vs 7
+G1 0 g POLY(1) in 0 7
+F1 0 f POLY(1) Vs 7
+Rg g 0 1
+Rf f 0 1
+.control
+set wr_singlescale
+set wr_vecnames
+op
+wrdata response.dat v(e) v(h) v(g) v(f)
+quit
+.endc
+.end
+";
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    if let Some(values) = rows(
+        &directory.path().join("native"),
+        &prepared.primary.bytes,
+        false,
+    )? {
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].len(), 5);
+        for &value in &values[0][1..] {
+            close(value, -14.);
         }
     }
     Ok(())

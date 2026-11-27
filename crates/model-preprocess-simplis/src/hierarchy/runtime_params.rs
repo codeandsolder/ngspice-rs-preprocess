@@ -10,6 +10,7 @@
 use super::{active_statement_prefix, logical_statements, lower_hex};
 use crate::{find_ascii_case_insensitive, parameter_assignments, validate_simetrix_parameter_name};
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::{Resource, WorkBudget};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -24,15 +25,21 @@ struct Symbols {
 }
 
 impl Symbols {
-    fn collect(statements: &[String]) -> Result<Self> {
+    fn collect(statements: &[String], budget: &WorkBudget) -> Result<Self> {
         let mut symbols = Self::default();
         for statement in statements {
+            budget.charge(Resource::Statements, 1)?;
+            budget.charge(Resource::ScannedBytes, statement.len())?;
             if let Some(tail) = param_tail(statement) {
                 for (name, _) in parameter_assignments(tail)? {
+                    budget.charge(Resource::GeneratedNodes, 1)?;
+                    budget.charge(Resource::EmittedBytes, name.len())?;
                     symbols.parameters.insert(name.to_ascii_uppercase());
                 }
             }
             if let Some(name) = model_name(statement) {
+                budget.charge(Resource::GeneratedNodes, 1)?;
+                budget.charge(Resource::EmittedBytes, name.len())?;
                 symbols.models.insert(name.to_ascii_uppercase());
             }
         }
@@ -43,6 +50,7 @@ impl Symbols {
 #[derive(Clone, Debug, Default)]
 pub(super) struct RuntimeScope {
     identity: String,
+    budget: WorkBudget,
     names: Names,
     local_models: BTreeSet<String>,
     root_symbols: Arc<Symbols>,
@@ -96,8 +104,8 @@ fn closing_parenthesis(bytes: &[u8], open: usize) -> Result<usize> {
 /// Rename parameter symbols, not numeric suffixes, function names, string
 /// literals, or node/current probe arguments. Expressions may contain braces
 /// or native behavioural expression syntax; no numeric evaluation is done.
-fn rewrite_expression(input: &str, names: &Names) -> Result<String> {
-    rewrite_symbols(input, names, false)
+fn rewrite_expression(input: &str, names: &Names, budget: &WorkBudget) -> Result<String> {
+    rewrite_symbols(input, names, false, budget)
 }
 
 /// Shared expression token walker. Assignment destinations can be excluded
@@ -106,7 +114,10 @@ pub(super) fn rewrite_symbols(
     input: &str,
     names: &Names,
     preserve_assignments: bool,
+    budget: &WorkBudget,
 ) -> Result<String> {
+    budget.charge(Resource::EvaluationSteps, input.len())?;
+    budget.charge(Resource::EmittedBytes, input.len())?;
     if names.is_empty() {
         return Ok(input.to_owned());
     }
@@ -157,6 +168,10 @@ pub(super) fn rewrite_symbols(
             {
                 output.push_str(name);
             } else if let Some(replacement) = names.get(&name.to_ascii_uppercase()) {
+                budget.charge(
+                    Resource::EmittedBytes,
+                    replacement.len().saturating_sub(name.len()),
+                )?;
                 output.push_str(replacement);
             } else {
                 output.push_str(name);
@@ -221,17 +236,22 @@ fn braced(expression: &str) -> String {
 }
 
 impl RuntimeScope {
-    pub(super) fn root(identity: &str) -> Self {
+    pub(super) fn root(identity: &str, budget: &WorkBudget) -> Self {
         Self {
             identity: identity.to_owned(),
+            budget: budget.clone(),
             ..Self::default()
         }
     }
 
-    pub(super) fn root_with_symbols(identity: &str, statements: &[String]) -> Result<Self> {
+    pub(super) fn root_with_symbols(
+        identity: &str,
+        statements: &[String],
+        budget: &WorkBudget,
+    ) -> Result<Self> {
         Ok(Self {
-            root_symbols: Arc::new(Symbols::collect(statements)?),
-            ..Self::root(identity)
+            root_symbols: Arc::new(Symbols::collect(statements, budget)?),
+            ..Self::root(identity, budget)
         })
     }
 
@@ -241,7 +261,7 @@ impl RuntimeScope {
         source_statements: &[String],
     ) -> Result<()> {
         self.root_symbols = Arc::clone(&parent.root_symbols);
-        self.source_symbols = Symbols::collect(source_statements)?;
+        self.source_symbols = Symbols::collect(source_statements, &self.budget)?;
         Ok(())
     }
 
@@ -253,6 +273,10 @@ impl RuntimeScope {
         statement: &str,
         catalog_model: impl FnOnce(&str) -> Result<bool>,
     ) -> Result<String> {
+        self.budget
+            .charge(Resource::ScannedBytes, statement.len())?;
+        self.budget
+            .charge(Resource::EmittedBytes, statement.len())?;
         let Some(value) = bare_passive_value(statement) else {
             return Ok(statement.to_owned());
         };
@@ -272,6 +296,10 @@ impl RuntimeScope {
         {
             return Ok(statement.to_owned());
         }
+        self.budget.charge(
+            Resource::EmittedBytes,
+            bound.len().saturating_add(2).saturating_sub(value.len()),
+        )?;
         let start = value.as_ptr().addr() - statement.as_ptr().addr();
         Ok(format!(
             "{}{{{bound}}}{}",
@@ -292,8 +320,13 @@ impl RuntimeScope {
         input: &[u8],
         identity: &str,
         actual_text: &str,
+        budget: &WorkBudget,
     ) -> Result<(Vec<u8>, Self)> {
+        budget.charge(Resource::ScannedBytes, input.len())?;
+        budget.charge(Resource::EvaluationSteps, actual_text.len())?;
         let text = std::str::from_utf8(input)?;
+        budget.charge(Resource::EmittedBytes, input.len().saturating_mul(2))?;
+        budget.charge(Resource::GeneratedNodes, text.lines().count())?;
         let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
         let statements = logical_statements(&lines);
         let (header, body) = statements
@@ -301,7 +334,7 @@ impl RuntimeScope {
             .context("empty runtime subcircuit")?;
         let (prefix, defaults) = header_parameters(header)?;
         let actuals = parameter_assignments(actual_text)?;
-        let mut scope = Self::root(identity);
+        let mut scope = Self::root(identity, budget);
         scope.local_models = body
             .iter()
             .filter_map(|statement| model_name(statement))
@@ -309,6 +342,8 @@ impl RuntimeScope {
             .collect();
         let mut formal_names = BTreeSet::new();
         for (name, _) in &defaults {
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(Resource::EmittedBytes, name.len())?;
             validate_simetrix_parameter_name(name)?;
             if !formal_names.insert(name.to_ascii_uppercase()) {
                 bail!("duplicate subcircuit formal {name}");
@@ -316,6 +351,8 @@ impl RuntimeScope {
         }
         let mut implicit = BTreeSet::new();
         for (name, _) in &actuals {
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(Resource::EmittedBytes, name.len().saturating_mul(2))?;
             validate_simetrix_parameter_name(name)?;
             let key = name.to_ascii_uppercase();
             if formal_names.insert(key.clone()) {
@@ -323,14 +360,23 @@ impl RuntimeScope {
             }
         }
         for key in &formal_names {
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(Resource::EmittedBytes, key.len().saturating_add(28))?;
             scope
                 .names
                 .insert(key.clone(), generated_name("srp", identity, key));
         }
         for statement in body {
+            budget.charge(Resource::Statements, 1)?;
+            budget.charge(Resource::ScannedBytes, statement.len())?;
             if let Some(tail) = param_tail(statement) {
                 for (name, _) in parameter_assignments(tail)? {
                     validate_simetrix_parameter_name(name)?;
+                    budget.charge(Resource::GeneratedNodes, 1)?;
+                    budget.charge(
+                        Resource::EmittedBytes,
+                        name.len().saturating_mul(2).saturating_add(28),
+                    )?;
                     let key = name.to_ascii_uppercase();
                     if scope.names.contains_key(&key) {
                         bail!("subcircuit parameter {name} has already been defined");
@@ -345,17 +391,29 @@ impl RuntimeScope {
         if !scope.has_bindings() {
             return Ok((input.to_vec(), scope));
         }
+        budget.charge(Resource::EmittedBytes, input.len())?;
         let mut output = prefix.to_owned();
         if !formal_names.is_empty() {
             output.push_str(" params:");
             for (name, value) in defaults {
                 let target = scope.lookup(name)?;
-                let value = rewrite_expression(value, &scope.names)?;
+                let value = rewrite_expression(value, &scope.names, budget)?;
+                budget.charge(
+                    Resource::EmittedBytes,
+                    target.len().saturating_add(value.len()).saturating_add(2),
+                )?;
                 write!(output, " {target}={value}")?;
             }
             for key in implicit {
                 let target = scope.lookup(&key)?;
                 let required = generated_name("sr_required", identity, &key);
+                budget.charge(
+                    Resource::EmittedBytes,
+                    target
+                        .len()
+                        .saturating_add(required.len())
+                        .saturating_add(4),
+                )?;
                 write!(output, " {target}={{{required}}}")?;
             }
         }
@@ -382,26 +440,54 @@ impl RuntimeScope {
         instance: &str,
         actual_text: &str,
     ) -> Result<(String, String)> {
+        self.budget
+            .charge(Resource::GeneratedNodes, self.names.len())?;
+        for (key, value) in &self.names {
+            self.budget.charge(
+                Resource::EmittedBytes,
+                key.len().saturating_add(value.len()),
+            )?;
+        }
+        self.budget
+            .charge(Resource::ScannedBytes, actual_text.len())?;
         let mut visible = self.names.clone();
         let mut actuals = BTreeMap::new();
         let mut declarations = String::new();
         for (index, (name, expression)) in
             parameter_assignments(actual_text)?.into_iter().enumerate()
         {
+            self.budget.charge(Resource::GeneratedNodes, 2)?;
+            self.budget
+                .charge(Resource::EmittedBytes, name.len().saturating_add(56))?;
             let temporary = generated_name("sra", &self.identity, &format!("{instance}:{index}"));
-            let expression = rewrite_expression(expression, &visible)?;
+            let expression = rewrite_expression(expression, &visible, &self.budget)?;
+            self.budget.charge(
+                Resource::EmittedBytes,
+                temporary
+                    .len()
+                    .saturating_add(expression.len())
+                    .saturating_add(11),
+            )?;
             writeln!(declarations, ".param {temporary}={}", braced(&expression))?;
             visible.insert(name.to_ascii_uppercase(), temporary.clone());
             actuals.insert(callee.lookup(name)?, temporary);
         }
         let mut arguments = String::new();
         for (name, temporary) in actuals {
+            self.budget.charge(
+                Resource::EmittedBytes,
+                name.len().saturating_add(temporary.len()).saturating_add(4),
+            )?;
             write!(arguments, " {name}={{{temporary}}}")?;
         }
         Ok((declarations, arguments))
     }
 
     pub(super) fn rewrite_statement(&self, statement: &str) -> Result<String> {
+        self.budget
+            .charge(Resource::ScannedBytes, statement.len())?;
+        self.budget
+            .charge(Resource::EmittedBytes, statement.len())?;
         if !self.has_bindings() {
             return Ok(statement.to_owned());
         }
@@ -417,7 +503,7 @@ impl RuntimeScope {
                     output,
                     " {}={}",
                     self.lookup(name)?,
-                    rewrite_expression(value, &self.names)?
+                    rewrite_expression(value, &self.names, &self.budget)?
                 )?;
             }
             return Ok(output);
@@ -437,10 +523,10 @@ impl RuntimeScope {
             return Ok(format!(
                 "{}{}",
                 &trimmed[..=close],
-                rewrite_expression(&trimmed[close + 1..], &names)?
+                rewrite_expression(&trimmed[close + 1..], &names, &self.budget)?
             ));
         }
-        rewrite_device_expressions(active, &self.names)
+        rewrite_device_expressions(active, &self.names, &self.budget)
     }
 }
 
@@ -474,12 +560,20 @@ fn bare_passive_value(statement: &str) -> Option<&str> {
 /// Rewrite explicit expression regions of native device statements. The
 /// structural device/model/node fields are left intact. Unbraced behavioural
 /// RHS expressions are supported in addition to ordinary brace expressions.
-fn rewrite_device_expressions(statement: &str, names: &Names) -> Result<String> {
+fn rewrite_device_expressions(
+    statement: &str,
+    names: &Names,
+    budget: &WorkBudget,
+) -> Result<String> {
     if let Some(tail) = super::capacitor_charge_assignments(statement) {
         let start = tail.as_ptr().addr() - statement.as_ptr().addr();
         let mut output = statement[..start].trim_end().to_owned();
         for (key, value) in parameter_assignments(tail)? {
-            write!(output, " {key}={}", rewrite_expression(value, names)?)?;
+            write!(
+                output,
+                " {key}={}",
+                rewrite_expression(value, names, budget)?
+            )?;
         }
         return Ok(output);
     }
@@ -506,7 +600,7 @@ fn rewrite_device_expressions(statement: &str, names: &Names) -> Result<String> 
             return Ok(format!(
                 "{}{}",
                 &trimmed[..=eq],
-                rewrite_expression(&trimmed[eq + 1..], names)?
+                rewrite_expression(&trimmed[eq + 1..], names, budget)?
             ));
         }
     }
@@ -524,7 +618,11 @@ fn rewrite_device_expressions(statement: &str, names: &Names) -> Result<String> 
                 .map(|index| index + start + 1)
                 .context("unterminated quoted runtime expression")?
         };
-        output.push_str(&rewrite_expression(&statement[start + 1..end], names)?);
+        output.push_str(&rewrite_expression(
+            &statement[start + 1..end],
+            names,
+            budget,
+        )?);
         output.push(char::from(statement.as_bytes()[end]));
         offset = end + 1;
     }
@@ -538,11 +636,12 @@ mod tests {
 
     #[test]
     fn actuals_bind_in_source_order_without_callee_defaults() -> Result<()> {
-        let parent = RuntimeScope::root("caller");
+        let parent = RuntimeScope::root("caller", &WorkBudget::default());
         let (body, callee) = RuntimeScope::prepare(
             b".subckt T a b params: r=5k q={2*r}\nR1 a b {q}\n.ends\n",
             "callee",
             "q={2*r} r=2k q={r+1}",
+            &WorkBudget::default(),
         )?;
         let body = std::str::from_utf8(&body)?;
         let r = callee.lookup("r")?;
@@ -584,11 +683,13 @@ mod tests {
                 ".param global_r=2k".into(),
                 ".model global_model R(R=3k)".into(),
             ],
+            &WorkBudget::default(),
         )?;
         let (_, mut scope) = RuntimeScope::prepare(
             b".subckt T p n params: local_r=2k global_model=7k external_model=8k\n.param local_model=5k\n.model local_model R(R=3k)\n.ends\n",
             "scope",
             "",
+            &WorkBudget::default(),
         )?;
         scope.set_source_scope(&root, &[".param source_c=10n".into()])?;
         let local_r = scope.lookup("local_r")?;
@@ -624,6 +725,7 @@ mod tests {
             b".subckt T p n params: gain=3 p=9 m=2\nC1 p n Q=(gain*V(p,n)+p) M={m}\n.ends\n",
             "charge-scope",
             "",
+            &WorkBudget::default(),
         )?;
         let gain = scope.lookup("gain")?;
         let p = scope.lookup("p")?;
@@ -644,6 +746,7 @@ mod tests {
             b".subckt T p n\nB1 n 0 V=gain*V(p)+p+1k\n.ends\n",
             "scope",
             "gain=3 p=9 k=2",
+            &WorkBudget::default(),
         )?;
         let gain = scope.lookup("gain")?;
         let p = scope.lookup("p")?;

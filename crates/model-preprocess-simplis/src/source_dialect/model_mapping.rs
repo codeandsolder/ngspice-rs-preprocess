@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::model_card::{
     ModelCard, ModelParameter, parse_model_card, parse_parameter_fields, parse_spice_constant,
 };
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 
 use super::{DialectContext, OpaqueSource, ScopedStatement};
@@ -253,13 +254,16 @@ impl DeviceConfiguration {
     ///
     /// # Errors
     /// Invalid or unsupported declaration, target, field or level.
-    pub fn parse(source: &str, text: &str) -> Result<Self> {
+    pub fn parse(source: &str, text: &str, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::ScannedBytes, text.len())?;
         let mut entries = Vec::new();
         for (index, line) in text.lines().enumerate() {
+            budget.charge(Resource::Statements, 1)?;
             let line = line.trim();
             if line.is_empty() || line.starts_with(['*', ';', '#']) {
                 continue;
             }
+            budget.charge(Resource::GeneratedNodes, 1)?;
             entries.push(
                 MapDeclaration::parse(line, source)
                     .with_context(|| format!("device configuration {source}:{}", index + 1))?,
@@ -360,6 +364,14 @@ fn directives(statements: &[ScopedStatement]) -> impl Iterator<Item = (&ScopedSt
     })
 }
 
+fn charge_mapping_scan(statements: &[ScopedStatement], budget: &WorkBudget) -> Result<()> {
+    budget.charge(Resource::Statements, statements.len())?;
+    for statement in statements {
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
+    }
+    Ok(())
+}
+
 fn require_global(line: &ScopedStatement, nested: bool) -> Result<()> {
     ensure!(
         !nested,
@@ -383,10 +395,13 @@ impl MappingTable {
     pub fn resolve(
         configuration: &DeviceConfiguration,
         statements: &[ScopedStatement],
+        budget: &WorkBudget,
     ) -> Result<Self> {
+        charge_mapping_scan(statements, budget)?;
         let mut table = Self::default();
         let mut hspice_models = None;
         for (line, nested) in directives(statements) {
+            budget.check()?;
             let text = line.text.trim_start();
             let (first, tail) = text.split_at(text.find(char::is_whitespace).unwrap_or(text.len()));
             if [".OPTIONS", ".OPTION", ".OPT"]
@@ -415,13 +430,17 @@ impl MappingTable {
         }
         table.hspice_models = hspice_models.unwrap_or_default();
         for entry in &configuration.entries {
+            budget.charge(Resource::GeneratedNodes, 1)?;
             table.insert(entry, SelectionOrigin::DeviceConfiguration)?;
         }
+        charge_mapping_scan(statements, budget)?;
         for (line, nested) in directives(statements) {
+            budget.check()?;
             let text = line.text.trim_start();
             let (first, tail) = text.split_at(text.find(char::is_whitespace).unwrap_or(text.len()));
             if first.eq_ignore_ascii_case(".MAP") {
                 require_global(line, nested)?;
+                budget.charge(Resource::GeneratedNodes, 1)?;
                 let entry = MapDeclaration::parse(tail, &line.source)?;
                 table.insert(&entry, SelectionOrigin::NetlistMap)?;
             }
@@ -528,13 +547,14 @@ impl MappingTable {
     pub fn select_standalone_hspice(
         line: &ScopedStatement,
         scope: &[String],
+        budget: &WorkBudget,
     ) -> Result<ModelSelection> {
         let table = Self {
             hspice_models: true,
             ..Self::default()
         };
         let mut selection = table
-            .select_card(line, scope)?
+            .select_card(line, scope, budget)?
             .context("HSPICE model has no qualified native mapping")?;
         let diode = selection.mapping.device == Device::Diode3
             && selection.mapping.key.model_type == "D"
@@ -558,6 +578,30 @@ impl MappingTable {
         Ok(selection)
     }
 
+    fn family_mappings<'a>(&'a self, family: &'a str) -> impl Iterator<Item = &'a Mapping> {
+        self.entries
+            .range(
+                ModelKey {
+                    model_type: family.to_owned(),
+                    level: 0,
+                }..,
+            )
+            .take_while(move |(key, _)| key.model_type == family)
+            .map(|(_, mapping)| mapping)
+    }
+
+    fn positional_fields(&self, family: &str) -> Vec<&'static str> {
+        let mut fields = vec!["LEVEL", "VERSION", "VLEVEL"];
+        if family == "D"
+            || self
+                .family_mappings(family)
+                .any(|mapping| mapping.device == Device::Diode1)
+        {
+            fields.extend_from_slice(model_kernel_diode::SOURCE_PARAMETERS);
+        }
+        fields
+    }
+
     /// Resolve an admitted card before source-family lowering. Other
     /// device classes retain their own dedicated frontend.
     ///
@@ -567,6 +611,7 @@ impl MappingTable {
         &self,
         line: &ScopedStatement,
         scope: &[String],
+        budget: &WorkBudget,
     ) -> Result<Option<ModelSelection>> {
         let text = line.text.trim_start();
         let Some((directive, remainder)) = text.split_once(char::is_whitespace) else {
@@ -587,26 +632,11 @@ impl MappingTable {
             .next()
             .unwrap_or_default()
             .to_ascii_uppercase();
-        if !known_family(&family) && !self.entries.keys().any(|key| key.model_type == family) {
+        if !known_family(&family) && self.family_mappings(&family).next().is_none() {
             return Ok(None);
         }
-        let structural = ["LEVEL", "VERSION", "VLEVEL"];
-        let diode_fields;
-        let positional = if family == "D"
-            || self
-                .entries
-                .values()
-                .any(|mapping| mapping.key.model_type == family && mapping.device == Device::Diode1)
-        {
-            diode_fields = structural
-                .into_iter()
-                .chain(model_kernel_diode::SOURCE_PARAMETERS.iter().copied())
-                .collect::<Vec<_>>();
-            diode_fields.as_slice()
-        } else {
-            &structural
-        };
-        let card = parse_model_card(text, line.first_line, positional)?;
+        let positional = self.positional_fields(&family);
+        let card = parse_model_card(text, line.first_line, &positional)?;
         let level = one(&card.parameters, "LEVEL")?;
         let vlevel = if matches!(family.as_str(), "NMOS" | "PMOS") {
             one(&card.parameters, "VLEVEL")?
@@ -643,6 +673,11 @@ impl MappingTable {
         );
         let version = one(&card.parameters, "VERSION")?.map(str::to_owned);
         let effective_version = resolve_version(mapping.device, version.as_deref())?;
+        super::identity::charge_scope_copy(scope, budget)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            line.source.len().saturating_add(line.text.len()),
+        )?;
         Ok(Some(ModelSelection {
             source: line.source.clone(),
             scope: scope.to_vec(),
@@ -924,18 +959,24 @@ impl MappingTable {
     ///
     /// # Errors
     /// Invalid model selection, nested scope or unavailable lowering.
-    pub fn apply(&self, statements: &[ScopedStatement]) -> Result<MappedSource> {
+    pub fn apply(
+        &self,
+        statements: &[ScopedStatement],
+        budget: &WorkBudget,
+    ) -> Result<MappedSource> {
+        charge_mapping_scan(statements, budget)?;
         let mut output = Vec::with_capacity(statements.len());
         let mut selections = Vec::new();
         let mut scope = Vec::new();
         let mut opaque = OpaqueSource::default();
         for line in statements {
-            let mut line = line.clone();
+            let mut line = line.clone_with_budget(budget)?;
             let mut tokens = line.text.split_whitespace();
             let directive = tokens.next().unwrap_or_default().to_ascii_uppercase();
             if !opaque.consume(&line.text) {
                 match directive.as_str() {
                     ".SUBCKT" => {
+                        budget.check_depth(scope.len().saturating_add(1))?;
                         scope.push(tokens.next().context("missing subcircuit name")?.to_owned());
                     }
                     ".ENDS" => {
@@ -943,16 +984,18 @@ impl MappingTable {
                     }
                     ".MAP" => line.text = format!("* consumed {}", line.text),
                     ".MODEL" => {
-                        if let Some(selection) = self.select_card(&line, &scope)? {
+                        if let Some(selection) = self.select_card(&line, &scope, budget)? {
                             line.text = selection.lower().with_context(|| {
                                 format!("model {} in {}", selection.card.name, selection.source)
                             })?;
+                            budget.charge(Resource::GeneratedNodes, 1)?;
                             selections.push(selection);
                         }
                     }
                     _ => (),
                 }
             }
+            budget.charge(Resource::EmittedBytes, line.text.len().saturating_add(1))?;
             output.push(line);
         }
         opaque.finish()?;
@@ -969,8 +1012,13 @@ impl MappingTable {
 ///
 /// # Errors
 /// A catalog member contains a simulation-wide selection directive.
-pub fn validate_catalog_directives(statements: &[ScopedStatement]) -> Result<()> {
+pub fn validate_catalog_directives(
+    statements: &[ScopedStatement],
+    budget: &WorkBudget,
+) -> Result<()> {
+    charge_mapping_scan(statements, budget)?;
     for (line, _) in directives(statements) {
+        budget.check()?;
         let text = line.text.trim_start();
         let (first, tail) = text.split_at(text.find(char::is_whitespace).unwrap_or(text.len()));
         if first.eq_ignore_ascii_case(".MAP") {

@@ -19,10 +19,10 @@ pub(super) fn passive_model(
     declarations: &Declarations,
     field: &[u8],
 ) -> Result<bool> {
-    match declarations.model(statement.line, field) {
+    match declarations.model(statement.line, field)? {
         Visibility::Missing => Ok(false),
         Visibility::Unique(_)
-            if declarations.parameter(statement.line, field) == Visibility::Missing
+            if declarations.parameter(statement.line, field)? == Visibility::Missing
                 && literal(field).is_none()
                 && !field.first().is_some_and(u8::is_ascii_digit)
                 && !(field.starts_with(b".") && field.get(1).is_some_and(u8::is_ascii_digit)) =>
@@ -63,7 +63,7 @@ fn brace_reference(
     {
         return Ok(());
     }
-    let known = match declarations.parameter(statement.line, raw) {
+    let known = match declarations.parameter(statement.line, raw)? {
         Visibility::Missing => false,
         Visibility::Ambiguous => {
             return Err(reject(
@@ -99,7 +99,7 @@ fn brace_reference(
         };
     if rewrite {
         let text = std::str::from_utf8(raw)?;
-        SpiceExpression::parse(text).map_err(|error| {
+        SpiceExpression::parse_with_budget(text, declarations.budget()).map_err(|error| {
             reject(
                 origin,
                 Feature::Binding,
@@ -141,7 +141,7 @@ fn bjt_polarity(
     }
     let mut candidates = Vec::new();
     for (index, field) in fields.iter().enumerate().skip(4).take(2) {
-        match declarations.model(statement.line, &text[field.clone()]) {
+        match declarations.model(statement.line, &text[field.clone()])? {
             Visibility::Unique(family) if is_bjt_family(family) => candidates.push((index, family)),
             Visibility::Ambiguous => {
                 return Err(reject(

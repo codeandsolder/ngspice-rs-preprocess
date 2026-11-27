@@ -42,7 +42,8 @@ fn cli_and_library_have_identical_artifacts_and_manifest() -> Result<()> {
     );
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
-    assert_eq!(manifest["version"], 8);
+    assert_eq!(manifest["version"], 9);
+    assert_eq!(manifest["pwl_resistors"], serde_json::json!([]));
     assert_eq!(manifest["required_code_models"], serde_json::json!([]));
     assert_eq!(manifest["input_format"], "native-deck");
     assert_eq!(manifest["primary"], "deck.cir");
@@ -150,6 +151,20 @@ fn assert_piecewise_resistor_dc_law(source: &str) -> Result<()> {
     fs::write(&root, source)?;
     let prepared = run("expanded-deck", &root, &output, &[])?;
     assert!(prepared.status.success(), "{prepared:?}");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    let declarations: Vec<ngspice_rs_preprocess::pwl_resistor::PreparedPwlResistor> =
+        serde_json::from_value(manifest["pwl_resistors"].clone())?;
+    let [resistor] = declarations.as_slice() else {
+        anyhow::bail!("expected one prepared resistor");
+    };
+    assert_eq!(resistor.initial_segment, Some(1));
+    assert_eq!(resistor.artifact, "deck.cir");
+    assert_eq!(resistor.knots.len(), 3);
+    assert_eq!(
+        resistor.axis,
+        ngspice_rs_preprocess::pwl_resistor::Axis::Voltage
+    );
     let bytes = fs::read(output.join("deck.cir"))?;
     let body = bytes
         .strip_suffix(b".end\n")

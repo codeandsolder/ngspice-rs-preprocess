@@ -1,6 +1,9 @@
 //! Instance-only positional syntax, independent of model-value resolution.
 
-use crate::{lexical, model_card::parse_spice_constant};
+use crate::{
+    lexical,
+    model_card::{parse_spice_constant, positional_prefix},
+};
 use anyhow::{Context, Result, ensure};
 use std::ops::Range;
 
@@ -103,11 +106,103 @@ fn area(text: &str, bjt: bool, local: bool, ground: &str) -> Result<String> {
     )?)
 }
 
+/// `PSpice`'s one-dimensional, one-coefficient shorthand is P1 with P0=0.
+/// Preserve native POLY identity and every coefficient spelling; only make
+/// the dialect-specific implicit constant explicit before native parsing.
+fn poly_shorthand(text: &str, voltage: bool) -> Result<String> {
+    let (fields, _) = positional_prefix(text);
+    if !fields
+        .get(3)
+        .is_some_and(|(word, _)| word.eq_ignore_ascii_case("poly"))
+    {
+        return Ok(text.to_owned());
+    }
+    let dimension = fields
+        .get(4)
+        .context("PSpice POLY lacks dimension")?
+        .0
+        .parse::<usize>()
+        .context("invalid PSpice POLY dimension")?;
+    ensure!(dimension > 0, "PSpice POLY dimension must be positive");
+    if dimension != 1 {
+        return Ok(text.to_owned());
+    }
+    let (_, end) = fields
+        .get(if voltage { 6 } else { 5 })
+        .context("PSpice POLY lacks controls")?;
+    let suffix = &text[*end..];
+    let tail =
+        suffix.trim_start_matches(|c: char| c.is_ascii_whitespace() || matches!(c, ')' | ','));
+    let start = text.len() - tail.len();
+    let tokens = lexical::waveform_tokens(tail.as_bytes())?;
+    let first = tokens.first().context("PSpice POLY lacks coefficients")?;
+    // Remaining named setters do not count as polynomial coefficients.
+    if tokens.len() > 1 && tokens.get(2).is_none_or(|span| &tail[span.clone()] != "=") {
+        return Ok(text.to_owned());
+    }
+    let spelling = &tail[first.clone()];
+    let insert = if let Some(inner) = spelling
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let operands = lexical::waveform_tokens(inner.as_bytes())?;
+        if operands.len() != 1 {
+            return Ok(text.to_owned());
+        }
+        start + first.start + 1
+    } else {
+        start + first.start
+    };
+    let mut output = String::new();
+    output.try_reserve(
+        text.len()
+            .checked_add(2)
+            .context("PSpice POLY output length overflow")?,
+    )?;
+    output.push_str(&text[..insert]);
+    output.push_str("0 ");
+    output.push_str(&text[insert..]);
+    Ok(output)
+}
+
 pub(super) fn rewrite(text: &str, local: bool, ground: &str) -> Result<String> {
     match text.as_bytes().first().map(u8::to_ascii_lowercase) {
         Some(b'r' | b'l' | b'c') => temperature_coefficients(text),
         Some(b'q') => area(text, true, local, ground),
         Some(b'd') => area(text, false, local, ground),
+        Some(b'e' | b'g') => poly_shorthand(text, true),
+        Some(b'f' | b'h') => poly_shorthand(text, false),
         _ => Ok(text.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poly_shorthand_preserves_controls_identity_and_other_coefficients() -> Result<()> {
+        for (input, expected) in [
+            ("E1 out 0 POLY(1) in 0 7", "E1 out 0 POLY(1) in 0 0 7"),
+            (
+                "G1 0 out POLY (1) (in,0) (7)",
+                "G1 0 out POLY (1) (in,0) (0 7)",
+            ),
+            ("F1 out 0 POLY 1 VS -2", "F1 out 0 POLY 1 VS 0 -2"),
+            (
+                "H1 out 0 POLY(1) VS {gain + 1}",
+                "H1 out 0 POLY(1) VS 0 {gain + 1}",
+            ),
+            ("E1 out 0 POLY(1) in 0 (7,0)", "E1 out 0 POLY(1) in 0 (7,0)"),
+            ("G1 out 0 POLY(1) in 0 7 0", "G1 out 0 POLY(1) in 0 7 0"),
+            ("F1 out 0 POLY(2) V1 V2 7", "F1 out 0 POLY(2) V1 V2 7"),
+            ("G1 out 0 in 0 7", "G1 out 0 in 0 7"),
+            ("F1 out 0 POLY(1) VS 7 m=2", "F1 out 0 POLY(1) VS 0 7 m=2"),
+        ] {
+            assert_eq!(rewrite(input, false, "0")?, expected);
+        }
+        assert!(rewrite("E1 out 0 POLY(0) 7", false, "0").is_err());
+        assert!(rewrite("F1 out 0 POLY(1) VS", false, "0").is_err());
+        Ok(())
     }
 }

@@ -24,7 +24,7 @@ match the root LICENSE; the MIT/BSD packages carry the root third-party notices
 retains the Apache-2.0 IHP Open PDK fixture license. The Touchstone
 codec has its own BSD license. The intrinsic compact-model package has a
 non-SPDX license-file preserving the HiSIM/HiSIM-HV attribution and noncharging
-conditions, Berkeley BSD notices, and STAG DERA licence. The latter requires
+conditions, legacy BSIM and BSIM SOI Berkeley BSD notices, and STAG DERA licence. The latter requires
 specific review before registry distribution; no blanket MIT claim applies.
 Review additions against the source licenses, not just registry metadata.
 
