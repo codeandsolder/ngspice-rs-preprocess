@@ -127,11 +127,12 @@ impl Rewriter<'_> {
 
 /// Identify lexical definitions rather than globally matching K references.
 /// A K card in one subcircuit never disables default loss in another.
-fn scoped(input: &[u8]) -> Result<Vec<(usize, lexical::Statement)>> {
+fn scoped(input: &[u8], budget: &WorkBudget) -> Result<Vec<(usize, lexical::Statement)>> {
     let mut scopes = vec![0];
     let mut control = false;
     let mut output = Vec::new();
     for statement in lexical::statements(input)? {
+        budget.charge(Resource::Statements, 1)?;
         let first = statement
             .text
             .split(u8::is_ascii_whitespace)
@@ -147,6 +148,7 @@ fn scoped(input: &[u8]) -> Result<Vec<(usize, lexical::Statement)>> {
             continue;
         }
         if first.eq_ignore_ascii_case(b".subckt") {
+            budget.check_depth(scopes.len())?;
             scopes.push(statement.line);
         } else if first.eq_ignore_ascii_case(b".ends") {
             ensure!(scopes.len() > 1, "line {}: unmatched .ends", statement.line);
@@ -164,9 +166,11 @@ fn scoped(input: &[u8]) -> Result<Vec<(usize, lexical::Statement)>> {
 
 fn coupled_inductors(
     statements: &[(usize, lexical::Statement)],
+    budget: &WorkBudget,
 ) -> Result<BTreeSet<(usize, Vec<u8>)>> {
     let mut coupled = BTreeSet::new();
     for (scope, statement) in statements {
+        budget.charge(Resource::Statements, 1)?;
         if !matches!(statement.text.first(), Some(b'k' | b'K')) {
             continue;
         }
@@ -177,6 +181,8 @@ fn coupled_inductors(
             statement.line
         );
         for span in &fields[1..fields.len() - 1] {
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(Resource::EmittedBytes, span.len())?;
             coupled.insert((*scope, statement.text[span.clone()].to_ascii_uppercase()));
         }
     }
@@ -357,9 +363,10 @@ pub fn rewrite(
         serial: 0,
     };
     if dialect == NormalizationDialect::Ltspice {
-        let statements = scoped(input)?;
-        let coupled = coupled_inductors(&statements)?;
+        let statements = scoped(input, budget)?;
+        let coupled = coupled_inductors(&statements, budget)?;
         for (scope, statement) in &statements {
+            budget.charge(Resource::Statements, 1)?;
             rewrite_explicit(&mut rewriter, statement, *scope, &coupled, include)?;
         }
     } else {
@@ -367,6 +374,7 @@ pub fn rewrite(
         // only an explicitly written inductor Rser is interpreted.
         let mut control = false;
         for statement in lexical::statements(input)? {
+            budget.charge(Resource::Statements, 1)?;
             let text = &statement.text;
             let first = text
                 .split(u8::is_ascii_whitespace)

@@ -695,3 +695,34 @@ fn rational_transfer_algebra_shares_preparation_budget() -> Result<()> {
     )?;
     Ok(())
 }
+
+#[test]
+fn ltspice_source_expression_and_waveform_share_cumulative_budget() -> Result<()> {
+    use std::fmt::Write as _;
+    let dir = tempfile::tempdir()?;
+    let deep = format!(
+        "* source depth\n.param a={{{}1{}}}\nR1 a 0 1k\n.end\n",
+        "(".repeat(80) + "2^",
+        ")".repeat(80)
+    );
+    let req = request(dir.path(), InputFormat::LtspiceDeck, &deep);
+    fails(&req, WorkLimits::default(), "depth budget exceeded")?;
+
+    let mut deck = String::from("* waveform budget\n.param a=1\nV1 a 0 PWL(0 {a}");
+    for _ in 0..128 {
+        write!(deck, " +1n {{a}}")?;
+    }
+    deck.push_str(")\nR1 a 0 1k\n.end\n");
+    let req = request(dir.path(), InputFormat::LtspiceDeck, &deck);
+    let bundle = run(&req, WorkLimits::default())?;
+    assert_eq!(bundle.waveforms.len(), 1);
+    fails(
+        &req,
+        WorkLimits {
+            evaluation_steps: 128,
+            ..WorkLimits::default()
+        },
+        "EvaluationSteps budget exceeded",
+    )?;
+    Ok(())
+}

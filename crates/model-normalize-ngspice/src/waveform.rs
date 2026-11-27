@@ -706,7 +706,7 @@ pub fn validate_artifact(
     Ok(())
 }
 
-fn charge_scope(scope: &[String], name_bytes: usize, budget: &WorkBudget) -> Result<()> {
+pub(crate) fn charge_scope(scope: &[String], name_bytes: usize, budget: &WorkBudget) -> Result<()> {
     budget.charge(Resource::EmittedBytes, name_bytes)?;
     budget.charge(Resource::GeneratedNodes, scope.len())?;
     for part in scope {

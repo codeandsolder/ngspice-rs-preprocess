@@ -121,6 +121,7 @@ fn rewrite_expression(
     match lower_ltspice(raw, runtime, budget) {
         Ok(lowered) => lexical::replace_span(statement, span, lowered.as_bytes(), edits),
         Err(error) => {
+            budget.check()?;
             let groups = braced_ranges(text, span.clone())?;
             let mut outside = span.start;
             for group in &groups {
@@ -200,6 +201,7 @@ pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>
     let mut edits = Vec::new();
     let mut control = false;
     for statement in lexical::statements(body)? {
+        budget.charge(Resource::Statements, 1)?;
         let first = statement
             .text
             .split(u8::is_ascii_whitespace)
@@ -218,45 +220,70 @@ pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>
     lexical::apply_budgeted_edits(body, edits, budget)
 }
 
-/// Classify a table call by the containing evaluation phase. A behavioral
-/// brace group containing circuit probes or runtime symbols remains dynamic.
-/// Function definitions are macro bodies: the call site determines phase.
-pub(super) fn static_table(text: &[u8], start: usize, call: usize) -> Result<bool> {
-    let first = text
-        .split(u8::is_ascii_whitespace)
-        .next()
-        .unwrap_or_default();
-    if [
-        b".param".as_slice(),
-        b".subckt",
-        b".model",
-        b".if",
-        b".elseif",
-    ]
-    .iter()
-    .any(|keyword| first.eq_ignore_ascii_case(keyword))
-        || first
-            .first()
-            .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x'))
-    {
-        return Ok(true);
-    }
-    if first.eq_ignore_ascii_case(b".func") {
-        return Ok(false);
-    }
-    for group in braced_ranges(text, start..text.len())? {
-        if group.contains(&call) {
-            let expression = &text[group];
-            let runtime = [b"v".as_slice(), b"i"]
-                .iter()
-                .any(|name| !lexical::function_names(expression, name, 0).is_empty())
-                || expression.split(|byte| !identifier(*byte)).any(|word| {
-                    [b"time".as_slice(), b"hertz", b"frequency", b"temper"]
+/// Classify all table call sites in one statement. Precompute disjoint
+/// parameter groups so repeated calls do not rescan the entire card.
+pub(super) enum TablePhases {
+    Static,
+    Runtime,
+    Groups(Vec<(Range<usize>, bool)>),
+}
+
+impl TablePhases {
+    pub(super) fn new(text: &[u8], start: usize, budget: &WorkBudget) -> Result<Self> {
+        let first = text
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .unwrap_or_default();
+        if [
+            b".param".as_slice(),
+            b".subckt",
+            b".model",
+            b".if",
+            b".elseif",
+        ]
+        .iter()
+        .any(|keyword| first.eq_ignore_ascii_case(keyword))
+            || first
+                .first()
+                .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x'))
+        {
+            return Ok(Self::Static);
+        }
+        if first.eq_ignore_ascii_case(b".func") {
+            return Ok(Self::Runtime);
+        }
+        budget.charge(Resource::ScannedBytes, text.len() - start)?;
+        let groups = braced_ranges(text, start..text.len())?;
+        budget.charge(Resource::GeneratedNodes, groups.len())?;
+        Ok(Self::Groups(
+            groups
+                .into_iter()
+                .map(|group| {
+                    let expression = &text[group.clone()];
+                    let runtime = [b"v".as_slice(), b"i"]
                         .iter()
-                        .any(|name| word.eq_ignore_ascii_case(name))
-                });
-            return Ok(!runtime);
+                        .any(|name| !lexical::function_names(expression, name, 0).is_empty())
+                        || expression.split(|byte| !identifier(*byte)).any(|word| {
+                            [b"time".as_slice(), b"hertz", b"frequency", b"temper"]
+                                .iter()
+                                .any(|name| word.eq_ignore_ascii_case(name))
+                        });
+                    (group, !runtime)
+                })
+                .collect(),
+        ))
+    }
+
+    pub(super) fn is_static(&self, call: usize) -> bool {
+        match self {
+            Self::Static => true,
+            Self::Runtime => false,
+            Self::Groups(groups) => {
+                let index = groups.partition_point(|(range, _)| range.end <= call);
+                groups
+                    .get(index)
+                    .is_some_and(|(range, static_phase)| range.contains(&call) && *static_phase)
+            }
         }
     }
-    Ok(false)
 }

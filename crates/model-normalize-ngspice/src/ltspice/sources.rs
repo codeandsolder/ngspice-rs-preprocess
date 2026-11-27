@@ -410,6 +410,10 @@ struct Bind<'a> {
 
 impl Bind<'_> {
     fn scalar(&mut self, raw: &str) -> Result<String> {
+        self.budget.charge(Resource::GeneratedNodes, 1)?;
+        self.budget
+            .charge(Resource::EvaluationSteps, raw.len().max(1))?;
+        self.budget.charge(Resource::EmittedBytes, raw.len())?;
         if let Ok(value) = parse_spice_constant(raw) {
             return Ok(value.to_string());
         }
@@ -428,6 +432,7 @@ impl Bind<'_> {
         let name = self.used.fresh(b"ltprep_waveform")?;
         let name = String::from_utf8(name)?;
         let line = format!(".param {name}={{{expression}}}\n");
+        self.budget.charge(Resource::EmittedBytes, line.len())?;
         self.declarations.extend_from_slice(line.as_bytes());
         self.aliases.insert(expression, name.clone());
         Ok(name)
@@ -489,6 +494,8 @@ impl SourcePass<'_> {
                 replacements.push((field, replacement.into_bytes()));
             }
             let name = scalar(text, &fields[0])?;
+            self.budget.charge(Resource::GeneratedNodes, 1)?;
+            crate::waveform::charge_scope(&self.scope, name.len(), self.budget)?;
             let declaration = PreparedWaveform {
                 artifact: self.artifact.to_owned(),
                 scope: self.scope.clone(),
@@ -550,6 +557,7 @@ pub(super) fn rewrite(
     };
     let mut control = false;
     for statement in lexical::statements(body)? {
+        budget.charge(Resource::Statements, 1)?;
         let first = statement
             .text
             .split(u8::is_ascii_whitespace)
@@ -572,6 +580,8 @@ pub(super) fn rewrite(
                 .split(u8::is_ascii_whitespace)
                 .nth(1)
                 .context("missing subcircuit name")?;
+            budget.check_depth(pass.scope.len().saturating_add(1))?;
+            budget.charge(Resource::EmittedBytes, name.len())?;
             pass.scope.push(std::str::from_utf8(name)?.to_owned());
         } else if first.eq_ignore_ascii_case(b".ends") {
             ensure!(pass.scope.pop().is_some(), "unmatched .ends");

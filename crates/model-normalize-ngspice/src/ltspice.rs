@@ -252,10 +252,14 @@ impl Helper {
         }
     }
 
-    fn definition(self) -> Result<String> {
+    fn definition(self, budget: &WorkBudget) -> Result<String> {
         match self {
-            Self::Fixed(index) => Ok(HELPERS[index].1.to_owned()),
-            Self::Table(points, static_phase) => table::definition(points, static_phase),
+            Self::Fixed(index) => {
+                let definition = HELPERS[index].1;
+                budget.charge(Resource::EmittedBytes, definition.len())?;
+                Ok(definition.to_owned())
+            }
+            Self::Table(points, static_phase) => table::definition(points, static_phase, budget),
         }
     }
 }
@@ -296,13 +300,19 @@ fn rewrite_intrinsics(
         .next()
         .is_some_and(|keyword| keyword.eq_ignore_ascii_case(b".func"))
         && static_macros.contains(&text[functions::name(text)?].to_ascii_uppercase());
-    for span in lexical::function_names(text, b"table", start) {
-        let points = table::point_count(text, span.clone())?;
+    let table_calls = lexical::function_names(text, b"table", start);
+    if table_calls.is_empty() {
+        return Ok(());
+    }
+    let phases = if static_macro {
+        operators::TablePhases::Static
+    } else {
+        operators::TablePhases::new(text, start, &used.budget)?
+    };
+    for span in table_calls {
+        let points = table::point_count(text, span.clone(), &used.budget)?;
         let identifier = helper_identifier(
-            Helper::Table(
-                points,
-                static_macro || operators::static_table(text, start, span.start)?,
-            ),
+            Helper::Table(points, phases.is_static(span.start)),
             statement.line + title_lines,
             used,
             helpers,
@@ -336,6 +346,7 @@ fn plan_rewrites(
     static_macros: &BTreeSet<Vec<u8>>,
     budget: &WorkBudget,
 ) -> Result<RewritePlan> {
+    budget.charge(Resource::ScannedBytes, body.len())?;
     let mut used = IdentifierAllocator::new(bytes, budget)?;
     let mut edits = Vec::new();
     let mut helpers = HelperMap::new();
@@ -344,6 +355,7 @@ fn plan_rewrites(
     let mut model_passes = Vec::new();
     let mut control = false;
     for statement in lexical::statements(body)? {
+        budget.charge(Resource::Statements, 1)?;
         let text = &statement.text;
         let first = text
             .split(u8::is_ascii_whitespace)
@@ -379,12 +391,11 @@ fn plan_rewrites(
         if first.eq_ignore_ascii_case(b".func") {
             reject_shadowed_helpers(&statement)?;
         }
-        if first.eq_ignore_ascii_case(b".model") {
-            if let Some(pass) = select_model(&statement, &mut edits)?
-                && !model_passes.contains(&pass)
-            {
-                model_passes.push(pass);
-            }
+        if first.eq_ignore_ascii_case(b".model")
+            && let Some(pass) = select_model(&statement, &mut edits)?
+            && !model_passes.contains(&pass)
+        {
+            model_passes.push(pass);
         }
         let Some(start) = expression_start(text, first)? else {
             continue;
@@ -485,9 +496,19 @@ pub fn normalize(
             .passes
             .push(NormalizationPass::LtspiceIntrinsics);
     }
+    apply_plan(input, title, title_lines, &static_macros, budget)
+}
+
+fn apply_plan(
+    mut input: MappedNormalization,
+    title: usize,
+    title_lines: usize,
+    static_macros: &BTreeSet<Vec<u8>>,
+    budget: &WorkBudget,
+) -> Result<MappedNormalization> {
     let bytes = &input.model.bytes;
     let body = &bytes[title..];
-    let plan = plan_rewrites(bytes, body, title_lines, &static_macros, budget)?;
+    let plan = plan_rewrites(bytes, body, title_lines, static_macros, budget)?;
     let RewritePlan {
         edits,
         helpers,
@@ -501,7 +522,7 @@ pub fn normalize(
     let mut output = bytes[..title].to_vec();
     let mut origins = input.input_lines[..title_lines].to_vec();
     for (helper, (identifier, origin)) in &helpers {
-        let definition = helper.definition()?;
+        let definition = helper.definition(budget)?;
         budget.charge(
             Resource::EmittedBytes,
             identifier

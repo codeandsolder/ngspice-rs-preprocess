@@ -42,7 +42,7 @@ struct Constants {
 }
 
 impl Constants {
-    fn charge(&mut self) -> Result<()> {
+    fn charge(&self) -> Result<()> {
         self.budget.charge(Resource::EvaluationSteps, 1)?;
         Ok(())
     }
@@ -74,7 +74,7 @@ impl SpiceExpressionContext for Constants {
                 args.len() >= 3 && args.len() % 2 == 1,
                 "invalid table arity"
             );
-            table::definition(args.len() / 2, true)?
+            table::definition(args.len() / 2, true, &self.budget)?
         } else {
             HELPERS
                 .iter()
@@ -121,7 +121,10 @@ pub(super) fn try_evaluate(
     };
     match expression.evaluate_with_budget(&mut context, budget) {
         Ok(value) => Ok(Some(value)),
-        Err(_) if context.unbound => Ok(None),
+        Err(_) if context.unbound => {
+            budget.check()?;
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }

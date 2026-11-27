@@ -546,6 +546,7 @@ pub(crate) fn lower_ltspice(raw: &str, runtime: bool, budget: &WorkBudget) -> Re
 
 impl Expr {
     fn render_ltspice(&self, out: &mut String, budget: &WorkBudget) -> Result<()> {
+        use std::fmt::Write as _;
         let _depth = budget.enter()?;
         budget.charge(Resource::EvaluationSteps, 1)?;
         budget.charge(
@@ -556,7 +557,6 @@ impl Expr {
                 _ => 32,
             },
         )?;
-        use std::fmt::Write as _;
         match self {
             Self::Number(value) => write!(out, "{value}")?,
             Self::SourceAtom(value) | Self::Symbol(value) => out.push_str(value),

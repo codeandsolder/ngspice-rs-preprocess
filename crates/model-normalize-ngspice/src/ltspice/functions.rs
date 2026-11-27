@@ -45,6 +45,7 @@ fn specialized_names(input: &[u8], body: &[u8], budget: &WorkBudget) -> Result<N
     budget.charge(Resource::ScannedBytes, body.len())?;
     let mut reverse = BTreeMap::<Vec<u8>, BTreeSet<Vec<u8>>>::new();
     for statement in lexical::statements(body)? {
+        budget.charge(Resource::Statements, 1)?;
         let text = &statement.text;
         if !first(text).eq_ignore_ascii_case(b".func") {
             continue;
@@ -118,10 +119,12 @@ pub(super) fn specialize(
     if names.is_empty() {
         return Ok(None);
     }
+    budget.charge(Resource::ScannedBytes, body.len())?;
     let mut edits = Vec::new();
     let mut inserted = BTreeSet::new();
     let mut control = false;
     for statement in lexical::statements(body)? {
+        budget.charge(Resource::Statements, 1)?;
         let text = &statement.text;
         let keyword = first(text);
         if keyword.eq_ignore_ascii_case(b".control") {
@@ -146,10 +149,20 @@ pub(super) fn specialize(
             }
             continue;
         }
-        for call in expression_calls(text, start) {
-            if let Some(alias) = names.get(&text[call.clone()].to_ascii_uppercase())
-                && operators::static_table(text, start, call.start)?
-            {
+        let mut calls = expression_calls(text, start)
+            .into_iter()
+            .filter_map(|call| {
+                names
+                    .get(&text[call.clone()].to_ascii_uppercase())
+                    .map(|alias| (call, alias))
+            })
+            .peekable();
+        if calls.peek().is_none() {
+            continue;
+        }
+        let phases = operators::TablePhases::new(text, start, budget)?;
+        for (call, alias) in calls {
+            if phases.is_static(call.start) {
                 lexical::replace_span(&statement, call, alias, &mut edits);
             }
         }
