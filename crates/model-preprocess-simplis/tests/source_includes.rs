@@ -252,3 +252,26 @@ fn catalog_index_does_not_execute_root_control_programs() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn active_include_diagnostics_use_physical_projected_source_positions() -> Result<()> {
+    let libraries = [
+        ("parent.lb", ".VAR A=1\n.include broken.lb\n"),
+        (
+            "broken.lb",
+            ".SIMULATOR SIMETRIX\n* excluded\n.SIMULATOR SIMPLIS\n.VAR B=2\n.ERROR bad input\n",
+        ),
+    ];
+    for parsed in [false, true] {
+        let error = outputs(".include parent.lb\n.end\n", &libraries, parsed)
+            .expect_err("active included error");
+        let text = format!("{error:#}");
+        assert!(text.contains("parent.lb:2"), "{text}");
+        assert!(text.contains("broken.lb:5"), "{text}");
+        assert!(text.contains("bad input"), "{text}");
+        let missing = outputs(".include missing.lb\n.end\n", &[], parsed)
+            .expect_err("missing active include");
+        assert!(format!("{missing:#}").contains("unresolved SIMPLIS source include"));
+    }
+    Ok(())
+}

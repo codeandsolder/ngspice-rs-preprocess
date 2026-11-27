@@ -11,15 +11,17 @@ use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::collections::BTreeSet;
 
-struct ActiveSource {
-    id: String,
-    name: String,
+struct ActiveSource<'a> {
+    id: &'a str,
+    name: &'a str,
+    positions: &'a [usize],
+    position: usize,
     ended: bool,
 }
 
 pub(crate) struct RootIncludes<'a> {
     catalog: &'a SubcircuitCatalog,
-    active: Vec<ActiveSource>,
+    active: Vec<ActiveSource<'a>>,
     definitions: Vec<Definition>,
     imported: BTreeSet<IncludedSource>,
     origin: Option<String>,
@@ -73,48 +75,62 @@ impl<'a> RootIncludes<'a> {
         (self.definitions, self.imported)
     }
 
-    pub(crate) fn enter(&mut self, target: &str) -> Result<Option<String>> {
+    pub(crate) fn enter(&mut self, target: &str) -> Result<&'a str> {
         let parent = self
             .active
             .last()
-            .map(|source| source.name.as_str())
+            .map(|source| source.name)
             .or(self.origin.as_deref());
-        let Some((id, name, metadata)) = self.catalog.explicit_include(target, parent)? else {
-            return Ok(None);
-        };
+        let (id, name, metadata) = self
+            .catalog
+            .explicit_include(target, parent)?
+            .with_context(|| format!("unresolved SIMPLIS source include {target:?}"))?;
         ensure!(
             !self
                 .active
                 .iter()
-                .any(|source| normalized_source_path(&source.name) == normalized_source_path(name)),
+                .any(|source| normalized_source_path(source.name) == normalized_source_path(name)),
             "recursive SIMPLIS source include {name:?}"
         );
         let budget = &self.catalog.budget;
         budget.check_depth(self.active.len().saturating_add(1))?;
         budget.charge(Resource::SourceVisits, 1)?;
         budget.charge(Resource::ScannedBytes, metadata.explicit_source.len())?;
-        budget.charge(
-            Resource::EmittedBytes,
-            metadata
-                .explicit_source
-                .len()
-                .saturating_add(id.len())
-                .saturating_add(name.len()),
-        )?;
+        budget.charge(Resource::EmittedBytes, id.len().saturating_add(name.len()))?;
+        let positions = metadata
+            .source_positions
+            .get(name)
+            .context("missing projected source positions")?;
         self.active.push(ActiveSource {
-            id: id.to_owned(),
-            name: name.to_owned(),
+            id,
+            name,
+            positions,
+            position: 0,
             ended: false,
         });
         self.imported.insert(IncludedSource {
             source_id: id.to_owned(),
             source_name: name.to_owned(),
         });
-        Ok(Some(metadata.explicit_source.clone()))
+        Ok(&metadata.explicit_source)
     }
 
-    pub(crate) fn leave(&mut self) {
-        self.active.pop();
+    pub(crate) fn set_position(&mut self, index: usize) {
+        if let Some(source) = self.active.last_mut() {
+            source.position = index;
+        }
+    }
+
+    pub(crate) fn leave(&mut self, result: Result<()>) -> Result<()> {
+        let source = self.active.pop().context("missing active include")?;
+        result.with_context(|| {
+            let line = source
+                .positions
+                .get(source.position)
+                .copied()
+                .unwrap_or(source.position.saturating_add(1));
+            format!("executing SIMPLIS include {}:{line}", source.name)
+        })
     }
 
     /// Definitions are declarations, not instructions in the importing
@@ -160,8 +176,8 @@ impl<'a> RootIncludes<'a> {
                     Resource::EmittedBytes,
                     source.id.len().saturating_add(source.name.len()),
                 )?;
-                definition.source_id = Some(source.id.clone());
-                definition.source_name = Some(source.name.clone());
+                definition.source_id = Some(source.id.to_owned());
+                definition.source_name = Some(source.name.to_owned());
             }
         }
         self.definitions.extend(extracted.definitions);
@@ -268,4 +284,26 @@ pub(super) fn indexed_view(text: &str, budget: &WorkBudget) -> Result<String> {
         "unterminated library lexical block"
     );
     Ok(output)
+}
+
+/// Retain physical line positions independently for each admitted source
+/// name; identical projected programs may originate at different offsets.
+pub(super) fn source_positions(
+    statements: &[crate::source_dialect::ScopedStatement],
+    budget: &WorkBudget,
+) -> Result<Vec<usize>> {
+    let mut positions = Vec::new();
+    for statement in statements {
+        for (index, _) in statement.text.split('\n').enumerate() {
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(Resource::EmittedBytes, size_of::<usize>())?;
+            positions.push(
+                statement
+                    .first_line
+                    .saturating_add(index)
+                    .min(statement.last_line),
+            );
+        }
+    }
+    Ok(positions)
 }

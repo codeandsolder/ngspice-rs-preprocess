@@ -232,7 +232,7 @@ impl ParsedLibrary {
 #[derive(Clone, Debug)]
 struct SourceMetadata {
     source_name: String,
-    source_names: BTreeSet<String>,
+    source_positions: BTreeMap<String, Vec<usize>>,
     support_lines: Vec<String>,
     aliases: Vec<Alias>,
     /// Ordered source retained separately from indexed declarations.
@@ -519,18 +519,32 @@ impl SubcircuitCatalog {
                 source_id.clone(),
                 SourceMetadata {
                     source_name: source_name.clone(),
-                    source_names: BTreeSet::new(),
+                    source_positions: BTreeMap::new(),
                     support_lines: parsed.support_lines.clone(),
                     aliases: parsed.aliases.clone(),
                     explicit_source,
                 },
             );
         }
-        self.sources
+        let positions = if parsed.simulator == LibrarySimulator::Simplis {
+            source_includes::source_positions(&parsed.scoped_statements, &self.budget)?
+        } else {
+            Vec::new()
+        };
+        let metadata = self
+            .sources
             .get_mut(source_id)
-            .context("missing registered source")?
-            .source_names
-            .insert(source_name.clone());
+            .context("missing registered source")?;
+        if let Some(previous) = metadata.source_positions.get(source_name) {
+            ensure!(
+                previous == &positions,
+                "conflicting projected line positions for source {source_name}"
+            );
+        } else {
+            metadata
+                .source_positions
+                .insert(source_name.clone(), positions);
+        }
         for alias in &parsed.aliases {
             let bindings = self
                 .aliases
@@ -611,7 +625,7 @@ impl SubcircuitCatalog {
             &target_path[..]
         };
         for (identity, metadata) in &self.sources {
-            for name in &metadata.source_names {
+            for name in metadata.source_positions.keys() {
                 self.budget.charge(Resource::EvaluationSteps, 1)?;
                 self.budget.charge(
                     Resource::ScannedBytes,
