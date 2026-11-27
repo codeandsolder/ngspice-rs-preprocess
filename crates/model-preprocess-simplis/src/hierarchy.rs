@@ -14,9 +14,11 @@ use std::{
 };
 
 mod runtime_params;
+mod source_includes;
 use runtime_params::RuntimeScope;
+pub(crate) use source_includes::RootIncludes;
 
-const PARSED_LIBRARY_FORMAT_VERSION: u32 = 6;
+const PARSED_LIBRARY_FORMAT_VERSION: u32 = 7;
 
 fn lower_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -233,6 +235,8 @@ struct SourceMetadata {
     source_names: BTreeSet<String>,
     support_lines: Vec<String>,
     aliases: Vec<Alias>,
+    /// Ordered source retained separately from indexed declarations.
+    explicit_source: String,
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +253,7 @@ pub struct SubcircuitCatalog {
     aliases: BTreeMap<String, Vec<AliasBinding>>,
     sources: BTreeMap<String, SourceMetadata>,
     next_anonymous_source: usize,
+    explicit_sources: BTreeSet<String>,
     budget: WorkBudget,
 }
 
@@ -306,6 +311,20 @@ fn path_suffix_matches(source: &str, include: &str) -> bool {
             .iter()
             .zip(source)
             .all(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+}
+
+fn normalized_source_path(path: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.split(['/', '\\']) {
+        match component {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|part| part != "..") => {
+                parts.pop();
+            }
+            _ => parts.push(component.to_ascii_lowercase()),
+        }
+    }
+    parts
 }
 
 impl SubcircuitCatalog {
@@ -469,14 +488,32 @@ impl SubcircuitCatalog {
                 )?;
             }
         }
+        if !self.sources.contains_key(source_id) {
+            let mut explicit_source = String::new();
+            if parsed.simulator == LibrarySimulator::Simplis {
+                for statement in &parsed.scoped_statements {
+                    self.budget.charge(
+                        Resource::EmittedBytes,
+                        statement.text.len().saturating_add(1),
+                    )?;
+                    explicit_source.push_str(&statement.text);
+                    explicit_source.push('\n');
+                }
+            }
+            self.sources.insert(
+                source_id.clone(),
+                SourceMetadata {
+                    source_name: source_name.clone(),
+                    source_names: BTreeSet::new(),
+                    support_lines: parsed.support_lines.clone(),
+                    aliases: parsed.aliases.clone(),
+                    explicit_source,
+                },
+            );
+        }
         self.sources
-            .entry(source_id.clone())
-            .or_insert_with(|| SourceMetadata {
-                source_name: source_name.clone(),
-                source_names: BTreeSet::new(),
-                support_lines: parsed.support_lines.clone(),
-                aliases: parsed.aliases.clone(),
-            })
+            .get_mut(source_id)
+            .context("missing registered source")?
             .source_names
             .insert(source_name.clone());
         for alias in &parsed.aliases {
@@ -523,34 +560,64 @@ impl SubcircuitCatalog {
         path.rsplit(['/', '\\']).next().unwrap_or(path)
     }
 
-    fn matches_supplied_include(&self, statement: &str) -> Result<bool> {
-        let Some(include) = source_include_target(statement)? else {
-            return Ok(false);
-        };
-        let mut suffix_matches = BTreeSet::new();
-        let mut basename_matches = BTreeSet::new();
+    fn explicit_include(
+        &self,
+        include: &str,
+        parent: Option<&str>,
+    ) -> Result<Option<(&str, &str, &SourceMetadata)>> {
+        let mut relative = BTreeMap::new();
+        let mut suffix = BTreeMap::new();
+        let mut basename = BTreeMap::new();
+        let target = include.replace('\\', "/");
+        let parent_target = parent.map(|name| {
+            let name = name.replace('\\', "/");
+            let directory = name.rsplit_once('/').map_or("", |(directory, _)| directory);
+            if directory.is_empty() {
+                target.clone()
+            } else {
+                format!("{directory}/{target}")
+            }
+        });
         for (identity, metadata) in &self.sources {
             for name in &metadata.source_names {
+                self.budget.charge(Resource::EvaluationSteps, 1)?;
+                self.budget.charge(
+                    Resource::ScannedBytes,
+                    name.len().saturating_add(include.len()),
+                )?;
+                let entry = (identity.as_str(), name.as_str(), metadata);
+                if parent_target.as_ref().is_some_and(|path| {
+                    normalized_source_path(name) == normalized_source_path(path)
+                }) {
+                    relative.insert(identity, entry);
+                }
                 if path_suffix_matches(name, include) {
-                    suffix_matches.insert(identity);
+                    suffix.insert(identity, entry);
                 }
                 if Self::path_basename(name).eq_ignore_ascii_case(Self::path_basename(include)) {
-                    basename_matches.insert(identity);
+                    basename.insert(identity, entry);
                 }
             }
         }
-        // Explicit path suffixes distinguish same-name libraries; basename
-        // fallback supports relocated vendor source paths only when unique.
-        let candidates = if suffix_matches.is_empty() {
-            basename_matches
+        let candidates = if !relative.is_empty() {
+            relative
+        } else if !suffix.is_empty() {
+            suffix
         } else {
-            suffix_matches
+            basename
         };
         anyhow::ensure!(
             candidates.len() <= 1,
             "ambiguous supplied library include {include:?}"
         );
-        Ok(!candidates.is_empty())
+        Ok(candidates.into_values().next())
+    }
+
+    fn matches_supplied_include(&self, statement: &str) -> Result<bool> {
+        let Some(include) = source_include_target(statement)? else {
+            return Ok(false);
+        };
+        Ok(self.explicit_include(include, None)?.is_some())
     }
 
     fn model_statement<'a>(statement: &'a str, name: &str) -> Option<Vec<&'a str>> {
@@ -921,8 +988,32 @@ pub fn parse_library_with_budget(
             budget,
         );
     }
-    let view = project_source(input, simulator)?;
-    budget.charge(Resource::EmittedBytes, view.len())?;
+    let decoded = decode_simplis_text(input)?;
+    let lines = decoded.lines().collect::<Vec<_>>();
+    let selected = selected_library_lines(lines.iter().copied(), simulator)?;
+    let context = DialectContext::default();
+    let mut view = String::new();
+    let mut statements = Vec::new();
+    for index in selected {
+        let text = lines[index];
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            source_name
+                .len()
+                .saturating_add(text.len().saturating_mul(2))
+                .saturating_add(1),
+        )?;
+        view.push_str(text);
+        view.push('\n');
+        statements.push(ScopedStatement {
+            source: source_name.clone(),
+            context,
+            first_line: index + 1,
+            last_line: index + 1,
+            text: text.to_owned(),
+        });
+    }
     parse_library_parts(
         source_name,
         sources,
@@ -930,7 +1021,7 @@ pub fn parse_library_with_budget(
         LibraryProjection {
             simulator,
             dialect: None,
-            scoped_statements: Vec::new(),
+            scoped_statements: statements,
         },
         Vec::new(),
         budget,
@@ -1491,7 +1582,7 @@ fn parsed_library_digest(
 ) -> String {
     let semantic_digest = library_digest(support_lines, aliases, definitions);
     let mut hasher = Sha256::new();
-    hasher.update(b"ngspice-rs-preprocess-parsed-library-v6\0");
+    hasher.update(b"ngspice-rs-preprocess-parsed-library-v7\0");
     if let Some(context) = dialect {
         hasher.update([match context.language {
             crate::source_dialect::SourceLanguage::Simetrix => 1,
@@ -2531,12 +2622,22 @@ pub fn preprocess_netlist(
     input: &[u8],
     external: &SubcircuitCatalog,
 ) -> Result<PreprocessedNetlist> {
-    let text = decode_simplis_text(input)?;
-    let mut extracted = extract_definitions_scoped(&text, None, &external.budget)?;
+    let PreparedRoot {
+        mut extracted,
+        statements: root_statements,
+        globals,
+        explicit_sources,
+    } = prepare_root(input, external)?;
     let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
     let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
-    assign_local_source(&mut extracted.definitions, &root_source_id, "<root>");
+    for definition in &mut extracted.definitions {
+        if definition.source_id.is_none() {
+            definition.source_id = Some(root_source_id.clone());
+            definition.source_name = Some("<root>".to_owned());
+        }
+    }
     let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
+    local.explicit_sources = explicit_sources;
     let mut retained_local = Vec::new();
     let mut removed_local = 0usize;
     for definition in extracted.definitions {
@@ -2553,8 +2654,6 @@ pub fn preprocess_netlist(
         }
     }
 
-    let (root_statements, globals) =
-        preprocess_root_statements(&extracted.root_lines, &external.budget)?;
     let mut output_root = Vec::new();
     let mut pending = Vec::new();
     let mut end_statement = None;
@@ -3028,6 +3127,35 @@ fn definition_uses_preprocessor(definition: &Definition) -> bool {
         .any(is_preprocessor_control)
 }
 
+struct PreparedRoot {
+    extracted: Extracted,
+    statements: Vec<String>,
+    globals: GlobalBindings,
+    explicit_sources: BTreeSet<String>,
+}
+
+fn prepare_root(input: &[u8], external: &SubcircuitCatalog) -> Result<PreparedRoot> {
+    let text = decode_simplis_text(input)?;
+    // SIMetrix retains its existing admitted source expansion and runtime
+    // mapping. SIMPLIS catalog includes are executable source programs.
+    if external.simulator != Some(LibrarySimulator::Simetrix)
+        && text
+            .lines()
+            .any(|line| is_directive(line, "INCLUDE") || is_directive(line, "INC"))
+    {
+        return source_includes::prepare_root(&text, external);
+    }
+    let extracted = extract_definitions_scoped(&text, None, &external.budget)?;
+    let (statements, globals) =
+        preprocess_root_statements(&extracted.root_lines, &external.budget)?;
+    Ok(PreparedRoot {
+        extracted,
+        statements,
+        globals,
+        explicit_sources: BTreeSet::new(),
+    })
+}
+
 fn preprocess_root_statements(
     root_lines: &[String],
     budget: &WorkBudget,
@@ -3188,11 +3316,14 @@ fn initialize_linked_builder(
     builder: &mut LinkedLibraryBuilder,
     source_id: &str,
     source_name: &str,
+    local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
 ) -> Result<()> {
     if builder.source_name.is_empty() {
         source_name.clone_into(&mut builder.source_name);
-        if external.source_metadata(source_id).is_some() {
+        if !local.explicit_sources.contains(source_id)
+            && external.source_metadata(source_id).is_some()
+        {
             builder.support_lines = external.materialized_support(source_id)?;
         }
     }
@@ -3332,7 +3463,7 @@ fn emit_linked_unit(
             local_key: None,
         };
         let builder = builders.entry(source_id.clone()).or_default();
-        initialize_linked_builder(builder, &source_id, &source_name, external)?;
+        initialize_linked_builder(builder, &source_id, &source_name, local, external)?;
         let before = builder.output.len();
         emit_microchip_complementary_pwm(&pending, &mut builder.output)?;
         external
@@ -3354,7 +3485,7 @@ fn emit_linked_unit(
         dependencies,
     } = rewrite_linked_body(unit, bytes, &source_id, local, external)?;
     let builder = builders.entry(source_id.clone()).or_default();
-    initialize_linked_builder(builder, &source_id, &source_name, external)?;
+    initialize_linked_builder(builder, &source_id, &source_name, local, external)?;
     builder.dependencies.extend(dependencies);
     append_linked_body(
         builder,
@@ -3378,13 +3509,6 @@ fn emit_linked_unit(
     active.remove(&seen_key);
     seen.insert(seen_key);
     Ok(())
-}
-
-fn assign_local_source(definitions: &mut [Definition], source_id: &str, source_name: &str) {
-    for definition in definitions {
-        definition.source_id = Some(source_id.to_owned());
-        definition.source_name = Some(source_name.to_owned());
-    }
 }
 
 struct ModelNamespace<'a> {
@@ -3524,14 +3648,14 @@ fn validate_linked_model_namespace(
 }
 
 fn link_root_statements(
-    root_lines: &[String],
+    root_statements: Vec<String>,
+    globals: GlobalBindings,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
     runtime: Option<&RuntimeScope>,
 ) -> Result<(String, Vec<LinkedUnit>, Option<String>)> {
     use std::fmt::Write as _;
 
-    let (root_statements, globals) = preprocess_root_statements(root_lines, &external.budget)?;
     let mut root_init = InitTree::default();
     for statement in &root_statements {
         if let Some(assignments) = parse_init_statement(statement)? {
@@ -3608,6 +3732,7 @@ fn link_root_statements(
 fn include_referenced_device_model_libraries(
     root_output: &str,
     builders: &mut BTreeMap<String, LinkedLibraryBuilder>,
+    local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
 ) -> Result<()> {
     // Device-model dependencies can appear directly in a root deck or
@@ -3650,7 +3775,7 @@ fn include_referenced_device_model_libraries(
             .source_name
             .clone();
         let builder = builders.entry(source_id.clone()).or_default();
-        initialize_linked_builder(builder, &source_id, &source_name, external)?;
+        initialize_linked_builder(builder, &source_id, &source_name, local, external)?;
     }
     Ok(())
 }
@@ -3687,13 +3812,23 @@ pub fn preprocess_netlist_linked(
 ) -> Result<LinkedPreprocessedNetlist> {
     use std::fmt::Write as _;
 
-    let text = decode_simplis_text(input)?;
-    let mut extracted = extract_definitions_scoped(&text, None, &external.budget)?;
+    let PreparedRoot {
+        mut extracted,
+        statements: root_statements,
+        globals,
+        explicit_sources,
+    } = prepare_root(input, external)?;
     let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
     let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
-    assign_local_source(&mut extracted.definitions, &root_source_id, "<root>");
+    for definition in &mut extracted.definitions {
+        if definition.source_id.is_none() {
+            definition.source_id = Some(root_source_id.clone());
+            definition.source_name = Some("<root>".to_owned());
+        }
+    }
 
     let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
+    local.explicit_sources = explicit_sources;
     for definition in &extracted.definitions {
         insert_local_definition(&mut local, definition.clone())?;
     }
@@ -3702,7 +3837,7 @@ pub fn preprocess_netlist_linked(
         .then(|| RuntimeScope::root_with_symbols(&root_source_id, &root_support, &external.budget))
         .transpose()?;
     let (mut root_output, root_units, end_statement) =
-        link_root_statements(&extracted.root_lines, &local, external, runtime.as_ref())?;
+        link_root_statements(root_statements, globals, &local, external, runtime.as_ref())?;
 
     let root_specializations = root_units
         .iter()
@@ -3723,7 +3858,7 @@ pub fn preprocess_netlist_linked(
             &mut generated_subcircuits,
         )?;
     }
-    include_referenced_device_model_libraries(&root_output, &mut builders, external)?;
+    include_referenced_device_model_libraries(&root_output, &mut builders, &local, external)?;
 
     validate_linked_model_namespace(&builders)?;
 

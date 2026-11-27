@@ -1308,7 +1308,7 @@ fn find_while_end(lines: &[&str], start: usize, end: usize, budget: &WorkBudget)
     bail!("unterminated SIMPLIS .WHILE at line {}", start + 1)
 }
 
-struct PreprocessState<'a> {
+struct PreprocessState<'a, 'catalog> {
     env: &'a mut Environment,
     output: &'a mut String,
     assigned_variables: &'a mut usize,
@@ -1317,6 +1317,7 @@ struct PreprocessState<'a> {
     parameter_names: &'a mut BTreeSet<String>,
     substitution: Substitution,
     evaluate_parameters: bool,
+    includes: Option<&'a mut hierarchy::RootIncludes<'catalog>>,
 }
 
 fn process_while(
@@ -1324,7 +1325,7 @@ fn process_while(
     start: usize,
     end: usize,
     header: &str,
-    state: &mut PreprocessState<'_>,
+    state: &mut PreprocessState<'_, '_>,
 ) -> Result<()> {
     let line = start + 1;
     let (condition, source_limit) =
@@ -1370,7 +1371,7 @@ fn process_range(
     lines: &[&str],
     start: usize,
     end: usize,
-    state: &mut PreprocessState<'_>,
+    state: &mut PreprocessState<'_, '_>,
 ) -> Result<()> {
     let _depth = state.env.budget.enter()?;
     let mut index = start;
@@ -1381,6 +1382,28 @@ fn process_range(
             .env
             .budget
             .charge(Resource::ScannedBytes, line.len())?;
+        if let Some(includes) = state.includes.as_deref_mut() {
+            if let Some(end_index) = includes.capture_definition(lines, index, end)? {
+                index = end_index;
+                continue;
+            }
+            if let Some(target) = hierarchy::source_include_target(line)?
+                && let Some(source) = includes.enter(target)?
+            {
+                let nested = source.lines().collect::<Vec<_>>();
+                let result = process_range(&nested, 0, nested.len(), state);
+                if let Some(includes) = state.includes.as_deref_mut() {
+                    includes.leave();
+                }
+                result.with_context(|| format!("executing SIMPLIS include {target:?}"))?;
+                index += 1;
+                continue;
+            }
+            // A source include's .END terminates only that resource.
+            if includes.included() && directive(line, "END").is_some() {
+                break;
+            }
+        }
         if let Some(condition) = directive(line, "IF") {
             let (else_index, endif_index) = find_if_bounds(lines, index, end, &state.env.budget)?;
             let active = Evaluation::new(state.env)
@@ -1492,12 +1515,13 @@ pub fn preprocess_body(input: &[u8], initial: &Environment) -> Result<Preprocess
     preprocess_body_with_mode(input, initial, true)
 }
 
-fn run_preprocess_body(
+fn run_preprocess_body_with_includes(
     input: &[u8],
     initial: &Environment,
     substitution: Substitution,
     evaluate_parameters: bool,
     parameter_names: &mut BTreeSet<String>,
+    includes: Option<&mut hierarchy::RootIncludes<'_>>,
 ) -> Result<Preprocessed> {
     initial.budget.charge(Resource::ScannedBytes, input.len())?;
     let text = decode_simplis_text(input)?;
@@ -1520,6 +1544,7 @@ fn run_preprocess_body(
             parameter_names,
             substitution,
             evaluate_parameters,
+            includes,
         },
     )?;
     Ok(Preprocessed {
@@ -1531,6 +1556,23 @@ fn run_preprocess_body(
             substituted_expressions,
         },
     })
+}
+
+fn run_preprocess_body(
+    input: &[u8],
+    initial: &Environment,
+    substitution: Substitution,
+    evaluate_parameters: bool,
+    parameter_names: &mut BTreeSet<String>,
+) -> Result<Preprocessed> {
+    run_preprocess_body_with_includes(
+        input,
+        initial,
+        substitution,
+        evaluate_parameters,
+        parameter_names,
+        None,
+    )
 }
 
 // Execute source controls and substitute known compile-time expressions
