@@ -24,6 +24,34 @@ enum Token {
     End,
 }
 
+fn number_end(bytes: &[u8], byte: u8, cursor: &mut usize) {
+    if byte == b'.' {
+        *cursor += 1;
+    }
+    while bytes.get(*cursor).is_some_and(u8::is_ascii_digit) {
+        *cursor += 1;
+    }
+    if bytes.get(*cursor) == Some(&b'.') {
+        *cursor += 1;
+        while bytes.get(*cursor).is_some_and(u8::is_ascii_digit) {
+            *cursor += 1;
+        }
+    }
+    if matches!(bytes.get(*cursor), Some(b'e' | b'E' | b'd' | b'D')) {
+        let exponent = *cursor + 1;
+        let offset = exponent + usize::from(matches!(bytes.get(exponent), Some(b'+' | b'-')));
+        if bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+            *cursor = offset + 1;
+            while bytes.get(*cursor).is_some_and(u8::is_ascii_digit) {
+                *cursor += 1;
+            }
+        }
+    }
+    while bytes.get(*cursor).is_some_and(u8::is_ascii_alphabetic) {
+        *cursor += 1;
+    }
+}
+
 fn tokenize(raw: &str) -> Result<Vec<Token>> {
     ensure!(raw.is_ascii(), "non-ASCII ngspice parameter expression");
     let bytes = raw.as_bytes();
@@ -38,32 +66,7 @@ fn tokenize(raw: &str) -> Result<Vec<Token>> {
         if byte.is_ascii_digit()
             || (byte == b'.' && bytes.get(cursor + 1).is_some_and(u8::is_ascii_digit))
         {
-            if byte == b'.' {
-                cursor += 1;
-            }
-            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                cursor += 1;
-            }
-            if bytes.get(cursor) == Some(&b'.') {
-                cursor += 1;
-                while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                    cursor += 1;
-                }
-            }
-            if matches!(bytes.get(cursor), Some(b'e' | b'E' | b'd' | b'D')) {
-                let exponent = cursor + 1;
-                let offset =
-                    exponent + usize::from(matches!(bytes.get(exponent), Some(b'+' | b'-')));
-                if bytes.get(offset).is_some_and(u8::is_ascii_digit) {
-                    cursor = offset + 1;
-                    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                        cursor += 1;
-                    }
-                }
-            }
-            while bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic) {
-                cursor += 1;
-            }
+            number_end(bytes, byte, &mut cursor);
             tokens.push(Token::Value(parse_spice_constant(&raw[start..cursor])?));
             continue;
         }
@@ -236,11 +239,10 @@ impl Parser<'_> {
                 // A sign at the beginning of a native expression binds below
                 // products; after an operator a signed literal binds atomically.
                 let precedence = match op {
-                    UnaryOp::Not => BinaryOp::Pow.precedence() + 1,
                     UnaryOp::Plus | UnaryOp::Minus if minimum == 0 => {
                         BinaryOp::Add.precedence() + 1
                     }
-                    UnaryOp::Plus | UnaryOp::Minus => BinaryOp::Pow.precedence() + 1,
+                    _ => BinaryOp::Pow.precedence() + 1,
                 };
                 let arg = self.expression(precedence)?;
                 self.node(Expr::Unary(op, Box::new(arg.tree)), arg.height + 1)

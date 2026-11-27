@@ -395,10 +395,10 @@ fn evaluate_function(function: Function, args: &[f64]) -> f64 {
     let z = args[0];
     match function {
         Function::Ternary => {
-            if z != 0.0 {
-                args[1]
-            } else {
+            if z == 0.0 {
                 x
+            } else {
+                args[1]
             }
         }
         Function::Sqr => x * x,
