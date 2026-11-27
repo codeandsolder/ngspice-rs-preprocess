@@ -4,6 +4,7 @@
 use super::{
     Definition, Environment, Extracted, PreparedRoot, SubcircuitCatalog,
     extract_definitions_scoped, is_directive, is_subcircuit_header, logical_statements,
+    normalized_source_path,
 };
 use crate::{Substitution, run_preprocess_body_with_includes};
 use anyhow::{Context, Result, ensure};
@@ -13,6 +14,7 @@ use std::collections::BTreeSet;
 struct ActiveSource {
     id: String,
     name: String,
+    ended: bool,
 }
 
 pub(crate) struct RootIncludes<'a> {
@@ -20,29 +22,71 @@ pub(crate) struct RootIncludes<'a> {
     active: Vec<ActiveSource>,
     definitions: Vec<Definition>,
     imported: BTreeSet<String>,
+    origin: Option<String>,
+    owner: Option<String>,
 }
 
 impl<'a> RootIncludes<'a> {
-    fn new(catalog: &'a SubcircuitCatalog) -> Self {
+    pub(super) fn new(catalog: &'a SubcircuitCatalog) -> Self {
         Self {
             catalog,
             active: Vec::new(),
             definitions: Vec::new(),
             imported: BTreeSet::new(),
+            origin: None,
+            owner: None,
         }
     }
 
-    pub(crate) fn included(&self) -> bool {
-        !self.active.is_empty()
+    pub(super) fn for_definition(catalog: &'a SubcircuitCatalog, definition: &Definition) -> Self {
+        Self {
+            origin: definition.source_name.clone(),
+            owner: Some(definition.scope_id.clone()),
+            ..Self::new(catalog)
+        }
+    }
+
+    pub(crate) fn clear_pass(&mut self) {
+        self.active.clear();
+        self.definitions.clear();
+        self.imported.clear();
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.active.last().is_some_and(|source| source.ended)
+    }
+
+    pub(crate) fn finish_source(&mut self, line: &str) -> bool {
+        if let Some(source) = self.active.last_mut() {
+            if is_directive(line, "END") {
+                source.ended = true;
+                return true;
+            }
+            if is_directive(line, "SYSTEMLIB") {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(super) fn into_captures(self) -> (Vec<Definition>, BTreeSet<String>) {
+        (self.definitions, self.imported)
     }
 
     pub(crate) fn enter(&mut self, target: &str) -> Result<Option<String>> {
-        let parent = self.active.last().map(|source| source.name.as_str());
+        let parent = self
+            .active
+            .last()
+            .map(|source| source.name.as_str())
+            .or(self.origin.as_deref());
         let Some((id, name, metadata)) = self.catalog.explicit_include(target, parent)? else {
             return Ok(None);
         };
         ensure!(
-            !self.active.iter().any(|source| source.name == name),
+            !self
+                .active
+                .iter()
+                .any(|source| normalized_source_path(&source.name) == normalized_source_path(name)),
             "recursive SIMPLIS source include {name:?}"
         );
         let budget = &self.catalog.budget;
@@ -60,6 +104,7 @@ impl<'a> RootIncludes<'a> {
         self.active.push(ActiveSource {
             id: id.to_owned(),
             name: name.to_owned(),
+            ended: false,
         });
         self.imported.insert(id.to_owned());
         Ok(Some(metadata.explicit_source.clone()))
@@ -99,9 +144,13 @@ impl<'a> RootIncludes<'a> {
             }
         }
         let stop = stop.context("unterminated SIMPLIS .SUBCKT in active source")?;
+        let bytes_len = lines[start..stop]
+            .iter()
+            .map(|line| line.len().saturating_add(1))
+            .fold(0usize, usize::saturating_add);
+        budget.charge(Resource::EmittedBytes, bytes_len)?;
         let bytes = lines[start..stop].join("\n");
-        budget.charge(Resource::EmittedBytes, bytes.len())?;
-        let mut extracted = extract_definitions_scoped(&bytes, None, budget)?;
+        let mut extracted = extract_definitions_scoped(&bytes, self.owner.as_deref(), budget)?;
         if let Some(source) = self.active.last() {
             for definition in &mut extracted.definitions {
                 budget.charge(

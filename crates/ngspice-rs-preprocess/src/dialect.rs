@@ -719,6 +719,25 @@ struct CompanionOrigins<'a> {
     root: &'a BTreeSet<String>,
 }
 
+fn extend_include_origins(
+    origins: &mut BTreeSet<String>,
+    includes: &BTreeSet<String>,
+    sources: &BTreeMap<String, BTreeSet<String>>,
+    budget: &WorkBudget,
+) -> Result<()> {
+    for source in includes {
+        let paths = sources
+            .get(source)
+            .context("executed include missing admitted source origin")?;
+        for path in paths {
+            budget.charge(super::Resource::GeneratedNodes, 1)?;
+            budget.charge(super::Resource::EmittedBytes, path.len())?;
+            origins.insert(path.clone());
+        }
+    }
+    Ok(())
+}
+
 fn translate_companions(
     linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
     translated_libraries: Vec<WholeModelTranslation>,
@@ -756,7 +775,14 @@ fn translate_companions(
         for origin in origin_set {
             budget.charge(super::Resource::EmittedBytes, origin.len())?;
         }
-        let origins = origin_set.iter().cloned().collect();
+        let mut artifact_origins = origin_set.clone();
+        extend_include_origins(
+            &mut artifact_origins,
+            &library.included_sources,
+            origins.sources,
+            budget,
+        )?;
+        let origins = artifact_origins.into_iter().collect();
         dependencies.push(library.source_id.clone());
         companions.push(generated(
             library.filename.clone(),
@@ -943,7 +969,7 @@ fn linked(
 ) -> Result<PreparedBundle> {
     let ResolvedDeck {
         root: expanded_root,
-        root_sources,
+        mut root_sources,
         declarations,
         libraries:
             ResolvedLibraries {
@@ -954,6 +980,12 @@ fn linked(
             },
     } = resolve_deck(root, request, options, cancellation, session)?;
     let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
+    extend_include_origins(
+        &mut root_sources,
+        &linked.included_sources,
+        &sources,
+        session.budget(),
+    )?;
     let mut plan = capture_linked_plan(
         &mut linked,
         root,
