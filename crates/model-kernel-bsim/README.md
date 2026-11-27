@@ -54,8 +54,12 @@ nodes. Heat balance and stored thermal energy occupy the thermal row. Noise
 sources are independent PSDs with explicit terminal-pair injections. No
 integration history or heap allocation belongs to the Newton evaluation.
 
-The assembled artifact has compile/strict qualification; executable
-Jacobian, topology, model-group and native noise reference tests are separate
-from the previously validated intrinsic subkernels. Native DC distributed-body
-and reverse gate-current Jacobian omissions are not copied into the physical
-conservative assembly.
+Executable tests qualify candidate replay and rollback, conservative Jacobians
+across 576 topology/gradient cases, and a 336-record ngspice 47 clamped DC/AC
+reference. The raw reference is retained. For AC entries affected by the
+native omitted intrinsic gate/backgate capacitance or CAPMOD2 bulk thermal
+derivative, the independent stored-charge finite differences qualify the
+physical Jacobian at the original tolerance. The separate 120-record
+intrinsic gradient fixture and generator document that correction. Native
+DC distributed-body and reverse gate-current Jacobian omissions are likewise
+not copied into the physical conservative assembly.

@@ -323,15 +323,12 @@ fn group_candidate_replays_and_does_not_mutate_reference() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn native_clamped_terminal_residual_and_admittance() -> TestResult {
-    let fixture = include_str!("fixtures/bsimsoi-clamped-ngspice47.txt");
+fn native_card(fixture: &str) -> TestResult<Vec<(&str, ParameterValue)>> {
     let card = fixture
         .lines()
         .find_map(|line| line.strip_prefix("# model-card "))
         .ok_or("native model card")?;
-    let raw_card = card
-        .split_whitespace()
+    card.split_whitespace()
         .map(|assignment| -> TestResult<(&str, ParameterValue)> {
             let (name, value) = assignment.split_once('=').ok_or("model assignment")?;
             let spec = ModelVariant::BsimSoi
@@ -344,7 +341,93 @@ fn native_clamped_terminal_residual_and_admittance() -> TestResult {
             };
             Ok((name, value))
         })
-        .collect::<TestResult<Vec<_>>>()?;
+        .collect::<TestResult<Vec<_>>>()
+}
+
+type NativePoint = (bool, i32, i32, i32, bool, usize);
+type NativeGradients = std::collections::BTreeMap<NativePoint, [f64; 5]>;
+
+fn native_charge_gradients() -> TestResult<NativeGradients> {
+    let mut gradients = NativeGradients::new();
+    let fixture = include_str!("fixtures/bsimsoi-intrinsic-charge-gradients-ngspice47.txt");
+    for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(fields.len(), 11);
+        let key = (
+            fields[0] == "1",
+            fields[1].parse()?,
+            fields[2].parse()?,
+            fields[3].parse()?,
+            fields[4] == "1",
+            fields[5].parse()?,
+        );
+        let values = fields[6..]
+            .iter()
+            .map(|value| value.parse::<f64>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let values: [f64; 5] = values.try_into().map_err(|_| "intrinsic gradient width")?;
+        assert!(gradients.insert(key, values).is_none());
+    }
+    assert_eq!(gradients.len(), 120);
+    Ok(gradients)
+}
+
+/// The clamped native circuit is a valid oracle except for two documented
+/// defects in its analytical capacitance stamp. Correct the reference using
+/// independent finite differences of *native* charge values, never Rust values.
+fn physical_native_capacitance(
+    native: f64,
+    case: NativeCase,
+    gradients: &NativeGradients,
+) -> TestResult<f64> {
+    let (pmos, soi, cap, heat, reverse, axis, row) = case;
+    if soi != 0 && (axis == 3 || (axis == 5 && soi != 2)) {
+        // B4SOIacLoad hard-codes xcgeb=-GEoverlapCap and calculates
+        // the normalized source/backgate column by conservation with that
+        // intrinsic contribution omitted. It also puts the missing gate/E
+        // derivative in the gate/body column (when the body exists).
+        let intrinsic_gate_e = gradients
+            .get(&(pmos, soi, cap, heat, reverse, 3))
+            .ok_or("native backgate gradient")?[1];
+        let correction = if axis == 3 {
+            intrinsic_gate_e
+        } else {
+            -intrinsic_gate_e
+        };
+        let normalized_source = if reverse { 0 } else { 2 };
+        return Ok(if row == 1 {
+            native + correction
+        } else if row == normalized_source {
+            native - correction
+        } else {
+            native
+        });
+    }
+    if cap == 2 && heat != 0 && soi != 2 && axis == 6 {
+        // B4SOIload computes dqbulk/dT with dAbulk/dT instead of
+        // dAbulkCV/dT. This fixture has zero sidewall temperature
+        // coefficients; reverse-junction diffusion storage contributes below
+        // the original absolute capacitance tolerance. Direct native charge
+        // differences supply the body and normalized drain derivatives.
+        let gradient = gradients
+            .get(&(pmos, soi, cap, heat, reverse, 6))
+            .ok_or("native thermal gradient")?;
+        let normalized_drain = if reverse { 2 } else { 0 };
+        if row == normalized_drain {
+            return Ok(gradient[row]);
+        }
+        if row == 5 {
+            return Ok(gradient[4]);
+        }
+    }
+    Ok(native)
+}
+
+#[test]
+fn native_clamped_terminal_residual_and_admittance() -> TestResult {
+    let fixture = include_str!("fixtures/bsimsoi-clamped-ngspice47.txt");
+    let raw_card = native_card(fixture)?;
+    let gradients = native_charge_gradients()?;
     let mut count = 0;
     let mut mismatches = Vec::new();
     let mut compare =
@@ -413,7 +496,11 @@ fn native_clamped_terminal_residual_and_admittance() -> TestResult {
             );
             compare(
                 point.c[row * 7 + excite],
-                -data[15 + 2 * row] / (2. * std::f64::consts::PI * 1e6),
+                physical_native_capacitance(
+                    -data[15 + 2 * row] / (2. * std::f64::consts::PI * 1e6),
+                    context,
+                    &gradients,
+                )?,
                 3e-4,
                 2e-20,
                 (context, "AC imaginary"),
