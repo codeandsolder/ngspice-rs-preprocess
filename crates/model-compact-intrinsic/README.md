@@ -999,6 +999,25 @@ Cardano expression and a Newton refinement; 320 native cases cover its charge
 and gradient. These are intrinsic electrostatic primitives, not yet the complete
 coupled HiSIM-HV channel evaluation.
 
+### HiSIM-HV material preparation and intrinsic bias conditioning
+
+The material preparation law retains original instance parameter presence,
+including optional DFM doping overrides, and prepares width/STI-corrected
+pocket and bulk doping, pocket overlap, native reference potentials, and
+version-specific drain smoothing. Its local-temperature evaluation supplies
+the physical Poisson coefficients and HV2 depletion-mode potentials. Native
+static material references cover 192 cases, with independent thermal
+finite differences for each case.
+
+The body conditioning law retains native forward-body confinement, its
+first and mixed derivatives, and the zero-drain symmetry polynomial. The
+1280-case effective drain smoothing oracle covers both native versions,
+including the positive square-root smoothing and drain saturation. The
+2688-case body bias oracle checks all seven returned scalars and their
+intrinsic gradients. Zero-drain limits and depletion-mode material selection
+are tested separately. The laws accept actual intrinsic model states rather
+than inventing replacement terminal potentials.
+
 ## Reference test coverage
 
 `tests/fixtures/*.names` contains **only parameter names** extracted from eight

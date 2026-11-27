@@ -3,8 +3,11 @@
 //! This is setup-stage parameter preparation, not a physical model implementation.
 
 mod accumulation;
+mod bias_conditioning;
+mod drain_smoothing;
 mod edge_tunneling;
 mod effective;
+mod electrostatic_material;
 mod fringing;
 mod gate_tunneling;
 mod gidl;
@@ -21,11 +24,22 @@ mod transport;
 pub use accumulation::{
     HiSimHvAccumulationInputs, HiSimHvAccumulationPoint, evaluate_hisim_hv_accumulation,
 };
+pub use bias_conditioning::{
+    HiSimHvBiasConditioningInputs, HiSimHvBiasConditioningPoint,
+    evaluate_hisim_hv_bias_conditioning,
+};
+pub use drain_smoothing::{
+    HiSimHvDrainSmoothingInputs, HiSimHvDrainSmoothingPoint, evaluate_hisim_hv_drain_smoothing,
+};
 pub use edge_tunneling::{
     HiSimHvEdgeTunnelingCurrent, HiSimHvEdgeTunnelingCurrents, PreparedHiSimHvEdgeTunneling,
     prepare_hisim_hv_edge_tunneling,
 };
 pub use effective::HiSimHvEffectiveGeometry;
+pub use electrostatic_material::{
+    HiSimHvDepletionMaterialPoint, HiSimHvElectrostaticMaterialPoint,
+    PreparedHiSimHvElectrostaticMaterial, prepare_hisim_hv_electrostatic_material,
+};
 pub use fringing::{HiSimHvFringingCharges, PreparedHiSimHvFringing, prepare_hisim_hv_fringing};
 pub use gate_tunneling::{
     HiSimHvGateChannelState, HiSimHvGateTunnelingCurrents, PreparedHiSimHvGateTunneling,
