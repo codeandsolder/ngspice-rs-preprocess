@@ -11,6 +11,7 @@ use model_kernel_bsim::soi::{BsimSoiGroup, BsimSoiKernel, Instance};
 use std::sync::Arc;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+type NativeCase = (bool, i32, i32, i32, bool, usize, usize);
 
 fn model(
     pmos: bool,
@@ -128,7 +129,7 @@ fn sample(
 }
 fn close(a: f64, b: f64, rel: f64, abs: f64, context: impl std::fmt::Debug) {
     assert!(
-        (a - b).abs() <= rel * a.abs().max(b.abs()) + abs,
+        (a - b).abs() <= rel.mul_add(a.abs().max(b.abs()), abs),
         "{context:?}: {a:e} vs {b:e}"
     );
 }
@@ -143,7 +144,6 @@ fn coordinates(a: &Artifact<BsimSoiKernel>, pmos: bool, reverse: bool) -> Vec<f6
                 "drain" => d + 0.01,
                 "drain_prime" => d,
                 "source" => -0.005,
-                "source_prime" => 0.,
                 "gate" => 1.25,
                 "gate_prime" => 1.2,
                 "gate_mid" => 1.23,
@@ -346,6 +346,17 @@ fn native_clamped_terminal_residual_and_admittance() -> TestResult {
         })
         .collect::<TestResult<Vec<_>>>()?;
     let mut count = 0;
+    let mut mismatches = Vec::new();
+    let mut compare =
+        |actual: f64, expected: f64, relative: f64, absolute: f64, context: (NativeCase, &str)| {
+            if !actual.is_finite()
+                || !expected.is_finite()
+                || (actual - expected).abs()
+                    > relative.mul_add(actual.abs().max(expected.abs()), absolute)
+            {
+                mismatches.push(format!("{context:?}: {actual:e} vs {expected:e}"));
+            }
+        };
     let mut group = None;
     for line in fixture.lines().filter(|line| !line.starts_with('#')) {
         let values = line.split_whitespace().collect::<Vec<_>>();
@@ -391,16 +402,16 @@ fn native_clamped_terminal_residual_and_admittance() -> TestResult {
         assert_eq!(point.f.len(), 7);
         for row in 0..7 {
             let context = (pmos, soi, cap, heat, reverse, excite, row);
-            close(point.f[row], -data[7 + row], 3e-5, 2e-13, (context, "DC"));
+            compare(point.f[row], -data[7 + row], 3e-5, 2e-13, (context, "DC"));
             // Native current-source signs are opposite to residual signs.
-            close(
+            compare(
                 point.g[row * 7 + excite],
                 -data[14 + 2 * row],
                 3e-4,
                 2e-10,
                 (context, "AC real"),
             );
-            close(
+            compare(
                 point.c[row * 7 + excite],
                 -data[15 + 2 * row] / (2. * std::f64::consts::PI * 1e6),
                 3e-4,
@@ -411,5 +422,11 @@ fn native_clamped_terminal_residual_and_admittance() -> TestResult {
         count += 1;
     }
     assert_eq!(count, 336);
+    assert!(
+        mismatches.is_empty(),
+        "{} native mismatches:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
     Ok(())
 }
