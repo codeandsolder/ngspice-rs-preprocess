@@ -192,3 +192,37 @@ fn active_model_and_subcircuit_aliases_use_evaluated_source_scope() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn root_origin_selects_only_the_relative_resource() -> Result<()> {
+    for parsed in [false, true] {
+        let mut catalog = SubcircuitCatalog::new();
+        for path in ["left/child.lb", "right/child.lb"] {
+            let bytes = b".VAR N=3\n";
+            if parsed {
+                catalog.add_parsed_library(&ParsedLibrary::from_json(
+                    &parse_library(path, bytes)?.to_json()?,
+                )?)?;
+            } else {
+                catalog.add_library_named(path, bytes)?;
+            }
+        }
+        let root = b".include child.lb\nR1 1 0 {N}\n.end\n";
+        let flat =
+            model_preprocess_simplis::preprocess_netlist_at(root, &catalog, Some("left/deck.net"))?;
+        assert!(String::from_utf8(flat.bytes)?.contains("R1 1 0 3"));
+        let linked = model_preprocess_simplis::preprocess_netlist_linked_at(
+            root,
+            &catalog,
+            Some("left/deck.net"),
+        )?;
+        assert!(String::from_utf8(linked.root_bytes)?.contains("R1 1 0 3"));
+        let paths: Vec<_> = linked
+            .included_sources
+            .iter()
+            .map(|s| s.source_name.as_str())
+            .collect();
+        assert_eq!(paths, ["left/child.lb"]);
+    }
+    Ok(())
+}

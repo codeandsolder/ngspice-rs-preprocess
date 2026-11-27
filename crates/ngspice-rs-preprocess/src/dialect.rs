@@ -19,8 +19,8 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_scoped_statements, parse_library_with_budget, parse_scoped_library,
-    parse_standalone_library, preprocess_netlist_linked, project_resource, project_spice_resource,
-    source_include_target,
+    parse_standalone_library, preprocess_netlist_linked_at, project_resource,
+    project_spice_resource, source_include_target,
 };
 use model_translate_simplis::{
     WholeModelTranslation, capture_artifact_initial_conditions, capture_artifact_waveforms,
@@ -721,19 +721,21 @@ struct CompanionOrigins<'a> {
 
 fn extend_include_origins(
     origins: &mut BTreeSet<String>,
-    includes: &BTreeSet<String>,
+    includes: &BTreeSet<model_preprocess_simplis::IncludedSource>,
     sources: &BTreeMap<String, BTreeSet<String>>,
     budget: &WorkBudget,
 ) -> Result<()> {
     for source in includes {
         let paths = sources
-            .get(source)
+            .get(&source.source_id)
             .context("executed include missing admitted source origin")?;
-        for path in paths {
-            budget.charge(super::Resource::GeneratedNodes, 1)?;
-            budget.charge(super::Resource::EmittedBytes, path.len())?;
-            origins.insert(path.clone());
-        }
+        ensure!(
+            paths.contains(&source.source_name),
+            "executed include has unknown source path"
+        );
+        budget.charge(super::Resource::GeneratedNodes, 1)?;
+        budget.charge(super::Resource::EmittedBytes, source.source_name.len())?;
+        origins.insert(source.source_name.clone());
     }
     Ok(())
 }
@@ -979,7 +981,8 @@ fn linked(
                 model_selections,
             },
     } = resolve_deck(root, request, options, cancellation, session)?;
-    let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
+    let mut linked =
+        preprocess_netlist_linked_at(&expanded_root, &catalog, Some(&root.path.to_string_lossy()))?;
     extend_include_origins(
         &mut root_sources,
         &linked.included_sources,
