@@ -789,7 +789,7 @@ pub fn normalize_mapped(
     budget: &WorkBudget,
 ) -> Result<PspiceNormalization> {
     budget.charge(Resource::ScannedBytes, input.len())?;
-    let shared = super::normalize_mapped(input, kind, budget)?;
+    let shared = super::normalize_mapped(input, kind, super::NormalizationDialect::Native, budget)?;
     budget.charge(Resource::EmittedBytes, shared.model.bytes.len())?;
     let first = usize::from(kind == RootKind::Deck);
     let title_end = if first != 0 {
@@ -845,6 +845,7 @@ pub fn normalize_mapped(
     Ok(PspiceNormalization {
         mapped: MappedNormalization {
             model: crate::NormalizedModel { bytes, passes },
+            waveforms: shared.waveforms,
             input_lines,
         },
         renamed,
