@@ -301,6 +301,20 @@ fn explicit_simplis_include_program_is_identical_for_raw_and_parsed_catalogs() -
 }
 
 #[test]
+fn simplis_catalog_include_syntax_is_checked_only_in_active_branches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.net");
+    let source = ".IF 0\n.inc missing.lb unexpected\n.ENDIF\nR1 a 0 47\n.end\n";
+    fs::write(&root, source)?;
+    let req = request(InputFormat::SimplisDeck, &root);
+    let output = prepare_default(&req)?;
+    assert!(std::str::from_utf8(&output.primary.bytes)?.contains("R1 a 0 47"));
+    fs::write(&root, source.replace(".IF 0", ".IF 1"))?;
+    assert!(prepare_default(&req).is_err());
+    Ok(())
+}
+
+#[test]
 fn equal_library_content_under_multiple_names_retains_all_include_aliases() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let first = dir.path().join("first.lb");

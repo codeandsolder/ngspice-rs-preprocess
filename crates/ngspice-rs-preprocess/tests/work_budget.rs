@@ -121,6 +121,35 @@ fn repeated_empty_include_work_is_bounded_independently_of_emitted_bytes() -> Re
 }
 
 #[test]
+fn repeated_simplis_catalog_includes_charge_actual_visits() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut req = request(
+        dir.path(),
+        InputFormat::SimplisDeck,
+        ".VAR I=0\n.WHILE {I<8}\n.inc step.lb\n.ENDWHILE\nR1 1 0 {I}\n.end\n",
+    );
+    let parsed = model_preprocess_simplis::parse_library("step.lb", b".VAR I={I+1}\n")?;
+    req.libraries.push(LibraryInput::Parsed(parsed));
+    fails(
+        &req,
+        WorkLimits {
+            source_visits: 8,
+            ..WorkLimits::default()
+        },
+        "SourceVisits budget exceeded",
+    )?;
+    let prepared = run(
+        &req,
+        WorkLimits {
+            source_visits: 16,
+            ..WorkLimits::default()
+        },
+    )?;
+    assert!(std::str::from_utf8(&prepared.primary.bytes)?.contains("R1 1 0 8"));
+    Ok(())
+}
+
+#[test]
 fn cycles_are_distinct_from_acyclic_depth_exhaustion() -> Result<()> {
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("a.lib"), ".include b.lib\n")?;

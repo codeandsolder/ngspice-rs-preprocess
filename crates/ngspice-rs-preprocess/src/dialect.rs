@@ -425,7 +425,16 @@ impl<'a> SourceExpansion<'a> {
         context: DialectContext,
         line: &str,
     ) -> Result<bool> {
-        if let Some(target) = source_include_target(line)? {
+        // A SIMPLIS catalog include is interpreted only if its source
+        // statement executes. Leave invalid syntax for that active pass.
+        let target = match source_include_target(line) {
+            Ok(target) => target,
+            Err(_) if !self.standalone && self.simulator == LibrarySimulator::Simplis => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(target) = target {
             let normalized = target.replace('\\', "/");
             let target = Path::new(&normalized);
             let init = target

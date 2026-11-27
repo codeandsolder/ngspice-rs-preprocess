@@ -1555,7 +1555,7 @@ fn process_active_line(
     }
     if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
         let (name, value) = parse_assignment(assignment, state.env)
-            .with_context(|| format!("SIMPLIS assignment at line {}", line_number))?;
+            .with_context(|| format!("SIMPLIS assignment at line {line_number}"))?;
         if directive(line, "GLOBALVAR").is_some() {
             state.env.set_global(&name, value)?;
         } else {
@@ -1569,7 +1569,7 @@ fn process_active_line(
         && let Some(assignment) = directive(line, "PARAM")
     {
         let (name, value) = parse_assignment(assignment, state.env)
-            .with_context(|| format!("SIMPLIS .PARAM assignment at line {}", line_number))?;
+            .with_context(|| format!("SIMPLIS .PARAM assignment at line {line_number}"))?;
         state.env.set(&name, value);
         state.parameter_names.insert(name);
         *state.assigned_variables = state.assigned_variables.saturating_add(1);
@@ -1577,11 +1577,11 @@ fn process_active_line(
     }
     if let Some(message) = directive(line, "ERROR") {
         let (message, _) = substitute_line(message, state.env, Substitution::All)?;
-        bail!("SIMPLIS .ERROR at line {}: {}", line_number, message.trim());
+        bail!("SIMPLIS .ERROR at line {line_number}: {}", message.trim());
     }
     for unsupported in ["FOR", "ENDFOR"] {
         if directive(line, unsupported).is_some() {
-            bail!("unsupported SIMPLIS .{unsupported} at line {}", line_number);
+            bail!("unsupported SIMPLIS .{unsupported} at line {line_number}");
         }
     }
     // A runtime parameter declaration must retain its expression and
@@ -1592,7 +1592,7 @@ fn process_active_line(
         state.substitution
     };
     let (rendered, count) = substitute_line(line, state.env, mode)
-        .with_context(|| format!("SIMPLIS substitution at line {}", line_number))?;
+        .with_context(|| format!("SIMPLIS substitution at line {line_number}"))?;
     *state.substituted_expressions = state.substituted_expressions.saturating_add(count);
     state
         .env

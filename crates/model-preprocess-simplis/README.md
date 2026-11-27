@@ -66,3 +66,23 @@ validation by the downstream parser.
 source dialect has been established for them. Cumulative expansion uses shared `WorkBudget` counters from
 `model-preprocess-command`, distinct from the source-language loop limit.
 Full local/global parameter propagation is a separate policy.
+
+## Explicit catalog includes
+
+A supplied SIMPLIS library has two roles: its indexed subcircuits and
+unconditional support are available for model lookup, but its source
+program executes only when an active `.include` or `.inc` imports it.
+The imported program runs in the caller's existing compile-time scope,
+including each active loop iteration. Inactive branches do not resolve
+includes. Local `.VAR` bindings stay local; promoted `.GLOBALVAR`
+bindings are inherited by child expansion after the caller completes.
+Nested imports resolve relative to the importing resource; recursive
+imports and ambiguous supplied paths fail with diagnostics. Repeated
+imports count separately against the shared work budget. Identical
+model support is emitted once per importing scope.
+
+Parsed library archive version 7 preserves the projected root program and
+its physical line positions as part of the content identity; older
+archives must be regenerated from their source. Raw and parsed catalogs
+therefore execute the same program, rather than importing a guessed
+variable environment from indexed support.

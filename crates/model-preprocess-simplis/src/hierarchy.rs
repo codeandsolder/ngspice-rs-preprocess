@@ -48,13 +48,13 @@ struct Alias {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ActiveAlias {
+pub struct ActiveAlias {
     alias: Alias,
     source_id: String,
 }
-pub(super) type ActiveAliases = BTreeMap<String, ActiveAlias>;
+pub type ActiveAliases = BTreeMap<String, ActiveAlias>;
 
-pub(super) fn record_include_alias(
+pub fn record_include_alias(
     aliases: &mut ActiveAliases,
     source_id: &str,
     statement: &str,
@@ -365,13 +365,12 @@ fn relative_include_path(origin: Option<&str>, include: &str) -> String {
     if include.starts_with('/') || include.as_bytes().get(1) == Some(&b':') {
         return normalize_include_path(&include);
     }
-    if let Some(parent) =
-        origin.and_then(|path| path.rsplit_once(['/', '\\']).map(|(parent, _)| parent))
-    {
-        normalize_include_path(&format!("{parent}/{include}"))
-    } else {
-        normalize_include_path(&include)
-    }
+    origin
+        .and_then(|path| path.rsplit_once(['/', '\\']).map(|(parent, _)| parent))
+        .map_or_else(
+            || normalize_include_path(&include),
+            |parent| normalize_include_path(&format!("{parent}/{include}")),
+        )
 }
 
 impl SubcircuitCatalog {
@@ -3454,6 +3453,31 @@ fn preprocess_root_statements(
     })
 }
 
+fn prepare_linked_runtime(
+    bytes: Vec<u8>,
+    definition: &Definition,
+    explicit_vars: bool,
+    override_text: &str,
+    parent_runtime: Option<&RuntimeScope>,
+    external: &SubcircuitCatalog,
+) -> Result<(Vec<u8>, Option<RuntimeScope>)> {
+    if let Some(parent) = parent_runtime {
+        let actuals = if explicit_vars { "" } else { override_text };
+        let (prepared, mut runtime) =
+            RuntimeScope::prepare(&bytes, &definition.scope_id, actuals, &external.budget)
+                .with_context(|| format!("binding SIMetrix parameters for {}", definition.name))?;
+        let support = definition
+            .source_id
+            .as_deref()
+            .and_then(|source| external.source_metadata(source))
+            .map_or(&[][..], |metadata| metadata.support_lines.as_slice());
+        runtime.set_source_scope(parent, support)?;
+        Ok((prepared, Some(runtime)))
+    } else {
+        Ok((bytes, None))
+    }
+}
+
 fn make_linked_unit(
     definition: Definition,
     explicit_vars: bool,
@@ -3532,21 +3556,14 @@ fn make_linked_unit(
         .budget
         .charge(Resource::EmittedBytes, bytes.len())?;
     let (bytes, init) = merge_local_init(&bytes, init, &external.budget)?;
-    let (bytes, runtime) = if let Some(parent) = parent_runtime {
-        let actuals = if explicit_vars { "" } else { override_text };
-        let (prepared, mut runtime) =
-            RuntimeScope::prepare(&bytes, &definition.scope_id, actuals, &external.budget)
-                .with_context(|| format!("binding SIMetrix parameters for {}", definition.name))?;
-        let support = definition
-            .source_id
-            .as_deref()
-            .and_then(|source| external.source_metadata(source))
-            .map_or(&[][..], |metadata| metadata.support_lines.as_slice());
-        runtime.set_source_scope(parent, support)?;
-        (prepared, Some(runtime))
-    } else {
-        (bytes, None)
-    };
+    let (bytes, runtime) = prepare_linked_runtime(
+        bytes,
+        &definition,
+        explicit_vars,
+        override_text,
+        parent_runtime,
+        external,
+    )?;
     let specialized =
         needs_preprocessing || scoped || runtime.as_ref().is_some_and(RuntimeScope::has_bindings);
     let emitted_name = if specialized || !init.is_empty() {
@@ -3588,7 +3605,7 @@ fn link_call(
     statement: &str,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
-    caller: LinkCaller<'_>,
+    caller: &LinkCaller<'_>,
     init: InitTree,
 ) -> Result<Option<(String, LinkedUnit)>> {
     let Some((model, override_text, explicit_vars)) = call_target(statement)? else {
@@ -3610,7 +3627,7 @@ fn link_call(
         definition,
         compile_time_vars,
         override_text,
-        &caller,
+        caller,
         init,
         external,
     )?;
@@ -3710,7 +3727,7 @@ fn rewrite_linked_body(
             &statement,
             local,
             external,
-            LinkCaller {
+            &LinkCaller {
                 source: unit.definition.source_id.as_deref(),
                 scope: Some(&unit.definition.scope_id),
                 globals: unit.globals.clone(),
@@ -4034,7 +4051,7 @@ fn link_root_statements(
             &statement,
             local,
             external,
-            LinkCaller {
+            &LinkCaller {
                 source: None,
                 scope: None,
                 globals: globals.clone(),
