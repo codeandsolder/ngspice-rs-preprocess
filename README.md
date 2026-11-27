@@ -168,6 +168,11 @@ Raw catalog members and compiled members use the same occurrence binding.
 The root deck owns `PARHIER`, `XMULT_IN_EXP`, temperature defaults and
 model-selection policies. Source parameter and model aliases preserve
 electrical terminal names, nested multiplier products, and source spans.
+Mixed scalar/function `.PARAM` declarations and `.FUNC` macros use the same
+occurrence binding: `PARHIER` selects visible declarations, free symbols
+resolve in the calling occurrence and formals shadow parameters. Native
+function aliases retain nested calls and electrical probes without expanding
+expression trees in the producer. Cyclic and out-of-scope calls are diagnosed.
 Native output retains qualified OP, source DC, AC and single-interval
 transient commands. The supported model subset is nongeometric level-1
 junction diodes (including AREA/PJ, breakdown and depletion charge) and
@@ -178,8 +183,8 @@ WNFLAG, rather than native fuzzy bin matching. Version-specific parameter
 inventories reject unknown fields instead of allowing a native parser to
 ignore them.
 
-This is not blanket HSPICE equivalence. Other physical variants, source
-function hierarchy, non-HSPICE model cards inside an overridden resource,
+This is not blanket HSPICE equivalence. Other physical variants,
+non-HSPICE model cards inside an overridden resource,
 controlled transfer extensions, statistical or multi-interval analyses
 and unqualified output directives are diagnosed rather than guessed.
 See issues [#68](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/68),
