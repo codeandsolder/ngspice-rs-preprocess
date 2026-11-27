@@ -93,10 +93,19 @@ impl Statement {
 }
 
 pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
+    statements_with_digital(input, false)
+}
+
+pub fn pspice_statements(input: &[u8]) -> Result<Vec<Statement>> {
+    statements_with_digital(input, true)
+}
+
+fn statements_with_digital(input: &[u8], pspice: bool) -> Result<Vec<Statement>> {
     ensure_textual(input)?;
     let mut statements: Vec<Statement> = Vec::new();
     let mut offset = 0;
     let mut context = Context::default();
+    let mut digital = false;
     for (index, physical) in input.split_inclusive(|b| *b == b'\n').enumerate() {
         let start = offset;
         offset += physical.len();
@@ -110,14 +119,17 @@ pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
         let code_start = indent + usize::from(continuation);
         if !continuation {
             context = Context::default();
+            digital = pspice && matches!(trimmed.first(), Some(b'u' | b'U'));
         }
         let mut end = body.len();
         for at in code_start..body.len() {
-            if context.comment(
-                body,
-                at,
-                at == code_start || matches!(body[at - 1], b' ' | b'\t' | b','),
-            ) {
+            if !(digital && body[at] == b'$')
+                && context.comment(
+                    body,
+                    at,
+                    at == code_start || matches!(body[at - 1], b' ' | b'\t' | b','),
+                )
+            {
                 end = at;
                 break;
             }

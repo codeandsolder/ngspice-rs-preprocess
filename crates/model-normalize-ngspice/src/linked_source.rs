@@ -3,7 +3,7 @@
 //! This source-only stage expands library resources before `.param`/`.model`
 //! parsing. Each output physical line retains its original file and line.
 
-use crate::lexical::{normalize_nbsp, statements};
+use crate::lexical::{normalize_nbsp, pspice_statements, statements};
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{AdmittedSource, Resource, SourceSession};
 use std::path::{Path, PathBuf};
@@ -199,7 +199,7 @@ struct Record {
     logical: Vec<u8>,
 }
 
-fn records(bytes: &[u8], first_line: usize) -> Result<Vec<Record>> {
+fn records(bytes: &[u8], first_line: usize, pspice: bool) -> Result<Vec<Record>> {
     let physical_count = bytes.split_inclusive(|byte| *byte == b'\n').count();
     let normalized = normalize_nbsp(bytes);
     let normalized = normalized.as_deref().unwrap_or(bytes);
@@ -209,7 +209,11 @@ fn records(bytes: &[u8], first_line: usize) -> Result<Vec<Record>> {
     }
     let mut result = Vec::new();
     let mut cursor = 0;
-    for statement in statements(normalized)? {
+    for statement in if pspice {
+        pspice_statements(normalized)?
+    } else {
+        statements(normalized)?
+    } {
         let start = statement.line - 1;
         let end = statement
             .source_ranges(0..statement.text.len())
@@ -489,7 +493,11 @@ impl LinkState<'_> {
         if self.settings.library_syntax == LibrarySyntax::Pspice {
             check_pspice_header(body, path, kind)?;
         }
-        let records = records(body, first_line)?;
+        let records = records(
+            body,
+            first_line,
+            self.settings.library_syntax == LibrarySyntax::Pspice,
+        )?;
         if self.settings.library_syntax == LibrarySyntax::Qspice && self.stack.len() == 1 {
             self.collect_source_paths(path, &records)?;
         }

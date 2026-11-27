@@ -19,6 +19,7 @@ use std::{
     fmt::Write as _,
 };
 
+pub mod digital;
 mod instances;
 mod nodes;
 mod options;
@@ -592,7 +593,23 @@ fn rewrite(text: &str, line: usize, functions: &mut Functions) -> Result<String>
         bail!("PSpice statistical directives require a realization policy");
     }
     if lower.starts_with('u') {
-        bail!("PSpice digital U-device requires a typed digital primitive");
+        let device = digital::Device::parse(text, functions.scopes.budget())?;
+        let family = device.primitive.timing_family();
+        let name = device.timing_model.to_ascii_lowercase();
+        if let Some(model_line) = functions.scopes.find_model(functions.scope, &name)? {
+            let timing = digital::timing::Model::parse(
+                &functions.scopes.model(model_line)?,
+                functions.scopes.budget(),
+            )?;
+            ensure!(
+                timing.family == family,
+                "PSpice timing model {name} has wrong family"
+            );
+        }
+        bail!(
+            "PSpice digital U-device {} requires a transactional {family:?} runtime",
+            device.name
+        );
     }
     let Some(start) = crate::expression_start(text.as_bytes(), first.as_bytes())? else {
         return Ok(text.to_owned());
@@ -689,7 +706,7 @@ fn rewrite_statements(
 
 fn lower_body(body: &[u8], budget: &WorkBudget) -> Result<LoweredBody> {
     budget.charge(Resource::ScannedBytes, body.len())?;
-    let statements = lexical::statements(body)?;
+    let statements = lexical::pspice_statements(body)?;
     let scopes = Scopes::collect(&statements, budget)?;
     let options = options::GlobalOptions::collect(&statements)?;
     let mut functions = Functions::new(body, scopes, options)?;
