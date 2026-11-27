@@ -1,7 +1,6 @@
 use super::{
     Environment, GlobalBindings, Substitution, call_defaults, decode_simplis_text, eval_expression,
-    find_ascii_case_insensitive, parameter_assignments, preprocess_control_flow,
-    specialize_subcircuit_control_flow_with_base, specialize_subcircuit_with_base, substitute_line,
+    find_ascii_case_insensitive, parameter_assignments, preprocess_control_flow, substitute_line,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::SourceSession;
@@ -14,6 +13,7 @@ use std::{
 };
 
 mod runtime_params;
+mod source_aliases;
 mod source_includes;
 use runtime_params::RuntimeScope;
 pub(crate) use source_includes::RootIncludes;
@@ -254,6 +254,7 @@ pub struct SubcircuitCatalog {
     sources: BTreeMap<String, SourceMetadata>,
     next_anonymous_source: usize,
     explicit_sources: BTreeSet<String>,
+    active_aliases: BTreeMap<String, Alias>,
     budget: WorkBudget,
 }
 
@@ -325,6 +326,23 @@ fn normalized_source_path(path: &str) -> Vec<String> {
         }
     }
     parts
+}
+
+type IncludeCandidate<'a> = (&'a str, &'a str, &'a SourceMetadata);
+
+fn insert_include_candidate<'a>(
+    candidates: &mut BTreeMap<Vec<String>, IncludeCandidate<'a>>,
+    path: Vec<String>,
+    entry: IncludeCandidate<'a>,
+) -> Result<()> {
+    if let Some(previous) = candidates.insert(path, entry) {
+        ensure!(
+            previous.0 == entry.0,
+            "conflicting supplied library include {:?}",
+            entry.1
+        );
+    }
+    Ok(())
 }
 
 impl SubcircuitCatalog {
@@ -569,15 +587,20 @@ impl SubcircuitCatalog {
         let mut suffix = BTreeMap::new();
         let mut basename = BTreeMap::new();
         let target = include.replace('\\', "/");
-        let parent_target = parent.map(|name| {
-            let name = name.replace('\\', "/");
-            let directory = name.rsplit_once('/').map_or("", |(directory, _)| directory);
-            if directory.is_empty() {
-                target.clone()
-            } else {
-                format!("{directory}/{target}")
-            }
-        });
+        let parent_target = parent
+            .filter(|_| {
+                !target.starts_with('/')
+                    && !target.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+            })
+            .map(|name| {
+                let name = name.replace('\\', "/");
+                let directory = name.rsplit_once('/').map_or("", |(directory, _)| directory);
+                if directory.is_empty() {
+                    target.clone()
+                } else {
+                    format!("{directory}/{target}")
+                }
+            });
         for (identity, metadata) in &self.sources {
             for name in &metadata.source_names {
                 self.budget.charge(Resource::EvaluationSteps, 1)?;
@@ -586,16 +609,18 @@ impl SubcircuitCatalog {
                     name.len().saturating_add(include.len()),
                 )?;
                 let entry = (identity.as_str(), name.as_str(), metadata);
-                if parent_target.as_ref().is_some_and(|path| {
-                    normalized_source_path(name) == normalized_source_path(path)
-                }) {
-                    relative.insert(identity, entry);
+                let path = normalized_source_path(name);
+                if parent_target.as_ref().map_or_else(
+                    || path == normalized_source_path(&target),
+                    |target| path == normalized_source_path(target),
+                ) {
+                    insert_include_candidate(&mut relative, path.clone(), entry)?;
                 }
                 if path_suffix_matches(name, include) {
-                    suffix.insert(identity, entry);
+                    insert_include_candidate(&mut suffix, path.clone(), entry)?;
                 }
                 if Self::path_basename(name).eq_ignore_ascii_case(Self::path_basename(include)) {
-                    basename.insert(identity, entry);
+                    insert_include_candidate(&mut basename, path, entry)?;
                 }
             }
         }
@@ -2015,6 +2040,193 @@ fn bind_call_overrides(
     parse_overrides(input, &defaults)
 }
 
+#[derive(Debug)]
+struct IncludeScope {
+    owner: String,
+    definitions: Vec<Definition>,
+    aliases: BTreeMap<String, Alias>,
+    parent: Option<std::sync::Arc<Self>>,
+    digest: String,
+}
+
+impl IncludeScope {
+    fn new(
+        definition: &Definition,
+        captures: Vec<Definition>,
+        aliases: BTreeMap<String, Alias>,
+        parent: Option<std::sync::Arc<Self>>,
+        budget: &WorkBudget,
+    ) -> Result<Option<std::sync::Arc<Self>>> {
+        if captures.is_empty() && aliases.is_empty() {
+            return Ok(parent);
+        }
+        let mut catalog = SubcircuitCatalog::new().with_budget(budget.clone());
+        for capture in captures {
+            budget.charge(Resource::EvaluationSteps, 1)?;
+            insert_local_definition(&mut catalog, capture)?;
+        }
+        let definitions: Vec<_> = catalog.definitions.into_values().flatten().collect();
+        let mut hasher = Sha256::new();
+        hasher.update(definition.scope_id.as_bytes());
+        if let Some(parent) = &parent {
+            hasher.update(parent.digest.as_bytes());
+        }
+        for item in &definitions {
+            budget.charge(Resource::ScannedBytes, item.bytes.len())?;
+            if let Some(source) = &item.source_id {
+                hasher.update(source.as_bytes());
+            }
+            hasher.update(item.scope_id.as_bytes());
+            if let Some(owner) = &item.owner_scope_id {
+                hasher.update(owner.as_bytes());
+            }
+        }
+        for alias in aliases.values() {
+            hasher.update(alias.name.as_bytes());
+            hasher.update([0]);
+            hasher.update(alias.target.as_bytes());
+            hasher.update([0]);
+            hasher.update(alias.kind.as_bytes());
+            hasher.update([0xff]);
+        }
+        Ok(Some(std::sync::Arc::new(Self {
+            owner: definition.scope_id.clone(),
+            definitions,
+            aliases,
+            parent,
+            digest: lower_hex(&hasher.finalize()),
+        })))
+    }
+
+    fn resolve(
+        &self,
+        name: &str,
+        caller: &Definition,
+        budget: &WorkBudget,
+    ) -> Result<Option<&Definition>> {
+        // Search the current lexical declaration scope, then its enclosing
+        // imported declaration scopes, never the dynamic invocation chain.
+        let mut scope = Some(caller.scope_id.as_str());
+        while let Some(owner) = scope {
+            budget.charge(Resource::EvaluationSteps, self.definitions.len())?;
+            if let Some(definition) = self.definitions.iter().find(|definition| {
+                definition.owner_scope_id.as_deref() == Some(owner)
+                    && definition.name.eq_ignore_ascii_case(name)
+            }) {
+                return Ok(Some(definition));
+            }
+            scope = if owner == caller.scope_id {
+                caller.owner_scope_id.as_deref()
+            } else {
+                self.definitions
+                    .iter()
+                    .find(|definition| definition.scope_id == owner)
+                    .and_then(|definition| definition.owner_scope_id.as_deref())
+            };
+            // The declaration graph is acyclic; a same-content parent and
+            // child must still not permit an unbounded walk.
+            budget.charge(Resource::EvaluationSteps, 1)?;
+        }
+        if let Some(parent) = &self.parent {
+            return parent.resolve(name, caller, budget);
+        }
+        Ok(None)
+    }
+
+    fn contains_imported(&self, definition: &Definition) -> bool {
+        self.definitions.iter().any(|item| {
+            item.scope_id == definition.scope_id
+                && item.source_id == definition.source_id
+                && item.owner_scope_id == definition.owner_scope_id
+        }) || self
+            .parent
+            .as_ref()
+            .is_some_and(|parent| parent.contains_imported(definition))
+    }
+
+    fn alias_target<'a>(
+        &'a self,
+        name: &'a str,
+        caller: &Definition,
+        budget: &WorkBudget,
+    ) -> Result<&'a str> {
+        if caller.scope_id == self.owner
+            || caller.owner_scope_id.as_deref() == Some(self.owner.as_str())
+            || self
+                .definitions
+                .iter()
+                .any(|definition| definition.scope_id == caller.scope_id)
+        {
+            let target =
+                source_aliases::resolve_alias_target(&self.aliases, name, Some("subckt"), budget)?;
+            if target != name {
+                return Ok(target);
+            }
+        }
+        if let Some(parent) = &self.parent {
+            return parent.alias_target(name, caller, budget);
+        }
+        Ok(name)
+    }
+
+    fn for_callee(
+        scope: Option<&std::sync::Arc<Self>>,
+        definition: &Definition,
+    ) -> Option<std::sync::Arc<Self>> {
+        let scope = scope?;
+        if definition.owner_scope_id.as_deref() == Some(scope.owner.as_str())
+            || scope.definitions.iter().any(|item| {
+                item.scope_id == definition.scope_id && item.source_id == definition.source_id
+            })
+        {
+            return Some(std::sync::Arc::clone(scope));
+        }
+        Self::for_callee(scope.parent.as_ref(), definition)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CallSite<'a> {
+    definition: Option<&'a Definition>,
+    imports: Option<&'a std::sync::Arc<IncludeScope>>,
+}
+
+impl CallSite<'_> {
+    fn resolve(
+        self,
+        name: &str,
+        local: &SubcircuitCatalog,
+        external: &SubcircuitCatalog,
+    ) -> Result<Option<(Definition, bool)>> {
+        let mut target = name;
+        if let (Some(caller), Some(imports)) = (self.definition, self.imports) {
+            target = imports.alias_target(target, caller, &external.budget)?;
+            if let Some(definition) = imports.resolve(target, caller, &external.budget)? {
+                return Ok(Some((definition.clone(), true)));
+            }
+        }
+        target = source_aliases::resolve_alias_target(
+            &local.active_aliases,
+            target,
+            Some("subckt"),
+            &external.budget,
+        )?;
+        resolve_definition(
+            target,
+            local,
+            external,
+            self.definition
+                .and_then(|definition| definition.source_id.as_deref()),
+            self.definition
+                .map(|definition| definition.scope_id.as_str()),
+        )
+    }
+
+    fn for_callee(self, definition: &Definition) -> Option<std::sync::Arc<IncludeScope>> {
+        IncludeScope::for_callee(self.imports, definition)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Pending {
     definition: Definition,
@@ -2022,6 +2234,7 @@ struct Pending {
     overrides: Environment,
     inherited: GlobalBindings,
     local_key: Option<String>,
+    imports: Option<std::sync::Arc<IncludeScope>>,
 }
 
 /// Portion of a logical statement preceding an unquoted semicolon comment.
@@ -2271,21 +2484,22 @@ fn rewrite_call(
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
     state: &mut FlatExpansion,
-    caller: (Option<&str>, Option<&str>),
+    caller: CallSite<'_>,
     inherited: GlobalBindings,
 ) -> Result<Option<(String, Pending)>> {
     let Some((model, override_text, explicit_vars)) = call_target(statement)? else {
         return Ok(None);
     };
-    let Some((definition, is_local)) =
-        resolve_definition(model, local, external, caller.0, caller.1)?
-    else {
+    let Some((definition, is_local)) = caller.resolve(model, local, external)? else {
         if explicit_vars {
             bail!("unresolved parameterized SIMPLIS subcircuit {model}");
         }
         return Ok(None);
     };
-    if inherited.is_empty()
+    let imports = caller.for_callee(&definition);
+    if imports.is_none()
+        && model.eq_ignore_ascii_case(&definition.name)
+        && inherited.is_empty()
         && !explicit_vars
         && let Some(plain) = plain_dependency_closure(&definition, local, external)?
     {
@@ -2318,6 +2532,7 @@ fn rewrite_call(
             overrides,
             inherited,
             local_key,
+            imports,
         },
     )))
 }
@@ -2495,6 +2710,66 @@ struct FlatExpansion {
     active: Vec<SpecializationIdentity>,
 }
 
+struct OccurrenceSpecialization {
+    bytes: Vec<u8>,
+    globals: GlobalBindings,
+    imports: Option<std::sync::Arc<IncludeScope>>,
+    source_ids: BTreeSet<String>,
+}
+
+fn specialize_occurrence(
+    definition: &Definition,
+    inherited: &Environment,
+    overrides: &Environment,
+    substitute: bool,
+    external: &SubcircuitCatalog,
+    imports: Option<std::sync::Arc<IncludeScope>>,
+) -> Result<OccurrenceSpecialization> {
+    let mut includes = (external.simulator != Some(LibrarySimulator::Simetrix)
+        && definition_has_include(definition))
+    .then(|| source_includes::RootIncludes::for_definition(external, definition));
+    let specialized = crate::specialize_subcircuit_with_base_mode(
+        &definition.bytes,
+        inherited,
+        overrides,
+        substitute,
+        includes.as_mut(),
+    )?;
+    let (captures, source_ids) = includes.map_or_else(
+        || (Vec::new(), BTreeSet::new()),
+        source_includes::RootIncludes::into_captures,
+    );
+    let mut bytes = specialized.bytes;
+    let mut aliases = BTreeMap::new();
+    if external.simulator != Some(LibrarySimulator::Simetrix)
+        && std::str::from_utf8(&bytes)?
+            .lines()
+            .any(|line| is_directive(line, "ALIAS"))
+    {
+        let mut statements = logical_statements(
+            &std::str::from_utf8(&bytes)?
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+        aliases = source_aliases::materialize(&mut statements, external)?;
+        let len = statements
+            .iter()
+            .map(|line| line.len().saturating_add(1))
+            .fold(0usize, usize::saturating_add);
+        external.budget.charge(Resource::EmittedBytes, len)?;
+        bytes = statements.join("\n").into_bytes();
+        bytes.push(b'\n');
+    }
+    let imports = IncludeScope::new(definition, captures, aliases, imports, &external.budget)?;
+    Ok(OccurrenceSpecialization {
+        bytes,
+        globals: specialized.environment.globals,
+        imports,
+        source_ids,
+    })
+}
+
 fn emit_pending(
     pending: &Pending,
     local: &SubcircuitCatalog,
@@ -2523,15 +2798,14 @@ fn emit_pending(
     );
     state.active.push(identity);
     let inherited = Environment::inherited(pending.inherited.clone(), external.budget.clone());
-    let specialized = if pending.definition.parameterized || !pending.overrides.is_empty() {
-        specialize_subcircuit_with_base(&pending.definition.bytes, &inherited, &pending.overrides)
-    } else {
-        specialize_subcircuit_control_flow_with_base(
-            &pending.definition.bytes,
-            &inherited,
-            &pending.overrides,
-        )
-    }
+    let specialized = specialize_occurrence(
+        &pending.definition,
+        &inherited,
+        &pending.overrides,
+        pending.definition.parameterized || !pending.overrides.is_empty(),
+        external,
+        pending.imports.clone(),
+    )
     .with_context(|| {
         format!(
             "specializing SIMPLIS subcircuit {}",
@@ -2548,11 +2822,11 @@ fn emit_pending(
             local,
             external,
             state,
-            (
-                pending.definition.source_id.as_deref(),
-                Some(&pending.definition.scope_id),
-            ),
-            specialized.environment.globals.clone(),
+            CallSite {
+                definition: Some(&pending.definition),
+                imports: specialized.imports.as_ref(),
+            },
+            specialized.globals.clone(),
         )? {
             if let Some(key) = &child.local_key {
                 state.specialized_local.insert(key.clone());
@@ -2624,7 +2898,7 @@ pub fn preprocess_netlist(
 ) -> Result<PreprocessedNetlist> {
     let PreparedRoot {
         mut extracted,
-        statements: root_statements,
+        statements: mut root_statements,
         globals,
         explicit_sources,
     } = prepare_root(input, external)?;
@@ -2638,6 +2912,9 @@ pub fn preprocess_netlist(
     }
     let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
     local.explicit_sources = explicit_sources;
+    if external.simulator != Some(LibrarySimulator::Simetrix) {
+        local.active_aliases = source_aliases::materialize(&mut root_statements, external)?;
+    }
     let mut retained_local = Vec::new();
     let mut removed_local = 0usize;
     for definition in extracted.definitions {
@@ -2668,7 +2945,10 @@ pub fn preprocess_netlist(
             &local,
             external,
             &mut state,
-            (None, None),
+            CallSite {
+                definition: None,
+                imports: None,
+            },
             globals.clone(),
         )? {
             if let Some(key) = &root_pending.local_key {
@@ -2951,13 +3231,17 @@ struct LinkedUnit {
     globals: GlobalBindings,
     runtime: Option<RuntimeScope>,
     init: InitTree,
+    imports: Option<std::sync::Arc<IncludeScope>>,
+    included_sources: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct LinkedLibraryBuilder {
     source_name: String,
     support_lines: Vec<String>,
+    support_materialized: bool,
     dependencies: BTreeSet<String>,
+    included_sources: BTreeSet<String>,
     output: String,
 }
 
@@ -2967,12 +3251,14 @@ pub struct LinkedGeneratedLibrary {
     pub source_name: String,
     pub filename: String,
     pub dependencies: Vec<String>,
+    pub included_sources: BTreeSet<String>,
     pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LinkedPreprocessedNetlist {
     pub root_bytes: Vec<u8>,
+    pub included_sources: BTreeSet<String>,
     pub libraries: Vec<LinkedGeneratedLibrary>,
     pub stats: NetlistPreprocessStats,
 }
@@ -3026,6 +3312,7 @@ fn linked_specialization_name(
     overrides: &Environment,
     globals: &GlobalBindings,
     init: &InitTree,
+    imports: Option<&IncludeScope>,
 ) -> String {
     let mut hasher = Sha256::new();
     if let Some(source_id) = &definition.source_id {
@@ -3057,6 +3344,10 @@ fn linked_specialization_name(
             update_value_hash(&mut hasher, value);
             hasher.update([0xff]);
         }
+    }
+    if let Some(imports) = imports {
+        hasher.update(b"lexical-includes\0");
+        hasher.update(imports.digest.as_bytes());
     }
     init.hash_into(&mut hasher);
     let digest = lower_hex(&hasher.finalize());
@@ -3121,10 +3412,17 @@ fn is_preprocessor_control(line: &str) -> bool {
     })
 }
 
+fn definition_has_include(definition: &Definition) -> bool {
+    String::from_utf8_lossy(&definition.bytes)
+        .lines()
+        .any(|line| is_directive(line, "INCLUDE") || is_directive(line, "INC"))
+}
+
 fn definition_uses_preprocessor(definition: &Definition) -> bool {
     String::from_utf8_lossy(&definition.bytes)
         .lines()
-        .any(is_preprocessor_control)
+        .any(|line| is_preprocessor_control(line) || is_directive(line, "ALIAS"))
+        || definition_has_include(definition)
 }
 
 struct PreparedRoot {
@@ -3181,6 +3479,7 @@ fn make_linked_unit(
     init: InitTree,
     parent_runtime: Option<&RuntimeScope>,
     external: &SubcircuitCatalog,
+    imports: Option<std::sync::Arc<IncludeScope>>,
 ) -> Result<LinkedUnit> {
     let overrides = if explicit_vars {
         bind_call_overrides(&definition, override_text, inherited)?
@@ -3198,8 +3497,14 @@ fn make_linked_unit(
         if !init.is_empty() {
             bail!("SIMPLIS .INIT is not supported inside protected Microchip PWM replacement");
         }
-        let emitted_name =
-            linked_specialization_name(&definition, None, &overrides, &inherited.globals, &init);
+        let emitted_name = linked_specialization_name(
+            &definition,
+            None,
+            &overrides,
+            &inherited.globals,
+            &init,
+            imports.as_deref(),
+        );
         return Ok(LinkedUnit {
             definition,
             emitted_name,
@@ -3207,6 +3512,8 @@ fn make_linked_unit(
             globals: inherited.globals.clone(),
             runtime: None,
             init,
+            imports,
+            included_sources: BTreeSet::new(),
         });
     }
 
@@ -3214,16 +3521,28 @@ fn make_linked_unit(
     let needs_substitution = definition.parameterized || explicit_vars;
     let needs_control_flow = definition_uses_preprocessor(&definition);
     let needs_preprocessing = needs_substitution || needs_control_flow || !inherited.is_empty();
-    let (bytes, globals) = if needs_preprocessing {
-        let specialized = if needs_substitution {
-            specialize_subcircuit_with_base(&definition.bytes, inherited, &overrides)
-        } else {
-            specialize_subcircuit_control_flow_with_base(&definition.bytes, inherited, &overrides)
-        }
-        .with_context(|| format!("specializing SIMPLIS subcircuit {}", definition.name))?;
-        (specialized.bytes, specialized.environment.globals)
+    let OccurrenceSpecialization {
+        bytes,
+        globals,
+        imports,
+        source_ids: included_sources,
+    } = if needs_preprocessing || imports.is_some() {
+        specialize_occurrence(
+            &definition,
+            inherited,
+            &overrides,
+            needs_substitution,
+            external,
+            imports,
+        )
+        .with_context(|| format!("specializing SIMPLIS subcircuit {}", definition.name))?
     } else {
-        (definition.bytes.clone(), inherited.globals.clone())
+        OccurrenceSpecialization {
+            bytes: definition.bytes.clone(),
+            globals: inherited.globals.clone(),
+            imports,
+            source_ids: BTreeSet::new(),
+        }
     };
     external
         .budget
@@ -3244,10 +3563,19 @@ fn make_linked_unit(
     } else {
         (bytes, None)
     };
-    let specialized =
-        needs_preprocessing || scoped || runtime.as_ref().is_some_and(RuntimeScope::has_bindings);
+    let specialized = needs_preprocessing
+        || scoped
+        || imports.is_some()
+        || runtime.as_ref().is_some_and(RuntimeScope::has_bindings);
     let emitted_name = if specialized || !init.is_empty() {
-        linked_specialization_name(&definition, Some(&bytes), &overrides, &globals, &init)
+        linked_specialization_name(
+            &definition,
+            Some(&bytes),
+            &overrides,
+            &globals,
+            &init,
+            imports.as_deref(),
+        )
     } else {
         linked_plain_name(&definition)?
     };
@@ -3258,13 +3586,14 @@ fn make_linked_unit(
         globals,
         runtime,
         init,
+        imports,
+        included_sources,
     })
 }
 
 #[derive(Clone)]
 struct LinkCaller<'a> {
-    source: Option<&'a str>,
-    scope: Option<&'a str>,
+    site: CallSite<'a>,
     globals: GlobalBindings,
     runtime: Option<&'a RuntimeScope>,
 }
@@ -3279,11 +3608,10 @@ fn link_call(
     let Some((model, override_text, explicit_vars)) = call_target(statement)? else {
         return Ok(None);
     };
-    let Some((definition, _is_local)) =
-        resolve_definition(model, local, external, caller.source, caller.scope)?
-    else {
+    let Some((definition, _is_local)) = caller.site.resolve(model, local, external)? else {
         bail!("unresolved SIMPLIS subcircuit {model} in linkable preprocessing");
     };
+    let imports = caller.site.for_callee(&definition);
     let inherited = Environment::inherited(caller.globals, external.budget.clone());
     let compile_time_vars = explicit_vars || definition.parameterized;
     let unit = make_linked_unit(
@@ -3294,6 +3622,7 @@ fn link_call(
         init,
         caller.runtime,
         external,
+        imports,
     )?;
     let rewritten = if !compile_time_vars
         && let (Some(caller), Some(callee)) = (caller.runtime, &unit.runtime)
@@ -3318,14 +3647,18 @@ fn initialize_linked_builder(
     source_name: &str,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
+    captured: bool,
 ) -> Result<()> {
     if builder.source_name.is_empty() {
         source_name.clone_into(&mut builder.source_name);
-        if !local.explicit_sources.contains(source_id)
-            && external.source_metadata(source_id).is_some()
-        {
-            builder.support_lines = external.materialized_support(source_id)?;
-        }
+    }
+    if !captured
+        && !builder.support_materialized
+        && !local.explicit_sources.contains(source_id)
+        && external.source_metadata(source_id).is_some()
+    {
+        builder.support_lines = external.materialized_support(source_id)?;
+        builder.support_materialized = true;
     }
     Ok(())
 }
@@ -3394,8 +3727,10 @@ fn rewrite_linked_body(
             local,
             external,
             LinkCaller {
-                source: unit.definition.source_id.as_deref(),
-                scope: Some(&unit.definition.scope_id),
+                site: CallSite {
+                    definition: Some(&unit.definition),
+                    imports: unit.imports.as_ref(),
+                },
                 globals: unit.globals.clone(),
                 runtime: unit.runtime.as_ref(),
             },
@@ -3442,6 +3777,10 @@ fn emit_linked_unit(
     let (source_id, source_name) = linked_source(unit)?;
     let source_id = source_id.to_owned();
     let source_name = source_name.to_owned();
+    let captured = unit
+        .imports
+        .as_ref()
+        .is_some_and(|scope| scope.contains_imported(&unit.definition));
     let seen_key = (source_id.clone(), unit.emitted_name.clone());
     anyhow::ensure!(
         !active.contains(&seen_key),
@@ -3461,9 +3800,10 @@ fn emit_linked_unit(
             overrides: overrides.charged_clone()?,
             inherited: GlobalBindings::default(),
             local_key: None,
+            imports: None,
         };
         let builder = builders.entry(source_id.clone()).or_default();
-        initialize_linked_builder(builder, &source_id, &source_name, local, external)?;
+        initialize_linked_builder(builder, &source_id, &source_name, local, external, captured)?;
         let before = builder.output.len();
         emit_microchip_complementary_pwm(&pending, &mut builder.output)?;
         external
@@ -3485,8 +3825,11 @@ fn emit_linked_unit(
         dependencies,
     } = rewrite_linked_body(unit, bytes, &source_id, local, external)?;
     let builder = builders.entry(source_id.clone()).or_default();
-    initialize_linked_builder(builder, &source_id, &source_name, local, external)?;
+    initialize_linked_builder(builder, &source_id, &source_name, local, external, captured)?;
     builder.dependencies.extend(dependencies);
+    builder
+        .included_sources
+        .extend(unit.included_sources.iter().cloned());
     append_linked_body(
         builder,
         &header,
@@ -3677,7 +4020,9 @@ fn link_root_statements(
         if is_directive(&statement, "INIT") {
             continue;
         }
-        if external.matches_supplied_include(&statement)? {
+        if external.simulator == Some(LibrarySimulator::Simetrix)
+            && external.matches_supplied_include(&statement)?
+        {
             root_output.push_str("* ngspice-rs-preprocess: consumed supplied SIMPLIS include ");
             root_output.push_str(statement.trim());
             root_output.push('\n');
@@ -3691,8 +4036,10 @@ fn link_root_statements(
             local,
             external,
             LinkCaller {
-                source: None,
-                scope: None,
+                site: CallSite {
+                    definition: None,
+                    imports: None,
+                },
                 globals: globals.clone(),
                 runtime,
             },
@@ -3775,7 +4122,7 @@ fn include_referenced_device_model_libraries(
             .source_name
             .clone();
         let builder = builders.entry(source_id.clone()).or_default();
-        initialize_linked_builder(builder, &source_id, &source_name, local, external)?;
+        initialize_linked_builder(builder, &source_id, &source_name, local, external, false)?;
     }
     Ok(())
 }
@@ -3814,7 +4161,7 @@ pub fn preprocess_netlist_linked(
 
     let PreparedRoot {
         mut extracted,
-        statements: root_statements,
+        statements: mut root_statements,
         globals,
         explicit_sources,
     } = prepare_root(input, external)?;
@@ -3829,6 +4176,9 @@ pub fn preprocess_netlist_linked(
 
     let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
     local.explicit_sources = explicit_sources;
+    if external.simulator != Some(LibrarySimulator::Simetrix) {
+        local.active_aliases = source_aliases::materialize(&mut root_statements, external)?;
+    }
     for definition in &extracted.definitions {
         insert_local_definition(&mut local, definition.clone())?;
     }
@@ -3896,6 +4246,7 @@ pub fn preprocess_netlist_linked(
             source_id,
             source_name: builder.source_name,
             dependencies: builder.dependencies.into_iter().collect(),
+            included_sources: builder.included_sources,
             bytes: output.into_bytes(),
         });
     }
@@ -3908,6 +4259,7 @@ pub fn preprocess_netlist_linked(
     external.budget.check()?;
     Ok(LinkedPreprocessedNetlist {
         root_bytes: root_output.into_bytes(),
+        included_sources: local.explicit_sources,
         libraries,
         stats: NetlistPreprocessStats {
             root_specializations,

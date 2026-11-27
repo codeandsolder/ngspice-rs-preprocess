@@ -1363,6 +1363,13 @@ fn process_while(
             "SIMPLIS .WHILE at line {line} exceeded implementation ceiling {MAX_WHILE_ITERATIONS} iterations"
         );
         process_range(lines, start + 1, end, state)?;
+        if state
+            .includes
+            .as_ref()
+            .is_some_and(|includes| includes.ended())
+        {
+            return Ok(());
+        }
         iterations += 1;
     }
 }
@@ -1376,6 +1383,13 @@ fn process_range(
     let _depth = state.env.budget.enter()?;
     let mut index = start;
     while index < end {
+        if state
+            .includes
+            .as_ref()
+            .is_some_and(|includes| includes.ended())
+        {
+            break;
+        }
         let line = lines[index];
         state.env.budget.charge(Resource::Statements, 1)?;
         state
@@ -1390,6 +1404,10 @@ fn process_range(
             if let Some(target) = hierarchy::source_include_target(line)?
                 && let Some(source) = includes.enter(target)?
             {
+                state
+                    .env
+                    .budget
+                    .charge(Resource::GeneratedNodes, source.lines().count())?;
                 let nested = source.lines().collect::<Vec<_>>();
                 let result = process_range(&nested, 0, nested.len(), state);
                 if let Some(includes) = state.includes.as_deref_mut() {
@@ -1400,8 +1418,9 @@ fn process_range(
                 continue;
             }
             // A source include's .END terminates only that resource.
-            if includes.included() && directive(line, "END").is_some() {
-                break;
+            if includes.finish_source(line) {
+                index = index.saturating_add(1);
+                continue;
             }
         }
         if let Some(condition) = directive(line, "IF") {
@@ -1593,18 +1612,38 @@ fn preprocess_body_with_mode(
     initial: &Environment,
     substitute_active_lines: bool,
 ) -> Result<Preprocessed> {
+    preprocess_body_with_includes(input, initial, substitute_active_lines, None)
+}
+
+fn preprocess_body_with_includes(
+    input: &[u8],
+    initial: &Environment,
+    substitute_active_lines: bool,
+    mut includes: Option<&mut hierarchy::RootIncludes<'_>>,
+) -> Result<Preprocessed> {
     if !substitute_active_lines {
-        return preprocess_control_flow(input, initial);
+        return run_preprocess_body_with_includes(
+            input,
+            initial,
+            Substitution::Known,
+            false,
+            &mut BTreeSet::new(),
+            includes,
+        );
     }
 
     let mut discovered_names = BTreeSet::new();
-    let discovery = run_preprocess_body(
+    let discovery = run_preprocess_body_with_includes(
         input,
         initial,
         Substitution::None,
         true,
         &mut discovered_names,
+        includes.as_deref_mut(),
     )?;
+    if let Some(include) = includes.as_deref_mut() {
+        include.clear_pass();
+    }
     let mut seeded = initial.charged_clone()?;
     for name in discovered_names {
         let value = discovery
@@ -1614,12 +1653,13 @@ fn preprocess_body_with_mode(
             .clone();
         seeded.set(name, value);
     }
-    run_preprocess_body(
+    run_preprocess_body_with_includes(
         input,
         &seeded,
         Substitution::All,
         true,
         &mut BTreeSet::new(),
+        includes,
     )
 }
 
@@ -2430,15 +2470,7 @@ fn specialize_subcircuit_with_base(
     inherited: &Environment,
     overrides: &Environment,
 ) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base_mode(input, inherited, overrides, true)
-}
-
-fn specialize_subcircuit_control_flow_with_base(
-    input: &[u8],
-    inherited: &Environment,
-    overrides: &Environment,
-) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base_mode(input, inherited, overrides, false)
+    specialize_subcircuit_with_base_mode(input, inherited, overrides, true, None)
 }
 
 fn read_subcircuit_header(lines: &[&str]) -> Result<(String, usize)> {
@@ -2487,6 +2519,7 @@ fn specialize_subcircuit_with_base_mode(
     inherited: &Environment,
     overrides: &Environment,
     substitute_active_lines: bool,
+    includes: Option<&mut hierarchy::RootIncludes<'_>>,
 ) -> Result<SpecializedSubcircuit> {
     inherited
         .budget
@@ -2539,7 +2572,12 @@ fn specialize_subcircuit_with_base_mode(
         body_source.push_str(line);
         body_source.push('\n');
     }
-    let body = preprocess_body_with_mode(body_source.as_bytes(), &env, substitute_active_lines)?;
+    let body = preprocess_body_with_includes(
+        body_source.as_bytes(),
+        &env,
+        substitute_active_lines,
+        includes,
+    )?;
 
     let mut output = format!(".SUBCKT {name} {nodes}\n");
     output.push_str(std::str::from_utf8(&body.bytes)?);

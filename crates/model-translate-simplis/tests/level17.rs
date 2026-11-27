@@ -346,9 +346,10 @@ fn level17_global_models_bind_across_linked_artifacts() -> Result<()> {
         LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
     };
     let linked = LinkedPreprocessedNetlist {
+        included_sources: Default::default(),
         root_bytes: b"* Linked global source model\nVg g 0 3\nVroot d 0 1\nVchild d2 0 1\n.model RootMos NMOS (LEVEL=17 VTO=2 KP=.1)\nM1 d g 0 0 LibraryMos\nX1 d2 g 0 cell\n.include \"models.lib\"\n.end\n".to_vec(),
         libraries: vec![LinkedGeneratedLibrary {
-            source_id: "synthetic-models".into(), source_name: "models.lb".into(), filename: "models.lib".into(), dependencies: vec![],
+            source_id: "synthetic-models".into(), source_name: "models.lb".into(), filename: "models.lib".into(), dependencies: vec![], included_sources: Default::default(),
             bytes: b".model LibraryMos NMOS (LEVEL=17 VTO=1 KP=.1)\n.subckt cell d g s\nM1 d g s s RootMos\n.ends cell\n".to_vec(),
         }],
         stats: NetlistPreprocessStats { root_specializations: 0, generated_subcircuits: 1, local_parameterized_definitions_removed: 0 },
