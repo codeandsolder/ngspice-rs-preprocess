@@ -226,3 +226,29 @@ fn root_origin_selects_only_the_relative_resource() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn catalog_index_does_not_execute_root_control_programs() -> Result<()> {
+    let source = ".GLOBALVAR N=99\n.IF 0\n.SUBCKT INACTIVE 1 2\nR9 1 2 99\n.ENDS\n.MODEL INACTIVE_D D IS=99\n.ENDIF\n.SUBCKT INDEXED 1 2 VARS: A=1\nR1 1 2 {A}\n.ENDS\n";
+    for parsed in [false, true] {
+        for output in outputs(
+            "R0 1 0 {N}\nX1 1 0 INDEXED VARS: A=3\n.end\n",
+            &[("program.lb", source)],
+            parsed,
+        )? {
+            assert!(output.contains("R0 1 0 {N}"), "{output}");
+            assert!(output.contains("R1 1 2 3"), "{output}");
+            assert!(!output.contains(".GLOBALVAR"), "{output}");
+            assert!(!output.contains("INACTIVE"), "{output}");
+            assert!(!output.contains(".IF 0"), "{output}");
+        }
+        let err = outputs(
+            ".include program.lb\nX1 1 0 INACTIVE VARS: A=1\n.end\n",
+            &[("program.lb", source)],
+            parsed,
+        )
+        .expect_err("inactive definition must not resolve via the index");
+        assert!(format!("{err:#}").contains("unresolved"));
+    }
+    Ok(())
+}

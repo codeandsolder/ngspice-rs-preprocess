@@ -377,3 +377,31 @@ fn level17_global_models_bind_across_linked_artifacts() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn linked_source_include_specializations_match_analytic_resistance() -> Result<()> {
+    use model_preprocess_simplis::{SubcircuitCatalog, preprocess_netlist_linked};
+    let budget = WorkBudget::default();
+    let mut catalog = SubcircuitCatalog::new().with_budget(budget.clone());
+    catalog.add_library_named(
+        "parent.lb",
+        b".SUBCKT LOAD a b VARS: A=1\n.include resistance.lb\nR1 a b {B}\n.ENDS\n",
+    )?;
+    catalog.add_library_named("resistance.lb", b".VAR B={A+1}\n")?;
+    let source = b"* Explicit include occurrence witness\nV1 a 0 1\nV2 b 0 1\nX1 a 0 LOAD VARS: A=1\nX2 b 0 LOAD VARS: A=4\n.END\n";
+    let linked = preprocess_netlist_linked(source, &catalog)?;
+    let (root, libraries) = translate_simplis_linked_netlist(&linked, &budget)?;
+    let companions = linked
+        .libraries
+        .iter()
+        .zip(&libraries)
+        .map(|(library, translated)| (library.filename.as_str(), translated.bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let actual = run_native(&root.bytes, &companions, "op", "i(V1) i(V2)")?;
+    let row = actual.last().context("missing linked OP")?;
+    ensure!(
+        row.len() == 3 && (row[1] + 0.5).abs() < 1e-8 && (row[2] + 0.2).abs() < 1e-8,
+        "resistance witness: {row:?}"
+    );
+    Ok(())
+}
