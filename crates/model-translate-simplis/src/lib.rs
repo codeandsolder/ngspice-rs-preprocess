@@ -5,6 +5,7 @@
 //! unsupported primitive/model variants fail closed.
 
 use anyhow::{Context, Result, bail};
+use model_normalize_ngspice::pwl_resistor::{Axis, Knot, NativeBinding, validate_curve};
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -17,7 +18,8 @@ pub use whole::{
     SplitDeckTranslation, WholeModelTranslation, capture_artifact_initial_conditions,
     capture_artifact_waveforms, capture_linked_waveforms, capture_passive_initial_conditions,
     lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_deck_split,
-    translate_simplis_expanded_library, translate_simplis_linked_netlist,
+    translate_simplis_deck_with_budget, translate_simplis_expanded_library,
+    translate_simplis_expanded_library_with_budget, translate_simplis_linked_netlist,
 };
 
 /// One numeric point on a piecewise-linear characteristic.
@@ -189,34 +191,38 @@ fn write_pwl(output: &mut String, node_p: &str, node_n: &str, points: &[Point]) 
     Ok(())
 }
 
+fn resistor_knots(points: &[Point]) -> impl Iterator<Item = Knot> + '_ {
+    points.iter().map(|point| Knot {
+        voltage: point.voltage,
+        current: point.value,
+    })
+}
+
 fn validate_resistor_end_slopes(points: &[Point], current_defined: bool) -> Result<()> {
-    validate_finite_points(points)?;
-    let independent = |point: &Point| {
+    validate_curve(
         if current_defined {
-            point.value
+            Axis::Current
         } else {
-            point.voltage
+            Axis::Voltage
+        },
+        resistor_knots(points),
+    )
+}
+
+fn resistor_binding(name: &str, axis: Axis) -> NativeBinding {
+    match axis {
+        Axis::Voltage => NativeBinding::CurrentLaw {
+            source: format!("B{name}"),
+        },
+        Axis::Current => {
+            let stem = sanitized_name(name);
+            NativeBinding::VoltageLaw {
+                sensor: format!("V__{stem}_IPWLR_SENSE"),
+                source: format!("B__{stem}_IPWLR"),
+                intermediate: format!("__{stem}_IPWLR_MID"),
+            }
         }
-    };
-    let dependent = |point: &Point| {
-        if current_defined {
-            point.voltage
-        } else {
-            point.value
-        }
-    };
-    anyhow::ensure!(
-        points
-            .windows(2)
-            .all(|pair| independent(&pair[0]) < independent(&pair[1])),
-        "piecewise-linear resistor independent coordinates must be strictly increasing"
-    );
-    anyhow::ensure!(
-        dependent(&points[0]) < dependent(&points[1])
-            && dependent(&points[points.len() - 2]) < dependent(&points[points.len() - 1]),
-        "piecewise-linear resistor end segments require positive differential resistance"
-    );
-    Ok(())
+    }
 }
 
 /// Translate a SIMPLIS `VPWLR` two-terminal V-I primitive to an ngspice
@@ -232,19 +238,13 @@ pub fn translate_vpwlr(
     node_n: &str,
     points: &[Point],
 ) -> Result<Translation> {
-    validate_name(name)?;
-    validate_node(node_p)?;
-    validate_node(node_n)?;
-    validate_resistor_end_slopes(points, false)?;
-
-    let mut output = String::new();
-    write!(output, "B{name} {node_p} {node_n} I=")?;
-    write_pwl(&mut output, node_p, node_n, points)?;
-    output.push('\n');
-    Ok(Translation {
-        bytes: output.into_bytes(),
-        kind: TranslationKind::Vpwlr,
-    })
+    translate_pwl_resistor(
+        name,
+        node_p,
+        node_n,
+        points,
+        &resistor_binding(name, Axis::Voltage),
+    )
 }
 
 /// Translate a SIMPLIS `IPWLR` two-terminal I-V primitive to an ngspice
@@ -263,27 +263,55 @@ pub fn translate_ipwlr(
     node_n: &str,
     points: &[Point],
 ) -> Result<Translation> {
+    translate_pwl_resistor(
+        name,
+        node_p,
+        node_n,
+        points,
+        &resistor_binding(name, Axis::Current),
+    )
+}
+
+fn translate_pwl_resistor(
+    name: &str,
+    node_p: &str,
+    node_n: &str,
+    points: &[Point],
+    binding: &NativeBinding,
+) -> Result<Translation> {
     validate_name(name)?;
     validate_node(node_p)?;
     validate_node(node_n)?;
-    validate_resistor_end_slopes(points, true)?;
-
-    let stem = sanitized_name(name);
-    let sense = format!("V__{stem}_IPWLR_SENSE");
-    let middle = format!("__{stem}_IPWLR_MID");
     let mut output = String::new();
-    writeln!(output, "{sense} {node_p} {middle} 0")?;
-    write!(output, "B__{stem}_IPWLR {middle} {node_n} V=pwl(i({sense})")?;
-    for point in points {
-        output.push_str(", ");
-        write_number(&mut output, point.value)?;
-        output.push_str(", ");
-        write_number(&mut output, point.voltage)?;
-    }
-    output.push_str(")\n");
+    let kind = match binding {
+        NativeBinding::CurrentLaw { source } => {
+            validate_resistor_end_slopes(points, false)?;
+            write!(output, "{source} {node_p} {node_n} I=")?;
+            write_pwl(&mut output, node_p, node_n, points)?;
+            output.push('\n');
+            TranslationKind::Vpwlr
+        }
+        NativeBinding::VoltageLaw {
+            sensor,
+            source,
+            intermediate,
+        } => {
+            validate_resistor_end_slopes(points, true)?;
+            writeln!(output, "{sensor} {node_p} {intermediate} 0")?;
+            write!(output, "{source} {intermediate} {node_n} V=pwl(i({sensor})")?;
+            for point in points {
+                output.push_str(", ");
+                write_number(&mut output, point.value)?;
+                output.push_str(", ");
+                write_number(&mut output, point.voltage)?;
+            }
+            output.push_str(")\n");
+            TranslationKind::Ipwlr
+        }
+    };
     Ok(Translation {
         bytes: output.into_bytes(),
-        kind: TranslationKind::Ipwlr,
+        kind,
     })
 }
 

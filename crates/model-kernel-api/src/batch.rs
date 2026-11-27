@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use crate::{Artifact, Capability, Descriptor, Error, Kernel, Point, Result, allocate};
+use crate::{
+    Artifact, Capability, Descriptor, Error, Kernel, Point, Prepared, Result, allocate, noise,
+};
 
 /// Persistent contiguous output buffers for a homogeneous tile.
 #[derive(Debug)]
@@ -115,6 +117,35 @@ pub struct PreparedTile<K: Kernel> {
     data: Vec<K::Prepared>,
 }
 
+/// Recipe for one changed lane. Parameter order and ambient units are
+/// identical to standalone preparation.
+#[derive(Clone, Copy, Debug)]
+pub struct LaneUpdate<'a> {
+    pub lane: usize,
+    pub values: &'a [f64],
+    pub ambient_kelvin: f64,
+}
+
+/// Validated replacements holding exclusive access to the target tile.
+///
+/// Dropping this transaction leaves every original lane unchanged.
+/// Multiple disjoint tiles may be staged before any of them is committed.
+#[must_use = "commit the validated replacements or explicitly discard them"]
+pub struct LaneTransaction<'a, K: Kernel> {
+    tile: &'a mut PreparedTile<K>,
+    prepared: Vec<(usize, K::Prepared)>,
+}
+
+impl<K: Kernel> LaneTransaction<'_, K> {
+    /// Install the already prepared lanes. Cannot fail a domain or shape
+    /// check: all checks and allocation completed during staging.
+    pub fn commit(self) {
+        for (lane, data) in self.prepared {
+            self.tile.data[lane] = data;
+        }
+    }
+}
+
 impl<K: Kernel> PreparedTile<K> {
     /// Prepare an independent candidate in every lane, preserving order.
     ///
@@ -134,6 +165,140 @@ impl<K: Kernel> PreparedTile<K> {
             artifact: Arc::clone(artifact),
             data,
         })
+    }
+
+    /// Consume standalone prepared instances without preparing them again.
+    /// The destination remains one contiguous typed array, not a collection
+    /// of individually allocated or type-erased lanes.
+    ///
+    /// # Errors
+    /// Empty input, foreign artifact (even with the same fingerprint), or
+    /// allocation failure.
+    pub fn from_prepared(artifact: &Arc<Artifact<K>>, instances: Vec<Prepared<K>>) -> Result<Self> {
+        if instances.is_empty() {
+            return Err(Error::Shape("empty prepared tile"));
+        }
+        for instance in &instances {
+            artifact.check(instance)?;
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(instances.len())
+            .map_err(|_| Error::Allocation)?;
+        data.extend(instances.into_iter().map(|instance| instance.data));
+        Ok(Self {
+            artifact: Arc::clone(artifact),
+            data,
+        })
+    }
+
+    #[must_use = "the lane count determines valid lane ordinals"]
+    pub const fn lanes(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Stage only changed lanes, without cloning or preparing unaffected
+    /// physical data. Validation precedes every mutation; a failed stage or
+    /// discarded transaction leaves this candidate intact. Exclusive access
+    /// prevents stale transactions and borrowed lane evaluation during commit.
+    ///
+    /// # Errors
+    /// Foreign artifact, duplicate or out-of-range lane, allocation, or
+    /// invalid candidate inputs including structural changes.
+    pub fn stage_replacements(
+        &mut self,
+        artifact: &Artifact<K>,
+        updates: &[LaneUpdate<'_>],
+    ) -> Result<LaneTransaction<'_, K>> {
+        if !std::ptr::eq(artifact, self.artifact.as_ref()) {
+            return Err(Error::ForeignArtifact);
+        }
+        let mut ordered = Vec::new();
+        ordered
+            .try_reserve_exact(updates.len())
+            .map_err(|_| Error::Allocation)?;
+        ordered.extend_from_slice(updates);
+        ordered.sort_unstable_by_key(|update| update.lane);
+        if ordered
+            .last()
+            .is_some_and(|update| update.lane >= self.data.len())
+        {
+            return Err(Error::Shape("replacement lane"));
+        }
+        if ordered.windows(2).any(|pair| pair[0].lane == pair[1].lane) {
+            return Err(Error::Shape("duplicate replacement lane"));
+        }
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(ordered.len())
+            .map_err(|_| Error::Allocation)?;
+        for update in ordered {
+            let data = self
+                .artifact
+                .prepare_data(update.values, update.ambient_kelvin)?;
+            prepared.push((update.lane, data));
+        }
+        Ok(LaneTransaction {
+            tile: self,
+            prepared,
+        })
+    }
+
+    /// Evaluate exactly the same prepared lane used by specialized batch
+    /// dispatch, without constructing an additional scalar instance.
+    ///
+    /// # Errors
+    /// Invalid lane, input shape, domain or invalid output.
+    pub fn evaluate_lane(
+        &self,
+        lane: usize,
+        coordinates: &[f64],
+        out: &mut Point<'_>,
+    ) -> Result<()> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        self.artifact.evaluate_data(data, coordinates, out)
+    }
+
+    /// Evaluate source noise directly from the existing prepared lane.
+    ///
+    /// # Errors
+    /// Invalid lane, bias/frequency or unsupported/invalid noise.
+    pub fn evaluate_lane_noise(
+        &self,
+        lane: usize,
+        coordinates: &[f64],
+        frequency: f64,
+        sink: &mut dyn noise::Sink,
+    ) -> Result<()> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        self.artifact
+            .evaluate_noise_data(data, coordinates, frequency, sink)
+    }
+
+    /// Linearize one existing prepared lane without copying or repreparing it.
+    ///
+    /// # Errors
+    /// Invalid lane, trial coordinates or unsupported declared policy.
+    pub fn linearize_lane_trial(
+        &self,
+        lane: usize,
+        input: crate::trial::TrialInput<'_>,
+        coordinates: &mut [f64],
+    ) -> Result<crate::trial::TrialOutcome> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        crate::trial::linearize(&self.artifact, data, input, coordinates)
+    }
+
+    /// Check the additional convergence condition for one existing lane.
+    ///
+    /// # Errors
+    /// Invalid lane, sample, tolerance or unsupported declared policy.
+    pub fn check_lane_trial_convergence(
+        &self,
+        lane: usize,
+        input: crate::trial::ConvergenceInput<'_>,
+    ) -> Result<crate::trial::Convergence> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        crate::trial::convergence(&self.artifact, data, input)
     }
 
     /// Linearize each lane independently using exactly the scalar trial contract.

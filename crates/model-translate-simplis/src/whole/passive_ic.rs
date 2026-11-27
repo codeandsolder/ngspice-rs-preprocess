@@ -2,7 +2,8 @@
 
 use super::{Item, capture_artifact_items};
 use anyhow::Result;
-use model_normalize_ngspice::passive_ic::{InitialConditions, capture_statement};
+use model_normalize_ngspice::passive_ic::{Capture, InitialConditions};
+use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::LinkedPreprocessedNetlist;
 use std::fmt::Write as _;
 
@@ -79,16 +80,19 @@ fn apply_local_reactive_overrides(items: &mut [Item]) -> Result<bool> {
 
 fn capture_items(
     items: &mut [Item],
-    artifact: &str,
     scope: &[String],
-    conditions: &mut InitialConditions,
+    capture: &mut Capture<'_>,
+    budget: &WorkBudget,
 ) -> Result<bool> {
+    let _depth = budget.enter()?;
     let mut changed = apply_local_reactive_overrides(items)?;
     let mut embedded = false;
     let mut control = false;
     for item in items {
         match item {
             Item::Statement(statement) => {
+                budget.charge(Resource::Statements, 1)?;
+                budget.charge(Resource::ScannedBytes, statement.len())?;
                 if let Some(start) = crate::syntax::file_boundary(statement) {
                     embedded = start;
                     continue;
@@ -99,7 +103,7 @@ fn capture_items(
                 } else if first.eq_ignore_ascii_case(".endc") {
                     control = false;
                 } else if !embedded && !control {
-                    let rewritten = capture_statement(conditions, artifact, scope, statement)?;
+                    let rewritten = capture.statement(scope, statement)?;
                     if rewritten != *statement {
                         *statement = rewritten;
                         changed = true;
@@ -109,9 +113,9 @@ fn capture_items(
             Item::Subcircuit(block) => {
                 changed |= capture_items(
                     &mut block.body,
-                    artifact,
                     std::slice::from_ref(&block.name),
-                    conditions,
+                    capture,
+                    budget,
                 )?;
             }
         }
@@ -127,9 +131,11 @@ pub fn capture_artifact_initial_conditions(
     bytes: &mut Vec<u8>,
     filename: &str,
     conditions: &mut InitialConditions,
+    budget: &WorkBudget,
 ) -> Result<()> {
-    capture_artifact_items(bytes, |items| {
-        capture_items(items, filename, &[], conditions)
+    let mut capture = Capture::new(conditions, filename, budget)?;
+    capture_artifact_items(bytes, budget, |items| {
+        capture_items(items, &[], &mut capture, budget)
     })
 }
 
@@ -142,6 +148,7 @@ pub fn capture_artifact_initial_conditions(
 /// Invalid initialization grammar or malformed source scopes.
 pub fn capture_passive_initial_conditions(
     linked: &mut LinkedPreprocessedNetlist,
+    budget: &WorkBudget,
 ) -> Result<InitialConditions> {
     let mut conditions = InitialConditions::default();
     // Catalog support declarations are visible before root options.
@@ -150,8 +157,14 @@ pub fn capture_passive_initial_conditions(
             &mut library.bytes,
             &library.filename,
             &mut conditions,
+            budget,
         )?;
     }
-    capture_artifact_initial_conditions(&mut linked.root_bytes, "deck.cir", &mut conditions)?;
+    capture_artifact_initial_conditions(
+        &mut linked.root_bytes,
+        "deck.cir",
+        &mut conditions,
+        budget,
+    )?;
     Ok(conditions)
 }

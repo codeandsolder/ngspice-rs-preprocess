@@ -10,6 +10,7 @@ use model_normalize_ngspice::{
     model_card::{ModelCard, parse_assignments, parse_model_card, parse_spice_constant},
     parameter_scope::ModelLibrary,
 };
+use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::{
     lower_spice_expression,
     source_dialect::{
@@ -52,15 +53,32 @@ fn canonical(name: &str) -> Result<&'static str> {
 pub fn render(
     card: &ModelCard,
     name: &str,
+    budget: &WorkBudget,
     mut map: impl FnMut(&str) -> Result<String>,
 ) -> Result<String> {
+    budget.charge(
+        Resource::EmittedBytes,
+        name.len()
+            .saturating_add(card.family.len())
+            .saturating_add(11),
+    )?;
     let mut text = format!(".model {name} {} (", card.family);
     for parameter in &card.parameters {
+        budget.charge(Resource::EvaluationSteps, 1)?;
         let value = parameter
             .expression
             .as_deref()
             .context("model field requires a value")?;
-        write!(text, " {}={}", parameter.name, map(value)?)?;
+        let mapped = map(value)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            parameter
+                .name
+                .len()
+                .saturating_add(mapped.len())
+                .saturating_add(2),
+        )?;
+        write!(text, " {}={mapped}", parameter.name)?;
     }
     text.push(')');
     Ok(text)
@@ -71,19 +89,22 @@ pub fn lower(
     scope: &[String],
     dcap: u8,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<(String, ModelSelection)> {
     ensure!(
         statement.context.language == SourceLanguage::Hspice,
         "model lowering for this resource language is not qualified"
     );
-    let selection = MappingTable::select_standalone_hspice(statement, scope)?;
+    let selection = MappingTable::select_standalone_hspice(statement, scope, budget)?;
+    budget.charge(Resource::GeneratedNodes, selection.card.parameters.len())?;
+    budget.charge(Resource::EmittedBytes, statement.text.len())?;
     let mut selected = selection.clone();
     if selected.mapping.device == Device::Bsim4 {
         super::mos::qualify_model(&mut selected)?;
         let native = selected.lower()?;
         let card = parse_model_card(&native, statement.first_line, &[])?;
-        let text = render(&card, &card.name, |value| {
-            lower_spice_expression(value, statement.context, limit)
+        let text = render(&card, &card.name, budget, |value| {
+            lower_spice_expression(value, statement.context, limit, budget)
         })?;
         ensure!(
             text.len() <= limit,
@@ -116,7 +137,7 @@ pub fn lower(
     }
     let native = selected.lower()?;
     let card = parse_model_card(&native, statement.first_line, &[])?;
-    let text = render(&card, &card.name, |value| {
+    let text = render(&card, &card.name, budget, |value| {
         lower_spice_expression(
             value,
             DialectContext {
@@ -124,6 +145,7 @@ pub fn lower(
                 separator: None,
             },
             limit,
+            budget,
         )
     })?;
     ensure!(
@@ -135,15 +157,27 @@ pub fn lower(
 
 /// Resolve HSPICE's zero-breakdown sentinel after occurrence binding. A
 /// standalone include cannot assume values of parameters supplied by its caller.
-pub fn resolve_breakdown(bytes: &[u8], kind: RootKind, limit: usize) -> Result<Vec<u8>> {
+pub fn resolve_breakdown(
+    bytes: &[u8],
+    kind: RootKind,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<Vec<u8>> {
+    budget.charge(Resource::ScannedBytes, bytes.len())?;
+    budget.charge(Resource::EmittedBytes, bytes.len())?;
     let source = std::str::from_utf8(bytes)?;
     let library = if kind == RootKind::Deck {
-        Some(ModelLibrary::parse_source(bytes, kind)?)
+        Some(ModelLibrary::parse_source_with_budget(
+            bytes,
+            kind,
+            budget.clone(),
+        )?)
     } else {
         None
     };
     let mut output = String::with_capacity(bytes.len());
     for (index, line) in source.lines().enumerate() {
+        budget.charge(Resource::Statements, 1)?;
         if (index == 0 && kind == RootKind::Deck)
             || !super::analysis_plan::command(line).eq_ignore_ascii_case(".MODEL")
         {
@@ -179,7 +213,7 @@ pub fn resolve_breakdown(bytes: &[u8], kind: RootKind, limit: usize) -> Result<V
             writeln!(
                 output,
                 "{}",
-                render(&card, &card.name, |value| Ok(value.to_owned()))?
+                render(&card, &card.name, budget, |value| Ok(value.to_owned()))?
             )?;
         } else {
             writeln!(output, "{line}")?;

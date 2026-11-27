@@ -135,7 +135,7 @@ pub fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
 ///
 /// Parenthesized terminal lists and commas use the same token boundaries as
 /// native ngspice. Return the unconsumed assignment text.
-#[must_use]
+#[must_use = "the returned prefix and remainder identify the positional and assignment fields"]
 pub fn positional_prefix(input: &str) -> (Vec<(&str, usize)>, &str) {
     let mut source = Source {
         text: input,

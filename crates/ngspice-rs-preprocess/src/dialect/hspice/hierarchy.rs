@@ -10,6 +10,7 @@ use model_normalize_ngspice::{
     parameter_scope::{ModelLibrary, SubcircuitIndex},
     statement_token_spans,
 };
+use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::rewrite_parameter_symbols;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -44,8 +45,11 @@ fn collect_parameters(
     line: usize,
     actual: bool,
     parameters: &mut Parameters,
+    budget: &WorkBudget,
 ) -> Result<()> {
+    budget.charge(Resource::ScannedBytes, fields.len())?;
     for field in parse_assignments(fields)? {
+        budget.charge(Resource::GeneratedNodes, 1)?;
         let name = field.name.to_ascii_uppercase();
         ensure!(
             name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic),
@@ -63,7 +67,12 @@ fn collect_parameters(
     Ok(())
 }
 
-fn collect_definitions(source: &ModelLibrary, lines: &[&str]) -> Result<Vec<Definition>> {
+fn collect_definitions(
+    source: &ModelLibrary,
+    lines: &[&str],
+    budget: &WorkBudget,
+) -> Result<Vec<Definition>> {
+    budget.charge(Resource::GeneratedNodes, source.scopes.len())?;
     let mut definitions = (0..source.scopes.len())
         .map(|_| Definition::default())
         .collect::<Vec<_>>();
@@ -76,6 +85,8 @@ fn collect_definitions(source: &ModelLibrary, lines: &[&str]) -> Result<Vec<Defi
         .collect::<BTreeMap<_, _>>();
     let mut owner = 0;
     for (line, text) in lines.iter().enumerate().skip(1) {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, text.len())?;
         if let Some(&child) = starts.get(&line) {
             ensure!(
                 source.scopes[child].parent == Some(owner),
@@ -83,7 +94,13 @@ fn collect_definitions(source: &ModelLibrary, lines: &[&str]) -> Result<Vec<Defi
             );
             owner = child;
             let (_, fields) = positional_prefix(text);
-            collect_parameters(fields, line, false, &mut definitions[owner].parameters)?;
+            collect_parameters(
+                fields,
+                line,
+                false,
+                &mut definitions[owner].parameters,
+                budget,
+            )?;
         } else if owner != 0 && source.scopes[owner].end_line == line + 1 {
             owner = source.scopes[owner]
                 .parent
@@ -95,7 +112,13 @@ fn collect_definitions(source: &ModelLibrary, lines: &[&str]) -> Result<Vec<Defi
                     .split_once(char::is_whitespace)
                     .context("empty parameter declaration")?
                     .1;
-                collect_parameters(tail, line, false, &mut definitions[owner].parameters)?;
+                collect_parameters(
+                    tail,
+                    line,
+                    false,
+                    &mut definitions[owner].parameters,
+                    budget,
+                )?;
             }
         }
     }
@@ -111,11 +134,13 @@ fn inner(expression: &str) -> &str {
         .unwrap_or_else(|| expression.trim())
 }
 
-fn bind_values(text: &str, names: &Names, limit: usize) -> Result<String> {
-    map_values(text, limit, |value, remaining| {
+fn bind_values(text: &str, names: &Names, limit: usize, budget: &WorkBudget) -> Result<String> {
+    map_values(text, limit, budget, |value, remaining| {
         // Explicit braces make standalone positional parameters native values;
         // the common expression scanner handles expressions without renaming
         // node/current probes, function names or assignment destinations.
+        budget.charge(Resource::EvaluationSteps, value.len())?;
+        budget.charge(Resource::EmittedBytes, value.len())?;
         let tokens = statement_token_spans(value)?;
         let mut output = String::new();
         let mut previous = 0;
@@ -128,9 +153,10 @@ fn bind_values(text: &str, names: &Names, limit: usize) -> Result<String> {
             if assignment {
                 output.push_str(word);
             } else if let Some(alias) = names.get(&word.to_ascii_uppercase()) {
+                budget.charge(Resource::EmittedBytes, alias.len().saturating_add(2))?;
                 write!(output, "{{{alias}}}")?;
             } else {
-                output.push_str(&rewrite_parameter_symbols(word, names, true)?);
+                output.push_str(&rewrite_parameter_symbols(word, names, true, budget)?);
             }
             previous = range.end;
         }
@@ -223,6 +249,7 @@ impl ModelFrame {
 }
 
 struct Binder<'a> {
+    budget: &'a WorkBudget,
     source: &'a ModelLibrary,
     index: SubcircuitIndex,
     lines: &'a [&'a str],
@@ -242,6 +269,9 @@ struct Binder<'a> {
 
 impl Binder<'_> {
     fn account(&mut self, text: String, line: usize) -> Result<(String, usize)> {
+        self.budget.charge(Resource::GeneratedNodes, 1)?;
+        self.budget
+            .charge(Resource::EmittedBytes, text.len().saturating_add(1))?;
         self.emitted_bytes = self
             .emitted_bytes
             .saturating_add(text.len().saturating_add(1));
@@ -253,6 +283,7 @@ impl Binder<'_> {
     }
 
     fn fresh(&mut self, kind: char) -> Result<String> {
+        self.budget.charge(Resource::GeneratedNodes, 1)?;
         self.serial = self
             .serial
             .checked_add(1)
@@ -268,7 +299,24 @@ impl Binder<'_> {
     }
 
     fn visible(&mut self, scope: usize, parent: &Names, actuals: Parameters) -> Result<Names> {
-        let mut definitions = self.definitions[scope].parameters.clone();
+        let parameters = &self.definitions[scope].parameters;
+        self.budget.charge(
+            Resource::GeneratedNodes,
+            parameters.len().saturating_add(parent.len()),
+        )?;
+        for (name, parameter) in parameters {
+            self.budget.charge(
+                Resource::EmittedBytes,
+                name.len().saturating_add(parameter.value.len()),
+            )?;
+        }
+        for (name, alias) in parent {
+            self.budget.charge(
+                Resource::EmittedBytes,
+                name.len().saturating_add(alias.len()),
+            )?;
+        }
+        let mut definitions = parameters.clone();
         definitions.extend(actuals);
         if self.precedence == Precedence::Global {
             definitions.retain(|name, _| !parent.contains_key(name));
@@ -279,7 +327,8 @@ impl Binder<'_> {
         }
         for (name, parameter) in definitions {
             let visible = if parameter.actual { parent } else { &names };
-            let expression = rewrite_parameter_symbols(&parameter.value, visible, false)?;
+            let expression =
+                rewrite_parameter_symbols(&parameter.value, visible, false, self.budget)?;
             self.declare(&names[&name], &expression, parameter.line)?;
         }
         Ok(names)
@@ -287,7 +336,12 @@ impl Binder<'_> {
 
     fn enter_models(&mut self, scope: usize, names: &Names) -> Result<()> {
         let mut aliases = ModelFrame::default();
+        self.budget
+            .charge(Resource::GeneratedNodes, self.definitions[scope].body.len())?;
         for line in self.definitions[scope].body.clone() {
+            self.budget.charge(Resource::Statements, 1)?;
+            self.budget
+                .charge(Resource::ScannedBytes, self.lines[line].len())?;
             if analysis_plan::command(self.lines[line]) != ".MODEL" {
                 continue;
             }
@@ -299,8 +353,8 @@ impl Binder<'_> {
                 self.fresh('d')?
             };
             aliases.insert(card.name.to_ascii_uppercase(), alias.clone(), mos)?;
-            let text = models::render(&card, &alias, |value| {
-                rewrite_parameter_symbols(value, names, false)
+            let text = models::render(&card, &alias, self.budget, |value| {
+                rewrite_parameter_symbols(value, names, false, self.budget)
             })?;
             let row = self.account(text, line)?;
             self.parameters.push(row);
@@ -312,6 +366,8 @@ impl Binder<'_> {
     fn candidates(&self, mut scope: usize, model: &str, mos: bool) -> Result<Vec<mos::Candidate>> {
         let mut candidates = Vec::new();
         loop {
+            self.budget
+                .charge(Resource::EvaluationSteps, self.model_frames.len())?;
             let (_, aliases) = self
                 .model_frames
                 .iter()
@@ -319,6 +375,8 @@ impl Binder<'_> {
                 .find(|(id, _)| *id == scope)
                 .context("inactive lexical HSPICE model scope")?;
             if let Some(alias) = aliases.exact.get(model) {
+                self.budget.charge(Resource::GeneratedNodes, 1)?;
+                self.budget.charge(Resource::EmittedBytes, alias.len())?;
                 candidates.push(mos::Candidate {
                     alias: alias.clone(),
                     exact: true,
@@ -326,10 +384,14 @@ impl Binder<'_> {
                 break;
             }
             if mos && let Some(bins) = aliases.bins.get(model) {
-                candidates.extend(bins.iter().map(|alias| mos::Candidate {
-                    alias: alias.clone(),
-                    exact: false,
-                }));
+                for alias in bins {
+                    self.budget.charge(Resource::GeneratedNodes, 1)?;
+                    self.budget.charge(Resource::EmittedBytes, alias.len())?;
+                    candidates.push(mos::Candidate {
+                        alias: alias.clone(),
+                        exact: false,
+                    });
+                }
             }
             let Some(parent) = self.source.scopes[scope].parent else {
                 break;
@@ -389,15 +451,19 @@ impl Binder<'_> {
             nodes.len()
         );
         ensure!(
-            self.active.len() < 128 && !self.active.contains(&scope),
+            !self.active.contains(&scope),
             "recursive HSPICE subcircuit {}",
             target.0
         );
+        let _depth = self.budget.enter()?;
+        self.budget.charge(Resource::EvaluationSteps, 1)?;
         let mut actuals = Parameters::new();
-        collect_parameters(fields, line, true, &mut actuals)?;
+        collect_parameters(fields, line, true, &mut actuals, self.budget)?;
         let local_multiplier = actuals
             .get("M")
-            .map(|parameter| rewrite_parameter_symbols(&parameter.value, parent, false))
+            .map(|parameter| {
+                rewrite_parameter_symbols(&parameter.value, parent, false, self.budget)
+            })
             .transpose()?;
         // The X multiplier affects device multiplicity independently of the
         // ordinary M expression parameter. HSPICE defaults XMULT_IN_EXP to NO.
@@ -426,7 +492,10 @@ impl Binder<'_> {
         let opening = self.source.scopes[scope].source_line - 1;
         let closing = self.source.scopes[scope].end_line - 1;
         let mut body = vec![self.account(header, opening)?];
+        self.budget
+            .charge(Resource::GeneratedNodes, self.definitions[scope].body.len())?;
         for card in self.definitions[scope].body.clone() {
+            self.budget.charge(Resource::Statements, 1)?;
             if matches!(
                 analysis_plan::command(self.lines[card]).as_str(),
                 ".PARAM" | ".MODEL"
@@ -456,6 +525,8 @@ impl Binder<'_> {
         multiplier: Option<&str>,
     ) -> Result<String> {
         let text = self.lines[line];
+        self.budget.charge(Resource::ScannedBytes, text.len())?;
+        self.budget.charge(Resource::Statements, 1)?;
         let command = analysis_plan::command(text);
         if command.starts_with('X') {
             return self.call(owner, line, names, multiplier);
@@ -467,7 +538,7 @@ impl Binder<'_> {
         {
             return Ok(text.to_owned());
         }
-        let bound = bind_values(text, names, self.limit)?;
+        let bound = bind_values(text, names, self.limit, self.budget)?;
         let bound = if command.starts_with(['D', 'M']) {
             self.model_reference(owner, &bound, command.starts_with('M'))?
         } else {
@@ -504,7 +575,7 @@ impl Binder<'_> {
         result.append(&mut self.emitted_definitions);
         result.append(&mut ends);
         super::analysis::validate_dc_sources(&result)?;
-        mos::finish(&mut result, &self.pending_mos, mos_options)?;
+        mos::finish(&mut result, &self.pending_mos, mos_options, self.budget)?;
         Ok(result)
     }
 }
@@ -516,23 +587,27 @@ pub fn bind(
     xmult_in_exp: bool,
     mos_options: &mos::Options,
     limit: usize,
+    budget: &WorkBudget,
 ) -> Result<(Vec<u8>, Vec<OriginLine>)> {
+    budget.charge(Resource::ScannedBytes, bytes.len())?;
     let text = std::str::from_utf8(bytes)?;
+    budget.charge(Resource::Statements, text.lines().count())?;
     let lines = text.lines().collect::<Vec<_>>();
     ensure!(
         lines.len() == origins.len() && !lines.is_empty(),
         "inconsistent HSPICE source span map"
     );
-    let source = ModelLibrary::parse_source(bytes, RootKind::Deck)?;
+    let source = ModelLibrary::parse_source_with_budget(bytes, RootKind::Deck, budget.clone())?;
     let index = SubcircuitIndex::new(&source)?;
     ensure!(
         index.duplicates().is_empty(),
         "duplicate HSPICE lexical subcircuit declaration"
     );
-    let definitions = collect_definitions(&source, &lines)?;
+    let definitions = collect_definitions(&source, &lines, budget)?;
     let lower = text.to_ascii_lowercase();
     let mut prefix = String::from("hspbind_");
     while lower.contains(&prefix) {
+        budget.charge(Resource::ScannedBytes, lower.len())?;
         prefix.push('_');
     }
     // Source function macros have simulator-specific visibility; don't
@@ -548,6 +623,7 @@ pub fn bind(
         bail!("HSPICE functions with hierarchical parameters require qualified binding");
     }
     let binder = Binder {
+        budget,
         source: &source,
         index,
         lines: &lines,
@@ -572,6 +648,17 @@ pub fn bind(
             output.len().saturating_add(text.len()).saturating_add(1) <= limit,
             "HSPICE occurrence output byte budget exceeded"
         );
+        budget.charge(Resource::EmittedBytes, text.len().saturating_add(1))?;
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            origins
+                .get(line)
+                .context("invalid HSPICE occurrence origin")?
+                .source
+                .as_os_str()
+                .len(),
+        )?;
         output.extend_from_slice(text.as_bytes());
         output.push(b'\n');
         mapped.push(

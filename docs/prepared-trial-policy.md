@@ -72,7 +72,9 @@ when a series resistor is present. The comparison scales both quantities to
 avoid floating-point overflow and rejects nonrepresentable predictions.
 
 Other currently prepared families explicitly select engine policy; this
-contract does not yet claim specialized limiting for VDMOS, VBIC or HICUM2.
+contract does not yet claim specialized limiting for VDMOS, VBIC, HICUM2
+or BSIM1/2. Individual tile lanes use the same policy and prepared data
+as scalar and full-tile evaluation, including after selective replacement.
 
 The tests use an independent monotone load-line bisection of a Shockley
 junction with external resistor and capacitor, including extreme forward

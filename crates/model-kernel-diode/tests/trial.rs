@@ -166,6 +166,12 @@ fn tile_policy_and_physical_evaluation_agree_with_scalar() -> Result<()> {
             outcomes[index]
         );
         assert_eq!(output, points[2 * index..2 * index + 2]);
+        let mut lane = [0.; 2];
+        assert_eq!(
+            tile.linearize_lane_trial(index, inputs[index], &mut lane)?,
+            outcomes[index]
+        );
+        assert_eq!(lane, output);
         let mut scalar = PointBuffer::new(2)?;
         compiled.evaluate(prepared, &output, &mut scalar.point())?;
         let a = scalar.point();
@@ -460,5 +466,79 @@ fn difficult_load_line_and_ramp_against_ngspice() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn selective_trial_lane_uses_committed_candidate_and_retains_rejected_state() -> Result<()> {
+    use model_kernel_api::batch::LaneUpdate;
+    let compiled = artifact(
+        compile_simetrix([("IS", 1e-14)])?,
+        Instance::default(),
+        [9; 16],
+    )?;
+    let mut tile = PreparedTile::new(&compiled, &[(&PARAMS, 300.15), (&PARAMS, 320.)])?;
+    let proposed = [1000., 0.];
+    let accepted = [0.6, 0.];
+    let trial = TrialInput {
+        proposed: &proposed,
+        phase: TrialPhase::Predictor {
+            accepted: &accepted,
+        },
+    };
+    let mut before = [[0.; 2]; 2];
+    for (lane, point) in before.iter_mut().enumerate() {
+        assert_eq!(
+            tile.linearize_lane_trial(lane, trial, point)?,
+            TrialOutcome::Limited
+        );
+    }
+    let params = [2., 3., 0., 0.];
+    let update = LaneUpdate {
+        lane: 1,
+        values: &params,
+        ambient_kelvin: 380.,
+    };
+    drop(tile.stage_replacements(&compiled, &[update])?);
+    let mut point = [0.; 2];
+    assert_eq!(
+        tile.linearize_lane_trial(1, trial, &mut point)?,
+        TrialOutcome::Limited
+    );
+    assert_eq!(point, before[1]);
+    tile.stage_replacements(&compiled, &[update])?.commit();
+    assert_eq!(
+        tile.linearize_lane_trial(0, trial, &mut point)?,
+        TrialOutcome::Limited
+    );
+    assert_eq!(point, before[0]);
+    assert_eq!(
+        tile.linearize_lane_trial(1, trial, &mut point)?,
+        TrialOutcome::Limited
+    );
+    assert_ne!(point, before[1]);
+    let scalar = compiled.prepare(&params, 380.)?;
+    let mut expected = [0.; 2];
+    assert_eq!(
+        compiled.linearize_trial(&scalar, trial, &mut expected)?,
+        TrialOutcome::Limited
+    );
+    assert_eq!(point, expected);
+    assert!(tile.linearize_lane_trial(2, trial, &mut point).is_err());
+    let mut old = PointBuffer::new(2)?;
+    let mut new = PointBuffer::new(2)?;
+    let candidate = [0.601, 0.];
+    tile.evaluate_lane(1, &accepted, &mut old.point())?;
+    tile.evaluate_lane(1, &candidate, &mut new.point())?;
+    let input = ConvergenceInput {
+        previous: sample(&accepted, &mut old),
+        candidate: sample(&candidate, &mut new),
+        candidate_outcome: TrialOutcome::Exact,
+        relative_tolerance: 1e-6,
+        absolute_tolerances: &[1e-12; 2],
+    };
+    let expected = compiled.check_trial_convergence(&scalar, input)?;
+    assert_eq!(tile.check_lane_trial_convergence(1, input)?, expected);
+    assert!(tile.check_lane_trial_convergence(2, input).is_err());
     Ok(())
 }

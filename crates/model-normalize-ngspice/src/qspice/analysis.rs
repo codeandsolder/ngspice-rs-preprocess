@@ -10,6 +10,7 @@ use crate::{
     parameter_scope::declarations::Declarations,
 };
 use anyhow::{Context, Result};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::ops::Range;
 
 #[derive(Clone, Debug)]
@@ -19,7 +20,8 @@ struct Scalar {
 }
 
 impl Scalar {
-    fn parse(raw: &str, origin: &SourceOrigin) -> Result<Self> {
+    fn parse(raw: &str, origin: &SourceOrigin, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::EmittedBytes, raw.len())?;
         let raw = raw.trim();
         if let Some(value) = literal(raw.as_bytes()) {
             return Ok(Self {
@@ -33,7 +35,7 @@ impl Scalar {
             .and_then(|s| s.strip_suffix('}'))
             .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
             .unwrap_or(raw);
-        SpiceExpression::parse(raw).map_err(|error| {
+        SpiceExpression::parse_with_budget(raw, budget).map_err(|error| {
             reject(
                 origin,
                 Feature::TransientTiming,
@@ -53,16 +55,27 @@ impl Scalar {
         }
     }
 
-    fn emit(&self) -> String {
-        if self.value.is_some() {
+    fn copy(&self, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::EmittedBytes, self.inner.len())?;
+        Ok(self.clone())
+    }
+
+    fn emit(&self, budget: &WorkBudget) -> Result<String> {
+        budget.charge(
+            Resource::EmittedBytes,
+            self.inner
+                .len()
+                .saturating_add(usize::from(self.value.is_none()) * 2),
+        )?;
+        Ok(if self.value.is_some() {
             self.inner.clone()
         } else {
             format!("{{{}}}", self.inner)
-        }
+        })
     }
 
-    fn select(self, other: Self, maximum: bool) -> Self {
-        match (self.value, other.value) {
+    fn select(self, other: Self, maximum: bool, budget: &WorkBudget) -> Result<Self> {
+        Ok(match (self.value, other.value) {
             (Some(left), Some(right)) => {
                 if (maximum && left >= right) || (!maximum && left <= right) {
                     self
@@ -73,24 +86,31 @@ impl Scalar {
             _ if self.inner == other.inner => self,
             _ => {
                 let function = if maximum { "max" } else { "min" };
+                budget.charge(
+                    Resource::EmittedBytes,
+                    self.inner
+                        .len()
+                        .saturating_add(other.inner.len())
+                        .saturating_add(10),
+                )?;
                 Self {
                     inner: format!("{function}(({}),({}))", self.inner, other.inner),
                     value: None,
                 }
             }
-        }
+        })
     }
 
-    fn default_maximum(&self) -> Self {
-        // Contemporary QSPICE default, documented as Tstop/1024:
-        // https://forum.qorvo.com/t/oscillator-problems/25473/10
-        self.value.map_or_else(
-            || Self {
+    fn default_maximum(&self, budget: &WorkBudget) -> Result<Self> {
+        if let Some(duration) = self.value {
+            Ok(Self::number(duration / 1024.0))
+        } else {
+            budget.charge(Resource::EmittedBytes, self.inner.len().saturating_add(7))?;
+            Ok(Self {
                 inner: format!("({})/1024", self.inner),
                 value: None,
-            },
-            |duration| Self::number(duration / 1024.0),
-        )
+            })
+        }
     }
 
     fn same(&self, other: &Self) -> bool {
@@ -101,8 +121,8 @@ impl Scalar {
     }
 }
 
-#[derive(Default)]
-pub(super) struct Settings {
+pub(super) struct Settings<'a> {
+    budget: &'a WorkBudget,
     maximum: Option<Scalar>,
     absolute: Option<bool>,
 }
@@ -135,7 +155,7 @@ fn positive(value: &Scalar, origin: &SourceOrigin, message: &str) -> Result<()> 
     Ok(())
 }
 
-impl Settings {
+impl Settings<'_> {
     fn add(&mut self, parameter: &ModelParameter, origin: &SourceOrigin) -> Result<()> {
         if parameter.name.eq_ignore_ascii_case("maxstep") {
             let raw = parameter.expression.as_deref().ok_or_else(|| {
@@ -145,7 +165,7 @@ impl Settings {
                     "MAXSTEP requires an explicit positive value",
                 )
             })?;
-            let maximum = Scalar::parse(raw, origin)?;
+            let maximum = Scalar::parse(raw, origin, self.budget)?;
             positive(&maximum, origin, "MAXSTEP must be positive")?;
             if self
                 .maximum
@@ -183,52 +203,20 @@ impl Settings {
         Ok(())
     }
 
-    fn tran(
-        &self,
-        statement: &Statement,
-        origin: &SourceOrigin,
-        fields: &[Range<usize>],
-        edits: &mut Vec<Edit>,
-        input: &[u8],
-    ) -> Result<()> {
-        let text = &statement.text;
-        let mut args = &fields[1..];
-        if args
-            .last()
-            .is_some_and(|span| text[span.clone()].eq_ignore_ascii_case(b"uic"))
-        {
-            args = &args[..args.len() - 1];
-        }
-        if !(1..=4).contains(&args.len()) {
-            return Err(reject(
-                origin,
-                Feature::TransientTiming,
-                "expected stop, or step stop [start [maxstep]], optionally followed by UIC",
-            ));
-        }
-        let values = args
-            .iter()
-            .map(|span| Scalar::parse(std::str::from_utf8(&text[span.clone()])?, origin))
-            .collect::<Result<Vec<_>>>()?;
-        if values
-            .iter()
-            .any(|value| value.value.is_some_and(|v| v < 0.0))
-        {
-            return Err(reject(
-                origin,
-                Feature::TransientTiming,
-                "negative transient time field",
-            ));
-        }
-        let stop = values.get(1).map_or_else(
-            || values[0].clone(),
-            |duration| values[0].clone().select(duration.clone(), true),
-        );
+    fn native_times(&self, values: &[Scalar], origin: &SourceOrigin) -> Result<[String; 4]> {
+        let stop = match values.get(1) {
+            Some(duration) => values[0].copy(self.budget)?.select(
+                duration.copy(self.budget)?,
+                true,
+                self.budget,
+            )?,
+            None => values[0].copy(self.budget)?,
+        };
         positive(&stop, origin, "stop time must be positive")?;
-        let start = values
-            .get(2)
-            .cloned()
-            .unwrap_or_else(|| Scalar::number(0.0));
+        let start = match values.get(2) {
+            Some(value) => value.copy(self.budget)?,
+            None => Scalar::number(0.0),
+        };
         if start.value != Some(0.0) && self.absolute != Some(true) {
             return Err(reject(
                 origin,
@@ -255,13 +243,66 @@ impl Settings {
                 "conflicting .tran and .option MAXSTEP; precedence is not qualified",
             ));
         }
-        let maximum = explicit
-            .or(self.maximum.as_ref())
-            .cloned()
-            .unwrap_or_else(|| stop.default_maximum());
+        let maximum = match explicit.or(self.maximum.as_ref()) {
+            Some(value) => value.copy(self.budget)?,
+            None => stop.default_maximum(self.budget)?,
+        };
         positive(&maximum, origin, "maximum timestep is not representable")?;
-        let interval = stop.clone().select(maximum.clone(), false);
-        let native = [interval.emit(), stop.emit(), start.emit(), maximum.emit()];
+        let interval =
+            stop.copy(self.budget)?
+                .select(maximum.copy(self.budget)?, false, self.budget)?;
+        Ok([
+            interval.emit(self.budget)?,
+            stop.emit(self.budget)?,
+            start.emit(self.budget)?,
+            maximum.emit(self.budget)?,
+        ])
+    }
+
+    fn tran(
+        &self,
+        statement: &Statement,
+        origin: &SourceOrigin,
+        fields: &[Range<usize>],
+        edits: &mut Vec<Edit>,
+        input: &[u8],
+    ) -> Result<()> {
+        let text = &statement.text;
+        let mut args = &fields[1..];
+        if args
+            .last()
+            .is_some_and(|span| text[span.clone()].eq_ignore_ascii_case(b"uic"))
+        {
+            args = &args[..args.len() - 1];
+        }
+        if !(1..=4).contains(&args.len()) {
+            return Err(reject(
+                origin,
+                Feature::TransientTiming,
+                "expected stop, or step stop [start [maxstep]], optionally followed by UIC",
+            ));
+        }
+        let values = args
+            .iter()
+            .map(|span| {
+                Scalar::parse(
+                    std::str::from_utf8(&text[span.clone()])?,
+                    origin,
+                    self.budget,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if values
+            .iter()
+            .any(|value| value.value.is_some_and(|v| v < 0.0))
+        {
+            return Err(reject(
+                origin,
+                Feature::TransientTiming,
+                "negative transient time field",
+            ));
+        }
+        let native = self.native_times(&values, origin)?;
         let replacements = args
             .iter()
             .enumerate()
@@ -331,16 +372,24 @@ impl Settings {
     }
 }
 
-pub(super) fn collect(
+pub(super) fn collect<'a>(
     statements: &[Statement],
     linked: &LinkedSource,
     has_title: bool,
-    declarations: &Declarations,
-) -> Result<Settings> {
-    let mut settings = Settings::default();
+    declarations: &'a Declarations,
+) -> Result<Settings<'a>> {
+    let mut settings = Settings {
+        budget: declarations.budget(),
+        maximum: None,
+        absolute: None,
+    };
     let mut first_option = None;
     let mut transient = false;
     for statement in statements {
+        settings.budget.charge(Resource::Statements, 1)?;
+        settings
+            .budget
+            .charge(Resource::ScannedBytes, statement.text.len())?;
         let fields = tokens(&statement.text)?;
         let Some(first) = fields.first() else {
             continue;

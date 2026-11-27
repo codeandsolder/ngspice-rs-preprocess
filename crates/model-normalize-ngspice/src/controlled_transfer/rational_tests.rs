@@ -1,6 +1,7 @@
 use super::{Control, ControlledTransfer, OutputKind, ResolvedTransfer, SpiceExpression, parse};
 use crate::{linked_source::RootKind, normalize_mapped};
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::WorkBudget;
 use std::{fs, process::Command};
 
 fn card(text: &str) -> Result<ControlledTransfer> {
@@ -104,7 +105,7 @@ fn malformed_or_nonrational_forms_fail_without_changing_ordinary_sources() -> Re
 #[test]
 fn lowering_keeps_scope_branch_names_source_lines_and_collision_free_ids() -> Result<()> {
     let input = b"rational transfer\r\n.subckt filter in ref out p=2 g=3\r\nE1 out ref LAPLACE {V(in,ref)} =\r\n+ {g/(s+p)} ; source\r\nR1 __laplace_2_out 0 1k\r\n.ends filter\r\n.control\r\necho laplace\r\n.endc\r\n.end\r\n";
-    let result = normalize_mapped(input, RootKind::Deck)?;
+    let result = normalize_mapped(input, RootKind::Deck, &WorkBudget::default())?;
     let text = std::str::from_utf8(&result.model.bytes)?;
     assert!(
         text.contains("E1 out ref __laplace_2_out_1 0 1\r\n"),
@@ -117,11 +118,12 @@ fn lowering_keeps_scope_branch_names_source_lines_and_collision_free_ids() -> Re
     assert!(text.contains("; source"));
     assert!(text.contains("echo laplace"));
     assert_eq!(result.input_lines, [1, 2, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10]);
-    let repeated = normalize_mapped(&result.model.bytes, RootKind::Deck)?;
+    let repeated = normalize_mapped(&result.model.bytes, RootKind::Deck, &WorkBudget::default())?;
     assert_eq!(repeated.model.bytes, result.model.bytes);
     let bad = normalize_mapped(
         b"title\nL1 a 0 1m Rser=1\nE1 b 0 a 0 Laplace={exp(-s)}\n.end\n",
         RootKind::Deck,
+        &WorkBudget::default(),
     );
     assert!(format!("{:#}", bad.err().context("expected positioned failure")?).contains("line 3"));
     Ok(())
@@ -148,7 +150,7 @@ fn native_rational_reference_ac_transient_scope_and_current_polarity() -> Result
     // Independent first-order oracle, nonzero common mode and distinct
     // lexical overrides of one physical subcircuit.
     let source = b"Rational scoped reference\n.subckt filter p n out gout params: tau=1m gainv=2\nE1 out 0 LAPLACE {v(p,n)}={gainv/(1+tau*s)}\nG1 gout 0 p n Laplace={gainv/(1+tau*s)}\n.ends filter\nV1 in ref dc 0 ac 1 PWL(0 0 1u 1 5m 1)\nVref ref 0 2\nX1 in ref out1 gout1 filter tau=1m gainv=2\nX2 in ref out2 gout2 filter tau=2m gainv=3\nR1 out1 0 1k\nR2 out2 0 1k\nRg1 gout1 0 1\nRg2 gout2 0 1\n.options reltol=1e-7 abstol=1e-12 vntol=1e-9\n.control\nset wr_singlescale\nset wr_vecnames\nac lin 5 100 500\nwrdata ac.dat v(out1) v(gout1) v(out2) v(gout2)\ntran 0.1u 5m 0 0.1u\nwrdata tran.dat v(out1) v(gout1) v(out2) v(gout2)\nquit\n.endc\n.end\n";
-    let normalized = normalize_mapped(source, RootKind::Deck)?;
+    let normalized = normalize_mapped(source, RootKind::Deck, &WorkBudget::default())?;
     fs::write(
         directory.path().join("reference.cir"),
         normalized.model.bytes,
@@ -210,5 +212,76 @@ fn native_rational_reference_ac_transient_scope_and_current_polarity() -> Result
         last = *time;
     }
     near(last, 0.005, 1e-10);
+    Ok(())
+}
+
+#[test]
+fn rational_coefficients_consume_cumulative_intermediate_work() -> Result<()> {
+    use model_preprocess_command::{Cancellation, Resource, WorkLimits};
+
+    let source = "E1 out 0 in 0 Laplace={1/(s+1)^32}";
+    let normal = super::parse_with_budget(source, &WorkBudget::default())?
+        .context("missing rational transfer")?;
+    let (numerator, denominator) = resolve(&normal, 1., 1.)?;
+    assert_eq!(numerator, [1.]);
+    assert_eq!(denominator.len(), 33);
+    assert_eq!(denominator[1], 32.);
+    for (limits, dimension) in [
+        (
+            WorkLimits {
+                evaluation_steps: 200,
+                ..WorkLimits::default()
+            },
+            "EvaluationSteps",
+        ),
+        (
+            WorkLimits {
+                generated_nodes: 100,
+                ..WorkLimits::default()
+            },
+            "GeneratedNodes",
+        ),
+        (
+            WorkLimits {
+                emitted_bytes: 4096,
+                ..WorkLimits::default()
+            },
+            "EmittedBytes",
+        ),
+    ] {
+        let budget = WorkBudget::new(limits, Cancellation::default());
+        let error = super::parse_with_budget(source, &budget)
+            .err()
+            .context("rational work escaped the caller's limit")?;
+        assert!(
+            format!("{error:#}").contains(&format!("{dimension} budget exceeded")),
+            "{error:#}"
+        );
+        assert!(budget.check().is_err());
+    }
+
+    // Exact allowance for a single symbolic transfer, then an identical
+    // second call against the same ledger. Neither call changes coefficients.
+    let symbolic = "E1 out 0 in 0 Laplace={g/((s+p)*(s+2*p))}";
+    let limits = WorkLimits::default();
+    let measured = WorkBudget::new(limits, Cancellation::default());
+    let expected = super::parse_with_budget(symbolic, &measured)?;
+    let bytes = limits.emitted_bytes - measured.remaining(Resource::EmittedBytes)?;
+    let budget = WorkBudget::new(
+        WorkLimits {
+            emitted_bytes: bytes,
+            ..limits
+        },
+        Cancellation::default(),
+    );
+    assert_eq!(super::parse_with_budget(symbolic, &budget)?, expected);
+    assert_eq!(budget.remaining(Resource::EmittedBytes)?, 0);
+    let error = super::parse_with_budget(symbolic, &budget)
+        .err()
+        .context("transfer parser reset cumulative allowance")?;
+    assert!(
+        format!("{error:#}").contains("EmittedBytes budget exceeded"),
+        "{error:#}"
+    );
     Ok(())
 }

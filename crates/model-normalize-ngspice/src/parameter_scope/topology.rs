@@ -211,7 +211,10 @@ struct Call<'a> {
     args: BTreeMap<String, SpiceExpression>,
 }
 
-fn call(card: &SourceCard) -> Result<Call<'_>> {
+fn call<'a>(
+    card: &'a SourceCard,
+    budget: &model_preprocess_command::WorkBudget,
+) -> Result<Call<'a>> {
     let (prefix, fields) = positional_prefix(&card.text);
     let (name, remaining) = prefix.split_first().context("empty X-line")?;
     let (target, nodes) = remaining
@@ -221,7 +224,7 @@ fn call(card: &SourceCard) -> Result<Call<'_>> {
         name: name.0,
         nodes: nodes.iter().map(|&(node, _)| node).collect(),
         target: target.0,
-        args: assignments(fields, card.line)?,
+        args: assignments(fields, card.line, budget)?,
     })
 }
 
@@ -247,7 +250,7 @@ impl Index {
         for (owner, scope) in source.scopes.iter().enumerate() {
             for card in &scope.cards {
                 if is_x(card)
-                    && let Ok(call) = call(card)
+                    && let Ok(call) = call(card, &source.budget)
                     && let Some(target) = result.subcircuits.resolve(source, owner, call.target)
                     && !source.scopes[target].defaults.contains_key("m")
                 {
@@ -258,6 +261,7 @@ impl Index {
                 }
             }
         }
+        source.budget.check()?;
         while let Some(owner) = pending.pop() {
             for &target in &edges[owner] {
                 if result.implicit_m.insert(target) {
@@ -426,7 +430,7 @@ impl<'a> Builder<'a> {
         card: &SourceCard,
         resolver: &mut ScopeResolver<'a>,
     ) -> Result<()> {
-        let call = call(card)?;
+        let call = call(card, &self.source.budget)?;
         let owner = self.result.frames[parent].declaration;
         let target = self
             .index
@@ -503,7 +507,11 @@ impl<'a> Builder<'a> {
         let model = &self.source.models[declaration];
         let mut resolver = self.resolver(owner)?;
         let value = vdmos_resolved(&model.card, |expr| {
-            resolver.evaluate(model.scope, &SpiceExpression::parse(expr)?, None)
+            resolver.evaluate(
+                model.scope,
+                &SpiceExpression::parse_with_budget(expr, &self.source.budget)?,
+                None,
+            )
         })?;
         let variant = value
             .map(|values| -> Result<_> {
@@ -512,7 +520,11 @@ impl<'a> Builder<'a> {
                 // declaration wins; explicit device fields subsequently override.
                 for field in values.instance_defaults.iter().rev() {
                     apply_instance(&mut instance, field, |expr| {
-                        resolver.evaluate(model.scope, &SpiceExpression::parse(expr)?, None)
+                        resolver.evaluate(
+                            model.scope,
+                            &SpiceExpression::parse_with_budget(expr, &self.source.budget)?,
+                            None,
+                        )
                     })?;
                 }
                 let key = (
@@ -596,7 +608,11 @@ impl<'a> Builder<'a> {
                 continue;
             }
             apply_instance(&mut instance, field, |expr| {
-                resolver.evaluate(scope, &SpiceExpression::parse(expr)?, None)
+                resolver.evaluate(
+                    scope,
+                    &SpiceExpression::parse_with_budget(expr, &self.source.budget)?,
+                    None,
+                )
             })?;
         }
         if self.index.implicit_m.contains(&scope) {

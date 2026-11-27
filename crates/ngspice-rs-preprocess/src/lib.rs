@@ -10,9 +10,10 @@ use model_normalize_ngspice::{
     linked_source::{LibrarySyntax, LinkLimits, LinkedSource, RootKind, SourceLinker},
     normalize_mapped,
 };
-pub use model_normalize_ngspice::{passive_ic, waveform};
+pub use model_normalize_ngspice::{passive_ic, passive_storage, pwl_resistor, waveform};
 pub use model_preprocess_command::{
-    AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, SourceSession,
+    AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, Resource,
+    SourceSession, WorkBudget, WorkLimits,
 };
 pub use model_preprocess_simplis::{LibrarySimulator, ParsedLibrary};
 pub use model_translate_simplis::CodeModelRuntime;
@@ -159,6 +160,8 @@ pub struct Options {
     pub admission: AdmissionConfig,
     /// Ceiling on linked intermediate bytes and combined final artifact bytes.
     pub output_bytes: usize,
+    /// Shared cumulative work ceilings across the entire request.
+    pub work: WorkLimits,
     /// Disable conditioning when the consumer adds artificial topology
     /// (such as global shunts) or requires unchanged internal current names.
     pub conditioning: ConditioningPolicy,
@@ -174,6 +177,7 @@ impl Default for Options {
         Self {
             admission: AdmissionConfig::default(),
             output_bytes: 128 * 1024 * 1024,
+            work: WorkLimits::default(),
             conditioning: ConditioningPolicy::default(),
             device_config: None,
             statistical_sample: None,
@@ -260,6 +264,9 @@ pub struct PreparedBundle {
     /// elaborated occurrence and parameter candidate. Electrical cards
     /// retain the source identity but may contain only a DC placeholder.
     pub waveforms: Vec<waveform::PreparedWaveform>,
+    /// Exact resistor laws with occurrence-local advisory startup segments.
+    /// A consumer must bind the emitted branch anchors before solving.
+    pub pwl_resistors: Vec<pwl_resistor::PreparedPwlResistor>,
 }
 
 impl PreparedBundle {
@@ -299,9 +306,9 @@ struct NativeProjection {
 }
 
 impl NativeProjection {
-    fn plain(bytes: &[u8], kind: RootKind) -> Result<Self> {
+    fn plain(bytes: &[u8], kind: RootKind, budget: &WorkBudget) -> Result<Self> {
         Ok(Self {
-            normalized: normalize_mapped(bytes, kind)?,
+            normalized: normalize_mapped(bytes, kind, budget)?,
             device_identities: Vec::new(),
             waveforms: Vec::new(),
         })
@@ -312,6 +319,7 @@ fn project_native(
     linked: &LinkedSource,
     kind: RootKind,
     format: InputFormat,
+    budget: &WorkBudget,
 ) -> Result<NativeProjection> {
     match format {
         InputFormat::PspiceDeck
@@ -319,9 +327,9 @@ fn project_native(
         | InputFormat::TinaDeck
         | InputFormat::TinaLibrary => {
             let normalized = if matches!(format, InputFormat::TinaDeck | InputFormat::TinaLibrary) {
-                model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind)?
+                model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind, budget)?
             } else {
-                model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind)?
+                model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind, budget)?
             };
             let identities = normalized
                 .renamed
@@ -330,6 +338,20 @@ fn project_native(
                     let origin = linked
                         .origin(device.input_line)
                         .context("missing renamed device origin")?;
+                    budget.charge(Resource::GeneratedNodes, 1)?;
+                    budget.charge(
+                        Resource::EmittedBytes,
+                        origin
+                            .path
+                            .as_os_str()
+                            .len()
+                            .saturating_add(device.declared.len())
+                            .saturating_add(device.declared.len())
+                            .saturating_add(device.linked.len()),
+                    )?;
+                    for part in &device.scope {
+                        budget.charge(Resource::EmittedBytes, part.len())?;
+                    }
                     Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
                         source: display_path(&origin.path),
                         scope: device.scope,
@@ -346,9 +368,12 @@ fn project_native(
             })
         }
         InputFormat::QspiceDeck | InputFormat::QspiceLibrary => {
-            let lowered = model_normalize_ngspice::qspice::lower_linked(linked, kind)?;
-            let mut normalized =
-                normalize_mapped(lowered.bytes.as_deref().unwrap_or(&linked.bytes), kind)?;
+            let lowered = model_normalize_ngspice::qspice::lower_linked(linked, kind, budget)?;
+            let mut normalized = normalize_mapped(
+                lowered.bytes.as_deref().unwrap_or(&linked.bytes),
+                kind,
+                budget,
+            )?;
             if lowered.bytes.is_some() {
                 normalized
                     .model
@@ -361,7 +386,7 @@ fn project_native(
                 waveforms: lowered.waveforms,
             })
         }
-        _ => NativeProjection::plain(&linked.bytes, kind),
+        _ => NativeProjection::plain(&linked.bytes, kind, budget),
     }
 }
 
@@ -409,7 +434,7 @@ fn native(
         },
         session,
     )?;
-    let projected = project_native(&linked, kind, request.format)?;
+    let projected = project_native(&linked, kind, request.format, session.budget())?;
     let origins = linked
         .origins
         .into_iter()
@@ -419,7 +444,14 @@ fn native(
             last_line: mapped.line,
         })
         .collect::<Vec<_>>();
-    native_bundle(origin, request.format, kind, projected, &origins)
+    native_bundle(
+        origin,
+        request.format,
+        kind,
+        projected,
+        &origins,
+        session.budget(),
+    )
 }
 
 fn native_bundle(
@@ -428,6 +460,7 @@ fn native_bundle(
     kind: RootKind,
     projection: NativeProjection,
     origins: &[OriginLine],
+    budget: &WorkBudget,
 ) -> Result<PreparedBundle> {
     let NativeProjection {
         normalized,
@@ -438,13 +471,15 @@ fn native_bundle(
         .input_lines
         .into_iter()
         .map(|line| {
-            origins
+            let mapped = origins
                 .get(
                     line.checked_sub(1)
                         .context("invalid linked source location")?,
                 )
-                .cloned()
-                .context("missing linked source location")
+                .context("missing linked source location")?;
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(Resource::EmittedBytes, mapped.source.as_os_str().len())?;
+            Ok(mapped.clone())
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(PreparedBundle {
@@ -470,6 +505,7 @@ fn native_bundle(
         initial_conditions: None,
         analysis_plan: None,
         waveforms,
+        pwl_resistors: Vec::new(),
     })
 }
 
@@ -527,7 +563,12 @@ pub fn prepare(
         "statistical sample selection is only valid for SIMetrix decks"
     );
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
-    let mut session = SourceSession::new(options.admission.clone(), cancellation.clone());
+    let budget = WorkBudget::new(options.work, cancellation.clone());
+    let mut session = SourceSession::with_budget(
+        options.admission.clone(),
+        cancellation.clone(),
+        budget.clone(),
+    );
     let root = request.input.admit(&mut session)?;
     let mut result = match request.format {
         InputFormat::NativeDeck
@@ -543,21 +584,45 @@ pub fn prepare(
     if request.format == InputFormat::SimetrixDeck
         && options.conditioning == ConditioningPolicy::PrivateDifferentiators
     {
-        condition_generated_bundle(&mut result)?;
+        condition_generated_bundle(&mut result, &budget)?;
     }
     ensure!(!cancellation.is_cancelled(), "source processing cancelled");
+    let artifact_names = result
+        .artifacts()
+        .map(|artifact| artifact.filename.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     for declaration in &result.waveforms {
+        budget.charge(Resource::EvaluationSteps, 1)?;
         ensure!(
-            result
-                .artifacts()
-                .any(|artifact| artifact.filename == declaration.artifact),
+            artifact_names.contains(declaration.artifact.as_str()),
             "missing waveform artifact {}",
             declaration.artifact
         );
     }
+    for declaration in &result.pwl_resistors {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        ensure!(
+            artifact_names.contains(declaration.artifact.as_str()),
+            "missing PWL resistor artifact {}",
+            declaration.artifact
+        );
+    }
+    budget.check()?;
     let mut remaining = options.output_bytes;
     for artifact in result.artifacts() {
-        waveform::validate_artifact(&result.waveforms, &artifact.filename, &artifact.bytes)?;
+        budget.charge(Resource::EmittedBytes, artifact.bytes.len())?;
+        pwl_resistor::validate_artifact(
+            &result.pwl_resistors,
+            &artifact.filename,
+            &artifact.bytes,
+            &budget,
+        )?;
+        waveform::validate_artifact(
+            &result.waveforms,
+            &artifact.filename,
+            &artifact.bytes,
+            &budget,
+        )?;
         remaining = remaining
             .checked_sub(artifact.bytes.len())
             .context("combined artifact output byte budget exceeded")?;
@@ -565,9 +630,9 @@ pub fn prepare(
     Ok(result)
 }
 
-fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
+fn condition_generated_bundle(bundle: &mut PreparedBundle, budget: &WorkBudget) -> Result<()> {
     use model_normalize_ngspice::conditioning::{
-        ConditioningInput, condition_private_differentiators,
+        ConditioningInput, condition_private_differentiators_with_budget,
     };
     let inputs = bundle
         .artifacts()
@@ -576,10 +641,11 @@ fn condition_generated_bundle(bundle: &mut PreparedBundle) -> Result<()> {
             bytes: &artifact.bytes,
         })
         .collect::<Vec<_>>();
-    let outputs = condition_private_differentiators(
+    let outputs = condition_private_differentiators_with_budget(
         &inputs,
         bundle.initial_conditions.as_ref(),
         &bundle.waveforms,
+        budget,
     )?;
     let mut changed = false;
     for (artifact, output) in std::iter::once(&mut bundle.primary)

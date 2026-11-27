@@ -301,12 +301,12 @@ fn source_policy_preserves_native_path_and_validates_modes() -> Result<()> {
         resistance: 2.,
     };
     let mut policy = InitialConditions::default();
-    let _ = ngspice_rs_preprocess::passive_ic::capture_statement(
+    let _ = ngspice_rs_preprocess::passive_ic::Capture::new(
         &mut policy,
         "deck.cir",
-        &[],
-        "C1 a 0 1u IC=2 ICMODE=3",
-    )?;
+        &model_preprocess_command::WorkBudget::default(),
+    )?
+    .statement(&[], "C1 a 0 1u IC=2 ICMODE=3")?;
     assert!(
         policy.devices[0]
             .resolve(Analysis::OperatingPoint, defaults, |value| isolated(
@@ -384,7 +384,7 @@ fn typed_bias_paths_disqualify_only_affected_private_loops() -> Result<()> {
     use model_normalize_ngspice::conditioning::{
         ConditioningInput, condition_private_differentiators,
     };
-    use ngspice_rs_preprocess::passive_ic::capture_statement;
+    use ngspice_rs_preprocess::passive_ic::Capture;
     let deck = b"* source\nX1 a 0 cell1\nX2 b 0 cell2\n.end\n";
     let models=b".subckt cell1 a b\nEdrive aux b a b 1\nCstate aux b 1\nBcap a b I={-1u*I(Edrive)}\n.ends cell1\n.subckt cell2 a b\nEdrive aux b a b 1\nCstate aux b 1\nBcap a b I={-1u*I(Edrive)}\n.ends cell2\n";
     let inputs = [
@@ -399,7 +399,12 @@ fn typed_bias_paths_disqualify_only_affected_private_loops() -> Result<()> {
     ];
     for declaration in ["Cstate aux b 1 IC=2 BRANCH=1", ".ic V(aux)=2"] {
         let mut policy = InitialConditions::default();
-        let _ = capture_statement(&mut policy, "model.lib", &["cell1".to_owned()], declaration)?;
+        let _ = Capture::new(
+            &mut policy,
+            "model.lib",
+            &model_preprocess_command::WorkBudget::default(),
+        )?
+        .statement(&["cell1".to_owned()], declaration)?;
         let result = condition_private_differentiators(&inputs, Some(&policy), &[])?;
         let scales = &result[1].scalings;
         assert_eq!(scales.len(), 1, "{declaration}");
@@ -498,19 +503,31 @@ fn analysis_dependent_alias_and_function_resolve_per_instance() -> Result<()> {
 fn final_emitted_scope_and_device_must_match_policy() -> Result<()> {
     let mut policy = InitialConditions::default();
     let scope = ["cell".to_owned()];
-    let _ = ngspice_rs_preprocess::passive_ic::capture_statement(
+    let _ = ngspice_rs_preprocess::passive_ic::Capture::new(
         &mut policy,
         "model.lib",
-        &scope,
-        "C1 a b 1u IC=1",
+        &model_preprocess_command::WorkBudget::default(),
+    )?
+    .statement(&scope, "C1 a b 1u IC=1")?;
+    policy.validate_artifact(
+        "model.lib",
+        b".subckt CELL a b\nC1 a b 1u\n.ends\n",
+        &model_preprocess_command::WorkBudget::default(),
     )?;
-    policy.validate_artifact("model.lib", b".subckt CELL a b\nC1 a b 1u\n.ends\n")?;
     for invalid in [
         b".subckt other a b\nC1 a b 1u\n.ends\n".as_slice(),
         b".subckt cell a b\nC2 a b 1u\n.ends\n".as_slice(),
         b".subckt cell a b\nC1 a b 1u\nC1 a b 2u\n.ends\n".as_slice(),
     ] {
-        assert!(policy.validate_artifact("model.lib", invalid).is_err());
+        assert!(
+            policy
+                .validate_artifact(
+                    "model.lib",
+                    invalid,
+                    &model_preprocess_command::WorkBudget::default()
+                )
+                .is_err()
+        );
     }
     Ok(())
 }
