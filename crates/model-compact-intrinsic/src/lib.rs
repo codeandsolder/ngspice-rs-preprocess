@@ -7,6 +7,7 @@
 mod bsim_soi;
 mod catalog;
 mod defaults;
+mod differential;
 mod hv;
 mod legacy_bsim;
 
@@ -42,16 +43,18 @@ pub use legacy_bsim::{
 pub use hv::{
     HiSimHvBinningGeometry, HiSimHvDepletionTransport, HiSimHvDrainBias, HiSimHvDrainCurrent,
     HiSimHvEdgeTunnelingCurrent, HiSimHvEdgeTunnelingCurrents, HiSimHvEffectiveGeometry,
-    HiSimHvElectricalGradient, HiSimHvFringingCharges, HiSimHvGeneratedHeat, HiSimHvJunctionBias,
-    HiSimHvJunctionCharge, HiSimHvJunctionCharges, HiSimHvJunctionCurrent, HiSimHvJunctionCurrents,
+    HiSimHvElectricalGradient, HiSimHvFringingCharges, HiSimHvGeneratedHeat, HiSimHvGidlCurrents,
+    HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar, HiSimHvJunctionBias, HiSimHvJunctionCharge,
+    HiSimHvJunctionCharges, HiSimHvJunctionCurrent, HiSimHvJunctionCurrents,
     HiSimHvLateralFieldCharge, HiSimHvThermalBranch, HiSimHvThermalJacobianRow,
     HiSimHvTransportGeometry, PreparedHiSimHvEdgeTunneling, PreparedHiSimHvFringing,
-    PreparedHiSimHvInstance, PreparedHiSimHvJunctionCharges, PreparedHiSimHvJunctionDiodes,
-    PreparedHiSimHvLateralFieldCharge, PreparedHiSimHvModel, PreparedHiSimHvTemperature,
-    PreparedHiSimHvTransport, evaluate_hisim_hv_generated_heat, prepare_hisim_hv_edge_tunneling,
-    prepare_hisim_hv_fringing, prepare_hisim_hv_instance, prepare_hisim_hv_junction_charges,
-    prepare_hisim_hv_junction_diodes, prepare_hisim_hv_lateral_field_charge,
-    prepare_hisim_hv_model, prepare_hisim_hv_temperature, prepare_hisim_hv_transport,
+    PreparedHiSimHvGidl, PreparedHiSimHvInstance, PreparedHiSimHvJunctionCharges,
+    PreparedHiSimHvJunctionDiodes, PreparedHiSimHvLateralFieldCharge, PreparedHiSimHvModel,
+    PreparedHiSimHvTemperature, PreparedHiSimHvTransport, evaluate_hisim_hv_generated_heat,
+    prepare_hisim_hv_edge_tunneling, prepare_hisim_hv_fringing, prepare_hisim_hv_gidl,
+    prepare_hisim_hv_instance, prepare_hisim_hv_junction_charges, prepare_hisim_hv_junction_diodes,
+    prepare_hisim_hv_lateral_field_charge, prepare_hisim_hv_model, prepare_hisim_hv_temperature,
+    prepare_hisim_hv_transport,
 };
 
 /// Exact ngspice model implementation selected by the SPICE model level/version.

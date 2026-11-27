@@ -5,6 +5,7 @@
 mod edge_tunneling;
 mod effective;
 mod fringing;
+mod gidl;
 mod heat;
 mod instance;
 mod junction;
@@ -20,6 +21,10 @@ pub use edge_tunneling::{
 };
 pub use effective::HiSimHvEffectiveGeometry;
 pub use fringing::{HiSimHvFringingCharges, PreparedHiSimHvFringing, prepare_hisim_hv_fringing};
+pub use gidl::{
+    HiSimHvGidlCurrents, HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar, PreparedHiSimHvGidl,
+    prepare_hisim_hv_gidl,
+};
 pub use heat::{
     HiSimHvDrainBias, HiSimHvDrainCurrent, HiSimHvElectricalGradient, HiSimHvGeneratedHeat,
     HiSimHvThermalJacobianRow, evaluate_hisim_hv_generated_heat,

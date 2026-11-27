@@ -963,6 +963,24 @@ model/instance comparisons** and physical-geometry acceptance/rejection.
 Native oracles do **not** inspect private mobility/velocity/RTH fields;
 full current/charge/thermal fidelity awaits physical nonlinear kernels.
 
+### HiSIM-HV gate-induced drain/source leakage
+
+`prepare_hisim_hv_gidl` binds the native HV1/HV2 GIDL/GISL coefficients,
+including length/width/cross binning, source-unit conversions, multiplicity,
+and the physical oxide thickness. `evaluate` uses normalized intrinsic
+`Vgs`, `Vds`, `Vbs` and the actual channel short-/long-channel threshold
+shifts and their four-coordinate derivatives. The gate-current bandgap and
+its temperature derivative come from the trial temperature preparation.
+The original drain-field smoothing, junction reverse-bias suppression and
+exponential cutoff are retained. The API does not independently estimate
+channel electrostatics.
+
+The 720-case checked-in reference fixture is regenerated from the original
+pinned ngspice C branches using `tools/hisim_hv_gidl_reference.py`; it covers
+both versions, selector states, binning, multiplicity, field and body-bias
+regions, and temperatures. Tests check both currents and four partials,
+plus independent finite differences of the Rust values.
+
 ## Reference test coverage
 
 `tests/fixtures/*.names` contains **only parameter names** extracted from eight
