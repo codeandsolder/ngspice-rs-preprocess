@@ -3,12 +3,12 @@
 
 use super::{
     Definition, Environment, Extracted, IncludedSource, PreparedRoot, SubcircuitCatalog,
-    extract_definitions_scoped, is_directive, is_subcircuit_header, logical_statements,
-    normalized_source_path,
+    directive_name, extract_definitions_scoped, is_directive, is_preprocessor_control,
+    is_subcircuit_header, logical_statements, normalized_source_path,
 };
 use crate::{Substitution, run_preprocess_body_with_includes};
 use anyhow::{Context, Result, ensure};
-use model_preprocess_command::Resource;
+use model_preprocess_command::{Resource, WorkBudget};
 use std::collections::BTreeSet;
 
 struct ActiveSource {
@@ -199,4 +199,73 @@ pub(super) fn prepare_root(
         globals: processed.environment.globals,
         explicit_sources: includes.imported,
     })
+}
+
+/// Index only declarations available without executing the source program.
+/// Keep subcircuit bodies intact: their compile-time program belongs to the
+/// occurrence, not the library's top-level lexical scope.
+pub(super) fn indexed_view(text: &str, budget: &WorkBudget) -> Result<String> {
+    let mut output = String::new();
+    let mut blocks = Vec::new();
+    let mut depth = 0usize;
+    let mut previous = false;
+    for line in text.lines() {
+        budget.charge(Resource::ScannedBytes, line.len())?;
+        budget.charge(Resource::Statements, 1)?;
+        let directive = directive_name(line).map(str::to_ascii_uppercase);
+        let emit = if is_subcircuit_header(line) {
+            depth = depth.saturating_add(1);
+            budget.check_depth(depth)?;
+            blocks.is_empty()
+        } else if depth > 0 {
+            if is_directive(line, "ENDS") {
+                depth -= 1;
+            }
+            blocks.is_empty()
+        } else if line.trim_start().starts_with('+') {
+            previous
+        } else {
+            match directive.as_deref() {
+                Some("IF" | "WHILE" | "FOR") => {
+                    let end = match directive.as_deref() {
+                        Some("IF") => "ENDIF",
+                        Some("WHILE") => "ENDWHILE",
+                        _ => "ENDFOR",
+                    };
+                    blocks.push(end);
+                    budget.check_depth(blocks.len())?;
+                    false
+                }
+                Some("ENDIF" | "ENDWHILE" | "ENDFOR") => {
+                    ensure!(
+                        blocks.pop() == directive.as_deref(),
+                        "unbalanced library preprocessing block"
+                    );
+                    false
+                }
+                Some("ELSE") => {
+                    ensure!(blocks.last() == Some(&"ENDIF"), "unmatched library .ELSE");
+                    false
+                }
+                Some("END") if blocks.is_empty() => break,
+                _ => {
+                    blocks.is_empty()
+                        && !is_preprocessor_control(line)
+                        && !is_directive(line, "INCLUDE")
+                        && !is_directive(line, "INC")
+                }
+            }
+        };
+        previous = emit;
+        if emit {
+            budget.charge(Resource::EmittedBytes, line.len().saturating_add(1))?;
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    ensure!(
+        blocks.is_empty() && depth == 0,
+        "unterminated library lexical block"
+    );
+    Ok(output)
 }

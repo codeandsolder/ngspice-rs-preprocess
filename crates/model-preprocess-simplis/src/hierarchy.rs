@@ -299,27 +299,18 @@ pub fn source_include_target(statement: &str) -> Result<Option<&str>> {
     Ok(Some(target))
 }
 
-fn path_suffix_matches(source: &str, include: &str) -> bool {
-    fn components(path: &str) -> impl Iterator<Item = &str> {
-        path.rsplit(['/', '\\'])
-            .filter(|part| !part.is_empty() && *part != ".")
-    }
-    let source = components(source).collect::<Vec<_>>();
-    let include = components(include).collect::<Vec<_>>();
-    !include.is_empty()
-        && include.len() <= source.len()
-        && include
-            .iter()
-            .zip(source)
-            .all(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
-}
-
 fn normalized_source_path(path: &str) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
+    if path.starts_with(['/', '\\']) {
+        parts.push("/".to_owned());
+    }
     for component in path.split(['/', '\\']) {
         match component {
             "" | "." => {}
-            ".." if parts.last().is_some_and(|part| part != "..") => {
+            ".." if parts
+                .last()
+                .is_some_and(|part| part != ".." && part != "/" && !part.ends_with(':')) =>
+            {
                 parts.pop();
             }
             _ => parts.push(component.to_ascii_lowercase()),
@@ -451,7 +442,13 @@ impl SubcircuitCatalog {
         for definition in &parsed.definitions {
             let key = definition.name.to_ascii_uppercase();
             let definitions = self.definitions.entry(key).or_default();
-            if has_equivalent_definition(definitions, definition, source_id, &self.budget)? {
+            if has_equivalent_definition(
+                definitions,
+                definition,
+                source_id,
+                source_name,
+                &self.budget,
+            )? {
                 continue;
             }
             self.budget
@@ -601,6 +598,18 @@ impl SubcircuitCatalog {
                     format!("{directory}/{target}")
                 }
             });
+        let target_path = normalized_source_path(&target);
+        let relative_path = parent_target
+            .as_ref()
+            .map_or_else(|| target_path.clone(), |path| normalized_source_path(path));
+        let suffix_path = if target_path
+            .first()
+            .is_some_and(|part| part == "/" || part.ends_with(':'))
+        {
+            &target_path[1..]
+        } else {
+            &target_path[..]
+        };
         for (identity, metadata) in &self.sources {
             for name in &metadata.source_names {
                 self.budget.charge(Resource::EvaluationSteps, 1)?;
@@ -610,13 +619,10 @@ impl SubcircuitCatalog {
                 )?;
                 let entry = (identity.as_str(), name.as_str(), metadata);
                 let path = normalized_source_path(name);
-                if parent_target.as_ref().map_or_else(
-                    || path == normalized_source_path(&target),
-                    |target| path == normalized_source_path(target),
-                ) {
+                if path == relative_path {
                     insert_include_candidate(&mut relative, path.clone(), entry)?;
                 }
-                if path_suffix_matches(name, include) {
+                if !suffix_path.is_empty() && path.ends_with(suffix_path) {
                     insert_include_candidate(&mut suffix, path.clone(), entry)?;
                 }
                 if Self::path_basename(name).eq_ignore_ascii_case(Self::path_basename(include)) {
@@ -786,7 +792,10 @@ impl SubcircuitCatalog {
         let first = iterator.next()?;
         let normalized = normalize_definition_for_equivalence(&first.bytes);
         iterator
-            .all(|definition| normalize_definition_for_equivalence(&definition.bytes) == normalized)
+            .all(|definition| {
+                same_include_context(first, definition.source_name.as_deref())
+                    && normalize_definition_for_equivalence(&definition.bytes) == normalized
+            })
             .then_some(first)
     }
 
@@ -1250,6 +1259,13 @@ fn parse_library_parts(
         dialect,
         scoped_statements,
     } = projection;
+    let indexed;
+    let selected_view = if simulator == LibrarySimulator::Simplis {
+        indexed = source_includes::indexed_view(selected_view, budget)?;
+        indexed.as_str()
+    } else {
+        selected_view
+    };
     let parsed = extract_definitions_scoped(selected_view, None, budget)?;
     let (support_lines, aliases) = parse_library_root(&parsed.root_lines)?;
     let mut definitions = parsed.definitions;
@@ -1763,6 +1779,7 @@ fn has_equivalent_definition(
     definitions: &[Definition],
     definition: &Definition,
     source_id: &str,
+    source_name: &str,
     budget: &WorkBudget,
 ) -> Result<bool> {
     for existing in definitions {
@@ -1774,8 +1791,9 @@ fn has_equivalent_definition(
                 Resource::ScannedBytes,
                 existing.bytes.len().saturating_add(definition.bytes.len()),
             )?;
-            if normalize_definition_for_equivalence(&existing.bytes)
-                == normalize_definition_for_equivalence(&definition.bytes)
+            if same_include_context(existing, Some(source_name))
+                && normalize_definition_for_equivalence(&existing.bytes)
+                    == normalize_definition_for_equivalence(&definition.bytes)
             {
                 return Ok(true);
             }
@@ -1801,23 +1819,33 @@ fn normalize_definition_for_equivalence(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
+// A syntactically identical occurrence program at a different origin can
+// select a different relative resource. Do not equate such declarations.
+fn same_include_context(definition: &Definition, source_name: Option<&str>) -> bool {
+    definition.source_name.as_deref() == source_name || !definition_has_include(definition)
+}
+
 fn insert_local_definition(
     catalog: &mut SubcircuitCatalog,
     definition: Definition,
 ) -> Result<bool> {
     let key = definition.name.to_ascii_uppercase();
     let definitions = catalog.definitions.entry(key).or_default();
-    let same_scope = definitions
-        .iter()
-        .filter(|existing| existing.owner_scope_id == definition.owner_scope_id)
-        .collect::<Vec<_>>();
-    if same_scope.iter().any(|existing| {
-        normalize_definition_for_equivalence(&existing.bytes)
-            == normalize_definition_for_equivalence(&definition.bytes)
-    }) {
-        return Ok(false);
-    }
-    if !same_scope.is_empty() {
+    for existing in definitions.iter() {
+        catalog.budget.charge(Resource::EvaluationSteps, 1)?;
+        if existing.owner_scope_id != definition.owner_scope_id {
+            continue;
+        }
+        catalog.budget.charge(
+            Resource::ScannedBytes,
+            existing.bytes.len().saturating_add(definition.bytes.len()),
+        )?;
+        if same_include_context(existing, definition.source_name.as_deref())
+            && normalize_definition_for_equivalence(&existing.bytes)
+                == normalize_definition_for_equivalence(&definition.bytes)
+        {
+            return Ok(false);
+        }
         bail!(
             "conflicting duplicate local SIMPLIS subcircuit {} in lexical scope",
             definition.name
