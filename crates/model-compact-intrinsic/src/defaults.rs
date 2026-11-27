@@ -179,6 +179,39 @@ fn check_selector_range(
     Ok(())
 }
 
+// B4SOIsetup derives the overlap capacitance from the *explicit* DLC flag,
+// not the resolved default DLC, and uses the material-dependent setup Cox.
+fn prepare_overlap_defaults(
+    source: &BoundParameters,
+    values: &mut [Option<ParameterValue>],
+) -> Result<(), ModelError> {
+    let (permittivity, thickness) = if model_integer(values, "mtrlmod")? == 0 {
+        (3.453_133e-11, real(values, model_slot("tox")?)?)
+    } else {
+        (3.9 * 8.85418e-12, real(values, model_slot("eot")?)?)
+    };
+    if thickness <= 0.0 || !thickness.is_finite() {
+        return Err(ModelError::InvalidPhysicalParameter("oxide thickness"));
+    }
+    let cox = permittivity / thickness;
+    let dlc = match source.get_slot(model_slot("dlc")?) {
+        Some(ParameterValue::Real(value)) if *value > 0.0 => Some(*value),
+        _ => None,
+    };
+    for (name, lateral) in [("cgdo", "cgdl"), ("cgso", "cgsl")] {
+        let id = usize::from(model_slot(name)?);
+        if values[id].is_none() {
+            let capacitance = if let Some(length) = dlc {
+                length.mul_add(cox, -real(values, model_slot(lateral)?)?)
+            } else {
+                0.6 * real(values, model_slot("xj")?)? * cox
+            };
+            values[id] = Some(ParameterValue::Real(capacitance));
+        }
+    }
+    Ok(())
+}
+
 /// Apply source-accurate BSIMSOI 4.x setup defaults to a bound model card.
 ///
 /// Assignment order mirrors `B4SOIsetup` in ngspice 47. Inputs override defaults;
@@ -269,6 +302,8 @@ pub fn prepare_bsim_soi_model(
         };
         values[dst] = Some(value);
     }
+
+    prepare_overlap_defaults(source, &mut values)?;
 
     // These are the selectors for which ngspice explicitly performs range
     // coercion. Rather than silently switching physical laws, reject here.

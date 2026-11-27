@@ -53,6 +53,10 @@ fn polarity_and_mobility_dependent_defaults_follow_upstream() -> Result<(), Mode
     assert_eq!(p.polarity(), MosPolarity::Pmos);
     assert_eq!(get(&p, "vth0"), Some(&ParameterValue::Real(-0.7)));
     assert_eq!(get(&p, "u0"), Some(&ParameterValue::Real(0.025)));
+    for (name, nmos, pmos) in [("noia", 6.25e41, 6.188e40), ("noib", 3.125e26, 1.5e25)] {
+        assert_eq!(get(&n, name), Some(&ParameterValue::Real(nmos)));
+        assert_eq!(get(&p, name), Some(&ParameterValue::Real(pmos)));
+    }
     assert_eq!(get(&p, "vddeot"), Some(&ParameterValue::Real(-1.5)));
     assert_eq!(get(&n, "vddeot"), Some(&ParameterValue::Real(1.5)));
     assert_eq!(get(&n, "uc"), Some(&ParameterValue::Real(-0.0465e-9)));
@@ -203,6 +207,49 @@ fn independent_parameter_batches_do_not_contaminate_shared_defaults() -> Result<
             ),
             Some(&ParameterValue::Integer(3))
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn overlap_defaults_preserve_dlc_presence_and_material() -> Result<(), ModelError> {
+    use ParameterValue::{Integer, Real};
+    for generalized in [false, true] {
+        for dlc in [None, Some(0.0), Some(4e-8)] {
+            let mut input = vec![
+                ("mtrlmod", Integer(i32::from(generalized))),
+                ("tox", Real(3e-9)),
+                ("eot", Real(2e-9)),
+                ("xj", Real(6e-8)),
+                ("cgsl", Real(1e-10)),
+                ("cgdl", Real(2e-10)),
+            ];
+            if let Some(length) = dlc {
+                input.push(("dlc", Real(length)));
+            }
+            let model = prepare_bsim_soi_model(&raw_model(&input)?, 300.15)?;
+            let cox = if generalized {
+                3.9 * 8.85418e-12 / 2e-9
+            } else {
+                3.453_133e-11 / 3e-9
+            };
+            for (name, lateral) in [("cgso", 1e-10), ("cgdo", 2e-10)] {
+                let expected = dlc
+                    .filter(|length| *length > 0.0)
+                    .map_or(0.6 * 6e-8 * cox, |length| length * cox - lateral);
+                assert!(
+                    matches!(get(&model, name), Some(Real(actual)) if (*actual-expected).abs() < 1e-24)
+                );
+            }
+            input.push(("cgso", Real(0.0)));
+            assert_eq!(
+                get(
+                    &prepare_bsim_soi_model(&raw_model(&input)?, 300.15)?,
+                    "cgso"
+                ),
+                Some(&Real(0.0))
+            );
+        }
     }
     Ok(())
 }
