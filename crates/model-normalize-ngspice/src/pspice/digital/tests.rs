@@ -1,5 +1,6 @@
 use super::{Connection, Device, Gate, Primitive, Role, Storage, timing};
 use crate::{lexical, model_card::parse_model_card};
+use Connection::{GlobalGround, GlobalSupply, Node};
 use anyhow::{Context, Result, bail};
 use model_preprocess_command::WorkBudget;
 
@@ -28,7 +29,6 @@ fn gate_arrays_keep_gate_major_input_order_and_shared_enable() -> Result<()> {
         .iter()
         .map(|p| (p.role, p.connections.as_slice()))
         .collect::<Vec<_>>();
-    use Connection::{GlobalGround, GlobalSupply, Node};
     assert_eq!(
         groups,
         vec![
@@ -289,5 +289,68 @@ fn diagnostic_uses_lexical_timing_model_not_an_unrelated_root_model() -> Result<
     );
     let error = result.err().context("expected wrong-family diagnostic")?;
     assert!(format!("{error:#}").contains("wrong family"), "{error:#}");
+    Ok(())
+}
+
+#[test]
+fn interface_models_preserve_load_and_level_specific_transition_offsets() -> Result<()> {
+    let budget = WorkBudget::default();
+    let card = parse_model_card(
+        ".model io UIO (DRVH={R} DRVL=12 DRVZ=5meg INR=1meg INLD=10p OUTLD=2p AtoD3=\"Schmitt\" DtoA3=\"OpenCollector\" DIGPOWER=\"Supply\" TSWHL3=3n TSWLH3=1n TPWRT=0)",
+        1,
+        &[],
+    )?;
+    let model = super::io::Model::parse(&card, &budget)?;
+    let mut context = |name: &str| {
+        if name.eq_ignore_ascii_case("R") {
+            Ok(24.0)
+        } else {
+            bail!("unknown {name}")
+        }
+    };
+    let bound = model.bind(3, &mut context, &budget)?;
+    close(bound.drive_high, 24.0);
+    close(bound.drive_low, 12.0);
+    close(bound.drive_z, 5e6);
+    close(bound.input_resistance, 1e6);
+    close(bound.input_capacitance, 10e-12);
+    close(bound.output_capacitance, 2e-12);
+    assert_eq!(bound.analog_to_digital, "Schmitt");
+    assert_eq!(bound.digital_to_analog, "OpenCollector");
+    assert_eq!(bound.power_subcircuit, "Supply");
+    close(bound.pulse_rejection.context("explicit zero")?, 0.0);
+    close(bound.interface_delay(2e-9, true, true), 1e-9);
+    close(bound.interface_delay(2e-9, false, true), 0.0);
+    close(bound.interface_delay(2e-9, false, false), 2e-9);
+    let default = super::io::Model::default();
+    let bound = default.bind(1, &mut context, &budget)?;
+    close(bound.drive_high, 50.0);
+    close(bound.drive_low, 50.0);
+    close(bound.drive_z, 250e3);
+    close(bound.input_resistance, 30e3);
+    close(bound.minimum_storage, 1e-3);
+    assert_eq!(bound.pulse_rejection, None);
+    assert_eq!(bound.analog_to_digital, "AtoDDefault");
+    assert_eq!(bound.digital_to_analog, "DtoADefault");
+    assert_eq!(bound.power_subcircuit, "DIGIFPWR");
+    Ok(())
+}
+
+#[test]
+fn circuit_policy_uses_final_global_values_and_ignores_control_commands() -> Result<()> {
+    let source = b".options DIGMNTYMX=1 DIGMNTYSCALE=.25 DIGTYMXSCALE=2 DIGIOLVL=3 DIGINITSTATE=1 DIGFREQ=5g DIGDRVF=3 DIGDRVZ=10k DIGOVRDRV=4\n.control\n.options DIGMNTYMX=3\n.endc\n.options DIGMNTYMX=4\n";
+    let statements = lexical::pspice_statements(source)?;
+    let policy = super::super::options::GlobalOptions::collect(&statements)?.digital;
+    assert_eq!(policy.corner, timing::Corner::WorstCase);
+    assert_eq!(policy.io_level, 3);
+    assert_eq!(policy.initial_state, timing::InitialState::Set);
+    close(policy.scale.minimum, 0.25);
+    close(policy.scale.maximum, 2.0);
+    close(policy.digital_frequency, 5e9);
+    close(policy.minimum_drive_resistance, 3.0);
+    close(policy.maximum_drive_resistance, 10e3);
+    close(policy.override_drive_ratio, 4.0);
+    let invalid = lexical::pspice_statements(b".options DIGIOLVL=0\n")?;
+    assert!(super::super::options::GlobalOptions::collect(&invalid).is_err());
     Ok(())
 }

@@ -606,6 +606,15 @@ fn rewrite(text: &str, line: usize, functions: &mut Functions) -> Result<String>
                 "PSpice timing model {name} has wrong family"
             );
         }
+        if let Some(model_line) = functions
+            .scopes
+            .find_model(functions.scope, &device.io_model.to_ascii_lowercase())?
+        {
+            digital::io::Model::parse(
+                &functions.scopes.model(model_line)?,
+                functions.scopes.budget(),
+            )?;
+        }
         bail!(
             "PSpice digital U-device {} requires a transactional {family:?} runtime",
             device.name

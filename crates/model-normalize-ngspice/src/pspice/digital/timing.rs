@@ -114,12 +114,26 @@ impl Scale {
     }
 }
 
+/// Source storage initialization before resolving time-zero inputs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InitialState {
+    Clear,
+    Set,
+    #[default]
+    Unknown,
+}
+
 /// Circuit policy inherited by a source occurrence unless overridden.
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
     pub corner: Corner,
     pub io_level: u8,
     pub scale: Scale,
+    pub initial_state: InitialState,
+    pub digital_frequency: f64,
+    pub minimum_drive_resistance: f64,
+    pub maximum_drive_resistance: f64,
+    pub override_drive_ratio: f64,
 }
 
 impl Default for Policy {
@@ -128,17 +142,73 @@ impl Default for Policy {
             corner: Corner::Typical,
             io_level: 1,
             scale: Scale::default(),
+            initial_state: InitialState::Unknown,
+            digital_frequency: 10e9,
+            minimum_drive_resistance: 2.0,
+            maximum_drive_resistance: 20e3,
+            override_drive_ratio: 3.0,
         }
     }
 }
 
 impl Policy {
-    pub(super) fn validate(self) -> Result<()> {
+    pub(in crate::pspice) fn validate(self) -> Result<()> {
         self.scale.validate()?;
         ensure!(
             (1..=4).contains(&self.io_level),
             "invalid PSpice circuit I/O level"
         );
+        ensure!(
+            self.digital_frequency.is_finite()
+                && self.digital_frequency > 0.0
+                && self.minimum_drive_resistance.is_finite()
+                && self.minimum_drive_resistance > 0.0
+                && self.maximum_drive_resistance.is_finite()
+                && self.maximum_drive_resistance >= self.minimum_drive_resistance
+                && self.override_drive_ratio.is_finite()
+                && self.override_drive_ratio > 0.0,
+            "invalid PSpice digital frequency or drive policy"
+        );
+        Ok(())
+    }
+
+    pub(in crate::pspice) fn recognizes_option(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "digmntymx"
+                | "digmntyscale"
+                | "digtymxscale"
+                | "digiolvl"
+                | "diginitstate"
+                | "digfreq"
+                | "digdrvf"
+                | "digdrvz"
+                | "digovrdrv"
+        )
+    }
+
+    pub(in crate::pspice) fn apply_option(&mut self, name: &str, value: f64) -> Result<()> {
+        match name.to_ascii_lowercase().as_str() {
+            "digmntymx" => {
+                self.corner = Corner::from_override(super::selector(value)?)?
+                    .context("PSpice DIGMNTYMX must select a circuit timing corner")?;
+            }
+            "digmntyscale" => self.scale.minimum = value,
+            "digtymxscale" => self.scale.maximum = value,
+            "digiolvl" => self.io_level = super::selector(value)?,
+            "diginitstate" => {
+                self.initial_state = match value {
+                    0.0 => InitialState::Clear,
+                    1.0 => InitialState::Set,
+                    _ => InitialState::Unknown,
+                };
+            }
+            "digfreq" => self.digital_frequency = value,
+            "digdrvf" => self.minimum_drive_resistance = value,
+            "digdrvz" => self.maximum_drive_resistance = value,
+            "digovrdrv" => self.override_drive_ratio = value,
+            _ => bail!("unsupported PSpice digital option {name}"),
+        }
         Ok(())
     }
 }

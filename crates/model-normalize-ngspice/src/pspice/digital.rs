@@ -11,6 +11,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 
+pub mod io;
 pub mod timing;
 
 /// Combinational truth function.
