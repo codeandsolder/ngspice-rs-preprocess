@@ -18,11 +18,11 @@ struct Scope {
     instances: BTreeSet<String>,
 }
 
-struct Declaration {
-    scope: usize,
-    card: ModelCard,
+pub(super) struct Declaration {
+    pub scope: usize,
+    pub card: ModelCard,
     base: Option<String>,
-    dialect: SourceDialect,
+    pub dialect: SourceDialect,
 }
 
 pub(super) struct Scopes {
@@ -253,7 +253,7 @@ impl Scopes {
             .is_some_and(|model| model.dialect.is_pspice())
     }
 
-    pub(super) fn model(&self, line: usize) -> Result<ModelCard> {
+    pub(super) fn model_chain(&self, line: usize) -> Result<Vec<&Declaration>> {
         // Resolve iteratively, avoiding recursive stack use on long AKO chains.
         let mut stack = Vec::new();
         let mut active = BTreeSet::new();
@@ -281,11 +281,17 @@ impl Scopes {
                 "PSpice AKO model inheritance across source dialects needs a qualified physical model contract"
             );
         }
-        let base = stack.pop().context("empty PSpice model chain")?;
+        stack.reverse();
+        Ok(stack)
+    }
+
+    pub(super) fn model(&self, line: usize) -> Result<ModelCard> {
+        let stack = self.model_chain(line)?;
+        let (base, derived) = stack.split_first().context("empty PSpice model chain")?;
         charge_card(&base.card, &self.budget)?;
         let mut model = base.card.clone();
         super::temperature::validate_base(&model)?;
-        for derived in stack.into_iter().rev() {
+        for derived in derived {
             ensure!(
                 derived.card.family.eq_ignore_ascii_case(&model.family),
                 "PSpice AKO model {} changes base family {} to {}",
@@ -310,7 +316,7 @@ pub(super) fn charge_scope(scope: &[String], budget: &WorkBudget) -> Result<()> 
     Ok(())
 }
 
-fn charge_card(card: &ModelCard, budget: &WorkBudget) -> Result<()> {
+pub(super) fn charge_card(card: &ModelCard, budget: &WorkBudget) -> Result<()> {
     budget.charge(Resource::GeneratedNodes, card.parameters.len())?;
     budget.charge(Resource::EvaluationSteps, card.parameters.len())?;
     budget.charge(

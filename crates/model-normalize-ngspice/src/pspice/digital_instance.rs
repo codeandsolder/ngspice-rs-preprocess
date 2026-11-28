@@ -366,7 +366,7 @@ pub struct DigitalInstance {
     pub selectors: Vec<ModelParameter>,
 }
 
-fn header<'a>(fields: &[&'a str]) -> Result<(Primitive, usize)> {
+fn header(fields: &[&str]) -> Result<(Primitive, usize)> {
     let token = *fields.first().context("missing PSpice U-device type")?;
     let (name, dimensions, used) = if let Some((name, dimensions)) = token.split_once('(') {
         (name, Some(dimensions), 1)
@@ -448,8 +448,19 @@ impl DigitalInstance {
         );
         let selectors = spans.get(model_end).map_or_else(
             || Ok(Vec::new()),
-            |span| parse_assignments(&text[span.start..]),
+            |span| {
+                let mut fields = parse_assignments(&text[span.start..])?;
+                for field in &mut fields {
+                    field.span.name =
+                        field.span.name.start + span.start..field.span.name.end + span.start;
+                    if let Some(value) = &mut field.span.value {
+                        *value = value.start + span.start..value.end + span.start;
+                    }
+                }
+                Ok::<_, anyhow::Error>(fields)
+            },
         )?;
+        // Keep duplicate assignments and their original order for source binding.
         for field in &selectors {
             ensure!(
                 field.name.eq_ignore_ascii_case("IO_LEVEL")

@@ -18,6 +18,7 @@ use std::{collections::BTreeMap, fmt::Write as _};
 
 pub mod digital_instance;
 pub mod digital_io;
+pub mod digital_source;
 pub mod digital_timing;
 mod instances;
 mod nodes;
@@ -551,6 +552,12 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
             timing.family
         );
     }
+    if let Some(io) = digital_io::IoModel::from_card(&card)? {
+        bail!(
+            "PSpice digital I/O model {} requires occurrence-bound native digital execution",
+            io.name
+        );
+    }
     let family = card.family.to_ascii_lowercase();
     for p in &card.parameters {
         let name = p.name.to_ascii_lowercase();
@@ -767,6 +774,14 @@ fn lower_body(
     budget.charge(Resource::ScannedBytes, body.len())?;
     let statements = lexical::statements(body)?;
     let scopes = Scopes::collect(&statements, origins, dialects, budget)?;
+    let digital = digital_source::capture(&statements, &scopes, origins, dialects)?;
+    if let Some(declaration) = digital.first() {
+        bail!(
+            "PSpice digital primitive {} at {:?} requires occurrence-bound native digital execution",
+            declaration.instance.declaration.name,
+            declaration.instance.location
+        );
+    }
     let options = options::GlobalOptions::collect(&statements)?;
     let mut functions = Functions::new(body, scopes, options)?;
     let rewritten_statements = rewrite_statements(&statements, &mut functions, origins, dialects)?;
