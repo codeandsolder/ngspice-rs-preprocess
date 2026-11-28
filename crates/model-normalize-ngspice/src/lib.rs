@@ -58,6 +58,38 @@ pub fn source_statements(
         .collect())
 }
 
+/// Remove selected fields of one logical source statement while preserving
+/// its physical lines, including wholly consumed continuation lines. Spans
+/// refer to the text returned by the shared logical statement scanner.
+///
+/// # Errors
+/// Invalid physical statement or field spans, or exhausted work budget.
+pub fn remove_statement_fields(
+    input: &[u8],
+    fields: &[std::ops::Range<usize>],
+    budget: &WorkBudget,
+) -> Result<Vec<u8>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    let normalized = lexical::normalize_nbsp(input);
+    let input = normalized.as_deref().unwrap_or(input);
+    let mut statements = lexical::statements(input)?;
+    ensure!(
+        statements.len() == 1,
+        "field removal needs exactly one logical statement"
+    );
+    let statement = statements.pop().context("missing logical statement")?;
+    ensure!(
+        fields
+            .iter()
+            .all(|span| span.start < span.end && span.end <= statement.text.len())
+            && fields.windows(2).all(|pair| pair[0].end <= pair[1].start),
+        "invalid logical field removal spans"
+    );
+    let mut edits = Vec::new();
+    lexical::remove_spans(&statement, input, fields, &mut edits);
+    Ok(lexical::apply_budgeted_edits(input, edits, budget)?.unwrap_or_else(|| input.to_vec()))
+}
+
 pub mod linked_source;
 pub mod ltspice;
 pub mod model_card;
@@ -74,7 +106,7 @@ pub mod vdmos_card;
 pub mod vdmos_ltspice;
 pub mod waveform;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use linked_source::SourceDialect;
 use model_preprocess_command::{Cancellation, ProcessLimits, Resource, WorkBudget, capture};
 use regex::bytes::Regex;

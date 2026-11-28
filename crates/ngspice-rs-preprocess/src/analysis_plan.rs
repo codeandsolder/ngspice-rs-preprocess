@@ -78,7 +78,7 @@ pub enum DirectiveOrigin {
 pub enum Disposition {
     /// Equivalent native analysis request; not embedded in the circuit.
     NativeRequest,
-    /// Numerical setting materialized in the circuit.
+    /// Setting materialized in the artifact, including qualified output options.
     Circuit,
     /// Already applied by source model selection; never emitted as a native option.
     ModelSelection,
@@ -683,6 +683,13 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
     use Disposition::{
         Circuit, Initialization, Metadata, ModelSelection, RequiresBinding, Unsupported,
     };
+    if dialect == AnalysisDialect::Ltspice
+        && model_normalize_ngspice::ltspice::output_options::SOURCE_NAMES
+            .iter()
+            .any(|source| name.eq_ignore_ascii_case(source))
+    {
+        return Circuit;
+    }
     match (dialect, name) {
         (
             AnalysisDialect::Ltspice,
@@ -691,13 +698,9 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
         ) => Circuit,
         (
             AnalysisDialect::Ltspice,
-            "MAXSTEP" | "TEMP" | "METHOD" | "SSTOL" | "STSTDELAY" | "STSTCLOCKS" | "PLOTRELTOL"
-            | "PLOTVNTOL" | "PLOTABSTOL" | "PLOTWINSIZE",
+            "MAXSTEP" | "TEMP" | "METHOD" | "SSTOL" | "STSTDELAY" | "STSTCLOCKS",
         ) => RequiresBinding,
-        (
-            AnalysisDialect::Ltspice,
-            "NUMDGT" | "MEASDGT" | "LOGPARAMS" | "LOGOPINFO" | "DEBUGTRAN",
-        ) => Metadata,
+        (AnalysisDialect::Ltspice, "MEASDGT" | "LOGPARAMS" | "LOGOPINFO" | "DEBUGTRAN") => Metadata,
         (AnalysisDialect::Simetrix, "HSPICEMODELS" | "HSPICECOMPATIBILITY") => ModelSelection,
         (AnalysisDialect::Simetrix, "INITCONDMODE" | "ICRES") => Initialization,
         (
@@ -728,43 +731,67 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
     }
 }
 
-fn options(fields: &[String], dialect: AnalysisDialect) -> Result<Vec<OptionSetting>> {
-    let mut result = Vec::new();
-    let mut index = 0;
-    while let Some(name) = fields.get(index) {
-        ensure!(
-            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-            "invalid option name {name:?}"
-        );
-        index += 1;
-        let value = if fields.get(index).is_some_and(|field| field == "=") {
-            let value = fields
-                .get(index + 1)
-                .filter(|value| *value != "=")
-                .context("missing option value")?
-                .clone();
-            index += 2;
-            Some(value)
-        } else {
-            None
-        };
-        let name = name.to_ascii_uppercase();
-        let disposition = option_disposition(&name, dialect);
-        ensure!(
-            !matches!(
-                disposition,
-                Disposition::Circuit | Disposition::Initialization
-            ) || value.is_some(),
-            "{name} requires an assignment"
-        );
-        result.push(OptionSetting {
-            name,
-            value,
-            disposition,
-        });
-    }
-    ensure!(!result.is_empty(), "empty options statement");
-    Ok(result)
+fn option_fields(
+    statement: &str,
+    dialect: AnalysisDialect,
+) -> Result<Vec<(OptionSetting, std::ops::Range<usize>)>> {
+    use model_normalize_ngspice::{model_card::parse_parameter_fields, statement_token_spans};
+    let fields = if dialect == AnalysisDialect::Ltspice {
+        model_normalize_ngspice::ltspice::output_options::source_fields(statement)?
+    } else {
+        let offset = statement_token_spans(statement)?
+            .into_iter()
+            .next()
+            .context("missing options directive")?
+            .end;
+        let mut fields = parse_parameter_fields(&statement[offset..], &[])?;
+        for field in &mut fields {
+            field.span.name = field.span.name.start + offset..field.span.name.end + offset;
+            if let Some(span) = &mut field.span.value {
+                *span = span.start + offset..span.end + offset;
+            }
+        }
+        fields
+    };
+    ensure!(!fields.is_empty(), "empty options statement");
+    fields
+        .into_iter()
+        .map(|field| {
+            let name = field.name.to_ascii_uppercase();
+            ensure!(
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                "invalid option name {name:?}"
+            );
+            let disposition = option_disposition(&name, dialect);
+            ensure!(
+                !matches!(
+                    disposition,
+                    Disposition::Circuit | Disposition::Initialization
+                ) || field.expression.is_some(),
+                "{name} requires an assignment"
+            );
+            let span = field.span.name.start
+                ..field
+                    .span
+                    .value
+                    .map_or(field.span.name.end, |span| span.end);
+            Ok((
+                OptionSetting {
+                    name,
+                    value: field.expression,
+                    disposition,
+                },
+                span,
+            ))
+        })
+        .collect()
+}
+
+fn options(statement: &str, dialect: AnalysisDialect) -> Result<Vec<OptionSetting>> {
+    Ok(option_fields(statement, dialect)?
+        .into_iter()
+        .map(|(setting, _)| setting)
+        .collect())
 }
 
 pub(crate) fn arguments(statement: &str) -> Result<Vec<String>> {
@@ -964,7 +991,7 @@ fn classify(
     if matches!(name, ".OPTIONS" | ".OPTION" | ".OPT") {
         return Ok((
             Directive::Options {
-                settings: options(&args, dialect)?,
+                settings: options(statement, dialect)?,
             },
             if scoped { Unsupported } else { Circuit },
         ));

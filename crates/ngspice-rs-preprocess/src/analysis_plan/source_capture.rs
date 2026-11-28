@@ -4,7 +4,7 @@
 
 use super::{
     AnalysisDialect, AnalysisPlan, Directive, DirectiveOrigin, Disposition, PlanKind, arguments,
-    command, options, push_entry, source_title, tracked,
+    command, option_fields, options, push_entry, source_title, tracked,
 };
 use crate::OriginLine;
 use anyhow::{Context, Result, ensure};
@@ -14,7 +14,7 @@ use model_normalize_ngspice::{
     source_statements,
 };
 use model_preprocess_command::{Resource, WorkBudget};
-use std::fmt::Write as _;
+use std::ops::Range;
 
 /// Location supplied by the admitted source occurrence graph.
 #[derive(Debug)]
@@ -173,11 +173,9 @@ impl Candidate {
         }
         let name = command(&self.text);
         Ok(match name.as_str() {
-            ".OPTIONS" | ".OPTION" | ".OPT" => {
-                options(&arguments(&self.text)?, self.location.dialect)?
-                    .iter()
-                    .any(|setting| setting.disposition != Disposition::Circuit)
-            }
+            ".OPTIONS" | ".OPTION" | ".OPT" => options(&self.text, self.location.dialect)?
+                .iter()
+                .any(|setting| setting.disposition != Disposition::Circuit),
             ".IC" | ".NODESET" => false,
             ".TEMP" => arguments(&self.text)?.len() > 1,
             _ => true,
@@ -257,7 +255,7 @@ fn collect_candidates(
 struct Rewrite {
     first: usize,
     last: usize,
-    native_options: String,
+    removed_fields: Option<Vec<Range<usize>>>,
 }
 
 fn extract_entry(
@@ -318,71 +316,77 @@ fn extract_entry(
             .try_bind_closed(budget)
             .with_context(|| format!("transient timing at {:?}", entry.origin))?;
     }
-    let mut native_options = String::new();
-    match &entry.directive {
+    let removed_fields = match &entry.directive {
         Directive::Circuit if entry.disposition != Disposition::Unsupported => return Ok(None),
         Directive::Options { settings } if entry.disposition == Disposition::Circuit => {
-            for setting in settings
+            if settings
                 .iter()
-                .filter(|setting| setting.disposition == Disposition::Circuit)
+                .all(|setting| setting.disposition == Disposition::Circuit)
             {
-                if native_options.is_empty() {
-                    native_options.push_str(".options");
-                }
-                write!(native_options, " {}", setting.name)?;
-                if let Some(value) = &setting.value {
-                    write!(native_options, "={value}")?;
-                }
+                return Ok(None);
+            }
+            if settings
+                .iter()
+                .any(|setting| setting.disposition == Disposition::Circuit)
+            {
+                Some(
+                    option_fields(&text, location.dialect)?
+                        .into_iter()
+                        .filter_map(|(setting, span)| {
+                            (setting.disposition != Disposition::Circuit).then_some(span)
+                        })
+                        .collect(),
+                )
+            } else {
+                None
             }
         }
-        _ => {}
-    }
+        _ => None,
+    };
     Ok(Some(Rewrite {
         first,
         last,
-        native_options,
+        removed_fields,
     }))
 }
 
 fn emit(physical: &[&[u8]], rewrites: Vec<Rewrite>, budget: &WorkBudget) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    let mut rewrites = rewrites.into_iter().peekable();
-    for (index, line) in physical.iter().enumerate() {
-        let number = index + 1;
-        if let Some(rewrite) = rewrites.peek()
-            && (rewrite.first..=rewrite.last).contains(&number)
+    let mut offset = 0;
+    for rewrite in rewrites {
+        let start = rewrite
+            .first
+            .checked_sub(1)
+            .context("invalid analysis source edit")?;
+        for line in physical
+            .get(offset..start)
+            .context("overlapping analysis edits")?
         {
-            if number == rewrite.first && !rewrite.native_options.is_empty() {
-                let ending = if line.ends_with(b"\r\n") {
-                    b"\r\n".as_slice()
-                } else if line.ends_with(b"\n") {
-                    b"\n".as_slice()
-                } else {
-                    b"".as_slice()
-                };
-                budget.charge(
-                    Resource::EmittedBytes,
-                    rewrite.native_options.len().saturating_add(ending.len()),
-                )?;
-                output.extend_from_slice(rewrite.native_options.as_bytes());
-                output.extend_from_slice(ending);
-            } else {
+            budget.charge(Resource::EmittedBytes, line.len())?;
+            output.extend_from_slice(line);
+        }
+        let lines = physical
+            .get(start..rewrite.last)
+            .context("analysis source edit outside physical artifact")?;
+        if let Some(fields) = rewrite.removed_fields {
+            let length = lines.iter().map(|line| line.len()).sum();
+            budget.charge(Resource::EmittedBytes, length)?;
+            let edited =
+                model_normalize_ngspice::remove_statement_fields(&lines.concat(), &fields, budget)?;
+            output.extend_from_slice(&edited);
+        } else {
+            for line in lines {
                 budget.charge(Resource::EmittedBytes, line.len().saturating_add(2))?;
                 output.extend_from_slice(b"* ");
                 output.extend_from_slice(line);
             }
-            if number == rewrite.last {
-                rewrites.next();
-            }
-        } else {
-            budget.charge(Resource::EmittedBytes, line.len())?;
-            output.extend_from_slice(line);
         }
+        offset = rewrite.last;
     }
-    ensure!(
-        rewrites.next().is_none(),
-        "analysis source edit outside physical artifact"
-    );
+    for line in &physical[offset..] {
+        budget.charge(Resource::EmittedBytes, line.len())?;
+        output.extend_from_slice(line);
+    }
     Ok(output)
 }
 

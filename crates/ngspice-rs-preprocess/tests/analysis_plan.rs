@@ -632,3 +632,56 @@ fn simetrix_compatibility_step_and_continuation_are_not_interchangeable() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn raw_file_options_share_source_fields_with_analysis_options() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"Option ownership\n.param pw=0\nV1 x 0 1\nR1 x 0 1k\n.options RELTOL=1e-5 MAXSTEP=1u\n+ plotwinsize pw\n+ SSTOL=1m\n+ numdgt={7+8}\n.tran 1m\n.end\n")?;
+    let bundle = prepare_path(&root, InputFormat::LtspiceDeck)?;
+    let plan = bundle
+        .analysis_plan
+        .as_ref()
+        .context("missing analysis plan")?;
+    let Directive::Options { settings } = &plan.entries[0].directive else {
+        anyhow::bail!("missing option settings");
+    };
+    assert_eq!(
+        settings
+            .iter()
+            .map(|setting| (&*setting.name, setting.disposition))
+            .collect::<Vec<_>>(),
+        [
+            ("RELTOL", Disposition::Circuit),
+            ("MAXSTEP", Disposition::RequiresBinding),
+            ("PLOTWINSIZE", Disposition::Circuit),
+            ("SSTOL", Disposition::RequiresBinding),
+            ("NUMDGT", Disposition::Circuit),
+        ]
+    );
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let ngspice_rs_preprocess::Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing source provenance");
+    };
+    for (marker, line) in [
+        ("ltspice_output_plotwinsize=", 6),
+        ("ltspice_output_numdgt=", 8),
+    ] {
+        let origin = text
+            .lines()
+            .zip(lines)
+            .find_map(|(card, origin)| card.contains(marker).then_some(origin))
+            .context("missing output projection")?;
+        assert_eq!(origin.line, line);
+        assert_eq!(origin.source, root.canonicalize()?);
+    }
+    assert!(text.contains(".options RELTOL=1e-5"), "{text}");
+    assert!(
+        !text
+            .lines()
+            .filter(|line| !line.starts_with('*'))
+            .any(|line| line.contains("MAXSTEP") || line.contains("SSTOL")),
+        "{text}"
+    );
+    Ok(())
+}

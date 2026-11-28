@@ -12,7 +12,8 @@ use crate::{
     linked_source::SourceDialect,
 };
 
-const NAMES: &[&str] = &[
+/// Source raw-file presentation fields with required scalar values.
+pub const SOURCE_NAMES: &[&str] = &[
     "plotwinsize",
     "numdgt",
     "plotreltol",
@@ -27,59 +28,76 @@ const PREFIX: &str = "ltspice_output_";
 #[must_use = "only explicitly projected raw-file options have no electrical effect"]
 pub fn is_projected(name: &str) -> bool {
     name.strip_prefix(PREFIX)
-        .is_some_and(|name| NAMES.contains(&name))
+        .is_some_and(|name| SOURCE_NAMES.contains(&name))
+}
+
+/// Parse one logical LTspice option card, retaining exact source field spans.
+/// The qualified presentation controls accept both assignments and bare values.
+///
+/// # Errors
+/// Malformed fields or missing presentation values.
+pub fn source_fields(text: &str) -> Result<Vec<crate::model_card::ModelParameter>> {
+    let head = lexical::tokens(text.as_bytes())?
+        .into_iter()
+        .next()
+        .context("missing LTspice options directive")?;
+    let offset = head.end;
+    let mut fields = crate::model_card::parse_parameter_fields(&text[offset..], SOURCE_NAMES)?;
+    for field in &mut fields {
+        field.span.name = field.span.name.start + offset..field.span.name.end + offset;
+        if let Some(span) = &mut field.span.value {
+            *span = span.start + offset..span.end + offset;
+        }
+        if SOURCE_NAMES
+            .iter()
+            .any(|name| field.name.eq_ignore_ascii_case(name))
+        {
+            let value = field
+                .expression
+                .as_deref()
+                .context("missing LTspice output option value")?;
+            ensure!(
+                field.span.explicit_equals
+                    || !SOURCE_NAMES
+                        .iter()
+                        .any(|name| value.eq_ignore_ascii_case(name)),
+                "LTspice output option {} requires a numeric value",
+                field.name
+            );
+        }
+    }
+    Ok(fields)
 }
 
 fn project_card(statement: &Statement, edits: &mut Vec<Edit>) -> Result<()> {
     let source = &statement.text;
-    let spans = lexical::comma_tokens(source)?;
-    let tokens: Vec<_> = spans.iter().map(|span| &source[span.clone()]).collect();
-    let mut index = 1;
-    while let Some(&key) = tokens.get(index) {
-        if key == b"," {
-            lexical::replace_span(statement, spans[index].clone(), b" ", edits);
-            index += 1;
-            continue;
-        }
-        let assigned = tokens.get(index + 1) == Some(&b"=".as_slice());
-        let Some(name) = NAMES
+    let text = std::str::from_utf8(source)?;
+    for field in source_fields(text)? {
+        let Some(name) = SOURCE_NAMES
             .iter()
-            .find(|name| key.eq_ignore_ascii_case(name.as_bytes()))
+            .find(|name| field.name.eq_ignore_ascii_case(name))
         else {
-            // Do not mistake the value of an unrelated option for a key.
-            index += if assigned { 3 } else { 1 };
             continue;
         };
-        let value_index = index + if assigned { 2 } else { 1 };
-        let value = tokens
-            .get(value_index)
-            .context("missing LTspice output option value")?;
-        ensure!(
-            !matches!(*value, b"=" | b",")
-                && tokens.get(value_index + 1) != Some(&b"=".as_slice())
-                && (assigned
-                    || !NAMES
-                        .iter()
-                        .any(|name| value.eq_ignore_ascii_case(name.as_bytes()))),
-            "line {}: LTspice output option {name} requires a numeric value",
-            statement.line
+        let value = field
+            .span
+            .value
+            .context("missing LTspice output option value span")?;
+        let raw = &text[value.clone()];
+        let marker = format!(
+            "{PREFIX}{name}{}",
+            if field.span.explicit_equals { "" } else { "=" }
         );
-        let marker = format!("{PREFIX}{name}{}", if assigned { "" } else { "=" });
-        lexical::replace_span(statement, spans[index].clone(), marker.as_bytes(), edits);
-        let raw = std::str::from_utf8(value)?;
-        if crate::model_card::parse_spice_constant(raw).is_err()
-            && !matches!(value.first(), Some(b'{' | b'\''))
-        {
-            // LTspice also accepts bare scalar parameters in this position.
-            // Retain them as expressions for occurrence-specific validation.
-            lexical::replace_span(
-                statement,
-                spans[value_index].clone(),
-                format!("{{{raw}}}").as_bytes(),
-                edits,
-            );
+        lexical::replace_span(statement, field.span.name, marker.as_bytes(), edits);
+        if crate::model_card::parse_spice_constant(raw).is_err() && !raw.starts_with(['{', '\'']) {
+            // Bare scalar parameters remain expressions until occurrence binding.
+            lexical::replace_span(statement, value, format!("{{{raw}}}").as_bytes(), edits);
         }
-        index = value_index + 1;
+    }
+    for span in lexical::comma_tokens(source)? {
+        if &source[span.clone()] == b"," {
+            lexical::replace_span(statement, span, b" ", edits);
+        }
     }
     Ok(())
 }
