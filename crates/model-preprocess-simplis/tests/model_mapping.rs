@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use model_preprocess_command::WorkBudget;
 use model_preprocess_simplis::source_dialect::{
-    DialectContext, ScopedStatement, SourceDialect, SourceLanguage,
+    DialectContext, ScopedStatement, SourceDialect,
     model_mapping::{Device, DeviceConfiguration, MappingTable, SelectionOrigin},
 };
 
@@ -245,7 +245,7 @@ fn classic_bjt_implementation_selection_is_not_the_lexical_dialect() -> Result<(
     let mut source = statements(
         ".map ModelName=PNP Level=69 Device=BJT\n.model n NPN(IS=3p)\n.model p PNP(LEVEL=69 IS=4p TNOM=29)\n.model v NPN(LEVEL=4 IS=1p)\n",
     );
-    source[2].context.language = SourceLanguage::Hspice;
+    source[2].context.language = SourceDialect::Hspice;
     let mapped = MappingTable::resolve(
         &DeviceConfiguration::default(),
         &source,
@@ -379,22 +379,16 @@ fn classic_bjt_selection_is_not_a_lexical_dialect_or_lateral_pnp_guess() -> Resu
     let mut source = statements(
         ".subckt part c b e\n.model same PNP(IS={local_is} T_ABS={TEMP} TNOM=27)\n.ends\n.model same NPN(IS=2p)\n",
     );
-    source[1].context.language = SourceLanguage::Hspice;
+    source[1].context.language = SourceDialect::Hspice;
     source[1].source = "part.lib".into();
-    source[3].context.language = SourceLanguage::Pspice;
+    source[3].context.language = SourceDialect::Pspice;
     let budget = WorkBudget::default();
     let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source, &budget)?
         .apply(&source, &budget)?;
     assert_eq!(mapped.selections[0].scope, ["part"]);
     assert_eq!(mapped.selections[0].source, "part.lib");
-    assert_eq!(
-        mapped.selections[0].context.language,
-        SourceLanguage::Hspice
-    );
-    assert_eq!(
-        mapped.selections[1].context.language,
-        SourceLanguage::Pspice
-    );
+    assert_eq!(mapped.selections[0].context.language, SourceDialect::Hspice);
+    assert_eq!(mapped.selections[1].context.language, SourceDialect::Pspice);
     assert!(mapped.statements[1].text.contains("gummel_poon_legacy_pnp"));
     assert!(mapped.statements[3].text.contains("gummel_poon_legacy_npn"));
     for declaration in [
