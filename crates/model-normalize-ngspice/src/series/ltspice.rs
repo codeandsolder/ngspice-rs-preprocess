@@ -423,6 +423,11 @@ fn storage(
                 budget,
             )?;
             card.push("pn_control", "0");
+        } else {
+            // A capacitor's behavioral current is the physical port
+            // current, not just the current of its primary charge storage.
+            // Selection of the sampling law is a separate operation.
+            card.push("pn_control", "1");
         }
     }
     Ok(())
@@ -505,6 +510,7 @@ mod tests {
                     vec![
                         ("pn_rseries", loss),
                         ("pn_lseries", inductance),
+                        ("pn_control", 1.),
                         ("pn_gterminal_dc", if copies > 0. { 2e-18 } else { 0. }),
                         ("pn_gterminal_tran", if copies > 0. { 2e-18 } else { 0. }),
                         ("pn_cparallel", if inductance == 0. { 0. } else { 2e-12 }),
@@ -522,6 +528,7 @@ mod tests {
                         ("pn_rparallel", 100.),
                         ("pn_cparallel", 1e-6),
                         ("pn_report_ac_rparallel_factor", copies - 1.),
+                        ("pn_control", 0.),
                     ],
                 ),
                 (

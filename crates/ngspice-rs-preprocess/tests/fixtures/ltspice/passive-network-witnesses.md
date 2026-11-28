@@ -111,3 +111,56 @@ solver issues #271 and #272. Capacitor behavioral current sampling across
 analysis phases is specified in #274, and occurrence-bound voltage source
 capacitance placement in #275. These are separate native contracts;
 a successful normalization is not sufficient to claim their implementation.
+
+## Signed occurrence coefficients and independent startup laws
+
+For a 2 V DC / 1 V AC source feeding a 10 ohm series resistor and one
+network to ground, LTspice accepts signed series and parallel storage
+and loss coefficients. At 10 kHz:
+
+| Device | Terminal voltage |
+|---|---|
+| C=2u Rser=-2 | 0.3716902792754108-j0.6249912365375416 |
+| C=2u Rpar=-20 | 0.2733529969952181-j0.6870110137575443 |
+| C=2u Cpar=-1u | 0.7169568003248977-j0.4504772433683886 |
+| C=-2u | 0.3877266367391514+j0.4872316614323186 |
+| L=3m Rpar=-20 | 1.977733752088942+j0.2098439503836435 |
+| L=-3m Rser=0 | 0.9971934217275060-j0.0529027540955512 |
+| C=2u m=-2 Rser=0 Rpar=0 | 0.1366764984976091+j0.3435055068787721 |
+| L=3m m=-2 Rser=0 Rpar=0 | 0.9888674202791085-j0.1049220919999672 |
+
+Omitted leakage depends on the sign of *effective* storage. C=1e9 with
+m=-2 gives 2 V DC, whereas C=-1e9 with m=-2 gives 1.96078431372549 V.
+L=1e-10 with Rser=5 and m=-2 gives -2/3 V DC; L=-1e-10 with the same
+resistance and multiplicity gives -5/7 V. Zero copies give zero leakage.
+An explicitly zero L with nonzero copies and omitted Rpar has an undefined
+leakage law; explicit Rpar=0 permits the ordinary finite series law.
+With Lser nonzero, omitted Cpar instead follows positive *unscaled* main
+capacitance times 1e-6; explicit zero, small signed and negative values
+are not replaced.
+
+For C=2u IC=.75, Rser=-2 and Rser=0 both give OP terminal voltage
+0.7501249875012499 V. The physical negative Rser is unchanged for the
+dynamic analysis: only the startup bias conductance selects 1000 S
+when Rser is nonpositive. Positive Rser uses its actual unscaled
+reciprocal, including Rser below 1m. L=3m IC=.1 Rpar=-20 with omitted
+Rser gives 2 V OP and zero external current, not zero winding current.
+
+Thermal noise is a separate law: Rpar=-20 uses absolute conductance,
+whereas Rser=-2 or RLshunt=-20 produces undefined (NaN) reference
+noise density. Negative voltage-source Rser has a finite absolute
+thermal magnitude as described above. These signed native requirements
+are tracked separately from source normalization in solver #278.
+
+## Current-reference identity
+
+For C=2u Rser=5 Rpar=20 on a 2 V source through 3 ohms, the operating
+point terminal current and a behavioral monitor I(C1) both equal
+0.08695652173913043 A. The monitor has zero small-signal current
+perturbation, despite a nonzero physical port current. Current branch
+identity is separate from the sampling law: the capacitor uses its
+physical terminal branch, while an inductor uses the intrinsic winding.
+At 10 kHz, L=3m Rser=5 Rpar=20 Cpar=1u m=2 driven by AC 1 through
+3 ohms has winding current -0.001818572457001496-j0.007668199776010198 A
+and reported current 0.1657616466885765+j0.04446561363256242 A.
+Do not infer either branch from the output reporting law.
