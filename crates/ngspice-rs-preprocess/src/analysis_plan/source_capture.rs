@@ -281,7 +281,7 @@ struct Rewrite {
     removed_fields: Option<Vec<Range<usize>>>,
 }
 
-fn extract_entry(
+fn extract_pspice_options(
     plan: &mut AnalysisPlan,
     candidate: Candidate,
     budget: &WorkBudget,
@@ -293,56 +293,69 @@ fn extract_entry(
         text,
         conditional,
     } = candidate;
-    let name = command(&text);
-    if location.dialect == AnalysisDialect::Pspice
-        && matches!(name.as_str(), ".OPTIONS" | ".OPTION" | ".OPT")
-    {
-        let fields = option_fields(&text, location.dialect)?;
-        let digital = fields
-            .iter()
-            .filter(|(setting, _)| {
-                model_normalize_ngspice::pspice::digital_options::DigitalOption::from_name(
-                    &setting.name,
-                )
-                .is_some()
-            })
-            .collect::<Vec<_>>();
-        if digital.is_empty() {
-            return Ok(None);
-        }
-        let library = plan.kind == PlanKind::Library;
-        push_entry(
-            plan,
-            location.origin,
-            &location.scope,
-            &text,
-            library || conditional,
-            budget,
-            location.dialect,
-        )?;
-        let entry = plan
-            .entries
-            .last_mut()
-            .context("missing digital option entry")?;
-        let Directive::Options { settings } = &mut entry.directive else {
-            anyhow::bail!("expected digital option entry");
-        };
-        settings.retain(|setting| {
+    let fields = option_fields(&text, location.dialect)?;
+    let digital = fields
+        .iter()
+        .filter(|(setting, _)| {
             model_normalize_ngspice::pspice::digital_options::DigitalOption::from_name(
                 &setting.name,
             )
             .is_some()
-        });
-        if entry.disposition != Disposition::Unsupported {
-            entry.disposition = Disposition::RequiresBinding;
-        }
-        return Ok(Some(Rewrite {
-            first,
-            last,
-            removed_fields: (digital.len() != fields.len())
-                .then(|| digital.into_iter().map(|(_, span)| span.clone()).collect()),
-        }));
+        })
+        .collect::<Vec<_>>();
+    if digital.is_empty() {
+        return Ok(None);
     }
+    let library = plan.kind == PlanKind::Library;
+    push_entry(
+        plan,
+        location.origin,
+        &location.scope,
+        &text,
+        library || conditional,
+        budget,
+        location.dialect,
+    )?;
+    let entry = plan
+        .entries
+        .last_mut()
+        .context("missing digital option entry")?;
+    let Directive::Options { settings } = &mut entry.directive else {
+        anyhow::bail!("expected digital option entry");
+    };
+    settings.retain(|setting| {
+        model_normalize_ngspice::pspice::digital_options::DigitalOption::from_name(&setting.name)
+            .is_some()
+    });
+    if entry.disposition != Disposition::Unsupported {
+        entry.disposition = Disposition::RequiresBinding;
+    }
+    return Ok(Some(Rewrite {
+        first,
+        last,
+        removed_fields: (digital.len() != fields.len())
+            .then(|| digital.into_iter().map(|(_, span)| span.clone()).collect()),
+    }));
+}
+
+fn extract_entry(
+    plan: &mut AnalysisPlan,
+    candidate: Candidate,
+    budget: &WorkBudget,
+) -> Result<Option<Rewrite>> {
+    let name = command(&candidate.text);
+    if candidate.location.dialect == AnalysisDialect::Pspice
+        && matches!(name.as_str(), ".OPTIONS" | ".OPTION" | ".OPT")
+    {
+        return extract_pspice_options(plan, candidate, budget);
+    }
+    let Candidate {
+        first,
+        last,
+        location,
+        text,
+        conditional,
+    } = candidate;
     // Native circuit directives are already in the solver's source language.
     // They remain in the electrical artifact rather than being duplicated.
     if location.dialect != AnalysisDialect::Ltspice
