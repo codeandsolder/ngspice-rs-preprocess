@@ -4,7 +4,7 @@
 //! a device. Lazy conditional evaluation and explicit errors for stochastic
 //! functions avoid silently substituting deterministic model parameters.
 
-use crate::model_card::parse_spice_constant;
+use crate::model_card::{identifier_start, parse_spice_constant};
 use crate::native_scalar::{BinaryOp, ConditionalChain, Function, UnaryOp};
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
@@ -274,7 +274,7 @@ fn tokenize(raw: &str, dialect: Dialect, runtime: bool) -> Result<Vec<Token>> {
             });
             continue;
         }
-        if byte.is_ascii_alphabetic() || byte == b'_' {
+        if identifier_start(byte) {
             let (token, end) = name_token(raw, cursor, dialect)?;
             cursor = end;
             tokens.push(token);

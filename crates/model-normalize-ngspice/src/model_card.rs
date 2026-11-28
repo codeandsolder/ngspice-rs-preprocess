@@ -149,8 +149,17 @@ pub struct ParameterDeclaration {
     pub function: Option<FunctionSignature>,
 }
 
+/// Native scalar identifiers, including generated helper names, may start
+/// with an ASCII letter or underscore.
+pub(crate) const fn identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
 fn valid_formal(name: &str) -> bool {
-    name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+    name.as_bytes()
+        .first()
+        .copied()
+        .is_some_and(identifier_start)
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
@@ -170,7 +179,10 @@ pub fn parse_function_signature(source: &str) -> Result<(FunctionSignature, &str
         .context("user-defined function missing closing parenthesis")?;
     let name = source[..open].trim();
     ensure!(
-        name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        name.as_bytes()
+            .first()
+            .copied()
+            .is_some_and(identifier_start)
             && name.bytes().all(|byte| byte.is_ascii_alphanumeric()
                 || matches!(byte, b'_' | b'#' | b'$' | b'[' | b']')),
         "invalid function identifier {name}"
