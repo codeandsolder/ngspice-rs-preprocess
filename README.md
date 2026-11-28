@@ -95,9 +95,23 @@ ngspice-rs-preprocess native-library model.lib normalized \
 
 Use repeatable `--library PATH` for raw catalog members, or
 `--parsed-library PATH` for previously compiled JSON artifacts. Explicit
-library path suffixes take priority over a unique portable basename;
-ambiguous includes fail. Content-equivalent library aliases retain all
-source names. A compiled artifact is never passed to the source command.
+source paths resolve relative to the importing source first, then by
+matching path suffix and unique portable basename; ambiguous includes fail.
+Content-equivalent libraries retain all admitted source names. Identical
+programs at different paths do not make their relative includes interchangeable.
+A compiled artifact is never passed to the source command.
+
+For SIMPLIS, an explicit catalog include executes its selected source program
+in the current preprocessing scope and in source order. Only active conditional
+and loop occurrences execute; a nested include resolves relative to its own
+origin. Local variables remain local, while promoted globals are visible to
+subsequently specialized subcircuits. Active model cards and aliases are emitted
+once at the declaration scope; occurrence-specific declarations are specialized
+with their caller's bindings. Merely adding a catalog member does not execute
+its root control program. The parsed-library v8 format preserves the selected
+source program separately from its indexed declarations and retains physical
+source positions. Regenerate older parsed artifacts before using them.
+
 Recursive relative `.init` resources are admitted in the same session and
 only in the selected simulator projection. Missing, ambiguous and
 recursive resources are errors. Dialect translation emits only the native
@@ -209,7 +223,7 @@ are qualified. The source-language header controls expression and
 lexical semantics independently of model selection. The mapping table is
 shared across the deck's admitted includes; indexed catalog libraries
 cannot independently introduce global selection directives. Include such
-resources explicitly instead. Parsed-library format v6 retains projected
+resources explicitly instead. Parsed-library format v8 retains projected
 source statements so that a catalog can be selected again under a new
 request's mapping rather than baking in a previous request's defaults.
 
