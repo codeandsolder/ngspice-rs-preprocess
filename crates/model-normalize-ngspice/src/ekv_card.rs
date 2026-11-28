@@ -80,7 +80,7 @@ mod tests {
                 .resolve_ekv(0, &[(1, "gain", multiplier)], defaults)?
                 .context("missing scoped EKV model")?;
             let device = model.bind([])?;
-            assert!((device.device.channel.kp - multiplier * 50e-6).abs() < 1e-18);
+            assert!(f64::mul_add(multiplier, -50e-6, device.device.channel.kp).abs() < 1e-18);
         }
         Ok(())
     }

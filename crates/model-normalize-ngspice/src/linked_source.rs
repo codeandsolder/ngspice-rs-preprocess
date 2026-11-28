@@ -1151,19 +1151,19 @@ mod tests {
             .visits
             .iter()
             .map(|visit| {
-                (
+                Ok((
                     visit
                         .path
                         .file_name()
-                        .unwrap()
+                        .context("linked occurrence must refer to a named file")?
                         .to_string_lossy()
                         .into_owned(),
                     visit.parent,
                     visit.dialect,
                     visit.declaration,
-                )
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         assert_eq!(
             visits,
             [
