@@ -623,7 +623,7 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
         let level =
             parse_spice_constant(&level).context("PSpice physical model level must be constant")?;
         ensure!(
-            level != 2.,
+            !matches!(level, 2.),
             "PSpice BJT level 2 requires a MEXTRAM physical kernel"
         );
     }
@@ -904,14 +904,14 @@ pub fn normalize_mapped(
     )
 }
 
-/// Project PSpice rows in a complete mixed-language declaration graph.
+/// Project `PSpice` rows in a complete mixed-language declaration graph.
 ///
 /// The caller has already joined logical statements and projected other
 /// source dialects, but has not specialized hierarchy or controlled transfers.
 /// The map includes the title when preparing a deck.
 ///
 /// # Errors
-/// Invalid row map, malformed source, or unsupported PSpice semantics.
+/// Invalid row map, malformed source, or unsupported `PSpice` semantics.
 pub fn project_rows(
     input: &[u8],
     kind: RootKind,

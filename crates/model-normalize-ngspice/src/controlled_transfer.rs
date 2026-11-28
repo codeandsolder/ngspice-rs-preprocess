@@ -827,7 +827,7 @@ pub struct TransferEmitter<'a> {
 
 impl<'a> TransferEmitter<'a> {
     /// Reserve identifiers lazily, only when a transfer requires them.
-    #[must_use]
+    #[must_use = "the emitter owns the collision-free identifier namespace"]
     pub const fn new(input: &'a [u8], budget: &'a WorkBudget) -> Self {
         Self {
             input,

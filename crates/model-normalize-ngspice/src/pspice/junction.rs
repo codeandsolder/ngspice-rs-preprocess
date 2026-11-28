@@ -1,11 +1,11 @@
-//! Model-declaration selection for PSpice junction devices. The source level
-//! and target physical variant are distinct: PSpice levels 6 and 7 select
+//! Model-declaration selection for `PSpice` junction devices. The source level
+//! and target physical variant are distinct: `PSpice` levels 6 and 7 select
 //! Berkeley BSIM3v3.2.4, not the native level-6 or level-7 implementations.
 use super::{parameter, set_parameter};
 use crate::model_card::{ModelCard, parse_spice_constant};
 use anyhow::{Context, Result, bail, ensure};
 
-/// Qualified junction model implementation selected by the PSpice frontend.
+/// Qualified junction model implementation selected by the `PSpice` frontend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JunctionKind {
     Diode,
@@ -43,7 +43,9 @@ impl JunctionKind {
 }
 
 /// Source declaration and effective model selection, before native spelling
-/// replaces its physical selector. For AKO the selection uses the inherited
+/// replaces its physical selector.
+///
+/// For AKO the selection uses the inherited
 /// effective declaration, while the declared card remains the source card.
 #[derive(Debug)]
 pub struct JunctionProjection {

@@ -765,7 +765,7 @@ pub struct NativeNormalization {
     pub mapped: MappedNormalization,
     /// Source device declarations that changed identity during lowering.
     pub renamed: Vec<RenamedDevice>,
-    /// Typed PSpice junction declarations keyed by the original input line.
+    /// Typed `PSpice` junction declarations keyed by the original input line.
     pub pspice_junctions: std::collections::BTreeMap<usize, pspice::JunctionProjection>,
     /// Source transfers retained for occurrence binding instead of native emission.
     pub pspice_transfers: BTreeMap<usize, controlled_transfer::ControlledTransfer>,
