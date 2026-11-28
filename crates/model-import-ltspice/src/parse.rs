@@ -397,12 +397,11 @@ impl Symbol {
         ensure!(!pins.is_empty(), "symbol has no electrical pins");
         if !block || pins.iter().any(|pin| pin.order.is_some()) {
             pins.sort_unstable_by_key(|pin| pin.order);
-            for (index, pin) in pins.iter().enumerate() {
-                ensure!(
-                    pin.order == Some(index + 1),
-                    "missing, duplicate or noncontiguous SpiceOrder"
-                );
-            }
+            ensure!(
+                pins.iter().all(|pin| pin.order.is_some())
+                    && pins.windows(2).all(|pair| pair[0].order != pair[1].order),
+                "missing or duplicate SpiceOrder"
+            );
         }
         Ok(Self {
             block,

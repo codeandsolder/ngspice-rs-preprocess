@@ -3,18 +3,26 @@ use anyhow::{Context, Result, ensure};
 use ngspice_rs_preprocess::{
     Cancellation, InputFormat, Options, PreparedBundle, Provenance, Request, SourceInput, prepare,
 };
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 const RES: &str = "Version 4\nSymbolType CELL\nSYMATTR Prefix R\nSYMATTR Value 1k\nPIN 0 16 NONE 0\nPINATTR SpiceOrder 2\nPIN 0 0 NONE 0\nPINATTR SpiceOrder 1\n";
 const CHILD: &str = "Version 4\nSymbolType BLOCK\nPIN 0 0 NONE 0\nPINATTR PinName in\nPINATTR SpiceOrder 1\nPIN 0 16 NONE 0\nPINATTR PinName out\nPINATTR SpiceOrder 2\n";
 
 fn prepared(path: &Path) -> Result<PreparedBundle> {
+    prepared_with_search(path, Vec::new())
+}
+
+fn prepared_with_search(path: &Path, search_paths: Vec<PathBuf>) -> Result<PreparedBundle> {
     prepare(
         &Request {
             format: InputFormat::LtspiceSchematic,
             input: SourceInput::File(path.to_owned()),
             libraries: Vec::new(),
-            search_paths: Vec::new(),
+            search_paths,
         },
         &Options::default(),
         &Cancellation::default(),
@@ -127,10 +135,106 @@ fn imported_hierarchical_rc_matches_independent_native_deck() -> Result<()> {
     let measured = numerical_data(dir.path(), &bundle.primary.bytes, "imported")?;
     let expected = numerical_data(dir.path(), reference, "reference")?;
     for (observed, expected) in measured.iter().zip(&expected) {
-        assert!(!observed.is_empty());
+        ensure!(!observed.is_empty(), "empty numerical trace");
         assert_eq!(observed.len(), expected.len());
         for (&a, &b) in observed.iter().zip(expected) {
             ensure!((a - b).abs() <= 1e-10 * b.abs().max(1.), "{a} != {b}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn imported_semiconductor_terminal_and_library_bindings_match_native_deck() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("devices.asc");
+    let lib = dir.path().join("lib");
+    let cmp = lib.join("cmp");
+    fs::create_dir_all(&cmp)?;
+    fs::write(dir.path().join("res.asy"), RES)?;
+    fs::write(
+        dir.path().join("voltage.asy"),
+        RES.replace("Prefix R", "Prefix V")
+            .replace("Value 1k", "Value 0"),
+    )?;
+    fs::write(
+        dir.path().join("diode.asy"),
+        RES.replace("Prefix R", "Prefix D")
+            .replace("Value 1k", "Value D"),
+    )?;
+    let three = format!("{RES}PIN 16 0 NONE 0\nPINATTR SpiceOrder 3\n");
+    fs::write(
+        dir.path().join("npn.asy"),
+        three
+            .replace("Prefix R", "Prefix QN")
+            .replace("Value 1k", "Value NPN"),
+    )?;
+    fs::write(
+        dir.path().join("nmos.asy"),
+        three
+            .replace("Prefix R", "Prefix MN")
+            .replace("Value 1k", "Value NMOS"),
+    )?;
+    // Deliberately authored compact models, not copied installation data.
+    fs::write(cmp.join("standard.dio"), ".model dm D(IS=2e-14 N=1.1)\n")?;
+    fs::write(
+        cmp.join("standard.bjt"),
+        ".model qm NPN(IS=3e-15 BF=120 VAF=100)\n",
+    )?;
+    fs::write(
+        cmp.join("standard.mos"),
+        ".model mm NMOS(LEVEL=1 VTO=.65 KP=.001)\n",
+    )?;
+    fs::write(
+        &root,
+        concat!(
+            "Version 4\nSHEET 1 800 600\n",
+            "FLAG 0 0 in\nFLAG 0 16 0\n",
+            "FLAG 32 0 vcc\nFLAG 32 16 0\n",
+            "FLAG 64 0 vcc\nFLAG 64 16 out\n",
+            "FLAG 96 0 in\nFLAG 96 16 base\n",
+            "FLAG 128 0 out\nFLAG 128 16 base\nFLAG 144 0 0\n",
+            "FLAG 160 0 out\nFLAG 160 16 in\nFLAG 176 0 0\n",
+            "FLAG 192 0 0\nFLAG 192 16 out\n",
+            "SYMBOL voltage 0 0 R0\nSYMATTR InstName V1\nSYMATTR Value PULSE(0 1.2 1u 1u 1u 2m 4m) AC 1\n",
+            "SYMBOL voltage 32 0 R0\nSYMATTR InstName V2\nSYMATTR Value 5\n",
+            "SYMBOL res 64 0 R0\nSYMATTR InstName R1\nSYMATTR Value 2k\n",
+            "SYMBOL res 96 0 R0\nSYMATTR InstName R2\nSYMATTR Value 10k\n",
+            "SYMBOL npn 128 0 R0\nSYMATTR InstName Q1\nSYMATTR Value qm\n",
+            "SYMBOL nmos 160 0 R0\nSYMATTR InstName M1\nSYMATTR Value mm\n",
+            "SYMBOL diode 192 0 R0\nSYMATTR InstName D1\nSYMATTR Value dm\n",
+            "TEXT 0 32 Left 2 !.op\n",
+        ),
+    )?;
+    let bundle = prepared_with_search(&root, vec![lib])?;
+    let output = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(output.lines().any(|line| line == "Q1 out base 0 0 qm"));
+    assert!(output.lines().any(|line| line == "M1 out in 0 0 mm"));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing provenance")
+    };
+    let qm = output
+        .lines()
+        .position(|line| line.starts_with(".model qm "))
+        .context("missing library model")?;
+    assert_eq!(lines[qm].source, cmp.join("standard.bjt").canonicalize()?);
+    assert_eq!(lines[qm].line, 1);
+    let reference = concat!(
+        "reference\n",
+        "V1 in 0 PULSE(0 1.2 1u 1u 1u 2m 4m) AC 1\n",
+        "V2 vcc 0 5\nR1 vcc out 2k\nR2 in base 10k\n",
+        "Q1 out base 0 0 qm\nM1 out in 0 0 mm\nD1 0 out dm\n",
+        ".model D D\n.model dm D(IS=2e-14 N=1.1)\n",
+        ".model NPN NPN\n.model PNP PNP\n.model qm NPN(IS=3e-15 BF=120 VAF=100)\n",
+        ".model NMOS NMOS\n.model PMOS PMOS\n.model mm NMOS(LEVEL=1 VTO=.65 KP=.001)\n.end\n",
+    );
+    let observed = numerical_data(dir.path(), &bundle.primary.bytes, "device-import")?;
+    let expected = numerical_data(dir.path(), reference.as_bytes(), "device-reference")?;
+    for (observed, expected) in observed.iter().zip(&expected) {
+        ensure!(!observed.is_empty(), "empty numerical trace");
+        assert_eq!(observed.len(), expected.len());
+        for (&a, &b) in observed.iter().zip(expected) {
+            ensure!((a - b).abs() <= 1e-10 * b.abs().max(1.0), "{a} != {b}");
         }
     }
     Ok(())

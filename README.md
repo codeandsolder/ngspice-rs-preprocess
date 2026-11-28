@@ -51,6 +51,7 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `tina-library` | TINA/TINA-TI plaintext SPICE macro source | `model.lib` |
 | `ltspice-deck` | Explicit LTspice source normalization (partial dialect coverage) | `deck.cir` |
 | `ltspice-library` | Explicit LTspice library normalization (partial dialect coverage) | `model.lib` |
+| `ltspice-schematic` | Headless ASC/ASY schematic and hierarchical symbol import through LTspice normalization | `deck.cir` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
@@ -81,6 +82,12 @@ the regression fixtures are independently authored and contain no vendor model t
 The LTspice formats normalize whole-file library imports, relative Windows-style paths, `noiseless` resistor flags, `.backanno`, scalar intrinsics and operator precedence, runtime versus parameter-phase evaluation, endpoint-clamped numeric tables (including phase-specialized macros), explicit capacitor/inductor series resistance, the uncoupled inductor default series resistance, closed nonnegative voltage-source series resistance, and explicit transient timing (including omitted or zero plotting step). PULSE, PWL, SINE and explicitly timed EXP share occurrence-bound prepared waveform declarations with the native source binder. Relative PWL times are accumulated, signed scales applied, and duplicate-time ordinates averaged before interpolation. Closed waveforms with exact native representations are emitted directly; symbolic coefficients or finite sine trains require the typed waveform manifest, which separates explicit DC bias from transient startup. These passes preserve source provenance and do not require a simulator-wide compatibility mode.
 
 The source-specific transformations have native ngspice OP/DC/AC/transient/noise regressions based on independent LTspice XVII and 24.0.12 measurements. Successful normalization alone does not establish equivalence for arbitrary decks. Idealized diode and voltage-controlled switch models select explicit native physical families. Passive IC and richer parasitic networks, structured/triggered waveforms, analysis-dependent EXP timing defaults, source shunt capacitance, negative or occurrence-parametric voltage-source series resistance, and unsupported expression forms require additional typed preparation or solver support. End-to-end Rust solver acceptance of the generated scalar functions and mandatory waveform declarations depends on its native parameter-expression, macro-expansion and prepared-waveform binding support.
+
+For schematic import, supply the root ASC and any symbol/model search roots.
+The headless importer resolves electrical geometry and symbol metadata,
+including hierarchical blocks, without invoking the graphical editor.
+Installation-specific symbols and component libraries remain external
+resources. See [the schematic import contract](docs/ltspice-schematic.md).
 
 No extension-based format guessing or implicit transformation is performed.
 For example:

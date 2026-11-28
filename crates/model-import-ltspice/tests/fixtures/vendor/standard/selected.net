@@ -1,0 +1,23 @@
+Ddiode diode1 diode2 1N4148
+Qnpn npn1 npn2 npn3 0 2N3904
+Qpnp pnp1 pnp2 pnp3 0 2N3906
+Mnmos nmos1 nmos2 nmos3 nmos3 2N7002
+Mpmos pmos1 pmos2 pmos3 pmos3 BSS84
+Mnmos4 nmos41 nmos42 nmos43 nmos44 MN4
+Jnjf njf1 njf2 njf3 2N3819
+Jpjf pjf1 pjf2 pjf3 2N5460
+Ssw sw1 sw2 sw3 sw4 MY_SW
+.model D D
+.lib standard.dio
+.model NPN NPN
+.model PNP PNP
+.lib standard.bjt
+.model NJF NJF
+.model PJF PJF
+.lib standard.jft
+.model NMOS NMOS
+.model PMOS PMOS
+.lib standard.mos
+.op
+.backanno
+.end

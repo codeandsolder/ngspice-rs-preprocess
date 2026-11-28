@@ -2,11 +2,13 @@
 //! topology and source emission are independent of numerical simulation.
 
 mod parse;
+mod primitive;
 mod topology;
 
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{AdmittedSource, Resource, SourceSession, WorkBudget};
 use parse::{Attributes, Placement, Sheet, Symbol};
+use primitive::{Binding, Prefix, Standard};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -63,6 +65,7 @@ struct Import<'a> {
     definitions: Vec<Body>,
     libraries: BTreeSet<PathBuf>,
     library_lines: Body,
+    standard: BTreeMap<Standard, (Origin, PathBuf)>,
 }
 
 fn path_text(raw: &str) -> Result<PathBuf> {
@@ -226,21 +229,17 @@ fn get<'a>(attrs: &'a Attributes, name: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-fn prefix_name(prefix: &str, name: &str) -> Result<String> {
+fn prefix_name(prefix: Prefix, name: &str) -> Result<String> {
     identifier(name)?;
-    ensure!(
-        prefix.len() == 1 && prefix.as_bytes()[0].is_ascii_alphabetic(),
-        "invalid SPICE prefix {prefix:?}"
-    );
     // LTspice treats a subcircuit prefix as an unconditional namespace
     // marker. Even a displayed instance X1 is exported as XX1.
-    if prefix.eq_ignore_ascii_case("x") {
+    if prefix.is_subcircuit() {
         return Ok(format!("X{name}"));
     }
-    if name.as_bytes()[0].eq_ignore_ascii_case(&prefix.as_bytes()[0]) {
+    if name.as_bytes()[0].eq_ignore_ascii_case(&prefix.letter()) {
         Ok(name.to_owned())
     } else {
-        Ok(format!("{prefix}§{name}"))
+        Ok(format!("{}§{name}", char::from(prefix.letter())))
     }
 }
 
@@ -281,6 +280,24 @@ impl Import<'_> {
                     .filter_map(|path| path.parent())
                     .map(|dir| dir.join(target)),
             );
+            if !symbol {
+                // A supplied symbol under an installation's sym tree also
+                // establishes its sibling component-library search directory.
+                for path in parents {
+                    if let Some(directory) = path
+                        .ancestors()
+                        .find(|ancestor| {
+                            ancestor
+                                .file_name()
+                                .is_some_and(|name| name.eq_ignore_ascii_case("sym"))
+                        })
+                        .and_then(Path::parent)
+                    {
+                        candidates.push(directory.join("cmp").join(target));
+                        candidates.push(directory.join("sub").join(target));
+                    }
+                }
+            }
             for dir in self.search {
                 candidates.push(dir.join(target));
                 if symbol {
@@ -289,6 +306,8 @@ impl Import<'_> {
                 } else {
                     candidates.push(dir.join("sub").join(target));
                     candidates.push(dir.join("lib/sub").join(target));
+                    candidates.push(dir.join("cmp").join(target));
+                    candidates.push(dir.join("lib/cmp").join(target));
                 }
             }
         }
@@ -348,49 +367,78 @@ impl Import<'_> {
         Ok(())
     }
 
+    fn register_standard(
+        &mut self,
+        family: Standard,
+        path: &Path,
+        symbol_path: &Path,
+        line: usize,
+    ) -> Result<()> {
+        if self.standard.contains_key(&family) {
+            return Ok(());
+        }
+        let library = self
+            .resolve(Path::new(family.library()), &[path, symbol_path], false)
+            .with_context(|| {
+                format!(
+                    "standard component library {} requires a supplied LTspice library root",
+                    family.library()
+                )
+            })?;
+        self.standard.insert(
+            family,
+            (
+                Origin {
+                    path: path.to_path_buf(),
+                    line,
+                },
+                library,
+            ),
+        );
+        Ok(())
+    }
+
+    fn emit_standard(&mut self, body: &mut Body) -> Result<()> {
+        for (family, (origin, library)) in std::mem::take(&mut self.standard) {
+            for card in family.defaults() {
+                self.emit(body, &origin.path, origin.line, card)?;
+            }
+            if self.libraries.insert(library.clone()) {
+                self.emit(
+                    body,
+                    &origin.path,
+                    origin.line,
+                    &format!(".lib {}", quoted(&library)?),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn primitive(
         &mut self,
+        prefix: Prefix,
         attrs: &Attributes,
         path: &Path,
         symbol_path: &Path,
         line: usize,
     ) -> Result<(String, String)> {
-        let prefix = get(attrs, "prefix").context("cell symbol has no Prefix")?;
         let name = prefix_name(
             prefix,
             get(attrs, "instname").context("symbol has no InstName")?,
         )?;
-        let subcircuit = prefix.eq_ignore_ascii_case("x");
-        let model = get(attrs, "spicemodel");
-        let value = get(attrs, "value");
-        let value2 = get(attrs, "value2");
-        let mut fields = Vec::new();
-        if let Some(file) = get(attrs, "modelfile") {
-            self.library(file, path, symbol_path, line)?;
-            fields.extend([model, value, value2].into_iter().flatten());
-        } else if subcircuit && value.is_some() && value2.is_some() && model.is_some() {
-            // Fixed subcircuit symbol: SpiceModel names the file, Value is
-            // display-only, Value2 is the complete subcircuit call tail.
-            self.library(
-                model.context("missing subcircuit library")?,
-                path,
-                symbol_path,
-                line,
-            )?;
-            fields.extend(value2);
-        } else {
-            fields.extend([model, value, value2].into_iter().flatten());
+        if let Some(family) = prefix.standard() {
+            self.register_standard(family, path, symbol_path, line)?;
         }
-        fields.extend(
-            [get(attrs, "spiceline"), get(attrs, "spiceline2")]
-                .into_iter()
-                .flatten(),
-        );
+        let binding = Binding::new(prefix, attrs);
+        if let Some(file) = binding.library {
+            self.library(file, path, symbol_path, line)?;
+        }
         ensure!(
-            !fields.is_empty(),
+            !binding.fields.is_empty(),
             "cell {name} has no electrical value or model"
         );
-        let tail = fields.join(" ").replace('µ', "u");
+        let tail = binding.fields.join(" ").replace('µ', "u");
         ensure!(
             !tail.to_ascii_lowercase().contains("$g_"),
             "LTspice global-node identifiers require dialect-aware global binding"
@@ -521,9 +569,14 @@ impl Import<'_> {
         let (symbol_path, symbol) = resolved;
         let mut attributes = symbol.attributes.clone();
         attributes.extend(placement.attributes.clone());
+        let prefix = if symbol.block {
+            Prefix::parse("X")?
+        } else {
+            Prefix::parse(get(&attributes, "prefix").context("cell symbol has no Prefix")?)?
+        };
         let (name, tail) = if symbol.block {
             let name = prefix_name(
-                "X",
+                prefix,
                 get(&attributes, "instname").context("hierarchical symbol has no InstName")?,
             )?;
             let child = self.child(symbol_path, symbol)?;
@@ -538,19 +591,19 @@ impl Import<'_> {
             .join(" ");
             (name, args)
         } else {
-            self.primitive(&attributes, path, symbol_path, placement.line)?
+            self.primitive(prefix, &attributes, path, symbol_path, placement.line)?
         };
         ensure!(
             instances.insert(name.to_ascii_lowercase()),
             "duplicate instance {name}"
         );
         let mut fields = vec![name];
-        for pin in &symbol.pins {
-            fields.push(
-                nets.name(placement.orientation.place(placement.origin, pin.point))?
-                    .to_owned(),
-            );
-        }
+        fields.extend(
+            prefix
+                .terminals(placement, symbol, nets)?
+                .into_iter()
+                .map(str::to_owned),
+        );
         fields.push(tail);
         self.emit(body, path, placement.line, &fields.join(" "))
     }
@@ -638,6 +691,11 @@ impl Import<'_> {
             )
             .with_context(|| format!("{}:{}", source.path.display(), placement.line))?;
         }
+        // The vendor emits generic default cards and standard component
+        // libraries in root scope before explicit analysis/model directives.
+        if definition.is_none() {
+            self.emit_standard(&mut body)?;
+        }
         for (line, text) in &sheet.directives {
             self.directive(&mut body, &source.path, *line, text, definition.is_some())?;
         }
@@ -672,6 +730,7 @@ pub fn import(
         definitions: Vec::new(),
         libraries: BTreeSet::new(),
         library_lines: Body::default(),
+        standard: BTreeMap::new(),
     };
     let mut body = importer.sheet(root, None)?;
     body.append(std::mem::take(&mut importer.library_lines));

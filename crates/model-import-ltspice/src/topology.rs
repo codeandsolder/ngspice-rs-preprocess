@@ -31,14 +31,63 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
         && (a.1.min(b.1)..=a.1.max(b.1)).contains(&p.1)
 }
 
-pub struct Nets(BTreeMap<Point, String>);
+fn electrical_points(
+    sheet: &Sheet,
+    pins: impl IntoIterator<Item = Point>,
+    budget: &WorkBudget,
+) -> Result<(BTreeSet<Point>, BTreeSet<Point>)> {
+    let mut unique = BTreeSet::new();
+    let mut attached = BTreeSet::new();
+    for point in pins {
+        // Charge each occurrence before allocating topology storage;
+        // repeated placements of a large cached symbol must remain bounded.
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        if !unique.insert(point) {
+            attached.insert(point);
+        }
+    }
+    for point in sheet
+        .labels
+        .iter()
+        .map(|label| label.point)
+        .chain(sheet.ports.keys().copied())
+    {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        unique.insert(point);
+        attached.insert(point);
+    }
+    for point in sheet
+        .wires
+        .iter()
+        .flat_map(|&wire| <[Point; 2]>::from(wire))
+    {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        unique.insert(point);
+        attached.insert(point);
+    }
+    Ok((unique, attached))
+}
+
+struct Node {
+    name: String,
+    attached: bool,
+}
+
+pub struct Nets(BTreeMap<Point, Node>);
 
 impl Nets {
     pub fn name(&self, point: Point) -> Result<&str> {
         self.0
             .get(&point)
-            .map(String::as_str)
+            .map(|node| node.name.as_str())
             .context("missing topology point")
+    }
+
+    /// A physical terminal is attached when a wire, flag or another pin
+    /// touches its point. A dangling wire still counts as a connection.
+    pub fn attached_name(&self, point: Point) -> Result<Option<&str>> {
+        let node = self.0.get(&point).context("missing topology point")?;
+        Ok(node.attached.then_some(node.name.as_str()))
     }
 
     pub fn build(
@@ -46,23 +95,7 @@ impl Nets {
         pins: impl IntoIterator<Item = Point>,
         budget: &WorkBudget,
     ) -> Result<Self> {
-        let points = pins
-            .into_iter()
-            .chain(sheet.labels.iter().map(|label| label.point))
-            .chain(sheet.ports.keys().copied())
-            .chain(
-                sheet
-                    .wires
-                    .iter()
-                    .flat_map(|&wire| <[Point; 2]>::from(wire)),
-            );
-        let mut unique = BTreeSet::new();
-        for point in points {
-            // Charge each occurrence before allocating topology storage;
-            // repeated placements of a large cached symbol must remain bounded.
-            budget.charge(Resource::GeneratedNodes, 1)?;
-            unique.insert(point);
-        }
+        let (unique, attached) = electrical_points(sheet, pins, budget)?;
         let indices: BTreeMap<_, _> = unique
             .into_iter()
             .enumerate()
@@ -73,6 +106,10 @@ impl Nets {
             .map(|(&Point(x, y), &index)| (Point(y, x), index))
             .collect();
         let mut sets = UnionFind((0..indices.len()).collect());
+        let mut connected = vec![false; indices.len()];
+        for point in attached {
+            connected[indices[&point]] = true;
+        }
         for &(a, b) in &sheet.wires {
             let (index, first, second) = if (b.0 - a.0).abs() >= (b.1 - a.1).abs() {
                 (&indices, a, b)
@@ -86,6 +123,7 @@ impl Nets {
                 budget.charge(Resource::EvaluationSteps, 1)?;
                 if on_segment(point, first, second) {
                     sets.join(anchor, id);
+                    connected[id] = true;
                 }
             }
         }
@@ -133,7 +171,13 @@ impl Nets {
                     }
                 }
             });
-            result.insert(point, name.clone());
+            result.insert(
+                point,
+                Node {
+                    name: name.clone(),
+                    attached: connected[id],
+                },
+            );
         }
         Ok(Self(result))
     }
