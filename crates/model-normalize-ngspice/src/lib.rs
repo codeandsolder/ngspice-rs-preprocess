@@ -595,6 +595,7 @@ pub struct RenamedDevice {
 }
 
 /// Lower a linked source graph using its per-occurrence source language.
+///
 /// The source-specific passes share a complete declaration graph and compose
 /// physical origins; none reinterprets an unrelated source language.
 ///
@@ -636,15 +637,13 @@ pub fn normalize_linked(
     } else {
         None
     };
-    let (input, origins) = if let Some(projection) = &tina {
+    let (input, origins) = tina.as_ref().map_or((input, None), |projection| {
         passes.extend_from_slice(&projection.passes);
         (
             projection.bytes.as_slice(),
             Some(projection.lines.as_slice()),
         )
-    } else {
-        (input, None)
-    };
+    });
     let mut mapped = normalize_selected(input, kind, dialects, origins, budget)?;
     passes.append(&mut mapped.model.passes);
     mapped.model.passes = passes;

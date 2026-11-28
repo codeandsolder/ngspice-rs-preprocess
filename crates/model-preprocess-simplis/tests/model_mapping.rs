@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use model_preprocess_command::WorkBudget;
 use model_preprocess_simplis::source_dialect::{
-    DialectContext, ScopedStatement, SourceLanguage,
+    DialectContext, ScopedStatement, SourceDialect,
     model_mapping::{Device, DeviceConfiguration, MappingTable, SelectionOrigin},
 };
 
@@ -58,7 +58,7 @@ fn level_selection_is_independent_of_lexical_dialect_and_scope() -> Result<()> {
     let mut source = statements(
         ".subckt cell a b\n.model diode D (LEVEL=1 IS={LOG(100)})\n.ends\n.options hspicemodels=1\n.model base D\n",
     );
-    source[1].context.language = SourceLanguage::Hspice;
+    source[1].context.language = SourceDialect::Hspice;
     source[1].source = "nested.lib".into();
     let mapped = MappingTable::resolve(
         &DeviceConfiguration::default(),
@@ -68,10 +68,7 @@ fn level_selection_is_independent_of_lexical_dialect_and_scope() -> Result<()> {
     .apply(&source, &WorkBudget::default())?;
     assert_eq!(mapped.selections[0].scope, ["cell"]);
     assert_eq!(mapped.selections[0].source, "nested.lib");
-    assert_eq!(
-        mapped.selections[0].context.language,
-        SourceLanguage::Hspice
-    );
+    assert_eq!(mapped.selections[0].context.language, SourceDialect::Hspice);
     assert_eq!(mapped.selections[0].mapping.device, Device::Diode3);
     assert_eq!(mapped.selections[1].mapping.device, Device::Diode3);
     assert!(mapped.statements[1].text.contains("IS={LOG(100)}"));

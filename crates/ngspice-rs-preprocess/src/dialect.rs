@@ -13,7 +13,7 @@ use model_normalize_ngspice::linked_source::{
 };
 use model_preprocess_command::{AdmissionConfig, WorkBudget};
 use model_preprocess_simplis::source_dialect::{
-    DeviceIdentity, DialectContext, ScopedStatement, SourceKind,
+    DeviceIdentity, DialectContext, RootKind, ScopedStatement,
     model_mapping::{DeviceConfiguration, MappingTable, ModelSelection},
     resolve_device_identities,
 };
@@ -196,7 +196,7 @@ impl<'a> SourceExpansion<'a> {
         &mut self,
         source: &AdmittedSource,
         inherited: DialectContext,
-        kind: SourceKind,
+        kind: RootKind,
         section: Option<&str>,
     ) -> Result<DialectContext> {
         let key = (source.path.clone(), section.map(str::to_ascii_lowercase));
@@ -243,7 +243,7 @@ impl<'a> SourceExpansion<'a> {
         &self,
         source: &AdmittedSource,
         inherited: DialectContext,
-        kind: SourceKind,
+        kind: RootKind,
         section: Option<&str>,
     ) -> Result<(
         DialectContext,
@@ -275,7 +275,7 @@ impl<'a> SourceExpansion<'a> {
         &mut self,
         source: &AdmittedSource,
         inherited: DialectContext,
-        kind: SourceKind,
+        kind: RootKind,
         section: Option<&str>,
     ) -> Result<DialectContext> {
         let (context, projected) = self.project_lines(source, inherited, kind, section)?;
@@ -283,7 +283,7 @@ impl<'a> SourceExpansion<'a> {
         let mut embedded = false;
         let mut projected = projected.into_iter();
         while let Some(line) = projected.next() {
-            if self.standalone && kind == SourceKind::Deck && line.first_line == 1 {
+            if self.standalone && kind == RootKind::Deck && line.first_line == 1 {
                 self.append_projected(source, context, &line, &line.text)?;
                 continue;
             }
@@ -370,7 +370,7 @@ impl<'a> SourceExpansion<'a> {
                     self.session.budget().check_depth(self.scope_depth)?;
                 }
             }
-            if kind == SourceKind::Include && name == ".END" && !embedded {
+            if kind == RootKind::Include && name == ".END" && !embedded {
                 self.append_projected(source, context, &line, &format!("* {}", line.text))?;
             } else {
                 self.append_projected(source, context, &line, &line.text)?;
@@ -449,7 +449,7 @@ impl<'a> SourceExpansion<'a> {
             };
             if let Some(path) = path {
                 let snapshot = self.session.load(&path)?;
-                self.expand(&snapshot, context, SourceKind::Include, None)?;
+                self.expand(&snapshot, context, RootKind::Include, None)?;
                 return Ok(true);
             }
         }
@@ -461,7 +461,7 @@ impl<'a> SourceExpansion<'a> {
                 .resolve_resource(&source.path, Path::new(&normalized))?
                 .with_context(|| format!("cannot resolve named library {target}"))?;
             let snapshot = self.session.load(&path)?;
-            self.expand(&snapshot, context, SourceKind::Include, Some(&section))?;
+            self.expand(&snapshot, context, RootKind::Include, Some(&section))?;
             return Ok(true);
         }
         Ok(false)
@@ -485,7 +485,7 @@ fn parse_admitted_library(
         );
     }
     let mut expansion = SourceExpansion::new(session, request, options);
-    let dialect = expansion.expand(source, inherited, SourceKind::Include, None)?;
+    let dialect = expansion.expand(source, inherited, RootKind::Include, None)?;
     if request.format.is_hspice() {
         return parse_standalone_library(
             origin,
@@ -854,7 +854,7 @@ fn resolve_deck(
 ) -> Result<ResolvedDeck> {
     let mut init = SourceExpansion::new(session, request, options);
     init.capture_plan = true;
-    let context = init.expand(root, DialectContext::default(), SourceKind::Deck, None)?;
+    let context = init.expand(root, DialectContext::default(), RootKind::Deck, None)?;
     let SourceExpansion {
         sources: root_sources,
         declarations,

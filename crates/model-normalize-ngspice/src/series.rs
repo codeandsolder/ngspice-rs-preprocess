@@ -343,7 +343,7 @@ fn rewrite_explicit(
     Ok(())
 }
 
-pub(super) struct SeriesRewrite {
+pub struct SeriesRewrite {
     pub(super) bytes: Vec<u8>,
     pub(super) ltspice: bool,
     pub(super) native: bool,
@@ -366,7 +366,7 @@ fn rewrite_native(rewriter: &mut Rewriter<'_>, statement: &lexical::Statement) -
     Ok(())
 }
 
-pub(super) fn rewrite(
+pub fn rewrite(
     input: &[u8],
     inserted: &mut Vec<usize>,
     dialects: SourceDialects<'_>,

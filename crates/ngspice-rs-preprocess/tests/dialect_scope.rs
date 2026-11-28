@@ -389,3 +389,53 @@ fn ltspice_root_does_not_apply_its_default_inductor_loss_to_native_include() -> 
     assert!(text.contains("R__Lvendor_RSER"));
     run_prepared(&bundle, "v(x)", &[1.0])
 }
+
+#[test]
+fn nested_pspice_qspice_and_tina_resources_keep_their_own_scalar_laws() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"Mixed source resource laws\n.param temp=7 native_power={pwr(-2,3)}\n.include ps.inc\nVnative a 0 {native_power+temp}\nVps b 0 {ps_power}\nVdrive d 0 1\nRnative d 0 multiplier 1k\nVq qin 0 4.4\nRq qout 0 1k\nX1 qin qout qdivider\nX2 t 0 tina_cell\n.temp 40\n.end\n")?;
+    fs::write(dir.path().join("ps.inc"), b"*#PSPICE\n.param ps_power={pwr(-2,3)}\n.model multiplier RES(R=2)\nEtemp temp_out 0 VALUE={TEMP}\n.include q.inc\n.include tina.inc\n")?;
+    fs::write(
+        dir.path().join("q.inc"),
+        b"*#QSPICE\n.subckt qdivider a b\nR1 a b 3k4\n.ends\n",
+    )?;
+    fs::write(
+        dir.path().join("tina.inc"),
+        b"*#TINA\n.subckt tina_cell o n .param local=3\nE1 o n VALUE={local}\n.ends\n",
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    ensure!(text.contains("native_power={pwr(-2,3)}"), "{text}");
+    ensure!(text.contains(".param temp=7"), "{text}");
+    ensure!(!text.contains("3k4"), "{text}");
+    ensure!(!text.contains("tina_cell o n .param"), "{text}");
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native line map");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    let source = dir.path().join("ps.inc").canonicalize()?;
+    for (prefix, expected) in [(".func __ps_pwr", 2), (".param __ps_temperature", 4)] {
+        let origin = text
+            .lines()
+            .zip(lines)
+            .find_map(|(line, origin)| line.starts_with(prefix).then_some(origin))
+            .context("missing generated PSpice helper")?;
+        assert_eq!(origin.source, source);
+        assert_eq!(origin.line, expected);
+    }
+    run_prepared(
+        &bundle,
+        "v(a) v(b) v(temp_out) i(vdrive) v(qout) v(t)",
+        &[15.0, -8.0, 40.0, -0.0005, 1.0, 3.0],
+    )
+}

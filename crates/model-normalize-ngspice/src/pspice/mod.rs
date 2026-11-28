@@ -14,10 +14,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-};
+use std::{collections::BTreeMap, fmt::Write as _};
 
 mod instances;
 mod nodes;
@@ -45,14 +42,15 @@ const fn identifier(byte: u8) -> bool {
 
 struct Functions {
     names: BTreeMap<String, String>,
-    used: BTreeSet<String>,
+    used: BTreeMap<String, usize>,
+    line: usize,
     scopes: Scopes,
     scope: usize,
     ground: String,
     identifiers: crate::IdentifierAllocator,
     passives: passive::PassiveModels,
-    temperature: bool,
-    uses_gmin: bool,
+    temperature: Option<usize>,
+    uses_gmin: Option<usize>,
     temperature_name: String,
     thermal_voltage_name: String,
     gmin_name: String,
@@ -76,14 +74,15 @@ impl Functions {
         let gmin_name = String::from_utf8(identifiers.fresh(b"__ps_gmin")?)?;
         Ok(Self {
             names,
-            used: BTreeSet::new(),
+            used: BTreeMap::new(),
+            line: 0,
             scopes,
             scope: 0,
             ground,
             identifiers,
             passives,
-            temperature: false,
-            uses_gmin: false,
+            temperature: None,
+            uses_gmin: None,
             temperature_name,
             thermal_voltage_name,
             gmin_name,
@@ -103,22 +102,26 @@ impl Functions {
         )
     }
 
-    fn definitions(&self) -> Result<String> {
+    fn definitions(&self) -> Result<(String, Vec<usize>)> {
         let mut result = String::new();
+        let mut origins = Vec::new();
         for (name, body) in FUNCTIONS {
-            if self.used.contains(*name) {
+            if let Some(&line) = self.used.get(*name) {
                 let generated = self.names.get(*name).context("missing PSpice helper")?;
                 writeln!(result, ".func {generated}{body}")?;
+                origins.push(line);
             }
         }
-        if self.temperature {
+        if let Some(line) = self.temperature {
             result.push_str(&self.temperature_parameters());
             result.push('\n');
+            origins.extend([line, line]);
         }
-        if self.uses_gmin {
+        if let Some(line) = self.uses_gmin {
             writeln!(result, ".param {}={:e}", self.gmin_name, self.options.gmin)?;
+            origins.push(line);
         }
-        Ok(result)
+        Ok((result, origins))
     }
 
     // Keep electrical probe operands opaque while rewriting actual function
@@ -157,7 +160,7 @@ impl Functions {
                         .budget()
                         .charge(Resource::EmittedBytes, generated.len())?;
                     output.extend_from_slice(generated.as_bytes());
-                    self.used.insert(lower);
+                    self.used.entry(lower).or_insert(self.line);
                     return Ok(end);
                 }
                 if lower == "table" {
@@ -173,13 +176,13 @@ impl Functions {
             // Generated names keep PSpice's implicit scalar parameters from
             // replacing same-spelled native parameters or instance setters.
             let generated = if name.eq_ignore_ascii_case("temp") {
-                self.temperature = true;
+                self.temperature.get_or_insert(self.line);
                 Some(&self.temperature_name)
             } else if name.eq_ignore_ascii_case("vt") {
-                self.temperature = true;
+                self.temperature.get_or_insert(self.line);
                 Some(&self.thermal_voltage_name)
             } else if name.eq_ignore_ascii_case("gmin") {
-                self.uses_gmin = true;
+                self.uses_gmin.get_or_insert(self.line);
                 Some(&self.gmin_name)
             } else {
                 None
@@ -653,7 +656,7 @@ fn rewrite(text: &str, line: usize, functions: &mut Functions) -> Result<String>
 struct LoweredBody {
     bytes: Vec<u8>,
     lines: Vec<usize>,
-    definitions: String,
+    definitions: (String, Vec<usize>),
     renamed: Vec<RenamedDevice>,
 }
 
@@ -666,6 +669,7 @@ fn rewrite_statements(
     let mut rewritten_statements = Vec::with_capacity(statements.len());
     let mut in_control = false;
     for statement in statements {
+        functions.line = statement.line;
         functions.scopes.budget().charge(Resource::Statements, 1)?;
         functions
             .scopes
@@ -755,7 +759,7 @@ fn lower_body(
     let mut edits: Vec<Edit> = Vec::new();
     let mut inserted = BTreeMap::<usize, usize>::new();
     for (statement, mut rewritten) in statements.iter().zip(rewritten_statements) {
-        if functions.temperature
+        if functions.temperature.is_some()
             && statement
                 .text
                 .split(u8::is_ascii_whitespace)
@@ -791,9 +795,9 @@ fn lower_body(
     }
     // PSpice treats *# directives as comments, not native simulator commands.
     let mut offset = 0;
-    for line in body.split_inclusive(|byte| *byte == b'\n') {
+    for (index, line) in body.split_inclusive(|byte| *byte == b'\n').enumerate() {
         let trimmed = line.trim_ascii_start();
-        if trimmed.starts_with(b"*#") {
+        if trimmed.starts_with(b"*#") && dialects.at_mapped(origins, index + 1)?.is_pspice() {
             let position = offset + line.len() - trimmed.len() + 1;
             edits.push((position..position, vec![b' ']));
         }
@@ -855,7 +859,7 @@ pub(crate) fn lower_mapped(
     let LoweredBody {
         bytes: body,
         lines,
-        definitions,
+        definitions: (definitions, definition_lines),
         mut renamed,
     } = lower_body(
         &shared.model.bytes[title_end..],
@@ -877,9 +881,15 @@ pub(crate) fn lower_mapped(
     )?;
     let mut bytes = shared.model.bytes[..title_end].to_vec();
     let mut input_lines = shared.input_lines[..first].to_vec();
-    let origin = shared.input_lines.get(first).copied().unwrap_or(1);
     bytes.extend_from_slice(definitions.as_bytes());
-    input_lines.extend(std::iter::repeat_n(origin, definitions.lines().count()));
+    for line in definition_lines {
+        input_lines.push(
+            *shared
+                .input_lines
+                .get(first + line - 1)
+                .context("missing PSpice helper origin")?,
+        );
+    }
     bytes.extend_from_slice(&body);
     for line in lines {
         input_lines.push(

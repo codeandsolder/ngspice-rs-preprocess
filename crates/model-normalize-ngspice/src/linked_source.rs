@@ -59,6 +59,8 @@ pub struct SourceVisit {
     pub section: Option<String>,
     /// Effective source language.
     pub dialect: SourceDialect,
+    /// Source-specific device identity separator.
+    pub separator: Option<char>,
     /// Physical declaration line; absent for an inherited dialect.
     pub declaration: Option<usize>,
 }
@@ -90,7 +92,8 @@ pub struct SourceLinker {
 }
 
 /// Source language and its resource-reference syntax.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SourceDialect {
     /// A single operand introduces a named section; references require a section.
     #[default]
@@ -106,11 +109,34 @@ pub enum SourceDialect {
     Tina,
     /// HSPICE named-section syntax.
     Hspice,
-    /// SIMetrix named-section syntax.
+    /// `SIMetrix` named-section syntax.
     Simetrix,
 }
 
 impl SourceDialect {
+    /// Default device identity separator for this source language.
+    #[must_use = "the separator determines source device identity"]
+    pub const fn default_separator(self) -> Option<char> {
+        match self {
+            Self::Simetrix => Some('$'),
+            _ => None,
+        }
+    }
+
+    /// Stable source-language identity used by serialized library digests.
+    #[must_use = "the identifier contributes to the library digest"]
+    pub const fn stable_id(self) -> u8 {
+        match self {
+            Self::Simetrix => 1,
+            Self::Hspice => 2,
+            Self::Pspice => 3,
+            Self::Native => 4,
+            Self::Ltspice => 5,
+            Self::Qspice => 6,
+            Self::Tina => 7,
+        }
+    }
+
     pub(crate) const fn is_pspice(self) -> bool {
         matches!(self, Self::Pspice | Self::Tina)
     }
@@ -423,32 +449,24 @@ fn portable_qspice_path(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(text.replace('\\', "/")))
 }
 
-fn source_declaration(
-    input: &[u8],
-    kind: RootKind,
-    path: &Path,
-) -> Result<Option<(SourceDialect, usize)>> {
-    let mut lines = input.split_inclusive(|byte| *byte == b'\n');
-    let first = lines.next().unwrap_or_default().trim_ascii();
-    let second = lines.next().unwrap_or_default().trim_ascii();
-    let (header, line) = if kind == RootKind::Deck {
-        (second, 2)
-    } else if first.starts_with(b"*#") {
-        (first, 1)
-    } else if first.is_empty() || first.starts_with(b"*") {
-        (second, 2)
-    } else {
-        return Ok(None);
-    };
-    let token = header
+/// A language declaration in one of the source header positions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceDeclaration {
+    /// Declared language.
+    pub dialect: SourceDialect,
+    /// Device identity separator selected by the declaration.
+    pub separator: Option<char>,
+    /// Original one-based physical line.
+    pub line: usize,
+}
+
+fn parse_source_header(header: &[u8], line: usize) -> Result<Option<SourceDeclaration>> {
+    let mut fields = header
         .split(u8::is_ascii_whitespace)
-        .next()
-        .unwrap_or_default();
+        .filter(|field| !field.is_empty());
+    let token = fields.next().unwrap_or_default();
     if token.eq_ignore_ascii_case(b"*#SIMPLIS") {
-        bail!(
-            "{}:{line}: SIMPLIS source requires translation",
-            path.display()
-        );
+        bail!("line {line}: SIMPLIS source requires translation");
     }
     let declarations = [
         (b"*#NATIVE".as_slice(), SourceDialect::Native),
@@ -460,9 +478,62 @@ fn source_declaration(
         (b"*#HSPICE", SourceDialect::Hspice),
         (b"*#SIMETRIX", SourceDialect::Simetrix),
     ];
-    Ok(declarations
+    let Some(dialect) = declarations
         .iter()
-        .find_map(|&(name, dialect)| token.eq_ignore_ascii_case(name).then_some((dialect, line))))
+        .find_map(|&(name, dialect)| token.eq_ignore_ascii_case(name).then_some(dialect))
+    else {
+        return Ok(None);
+    };
+    let mut separator = dialect.default_separator();
+    if dialect == SourceDialect::Simetrix {
+        for field in fields {
+            let Some((name, value)) = field.split_at_checked(4) else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case(b"sep=") {
+                continue;
+            }
+            if value.eq_ignore_ascii_case(b"none") {
+                separator = None;
+            } else if let Ok(value) = std::str::from_utf8(value) {
+                let mut chars = value.chars();
+                if let Some(character) = chars.next()
+                    && chars.next().is_none()
+                {
+                    separator = Some(character);
+                }
+            }
+        }
+    }
+    Ok(Some(SourceDeclaration {
+        dialect,
+        separator,
+        line,
+    }))
+}
+
+/// Resolve the legal resource language declaration, ignoring later comments.
+///
+/// A deck title never changes the language. Included resources may declare
+/// it on the first line or after an initial comment/blank line.
+///
+/// # Errors
+/// A SIMPLIS header requires the separate simulator-specific translation.
+pub fn source_declaration(input: &[u8], kind: RootKind) -> Result<Option<SourceDeclaration>> {
+    let input = input.strip_prefix(b"\xef\xbb\xbf").unwrap_or(input);
+    let mut lines = input.split_inclusive(|byte| *byte == b'\n');
+    let first = lines.next().unwrap_or_default().trim_ascii();
+    let second = lines.next().unwrap_or_default().trim_ascii();
+    if kind == RootKind::Deck {
+        return parse_source_header(second, 2);
+    }
+    if let Some(declaration) = parse_source_header(first, 1)? {
+        return Ok(Some(declaration));
+    }
+    if first.is_empty() || first.starts_with(b"*") {
+        return parse_source_header(second, 2);
+    }
+    Ok(None)
 }
 
 impl LinkState<'_> {
@@ -656,6 +727,10 @@ impl LinkState<'_> {
             scope: self.scope,
             section: section_key,
             dialect: inherited,
+            separator: self.stack.last().map_or_else(
+                || inherited.default_separator(),
+                |frame| self.output.visits[frame.visit].separator,
+            ),
             declaration: None,
         });
         self.stack.push(VisitFrame {
@@ -685,13 +760,16 @@ impl LinkState<'_> {
             .bytes
             .strip_prefix(b"\xef\xbb\xbf")
             .unwrap_or(&source.bytes);
-        if let Some((dialect, line)) = source_declaration(raw, kind, path)? {
+        if let Some(declaration) = source_declaration(raw, kind)
+            .with_context(|| format!("source header in {}", path.display()))?
+        {
             let frame = self
                 .stack
                 .last()
                 .context("missing linked source occurrence")?;
-            self.output.visits[frame.visit].dialect = dialect;
-            self.output.visits[frame.visit].declaration = Some(line);
+            self.output.visits[frame.visit].dialect = declaration.dialect;
+            self.output.visits[frame.visit].separator = declaration.separator;
+            self.output.visits[frame.visit].declaration = Some(declaration.line);
         }
         let decoded = if self.dialect() == SourceDialect::Qspice {
             crate::qspice::decode_resource(path, &source.bytes, self.admission.budget())?
@@ -1151,6 +1229,38 @@ mod tests {
             .map(|(_, origin)| (origin.visit, origin.scope, origin.line))
             .collect::<Vec<_>>();
         assert_eq!(parameters, [(1, 1, 2), (2, 2, 2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn header_options_follow_resource_occurrences_and_not_late_comments() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root.cir");
+        fs::write(&root, b"*#NATIVE title\n*#SIMETRIX sep=:\n.include inherited.inc\n.include explicit.inc\n.end\n")?;
+        fs::write(
+            temp.path().join("inherited.inc"),
+            b".param a=1\n*#SIMETRIX sep=none\n",
+        )?;
+        fs::write(
+            temp.path().join("explicit.inc"),
+            b"*#not_a_dialect\n*#SIMETRIX sep=none\n.include inherited.inc\n",
+        )?;
+        let mut session = SourceSession::default();
+        let admitted = session.load(&root)?;
+        let linked = SourceLinker::default().link_admitted(
+            &admitted,
+            RootKind::Deck,
+            LinkLimits::default(),
+            &mut session,
+        )?;
+        let separators = linked
+            .visits
+            .iter()
+            .map(|visit| visit.separator)
+            .collect::<Vec<_>>();
+        assert_eq!(separators, [Some(':'), Some(':'), None, None]);
+        assert_eq!(linked.visits[2].declaration, Some(2));
+        assert_eq!(linked.visits[1].declaration, None);
         Ok(())
     }
 

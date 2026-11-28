@@ -587,14 +587,14 @@ pub(super) fn rewrite(
         } else if first.eq_ignore_ascii_case(b".ends") {
             ensure!(pass.scope.pop().is_some(), "unmatched .ends");
         } else if dialects.at_mapped(origins, statement.line)?
-            != crate::linked_source::SourceDialect::Ltspice
+            == crate::linked_source::SourceDialect::Ltspice
         {
-            continue;
-        } else if first.eq_ignore_ascii_case(b".tran") {
-            rewrite_tran(&statement, &mut pass.edits, budget)?;
-        } else if matches!(first.first(), Some(b'V' | b'v' | b'I' | b'i')) {
-            pass.source(&statement)
-                .with_context(|| format!("line {}: LTspice source waveform", statement.line))?;
+            if first.eq_ignore_ascii_case(b".tran") {
+                rewrite_tran(&statement, &mut pass.edits, budget)?;
+            } else if matches!(first.first(), Some(b'V' | b'v' | b'I' | b'i')) {
+                pass.source(&statement)
+                    .with_context(|| format!("line {}: LTspice source waveform", statement.line))?;
+            }
         }
     }
     ensure!(
