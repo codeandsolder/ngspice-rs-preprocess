@@ -11,6 +11,7 @@ mod channel_electrostatics;
 mod channel_mobility;
 mod channel_modulation;
 mod drain_smoothing;
+mod drift;
 mod edge_tunneling;
 mod effective;
 mod electrostatic_material;
@@ -71,6 +72,10 @@ pub use channel_modulation::{
 pub use drain_smoothing::{
     HiSimHvDrainSmoothingInputs, HiSimHvDrainSmoothingPoint, evaluate_hisim_hv_drain_smoothing,
 };
+pub use drift::{
+    HiSimHvDriftBias, HiSimHvDriftPoint, HiSimHvDriftScalar, PreparedHiSimHvDrift,
+    prepare_hisim_hv_drift,
+};
 pub use edge_tunneling::{
     HiSimHvEdgeTunnelingCurrent, HiSimHvEdgeTunnelingCurrents, PreparedHiSimHvEdgeTunneling,
     prepare_hisim_hv_edge_tunneling,
@@ -111,7 +116,8 @@ pub use leakage::HiSimHvLeakagePoint;
 pub use noise::HiSimHvChannelNoise;
 pub use nqs::{HiSimHvNqsEquilibrium, HiSimHvNqsPoint, HiSimHvNqsScalar, HiSimHvNqsState};
 pub use overlap::{
-    HiSimHvChargeNetwork, HiSimHvOverlapBias, PreparedHiSimHvOverlap, prepare_hisim_hv_overlap,
+    HiSimHvChargeNetwork, HiSimHvDrainOverlap, HiSimHvOverlapBias, HiSimHvOverlapPoint,
+    PreparedHiSimHvOverlap, prepare_hisim_hv_overlap,
 };
 pub use poly_depletion::{
     HiSimHvPolyDepletionPoint, PreparedHiSimHvPolyDepletion, prepare_hisim_hv_poly_depletion,

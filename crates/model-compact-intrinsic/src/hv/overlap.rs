@@ -32,6 +32,20 @@ pub struct HiSimHvChargeNetwork {
     pub gate_source_prime: Jet,
 }
 
+/// Local physical drain-side electrostatics, before area or multiplicity.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HiSimHvDrainOverlap {
+    pub surface_potential: Jet,
+    pub depletion_density: Jet,
+}
+
+/// Overlap network and the physical drain state required by drift transport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiSimHvOverlapPoint {
+    pub charges: HiSimHvChargeNetwork,
+    pub physical_drain: HiSimHvDrainOverlap,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Side {
     length: f64,
@@ -45,6 +59,7 @@ struct Side {
 pub struct PreparedHiSimHvOverlap {
     variant: ModelVariant,
     enabled: bool,
+    drift: bool,
     source: Side,
     drain: Side,
     oxide: f64,
@@ -60,6 +75,7 @@ pub struct PreparedHiSimHvOverlap {
 
 #[derive(Clone, Copy)]
 struct Density {
+    surface: Jet,
     total: Jet,
     depletion: Jet,
     inversion: Jet,
@@ -70,6 +86,29 @@ struct LocalMaterial {
     ni: Jet,
     bandgap: Jet,
     maximum_body: Jet,
+}
+
+impl LocalMaterial {
+    const fn new(temperature: &PreparedHiSimHvTemperature, maximum_body: Jet) -> Self {
+        Self {
+            beta: Jet::coordinate(
+                temperature.inverse_thermal_voltage,
+                3,
+                temperature.inverse_thermal_voltage_derivative,
+            ),
+            ni: Jet::coordinate(
+                temperature.intrinsic_carrier_concentration_m3,
+                3,
+                temperature.intrinsic_carrier_derivative_m3_per_kelvin,
+            ),
+            bandgap: Jet::coordinate(
+                temperature.bandgap_ev,
+                3,
+                temperature.bandgap_derivative_ev_per_kelvin,
+            ),
+            maximum_body,
+        }
+    }
 }
 
 fn floor(value: Jet, minimum: f64) -> Jet {
@@ -181,6 +220,7 @@ impl PreparedHiSimHvOverlap {
                 },
             )?;
             return Ok(Density {
+                surface: point.surface_potential,
                 total: point.bulk_charge_density,
                 depletion: point.bulk_charge_density,
                 inversion: Jet::constant(0.),
@@ -203,6 +243,7 @@ impl PreparedHiSimHvOverlap {
                 poisson * surface.inversion_squared / denominator
             };
             return Ok(Density {
+                surface: surface.potential,
                 total: poisson * surface.total_root,
                 depletion: poisson * surface.depletion_root,
                 inversion,
@@ -212,10 +253,18 @@ impl PreparedHiSimHvOverlap {
         let total = oxide * (gate - body - chi / beta);
         let depletion = poisson * floor(chi + (-chi).exp_m1(), EPS).sqrt();
         Ok(Density {
+            surface: (body + chi / beta).checked("HiSIM-HV overlap surface")?,
             total: total.checked("HiSIM-HV overlap total density")?,
             depletion: depletion.checked("HiSIM-HV overlap depletion density")?,
             inversion: (total - depletion).checked("HiSIM-HV overlap inversion density")?,
         })
+    }
+
+    fn simplified(self, side: Side, gate: Jet, local: Jet, psi: Jet) -> Jet {
+        self.oxide
+            * self.width
+            * (side.length * (gate - local)
+                - self.slope * (self.magnitude + gate - local) * (1.2 + local - psi))
     }
 
     /// Evaluate overlap alone, preserving the independent intrinsic and external
@@ -228,30 +277,14 @@ impl PreparedHiSimHvOverlap {
         bias: HiSimHvOverlapBias,
         channel: &HiSimHvChannelElectrostaticPoint,
         temperature: &PreparedHiSimHvTemperature,
-    ) -> Result<HiSimHvChargeNetwork, ModelError> {
+    ) -> Result<HiSimHvOverlapPoint, ModelError> {
         let zero = Jet::constant(0.);
         let mut inner = Charges::default();
         let mut outer = Charges::default();
         let mut primes = [zero; 2];
-        if self.enabled {
-            let material = LocalMaterial {
-                beta: Jet::coordinate(
-                    temperature.inverse_thermal_voltage,
-                    3,
-                    temperature.inverse_thermal_voltage_derivative,
-                ),
-                ni: Jet::coordinate(
-                    temperature.intrinsic_carrier_concentration_m3,
-                    3,
-                    temperature.intrinsic_carrier_derivative_m3_per_kelvin,
-                ),
-                bandgap: Jet::coordinate(
-                    temperature.bandgap_ev,
-                    3,
-                    temperature.bandgap_derivative_ev_per_kelvin,
-                ),
-                maximum_body: channel.conditioned.maximum_body,
-            };
+        let mut physical_drain = HiSimHvDrainOverlap::default();
+        if self.enabled || self.drift {
+            let material = LocalMaterial::new(temperature, channel.conditioned.maximum_body);
             let intrinsic = voltages(bias.intrinsic.vgs, bias.intrinsic.vds, bias.intrinsic.vbs);
             let external = voltages(bias.external.vgs, bias.external.vds, bias.external.vbs);
             let sides = if bias.reversed {
@@ -263,6 +296,10 @@ impl PreparedHiSimHvOverlap {
                 self.extra_drain_charge * (intrinsic[1] - channel.charge.surface_difference);
             for (index, side) in sides.into_iter().enumerate() {
                 let drain = index == 1;
+                let physical_drain_side = drain != bias.reversed;
+                if !self.enabled && !physical_drain_side {
+                    continue;
+                }
                 let local = if drain { intrinsic[1] } else { zero };
                 let local_outer = if drain { external[1] } else { zero };
                 primes[index] = side.constant_capacitance * (external[0] - local_outer);
@@ -270,17 +307,16 @@ impl PreparedHiSimHvOverlap {
                     continue;
                 }
                 if side.doping == 0. {
-                    let psi = if drain {
-                        channel.charge.drain_surface
-                    } else {
-                        channel.charge.source_surface
-                    };
-                    let q = self.oxide
-                        * self.width
-                        * (side.length * (intrinsic[0] - local)
-                            - self.slope
-                                * (self.magnitude + intrinsic[0] - local)
-                                * (1.2 + local - psi));
+                    let q = self.simplified(
+                        side,
+                        intrinsic[0],
+                        local,
+                        if drain {
+                            channel.charge.drain_surface
+                        } else {
+                            channel.charge.source_surface
+                        },
+                    );
                     inner.add_side(drain, -q, -q, zero);
                 } else if side.doping > 0. {
                     let density = self.density(
@@ -289,6 +325,15 @@ impl PreparedHiSimHvOverlap {
                         side.doping,
                         material,
                     )?;
+                    if physical_drain_side {
+                        physical_drain = HiSimHvDrainOverlap {
+                            surface_potential: density.surface,
+                            depletion_density: density.depletion,
+                        };
+                    }
+                    if !self.enabled {
+                        continue;
+                    }
                     let additional = if drain && !bias.reversed {
                         qextra
                     } else if !drain && bias.reversed {
@@ -323,11 +368,19 @@ impl PreparedHiSimHvOverlap {
             inner.gate = inner.gate + bulk;
             inner.bulk = inner.bulk - bulk;
         }
-        Ok(HiSimHvChargeNetwork {
-            intrinsic: inner.finish()?,
-            external: outer.finish()?,
-            gate_source_prime: primes[0].checked("HiSIM-HV constant source overlap")?,
-            gate_drain_prime: primes[1].checked("HiSIM-HV constant drain overlap")?,
+        if !self.enabled {
+            inner = Charges::default();
+            outer = Charges::default();
+            primes = [zero; 2];
+        }
+        Ok(HiSimHvOverlapPoint {
+            physical_drain,
+            charges: HiSimHvChargeNetwork {
+                intrinsic: inner.finish()?,
+                external: outer.finish()?,
+                gate_source_prime: primes[0].checked("HiSIM-HV constant source overlap")?,
+                gate_drain_prime: primes[1].checked("HiSIM-HV constant drain overlap")?,
+            },
         })
     }
 }
@@ -417,6 +470,9 @@ pub fn prepare_hisim_hv_overlap(
     Ok(PreparedHiSimHvOverlap {
         variant: model.variant(),
         enabled: selector("coadov")? == 1,
+        drift: model.variant() == ModelVariant::HiSimHv2
+            && selector("cordrift")? == 1
+            && binned("nover")? != 0.,
         source: side("lovers", "novers", "coovlps", "cgso")?,
         drain: side("loverld", "nover", "coovlp", "cgdo")?,
         oxide,

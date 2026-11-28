@@ -180,6 +180,7 @@ pub struct HiSimHvNormalChannelWithParasiticsPoint {
     pub lateral_gate_charge_c: Jet,
     /// Overlap, lateral and fringing charges, excluding the channel state.
     pub parasitic_charges: HiSimHvChargeNetwork,
+    pub physical_drain_overlap: super::HiSimHvDrainOverlap,
     /// Independent channel charge relaxation targets when CONQS is enabled.
     pub nqs: Option<super::HiSimHvNqsEquilibrium>,
 }
@@ -306,7 +307,7 @@ impl PreparedHiSimHvNormalChannel {
             &transport.temperature,
         )?;
         let electrostatics = &channel.intrinsic.electrostatics;
-        let mut charges = self.overlap.evaluate(
+        let overlap = self.overlap.evaluate(
             HiSimHvOverlapBias {
                 intrinsic: bias,
                 external,
@@ -315,6 +316,7 @@ impl PreparedHiSimHvNormalChannel {
             electrostatics,
             &transport.temperature,
         )?;
+        let mut charges = overlap.charges;
         charges.intrinsic.gate = (charges.intrinsic.gate + lateral_gate_charge_c)
             .checked("HiSIM-HV assembled intrinsic gate charge")?;
         charges.intrinsic.drain = (charges.intrinsic.drain - lateral_gate_charge_c)
@@ -332,6 +334,7 @@ impl PreparedHiSimHvNormalChannel {
             leakage,
             lateral_gate_charge_c,
             parasitic_charges: charges,
+            physical_drain_overlap: overlap.physical_drain,
             nqs: self.nqs.equilibrium(&channel.intrinsic)?,
         })
     }

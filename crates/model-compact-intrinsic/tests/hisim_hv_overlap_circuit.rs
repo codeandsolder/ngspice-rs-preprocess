@@ -109,15 +109,17 @@ fn native_overlap_charge(fixture: &str, reversed: bool, expected_count: usize) -
             vbs: row[10],
         };
         let state = channel.evaluate(intrinsic, &temp)?;
-        let q = overlap.evaluate(
-            HiSimHvOverlapBias {
-                intrinsic,
-                external,
-                reversed,
-            },
-            &state.electrostatics,
-            &temp.temperature,
-        )?;
+        let q = overlap
+            .evaluate(
+                HiSimHvOverlapBias {
+                    intrinsic,
+                    external,
+                    reversed,
+                },
+                &state.electrostatics,
+                &temp.temperature,
+            )?
+            .charges;
         for (field, actual) in [
             q.intrinsic.gate.value + q.external.gate.value,
             if reversed {
@@ -200,15 +202,17 @@ fn independent_overlap_coordinates_and_orientation() -> TestResult {
                     };
                     let t = prepare_hisim_hv_transport(&model, &instance, x[3], 0.)?;
                     let state = channel.evaluate(intrinsic, &t)?;
-                    overlap.evaluate(
-                        HiSimHvOverlapBias {
-                            intrinsic,
-                            external,
-                            reversed,
-                        },
-                        &state.electrostatics,
-                        &t.temperature,
-                    )
+                    overlap
+                        .evaluate(
+                            HiSimHvOverlapBias {
+                                intrinsic,
+                                external,
+                                reversed,
+                            },
+                            &state.electrostatics,
+                            &t.temperature,
+                        )
+                        .map(|point| point.charges)
                 };
                 for gate in [-2., 0.2, 1.3, 3., 7.] {
                     for drain in [0.12, 1.6, 8.] {

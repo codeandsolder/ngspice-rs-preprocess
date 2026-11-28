@@ -853,6 +853,25 @@ relative accuracy in Pds; the comparison propagates the endpoint ULP bound
 through the squared-current law while retaining the ordinary relative and
 absolute criteria. The Rust difference solve does not lose that precision.
 
+### Physical HiSIM-HV2 nonlinear drift resistance
+
+The CORDRIFT preparation binds the drift geometry, local-temperature mobility,
+velocity saturation and carrier density, overlap-controlled depletion, junction
+depth, substrate depletion multiplier and physical drain/source sheet resistance.
+The evaluator shares the physical drain-side overlap solution with the charge
+network, including when COADOV disables the charge stamp. The two physical
+branch currents retain independent intrinsic and external voltages, temperature,
+drain/source prime drops and optional substrate voltage (ten coordinates).
+The drain resistance uses the native smooth upper limit and the branch
+resistances include multiplicity and the native minimum resistance; thermal
+spectra use the physical, unclamped resistance.
+
+All 5,120 native isolated-device operating points compare physical branch
+currents using measured internal drain and source voltages, with five drift
+cards, both polarities and directions, temperatures, multifinger geometries,
+and optional substrate nodes. Independent fourth-order finite differences
+verify all ten coordinates for both currents and drain resistance.
+
 ### Physical HiSIM-HV1/HV2 external fringing capacitance
 
 `prepare_hisim_hv_fringing(model, instance)` now prepares a real, original
@@ -1160,9 +1179,11 @@ of channel impact, drift impact, bulk potential and feedback current. The couple
 `evaluate_with_parasitics` path also evaluates the five terminal gate and
 junction leakage branches from the same solved channel state, including
 shared symmetric source potential and classical oxide capacitance. All 2,880
-native operating points and independent four-coordinate derivatives pass. HV2 depletion-mode transport, explicit series/drift
-resistance, parasitic assembly, noise and full circuit-level qualification
-remain work.
+native operating points and independent four-coordinate derivatives pass. The
+overlap, fringing, NQS, channel noise and HV2 CORDRIFT evaluators are
+qualified separately above. HV2 depletion-mode transport, conventional
+CORSRD=1/3 explicit series resistance, full device topology and electrothermal
+assembly remain work.
 
 ## Reference test coverage
 
