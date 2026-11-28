@@ -192,6 +192,35 @@ fn source_noise_borrowed_batch_and_invalid_physical_domains() -> TestResult {
         kernel.evaluate_batch(&[input; 3], &[1e3], &mut outputs),
         Err(EvaluationError::LengthMismatch)
     ));
+    // A longer companion slice must not be silently truncated by zip.
+    let sentinel = kernel.evaluate(input, 1e6)?;
+    let mut outputs = [sentinel; 3];
+    kernel.evaluate_batch(&[], &[], &mut [])?;
+    assert_eq!(
+        kernel.evaluate_batch(&[input; 3], &[1e3; 4], &mut outputs),
+        Err(EvaluationError::LengthMismatch)
+    );
+    assert_eq!(
+        kernel.evaluate_batch(&[input; 4], &[1e3; 3], &mut outputs),
+        Err(EvaluationError::LengthMismatch)
+    );
+    assert_eq!(
+        kernel.evaluate_batch(&[input; 4], &[1e3; 4], &mut outputs),
+        Err(EvaluationError::LengthMismatch)
+    );
+    assert_eq!(outputs, [sentinel; 3]);
+    let first = kernel.evaluate(input, 1e3)?;
+    assert_ne!(first, sentinel);
+    assert_eq!(
+        kernel.evaluate_batch(&[input; 3], &[1e3, 0.0, 1e9], &mut outputs),
+        Err(EvaluationError::InvalidPhysicalDomain)
+    );
+    assert_eq!(outputs, [first, sentinel, sentinel]);
+    let frequencies = [1e3, 1e6, 1e9];
+    kernel.evaluate_batch(&[input; 3], &frequencies, &mut outputs)?;
+    for (frequency, output) in frequencies.into_iter().zip(outputs) {
+        assert_eq!(output, kernel.evaluate(input, frequency)?);
+    }
     for frequency in [0.0, -1.0, f64::NAN] {
         assert!(matches!(
             kernel.evaluate(input, frequency),

@@ -11,7 +11,7 @@ use super::{
     Polarity, avalanche, external, internal_base, junction, noise, nqs, stamps, substrate,
     temperature, thermal, transport, tunneling,
 };
-use crate::{EvaluationError, ModelError, validate_batch_lengths};
+use crate::{EvaluationError, ModelError, evaluate_lanes};
 
 /// Absolute circuit voltages for the nine named HICUM electrical nodes.
 /// Source's thermal rise is prepared separately with model temperature preparation.
@@ -757,6 +757,9 @@ impl Prepared {
         stamps::assemble(self.polarity, self.tunneling_location, op)
     }
 
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Reports incompatible output buffers or a physical source failure.
     pub fn evaluate_batch(
@@ -764,11 +767,7 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (input, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(input)?;
-        }
-        Ok(())
+        evaluate_lanes(inputs.iter(), outputs, |input| self.evaluate(input))
     }
 }
 

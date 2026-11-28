@@ -14,9 +14,7 @@ use super::{
     temperature::{self, Coefficient as C},
     transport::{self, CheckedGradient, Gradient},
 };
-use crate::{
-    EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
-};
+use crate::{EvaluationError, ModelError, Temperature, evaluate_lanes, validate_nonnegative};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Parameters {
@@ -270,6 +268,9 @@ impl Prepared {
 
     /// Evaluate identical prepared parameters over a borrowed bias batch.
     ///
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Reports mismatched slices or any individual numerical failure.
     pub fn evaluate_batch(
@@ -277,11 +278,7 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (bias, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(bias)?;
-        }
-        Ok(())
+        evaluate_lanes(inputs.iter(), outputs, |bias| self.evaluate(bias))
     }
 }
 

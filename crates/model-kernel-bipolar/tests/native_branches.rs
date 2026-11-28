@@ -256,3 +256,63 @@ fn invalid_parameters_and_batch_contract_fail_closed() -> TestResult {
     assert_eq!(hout[0], hk.evaluate(hinputs[0])?);
     Ok(())
 }
+
+fn check_lane_contract<I: Copy, O: Copy + PartialEq + std::fmt::Debug>(
+    inputs: [I; 3],
+    invalid: I,
+    sentinel: O,
+    scalar: impl Fn(I) -> Result<O, EvaluationError>,
+    batch: impl Fn(&[I], &mut [O]) -> Result<(), EvaluationError>,
+) -> TestResult {
+    let mut outputs = [sentinel; 3];
+    batch(&[], &mut [])?;
+    assert_eq!(
+        batch(&inputs, &mut outputs[..2]),
+        Err(EvaluationError::LengthMismatch)
+    );
+    assert_eq!(
+        batch(&inputs[..2], &mut outputs),
+        Err(EvaluationError::LengthMismatch)
+    );
+    assert_eq!(outputs, [sentinel; 3]);
+    let first = scalar(inputs[0])?;
+    assert_ne!(first, sentinel);
+    assert_eq!(
+        batch(&[inputs[0], invalid, inputs[2]], &mut outputs),
+        Err(EvaluationError::NonFiniteBias)
+    );
+    assert_eq!(outputs, [first, sentinel, sentinel]);
+    batch(&inputs, &mut outputs)?;
+    for (input, output) in inputs.into_iter().zip(outputs) {
+        assert_eq!(scalar(input)?, output);
+    }
+    Ok(())
+}
+
+#[test]
+fn borrowed_batch_contract_across_families_and_temperatures() -> TestResult {
+    for kelvin in [233.15, 300.15, 398.15] {
+        let temp = Temperature::new(kelvin)?;
+        let vk = vbic::Prepared::new(ihp_vbic_npn13g2_nx4(), temp)?;
+        check_lane_contract(
+            [
+                vbic_bias(0.7, -0.5),
+                vbic_bias(-0.2, 0.1),
+                vbic_bias(0.9, 0.2),
+            ],
+            vbic_bias(f64::NAN, 0.0),
+            vk.evaluate(vbic_bias(0.0, 0.0))?,
+            |input| vk.evaluate(input),
+            |inputs, outputs| vk.evaluate_batch(inputs, outputs),
+        )?;
+        let hk = hicum2::Prepared::new(hicum_params(), temp)?;
+        check_lane_contract(
+            [hicum_bias(0.7), hicum_bias(-0.2), hicum_bias(0.9)],
+            hicum_bias(f64::NAN),
+            hk.evaluate(hicum_bias(0.0))?,
+            |input| hk.evaluate(input),
+            |inputs, outputs| hk.evaluate_batch(inputs, outputs),
+        )?;
+    }
+    Ok(())
+}

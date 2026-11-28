@@ -1,8 +1,9 @@
 //! Source-traceable native bipolar model laws, independent from the solver.
 //!
-//! These are **branch subkernels**, not complete transistor evaluators. A
-//! circuit solver must not bind them as complete VBIC/HICUM2 devices until the
-//! remaining transport, charge, electrothermal and noise laws are implemented.
+//! Includes individual physical branch laws and coupled prepared VBIC/HICUM2
+//! device artifacts with local residual, charge, analytic Jacobian and noise
+//! evaluation. Global circuit assembly, integration, and convergence policy
+//! remain the solver's responsibility.
 
 pub mod hicum2;
 pub mod vbic;
@@ -107,6 +108,21 @@ const fn validate_batch_lengths(inputs: usize, outputs: usize) -> Result<(), Eva
     } else {
         Err(EvaluationError::LengthMismatch)
     }
+}
+
+/// Evaluate exact-size borrowed lanes in order, writing only successful results.
+/// Multi-slice callers must check their independent lengths before zipping.
+#[inline]
+fn evaluate_lanes<I, O>(
+    inputs: impl ExactSizeIterator<Item = I>,
+    outputs: &mut [O],
+    mut evaluate: impl FnMut(I) -> Result<O, EvaluationError>,
+) -> Result<(), EvaluationError> {
+    validate_batch_lengths(inputs.len(), outputs.len())?;
+    for (input, output) in inputs.zip(outputs) {
+        *output = evaluate(input)?;
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for ModelError {

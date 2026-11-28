@@ -5,8 +5,8 @@
 //! FLCONO is enabled. Nodal gain, integration and topology are solver-owned.
 
 use crate::{
-    EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
-    validate_positive,
+    EvaluationError, ModelError, Temperature, evaluate_lanes, validate_batch_lengths,
+    validate_nonnegative, validate_positive,
 };
 
 const SOURCE_K: f64 = 1.380_650_3e-23;
@@ -297,6 +297,9 @@ impl Prepared {
         }
     }
 
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Rejects invalid frequencies, biases or buffer lengths.
     pub fn evaluate_batch(
@@ -305,11 +308,11 @@ impl Prepared {
         frequencies: &[f64],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(operating.len(), outputs.len())?;
-        validate_batch_lengths(frequencies.len(), outputs.len())?;
-        for ((op, frequency), out) in operating.iter().zip(frequencies).zip(outputs) {
-            *out = self.evaluate(*op, *frequency)?;
-        }
-        Ok(())
+        validate_batch_lengths(operating.len(), frequencies.len())?;
+        evaluate_lanes(
+            operating.iter().zip(frequencies),
+            outputs,
+            |(op, frequency)| self.evaluate(*op, *frequency),
+        )
     }
 }

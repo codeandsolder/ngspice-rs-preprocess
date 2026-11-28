@@ -316,6 +316,9 @@ impl Prepared {
         })
     }
 
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Reports length mismatch or invalid physical evaluation.
     pub fn evaluate_batch(
@@ -323,10 +326,8 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        crate::validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (input, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(*input)?;
-        }
-        Ok(())
+        crate::evaluate_lanes(inputs.iter().copied(), outputs, |input| {
+            self.evaluate(input)
+        })
     }
 }

@@ -13,7 +13,7 @@ use super::{
     transport::{self, jet::Jet},
 };
 use crate::{
-    Branch, EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
+    Branch, EvaluationError, ModelError, Temperature, evaluate_lanes, validate_nonnegative,
     validate_positive,
 };
 
@@ -349,6 +349,9 @@ impl Prepared {
         Ok((resistance, crbi))
     }
 
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Reports a batch mismatch or an invalid HICUM internal base state.
     pub fn evaluate_batch(
@@ -356,11 +359,7 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (input, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(input)?;
-        }
-        Ok(())
+        evaluate_lanes(inputs.iter(), outputs, |input| self.evaluate(input))
     }
 }
 

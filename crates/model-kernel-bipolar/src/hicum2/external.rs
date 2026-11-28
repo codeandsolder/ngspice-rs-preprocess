@@ -5,7 +5,7 @@
 //! node mapping and exact short collapse, not an artificial large conductance.
 
 use super::thermal::MIN_SOURCE_RESISTANCE;
-use crate::{EvaluationError, ModelError, validate_batch_lengths, validate_nonnegative};
+use crate::{EvaluationError, ModelError, evaluate_lanes, validate_nonnegative};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Resistances {
@@ -353,6 +353,9 @@ impl Prepared {
         Ok(out)
     }
 
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Reports incompatible borrowed buffers or invalid branch inputs.
     pub fn evaluate_batch(
@@ -360,11 +363,9 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (input, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(*input)?;
-        }
-        Ok(())
+        evaluate_lanes(inputs.iter().copied(), outputs, |input| {
+            self.evaluate(input)
+        })
     }
 }
 

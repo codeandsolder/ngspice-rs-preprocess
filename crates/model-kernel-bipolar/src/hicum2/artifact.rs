@@ -366,7 +366,8 @@ impl Prepared {
     }
 
     /// Homogeneous borrowed batch; source trial states are never accepted
-    /// implicitly. Earlier output slots remain written on a later failure.
+    /// implicitly. All lengths are checked before writes; a failed trial and
+    /// the remaining slots retain their previous values.
     ///
     /// # Errors
     /// Length mismatch or first rejected physical trial.
@@ -375,13 +376,9 @@ impl Prepared {
         inputs: &[Trial<'_>],
         outputs: &mut [Option<Frame>],
     ) -> Result<(), EvaluationError> {
-        if inputs.len() != outputs.len() {
-            return Err(EvaluationError::LengthMismatch);
-        }
-        for (trial, output) in inputs.iter().zip(outputs) {
-            *output = Some(self.evaluate(*trial)?);
-        }
-        Ok(())
+        crate::evaluate_lanes(inputs.iter().copied(), outputs, |trial| {
+            self.evaluate(trial).map(Some)
+        })
     }
 
     /// The actual local source noise PSD/covariance data; noise transfer
