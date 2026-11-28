@@ -123,7 +123,13 @@ void cm_preprocess_logic_event(ARGS)
         Digital_State_t clock = state->receiver[size - 1].bit;
         Digital_State_t trigger = (op % 2) ? ONE : ZERO;
         Digital_State_t data = state->receiver[0].bit;
-        desired = state->committed;
+        /* A captured clocked request is logical state, not the delayed
+         * physical output. Keep it through nontriggering samples and timer
+         * wakeups, including when a second edge toggles a pending request.
+         * The initial requested sentinel is not a valid captured bit. */
+        desired = ANALYSIS != DC &&
+            (state->requested == ZERO || state->requested == ONE) ?
+            state->requested : state->committed;
         /* DC establishes receiver history but is never a clock edge.
          * Evaluate all receivers before sampling data at the triggering edge. */
         if (ANALYSIS != DC && old_clock != clock && clock == trigger) {

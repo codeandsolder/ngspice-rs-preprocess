@@ -1,0 +1,48 @@
+* LTspice diode family selector characterization
+Vx x 0 DC 2 AC 1
+V0 x a0 0
+V1 x a1 0
+V2 x a2 0
+V3 x a3 0
+V4 x a4 0
+V5 x a5 0
+V6 x a6 0
+V7 x a7 0
+V8 x a8 0
+V9 x a9 0
+V10 x a10 0
+V11 x a11 0
+V12 x a12 0
+V13 x a13 0
+D0 a0 0 m0
+D1 a1 0 m1
+D2 a2 0 m2
+D3 a3 0 m3
+D4 a4 0 m4
+D5 a5 0 m5
+D6 a6 0 m6
+D7 a7 0 m7
+D8 a8 0 m8
+D9 a9 0 m9
+D10 a10 0 m10
+D11 a11 0 m11
+D12 a12 0 m12
+D13 a13 0 m13
+.model m0 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3)
+.model m1 D(Level=2)
+.model m2 D(Level=2 Ron=4 Roff=200 Vfwd=2 Vrev=4 Rrev=6)
+.model m3 D(Level=2 Ron=2)
+.model m4 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3 Is=1e-10)
+.model m5 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3 N=2)
+.model m6 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3 Cjo=1n)
+.model m7 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3 Tt=1u)
+.model m8 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3 Rs=2)
+.model m9 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3 Bv=3 Ibv=1m)
+.model m10 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3 area=2)
+.model m11 D(Level=2 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3 Vj=2 M=.2)
+.model m12 D(Level=3 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3)
+.model m13 D(Level=0 Ron=2 Roff=100 Vfwd=1 Vrev=2 Rrev=3)
+.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12 plotwinsize=0 numdgt=15
+.save I(V0) I(V1) I(V2) I(V3) I(V4) I(V5) I(V6) I(V7) I(V8) I(V9) I(V10) I(V11) I(V12) I(V13)
+.dc Vx -10 8 .1
+.end

@@ -1,0 +1,3 @@
+.subckt ext in out
+R1 in out 2k
+.ends ext

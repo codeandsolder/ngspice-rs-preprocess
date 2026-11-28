@@ -1277,6 +1277,19 @@ fn diode_current(
     Ok(-saturation_current * (1.0 + arg * arg * arg))
 }
 
+// These temperature-dependent quantities serve both the physical equations
+// and the family numerical trial policy. Keep their operation order intact.
+fn junction_potential(prepared: &PreparedModel, temp: Jet) -> Jet {
+    let ratio = temp / prepared.model.tnom;
+    pbfact(temp) + ratio * prepared.pbo * (prepared.model.tnom / REFERENCE_T)
+}
+
+fn saturation_exponent(model: &Model, temp: Jet, vte: Jet) -> Jet {
+    let ratio = temp / model.tnom;
+    let d = model.diode;
+    (ratio - 1.0) * d.eg / vte + (d.xti / d.n) * ratio.ln()
+}
+
 fn diode_at(
     prepared: &PreparedModel,
     mult: f64,
@@ -1286,12 +1299,11 @@ fn diode_at(
 ) -> Result<DiodeAt, ModelError> {
     let model = &prepared.model;
     let d = model.diode;
-    let ratio = temp / model.tnom;
     let dt = temp - model.tnom;
     let grading = d.m * (1.0 + d.tm1 * dt + d.tm2 * dt * dt);
     let pbo = prepared.pbo;
     let gmaold = (d.vj - pbo) / pbo;
-    let potential = pbfact(temp) + ratio * pbo * (model.tnom / REFERENCE_T);
+    let potential = junction_potential(prepared, temp);
     if potential.v <= 0.0 {
         return Err(ModelError::Invalid("temperature-adjusted diode potential"));
     }
@@ -1301,7 +1313,7 @@ fn diode_at(
         * (1.0 + grading * (400e-6 * (temp - REFERENCE_T) - gmanew));
     let thermal_voltage = K_OVER_Q * temp;
     let vte = d.n * thermal_voltage;
-    let scale = ((ratio - 1.0) * d.eg / vte + (d.xti / d.n) * ratio.ln()).exp();
+    let scale = saturation_exponent(model, temp, vte).exp();
     let isat = mult * d.is * scale;
     let current = diode_current(vd, isat, vte, thermal_voltage, d.breakdown)?;
     // ngspice 47 vdmostemp.c limits the *temperature-adjusted* junction

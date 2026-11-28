@@ -1,0 +1,11 @@
+XX1 a b child
+XX2 b 0 child
+
+* block symbol definitions
+.subckt child in out
+R1 in out 2k
+.ends child
+
+.op
+.backanno
+.end

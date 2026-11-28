@@ -5,57 +5,7 @@
 
 use super::{Avalanche, ExponentialJunction, PreparedInstance};
 use crate::{ModelError, finite};
-
-#[derive(Clone, Copy, Debug)]
-struct ExponentialLimit {
-    scale: f64,
-    critical: f64,
-}
-
-impl ExponentialLimit {
-    fn new(log_current: f64, inverse_scale: f64) -> Option<Self> {
-        // A disabled current law or a constant exponential needs no limiter.
-        if !log_current.is_finite() || inverse_scale <= 0. {
-            return None;
-        }
-        let scale = inverse_scale.recip();
-        if !scale.is_finite() || scale <= 0. {
-            return None;
-        }
-        // Compute the critical voltage in the log domain, including
-        // saturation currents whose linear representations underflow.
-        let critical = scale * (std::f64::consts::LN_2.mul_add(-0.5, scale.ln()) - log_current);
-        Some(Self {
-            scale,
-            critical: critical.max(0.),
-        })
-    }
-
-    fn limit(self, proposed: f64, reference: f64) -> f64 {
-        if proposed <= self.critical {
-            return proposed;
-        }
-        // In the nonconducting half-plane there is no useful exponential
-        // tangent. Start the compressed step at its boundary instead.
-        let anchor = reference.max(0.);
-        let delta = proposed - anchor;
-        if delta.abs() <= 2. * self.scale {
-            return proposed;
-        }
-        let ratio = delta.abs() / self.scale;
-        let logarithm = if ratio.is_finite() {
-            ratio.ln_1p()
-        } else {
-            // Equivalent asymptotic expression when the quotient overflows.
-            delta.abs().ln() - self.scale.ln()
-        };
-        let step = (self.scale * logarithm).copysign(delta);
-        // Prevent a floating-point rounding excursion outside the original
-        // interval, including when the proposed and reference voltages differ
-        // by hundreds of orders of magnitude.
-        (anchor + step).clamp(anchor.min(proposed), anchor.max(proposed))
-    }
-}
+use model_kernel_api::trial::limiting::ExponentialLimit;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TrialLimits {
@@ -101,7 +51,7 @@ impl TrialLimits {
             .forward
             .into_iter()
             .flatten()
-            .map(|term| term.critical)
+            .map(ExponentialLimit::critical)
             .fold(f64::INFINITY, f64::min);
         if critical.is_finite() { critical } else { 0. }
     }

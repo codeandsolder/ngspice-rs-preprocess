@@ -15,7 +15,7 @@ pub use model_preprocess_command::{
     AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, Resource,
     SourceSession, WorkBudget, WorkLimits,
 };
-pub use model_preprocess_simplis::{LibrarySimulator, ParsedLibrary};
+pub use model_preprocess_simplis::{LibrarySimulator, ParsedLibrary, source_dialect::PowerTarget};
 pub use model_translate_simplis::CodeModelRuntime;
 use serde::Serialize;
 use std::{
@@ -41,6 +41,8 @@ pub enum InputFormat {
     TinaLibrary,
     /// Complete `LTspice` source deck, emitted in native syntax.
     LtspiceDeck,
+    /// Headless `LTspice` ASCII schematic and its symbol/hierarchy graph.
+    LtspiceSchematic,
     /// `LTspice` source library, emitted as include-safe native syntax.
     LtspiceLibrary,
     /// Standalone `PSpice` deck lowered to native SPICE.
@@ -83,6 +85,7 @@ impl InputFormat {
             "tina-deck" => Ok(Self::TinaDeck),
             "tina-library" => Ok(Self::TinaLibrary),
             "ltspice-deck" => Ok(Self::LtspiceDeck),
+            "ltspice-schematic" => Ok(Self::LtspiceSchematic),
             "ltspice-library" => Ok(Self::LtspiceLibrary),
             "pspice-deck" => Ok(Self::PspiceDeck),
             "pspice-library" => Ok(Self::PspiceLibrary),
@@ -176,6 +179,8 @@ pub struct Options {
     pub device_config: Option<PathBuf>,
     /// Explicit experiment seed and sample; absent means nominal.
     pub statistical_sample: Option<StatisticalSample>,
+    /// Explicit consumer power-expression contract.
+    pub power_target: PowerTarget,
 }
 
 impl Default for Options {
@@ -187,6 +192,7 @@ impl Default for Options {
             conditioning: ConditioningPolicy::default(),
             device_config: None,
             statistical_sample: None,
+            power_target: PowerTarget::NativeNgspice,
         }
     }
 }
@@ -246,6 +252,8 @@ pub struct Artifact {
 pub struct PreparedBundle {
     /// Explicit input format.
     pub format: InputFormat,
+    /// Power-expression contract required by the emitted artifact.
+    pub power_target: PowerTarget,
     /// Canonical root origin.
     pub origin: PathBuf,
     /// Main artifact (native deck, include, or parsed-library JSON).
@@ -398,7 +406,9 @@ fn project_native(
         _ => {
             let dialect = if matches!(
                 format,
-                InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary
+                InputFormat::LtspiceDeck
+                    | InputFormat::LtspiceLibrary
+                    | InputFormat::LtspiceSchematic
             ) {
                 NormalizationDialect::Ltspice
             } else {
@@ -425,6 +435,7 @@ fn native(
         request.format,
         InputFormat::NativeDeck
             | InputFormat::LtspiceDeck
+            | InputFormat::LtspiceSchematic
             | InputFormat::PspiceDeck
             | InputFormat::QspiceDeck
             | InputFormat::TinaDeck
@@ -434,6 +445,24 @@ fn native(
         RootKind::Include
     };
     let origin = root.path.clone();
+    let imported = if request.format == InputFormat::LtspiceSchematic {
+        let deck = model_import_ltspice::import(
+            root,
+            &request.search_paths,
+            session,
+            options.output_bytes,
+        )?;
+        Some((
+            AdmittedSource {
+                path: origin.clone(),
+                bytes: Arc::from(deck.bytes),
+            },
+            deck.origins,
+        ))
+    } else {
+        None
+    };
+    let root = imported.as_ref().map_or(root, |(source, _)| source);
     if matches!(
         request.format,
         InputFormat::TinaDeck | InputFormat::TinaLibrary
@@ -441,7 +470,9 @@ fn native(
         model_normalize_ngspice::tina::validate_plaintext(&root.bytes)?;
     }
     let syntax = match request.format {
-        InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary => LibrarySyntax::Ltspice,
+        InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary | InputFormat::LtspiceSchematic => {
+            LibrarySyntax::Ltspice
+        }
         InputFormat::PspiceDeck
         | InputFormat::PspiceLibrary
         | InputFormat::TinaDeck
@@ -465,12 +496,32 @@ fn native(
     let origins = linked
         .origins
         .into_iter()
-        .map(|mapped| OriginLine {
-            source: mapped.path,
-            line: mapped.line,
-            last_line: mapped.line,
+        .map(|mapped| {
+            if let Some((_, origins)) = &imported
+                && mapped.path == origin
+            {
+                let original = origins
+                    .get(
+                        mapped
+                            .line
+                            .checked_sub(1)
+                            .context("invalid schematic source line")?,
+                    )
+                    .context("missing schematic source origin")?;
+                Ok(OriginLine {
+                    source: original.path.clone(),
+                    line: original.line,
+                    last_line: original.line,
+                })
+            } else {
+                Ok(OriginLine {
+                    source: mapped.path,
+                    line: mapped.line,
+                    last_line: mapped.line,
+                })
+            }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     native_bundle(
         origin,
         request.format,
@@ -511,6 +562,7 @@ fn native_bundle(
         .collect::<Result<Vec<_>>>()?;
     Ok(PreparedBundle {
         format,
+        power_target: PowerTarget::NativeNgspice,
         origin,
         primary: Artifact {
             filename: if kind == RootKind::Deck {
@@ -556,6 +608,7 @@ fn validate_request(request: &Request) -> Result<()> {
                     | InputFormat::TinaDeck
                     | InputFormat::TinaLibrary
                     | InputFormat::LtspiceDeck
+                    | InputFormat::LtspiceSchematic
                     | InputFormat::LtspiceLibrary
                     | InputFormat::PspiceDeck
                     | InputFormat::PspiceLibrary
@@ -584,6 +637,11 @@ pub fn prepare(
 ) -> Result<PreparedBundle> {
     validate_request(request)?;
     ensure!(
+        options.power_target == PowerTarget::NativeNgspice
+            || request.format == InputFormat::SimetrixDeck,
+        "prepared power target requires a SIMetrix deck"
+    );
+    ensure!(
         options.device_config.is_none() || request.format == InputFormat::SimetrixDeck,
         "device configuration is only valid for SIMetrix decks"
     );
@@ -605,6 +663,7 @@ pub fn prepare(
         | InputFormat::TinaDeck
         | InputFormat::TinaLibrary
         | InputFormat::LtspiceDeck
+        | InputFormat::LtspiceSchematic
         | InputFormat::LtspiceLibrary
         | InputFormat::PspiceDeck
         | InputFormat::PspiceLibrary
@@ -612,6 +671,7 @@ pub fn prepare(
         | InputFormat::QspiceLibrary => native(&root, request, options, &mut session),
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
+    result.power_target = options.power_target;
     if request.format == InputFormat::SimetrixDeck
         && options.conditioning == ConditioningPolicy::PrivateDifferentiators
     {

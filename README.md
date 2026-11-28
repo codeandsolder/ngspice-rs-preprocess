@@ -51,6 +51,7 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `tina-library` | TINA/TINA-TI plaintext SPICE macro source | `model.lib` |
 | `ltspice-deck` | Explicit LTspice source normalization (partial dialect coverage) | `deck.cir` |
 | `ltspice-library` | Explicit LTspice library normalization (partial dialect coverage) | `model.lib` |
+| `ltspice-schematic` | Headless ASC/ASY schematic and hierarchical symbol import through LTspice normalization | `deck.cir` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
@@ -82,6 +83,12 @@ The LTspice formats normalize whole-file library imports, relative Windows-style
 
 The source-specific transformations have native ngspice OP/DC/AC/transient/noise regressions based on independent LTspice XVII and 24.0.12 measurements. Successful normalization alone does not establish equivalence for arbitrary decks. All LTspice diode models retain an explicit `ltspice_diode` dialect marker and their ordered setters, including lexical LEVEL expressions; the consumer selects the constitutive law after occurrence-specific resolution. Voltage-controlled switch models select an explicit native physical family. The diode marker is a breaking producer/consumer contract coordinated with [solver #258](https://github.com/codeandsolder/ngspice-rs-fast/issues/258); it is not raw ngspice syntax. See [diode dispatch](docs/ltspice-diode-dispatch.md). Passive IC and richer parasitic networks, structured/triggered waveforms, analysis-dependent EXP timing defaults, source shunt capacitance, negative or occurrence-parametric voltage-source series resistance, and unsupported expression forms require additional typed preparation or solver support. End-to-end Rust solver acceptance of the generated scalar functions and mandatory waveform declarations depends on its native parameter-expression, macro-expansion and prepared-waveform binding support.
 
+For schematic import, supply the root ASC and any symbol/model search roots.
+The headless importer resolves electrical geometry and symbol metadata,
+including hierarchical blocks, without invoking the graphical editor.
+Installation-specific symbols and component libraries remain external
+resources. See [the schematic import contract](docs/ltspice-schematic.md).
+
 No extension-based format guessing or implicit transformation is performed.
 For example:
 
@@ -95,9 +102,23 @@ ngspice-rs-preprocess native-library model.lib normalized \
 
 Use repeatable `--library PATH` for raw catalog members, or
 `--parsed-library PATH` for previously compiled JSON artifacts. Explicit
-library path suffixes take priority over a unique portable basename;
-ambiguous includes fail. Content-equivalent library aliases retain all
-source names. A compiled artifact is never passed to the source command.
+source paths resolve relative to the importing source first, then by
+matching path suffix and unique portable basename; ambiguous includes fail.
+Content-equivalent libraries retain all admitted source names. Identical
+programs at different paths do not make their relative includes interchangeable.
+A compiled artifact is never passed to the source command.
+
+For SIMPLIS, an explicit catalog include executes its selected source program
+in the current preprocessing scope and in source order. Only active conditional
+and loop occurrences execute; a nested include resolves relative to its own
+origin. Local variables remain local, while promoted globals are visible to
+subsequently specialized subcircuits. Active model cards and aliases are emitted
+once at the declaration scope; occurrence-specific declarations are specialized
+with their caller's bindings. Merely adding a catalog member does not execute
+its root control program. The parsed-library v8 format preserves the selected
+source program separately from its indexed declarations and retains physical
+source positions. Regenerate older parsed artifacts before using them.
+
 Recursive relative `.init` resources are admitted in the same session and
 only in the selected simulator projection. Missing, ambiguous and
 recursive resources are errors. Dialect translation emits only the native
@@ -209,7 +230,7 @@ are qualified. The source-language header controls expression and
 lexical semantics independently of model selection. The mapping table is
 shared across the deck's admitted includes; indexed catalog libraries
 cannot independently introduce global selection directives. Include such
-resources explicitly instead. Parsed-library format v6 retains projected
+resources explicitly instead. Parsed-library format v8 retains projected
 source statements so that a catalog can be selected again under a new
 request's mapping rather than baking in a previous request's defaults.
 
@@ -243,6 +264,17 @@ must also be implemented; `HSPICEMODELS` selects models alone.
 
 See the [SIMetrix device configuration reference](https://help.simetrix.co.uk/9.3/simetrix/simulator_reference/topics/simulatordevices_customisingdeviceconfiguration.htm).
 
+`Options::power_target` (CLI `--power-target`) selects the consumer's
+power-expression contract. `native-ngspice` is the default and keeps the
+existing portable guarded power expressions. For `simetrix-deck`,
+`prepared-solver-v1` preserves the explicit absolute-base, caret, real-part
+and ordered absolute-product operations instead. A prepared consumer must
+implement the four named operations and resolve function bodies in their
+actual scalar or behavioural phase. This capability is recorded in the
+bundle, not inferred from simulator names or a compatibility mode. Source
+catalog libraries remain target-neutral until linked; other source formats
+reject the prepared power target.
+
 Native linking preserves physical source lines, comments, continuations,
 scope boundaries and the root title. Static `.include`, `.inc` and named
 `.lib path section` resources are resolved relative to their containing
@@ -256,7 +288,8 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 9 includes typed PWL resistor declarations as well as
+counts, dependencies and provenance. Manifest version 10 records the explicit `power_target` capability and
+includes typed PWL resistor declarations as well as
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
 `Artifact::required_code_models` and `PreparedBundle::required_code_models()`.

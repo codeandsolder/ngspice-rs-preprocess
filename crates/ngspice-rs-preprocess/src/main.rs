@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use ngspice_rs_preprocess::{
     Cancellation, CommandConfig, ConditioningPolicy, InputFormat, LibraryInput, Options,
-    PreparedBundle, Request, SourceInput, prepare,
+    PowerTarget, PreparedBundle, Request, SourceInput, prepare,
 };
 use serde::Serialize;
 use std::{
@@ -15,7 +15,7 @@ use std::{
 
 const USAGE: &str = "\
 Usage: ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
-Formats: native-deck, native-library, ltspice-deck, ltspice-library,
+Formats: native-deck, native-library, ltspice-deck, ltspice-library, ltspice-schematic,
          pspice-deck, pspice-library, qspice-deck, qspice-library,
          tina-deck, tina-library, hspice-deck, hspice-library,
          simplis-deck, simetrix-deck,
@@ -43,6 +43,7 @@ Options:
   --max-work-generated-nodes N
   --max-work-emitted-bytes N  Intermediate and final emission
   --max-work-depth N          Recursive depth (maximum 64)
+  --power-target MODE         native-ngspice (default) or prepared-solver-v1
   --conditioning MODE         private-differentiators (default) or disabled
 The output directory must not already exist.
 ";
@@ -92,6 +93,34 @@ fn statistical_sample(value: &OsStr) -> Result<ngspice_rs_preprocess::Statistica
         seed: seed.parse()?,
         sample: sample.parse()?,
     })
+}
+
+fn command_config(
+    command: Option<PathBuf>,
+    command_args: Vec<OsString>,
+    cwd: Option<PathBuf>,
+) -> Result<Option<CommandConfig>> {
+    if let Some(executable) = command {
+        ensure!(
+            executable.is_absolute(),
+            "--command requires an absolute executable pathname"
+        );
+        ensure!(
+            cwd.as_ref().is_none_or(|path| path.is_absolute()),
+            "--command-cwd requires an absolute pathname"
+        );
+        Ok(Some(CommandConfig {
+            executable,
+            arguments: command_args,
+            working_directory: cwd,
+        }))
+    } else {
+        ensure!(
+            command_args.is_empty() && cwd.is_none(),
+            "command arguments and cwd require --command"
+        );
+        Ok(None)
+    }
 }
 
 fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>> {
@@ -158,6 +187,13 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
                     Duration::from_millis(u64::try_from(numeric(&value)?)?);
             }
             "--max-output-bytes" => options.output_bytes = numeric(&value)?,
+            "--power-target" => {
+                options.power_target = match value.to_str() {
+                    Some("native-ngspice") => PowerTarget::NativeNgspice,
+                    Some("prepared-solver-v1") => PowerTarget::PreparedSolverV1,
+                    _ => bail!("unknown power target {}", value.display()),
+                };
+            }
             "--conditioning" => {
                 options.conditioning = match value.to_str() {
                     Some("private-differentiators") => ConditioningPolicy::PrivateDifferentiators,
@@ -168,26 +204,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
             _ => bail!("unknown option {name:?}\n{USAGE}"),
         }
     }
-    if let Some(executable) = command {
-        ensure!(
-            executable.is_absolute(),
-            "--command requires an absolute executable pathname"
-        );
-        ensure!(
-            cwd.as_ref().is_none_or(|path| path.is_absolute()),
-            "--command-cwd requires an absolute pathname"
-        );
-        options.admission.command = Some(CommandConfig {
-            executable,
-            arguments: command_args,
-            working_directory: cwd,
-        });
-    } else {
-        ensure!(
-            command_args.is_empty() && cwd.is_none(),
-            "command arguments and cwd require --command"
-        );
-    }
+    options.admission.command = command_config(command, command_args, cwd)?;
     Ok(Some(Invocation {
         request,
         options,
@@ -199,6 +216,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
 struct Manifest<'a> {
     version: u32,
     input_format: InputFormat,
+    power_target: PowerTarget,
     origin: String,
     primary: &'a str,
     artifacts: Vec<ManifestArtifact<'a>>,
@@ -225,8 +243,9 @@ struct ManifestArtifact<'a> {
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 9,
+        version: 10,
         input_format: bundle.format,
+        power_target: bundle.power_target,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,
         artifacts: bundle

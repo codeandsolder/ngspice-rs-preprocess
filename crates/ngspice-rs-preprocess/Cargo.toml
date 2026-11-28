@@ -20,6 +20,7 @@ serde_json = "1"
 tempfile = "3"
 model-preprocess-command.workspace = true
 model-normalize-ngspice.workspace = true
+model-import-ltspice.workspace = true
 model-preprocess-simplis.workspace = true
 model-translate-simplis.workspace = true
 

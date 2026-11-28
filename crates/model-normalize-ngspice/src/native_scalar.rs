@@ -299,9 +299,11 @@ fn remainder(left: f64, right: f64) -> f64 {
 
 macro_rules! functions {
     ($($variant:ident => $name:literal / $arity:literal,)*) => {
-        /// The allowlisted numparam functions (a subset of `fmathS` in
-        /// `xpressn.c`). Statistical calls are realized separately from
-        /// ordinary deterministic math functions.
+        /// Native numparam functions and explicitly named prepared operations.
+        ///
+        /// Native spellings follow `fmathS` in `xpressn.c`; prepared
+        /// spellings do not change the native arithmetic contract.
+        /// Statistical calls are realized separately.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum Function {
             $(
@@ -311,7 +313,7 @@ macro_rules! functions {
         }
 
         impl Function {
-            /// Every allowlisted function, in `fmathS` order.
+            /// Every allowlisted function, native `fmathS` order followed by prepared operations.
             pub const ALL: &'static [Function] = &[$(Self::$variant,)*];
 
             /// Looks a function up by (case-insensitive) name.
@@ -373,6 +375,10 @@ functions! {
     Atanh => "atanh" / 1,
     Tan => "tan" / 1,
     Nint => "nint" / 1,
+    SimetrixAbsolute => "simetrix_abs_pow" / 2,
+    SimetrixCaret => "simetrix_caret_pow" / 2,
+    SimetrixRealPart => "simetrix_pow" / 2,
+    SimetrixAbsoluteProduct => "simetrix_abs_pow_product" / 3,
 }
 
 /// xpressn.c `mathfunction(f, z, x)`: `z` is the first argument of two.
@@ -411,6 +417,18 @@ fn evaluate_function(function: Function, args: &[f64]) -> f64 {
         Function::Abs => x.abs(),
         Function::Pow => z.powf(x),
         Function::Pwr => z.abs().powf(x),
+        Function::SimetrixAbsolute => simetrix_scalar_power(z.abs(), x),
+        Function::SimetrixCaret => simetrix_scalar_power(z, x),
+        Function::SimetrixRealPart => simetrix_real_part(z, x),
+        Function::SimetrixAbsoluteProduct => {
+            let base = args[1];
+            // Only the source's ordered zero-factor singularity is masked.
+            if z == 0. && base == 0. && x < 0. {
+                0.
+            } else {
+                z * simetrix_scalar_power(base.abs(), x)
+            }
+        }
         Function::Max => {
             if x > z {
                 x
@@ -448,5 +466,24 @@ fn evaluate_function(function: Function, args: &[f64]) -> f64 {
         Function::Acosh => x.acosh(),
         Function::Atanh => x.atanh(),
         Function::Tan => x.tan(),
+    }
+}
+
+// Scalar evaluation is deliberately independent of the runtime Jacobian.
+// The vendor absolute-static witness gives 0**0.5 = 1e-154 in numparam,
+// whereas the behavioural absolute-power operation returns zero there.
+fn simetrix_scalar_power(base: f64, exponent: f64) -> f64 {
+    if base == 0. && exponent > 0. && exponent.fract() != 0. {
+        1e-308_f64.powf(exponent)
+    } else {
+        base.powf(exponent)
+    }
+}
+
+fn simetrix_real_part(base: f64, exponent: f64) -> f64 {
+    if base >= 0. || exponent.fract() == 0. {
+        base.powf(exponent)
+    } else {
+        base.abs().powf(exponent) * (std::f64::consts::PI * exponent.rem_euclid(2.)).cos()
     }
 }

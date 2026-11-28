@@ -19,8 +19,8 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_scoped_statements, parse_library_with_budget, parse_scoped_library,
-    parse_standalone_library, preprocess_netlist_linked, project_resource, project_spice_resource,
-    source_include_target,
+    parse_standalone_library, preprocess_netlist_linked_at, project_resource,
+    project_spice_resource, source_include_target,
 };
 use model_translate_simplis::{
     WholeModelTranslation, capture_artifact_initial_conditions, capture_artifact_waveforms,
@@ -75,6 +75,7 @@ fn bundle(
 ) -> PreparedBundle {
     PreparedBundle {
         format,
+        power_target: super::PowerTarget::NativeNgspice,
         origin: root.path.clone(),
         primary,
         companions,
@@ -583,6 +584,7 @@ fn catalog(
     simulator: LibrarySimulator,
     members: Vec<(Cow<'_, ParsedLibrary>, String)>,
     mapping: Option<&MappingTable>,
+    target: super::PowerTarget,
     limit: usize,
     budget: &super::WorkBudget,
 ) -> Result<ResolvedLibraries> {
@@ -592,7 +594,7 @@ fn catalog(
     let mut model_selections = Vec::new();
     for (parsed, origin) in members {
         let parsed = if let Some(mapping) = mapping {
-            let (parsed, selections) = parsed.mapped(mapping, limit, budget)?;
+            let (parsed, selections) = parsed.mapped(mapping, target, limit, budget)?;
             model_selections.extend(selections);
             Cow::Owned(parsed)
         } else {
@@ -719,6 +721,27 @@ struct CompanionOrigins<'a> {
     root: &'a BTreeSet<String>,
 }
 
+fn extend_include_origins(
+    origins: &mut BTreeSet<String>,
+    includes: &BTreeSet<model_preprocess_simplis::IncludedSource>,
+    sources: &BTreeMap<String, BTreeSet<String>>,
+    budget: &WorkBudget,
+) -> Result<()> {
+    for source in includes {
+        let paths = sources
+            .get(&source.source_id)
+            .context("executed include missing admitted source origin")?;
+        ensure!(
+            paths.contains(&source.source_name),
+            "executed include has unknown source path"
+        );
+        budget.charge(super::Resource::GeneratedNodes, 1)?;
+        budget.charge(super::Resource::EmittedBytes, source.source_name.len())?;
+        origins.insert(source.source_name.clone());
+    }
+    Ok(())
+}
+
 fn translate_companions(
     linked: &model_preprocess_simplis::LinkedPreprocessedNetlist,
     translated_libraries: Vec<WholeModelTranslation>,
@@ -756,7 +779,14 @@ fn translate_companions(
         for origin in origin_set {
             budget.charge(super::Resource::EmittedBytes, origin.len())?;
         }
-        let origins = origin_set.iter().cloned().collect();
+        let mut artifact_origins = origin_set.clone();
+        extend_include_origins(
+            &mut artifact_origins,
+            &library.included_sources,
+            origins.sources,
+            budget,
+        )?;
+        let origins = artifact_origins.into_iter().collect();
         dependencies.push(library.source_id.clone());
         companions.push(generated(
             library.filename.clone(),
@@ -869,25 +899,28 @@ fn resolve_deck(
     } else {
         None
     };
-    let (expanded_root, mut device_identities, mut model_selections) = if let Some(mapping) =
-        &mapping
-    {
-        let mapped = mapping.apply(&statements, session.budget())?;
-        let lowered =
-            lower_scoped_statements(&mapped.statements, options.output_bytes, session.budget())?;
-        let resolved = resolve_device_identities(&lowered, session.budget())?;
-        ensure!(
-            resolved.text.len() <= options.output_bytes,
-            "device identity expansion byte budget exceeded"
-        );
-        (
-            resolved.text.into_bytes(),
-            resolved.identities,
-            mapped.selections,
-        )
-    } else {
-        (output, Vec::new(), Vec::new())
-    };
+    let (expanded_root, mut device_identities, mut model_selections) =
+        if let Some(mapping) = &mapping {
+            let mapped = mapping.apply(&statements, session.budget())?;
+            let lowered = lower_scoped_statements(
+                &mapped.statements,
+                options.power_target,
+                options.output_bytes,
+                session.budget(),
+            )?;
+            let resolved = resolve_device_identities(&lowered, session.budget())?;
+            ensure!(
+                resolved.text.len() <= options.output_bytes,
+                "device identity expansion byte budget exceeded"
+            );
+            (
+                resolved.text.into_bytes(),
+                resolved.identities,
+                mapped.selections,
+            )
+        } else {
+            (output, Vec::new(), Vec::new())
+        };
     let ResolvedLibraries {
         catalog,
         sources,
@@ -897,6 +930,7 @@ fn resolve_deck(
         projection(request.format),
         members,
         mapping.as_ref(),
+        options.power_target,
         options.output_bytes,
         session.budget(),
     )?;
@@ -934,6 +968,21 @@ fn attach_initial_conditions(
     Ok(())
 }
 
+fn prepare_linked_runtime(
+    linked: &mut model_preprocess_simplis::LinkedPreprocessedNetlist,
+    format: InputFormat,
+    options: &Options,
+    budget: &WorkBudget,
+) -> Result<Option<super::passive_ic::InitialConditions>> {
+    let initial_conditions = if format == InputFormat::SimetrixDeck {
+        lower_simetrix_linked_runtime(linked, options.statistical_sample, budget)?;
+        Some(capture_passive_initial_conditions(linked, budget)?)
+    } else {
+        None
+    };
+    Ok(initial_conditions)
+}
+
 fn linked(
     root: &AdmittedSource,
     request: &Request,
@@ -943,7 +992,7 @@ fn linked(
 ) -> Result<PreparedBundle> {
     let ResolvedDeck {
         root: expanded_root,
-        root_sources,
+        mut root_sources,
         declarations,
         libraries:
             ResolvedLibraries {
@@ -953,7 +1002,14 @@ fn linked(
                 model_selections,
             },
     } = resolve_deck(root, request, options, cancellation, session)?;
-    let mut linked = preprocess_netlist_linked(&expanded_root, &catalog)?;
+    let mut linked =
+        preprocess_netlist_linked_at(&expanded_root, &catalog, Some(&root.path.to_string_lossy()))?;
+    extend_include_origins(
+        &mut root_sources,
+        &linked.included_sources,
+        &sources,
+        session.budget(),
+    )?;
     let mut plan = capture_linked_plan(
         &mut linked,
         root,
@@ -964,15 +1020,8 @@ fn linked(
     if request.format == InputFormat::SimetrixDeck {
         plan.select_statistical_sample(options.statistical_sample, session.budget())?;
     }
-    let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
-        lower_simetrix_linked_runtime(&mut linked, options.statistical_sample, session.budget())?;
-        Some(capture_passive_initial_conditions(
-            &mut linked,
-            session.budget(),
-        )?)
-    } else {
-        None
-    };
+    let mut initial_conditions =
+        prepare_linked_runtime(&mut linked, request.format, options, session.budget())?;
     let waveforms = capture_linked_waveforms(&mut linked, session.budget())?;
     let known = linked
         .libraries
@@ -1067,6 +1116,7 @@ pub fn prepare(
         | InputFormat::TinaDeck
         | InputFormat::TinaLibrary
         | InputFormat::LtspiceDeck
+        | InputFormat::LtspiceSchematic
         | InputFormat::LtspiceLibrary
         | InputFormat::PspiceDeck
         | InputFormat::PspiceLibrary

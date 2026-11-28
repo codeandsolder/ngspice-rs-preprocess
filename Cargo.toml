@@ -3,6 +3,7 @@ members = [
     "crates/model-alb-xspice-ffi",
     "crates/model-alb-experimental",
     "crates/model-kernel-api",
+    "crates/model-import-ltspice",
     "crates/model-prepare-osdi",
     "crates/model-statistics",
     "crates/model-kernel-diode",
@@ -19,6 +20,7 @@ members = [
 ]
 default-members = [
     "crates/model-kernel-api",
+    "crates/model-import-ltspice",
     "crates/model-prepare-osdi",
     "crates/model-statistics",
     "crates/model-kernel-diode",
@@ -47,6 +49,7 @@ publish = false
 model-alb-experimental = { path = "crates/model-alb-experimental", version = "=0.1.0" }
 model-compact-intrinsic = { path = "crates/model-compact-intrinsic", version = "=0.1.0" }
 model-kernel-api = { path = "crates/model-kernel-api", version = "=0.1.0" }
+model-import-ltspice = { path = "crates/model-import-ltspice", version = "=0.1.0" }
 model-kernel-diode = { path = "crates/model-kernel-diode", version = "=0.1.0" }
 model-normalize-ngspice = { path = "crates/model-normalize-ngspice", version = "=0.1.0" }
 model-preprocess-command = { path = "crates/model-preprocess-command", version = "=0.1.0" }
