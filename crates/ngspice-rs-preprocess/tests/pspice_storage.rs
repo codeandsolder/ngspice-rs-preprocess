@@ -140,3 +140,102 @@ quit
     );
     Ok(())
 }
+
+#[test]
+fn device_ic_bias_policy_is_phase_specific_and_preserves_signed_occurrences() -> Result<()> {
+    use ngspice_rs_preprocess::{
+        Cancellation, InputFormat, Options, Request, SourceInput,
+        passive_ic::{Analysis, BiasConstraint, evaluate_expression},
+        prepare,
+    };
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("device.cir");
+    for skip_translation in [false, true] {
+        let flag = if skip_translation {
+            " NOICTRANSLATE"
+        } else {
+            ""
+        };
+        let source = format!(
+            "Device IC policy\n.model CM CAP(VC1=0.1)\n.model LM IND(IL1=0.2)\n\
+             C1 p n 1n IC=-2\nL1 a b 1m IC=0\nCabsent a b 2n\n\
+             .subckt cell p n params: x=3\nC2 p n CM 1n\n+ IC={{-x}}\n\
+             L2 p n LM 1m IC={{x/10}}\n.ends cell\nX1 p n cell x=5\n\
+             .options reltol=0.001{flag}\n.tran 1u 1m SKIPBP\n.end\n"
+        );
+        fs::write(&path, &source)?;
+        let bundle = prepare(
+            &Request {
+                format: InputFormat::PspiceDeck,
+                input: SourceInput::File(path.clone()),
+                libraries: Vec::new(),
+                search_paths: Vec::new(),
+            },
+            &Options::default(),
+            &Cancellation::default(),
+        )?;
+        let native = std::str::from_utf8(&bundle.primary.bytes)?;
+        assert!(!native.to_ascii_lowercase().contains("ic="), "{native}");
+        assert!(
+            !native.to_ascii_lowercase().contains("noictranslate"),
+            "{native}"
+        );
+        assert!(native.contains(".tran 1u 1m UIC"), "{native}");
+        assert!(native.contains("reltol=0.001"), "{native}");
+        assert_eq!(native.lines().count(), source.lines().count());
+        let policy = bundle
+            .initial_conditions
+            .context("missing IC declarations")?;
+        assert_eq!(policy.devices.len(), 4);
+        for (name, value, capacitor) in [
+            ("C1", -2., true),
+            ("L1", 0., false),
+            ("C2", -5., true),
+            ("L2", 0.5, false),
+        ] {
+            let device = policy
+                .devices
+                .iter()
+                .find(|d| d.device.eq_ignore_ascii_case(name))
+                .context("missing device")?;
+            for analysis in [
+                Analysis::OperatingPoint,
+                Analysis::Ac,
+                Analysis::Noise,
+                Analysis::DcSweep,
+                Analysis::Transient { uic: false },
+                Analysis::Transient { uic: true },
+            ] {
+                let evaluate = |text: &str| {
+                    evaluate_expression(text, analysis, |symbol| {
+                        ensure!(symbol.eq_ignore_ascii_case("x"), "unknown symbol {symbol}");
+                        Ok(5.)
+                    })
+                };
+                let defaults = policy.resolve_defaults(evaluate)?;
+                let resolved = device.resolve(analysis, defaults, evaluate)?;
+                assert_eq!(resolved.storage_ic, Some(value));
+                let expected = if skip_translation
+                    || matches!(
+                        analysis,
+                        Analysis::DcSweep | Analysis::Transient { uic: true }
+                    ) {
+                    BiasConstraint::None
+                } else if capacitor {
+                    BiasConstraint::CapacitorSoft {
+                        voltage: value,
+                        resistance: 0.002,
+                    }
+                } else {
+                    BiasConstraint::InductorSoft {
+                        current: value,
+                        conductance: 1e-9,
+                    }
+                };
+                assert_eq!(resolved.bias, expected);
+            }
+        }
+    }
+    Ok(())
+}

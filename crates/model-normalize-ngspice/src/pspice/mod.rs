@@ -19,7 +19,9 @@ use std::{
     fmt::Write as _,
 };
 
+mod initialization;
 mod instances;
+pub use initialization::capture_initialization;
 mod nodes;
 mod options;
 mod passive;
