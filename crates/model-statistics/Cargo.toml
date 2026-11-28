@@ -13,6 +13,6 @@ description = "Immutable statistical model realization"
 workspace = true
 
 [dependencies]
-xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
+xxhash-rust = { version = "=0.8.21", features = ["xxh3"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
