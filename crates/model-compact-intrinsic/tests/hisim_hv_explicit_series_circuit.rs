@@ -155,12 +155,12 @@ fn native_explicit_series_branches() -> TestResult {
             (row[11], row[12], row[13])
         };
         let bias = HiSimHvExplicitSeriesBias {
-            gate_source_v: gate,
-            drain_source_v: drain,
-            body_source_v: body,
-            drain_drop_v: drain - row[15],
-            source_drop_v: -row[16],
-            substrate_voltage_v: if row[9] == 1. { Some(row[14]) } else { None },
+            gate_source: gate,
+            drain_source: drain,
+            body_source: body,
+            drain_drop: drain - row[15],
+            source_drop: -row[16],
+            substrate_voltage: if row[9] == 1. { Some(row[14]) } else { None },
         };
         let point = series.evaluate(bias, &temp)?;
         let d = point.drain.ok_or("drain prime absent")?;
@@ -217,12 +217,12 @@ fn independent_series_jacobians() -> TestResult {
                         let temp = prepare_hisim_hv_temperature(&model, &instance, 300.15, x[3])?;
                         let p = series.evaluate(
                             HiSimHvExplicitSeriesBias {
-                                gate_source_v: x[0],
-                                drain_source_v: x[1],
-                                body_source_v: x[2],
-                                drain_drop_v: x[4],
-                                source_drop_v: x[5],
-                                substrate_voltage_v: substrate.then_some(x[6]),
+                                gate_source: x[0],
+                                drain_source: x[1],
+                                body_source: x[2],
+                                drain_drop: x[4],
+                                source_drop: x[5],
+                                substrate_voltage: substrate.then_some(x[6]),
                             },
                             &temp,
                         )?;

@@ -20,12 +20,12 @@ type Jet = HiSimHvExplicitSeriesScalar;
 /// All voltages refer to physical terminal orientation, normalized by polarity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HiSimHvExplicitSeriesBias {
-    pub gate_source_v: f64,
-    pub drain_source_v: f64,
-    pub body_source_v: f64,
-    pub drain_drop_v: f64,
-    pub source_drop_v: f64,
-    pub substrate_voltage_v: Option<f64>,
+    pub gate_source: f64,
+    pub drain_source: f64,
+    pub body_source: f64,
+    pub drain_drop: f64,
+    pub source_drop: f64,
+    pub substrate_voltage: Option<f64>,
 }
 
 /// A physical external-to-prime branch.
@@ -202,9 +202,9 @@ impl PreparedHiSimHvExplicitSeries {
         bias: HiSimHvExplicitSeriesBias,
         temp: &PreparedHiSimHvTemperature,
     ) -> Result<HiSimHvExplicitSeriesPoint, ModelError> {
-        let gate = Jet::coordinate(bias.gate_source_v, 0, 1.);
-        let drain = Jet::coordinate(bias.drain_source_v, 1, 1.);
-        let body = Jet::coordinate(bias.body_source_v, 2, 1.);
+        let gate = Jet::coordinate(bias.gate_source, 0, 1.);
+        let drain = Jet::coordinate(bias.drain_source, 1, 1.);
+        let body = Jet::coordinate(bias.body_source, 2, 1.);
         let reversed = drain.value < 0.;
         let (gate, drain, body, first, second) = if reversed {
             (gate - drain, -drain, body - drain, self.source, self.drain)
@@ -215,7 +215,7 @@ impl PreparedHiSimHvExplicitSeries {
         let enabled = self.voltage_base > 0.
             || self.gate_coefficient > 0.
             || self.body_coefficient > 0.
-            || bias.substrate_voltage_v.is_some();
+            || bias.substrate_voltage.is_some();
         let offset = symmetry_add(drain, self.symmetry, 1e-12);
         let modified_drain = drain + 2. * offset;
         let modified_gate = gate + offset;
@@ -242,7 +242,7 @@ impl PreparedHiSimHvExplicitSeries {
         } else {
             (Jet::constant(0.), Jet::constant(0.))
         };
-        if let Some(voltage) = bias.substrate_voltage_v
+        if let Some(voltage) = bias.substrate_voltage
             && !self.symmetric
             && has_base
         {
@@ -272,13 +272,13 @@ impl PreparedHiSimHvExplicitSeries {
             drain: self.branch(
                 self.drain,
                 raw_d,
-                Jet::coordinate(bias.drain_drop_v, 4, 1.),
+                Jet::coordinate(bias.drain_drop, 4, 1.),
                 temp,
             )?,
             source: self.branch(
                 self.source,
                 raw_s,
-                Jet::coordinate(bias.source_drop_v, 5, 1.),
+                Jet::coordinate(bias.source_drop, 5, 1.),
                 temp,
             )?,
         })
@@ -353,7 +353,7 @@ impl Binding<'_> {
         let overlap_scale = self.real("rdov11")?;
         let initial = Jet::constant(voltage_geometry);
         let scaled = lower(
-            initial * (1. + overlap_scale * (1. - overlap / (self.real("rdov12")? + 1e-50))),
+            initial * (overlap_scale.mul_add(1. - overlap / (self.real("rdov12")? + 1e-50), 1.)),
             initial,
             1e-2,
         );
