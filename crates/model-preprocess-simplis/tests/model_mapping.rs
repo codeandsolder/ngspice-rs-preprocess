@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use model_preprocess_command::WorkBudget;
 use model_preprocess_simplis::source_dialect::{
-    DialectContext, ScopedStatement, SourceDialect,
+    DialectContext, ScopedStatement, SourceDialect, SourceLanguage,
     model_mapping::{Device, DeviceConfiguration, MappingTable, SelectionOrigin},
 };
 
