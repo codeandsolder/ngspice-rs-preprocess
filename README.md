@@ -288,7 +288,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 12 records the explicit `power_target` capability and
+counts, dependencies and provenance. Manifest version 13 records the explicit `power_target` capability and
 includes typed PWL resistor declarations as well as
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
@@ -481,11 +481,23 @@ or capacitances, or requires unchanged internal current observations, select
 ### Original analysis intent
 
 A translated dialect deck is an electrical artifact, not an implicitly
-executable replica of the original netlist. Manifest v12 and
+executable replica of the original netlist. Manifest v13 and
 `PreparedBundle::analysis_plan` carry an ordered analysis plan alongside
 the circuit, with explicit source dialect, title, lexical scope and
 declaration locations. Complete SIMetrix decks reserve their first
 physical line as the title; include files and raw SIMPLIS streams do not.
+
+HSPICE preparation extracts OP, AC, DC and transient requests after
+lexical occurrence binding. Multi-segment transient timing is a symbolic
+`ScheduledTransient` declaration: each output interval has an absolute end,
+START gates output, UIC selects startup, and explicit DELMAX is a separate
+integration ceiling with its source location. The four-positional-operand
+legacy form is distinguished from two segments at candidate binding, not
+guessed while parsing. Omitted DELMAX retains the automatic HSPICE policy
+and requires a qualified consumer; it is not substituted with a native
+ngspice default. Independent SWEEP axes on AC and transient requests stay
+separate from DC continuation coordinates. Analyses are removed from the
+electrical artifact, so a consumer must execute the typed plan.
 
 Native-equivalent SIMetrix analyses are represented as requests with
 canonical arguments and a separate UIC flag. A static SIMetrix transient

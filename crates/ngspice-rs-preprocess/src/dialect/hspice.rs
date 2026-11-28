@@ -106,7 +106,8 @@ fn normalize_options(text: &str, state: &mut DeckOptions, budget: &WorkBudget) -
             }
             "TNOM" => state.nominal_temperature = true,
             "TEMP" => state.temperature = true,
-            "ABSTOL" | "VNTOL" | "RELTOL" | "GMIN" | "ITL1" | "ITL2" | "ITL4" | "CHGTOL" => (),
+            "ABSTOL" | "VNTOL" | "RELTOL" | "GMIN" | "ITL1" | "ITL2" | "ITL4" | "CHGTOL"
+            | "DELMAX" => (),
             _ => bail!("unqualified HSPICE option {}", field.name),
         }
         write!(native, " {}", field.name)?;
@@ -243,11 +244,39 @@ fn map_values(
             .map_or(text.len(), |index| start(index.saturating_sub(1)))
     };
     let offset = match command.as_str() {
-        ".PARAM" | ".TEMP" | ".OPTIONS" | ".OPTION" | ".OPT" | ".IC" | ".NODESET" | ".TRAN" => {
-            start(1)
-        }
+        ".PARAM" | ".TEMP" | ".OPTIONS" | ".OPTION" | ".OPT" | ".IC" | ".NODESET" => start(1),
         ".FUNC" => ranges.get(1).context("missing function declaration")?.end,
-        ".AC" => start(2),
+        ".TRAN" | ".AC" => {
+            let args = ranges
+                .iter()
+                .skip(1)
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>();
+            let structural = analysis::structural_analysis_fields(&args);
+            let mut output = String::new();
+            let mut previous = 0;
+            for (range, structural) in ranges.iter().skip(1).zip(structural) {
+                output.push_str(&text[previous..range.start]);
+                let value = &text[range.clone()];
+                if structural {
+                    output.push_str(value);
+                } else {
+                    let mapped = map(value, limit.saturating_sub(output.len()))?;
+                    budget.charge(
+                        Resource::EmittedBytes,
+                        mapped.len().saturating_sub(value.len()),
+                    )?;
+                    output.push_str(&mapped);
+                }
+                previous = range.end;
+            }
+            output.push_str(&text[previous..]);
+            ensure!(
+                output.len() <= limit,
+                "source expression byte budget exceeded"
+            );
+            return Ok(output);
+        }
         ".DC" => {
             // A second sweep has its own structural source identifier.
             let mut output = String::new();
@@ -710,6 +739,7 @@ pub(super) fn prepare(
         options.output_bytes,
         budget,
     )?;
+    let original = analysis::original_statements(&statements, &origins, budget)?;
     let (mut bytes, mut origins, selections, state) =
         lower_expansion(&statements, origins, options.output_bytes, budget)?;
     {
@@ -757,7 +787,18 @@ pub(super) fn prepare(
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
     }
-    bytes = models::resolve_breakdown(&bytes, RootKind::Deck, options.output_bytes, budget)?;
+    let (electrical, analysis_plan) = analysis::extract(
+        &bytes,
+        &origins,
+        &original,
+        &statements
+            .first()
+            .context("missing HSPICE deck title")?
+            .text,
+        options.output_bytes,
+        budget,
+    )?;
+    bytes = models::resolve_breakdown(&electrical, RootKind::Deck, options.output_bytes, budget)?;
     let mut bundle = native_bundle(
         root.path.clone(),
         request.format,
@@ -768,5 +809,6 @@ pub(super) fn prepare(
         budget,
     )?;
     bundle.model_selections = selections;
+    bundle.analysis_plan = analysis_plan;
     Ok(bundle)
 }

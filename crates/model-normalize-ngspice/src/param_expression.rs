@@ -573,7 +573,10 @@ impl SpiceExpression {
 
     /// Evaluate constants without requiring occurrence-scoped parameters.
     /// Invalid constant expressions remain errors.
-    pub(crate) fn known_value(&self, budget: &WorkBudget) -> Result<Option<f64>> {
+    ///
+    /// # Errors
+    /// Invalid closed expression or exhausted work budget.
+    pub fn known_value(&self, budget: &WorkBudget) -> Result<Option<f64>> {
         self.0.known_value(budget)
     }
 

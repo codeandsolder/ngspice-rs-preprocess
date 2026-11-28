@@ -243,7 +243,7 @@ struct ManifestArtifact<'a> {
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 12,
+        version: 13,
         input_format: bundle.format,
         power_target: bundle.power_target,
         origin: bundle.origin.to_string_lossy().into_owned(),
