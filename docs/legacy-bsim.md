@@ -196,6 +196,23 @@ There are 448 additional direct C operating-point/charge witnesses,
 another 180 independent derivative probes, and 16 additional native
 circuit operating points. The shared artifact tests exercise both model
 families, both orientations and polarities and optional series nodes.
-Native solver registration and family-specific limiting/convergence
-integration remain separate consumer work. Older BSIM3 revisions and
+Native solver registration remains separate consumer work. The ABI 4 family
+policy supplies a cold start using the zero-bias threshold, normalized
+VDS=0 and VBS=-1. During Newton/predictor evaluation it selects orientation
+and the exact bias-dependent threshold from the evaluated reference,
+restricts the gate/drain step with the shared FET limiters, and bounds both
+body junction voltages using the actual saturation currents and the fixed
+legacy thermal voltage. All intrinsic voltage differences are contracted
+along one common step; the exact constitutive equations and derivatives
+remain unchanged. Additional convergence compares the nonlinear residual
+rows to their previous exact Jacobian predictions. Source OFF and explicit
+IC handling, exact-load phase selection, history and acceptance remain
+consumer responsibilities.
+
+Series-node selection is resolved by the same resistance law as full
+preparation, independently of channel coefficients. Artifacts take this
+structural choice rather than a representative numeric instance; numeric
+geometry and topology edits are checked at actual instance preparation.
+Tests cover all four series shapes, both orientations and polarities,
+Newton and predictor references, exact loads and rejected limited trials. Older BSIM3 revisions and
 additional v3.3 modes remain separate, coordinated physical-port work.

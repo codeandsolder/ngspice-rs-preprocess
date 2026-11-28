@@ -11,6 +11,7 @@
 
 mod junction;
 mod noise;
+mod trial;
 
 use std::sync::Arc;
 
@@ -22,13 +23,39 @@ use model_compact_intrinsic::{
 use model_kernel_api::{
     ABI_VERSION, Artifact, Binding, Capability, Descriptor, Equation, EquationKind, Error, Kernel,
     Parameter, Point, Result,
+    trial::{Convergence, ConvergenceInput, TrialCapabilities, TrialPolicy, TrialReference},
 };
 
 /// Numeric instance slots in physical SI units and their descriptor names.
 pub const INSTANCE_PARAMETERS: [&str; 10] =
     ["l", "w", "m", "ad", "as", "pd", "ps", "nrd", "nrs", "gmin"];
 
-/// A numeric reference instance used to determine the structural descriptor.
+/// The exact structural series-node selection for one legacy BSIM artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeriesNodes {
+    /// A separate intrinsic drain row.
+    pub drain: bool,
+    /// A separate intrinsic source row.
+    pub source: bool,
+}
+
+impl SeriesNodes {
+    /// Resolve structure using the actual series conductance law without
+    /// preparing the channel or any other instance physics.
+    /// # Errors
+    /// Invalid sheet resistance or series squares.
+    pub fn resolve(model: &PreparedLegacyBsimModel, squares: [f64; 2]) -> Result<Self> {
+        let [drain, source] = model
+            .series_conductances(squares)
+            .map_err(|error| domain(&error))?;
+        Ok(Self {
+            drain: drain > 0.,
+            source: source > 0.,
+        })
+    }
+}
+
+/// The numeric instance slots, independent of artifact structure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Instance {
     /// Drawn channel length (m).
@@ -139,24 +166,25 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(instance: &PreparedLegacyBsimInstance) -> Self {
-        let mut width = 4;
-        let mut inner = |external, conductance| {
-            if conductance > 0. {
-                let index = width;
-                width += 1;
-                index
-            } else {
-                external
-            }
+    const fn new(series: SeriesNodes) -> Self {
+        let drain = if series.drain { 4 } else { 0 };
+        let source = if series.source {
+            if series.drain { 5 } else { 4 }
+        } else {
+            2
         };
-        let drain = inner(0, instance.drain.series_conductance);
-        let source = inner(2, instance.source.series_conductance);
         Self {
             drain,
             source,
-            width,
+            width: 4 + series.drain as usize + series.source as usize,
         }
+    }
+
+    fn from_prepared(instance: &PreparedLegacyBsimInstance) -> Self {
+        Self::new(SeriesNodes {
+            drain: instance.drain.series_conductance > 0.,
+            source: instance.source.series_conductance > 0.,
+        })
     }
 
     fn equations(self) -> Vec<Equation> {
@@ -236,15 +264,19 @@ pub struct LegacyBsimPrepared {
 /// Zero/nonzero series-resistance transitions require a new artifact.
 ///
 /// # Errors
-/// Wrong model family, invalid instance physics or descriptor identity.
+/// Wrong model family or descriptor identity. Numeric candidates validate physics separately.
 pub fn legacy_bsim_artifact(
     model: Arc<PreparedLegacyBsimModel>,
-    reference: Instance,
+    series: SeriesNodes,
     fingerprint: [u8; 16],
 ) -> Result<Arc<Artifact<LegacyBsimKernel>>> {
-    let slots = reference.slots();
-    let initial = prepare_instance(&model, &slots, 300.15)?;
-    let layout = Layout::new(&initial.physical);
+    let layout = Layout::new(series);
+    let slots = Instance {
+        drain_squares: f64::from(series.drain),
+        source_squares: f64::from(series.source),
+        ..Instance::default()
+    }
+    .slots();
     let parameters = INSTANCE_PARAMETERS
         .iter()
         .zip(slots)
@@ -268,7 +300,11 @@ pub fn legacy_bsim_artifact(
             parameters,
             charge: Capability::Computed,
             noise: Capability::Computed,
-            trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
+            trial: TrialCapabilities {
+                initialization: TrialPolicy::Kernel,
+                limiting: TrialPolicy::Kernel,
+                convergence: TrialPolicy::Kernel,
+            },
         },
         LegacyBsimKernel { model, layout },
     )
@@ -407,7 +443,7 @@ impl Kernel for LegacyBsimKernel {
 
     fn prepare(&self, values: &[f64], ambient_kelvin: f64) -> Result<Self::Prepared> {
         let prepared = prepare_instance(&self.model, values, ambient_kelvin)?;
-        if Layout::new(&prepared.physical) != self.layout {
+        if Layout::from_prepared(&prepared.physical) != self.layout {
             return Err(Error::Unsupported(
                 "legacy BSIM series-node edit requires new artifact",
             ));
@@ -437,6 +473,28 @@ impl Kernel for LegacyBsimKernel {
         stamp_junctions(out, self.layout, prepared, coordinates, orientation.sign)?;
         stamp_passive(out, self.layout, &prepared.physical, coordinates);
         Ok(())
+    }
+
+    fn initialize_trial(&self, prepared: &Self::Prepared, coordinates: &mut [f64]) -> Result<()> {
+        self.layout.initialize(&prepared.physical, coordinates)
+    }
+
+    fn limit_trial(
+        &self,
+        prepared: &Self::Prepared,
+        reference: TrialReference<'_>,
+        coordinates: &mut [f64],
+    ) -> Result<()> {
+        self.layout
+            .limit(&prepared.physical, reference.coordinates(), coordinates)
+    }
+
+    fn trial_convergence(
+        &self,
+        _prepared: &Self::Prepared,
+        input: ConvergenceInput<'_>,
+    ) -> Result<Convergence> {
+        self.layout.convergence(input)
     }
 
     fn evaluate_noise(

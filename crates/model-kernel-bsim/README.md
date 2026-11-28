@@ -9,13 +9,16 @@ validation](../../docs/legacy-bsim.md).
 The consumer supplies the content fingerprint of the model and topology,
 physical numeric instance slots (L/W, multiplicity, diffusion geometry,
 sheet-resistance squares, gmin), and ambient Kelvin. All model and instance
-preparation occurs outside evaluation. The artifact binds a fixed 4–6 row
+preparation occurs outside evaluation. SeriesNodes::resolve determines structure without channel preparation; the
+artifact descriptor and default slots are independent of the first actual
+instance. The artifact binds a fixed 4–6 row
 layout: public drain, gate, source, bulk and optional local drain/source
 series nodes. A candidate crossing a series-resistance zero requires a new
 artifact and row binding; all other candidate preparation is immutable.
 Current/charge values and Jacobians are in SI units, independent of circuit
-row numbers and accepted/trial history. The caller owns limiting and
-integration.
+row numbers and accepted/trial history. The family owns numerical startup, FET/junction limiting and the additional
+current-prediction convergence check via ABI 4. The caller owns integration,
+trial history, explicit source initialization, and acceptance.
 
 BSIM1's original constant thermal voltage is preserved for channel and
 junction physics; ambient Kelvin is used for thermal noise. Both source
