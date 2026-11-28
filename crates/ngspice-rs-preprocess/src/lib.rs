@@ -343,6 +343,7 @@ struct NativeProjection {
     normalized: MappedNormalization,
     device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
     waveforms: Vec<waveform::PreparedWaveform>,
+    initial_conditions: Option<passive_ic::InitialConditions>,
 }
 
 impl NativeProjection {
@@ -351,6 +352,7 @@ impl NativeProjection {
             normalized: normalize_mapped(bytes, kind, SourceDialect::Native, budget)?,
             device_identities: Vec::new(),
             waveforms: Vec::new(),
+            initial_conditions: None,
         })
     }
 }
@@ -393,10 +395,13 @@ fn project_native(
         .collect::<Result<Vec<_>>>()?;
     let mut mapped = normalized.mapped;
     let waveforms = std::mem::take(&mut mapped.waveforms);
+    let initial_conditions =
+        model_normalize_ngspice::pspice::capture_initialization(&mut mapped, linked, kind, budget)?;
     Ok(NativeProjection {
         normalized: mapped,
         device_identities: identities,
         waveforms,
+        initial_conditions,
     })
 }
 
@@ -544,6 +549,7 @@ fn native_bundle(
         normalized,
         device_identities,
         waveforms,
+        initial_conditions,
     } = projection;
     let lines = normalized
         .input_lines
@@ -584,7 +590,7 @@ fn native_bundle(
         normalization: normalized.model.passes,
         device_identities,
         model_selections: Vec::new(),
-        initial_conditions: None,
+        initial_conditions,
         analysis_plan: None,
         waveforms,
         pwl_resistors: Vec::new(),

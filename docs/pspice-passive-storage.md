@@ -3,7 +3,8 @@
 Source-selected CAP and IND models with nonzero or expression-valued VC1/VC2
 or IL1/IL2 coefficients emit explicit native-engine model families
 `pspice_cap` and `pspice_ind`. They retain the original device name, two
-terminal nodes, positional value, IC and model name. The multiplier and
+terminal nodes, positional value and model name. An explicit device IC is
+retained separately in the typed initialization policy. The multiplier and
 all nonlinear coefficients remain declaration-scoped model parameters;
 temperature attributes follow the existing AKO normalization
 (T_MEASURED -> TNOM, T_ABS -> TEMP, T_REL_GLOBAL -> DTEMP). The engine
@@ -29,8 +30,8 @@ For signed x = V(p)-V(n) or current from p to n, and effective base B:
 S is charge or flux linkage, D its derivative, E stored energy relative to
 zero. Do not substitute D(x)*x for storage; the derivative would be wrong.
 Use S(IC) for initial storage; retain the signed voltage/current as the
-initial coordinate. Capacitors are open at static equilibrium, inductors
-short; AC uses D at the equilibrium (j*omega*D admittance/impedance).
+initial coordinate. Except for an active initialization constraint, capacitors are open at
+static equilibrium and inductors short; AC uses D at the equilibrium (j*omega*D admittance/impedance).
 Transient integration uses differences in S and its exact tangent. Negative
 effective values and zero crossings are retained rather than clamped;
 nonfinite values and raw zero positional values are invalid. No noise
@@ -44,3 +45,29 @@ The engine must register these explicit model families and use its
 physical branch/charge state rather than lower to a behavioral coefficient.
 The typed prepared deck requires that native engine support; legacy C
 ngspice is not an oracle for these source models.
+
+## Device initial conditions
+
+The [Cadence PSpice User's Guide](https://engineering.unt.edu/ee/files/Cadence_PSpice.pdf),
+appendix A, p.582, specifies finite initialization sources for device IC
+properties. For a signed capacitor terminal voltage target V0 and oriented
+inductor current I0, the bias equations are
+
+    i_cap = (V - V0) / 0.002
+    i_ind = I0 + 1e-9 * V
+
+They are active only during the applicable small-signal or transient bias
+calculation, not the DC sweep, AC perturbation, or transient integration.
+The latter uses the integrated physical storage law above. The
+[PSpice Reference Guide](https://rincon-mora.gatech.edu/spice/pspice.pdf),
+.OPTIONS and .IC, documents NOICTRANSLATE and the distinction from a DC
+sweep. NOICTRANSLATE suppresses device bias equations, not skipped-bias
+initial coordinates. SKIPBP is normalized to UIC.
+
+Scalar and polynomial C/L use the same typed declaration keyed by emitted
+artifact, lexical definition and device name; IC expressions are evaluated
+per occurrence. Explicit zero and omission differ: omitted devices have no bias clamp,
+but skipped-bias startup uses zero rather than native node hints. The original
+IC property is not duplicated as a native parser hint. The policy does not
+create permanent helper components. This device-property contract does not
+define the separate PSpice .IC command's node-pair and inductor references.
