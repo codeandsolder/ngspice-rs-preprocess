@@ -1031,8 +1031,29 @@ limits, using cancellation-resistant expressions.
 The native-reference fixtures cover 5,120 quantum oxide, 3,456 threshold and
 4,320 poly-depletion cases, with independent finite-difference gradients.
 Effective geometry uses micrometres and square micrometres for the native
-size-dependent STI and short-device expressions, not centimetres. The final
-coupled intrinsic I/Q evaluation and topology integration remain separate work.
+size-dependent STI and short-device expressions, not centimetres.
+
+### HiSIM-HV coupled enhancement-mode channel
+
+The normal-channel evaluator composes the prepared electrostatic laws,
+source/drain surface solutions, native D1/D2/D3 charge integrals and
+no-inversion cutoff. It solves the drain potential relative to the source
+potential to avoid subtractive cancellation, preserves independent zero-drain
+Jacobian entries, and computes charge partition and conservative normalized
+terminal charges with capacitance width and device multiplicity.
+
+The channel transport law evaluates channel-length modulation, universal
+mobility, velocity saturation and the core drain current Ids0, including
+temperature derivatives. The prepared channel checks instance provenance
+against the transport state. Both native BB polarity defaults and the HV2
+symmetry factor are retained. The independent source-extracted reference
+fixtures cover 1,536 endpoint/integral cases (binary128 bisection and finite
+differences) and 864 channel-length/mobility cases. Composed-device tests
+check both variants and polarities, charge conservation, zero drain current
+and context ownership. These are intrinsic normal-channel results, not yet
+the complete native device: HV2 depletion-mode transport, additional channel
+corrections, parasitic assembly, noise and full circuit-level qualification
+remain separate work.
 
 ## Reference test coverage
 

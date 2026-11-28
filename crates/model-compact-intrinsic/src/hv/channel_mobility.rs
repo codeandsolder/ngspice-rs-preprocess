@@ -1,0 +1,235 @@
+//! Normal-channel HiSIM-HV universal mobility, velocity saturation and Ids0.
+use super::{
+    HiSimHvChannelChargePoint, HiSimHvChannelElectrostaticPoint, HiSimHvChannelModulationPoint,
+    HiSimHvChannelRegion, HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar as Jet,
+    PreparedHiSimHvChannelElectrostatics, PreparedHiSimHvInstance, PreparedHiSimHvModel,
+    PreparedHiSimHvTransport, instance::model_real, instance_real_at, lookup_slot,
+    prepare_hisim_hv_channel_electrostatics,
+};
+use crate::{ModelError, ParameterScope};
+use std::sync::Arc;
+
+const SILICON_PERMITTIVITY: f64 = 1.034_943e-10;
+const ELECTRON_CHARGE: f64 = 1.602_191_8e-19;
+const SMALL: f64 = 1e-25;
+
+/// Geometry-dependent coefficients of the native universal mobility law.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiSimHvChannelMobilityCoefficients {
+    pub depletion_field_factor: f64,
+    pub inversion_field_factor: f64,
+    pub coulomb_mobility: f64,
+    pub coulomb_density_factor: f64,
+    pub phonon_exponent: f64,
+    pub roughness_exponent: f64,
+    pub roughness_mobility: f64,
+    pub velocity_exponent: f64,
+    pub effective_width_m: f64,
+    pub multiplicity: f64,
+}
+
+/// Local temperature-dependent mobility inputs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiSimHvChannelMobilityInputs {
+    pub inverse_thermal_voltage: Jet,
+    pub density_gradient: Jet,
+    pub phonon_coefficient: Jet,
+    pub saturation_velocity_m_per_s: Jet,
+}
+
+/// Intrinsic normal-channel transport before access and leakage terms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiSimHvChannelMobilityPoint {
+    pub transverse_field: Jet,
+    pub universal_mobility_m2_per_vs: Jet,
+    pub longitudinal_field: Jet,
+    pub mobility_m2_per_vs: Jet,
+    /// Normalized Ids0, scaled by the instance multiplicity.
+    pub drain_current_a: Jet,
+}
+
+fn positive_pow(value: Jet, exponent: f64) -> Jet {
+    let power = value.value.powf(exponent);
+    value.map(power, exponent * power / value.value)
+}
+
+fn saturation_factor(ratio: Jet, exponent: f64) -> Jet {
+    // Evaluate (1 + ratio^BB)^(-1/BB) without overflowing ratio^BB.
+    let log_ratio = ratio.ln();
+    if log_ratio.value > 0. {
+        (-log_ratio - (-exponent * log_ratio).exp().ln_1p() / exponent).exp()
+    } else {
+        (-(exponent * log_ratio).exp().ln_1p() / exponent).exp()
+    }
+}
+
+impl HiSimHvChannelMobilityCoefficients {
+    /// Evaluate the native universal mobility, field correction and core current.
+    ///
+    /// The four derivatives are with respect to normalized intrinsic bias and
+    /// local device temperature. Accumulation and the no-inversion region
+    /// bypass transport just as in the original evaluator.
+    /// # Errors
+    /// Nonphysical coefficients or nonfinite transport state.
+    pub fn evaluate(
+        &self,
+        inputs: &HiSimHvChannelMobilityInputs,
+        charge: &HiSimHvChannelChargePoint,
+        modulation: &HiSimHvChannelModulationPoint,
+    ) -> Result<HiSimHvChannelMobilityPoint, ModelError> {
+        let zero = Jet::constant(0.);
+        if matches!(
+            charge.region,
+            HiSimHvChannelRegion::Accumulation | HiSimHvChannelRegion::NoInversion
+        ) {
+            return Ok(HiSimHvChannelMobilityPoint {
+                transverse_field: zero,
+                universal_mobility_m2_per_vs: zero,
+                longitudinal_field: zero,
+                mobility_m2_per_vs: zero,
+                drain_current_a: zero,
+            });
+        }
+        let field = (self.depletion_field_factor * charge.bulk_density
+            + self.inversion_field_factor * charge.inversion_density)
+            / (1. + charge.surface_difference * inputs.density_gradient);
+        let sheet_density = charge.inversion_density / (ELECTRON_CHARGE * 1e15);
+        let coulomb = self.coulomb_mobility + self.coulomb_density_factor * sheet_density;
+        if field.value <= 0.
+            || coulomb.value <= 0.
+            || self.roughness_mobility <= 0.
+            || self.velocity_exponent <= 0.
+            || inputs.saturation_velocity_m_per_s.value <= 0.
+            || inputs.inverse_thermal_voltage.value <= 0.
+            || modulation.effective_length_m.value <= 0.
+        {
+            return Err(ModelError::InvalidPhysicalParameter(
+                "HiSIM-HV channel mobility domain",
+            ));
+        }
+        let inverse_mobility = 1. / coulomb
+            + inputs.phonon_coefficient * positive_pow(field, self.phonon_exponent)
+            + positive_pow(field, self.roughness_exponent) / self.roughness_mobility;
+        let universal = 1. / (1e4 * inverse_mobility);
+        let length = modulation.effective_length_m;
+        let transport_field = charge.drift_diffusion_integral
+            / (inputs.inverse_thermal_voltage * (charge.source_inversion_density + SMALL) * length);
+        let velocity = inputs.saturation_velocity_m_per_s;
+        let floor = 0.2 * velocity / universal;
+        let longitudinal = (transport_field * transport_field + floor * floor).sqrt();
+        let mobility = universal
+            * saturation_factor(universal * longitudinal / velocity, self.velocity_exponent);
+        let current =
+            self.multiplicity * self.effective_width_m * charge.drift_diffusion_integral * mobility
+                / (inputs.inverse_thermal_voltage * length);
+        Ok(HiSimHvChannelMobilityPoint {
+            transverse_field: field.checked("HiSIM-HV transverse field")?,
+            universal_mobility_m2_per_vs: universal.checked("HiSIM-HV universal mobility")?,
+            longitudinal_field: longitudinal.checked("HiSIM-HV longitudinal field")?,
+            mobility_m2_per_vs: mobility.checked("HiSIM-HV field-limited mobility")?,
+            drain_current_a: current.checked("HiSIM-HV core channel current")?,
+        })
+    }
+}
+
+/// Bound normal-channel constitutive evaluator with instance provenance.
+#[derive(Clone, Debug)]
+pub struct PreparedHiSimHvNormalChannel {
+    electrostatics: PreparedHiSimHvChannelElectrostatics,
+    mobility: HiSimHvChannelMobilityCoefficients,
+    identity: Arc<()>,
+}
+
+/// Coupled intrinsic charge and core channel current, excluding parasitics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiSimHvNormalChannelPoint {
+    pub electrostatics: HiSimHvChannelElectrostaticPoint,
+    pub mobility: HiSimHvChannelMobilityPoint,
+}
+
+/// Prepare the native enhancement-mode channel for repeated local evaluation.
+/// # Errors
+/// Invalid prepared model, geometry, or unsupported depletion mode.
+pub fn prepare_hisim_hv_normal_channel(
+    model: &PreparedHiSimHvModel,
+    instance: &PreparedHiSimHvInstance,
+) -> Result<PreparedHiSimHvNormalChannel, ModelError> {
+    let electrostatics = prepare_hisim_hv_channel_electrostatics(model, instance)?;
+    let binned = |name| {
+        let slot = lookup_slot(model.variant(), name)?;
+        instance
+            .binned_model_slot(slot)
+            .ok_or(ModelError::MissingDefaultDependency(slot))
+    };
+    let length = (instance.geometry().gate_length_m * 1e6).powf(model_real(model, "ndeplp")?);
+    let depletion = binned("ndep")? * length
+        / (100. * SILICON_PERMITTIVITY * (length + model_real(model, "ndepl")?));
+    let m_slot = model
+        .variant()
+        .parameter(ParameterScope::Instance, "m")
+        .ok_or_else(|| ModelError::UnknownParameter("m".to_owned()))?
+        .slot;
+    let mobility = HiSimHvChannelMobilityCoefficients {
+        depletion_field_factor: depletion,
+        inversion_field_factor: binned("ninv")? / (100. * SILICON_PERMITTIVITY),
+        coulomb_mobility: binned("muecb0")?,
+        coulomb_density_factor: binned("muecb1")?,
+        phonon_exponent: model_real(model, "mueph0")?,
+        roughness_exponent: instance.transport_geometry().surface_roughness_coefficient,
+        roughness_mobility: binned("muesr1")?,
+        velocity_exponent: model_real(model, "bb")?,
+        effective_width_m: instance.effective_geometry().channel_width_total_m,
+        multiplicity: instance_real_at(instance, m_slot)?,
+    };
+    Ok(PreparedHiSimHvNormalChannel {
+        electrostatics,
+        mobility,
+        identity: Arc::clone(&instance.identity),
+    })
+}
+
+impl PreparedHiSimHvNormalChannel {
+    /// Evaluate core current and terminal charge with one consistent temperature state.
+    /// # Errors
+    /// Mismatched instance or nonphysical local constitutive state.
+    pub fn evaluate(
+        &self,
+        bias: HiSimHvIntrinsicBias,
+        transport: &PreparedHiSimHvTransport,
+    ) -> Result<HiSimHvNormalChannelPoint, ModelError> {
+        if !Arc::ptr_eq(&self.identity, &transport.instance_identity) {
+            return Err(ModelError::MismatchedPreparedContext);
+        }
+        let t = &transport.temperature;
+        let electrostatics = self.electrostatics.evaluate(bias, t)?;
+        let inputs = HiSimHvChannelMobilityInputs {
+            inverse_thermal_voltage: Jet::coordinate(
+                t.inverse_thermal_voltage,
+                3,
+                t.inverse_thermal_voltage_derivative,
+            ),
+            density_gradient: Jet::coordinate(
+                transport.density_gradient_coefficient,
+                3,
+                transport.density_gradient_derivative_per_kelvin,
+            ),
+            phonon_coefficient: Jet::coordinate(
+                transport.phonon_coefficient,
+                3,
+                transport.phonon_coefficient_derivative_per_kelvin,
+            ),
+            saturation_velocity_m_per_s: Jet::coordinate(
+                transport.saturation_velocity_m_per_s,
+                3,
+                transport.saturation_velocity_derivative_m_per_s_kelvin,
+            ),
+        };
+        let mobility =
+            self.mobility
+                .evaluate(&inputs, &electrostatics.charge, &electrostatics.modulation)?;
+        Ok(HiSimHvNormalChannelPoint {
+            electrostatics,
+            mobility,
+        })
+    }
+}

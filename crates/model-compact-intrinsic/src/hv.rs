@@ -4,6 +4,10 @@
 
 mod accumulation;
 mod bias_conditioning;
+mod channel_charge;
+mod channel_electrostatics;
+mod channel_mobility;
+mod channel_modulation;
 mod drain_smoothing;
 mod edge_tunneling;
 mod effective;
@@ -31,6 +35,23 @@ pub use accumulation::{
 pub use bias_conditioning::{
     HiSimHvBiasConditioningInputs, HiSimHvBiasConditioningPoint,
     evaluate_hisim_hv_bias_conditioning,
+};
+pub use channel_charge::{
+    HiSimHvChannelChargeInputs, HiSimHvChannelChargePoint, HiSimHvChannelRegion,
+    evaluate_hisim_hv_channel_charge,
+};
+pub use channel_electrostatics::{
+    HiSimHvChannelElectrostaticPoint, PreparedHiSimHvChannelElectrostatics,
+    prepare_hisim_hv_channel_electrostatics,
+};
+pub use channel_mobility::{
+    HiSimHvChannelMobilityCoefficients, HiSimHvChannelMobilityInputs, HiSimHvChannelMobilityPoint,
+    HiSimHvNormalChannelPoint, PreparedHiSimHvNormalChannel, prepare_hisim_hv_normal_channel,
+};
+pub use channel_modulation::{
+    HiSimHvChannelModulationInputs, HiSimHvChannelModulationPoint, HiSimHvChannelTerminalCharges,
+    PreparedHiSimHvChannelChargeArea, PreparedHiSimHvChannelModulation,
+    prepare_hisim_hv_channel_modulation,
 };
 pub use drain_smoothing::{
     HiSimHvDrainSmoothingInputs, HiSimHvDrainSmoothingPoint, evaluate_hisim_hv_drain_smoothing,
@@ -257,9 +278,9 @@ fn parse_source_rules(source: &'static str) -> Result<Box<[HvRule]>, ModelError>
         }
         parsed.push(parse_rule(line + 1, text)?);
     }
-    if parsed.len() != 772 {
+    if parsed.len() != 773 {
         return Err(ModelError::CorruptSourceCatalog(format!(
-            "HiSIM-HV source rule pool has {} rows, expected 772",
+            "HiSIM-HV source rule pool has {} rows, expected 773",
             parsed.len()
         )));
     }

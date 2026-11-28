@@ -240,3 +240,171 @@ pub fn evaluate_hisim_hv_surface(
         total_root: terms.total.checked("HiSIM-HV surface total")?,
     })
 }
+
+// Polynomial value at x and exact divided difference between x and x+delta.
+// This Horner recurrence does not subtract nearly identical potentials.
+fn polynomial_difference<const N: usize>(
+    x: Differential<N>,
+    delta: Differential<N>,
+    coefficients: &[f64],
+) -> (Differential<N>, Differential<N>) {
+    coefficients.iter().rev().fold(
+        (Differential::constant(0.), Differential::constant(0.)),
+        |(value, difference), coefficient| {
+            (value * x + *coefficient, difference * (x + delta) + value)
+        },
+    )
+}
+
+fn polynomial_charge_difference<const N: usize>(
+    chi: Differential<N>,
+    delta: Differential<N>,
+    base_log: Differential<N>,
+    quasi_fermi: Differential<N>,
+) -> Differential<N> {
+    let next = chi + delta;
+    let (dep, dep_difference) = polynomial_difference(chi, delta, &DEPLETION);
+    let depletion = chi * dep;
+    let depletion_delta = delta * (dep + next * dep_difference);
+    let (inv, inv_difference) = polynomial_difference(chi, delta, &INVERSION);
+    let inversion = chi * chi * chi * inv;
+    let chi_square = chi * chi;
+    let cubic_divided_difference = next * (next + chi) + chi_square;
+    let inversion_delta =
+        delta * (cubic_divided_difference * inv + next * next * next * inv_difference);
+    let negative = -quasi_fermi;
+    let inversion_squared_delta = base_log.exp()
+        * (negative.exp() * inversion_delta * (2. * inversion + inversion_delta)
+            + negative.exp_m1() * inversion * inversion);
+    depletion_delta * (2. * depletion + depletion_delta) + inversion_squared_delta
+}
+
+fn charge_squared_difference<const N: usize>(
+    chi: Differential<N>,
+    delta: Differential<N>,
+    base_log: Differential<N>,
+    quasi_fermi: Differential<N>,
+) -> Differential<N> {
+    if chi.value >= 5. {
+        delta + (base_log + chi).exp() * (delta - quasi_fermi).exp_m1()
+            - base_log.exp() * (-quasi_fermi).exp_m1()
+    } else if chi.value + delta.value < 5. {
+        polynomial_charge_difference(chi, delta, base_log, quasi_fermi)
+    } else {
+        // A branch transition is not a small perturbation of a single
+        // polynomial. Use the actual native values on both sides of it.
+        let source = charge_terms(chi, base_log);
+        let drain = charge_terms(chi + delta, base_log - quasi_fermi);
+        (drain.depletion - source.depletion) * (drain.depletion + source.depletion)
+            + drain.inversion
+            - source.inversion
+    }
+}
+#[derive(Clone, Copy)]
+struct DifferenceEquation<const N: usize> {
+    chi: Differential<N>,
+    beta: Differential<N>,
+    factor: Differential<N>,
+    base_log: Differential<N>,
+    quasi_fermi: Differential<N>,
+}
+impl<const N: usize> DifferenceEquation<N> {
+    fn evaluate(self, delta: Differential<N>) -> Differential<N> {
+        let source = charge_terms(self.chi, self.base_log);
+        let drain = charge_terms(self.chi + delta, self.base_log - self.quasi_fermi);
+        let difference =
+            charge_squared_difference(self.chi, delta, self.base_log, self.quasi_fermi)
+                / (source.total + drain.total);
+        delta / self.beta + self.factor * difference
+    }
+}
+impl DifferenceEquation<4> {
+    fn scalar(self, delta: f64) -> Differential<1> {
+        DifferenceEquation {
+            chi: Differential::constant(self.chi.value),
+            beta: Differential::constant(self.beta.value),
+            factor: Differential::constant(self.factor.value),
+            base_log: Differential::constant(self.base_log.value),
+            quasi_fermi: Differential::constant(self.quasi_fermi.value),
+        }
+        .evaluate(Differential::coordinate(delta, 0, 1.))
+    }
+    fn solve(self) -> Result<Jet, ModelError> {
+        let initial = self.scalar(0.);
+        let mut delta = 0.;
+        if self.quasi_fermi.value > 0. && initial.value < 0. {
+            let mut lower = 0.;
+            let mut upper = self.quasi_fermi.value;
+            delta = (-initial.value / initial.gradient[0]).min(upper);
+            let tolerance = 8. * f64::EPSILON * initial.value.abs();
+            let mut converged = false;
+            for _ in 0..128 {
+                let residual = self.scalar(delta);
+                if residual.value.abs() <= tolerance {
+                    converged = true;
+                    break;
+                }
+                if residual.value > 0. {
+                    upper = delta;
+                } else {
+                    lower = delta;
+                }
+                let candidate = delta - residual.value / residual.gradient[0];
+                delta = if candidate > lower && candidate < upper {
+                    candidate
+                } else {
+                    f64::midpoint(lower, upper)
+                };
+                if !(delta > lower && delta < upper) {
+                    converged = self.scalar(delta).value.abs() <= 64. * tolerance;
+                    break;
+                }
+            }
+            if !converged {
+                return Err(ModelError::InvalidPhysicalParameter(
+                    "HiSIM-HV drain difference convergence",
+                ));
+            }
+        }
+        let residual = self.evaluate(Jet::constant(delta));
+        let slope = self.scalar(delta).gradient[0];
+        Jet {
+            value: delta,
+            gradient: residual.gradient.map(|partial| -partial / slope),
+        }
+        .checked("HiSIM-HV drain potential difference")
+    }
+}
+
+/// Coupled drain endpoint and independently resolved surface difference.
+/// The difference equation subtracts the source Poisson equation algebraically
+/// before solving; it therefore preserves exponentially small drain response.
+pub(super) fn evaluate_drain_from_source(
+    inputs: &HiSimHvSurfaceInputs,
+    source: &HiSimHvSurfacePoint,
+) -> Result<(HiSimHvSurfacePoint, Jet), ModelError> {
+    let beta = inputs.inverse_thermal_voltage;
+    let base_log = inputs.minority_coefficient.ln() + beta * inputs.confined_body;
+    let quasi_fermi = beta * inputs.quasi_fermi;
+    let equation = DifferenceEquation {
+        chi: source.chi,
+        beta,
+        factor: inputs.charge_factor,
+        base_log,
+        quasi_fermi,
+    };
+    let delta = equation.solve()?;
+    let difference = (delta / beta).checked("HiSIM-HV drain surface difference")?;
+    let chi = (source.chi + delta).checked("HiSIM-HV drain chi")?;
+    let terms = charge_terms(chi, base_log - quasi_fermi);
+    Ok((
+        HiSimHvSurfacePoint {
+            potential: (source.potential + difference).checked("HiSIM-HV drain surface")?,
+            chi,
+            depletion_root: terms.depletion.checked("HiSIM-HV drain depletion")?,
+            inversion_squared: terms.inversion.checked("HiSIM-HV drain inversion")?,
+            total_root: terms.total.checked("HiSIM-HV drain total root")?,
+        },
+        difference,
+    ))
+}
