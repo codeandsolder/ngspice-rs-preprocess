@@ -1,4 +1,5 @@
 //! Source-neutral classic Gummel–Poon model identities shared with consumers.
+//!
 //! The thermal law is immutable and independent of transistor polarity,
 //! model parameters, nominal temperature, and instance temperature.
 
@@ -29,7 +30,7 @@ impl ClassicBjtFamily {
     /// Recognize classic polarity and explicit thermal-law aliases.
     /// LEVEL remains a separate physical implementation selector.
     #[must_use = "the recognized family identifies polarity and thermal law"]
-    pub fn parse(name: &str) -> Option<Self> {
+    pub const fn parse(name: &str) -> Option<Self> {
         use BjtPolarity::{Npn, Pnp};
         use BjtThermalConvention::{Legacy, Ngspice};
         let (polarity, thermal) = if name.eq_ignore_ascii_case("NPN") {
