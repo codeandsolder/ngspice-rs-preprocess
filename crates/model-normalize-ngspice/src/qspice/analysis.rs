@@ -125,6 +125,7 @@ pub(super) struct Settings<'a> {
     budget: &'a WorkBudget,
     maximum: Option<Scalar>,
     absolute: Option<bool>,
+    inductor_damping_disabled: bool,
 }
 
 pub(super) fn is_options(name: &[u8]) -> bool {
@@ -148,6 +149,14 @@ const fn timing_option(name: &str) -> bool {
     name.eq_ignore_ascii_case("maxstep") || name.eq_ignore_ascii_case("absolutetime")
 }
 
+const fn damping_option(name: &str) -> bool {
+    name.eq_ignore_ascii_case("lft")
+}
+
+const fn consumed_option(name: &str) -> bool {
+    timing_option(name) || damping_option(name)
+}
+
 fn positive(value: &Scalar, origin: &SourceOrigin, message: &str) -> Result<()> {
     if value.value.is_some_and(|v| v <= 0.0) {
         return Err(reject(origin, Feature::TransientTiming, message));
@@ -156,8 +165,28 @@ fn positive(value: &Scalar, origin: &SourceOrigin, message: &str) -> Result<()> 
 }
 
 impl Settings<'_> {
+    pub(super) const fn inductor_damping_disabled(&self) -> bool {
+        self.inductor_damping_disabled
+    }
+
     fn add(&mut self, parameter: &ModelParameter, origin: &SourceOrigin) -> Result<()> {
-        if parameter.name.eq_ignore_ascii_case("maxstep") {
+        if damping_option(&parameter.name) {
+            let value = parameter
+                .expression
+                .as_deref()
+                .and_then(|raw| literal(raw.as_bytes()));
+            // QSPICE defines zero LFT as disabling the implicit shunt, not
+            // as a short circuit. Positive/symbolic LFT needs the physical
+            // frequency-derived conductance contract, not native .option.
+            if value != Some(0.0) {
+                return Err(reject(
+                    origin,
+                    Feature::PassiveParasitics,
+                    "LFT must be explicitly zero until frequency-derived inductor damping is qualified",
+                ));
+            }
+            self.inductor_damping_disabled = true;
+        } else if parameter.name.eq_ignore_ascii_case("maxstep") {
             let raw = parameter.expression.as_deref().ok_or_else(|| {
                 reject(
                     origin,
@@ -341,7 +370,7 @@ impl Settings<'_> {
         let params = option_fields(&statement.text, first.end)?;
         let removals = params
             .iter()
-            .filter(|parameter| timing_option(&parameter.name))
+            .filter(|parameter| consumed_option(&parameter.name))
             .map(|parameter| {
                 parameter.span.name.start
                     ..parameter
@@ -361,7 +390,7 @@ impl Settings<'_> {
                 input,
                 &[(
                     0..statement.text.len(),
-                    b"* QSPICE timing options consumed".to_vec(),
+                    b"* QSPICE source options consumed".to_vec(),
                 )],
                 edits,
             );
@@ -382,6 +411,7 @@ pub(super) fn collect<'a>(
         budget: declarations.budget(),
         maximum: None,
         absolute: None,
+        inductor_damping_disabled: false,
     };
     let mut first_option = None;
     let mut transient = false;
@@ -416,17 +446,24 @@ pub(super) fn collect<'a>(
             transient = true;
         } else {
             for parameter in option_fields(&statement.text, first.end)? {
-                if !timing_option(&parameter.name) {
+                if !consumed_option(&parameter.name) {
                     continue;
                 }
+                let timing = timing_option(&parameter.name);
                 if !declarations.unconditional_root(statement.line) {
                     return Err(reject(
                         origin,
-                        Feature::TransientTiming,
-                        "conditional or subcircuit timing options need topology binding",
+                        if timing {
+                            Feature::TransientTiming
+                        } else {
+                            Feature::PassiveParasitics
+                        },
+                        "conditional or subcircuit source options need topology binding",
                     ));
                 }
-                first_option.get_or_insert(origin);
+                if timing {
+                    first_option.get_or_insert(origin);
+                }
                 settings.add(&parameter, origin)?;
             }
         }

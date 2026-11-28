@@ -195,6 +195,90 @@ fn reference(dir: &Path, circuit: &str, control: &str) -> Result<Vec<Vec<f64>>> 
 }
 
 #[test]
+fn explicit_global_ideal_inductor_damping_preserves_scope_and_options() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    fs::write(
+        dir.path().join("coil.lib"),
+        ".subckt coil a b Lval=1m\nLw a b {Lval}\n.ends coil\n",
+    )?;
+    fs::write(
+        &root,
+        "Title\n.lib coil.lib\nV1 a 0 AC 1\nX1 a b coil Lval=2m\nR1 b 0 10\n.option GMIN=1n\n+ LFT=0\n.ac lin 3 100 300\n.end\n",
+    )?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    ensure!(!text.to_ascii_lowercase().contains("lft="), "{text}");
+    ensure!(
+        text.contains("GMIN=1n") && text.contains("Lw a b {Lval}"),
+        "{text}"
+    );
+    let rows = reference(
+        dir.path(),
+        "Title\n.lib coil.lib\nV1 a 0 AC 1\nX1 a b coil Lval=2m\nR1 b 0 10\n.option GMIN=1n\n+ LFT=0\n.ac lin 3 100 300\n.end\n",
+        "run\nwrdata witness.dat v(b)",
+    )?;
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let [frequency, real, imaginary] = row.as_slice() else {
+            bail!("invalid AC trace");
+        };
+        let x = std::f64::consts::TAU * frequency * 0.002 / 10.;
+        let denominator = x.mul_add(x, 1.);
+        ensure!((real - 1. / denominator).abs() < 1e-10, "{row:?}");
+        ensure!((imaginary + x / denominator).abs() < 1e-10, "{row:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn damping_option_does_not_override_written_shunt_or_timing_scope() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for options in [
+        ".option LFT=1k",
+        ".option LFT={frequency}",
+        ".option LFT",
+        ".option LFT=-1",
+    ] {
+        fs::write(&root, format!("Title\nL1 a 0 1m\n{options}\n.end\n"))?;
+        let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+            .err()
+            .context("unqualified LFT accepted")?;
+        assert_eq!(
+            error
+                .downcast_ref::<Unsupported>()
+                .context("missing diagnostic")?
+                .feature,
+            Feature::PassiveParasitics
+        );
+    }
+    fs::write(&root, "Title\nL1 a 0 1m Rpar=1k\n.option LFT=0\n.end\n")?;
+    let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+        .err()
+        .context("explicit nonzero shunt was discarded")?;
+    assert_eq!(
+        error
+            .downcast_ref::<Unsupported>()
+            .context("missing diagnostic")?
+            .feature,
+        Feature::PassiveParasitics
+    );
+    fs::write(
+        &root,
+        "Title\nL1 a 0 1m\n.option LFT=0 MAXSTEP=1u\n.tran 1m\n.end\n",
+    )?;
+    let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    ensure!(
+        !text.contains("LFT=") && !text.contains("MAXSTEP="),
+        "{text}"
+    );
+    ensure!(text.contains(".tran 1u 1m 0 1u"), "{text}");
+    Ok(())
+}
+
+#[test]
 fn native_reference_matches_dc_ac_and_transient_laws() -> Result<()> {
     let dir = tempfile::tempdir()?;
     fs::write(

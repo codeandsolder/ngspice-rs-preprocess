@@ -35,8 +35,12 @@ Do not run the placeholder deck as a stand-alone reference.
   diagnosed. External code is never implicitly executed by this adapter.
 - Nonzero or symbolic passive series/shunt parasitics, initial conditions,
   implicit inductor shunt, and nonlinear passive laws require the corresponding
-  native physical contracts. In particular, `R=`, `C=`, `Q=` and
-  `Flux=` are not interchangeable with static positional values.
+  native physical contracts. Explicit root `.option LFT=0` disables the
+  omitted inductor shunt (equivalent to explicit `Rpar=0` only when no
+  shunt was written). Positive or symbolic LFT remains diagnosed until
+  frequency-derived damping is qualified. Do not equate LFT=0 with a
+  zero-ohm shunt. In particular, `R=`, `C=`, `Q=` and `Flux=` are not
+  interchangeable with static positional values.
 - Idealized diode and smooth switch laws require their own model binding.
   QSPICE's nonzero default soft-recovery parameter VP changes the diffusion
   charge law when TT is nonzero. Explicit literal `VP=0` opts into the

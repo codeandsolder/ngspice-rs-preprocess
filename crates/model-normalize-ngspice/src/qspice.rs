@@ -294,6 +294,7 @@ fn lower_passive(
     fields: &[Range<usize>],
     edits: &mut Vec<Edit>,
     input: &[u8],
+    inductor_damping_disabled: bool,
 ) -> Result<()> {
     let text = &statement.text;
     let designator = text[0].to_ascii_lowercase();
@@ -361,11 +362,11 @@ fn lower_passive(
             index += 1;
         }
     }
-    if designator == b'l' && !parallel {
+    if designator == b'l' && !parallel && !inductor_damping_disabled {
         return Err(reject(
             origin,
             Feature::PassiveParasitics,
-            "implicit inductor Rpar depends on analysis; specify Rpar=0 for an ideal inductor",
+            "implicit inductor Rpar depends on analysis; specify Rpar=0 or .option LFT=0 for an ideal inductor",
         ));
     }
     remove_spans(statement, input, &removed, edits);
@@ -506,6 +507,7 @@ fn lower_statement(
     fields: &[Range<usize>],
     edits: &mut Vec<Edit>,
     input: &[u8],
+    inductor_damping_disabled: bool,
 ) -> Result<()> {
     let text = &statement.text;
     let Some(first) = fields.first() else {
@@ -525,7 +527,14 @@ fn lower_statement(
             Feature::Directive,
             "analysis or output directive needs source-specific qualification",
         )),
-        [b'r' | b'l' | b'c', ..] => lower_passive(statement, origin, fields, edits, input),
+        [b'r' | b'l' | b'c', ..] => lower_passive(
+            statement,
+            origin,
+            fields,
+            edits,
+            input,
+            inductor_damping_disabled,
+        ),
         [b'b', ..]
             if fields.get(3..5).is_some_and(|pair| {
                 text[pair[0].clone()].eq_ignore_ascii_case(b"r") && text[pair[1].clone()] == *b"="
@@ -640,8 +649,15 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind, budget: &WorkBudget) 
             continue;
         }
         bindings::rewrite(&statement, origin, &declarations, &fields, &mut edits, body)?;
-        lower_statement(&statement, origin, &fields, &mut edits, body)
-            .with_context(|| format!("QSPICE source {}:{}", origin.path.display(), origin.line))?;
+        lower_statement(
+            &statement,
+            origin,
+            &fields,
+            &mut edits,
+            body,
+            settings.inductor_damping_disabled(),
+        )
+        .with_context(|| format!("QSPICE source {}:{}", origin.path.display(), origin.line))?;
     }
     let final_body = apply_budgeted_edits(body, edits, budget)?.or(lowered);
     if let Some(body) = &final_body {
