@@ -4,6 +4,9 @@
 //! Series resistance determines topology at artifact construction; a candidate
 //! changing that topology requires a fresh descriptor and circuit binding.
 
+/// Prepared Fowler–Nordheim source family.
+pub mod fowler_nordheim;
+
 use std::sync::Arc;
 
 use model_kernel_api::{
