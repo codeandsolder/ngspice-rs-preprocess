@@ -46,6 +46,7 @@ pub struct GuardTrace {
 
 impl GuardTrace {
     /// Executed sites from the last successful evaluation.
+    #[must_use = "executed guards determine physical branch localization"]
     pub fn records(&self) -> &[Guard] {
         &self.guards
     }
@@ -69,7 +70,7 @@ impl GuardTrace {
         Ok(())
     }
 
-    fn push(&mut self, guard: Guard) {
+    fn push(&mut self, guard: &Guard) {
         if self.error.is_some() {
             return;
         }
@@ -80,7 +81,7 @@ impl GuardTrace {
         } else if self.guards.try_reserve(1).is_err() {
             self.error = Some(Error::Allocation);
         } else {
-            self.guards.push(guard);
+            self.guards.push(*guard);
         }
     }
 }
@@ -90,6 +91,7 @@ impl GuardTrace {
 pub struct GuardRecorder<'a>(Option<&'a mut GuardTrace>);
 
 impl<'a> GuardRecorder<'a> {
+    #[must_use = "the recorder selects constitutive branches without retaining a trace"]
     pub const fn disabled() -> Self {
         Self(None)
     }
@@ -110,7 +112,7 @@ impl<'a> GuardRecorder<'a> {
     ) -> bool {
         let selected = predicate.selected(lhs.compare_to(rhs));
         if active && let Some(trace) = self.0.as_deref_mut() {
-            trace.push(Guard {
+            trace.push(&Guard {
                 site,
                 predicate,
                 selected,

@@ -210,11 +210,19 @@ impl<K: Kernel> Artifact<K> {
         for degree in 0..=input.order {
             out.point(shape, degree).reset(descriptor.charge);
         }
-        self.kernel.evaluate_taylor(data, input, out)?;
-        out.guards.validate(input.order)?;
-        for degree in 0..=input.order {
-            out.point(shape, degree).validate(descriptor)?;
+        let result = self
+            .kernel
+            .evaluate_taylor(data, input, out)
+            .and_then(|()| {
+                out.guards.validate(input.order)?;
+                for degree in 0..=input.order {
+                    out.point(shape, degree).validate(descriptor)?;
+                }
+                Ok(())
+            });
+        if result.is_err() {
+            out.guards.reset();
         }
-        Ok(())
+        result
     }
 }

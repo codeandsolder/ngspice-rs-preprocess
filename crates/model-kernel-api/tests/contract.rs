@@ -389,6 +389,8 @@ enum TaylorWitness {
     GuardInvalid,
     GuardOrder,
     GuardLimit,
+    GuardUnbalanced,
+    GuardKernelError,
 }
 
 impl Kernel for TaylorWitness {
@@ -420,7 +422,10 @@ impl Kernel for TaylorWitness {
                 out.charge[3] = 1.;
                 out.charge[4] = -1.;
             }
-            Self::GuardValid | Self::GuardDuplicate => {
+            Self::GuardValid
+            | Self::GuardDuplicate
+            | Self::GuardUnbalanced
+            | Self::GuardKernelError => {
                 use model_kernel_api::taylor::{GuardPredicate, GuardRecorder};
                 let mut recorder = GuardRecorder::new(out.guards);
                 let lhs = input.coordinate(3, 0)?;
@@ -429,6 +434,12 @@ impl Kernel for TaylorWitness {
                 recorder.select(8, GuardPredicate::Greater, lhs, rhs, false);
                 if matches!(self, Self::GuardDuplicate) {
                     recorder.select(7, GuardPredicate::Greater, lhs, rhs, true);
+                }
+                if matches!(self, Self::GuardUnbalanced) {
+                    out.current[3] = 1.;
+                }
+                if matches!(self, Self::GuardKernelError) {
+                    return Err(Error::Domain("witness kernel failure".into()));
                 }
             }
             Self::GuardInvalid => {
@@ -485,13 +496,18 @@ fn physical_taylor_checks_every_degree_and_known_zero_charge() -> Result<()> {
         TaylorWitness::GuardInvalid,
         TaylorWitness::GuardOrder,
         TaylorWitness::GuardLimit,
+        TaylorWitness::GuardUnbalanced,
+        TaylorWitness::GuardKernelError,
     ] {
         let expected = match witness {
             TaylorWitness::Valid | TaylorWitness::GuardValid => Ok(()),
             TaylorWitness::Incomplete => Err(Error::Domain(
                 "incomplete static residual or Jacobian".into(),
             )),
-            TaylorWitness::Unbalanced | TaylorWitness::Gauge => Err(Error::Conservation),
+            TaylorWitness::Unbalanced | TaylorWitness::Gauge | TaylorWitness::GuardUnbalanced => {
+                Err(Error::Conservation)
+            }
+            TaylorWitness::GuardKernelError => Err(Error::Domain("witness kernel failure".into())),
             TaylorWitness::Storage => Err(Error::Domain("nonzero declared-zero storage".into())),
             TaylorWitness::GuardDuplicate => Err(Error::Schema("duplicate physical guard site")),
             TaylorWitness::GuardInvalid | TaylorWitness::GuardOrder => {
@@ -505,6 +521,9 @@ fn physical_taylor_checks_every_degree_and_known_zero_charge() -> Result<()> {
         let a = Artifact::new(d, witness)?;
         let p = a.prepare(&[2.], 300.)?;
         assert_eq!(a.evaluate_taylor(&p, input, &mut buffer.point()), expected);
+        if expected.is_err() {
+            assert!(buffer.point().guards.records().is_empty());
+        }
     }
     Ok(())
 }

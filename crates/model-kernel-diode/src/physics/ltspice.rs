@@ -218,7 +218,10 @@ impl PreparedBranch {
         let forward_tail = if model.transport.saturation_current > 0.
             || (model.recombination.saturation_current > 0. && model.recombination.emission > 0.)
         {
-            Some(Tail::find(|v| law.forward(v, &mut super::GuardRecorder::disabled()), 1.)?)
+            Some(Tail::find(
+                |v| law.forward(v, &mut super::GuardRecorder::disabled()),
+                1.,
+            )?)
         } else {
             None
         };
@@ -334,7 +337,10 @@ impl PreparedBranch {
         let f = self
             .forward_tail
             .and_then(|tail| tail.evaluate(local))
-            .unwrap_or_else(|| self.law.forward(local, &mut super::GuardRecorder::disabled()));
+            .unwrap_or_else(|| {
+                self.law
+                    .forward(local, &mut super::GuardRecorder::disabled())
+            });
         let r = self
             .reverse_tail
             .and_then(|tail| tail.evaluate(local))
@@ -343,7 +349,10 @@ impl PreparedBranch {
         let current = self.floor.mul_add(local, physical);
         let conductance =
             (f.derivative + r.derivative).mul_add(self.factor, self.floor) / self.series_count;
-        let depletion = self.law.depletion.evaluate(local, &mut super::GuardRecorder::disabled());
+        let depletion = self
+            .law
+            .depletion
+            .evaluate(local, &mut super::GuardRecorder::disabled());
         let depletion_charge = self.factor * depletion.value;
         let depletion_capacitance = self.factor * depletion.derivative / self.series_count;
         let diffusion_charge = self.transit_time * current;

@@ -7,7 +7,7 @@ use model_kernel_api::taylor::{GuardPredicate, GuardRecorder, arithmetic::Scalar
 
 /// Computes XBV at the current temperature, including dXBV/dT for an exact
 /// thermal Jacobian. The limiter/bypass policy remains the solver's decision.
-pub(super) fn effective_voltage<S: Scalar>(
+pub fn effective_voltage<S: Scalar>(
     parameters: Breakdown,
     saturation_current: Jet<S>,
     thermal_voltage: Jet<S>,
@@ -137,7 +137,7 @@ fn solve_log_root(delta: f64, nbv: f64) -> Result<f64, ModelError> {
     }
     for _ in 0..128 {
         let mid = f64::midpoint(low, high);
-        if mid == low || mid == high {
+        if mid <= low || mid >= high {
             break;
         }
         if f(mid) >= 0. {
