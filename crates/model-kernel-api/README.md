@@ -80,3 +80,7 @@ ABI 5 adds explicit physical Taylor capability, normalized coefficient-major
 F/Q/G/C arrays, and direct evaluation of existing prepared tile lanes. See
 [prepared Taylor evaluation](../../docs/prepared-taylor.md) for the numerical
 contract and supported constitutive kernels.
+
+ABI 6 extends the physical Taylor output with bounded executed constitutive
+guards. The producer selects and reports the same physical branch; the
+consumer owns event localization. See [prepared Taylor contract](../../docs/prepared-taylor.md).

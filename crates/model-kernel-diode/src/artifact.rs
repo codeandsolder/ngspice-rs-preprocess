@@ -290,7 +290,12 @@ impl Kernel for DiodeKernel {
         let width = if self.series { 3 } else { 2 };
         let intrinsic = self.junction_anode();
         let voltage = input.coordinate(width, intrinsic)? - input.coordinate(width, 1)?;
-        let evaluation = prepared.evaluate_physical(voltage).map_err(domain)?;
+        let evaluation = prepared
+            .evaluate_physical(
+                voltage,
+                &mut model_kernel_api::taylor::GuardRecorder::new(out.guards),
+            )
+            .map_err(domain)?;
         let series = if self.series {
             let conductance = series_conductance(prepared)?;
             Some((

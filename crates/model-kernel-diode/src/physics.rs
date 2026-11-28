@@ -4,8 +4,11 @@ use super::{
     BOLTZMANN, ELEMENTARY_CHARGE, Instance, Junction, K_OVER_Q, Model, ModelError, Noise, finite,
     nonnegative, positive,
 };
-use model_kernel_api::taylor::arithmetic::Scalar;
+use model_kernel_api::taylor::{GuardPredicate, GuardRecorder, arithmetic::Scalar};
 use std::cmp::Ordering;
+
+const HIGH_INJECTION: u16 = 0;
+const DEPLETION_CONTINUATION: u16 = 1;
 
 #[derive(Clone, Copy, Debug)]
 struct Slope<S> {
@@ -77,9 +80,7 @@ impl ExponentialJunction {
             let raw = scaled_exponential
                 .offset(-self.saturation)
                 .with_value(raw_value);
-            if let Some(knee) = knee
-                && raw.compare(0.) == Some(Ordering::Greater)
-            {
+            if let Some(knee) = knee {
                 let ratio = raw / S::constant(knee);
                 if ratio.is_finite() {
                     let denominator = ratio.offset(1.0);
@@ -219,11 +220,17 @@ impl Depletion {
         }
     }
 
-    fn evaluate<S: Scalar>(self, voltage: S) -> Slope<S> {
+    fn evaluate<S: Scalar>(self, voltage: S, guards: &mut GuardRecorder<'_>) -> Slope<S> {
         if self.capacitance == 0.0 {
             return Slope::zero();
         }
-        if voltage.compare(self.threshold) == Some(Ordering::Less) {
+        if guards.select(
+            DEPLETION_CONTINUATION,
+            GuardPredicate::Less,
+            voltage,
+            S::constant(self.threshold),
+            self.grading != 0.,
+        ) {
             return self.below_threshold(voltage);
         }
         let delta = voltage.offset(-self.threshold);
@@ -436,11 +443,24 @@ impl PreparedInstance {
     pub(crate) fn evaluate_physical<S: Scalar>(
         &self,
         voltage: S,
+        guards: &mut GuardRecorder<'_>,
     ) -> Result<JunctionEvaluation<S>, ModelError> {
         if !voltage.is_finite() {
             return Err(ModelError::Invalid("junction voltage"));
         }
-        let transport = self.transport.evaluate(voltage, self.high_injection);
+        // The high-injection law is enabled on the positive-current side.
+        // Its physical surface is junction voltage zero, even when the
+        // scalar saturation current or raw current rounds to zero.
+        let knee = self.high_injection.filter(|_| {
+            guards.select(
+                HIGH_INJECTION,
+                GuardPredicate::Greater,
+                voltage,
+                S::constant(0.),
+                self.transport.log_saturation != f64::NEG_INFINITY,
+            )
+        });
+        let transport = self.transport.evaluate(voltage, knee);
         let recombination = self.evaluate_recombination(voltage);
         let mut physical = Slope {
             value: transport.value + recombination.value,
@@ -453,7 +473,7 @@ impl PreparedInstance {
                 physical.derivative = physical.derivative + term.derivative;
             }
         }
-        let depletion = self.depletion.evaluate(voltage);
+        let depletion = self.depletion.evaluate(voltage, guards);
         let result = JunctionEvaluation {
             current: S::constant(self.gmin).mul_add(voltage, physical.value),
             conductance: physical.derivative.offset(self.gmin),
@@ -485,7 +505,7 @@ impl PreparedInstance {
     /// # Errors
     /// A nonfinite voltage or nonrepresentable result is rejected.
     pub fn evaluate(&self, voltage: f64) -> Result<Evaluation, ModelError> {
-        let value = self.evaluate_physical(voltage)?;
+        let value = self.evaluate_physical(voltage, &mut GuardRecorder::disabled())?;
         Ok(Evaluation {
             current: value.current,
             conductance: value.conductance,

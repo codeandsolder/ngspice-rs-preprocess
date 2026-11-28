@@ -2,26 +2,35 @@
 //! The matching equation is from `vdmostemp.c`, with a convergent root solve
 //! rather than its fixed 25-iteration approximation.
 
-use super::{Breakdown, Jet, ModelError};
+use super::{AVALANCHE_MATCH, Breakdown, Jet, ModelError};
+use model_kernel_api::taylor::{GuardPredicate, GuardRecorder, arithmetic::Scalar};
 
 /// Computes XBV at the current temperature, including dXBV/dT for an exact
 /// thermal Jacobian. The limiter/bypass policy remains the solver's decision.
-pub fn effective_voltage<S: model_kernel_api::taylor::arithmetic::Scalar>(
+pub(super) fn effective_voltage<S: Scalar>(
     parameters: Breakdown,
     saturation_current: Jet<S>,
     thermal_voltage: Jet<S>,
+    guards: &mut GuardRecorder<'_>,
 ) -> Result<Jet<S>, ModelError> {
     let bv = parameters.bv.abs();
     let cbv = parameters.ibv;
     // This is ngspice 47's no-shift case when the requested breakdown
     // current is below the reverse-region current at BV.
-    if (saturation_current.v.scale(bv) / thermal_voltage.v).compare(cbv)
-        != Some(std::cmp::Ordering::Less)
-    {
+    let reverse = saturation_current * bv / thermal_voltage;
+    if !guards.select(
+        AVALANCHE_MATCH,
+        GuardPredicate::Less,
+        reverse.v,
+        S::constant(cbv),
+        cbv != 0.,
+    ) {
         return Ok(Jet::constant(bv));
     }
-    // y = log(B + NBV*y), with B = 1 + IBV/Is - BV/Vt.
-    let b = 1.0 + cbv / saturation_current - bv / thermal_voltage;
+    // y = log(B + NBV*y). Factor the same comparison surface into
+    // B = 1 + (IBV - Is*BV/Vt)/Is: at an exact matching boundary
+    // B is exactly one, without subtracting independently rounded ratios.
+    let b = 1.0 + (cbv - reverse) / saturation_current;
     if !b.v.is_finite() || b.v.value() < 1.0 {
         return Err(ModelError::Invalid("avalanche matching domain"));
     }
@@ -62,6 +71,9 @@ pub fn effective_voltage<S: model_kernel_api::taylor::arithmetic::Scalar>(
 }
 
 fn solve_log_root(b: f64, nbv: f64) -> Result<f64, ModelError> {
+    if b == 1. && nbv <= 1. {
+        return Ok(0.);
+    }
     let f = |y: f64| y - b.mul_add(1.0, nbv * y).ln();
     let mut y = b.ln().max(1e-10);
     for _ in 0..24 {
