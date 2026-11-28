@@ -390,7 +390,11 @@ fn linked_ltspice_analysis_is_extracted_with_occurrence_and_bound_axes() -> Resu
         anyhow::bail!("missing continuation sweep");
     };
     assert_eq!(axes[0].execution, SweepExecution::Continuation);
-    assert_eq!(plan.entries[4].statement, ".meas tran scaled PARAM vmax*2");
+    let Directive::Measurement { intent } = &plan.entries[4].directive else {
+        anyhow::bail!("missing source measurement");
+    };
+    assert_eq!(intent.operation, MeasurementOperation::Parameter);
+    assert_eq!(intent.expression, "vmax*2");
     let budget = WorkBudget::default();
     let sweeps = plan.bind_independent_sweeps(
         |_, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
