@@ -59,6 +59,8 @@ pub trait Scalar:
     #[must_use = "scalar operations return a new value"]
     fn exprel_slope(self) -> Self;
     fn degree(self) -> usize;
+    /// Capture the exact normalized germ without re-evaluating the law.
+    fn into_series(self) -> Series;
     #[must_use = "scalar operations return a new value"]
     fn with_value(self, value: f64) -> Self;
 
@@ -165,6 +167,9 @@ impl Scalar for f64 {
     }
     fn degree(self) -> usize {
         0
+    }
+    fn into_series(self) -> Series {
+        Series::constant_value(self)
     }
     fn with_value(self, value: f64) -> Self {
         value
@@ -567,6 +572,9 @@ impl Scalar for Series {
         } else {
             (self.exp() - self.exprel()) / self
         }
+    }
+    fn into_series(self) -> Series {
+        self
     }
     fn degree(self) -> usize {
         self.order

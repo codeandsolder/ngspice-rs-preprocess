@@ -444,3 +444,83 @@ fn scaled_exponential_series_avoids_unscaled_overflow() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn physical_guards_follow_intrinsic_voltage_and_selected_charge_germ() -> Result<()> {
+    use model_kernel_api::{
+        batch::PreparedTile,
+        taylor::{GuardPredicate, TaylorBuffer, TaylorInput},
+    };
+    // The series branch has no constitutive join; both surfaces depend on
+    // intrinsic, not external, voltage. Check the exact branch and the next
+    // constitutive coefficients at zero and the depletion continuation.
+    for resistance in [0., 0.5] {
+        let model = compile_simetrix([
+            ("IS", 1e-12),
+            ("IKF", 1e-3),
+            ("CJO", 20e-12),
+            ("VJ", 0.8),
+            ("M", 0.4),
+            ("FC", 0.5),
+            ("RS", resistance),
+        ])?;
+        let a = artifact(model, Instance::default(), [13; 16])?;
+        let p = a.prepare(&[1., 1., 0., 0.], 300.15)?;
+        let tile = PreparedTile::new(&a, &[(&[1., 1., 0., 0.], 300.15)])?;
+        let width = a.descriptor().equations.len();
+        let anode = if width == 3 { 2 } else { 0 };
+        let mut buffer = TaylorBuffer::new(width, 3)?;
+        for (bias, site) in [(0., 0), (0.4, 1)] {
+            for slope in [-0.03, 0., 0.03] {
+                let mut x = vec![0.; width * 4];
+                x[anode] = bias;
+                x[width + anode] = slope;
+                if width == 3 {
+                    x[0] = 2.;
+                    x[width] = -0.5;
+                }
+                let input = TaylorInput {
+                    order: 3,
+                    coefficients: &x,
+                };
+                let verify = |out: &mut TaylorBuffer| {
+                    let point = out.point();
+                    let guards = point.guards.records();
+                    assert_eq!(guards.len(), 2);
+                    let guard = guards.iter().find(|guard| guard.site == site).unwrap();
+                    let predicate = if site == 0 {
+                        GuardPredicate::Greater
+                    } else {
+                        GuardPredicate::Less
+                    };
+                    assert_eq!(guard.predicate, predicate);
+                    assert_eq!(
+                        guard.selected,
+                        if site == 0 { slope > 0. } else { slope < 0. }
+                    );
+                    assert_eq!(guard.surface.coefficient(0).to_bits(), 0_f64.to_bits());
+                    assert_eq!(guard.surface.coefficient(1).to_bits(), slope.to_bits());
+                };
+                a.evaluate_taylor(&p, input, &mut buffer.point())?;
+                verify(&mut buffer);
+                tile.evaluate_lane_taylor(0, input, &mut buffer.point())?;
+                verify(&mut buffer);
+            }
+        }
+    }
+    // A linear depletion charge (M=0) and disabled IKF have no physical joins.
+    let model = compile_simetrix([("IS", 1e-12), ("CJO", 20e-12), ("M", 0.)])?;
+    let a = artifact(model, Instance::default(), [14; 16])?;
+    let p = a.prepare(&[1., 1., 0., 0.], 300.15)?;
+    let mut buffer = TaylorBuffer::new(2, 1)?;
+    a.evaluate_taylor(
+        &p,
+        TaylorInput {
+            order: 1,
+            coefficients: &[0., 0., 1., 0.],
+        },
+        &mut buffer.point(),
+    )?;
+    assert!(buffer.point().guards.records().is_empty());
+    Ok(())
+}

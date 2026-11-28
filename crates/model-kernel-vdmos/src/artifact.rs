@@ -607,7 +607,10 @@ impl Kernel for VdmosKernel {
         let point = self.operating_point(prepared, &coordinates[..width])?;
         let evaluation = self
             .device(prepared)
-            .evaluate_physical(point.bias)
+            .evaluate_physical(
+                point.bias,
+                &mut model_kernel_api::taylor::GuardRecorder::new(out.guards),
+            )
             .map_err(|error| Error::Domain(error.to_string()))?;
         out.current.fill(0.);
         out.charge.fill(0.);

@@ -16,7 +16,7 @@ pub mod taylor;
 pub mod trial;
 
 /// Interface revision, independent of any model-family revision.
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 /// A missing contribution is not a known physical zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
