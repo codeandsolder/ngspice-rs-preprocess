@@ -281,7 +281,6 @@ dependencies = [
  "model-preprocess-simplis",
  "model-statistics",
  "serde",
- "serde_json",
  "tempfile",
 ]
 
