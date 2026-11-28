@@ -1,7 +1,8 @@
-"""Native HiSIM-HV2 depletion source endpoint oracle, before postsolve charge smoothing.
+"""Native HiSIM-HV2 depletion source endpoint oracle, including postsolve charge smoothing.
 
 Extract the original coupled Poisson iteration and initialization from ngspice 47.
 """
+from decimal import Decimal, localcontext
 from pathlib import Path
 from itertools import product
 import math
@@ -47,6 +48,21 @@ int main(void) {{
 }}
 """
 
+def stable_transport(beta, doping, surface, fermi="0"):
+    """Independent 80-digit evaluation of the native soft floor and Poisson charge."""
+    with localcontext() as ctx:
+        ctx.prec = 80
+        beta, doping, surface, fermi = map(Decimal, map(str, (beta, doping, surface, fermi)))
+        delta = Decimal("0.06")
+        potential = surface - fermi
+        if potential < delta:
+            ratio = (delta - potential) / delta
+            potential = delta * (1 - ratio / (1 + ratio**4)**(Decimal(1)/4))
+        chi = beta * potential
+        poisson = (2 * Decimal("1.034943e-10") * Decimal("1.6021918e-19") * doping / beta).sqrt()
+        return -poisson * (chi.exp() - 1 - chi).sqrt()
+
+
 def main():
     root, output=Path(sys.argv[1]), Path(sys.argv[2])
     cases=list(product((-8.,-4.,-2.,-1.,-.3,0.,.3,1.,3.,8.),(-.1,-.8,-3.),(27.,38.,44.),(.0015,.004),
@@ -60,11 +76,12 @@ def main():
         assert len(rows)==len(cases)
         valid=0
         with output.open("w") as f:
-            f.write("# gate body beta cox depletion_doping substrate_doping ni thickness native_mode surface buried junction surface_charge buried_charge substrate_charge accumulation_charge substrate_inversion surface_depletion residual_carrier back_carrier transport_carrier smoothing_charge\n")
+            f.write("# gate body beta cox depletion_doping substrate_doping ni thickness native_mode surface buried junction surface_charge buried_charge substrate_charge accumulation_charge substrate_inversion surface_depletion residual_carrier back_carrier transport_carrier smoothing_charge stable_transport_carrier\n")
             for case,row in zip(cases,rows):
                 words=row.split()
                 if words[0]!="1" or not all(math.isfinite(float(x)) for x in words): continue
                 valid+=1
-                f.write(" ".join(map(str,case))+" "+" ".join(words[1:])+"\n")
+                precise = stable_transport(case[2], case[4], words[2])
+                f.write(" ".join(map(str,case))+" "+" ".join(words[1:])+f" {precise:.20g}\n")
         print(f"{valid}/{len(cases)} native converged cases")
 if __name__=="__main__":main()

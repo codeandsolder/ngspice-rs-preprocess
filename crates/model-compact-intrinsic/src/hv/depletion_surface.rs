@@ -353,20 +353,22 @@ impl State {
         if rb.value.abs() > 1e-9 || rs.value.abs() > 1e-7 {
             return Err(ERR);
         }
-        let (a, c, d, e) = (
+        let (buried_surface, buried_buried, charge_surface, charge_buried) = (
             rb.gradient[4],
             rb.gradient[5],
             rs.gradient[4],
             rs.gradient[5],
         );
-        let determinant = a.mul_add(e, -c * d);
+        let determinant = buried_surface.mul_add(charge_buried, -buried_buried * charge_surface);
         let mut surface = Local::constant(surface_value);
         let mut buried = Local::constant(buried_value);
         for axis in 0..4 {
-            surface.gradient[axis] =
-                c.mul_add(rs.gradient[axis], -e * rb.gradient[axis]) / determinant;
-            buried.gradient[axis] =
-                d.mul_add(rb.gradient[axis], -a * rs.gradient[axis]) / determinant;
+            surface.gradient[axis] = buried_buried
+                .mul_add(rs.gradient[axis], -charge_buried * rb.gradient[axis])
+                / determinant;
+            buried.gradient[axis] = charge_surface
+                .mul_add(rb.gradient[axis], -buried_surface * rs.gradient[axis])
+                / determinant;
         }
         let q = self.charges(surface, buried);
         Ok(HiSimHvDepletionSurfacePoint {
@@ -396,7 +398,7 @@ fn solve(
     mut f: impl FnMut(f64) -> (f64, f64),
 ) -> Result<f64, ModelError> {
     let mut x = f64::midpoint(lo, hi);
-    for _ in 0..128 {
+    for iteration in 0..192 {
         let (residual, slope) = f(x);
         if residual.is_nan() {
             return Err(ERR);
@@ -413,7 +415,10 @@ fn solve(
             return Ok(f64::midpoint(lo, hi));
         }
         let candidate = x - residual / slope;
-        x = if candidate > lo
+        // At high field the exponential tail gives small Newton steps
+        // even far from the root. Force regular bracket contraction.
+        x = if iteration % 3 != 2
+            && candidate > lo
             && candidate < hi
             && (candidate - x).abs() > CONVERGENCE * x.abs().max(1.)
         {

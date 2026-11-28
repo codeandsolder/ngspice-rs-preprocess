@@ -175,7 +175,32 @@ fn native_depletion_endpoint() -> TestResult {
         };
         for (i, p) in endpoint_outputs(p).into_iter().enumerate() {
             let expected = row[9 + i];
-            let tol = 2e-8 * expected.abs().max(p.value.abs()) + if i < 3 { 2e-10 } else { 2e-12 };
+            let mut tol =
+                2e-8 * expected.abs().max(p.value.abs()) + if i < 3 { 2e-10 } else { 2e-12 };
+            if i == 11 {
+                let precise = row[22];
+                let precise_tol = 2e-8 * precise.abs().max(p.value.abs()) + 2e-12;
+                assert!(
+                    (p.value - precise).abs() <= precise_tol,
+                    "row {index}: extended precision transport {precise:e}, Rust {:e}",
+                    p.value
+                );
+                // Native computes exp(chi)-1-chi directly. Near zero, the
+                // cancellation loses the quadratic remainder. Bound the
+                // absolute error in the squared sheet charge, then convert
+                // it to a charge error using the difference of squares.
+                let poisson_squared =
+                    2. * 1.034_943e-10 * 1.602_191_8e-19 * parameters[4] / parameters[2];
+                if precise.abs() < 1e-3 * poisson_squared.sqrt() {
+                    let sum = expected.abs() + precise.abs();
+                    let squared_roundoff = 2. * f64::EPSILON * poisson_squared;
+                    tol += if sum > squared_roundoff.sqrt() {
+                        squared_roundoff / sum
+                    } else {
+                        squared_roundoff.sqrt()
+                    };
+                }
+            }
             let error = (p.value - expected).abs();
             if error > tol {
                 failures[i] += 1;
