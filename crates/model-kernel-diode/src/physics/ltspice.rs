@@ -30,7 +30,8 @@ const MAX_CONDUCTANCE: f64 = 1e12;
 pub struct Sidewall {
     /// Default perimeter.
     pub perimeter: f64,
-    /// Sidewall saturation current and emission coefficient.
+    /// Sidewall saturation current and emission coefficient. A nonpositive
+    /// emission coefficient inherits the original (unclamped) bulk N.
     pub transport: Junction,
     /// Sidewall series resistance.
     pub resistance: f64,
@@ -50,7 +51,7 @@ impl Default for Sidewall {
             perimeter: 0.,
             transport: Junction {
                 saturation_current: 0.,
-                emission: 1.,
+                emission: 0.,
             },
             resistance: 0.,
             capacitance: 0.,
@@ -259,6 +260,19 @@ impl PreparedBranch {
         let source = model.sidewall;
         let mut side = model.bulk;
         side.transport = source.transport;
+        // A zero inherited N has no conducting sidewall at or below nominal
+        // saturation scaling. Positive scaling gives a nonfinite vendor law.
+        if side.transport.emission == 0. {
+            if side.transport.saturation_current > 0.
+                && saturation_exponent(&side, instance.temperature, K_OVER_Q) > 0.
+            {
+                return Err(ModelError::Invalid(
+                    "LTspice zero sidewall emission at positive saturation scaling",
+                ));
+            }
+            side.transport.saturation_current = 0.;
+            side.transport.emission = 1.;
+        }
         side.recombination.saturation_current = 0.;
         side.high_injection = None;
         side.breakdown = None;
@@ -273,11 +287,12 @@ impl PreparedBranch {
         // LTspice uses the sidewall emission coefficient NS in the thermal
         // capacitance numerator, but MJSW in the nominal normalization.
         let law = prepare_law(&side, instance, factor, source.transport.emission)?;
-        let forward_tail = if source.transport.saturation_current > 0. {
-            Some(Tail::sidewall(law.transport)?)
-        } else {
-            None
-        };
+        let forward_tail =
+            if side.transport.saturation_current > 0. && source.transport.emission > 0. {
+                Some(Tail::sidewall(law.transport)?)
+            } else {
+                None
+            };
         let resistance = source.resistance * instance.series / factor;
         finite("LTspice sidewall resistance", &[resistance])?;
         Ok(Self {
@@ -287,14 +302,13 @@ impl PreparedBranch {
             // Sidewall geometry is part of the unscaled law and ceiling.
             factor: 1.,
             series_count: instance.series,
-            floor: if source.transport.saturation_current > 0. {
+            floor: if side.transport.saturation_current > 0. {
                 instance.gmin * instance.multiplier
             } else {
                 0.
             },
             resistance,
-            // The sidewall has depletion storage, but no bulk TT diffusion.
-            transit_time: 0.,
+            transit_time: model.bulk.transit_time,
             temperature: instance.temperature,
             shot_offset: 0.,
         })
@@ -476,6 +490,9 @@ impl SourceModel {
         )?;
         positive("LTspice nominal temperature", model.temperature.nominal)?;
         model.transport.saturation_current = model.transport.saturation_current.max(0.);
+        if self.sidewall.transport.emission <= 0. {
+            self.sidewall.transport.emission = model.transport.emission;
+        }
         model.transport.emission = model.transport.emission.max(0.1);
         model.recombination.saturation_current = model.recombination.saturation_current.max(0.);
         if model.recombination.saturation_current == 0. {
@@ -530,9 +547,6 @@ impl SourceModel {
         )?;
         self.sidewall.transport.saturation_current =
             self.sidewall.transport.saturation_current.max(0.);
-        if self.sidewall.transport.emission <= 0. {
-            self.sidewall.transport.emission = 1.;
-        }
         if let Some(v) = self.sidewall.potential {
             finite("LTspice VJSW", &[v])?;
             positive("LTspice VJSW", v)?;

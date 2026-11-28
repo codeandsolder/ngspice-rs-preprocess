@@ -61,12 +61,29 @@ fn dc_rows(cases: &[(&str, PreparedInstance)], data: &str, rel: f64) -> Result<u
         let voltage: f64 = fields.next().ok_or("missing bias")?.parse()?;
         for ((name, device), expected) in cases.iter().zip(fields) {
             let mut actual = 0.;
+            let mut conductance = 0.;
             for branch in [device.bulk, device.sidewall].into_iter().flatten() {
                 assert_eq!(branch.resistance().to_bits(), 0_f64.to_bits());
-                actual += branch.evaluate(voltage)?.total.current;
+                let value = branch.evaluate(voltage)?.total;
+                actual += value.current;
+                conductance += value.conductance;
             }
             let expected = expected.parse()?;
-            close(name, voltage, actual, expected, 2e-18, rel)?;
+            // Sweep accumulation near zero leaves a bias uncertainty at
+            // the scale of the sweep increment, not the tiny residual bias.
+            let bias_uncertainty = if voltage.abs() < f64::EPSILON {
+                2. * f64::EPSILON * conductance.abs()
+            } else {
+                0.
+            };
+            close(
+                name,
+                voltage,
+                actual,
+                expected,
+                2e-18 + bias_uncertainty,
+                rel,
+            )?;
             count += 1;
         }
     }
@@ -390,6 +407,47 @@ fn sidewall_thermal_capacitance() -> Result<()> {
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn sidewall_signed_emission_and_inheritance() -> Result<()> {
+    let models = cases(include_str!("fixtures/ltspice/side-signed-cases.tsv"))?;
+    assert_eq!(
+        dc_rows(
+            &models,
+            include_str!("fixtures/ltspice/side-signed-dc.tsv"),
+            2e-6
+        )?,
+        9 * 12
+    );
+    let models = source_cases(include_str!(
+        "fixtures/ltspice/side-default-emission-cases.tsv"
+    ))?;
+    let measured = include_str!("fixtures/ltspice/side-default-emission-ac.tsv").trim();
+    for ((name, model, instance), expected) in models.into_iter().zip(measured.split('\t')) {
+        let (g, b) = expected.split_once(',').ok_or("missing admittance")?;
+        let (g, b): (f64, f64) = (g.parse()?, b.parse()?);
+        if !g.is_finite() || !b.is_finite() {
+            // Some nonfinite entries in the mixed vendor deck disappear when
+            // isolated. The physically singular zero-emission case must fail;
+            // finite cases are checked in the separate signed DC sweep.
+            if model.bulk.transport.emission == 0. {
+                assert!(model.bind(instance).is_err());
+            }
+            continue;
+        }
+        let device = model.bind(instance)?;
+        let mut actual_g = 0.;
+        let mut actual_b = 0.;
+        for branch in [device.bulk, device.sidewall].into_iter().flatten() {
+            let value = branch.evaluate(0.)?.total;
+            actual_g += value.conductance;
+            actual_b += value.capacitance * std::f64::consts::TAU * 1000.;
+        }
+        close(name, 0., actual_g, g, 1e-17, 3e-8)?;
+        close(name, 0., actual_b, b, 1e-18, 3e-8)?;
     }
     Ok(())
 }

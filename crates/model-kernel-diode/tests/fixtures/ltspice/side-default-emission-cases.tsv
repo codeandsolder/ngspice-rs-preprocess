@@ -1,0 +1,27 @@
+m0|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=1.5|temp=-40
+m1|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3|temp=-40
+m2|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=1|temp=-40
+m3|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=0|temp=-40
+m4|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=-1|temp=-40
+m5|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=.05|temp=-40
+m6|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=2|temp=-40
+m7|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=0|temp=-40
+m8|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=.05|temp=-40
+m9|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=1.5|temp=27
+m10|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3|temp=27
+m11|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=1|temp=27
+m12|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=0|temp=27
+m13|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=-1|temp=27
+m14|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=.05|temp=27
+m15|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=2|temp=27
+m16|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=0|temp=27
+m17|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=.05|temp=27
+m18|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=1.5|temp=100
+m19|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3|temp=100
+m20|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=1|temp=100
+m21|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=0|temp=100
+m22|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=-1|temp=100
+m23|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=.05|temp=100
+m24|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=2|temp=100
+m25|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=0|temp=100
+m26|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=.05|temp=100

@@ -1,0 +1,12 @@
+m0|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=-1|temp=-40
+m1|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=-.5|temp=-40
+m2|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=0|temp=-40
+m3|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=.05|temp=-40
+m4|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=-1|temp=-40
+m5|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=0|temp=-40
+m6|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=-1|temp=27
+m7|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=-.5|temp=27
+m8|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=0|temp=27
+m9|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=.05|temp=27
+m10|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=-1|temp=27
+m11|is=0 isw=1e-10 perim=2 cjsw=1e-9 n=3 ns=0|temp=27
