@@ -223,3 +223,71 @@ fn copy_dependencies_and_trials_are_independent() -> Result<(), ModelError> {
     }
     Ok(())
 }
+
+#[test]
+fn hv2_native_parameter_resets_are_disclosed() -> Result<(), ModelError> {
+    for (name, lower, upper) in [
+        ("scp22", 0., 0.),
+        ("rdrcx", 0., 1.),
+        ("ndepm", 5e15, 2e17),
+        ("tndep", 1e-7, 1e-6),
+        ("depmue0", 1., 1e5),
+    ] {
+        let outside = [
+            (lower - upper.abs().max(1.), lower),
+            (upper + upper.abs().max(1.), upper),
+        ];
+        for (supplied, effective) in outside {
+            let raw = BoundParameters::bind(
+                ModelVariant::HiSimHv2,
+                ParameterScope::Model,
+                [(name, ParameterValue::Real(supplied))],
+            )?;
+            let model = prepare_hisim_hv_model(&raw)?;
+            assert_eq!(param(&model, name)?, &ParameterValue::Real(effective));
+            assert_eq!(
+                model.adjustments(),
+                &[model_compact_intrinsic::HiSimHvModelAdjustment {
+                    name,
+                    supplied: ParameterValue::Real(supplied),
+                    effective: ParameterValue::Real(effective),
+                }]
+            );
+            let slot = ModelVariant::HiSimHv2
+                .parameter(ParameterScope::Model, name)
+                .ok_or_else(|| ModelError::UnknownParameter(name.to_owned()))?
+                .slot;
+            assert_eq!(raw.get_slot(slot), Some(&ParameterValue::Real(supplied)));
+        }
+        let midpoint = f64::midpoint(lower, upper);
+        let model = prepare(
+            ModelVariant::HiSimHv2,
+            &[(name, ParameterValue::Real(midpoint))],
+        )?;
+        assert_eq!(param(&model, name)?, &ParameterValue::Real(midpoint));
+        assert!(model.adjustments().is_empty());
+    }
+    let model = prepare(
+        ModelVariant::HiSimHv2,
+        &[
+            ("codep", ParameterValue::Integer(1)),
+            ("copprv", ParameterValue::Integer(1)),
+        ],
+    )?;
+    assert_eq!(param(&model, "copprv")?, &ParameterValue::Integer(0));
+    assert_eq!(
+        model.adjustments(),
+        &[model_compact_intrinsic::HiSimHvModelAdjustment {
+            name: "copprv",
+            supplied: ParameterValue::Integer(1),
+            effective: ParameterValue::Integer(0),
+        }]
+    );
+    let hv1 = prepare(
+        ModelVariant::HiSimHv1,
+        &[("scp22", ParameterValue::Real(0.0007))],
+    )?;
+    assert_eq!(param(&hv1, "scp22")?, &ParameterValue::Real(0.0007));
+    assert!(hv1.adjustments().is_empty());
+    Ok(())
+}

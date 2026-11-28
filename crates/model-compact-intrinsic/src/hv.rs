@@ -170,9 +170,18 @@ pub struct PreparedHiSimHvModel {
     parameters: BoundParameters,
     polarity: MosPolarity,
     original_given: Box<[bool]>,
+    adjustments: Box<[HiSimHvModelAdjustment]>,
     /// Unique stable model provenance; retained across model clones and
     /// prepared instances so equal-valued but different model cards cannot mix.
     identity: Arc<()>,
+}
+
+/// An explicit source-defined normalization of a model-card parameter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiSimHvModelAdjustment {
+    pub name: &'static str,
+    pub supplied: ParameterValue,
+    pub effective: ParameterValue,
 }
 
 impl PreparedHiSimHvModel {
@@ -198,6 +207,12 @@ impl PreparedHiSimHvModel {
     #[must_use = "the returned buffer supplies the immutable model parameters"]
     pub const fn parameters(&self) -> &BoundParameters {
         &self.parameters
+    }
+
+    /// Parameter resets required by native HV2 setup, in source order.
+    #[must_use = "these adjustments disclose changes to the supplied model card"]
+    pub fn adjustments(&self) -> &[HiSimHvModelAdjustment] {
+        &self.adjustments
     }
 
     pub(crate) fn validate_instance(
@@ -575,6 +590,48 @@ fn apply_hv_rules(
     Ok(values)
 }
 
+fn normalize_hv2(
+    values: &mut [Option<ParameterValue>],
+) -> Result<Box<[HiSimHvModelAdjustment]>, ModelError> {
+    let variant = ModelVariant::HiSimHv2;
+    let mut adjustments = Vec::new();
+    // Native RANGERESET is unconditional; COERRREP controls diagnostics only.
+    for (name, minimum, maximum) in [
+        ("scp22", 0., 0.),
+        ("rdrcx", 0., 1.),
+        ("ndepm", 5e15, 2e17),
+        ("tndep", 1e-7, 1e-6),
+        ("depmue0", 1., 1e5),
+    ] {
+        let slot = lookup_slot(variant, name)?;
+        let Some(ParameterValue::Real(value)) =
+            values.get_mut(usize::from(slot)).and_then(Option::as_mut)
+        else {
+            return Err(ModelError::MissingDefaultDependency(slot));
+        };
+        if *value < minimum || *value > maximum {
+            let supplied = ParameterValue::Real(*value);
+            *value = value.clamp(minimum, maximum);
+            adjustments.push(HiSimHvModelAdjustment {
+                name,
+                supplied,
+                effective: ParameterValue::Real(*value),
+            });
+        }
+    }
+    let codep = lookup_slot(variant, "codep")?;
+    let copprv = lookup_slot(variant, "copprv")?;
+    if param_integer(values, codep)? != 0 && param_integer(values, copprv)? == 1 {
+        values[usize::from(copprv)] = Some(ParameterValue::Integer(0));
+        adjustments.push(HiSimHvModelAdjustment {
+            name: "copprv",
+            supplied: ParameterValue::Integer(1),
+            effective: ParameterValue::Integer(0),
+        });
+    }
+    Ok(adjustments.into_boxed_slice())
+}
+
 /// Apply source-order model-level parameter preparation for HiSIM-HV1/HV2.
 ///
 /// Both families are treated separately: HV2's `CODEP` depletion defaults,
@@ -622,7 +679,7 @@ pub fn prepare_hisim_hv_model(
         }
     }
 
-    let values = apply_hv_rules(source, polarity)?;
+    let mut values = apply_hv_rules(source, polarity)?;
 
     let tox_slot = lookup_slot(variant, "tox")?;
     if !matches!(values[usize::from(tox_slot)], Some(ParameterValue::Real(value)) if value > 0.0) {
@@ -650,6 +707,12 @@ pub fn prepare_hisim_hv_model(
         }
     }
 
+    let adjustments = if variant == ModelVariant::HiSimHv2 {
+        normalize_hv2(&mut values)?
+    } else {
+        Box::new([])
+    };
+
     Ok(PreparedHiSimHvModel {
         parameters: BoundParameters {
             variant,
@@ -659,6 +722,7 @@ pub fn prepare_hisim_hv_model(
         },
         polarity,
         original_given: source.values.iter().map(Option::is_some).collect(),
+        adjustments,
         identity: Arc::new(()),
     })
 }

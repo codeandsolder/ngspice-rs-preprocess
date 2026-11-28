@@ -154,6 +154,19 @@ fn check_circuit(smoke: bool) -> TestResult {
             if error > tolerance {
                 failures[i] += 1;
                 if failures[i] <= 5 || error > maximum[i] {
+                    if i == 0 {
+                        eprintln!(
+                            "components: surface={:e}, residual={:e}, back={:e}, carrier source={:e}, drain={:e}, Idd={:e}, Pds={:e}, Mu={:e}",
+                            point.channel.surface_current_a.value,
+                            point.channel.residual_current_a.value,
+                            point.channel.back_current_a.value,
+                            point.source.transport_carrier.value,
+                            point.drain.transport_carrier.value,
+                            point.channel.drift_diffusion_integral.value,
+                            point.channel.surface_difference.value,
+                            point.channel.surface_mobility.value
+                        );
+                    }
                     eprintln!(
                         "case {index}, field {i}: native={expected:e}, Rust={:e}, input {:?}, card {}, NF {}",
                         p.value,

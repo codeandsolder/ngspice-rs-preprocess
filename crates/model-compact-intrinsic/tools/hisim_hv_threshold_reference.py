@@ -21,7 +21,7 @@ def program(root,version):
     # Field initialization follows the source geometry/doping preparation, with
     # zero diffusion reductions, STI, and width corrections on this oracle card.
     maps={
-      'here':{'2qnsub_esi':'density','ptovr':'x[6]','nsubc':'bulk','wdplp':'sqrtl(2*C_ESI/(qe*pocket))','wdpl':'sqrtl(2*C_ESI/(qe*nsub))','msc':'0.0007L','lgate':'length','wg':'width*1e6L','dVthsm':'0.005L/(length*width*1e12L)'},
+      'here':{'2qnsub_esi':'density','ptovr':'x[6]','nsubc':'bulk','wdplp':'sqrtl(2*C_ESI/(qe*pocket))','wdpl':'sqrtl(2*C_ESI/(qe*nsub))','msc':'0.0007L' if version==1 else '0.L','lgate':'length','wg':'width*1e6L','dVthsm':'0.005L/(length*width*1e12L)'},
       'model':{'lp':'lp','bs1':'0.02L','bs2':'0.4L','vbi':'1.1L','scp21':'0.6L','parl2':'0.05e-6L','sc4':'0.12L','codep':'x[11]','depeta':'0.07L'},
       'pParam':{'pthrou':'x[10]','scp1':'0.1L','scp2':'0.03L','scp3':'0.04e-6L','sc1':'0.1L','sc2':'0.02L','sc3':'0.03e-6L','wfc':'0.3e-9L','wvth0':'0.03L'}
     }
