@@ -973,7 +973,7 @@ pub fn parse_library_with_budget(
     budget: &WorkBudget,
 ) -> Result<ParsedLibrary> {
     use crate::source_dialect::{
-        DEFAULT_PROJECTION_BYTES, DialectContext, ScopedStatement, SourceKind,
+        DEFAULT_PROJECTION_BYTES, DialectContext, RootKind, ScopedStatement,
     };
     budget.charge(Resource::SourceVisits, 1)?;
     budget.charge(Resource::ScannedBytes, input.len())?;
@@ -987,10 +987,10 @@ pub fn parse_library_with_budget(
         let (context, lines) = project_spice_resource(
             input,
             DialectContext {
-                language: crate::source_dialect::SourceLanguage::Hspice,
+                language: crate::source_dialect::SourceDialect::Hspice,
                 separator: None,
             },
-            SourceKind::Include,
+            RootKind::Include,
         )?;
         let statements = lines
             .into_iter()
@@ -1015,7 +1015,7 @@ pub fn parse_library_with_budget(
         let (context, view) = project_resource(
             input,
             DialectContext::default(),
-            SourceKind::Include,
+            RootKind::Include,
             simulator,
         )?;
         let statements = view
@@ -1346,7 +1346,7 @@ pub fn project_source(input: &[u8], simulator: LibrarySimulator) -> Result<Strin
 pub fn project_simetrix_source(
     input: &[u8],
     inherited: crate::source_dialect::DialectContext,
-    kind: crate::source_dialect::SourceKind,
+    kind: crate::source_dialect::RootKind,
 ) -> Result<(crate::source_dialect::DialectContext, String)> {
     let (context, statements) =
         project_resource(input, inherited, kind, LibrarySimulator::Simetrix)?;
@@ -1373,17 +1373,17 @@ pub fn render_projection(statements: &[crate::source_dialect::ProjectedStatement
 pub fn project_resource(
     input: &[u8],
     inherited: crate::source_dialect::DialectContext,
-    kind: crate::source_dialect::SourceKind,
+    kind: crate::source_dialect::RootKind,
     simulator: LibrarySimulator,
 ) -> Result<(
     crate::source_dialect::DialectContext,
     Vec<crate::source_dialect::ProjectedStatement>,
 )> {
-    use crate::source_dialect::{DialectContext, SourceKind, logical_source};
+    use crate::source_dialect::{DialectContext, RootKind, logical_source};
     if simulator == LibrarySimulator::Hspice {
         return project_spice_resource(input, inherited, kind);
     }
-    let decoded = if kind == SourceKind::Deck && simulator == LibrarySimulator::Simetrix {
+    let decoded = if kind == RootKind::Deck && simulator == LibrarySimulator::Simetrix {
         // A title is data, even when it looks like a directive or a device.
         let mut protected = Vec::with_capacity(input.len().saturating_add(2));
         let first = input
@@ -1400,7 +1400,7 @@ pub fn project_resource(
         decode_simplis_text(input)?
     };
     let context = if simulator == LibrarySimulator::Simetrix {
-        DialectContext::resolve(&decoded, inherited, kind)
+        DialectContext::resolve(&decoded, inherited, kind)?
     } else {
         inherited
     };
@@ -1428,15 +1428,15 @@ pub fn project_resource(
 pub fn project_spice_resource(
     input: &[u8],
     inherited: crate::source_dialect::DialectContext,
-    kind: crate::source_dialect::SourceKind,
+    kind: crate::source_dialect::RootKind,
 ) -> Result<(
     crate::source_dialect::DialectContext,
     Vec<crate::source_dialect::ProjectedStatement>,
 )> {
-    use crate::source_dialect::{DialectContext, ProjectedStatement, SourceKind, logical_source};
+    use crate::source_dialect::{DialectContext, ProjectedStatement, RootKind, logical_source};
     let decoded = decode_simplis_text(input)?;
-    let context = DialectContext::resolve(&decoded, inherited, kind);
-    if kind == SourceKind::Include {
+    let context = DialectContext::resolve(&decoded, inherited, kind)?;
+    if kind == RootKind::Include {
         return Ok((context, logical_source(&decoded, context)?));
     }
     let mut lines = decoded.splitn(2, '\n');
@@ -1679,11 +1679,7 @@ fn parsed_library_digest(
     let mut hasher = Sha256::new();
     hasher.update(b"ngspice-rs-preprocess-parsed-library-v8\0");
     if let Some(context) = dialect {
-        hasher.update([match context.language {
-            crate::source_dialect::SourceLanguage::Simetrix => 1,
-            crate::source_dialect::SourceLanguage::Hspice => 2,
-            crate::source_dialect::SourceLanguage::Pspice => 3,
-        }]);
+        hasher.update([context.language.stable_id()]);
         hasher.update(context.separator.map_or(0, u32::from).to_be_bytes());
     } else {
         hasher.update([0]);
@@ -1703,11 +1699,7 @@ fn parsed_library_digest(
         hasher.update([0xfe]);
     }
     for statement in statements {
-        hasher.update([match statement.context.language {
-            crate::source_dialect::SourceLanguage::Simetrix => 1,
-            crate::source_dialect::SourceLanguage::Hspice => 2,
-            crate::source_dialect::SourceLanguage::Pspice => 3,
-        }]);
+        hasher.update([statement.context.language.stable_id()]);
         hasher.update(
             statement
                 .context

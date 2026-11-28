@@ -1188,7 +1188,7 @@ pub(crate) fn capture(
 ) -> Result<()> {
     use model_preprocess_simplis::{
         LibrarySimulator, project_resource,
-        source_dialect::{DialectContext, SourceKind},
+        source_dialect::{DialectContext, RootKind},
     };
     budget.charge(Resource::ScannedBytes, bytes.len())?;
     let simulator = if plan.dialect == AnalysisDialect::Simetrix {
@@ -1199,7 +1199,7 @@ pub(crate) fn capture(
     let (_, lines) = project_resource(
         bytes,
         DialectContext::default(),
-        SourceKind::Include,
+        RootKind::Include,
         simulator,
     )?;
     let physical = std::str::from_utf8(bytes)?

@@ -1,6 +1,9 @@
 //! Shared physical-line-preserving lowering of series resistance.
 
-use crate::{IdentifierAllocator, NormalizationDialect, lexical, model_card::parse_spice_constant};
+use crate::{
+    IdentifierAllocator, SourceDialects, lexical, linked_source::SourceDialect,
+    model_card::parse_spice_constant,
+};
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeSet, io::Write, ops::Range};
@@ -340,15 +343,41 @@ fn rewrite_explicit(
     Ok(())
 }
 
+pub struct SeriesRewrite {
+    pub(super) bytes: Vec<u8>,
+    pub(super) ltspice: bool,
+    pub(super) native: bool,
+}
+
+fn rewrite_native(rewriter: &mut Rewriter<'_>, statement: &lexical::Statement) -> Result<()> {
+    let text = &statement.text;
+    if !matches!(text.first(), Some(b'l' | b'L'))
+        || !text
+            .windows(4)
+            .any(|part| part.eq_ignore_ascii_case(b"rser"))
+    {
+        return Ok(());
+    }
+    let fields = lexical::tokens(text)?;
+    if let Some((span, value)) = assignment(statement, &fields, b"rser")? {
+        rewriter.insert_resistor(statement, &fields, &text[value], &[])?;
+        rewriter.remove(statement, &[span]);
+    }
+    Ok(())
+}
+
 pub fn rewrite(
     input: &[u8],
     inserted: &mut Vec<usize>,
-    dialect: NormalizationDialect,
+    dialects: SourceDialects<'_>,
+    title_lines: usize,
     include: bool,
+    origins: Option<&[usize]>,
     budget: &WorkBudget,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<SeriesRewrite>> {
     budget.charge(Resource::ScannedBytes, input.len())?;
-    if dialect == NormalizationDialect::Native
+    let has_ltspice = dialects.includes(SourceDialect::Ltspice);
+    if !has_ltspice
         && !input
             .windows(4)
             .any(|part| part.eq_ignore_ascii_case(b"rser"))
@@ -362,21 +391,37 @@ pub fn rewrite(
         edits: Vec::new(),
         serial: 0,
     };
-    if dialect == NormalizationDialect::Ltspice {
+    let mut ltspice = false;
+    let mut native = false;
+    if has_ltspice {
+        // Coupling is a physical relation across dialect boundaries. Index
+        // every lexical scope, but lower only the source's own passive law.
         let statements = scoped(input, budget)?;
         let coupled = coupled_inductors(&statements, budget)?;
         for (scope, statement) in &statements {
             budget.charge(Resource::Statements, 1)?;
-            rewrite_explicit(&mut rewriter, statement, *scope, &coupled, include)?;
+            let previous = rewriter.edits.len();
+            let line = statement.line + title_lines;
+            let source = if let Some(origins) = origins {
+                dialects.at_mapped(origins, line)?
+            } else {
+                dialects.at(line)?
+            };
+            if source == SourceDialect::Ltspice {
+                rewrite_explicit(&mut rewriter, statement, *scope, &coupled, include)?;
+                ltspice |= rewriter.edits.len() != previous;
+            } else {
+                rewrite_native(&mut rewriter, statement)?;
+                native |= rewriter.edits.len() != previous;
+            }
         }
     } else {
-        // The narrow native compatibility pass retains its existing scope:
-        // only an explicitly written inductor Rser is interpreted.
+        // The narrow native compatibility pass does not add default losses.
         let mut control = false;
         for statement in lexical::statements(input)? {
             budget.charge(Resource::Statements, 1)?;
-            let text = &statement.text;
-            let first = text
+            let first = statement
+                .text
                 .split(u8::is_ascii_whitespace)
                 .next()
                 .unwrap_or_default();
@@ -385,21 +430,18 @@ pub fn rewrite(
             } else if first.eq_ignore_ascii_case(b".endc") {
                 control = false;
             }
-            if control
-                || !matches!(first.first(), Some(b'l' | b'L'))
-                || !text
-                    .windows(4)
-                    .any(|part| part.eq_ignore_ascii_case(b"rser"))
-            {
-                continue;
-            }
-            let fields = lexical::tokens(text)?;
-            if let Some((span, value)) = assignment(&statement, &fields, b"rser")? {
-                let value = &text[value];
-                rewriter.insert_resistor(&statement, &fields, value, &[])?;
-                rewriter.remove(&statement, &[span]);
+            if !control {
+                let previous = rewriter.edits.len();
+                rewrite_native(&mut rewriter, &statement)?;
+                native |= rewriter.edits.len() != previous;
             }
         }
     }
-    lexical::apply_budgeted_edits(input, rewriter.edits, budget)
+    Ok(
+        lexical::apply_budgeted_edits(input, rewriter.edits, budget)?.map(|bytes| SeriesRewrite {
+            bytes,
+            ltspice,
+            native,
+        }),
+    )
 }

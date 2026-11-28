@@ -14,7 +14,7 @@ use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::{
     lower_spice_expression,
     source_dialect::{
-        DialectContext, ScopedStatement, SourceLanguage,
+        DialectContext, ScopedStatement, SourceDialect,
         model_mapping::{Device, MappingTable, ModelSelection},
     },
 };
@@ -92,7 +92,7 @@ pub fn lower(
     budget: &WorkBudget,
 ) -> Result<(String, ModelSelection)> {
     ensure!(
-        statement.context.language == SourceLanguage::Hspice,
+        statement.context.language == SourceDialect::Hspice,
         "model lowering for this resource language is not qualified"
     );
     let selection = MappingTable::select_standalone_hspice(statement, scope, budget)?;
@@ -141,7 +141,7 @@ pub fn lower(
         lower_spice_expression(
             value,
             DialectContext {
-                language: SourceLanguage::Hspice,
+                language: SourceDialect::Hspice,
                 separator: None,
             },
             limit,

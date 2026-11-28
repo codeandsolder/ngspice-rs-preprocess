@@ -17,7 +17,7 @@ use model_normalize_ngspice::{
 };
 use model_preprocess_simplis::{
     lower_spice_expression,
-    source_dialect::{DialectContext, SourceKind, SourceLanguage},
+    source_dialect::{DialectContext, SourceDialect},
 };
 use std::fmt::Write as _;
 
@@ -28,7 +28,7 @@ mod models;
 mod mos;
 
 pub(super) const HSPICE: DialectContext = DialectContext {
-    language: SourceLanguage::Hspice,
+    language: SourceDialect::Hspice,
     separator: None,
 };
 
@@ -393,7 +393,7 @@ fn lower_card(
         return Ok(text.to_owned());
     }
     let command = analysis_plan::command(text);
-    let hspice = context.language == SourceLanguage::Hspice;
+    let hspice = context.language == SourceDialect::Hspice;
     let fields = statement_token_spans(text)?;
     if command == ".SUBCKT" {
         state.depth += 1;
@@ -560,7 +560,7 @@ fn lower_expansion(
         budget.charge(Resource::Statements, 1)?;
         budget.charge(Resource::ScannedBytes, statement.text.len())?;
         if index != 0
-            && statement.context.language == SourceLanguage::Hspice
+            && statement.context.language == SourceDialect::Hspice
             && analysis_plan::command(&statement.text) == ".PARAM"
             && let Some(lines) = lower_parameter_functions(
                 &statement.text,
@@ -671,6 +671,7 @@ fn add_catalog(
                 source: std::path::PathBuf::from(&statement.source),
                 line: statement.first_line,
                 last_line: statement.last_line,
+                linked: None,
             });
             linked.push(statement.clone_with_budget(budget)?);
         }
@@ -694,7 +695,7 @@ pub(super) fn prepare(
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
     let mut expansion = SourceExpansion::new(session, request, options);
-    let context = expansion.expand(root, HSPICE, SourceKind::Deck, None)?;
+    let context = expansion.expand(root, HSPICE, RootKind::Deck, None)?;
     let SourceExpansion {
         mut statements,
         mut origins,
@@ -740,6 +741,7 @@ pub(super) fn prepare(
             source: root.path.clone(),
             line: 0,
             last_line: 0,
+            linked: None,
         };
         let default_text = defaults.concat();
         ensure!(
@@ -762,6 +764,7 @@ pub(super) fn prepare(
         RootKind::Deck,
         NativeProjection::plain(&bytes, RootKind::Deck, budget)?,
         &origins,
+        None,
         budget,
     )?;
     bundle.model_selections = selections;
