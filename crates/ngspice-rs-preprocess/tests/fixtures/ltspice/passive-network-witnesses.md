@@ -164,3 +164,48 @@ At 10 kHz, L=3m Rser=5 Rpar=20 Cpar=1u m=2 driven by AC 1 through
 3 ohms has winding current -0.001818572457001496-j0.007668199776010198 A
 and reported current 0.1657616466885765+j0.04446561363256242 A.
 Do not infer either branch from the output reporting law.
+
+## Contextual storage temperature
+
+At 27 °C nominal, a capacitor with tc=.01 doubles its main storage at
+127 °C. Higher-order tc list entries are accepted; the isolated sixth
+coefficient 1e-12 at delta-T=100 produces a factor of two. Comma- and
+whitespace-separated symbolic entries are accepted. Global .options tnom
+changes the reference temperature, and local temp overrides ambient.
+For a 1 V AC source through 10 ohms, C=2u Rser=5 at 10 kHz has terminal
+voltage 0.4797550849386705-j0.2759984995014461 at 27 °C and
+0.3771577201505801-j0.1652140460077680 at 127 °C.
+
+An inductor instead accepts tc1/tc2 and local tnom (default 27 °C,
+independent of global tnom). Temperature changes the self inductance,
+not the nominal mutual-coupling base. With L1=3m tc1=.01 at 127 °C,
+L2=12m temp=27, K=.5, the winding mutual inductance is exactly 3m,
+although L1 self inductance is 6m.
+
+Only primary storage changes with the temperature polynomial. Explicit
+parasitics are unchanged; default capacitor Cpar is calculated from
+unscaled nominal C. Omitted capacitor leakage follows positive effective
+temperature-adjusted capacitance, while omitted inductor leakage follows
+the pre-temperature L and copy sign. Signed and zero effective values
+must not be clamped. Full numeric witnesses and native requirements:
+solver issue #284.
+
+Noise from C/L parasitics follows local temp, or ambient if omitted.
+The voltage-source temp setter is diagnosed as unknown in the reference;
+voltage-source parasitic noise follows ambient. Do not translate this
+invalid source setter to a valid native local noise-temperature field.
+
+## Behavioral current selection across families
+
+At 10 kHz a resistor divider's physical current of 0.125 A produces
+zero behavioral I(R) AC perturbation. The same zero-tangent law applies
+to diode, capacitor, current-source, F/G and current-output B reads.
+Voltage-source, E/H, voltage-output B and inductor winding references
+retain instantaneous AC behavior. For voltage-output B with
+V=2*V(s), V=V(s)*V(s), or V=sin(V(s)), driving 3 ohms from a control
+bias of 2 V and unit AC excitation, the behavioral current monitors are
+respectively -2/3, -4/3 and +0.1387156121823808 A. Thus classification
+does not depend on linearity of the expression. Linear F/H source
+controls accept a true winding or voltage-output branch, not R/C/I.
+Behavioral read policy must be selected by the actual bound occurrence,
+after macro expansion, rather than a source-text prefix heuristic.

@@ -940,7 +940,19 @@ fn voltage_source_series_resistance_preserves_identity_and_coefficients() -> Res
 fn source_parasitics_without_equivalent_observations_are_diagnostic() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("source.cir");
-    for card in ["V1 a 0 1 Rpar=1k", "I1 a 0 1 Rser=1k"] {
+    for card in [
+        "V1 a 0 1 Rpar=1k",
+        "I1 a 0 1 Rser=1k",
+        "V1 a 0 1 temp=127",
+        "V1 a 0 1 Rser=1 temp=127",
+        "C1 a 0 1u dtemp=10",
+        "C1 a 0 1u tc1=.01",
+        "C1 a 0 1u tc2=.01",
+        "C1 a 0 1u tnom=27",
+        "L1 a 0 1m dtemp=10",
+        "L1 a 0 1m tc=.01",
+        "L1 a 0 1m tc3=.01",
+    ] {
         fs::write(&root, format!("title\n{card}\n.end\n"))?;
         assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
     }

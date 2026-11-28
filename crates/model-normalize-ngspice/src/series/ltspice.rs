@@ -251,7 +251,7 @@ fn storage_shunt(
 }
 
 fn voltage(card: &mut Card<'_>, controlled: bool, budget: &WorkBudget) -> Result<()> {
-    for key in [b"rpar".as_slice(), b"lser", b"rlshunt"] {
+    for key in [b"rpar".as_slice(), b"lser", b"rlshunt", b"temp"] {
         card.reject(key)?;
     }
     let rser = card.take(b"rser")?;
@@ -276,7 +276,6 @@ fn voltage(card: &mut Card<'_>, controlled: bool, budget: &WorkBudget) -> Result
         )?;
     }
     if rser.is_some() || cpar.is_some() {
-        card.rename(b"temp", "pn_temp")?;
         card.push("pn_control", "1");
         card.push("pn_report_dc", "1");
     }
@@ -360,10 +359,17 @@ fn storage(
         "line {}: nonlinear LTspice passive requires typed lowering",
         card.statement.line
     );
+    // The source families do not share the native passive temperature
+    // setter vocabulary. Do not reinterpret a source-diagnosed setter.
+    card.reject(b"dtemp")?;
     if inductor {
-        // LTspice diagnoses these capacitor-only setters on L cards.
-        card.reject(b"lser")?;
-        card.reject(b"rlshunt")?;
+        for key in [b"lser".as_slice(), b"rlshunt", b"tc", b"tc3"] {
+            card.reject(key)?;
+        }
+    } else {
+        for key in [b"tc1".as_slice(), b"tc2", b"tnom"] {
+            card.reject(key)?;
+        }
     }
     let multiplicity = card.scalar(b"m")?.unwrap_or("1");
     let lser = card.scalar(b"lser")?;
