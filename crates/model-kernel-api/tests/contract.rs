@@ -75,6 +75,7 @@ fn descriptor() -> Descriptor {
         family: "linear".into(),
         fingerprint: [1; 16],
         abi: ABI_VERSION,
+        taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
         equations: [
             ("positive", EquationKind::Electrical),
             ("negative", EquationKind::Electrical),
@@ -180,10 +181,7 @@ fn metadata_structural_edits_and_noise() -> Result<()> {
 
 #[test]
 fn explicit_trial_capabilities_and_validation() -> Result<()> {
-    use model_kernel_api::trial::{
-        Convergence, ConvergenceInput, TrialInput, TrialOutcome, TrialPhase, TrialPolicy,
-        TrialSample,
-    };
+    use model_kernel_api::trial::{TrialInput, TrialOutcome, TrialPhase, TrialPolicy};
 
     let model = Artifact::new(descriptor(), Linear)?;
     let prepared = model.prepare(&[2.], 300.)?;
@@ -245,6 +243,15 @@ fn explicit_trial_capabilities_and_validation() -> Result<()> {
         Err(Error::Unsupported("trial initialization"))
     );
 
+    Ok(())
+}
+
+#[test]
+fn exact_trial_convergence_policy() -> Result<()> {
+    use model_kernel_api::trial::{Convergence, ConvergenceInput, TrialOutcome, TrialSample};
+    let model = Artifact::new(descriptor(), Linear)?;
+    let prepared = model.prepare(&[2.], 300.)?;
+    let proposed = [2., 1., 310.];
     let sample = TrialSample {
         coordinates: &proposed,
         residual: &[2., -2., 10.],
@@ -284,5 +291,164 @@ fn explicit_trial_capabilities_and_validation() -> Result<()> {
             .check_trial_convergence(&prepared, convergence)
             .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn physical_taylor_contract_rejects_bad_inputs_and_unavailable_kernels() -> Result<()> {
+    use model_kernel_api::taylor::{MAX_ORDER, TaylorBuffer, TaylorCapability, TaylorInput};
+    let mut invalid = descriptor();
+    invalid.taylor = TaylorCapability::Computed {
+        max_order: MAX_ORDER + 1,
+    };
+    assert!(Artifact::new(invalid, Linear).is_err());
+    let mut invalid = descriptor();
+    invalid.taylor = TaylorCapability::Computed { max_order: 2 };
+    invalid.charge = Capability::Unavailable;
+    assert!(Artifact::new(invalid, Linear).is_err());
+    assert!(TaylorBuffer::new(0, 0).is_err());
+    assert!(TaylorBuffer::new(usize::MAX, 1).is_err());
+    assert!(TaylorBuffer::new(1000, MAX_ORDER).is_err());
+    let model = Artifact::new(descriptor(), Linear)?;
+    let prepared = model.prepare(&[2.], 300.)?;
+    let input = TaylorInput {
+        order: 1,
+        coefficients: &[2., 1., 300., 0.1, 0., -2.],
+    };
+    let mut out = TaylorBuffer::new(3, 1)?;
+    assert!(matches!(
+        model.evaluate_taylor(&prepared, input, &mut out.point()),
+        Err(Error::Unsupported(_))
+    ));
+    let mut available = descriptor();
+    available.taylor = TaylorCapability::Computed { max_order: 1 };
+    let model = Artifact::new(available, Linear)?;
+    let other = model.prepare(&[2.], 300.)?;
+    assert_eq!(
+        model.evaluate_taylor(&prepared, input, &mut out.point()),
+        Err(Error::ForeignArtifact)
+    );
+    assert!(
+        model
+            .evaluate_taylor(&other, TaylorInput { order: 2, ..input }, &mut out.point())
+            .is_err()
+    );
+    assert!(
+        model
+            .evaluate_taylor(
+                &other,
+                TaylorInput {
+                    coefficients: &[0.; 6],
+                    ..input
+                },
+                &mut out.point()
+            )
+            .is_err()
+    );
+    assert!(
+        model
+            .evaluate_taylor(
+                &other,
+                TaylorInput {
+                    coefficients: &[1., 2., 300., f64::NAN, 0., 0.],
+                    ..input
+                },
+                &mut out.point()
+            )
+            .is_err()
+    );
+    assert!(
+        model
+            .evaluate_taylor(
+                &other,
+                TaylorInput {
+                    coefficients: &[1., 2., 300.],
+                    ..input
+                },
+                &mut out.point()
+            )
+            .is_err()
+    );
+    // Claiming support without an implementation does not silently use the ordinary point path.
+    assert!(matches!(
+        model.evaluate_taylor(&other, input, &mut out.point()),
+        Err(Error::Unsupported(_))
+    ));
+    Ok(())
+}
+
+#[derive(Debug)]
+enum TaylorWitness {
+    Valid,
+    Incomplete,
+    Unbalanced,
+    Gauge,
+    Storage,
+}
+
+impl Kernel for TaylorWitness {
+    type Prepared = f64;
+    fn prepare(&self, values: &[f64], temperature: f64) -> Result<f64> {
+        Linear.prepare(values, temperature)
+    }
+    fn evaluate(&self, data: &f64, x: &[f64], out: &mut Point<'_>) -> Result<()> {
+        Linear.evaluate(data, x, out)
+    }
+    fn evaluate_taylor(
+        &self,
+        _: &f64,
+        _: model_kernel_api::taylor::TaylorInput<'_>,
+        out: &mut model_kernel_api::taylor::TaylorPoint<'_>,
+    ) -> Result<()> {
+        // A separate degree-one witness; point zero is always valid, and
+        // only the higher degree contains the deliberately malformed data.
+        out.current.fill(0.);
+        out.conductance.fill(0.);
+        out.charge.fill(0.);
+        out.capacitance.fill(0.);
+        match self {
+            Self::Valid => {}
+            Self::Incomplete => out.current[3] = f64::NAN,
+            Self::Unbalanced => out.current[3] = 1.,
+            Self::Gauge => out.conductance[9 + 6] = 1.,
+            Self::Storage => {
+                out.charge[3] = 1.;
+                out.charge[4] = -1.;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn physical_taylor_checks_every_degree_and_known_zero_charge() -> Result<()> {
+    use model_kernel_api::taylor::{TaylorBuffer, TaylorCapability, TaylorInput};
+    let input = TaylorInput {
+        order: 1,
+        coefficients: &[2., 1., 300., 0.1, 0., 0.],
+    };
+    let mut buffer = TaylorBuffer::new(3, 1)?;
+    for witness in [
+        TaylorWitness::Valid,
+        TaylorWitness::Incomplete,
+        TaylorWitness::Unbalanced,
+        TaylorWitness::Gauge,
+        TaylorWitness::Storage,
+    ] {
+        let expected = match witness {
+            TaylorWitness::Valid => Ok(()),
+            TaylorWitness::Incomplete => Err(Error::Domain(
+                "incomplete static residual or Jacobian".into(),
+            )),
+            TaylorWitness::Unbalanced | TaylorWitness::Gauge => Err(Error::Conservation),
+            TaylorWitness::Storage => Err(Error::Domain("nonzero declared-zero storage".into())),
+        };
+        let mut d = descriptor();
+        d.charge = Capability::Zero;
+        d.taylor = TaylorCapability::Computed { max_order: 1 };
+        let a = Artifact::new(d, witness)?;
+        let p = a.prepare(&[2.], 300.)?;
+        assert_eq!(a.evaluate_taylor(&p, input, &mut buffer.point()), expected);
+    }
     Ok(())
 }

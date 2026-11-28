@@ -20,6 +20,8 @@ mod parameters;
 
 pub use parameters::{ParameterError, compile_ngspice};
 
+use model_kernel_api::taylor::arithmetic::Scalar;
+use std::cmp::Ordering;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 /// Physical MOS channel polarity.
@@ -410,7 +412,7 @@ impl Model {
                 return Err(ModelError::Invalid(name));
             }
         }
-        let nominal_pbfact = pbfact(Jet::constant(self.tnom)).v;
+        let nominal_pbfact = pbfact(Jet::<f64>::constant(self.tnom)).v;
         let pbo = (self.diode.vj - nominal_pbfact) / (self.tnom / REFERENCE_T);
         if !pbo.is_finite() || pbo <= 0.0 {
             return Err(ModelError::Invalid("diode nominal junction potential"));
@@ -527,87 +529,87 @@ pub struct PreparedInstance<'a> {
 /// drain-to-source for P-channel VDMOS. The caller supplies its intrinsic
 /// junction voltage separately from the external drain-source voltage.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Bias {
+pub struct Bias<S = f64> {
     /// Intrinsic gate-source bias, V.
-    pub vgs: f64,
+    pub vgs: S,
     /// Intrinsic drain-source bias, V.
-    pub vds: f64,
+    pub vds: S,
     /// External drain-source bias used in quasi-saturation, V.
-    pub vds_external: f64,
+    pub vds_external: S,
     /// Intrinsic body diode voltage in its physical polarity, V.
-    pub vdiode: f64,
+    pub vdiode: S,
     /// Polarity-normalized ngspice-47 soft-recovery internal node coordinate.
     /// Its actual integrated charge is TT(T) times this coordinate.
-    pub recovery_node: f64,
+    pub recovery_node: S,
     /// Instantaneous device temperature, K.
-    pub temperature: f64,
+    pub temperature: S,
 }
 
 /// Scalar current and exact derivatives with respect to Vgs, Vds and T.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Current {
+pub struct Current<S = f64> {
     /// Current, A.
-    pub value: f64,
+    pub value: S,
     /// Partial derivative with respect to the physical gate-source voltage.
-    pub d_vgs: f64,
+    pub d_vgs: S,
     /// Partial derivative with respect to the physical drain-source voltage.
-    pub d_vds: f64,
+    pub d_vds: S,
     /// Partial derivative with respect to Kelvin temperature.
-    pub d_temperature: f64,
+    pub d_temperature: S,
 }
 
 /// Charge, differential capacitance and temperature derivative.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Charge {
+pub struct Charge<S = f64> {
     /// Stored charge, C.
-    pub value: f64,
+    pub value: S,
     /// Partial derivative with respect to associated physical voltage, F.
-    pub d_voltage: f64,
+    pub d_voltage: S,
     /// Partial derivative with respect to Kelvin temperature, C/K.
-    pub d_temperature: f64,
+    pub d_temperature: S,
 }
 
 /// Compiled channel, gate and body diode equations at a single bias point.
 #[derive(Clone, Copy, Debug)]
-pub struct Evaluation {
+pub struct Evaluation<S = f64> {
     /// Temperature at which this evaluation was prepared, K.
-    pub temperature: f64,
+    pub temperature: S,
     /// Intrinsic drain-to-source channel conduction.
-    pub channel: Current,
+    pub channel: Current<S>,
     /// Gate-source charge, on gate plate.
-    pub qgs: Charge,
+    pub qgs: Charge<S>,
     /// Gate-drain charge, on gate plate.
-    pub qgd: Charge,
+    pub qgd: Charge<S>,
     /// Body diode conduction, positive in its forward physical direction.
-    pub diode: DiodeEvaluation,
+    pub diode: DiodeEvaluation<S>,
     /// Thermal source from intrinsic resistive/channel dissipation.
-    pub heat: Heat,
+    pub heat: Heat<S>,
     /// Series resistances and voltage-dependent conductances.
-    pub series: SeriesEvaluation,
+    pub series: SeriesEvaluation<S>,
 }
 
 /// Body-diode conduction, charge and extra recovery state equation.
 #[derive(Clone, Copy, Debug)]
-pub struct DiodeEvaluation {
+pub struct DiodeEvaluation<S = f64> {
     /// Junction DC current in the diode forward direction.
-    pub current: ChargeCurrent,
+    pub current: ChargeCurrent<S>,
     /// Depletion charge only; no solver history is included.
-    pub depletion: Charge,
+    pub depletion: Charge<S>,
     /// Diffusion charge when VP=0; absent when Qp relaxation is active.
-    pub diffusion: Charge,
+    pub diffusion: Charge<S>,
     /// Relaxation state source and coefficients when VP != 0 and TT != 0.
-    pub recovery: Option<Recovery>,
+    pub recovery: Option<Recovery<S>>,
 }
 
 /// Junction conduction with voltage and thermal sensitivities.
 #[derive(Clone, Copy, Debug)]
-pub struct ChargeCurrent {
+pub struct ChargeCurrent<S = f64> {
     /// Junction DC current, A.
-    pub value: f64,
+    pub value: S,
     /// Junction differential conductance, S.
-    pub d_voltage: f64,
+    pub d_voltage: S,
     /// Temperature coefficient, A/K.
-    pub d_temperature: f64,
+    pub d_temperature: S,
 }
 
 /// ODE physics exposed as charge and residual terms; time integration belongs
@@ -621,62 +623,62 @@ pub struct ChargeCurrent {
 /// `polarity*(1-VP)/TT(T) * dQs/dt`, including temperature-sensitive TT.
 /// A drain-to-source channel-current convention has the opposite sign.
 #[derive(Clone, Copy, Debug)]
-pub struct Recovery {
+pub struct Recovery<S = f64> {
     /// Algebraic residual excluding the time derivative of the stored charge.
-    pub residual: f64,
+    pub residual: S,
     /// Jacobian of the algebraic residual with respect to the Qp node coordinate.
-    pub d_node: f64,
+    pub d_node: S,
     /// Jacobian of the residual with respect to physical diode junction voltage.
-    pub d_voltage: f64,
+    pub d_voltage: S,
     /// Jacobian of the residual with respect to Kelvin temperature.
-    pub d_temperature: f64,
+    pub d_temperature: S,
     /// Charge on the independent recovery node; `d_voltage` here means dQs/dqp.
-    pub stored_charge: Charge,
+    pub stored_charge: Charge<S>,
     /// Physical diode current coefficient on dQs/dt.
-    pub diode_charge_rate_gain: f64,
+    pub diode_charge_rate_gain: S,
     /// Temperature derivative of the diode charge-rate coefficient.
-    pub d_gain_d_temperature: f64,
+    pub d_gain_d_temperature: S,
 }
 
 /// Power entering junction thermal node; the simulator stamps the heat source.
 #[derive(Clone, Copy, Debug)]
-pub struct Heat {
+pub struct Heat<S = f64> {
     /// Intrinsic channel conduction power, W.
-    pub channel: f64,
+    pub channel: S,
     /// Body diode conduction power, W.
-    pub diode: f64,
+    pub diode: S,
     /// Total intrinsic power, W, excluding separately bound ohmic branch losses.
-    pub intrinsic: f64,
+    pub intrinsic: S,
     /// Partial derivative dP/dVgs, A.
-    pub d_vgs: f64,
+    pub d_vgs: S,
     /// Partial derivative dP/dVds, A.
-    pub d_vds: f64,
+    pub d_vds: S,
     /// Partial derivative dP/dVdiode, A.
-    pub d_vdiode: f64,
+    pub d_vdiode: S,
     /// Partial derivative dP/dT, W/K.
-    pub d_temperature: f64,
+    pub d_temperature: S,
     /// Junction thermal storage capacitance, J/K.
-    pub junction_capacitance: f64,
+    pub junction_capacitance: S,
     /// Junction-to-case thermal conductance, W/K.
-    pub junction_to_case: f64,
+    pub junction_to_case: S,
     /// Case-to-ambient thermal conductance, W/K.
-    pub case_to_ambient: f64,
+    pub case_to_ambient: S,
 }
 
 /// Explicit, optional series conductances; zero denotes a shorted branch
 /// that the solver must eliminate from topology before numerical stamping.
 #[derive(Clone, Copy, Debug)]
-pub struct SeriesEvaluation {
+pub struct SeriesEvaluation<S = f64> {
     /// Drain effective conductance (S).
-    pub drain: Conductance,
+    pub drain: Conductance<S>,
     /// Source effective conductance (S).
-    pub source: Conductance,
+    pub source: Conductance<S>,
     /// Gate effective conductance (S).
-    pub gate: Conductance,
+    pub gate: Conductance<S>,
     /// Body diode effective conductance (S).
-    pub body: Conductance,
+    pub body: Conductance<S>,
     /// Drain-source shunt conductance (S).
-    pub shunt: f64,
+    pub shunt: S,
 }
 
 /// Ohmic power, optionally including terminal- and temperature-dependent resistance.
@@ -694,13 +696,13 @@ pub struct OhmicPower {
 
 /// Temperature- and possibly voltage-dependent conductance.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Conductance {
+pub struct Conductance<S = f64> {
     /// S; None represents a zero-ohm element requiring topology coalescing.
-    pub value: Option<f64>,
+    pub value: Option<S>,
     /// S/V, derivative with respect to physical external drain-source voltage.
-    pub d_vds_external: f64,
+    pub d_vds_external: S,
     /// S/K, temperature derivative.
-    pub d_temperature: f64,
+    pub d_temperature: S,
 }
 
 impl Conductance {
@@ -802,6 +804,13 @@ impl PreparedInstance<'_> {
     ///
     /// Fails on invalid temperature/bias or a singular/nonfinite model state.
     pub fn evaluate(&self, bias: Bias) -> Result<Evaluation, ModelError> {
+        self.evaluate_physical(bias)
+    }
+
+    pub(crate) fn evaluate_physical<S: Scalar>(
+        &self,
+        bias: Bias<S>,
+    ) -> Result<Evaluation<S>, ModelError> {
         if ![
             bias.vgs,
             bias.vds,
@@ -810,9 +819,9 @@ impl PreparedInstance<'_> {
             bias.recovery_node,
             bias.temperature,
         ]
-        .iter()
-        .all(|value| value.is_finite())
-            || bias.temperature <= 0.0
+        .into_iter()
+        .all(Scalar::is_finite)
+            || bias.temperature.value() <= 0.0
         {
             return Err(ModelError::Invalid("bias"));
         }
@@ -824,16 +833,16 @@ impl PreparedInstance<'_> {
 
         let ids = channel_at(m, self.multiplier, bias, t)?;
         let qgs = Charge {
-            value: m.gate.cgs * self.multiplier * bias.vgs,
-            d_voltage: m.gate.cgs * self.multiplier,
-            d_temperature: 0.0,
+            value: bias.vgs.scale(m.gate.cgs * self.multiplier),
+            d_voltage: S::constant(m.gate.cgs * self.multiplier),
+            d_temperature: S::constant(0.0),
         };
-        let normalized_vgd = polarity * (bias.vgs - bias.vds);
+        let normalized_vgd = (bias.vgs - bias.vds).scale(polarity);
         let (qgd_normal, cgd) = gate_charge(normalized_vgd, m.gate, self.multiplier);
         let qgd = Charge {
-            value: polarity * qgd_normal,
+            value: qgd_normal.scale(polarity),
             d_voltage: cgd,
-            d_temperature: 0.0,
+            d_temperature: S::constant(0.0),
         };
 
         let vd = Jet::voltage(bias.vdiode) * polarity;
@@ -859,21 +868,21 @@ impl PreparedInstance<'_> {
             d_vds: channel_power.dy,
             d_vdiode: diode_power.dx,
             d_temperature: intrinsic.dt,
-            junction_capacitance: if self.self_heating {
+            junction_capacitance: S::constant(if self.self_heating {
                 m.thermal.cthj * self.multiplier
             } else {
                 0.0
-            },
-            junction_to_case: if self.self_heating {
+            }),
+            junction_to_case: S::constant(if self.self_heating {
                 self.multiplier / m.thermal.rthjc
             } else {
                 0.0
-            },
-            case_to_ambient: if self.self_heating {
+            }),
+            case_to_ambient: S::constant(if self.self_heating {
                 self.multiplier / m.thermal.rthca
             } else {
                 0.0
-            },
+            }),
         };
         let result = Evaluation {
             temperature: bias.temperature,
@@ -894,7 +903,7 @@ impl PreparedInstance<'_> {
     }
 }
 
-fn validate_output(result: &Evaluation) -> Result<(), ModelError> {
+fn validate_output<S: Scalar>(result: &Evaluation<S>) -> Result<(), ModelError> {
     if ![
         result.channel.value,
         result.channel.d_vgs,
@@ -917,7 +926,12 @@ fn validate_output(result: &Evaluation) -> Result<(), ModelError> {
     Ok(())
 }
 
-fn channel_at(m: &Model, multiplier: f64, bias: Bias, t: Jet) -> Result<Jet, ModelError> {
+fn channel_at<S: Scalar>(
+    m: &Model,
+    multiplier: f64,
+    bias: Bias<S>,
+    t: Jet<S>,
+) -> Result<Jet<S>, ModelError> {
     let dt = t - m.tnom;
     let relative = t / m.tnom;
     let polarity = m.polarity.sign();
@@ -925,21 +939,25 @@ fn channel_at(m: &Model, multiplier: f64, bias: Bias, t: Jet) -> Result<Jet, Mod
     let threshold = m.channel.vth + m.channel.tcvth * dt;
     let slope =
         m.channel.ksubthres * (1.0 + m.channel.tksubthres1 * dt + m.channel.tksubthres2 * dt * dt);
-    if slope.v < 0.0 {
+    if slope.v.compare(0.) == Some(Ordering::Less) {
         return Err(ModelError::Invalid("temperature-adjusted ksubthres"));
     }
     let vgs = Jet::gate(bias.vgs) * polarity;
     let vds = Jet::drain(bias.vds) * polarity;
-    let mode = if vds.v >= 0.0 { 1.0 } else { -1.0 };
+    let mode = if vds.v.compare(0.) == Some(Ordering::Less) {
+        -1.0
+    } else {
+        1.0
+    };
     let overdrive = if mode > 0.0 { vgs } else { vgs - vds } - threshold * polarity;
     let vdsat = overdrive.max_zero();
     let gate_drive = (overdrive - m.channel.subshift).scaled_softplus(slope);
     let beta_effective = beta * (1.0 + m.channel.lambda * vds) / (1.0 + m.channel.theta * vdsat);
     let vdss = vds * (mode * m.channel.mtriode);
-    let channel_normal = if gate_drive.v <= vdss.v {
-        beta_effective * gate_drive * gate_drive * 0.5
-    } else {
+    let channel_normal = if gate_drive.v.compare_to(vdss.v) == Some(Ordering::Greater) {
         beta_effective * vdss * (gate_drive - 0.5 * vdss)
+    } else {
+        beta_effective * gate_drive * gate_drive * 0.5
     };
     let ids = channel_normal * (polarity * mode);
 
@@ -966,110 +984,121 @@ pub fn evaluate_batch(
 }
 
 #[derive(Clone, Copy)]
-struct Jet {
-    v: f64,
-    dx: f64,
-    dy: f64,
-    dt: f64,
+struct Jet<S = f64> {
+    v: S,
+    dx: S,
+    dy: S,
+    dt: S,
 }
 
-impl Jet {
-    const fn constant(v: f64) -> Self {
+impl<S: Scalar> Jet<S> {
+    fn constant(v: f64) -> Self {
+        Self::constant_value(S::constant(v))
+    }
+    fn constant_value(v: S) -> Self {
         Self {
             v,
-            dx: 0.0,
-            dy: 0.0,
-            dt: 0.0,
+            dx: S::constant(0.),
+            dy: S::constant(0.),
+            dt: S::constant(0.),
         }
     }
-    const fn gate(v: f64) -> Self {
+    fn gate(v: S) -> Self {
         Self {
-            v,
-            dx: 1.0,
-            dy: 0.0,
-            dt: 0.0,
+            dx: S::constant(1.),
+            ..Self::constant_value(v)
         }
     }
-    const fn drain(v: f64) -> Self {
+    fn drain(v: S) -> Self {
         Self {
-            v,
-            dx: 0.0,
-            dy: 1.0,
-            dt: 0.0,
+            dy: S::constant(1.),
+            ..Self::constant_value(v)
         }
     }
-    const fn voltage(v: f64) -> Self {
+    fn voltage(v: S) -> Self {
         Self::gate(v)
     }
-    const fn temperature(v: f64) -> Self {
+    fn temperature(v: S) -> Self {
         Self {
-            v,
-            dx: 0.0,
-            dy: 0.0,
-            dt: 1.0,
+            dt: S::constant(1.),
+            ..Self::constant_value(v)
         }
     }
     fn scale(self, scalar: f64) -> Self {
         Self {
-            v: self.v * scalar,
-            dx: self.dx * scalar,
-            dy: self.dy * scalar,
-            dt: self.dt * scalar,
+            v: self.v.scale(scalar),
+            dx: self.dx.scale(scalar),
+            dy: self.dy.scale(scalar),
+            dt: self.dt.scale(scalar),
+        }
+    }
+    fn compose(self, value: S, slope: S) -> Self {
+        Self {
+            v: value,
+            dx: self.dx * slope,
+            dy: self.dy * slope,
+            dt: self.dt * slope,
         }
     }
     fn exp(self) -> Self {
         let value = self.v.exp();
-        Self {
-            v: value,
-            ..self.scale(value)
-        }
+        self.compose(value, value)
+    }
+    fn exp_m1(self) -> Self {
+        self.compose(self.v.exp_m1(), self.v.exp())
     }
     fn ln(self) -> Self {
-        let inverse = self.v.recip();
-        Self {
-            v: self.v.ln(),
-            dx: self.dx * inverse,
-            dy: self.dy * inverse,
-            dt: self.dt * inverse,
-        }
+        self.compose(self.v.ln(), self.v.recip())
     }
     fn powf(self, exponent: f64) -> Self {
-        let value = self.v.powf(exponent);
-        let derivative = exponent * self.v.powf(exponent - 1.0);
-        Self {
-            v: value,
-            ..self.scale(derivative)
-        }
+        self.compose(
+            self.v.powf(exponent),
+            self.v.powf(exponent - 1.).scale(exponent),
+        )
+    }
+    fn exprel(self) -> Self {
+        self.compose(self.v.exprel(), self.v.exprel_slope())
     }
     fn max_zero(self) -> Self {
-        if self.v > 0.0 {
+        if self.v.compare(0.) == Some(Ordering::Greater) {
             self
         } else {
-            Self::constant(0.0)
+            Self::constant(0.)
         }
     }
     // Evaluate s*log(1+exp(x/s)) and its partials without forming
     // 1/s² or differentiating a potentially infinite intermediate.
     fn scaled_softplus(self, slope: Self) -> Self {
-        if slope.v == 0.0 {
+        if slope.v.value() == 0. {
+            // Jointly vanishing scale and argument can have path-dependent
+            // partials. Do not assign arbitrary coefficients at that join.
+            if !slope.v.is_zero() && self.v.value() == 0. {
+                return Self::constant(f64::NAN);
+            }
             return self.max_zero();
         }
         let ratio = self.v / slope.v;
         let magnitude = ratio.abs();
         let e = (-magnitude).exp();
         let tail = e.ln_1p();
-        let sigmoid = if ratio >= 0.0 {
-            1.0 / (1.0 + e)
+        let positive = ratio.compare(0.) != Some(Ordering::Less);
+        let sigmoid = if positive {
+            e.offset(1.).recip()
         } else {
-            e / (1.0 + e)
+            e / e.offset(1.)
         };
-        let ds = if magnitude.is_finite() {
-            (magnitude * e / (1.0 + e)) + tail
+        let ds = if magnitude.value().is_finite() {
+            magnitude * e / e.offset(1.) + tail
         } else {
-            0.0
+            S::constant(0.)
+        };
+        let maximum = if self.v.compare(0.) == Some(Ordering::Less) {
+            S::constant(0.)
+        } else {
+            self.v
         };
         Self {
-            v: slope.v.mul_add(tail, self.v.max(0.0)),
+            v: slope.v.mul_add(tail, maximum),
             dx: slope.dx.mul_add(ds, self.dx * sigmoid),
             dy: slope.dy.mul_add(ds, self.dy * sigmoid),
             dt: slope.dt.mul_add(ds, self.dt * sigmoid),
@@ -1077,12 +1106,12 @@ impl Jet {
     }
 }
 
-impl From<f64> for Jet {
+impl<S: Scalar> From<f64> for Jet<S> {
     fn from(v: f64) -> Self {
         Self::constant(v)
     }
 }
-impl Add for Jet {
+impl<S: Scalar> Add for Jet<S> {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
@@ -1093,7 +1122,7 @@ impl Add for Jet {
         }
     }
 }
-impl Sub for Jet {
+impl<S: Scalar> Sub for Jet<S> {
     type Output = Self;
     fn sub(self, other: Self) -> Self {
         Self {
@@ -1104,7 +1133,7 @@ impl Sub for Jet {
         }
     }
 }
-impl Mul for Jet {
+impl<S: Scalar> Mul for Jet<S> {
     type Output = Self;
     fn mul(self, other: Self) -> Self {
         Self {
@@ -1115,98 +1144,101 @@ impl Mul for Jet {
         }
     }
 }
-impl Div for Jet {
+impl<S: Scalar> Div for Jet<S> {
     type Output = Self;
     fn div(self, other: Self) -> Self {
-        let inverse = 1.0 / (other.v * other.v);
+        let value = self.v / other.v;
         Self {
-            v: self.v / other.v,
-            dx: self.v.mul_add(-other.dx, self.dx * other.v) * inverse,
-            dy: self.v.mul_add(-other.dy, self.dy * other.v) * inverse,
-            dt: self.v.mul_add(-other.dt, self.dt * other.v) * inverse,
+            v: value,
+            dx: (-value).mul_add(other.dx, self.dx) / other.v,
+            dy: (-value).mul_add(other.dy, self.dy) / other.v,
+            dt: (-value).mul_add(other.dt, self.dt) / other.v,
         }
     }
 }
-impl Neg for Jet {
+impl<S: Scalar> Neg for Jet<S> {
     type Output = Self;
     fn neg(self) -> Self {
-        self.scale(-1.0)
+        self.scale(-1.)
     }
 }
-impl Add<f64> for Jet {
+impl<S: Scalar> Add<f64> for Jet<S> {
     type Output = Self;
     fn add(self, other: f64) -> Self {
         self + Self::constant(other)
     }
 }
-impl Sub<f64> for Jet {
+impl<S: Scalar> Sub<f64> for Jet<S> {
     type Output = Self;
     fn sub(self, other: f64) -> Self {
         self - Self::constant(other)
     }
 }
-impl Mul<f64> for Jet {
+impl<S: Scalar> Mul<f64> for Jet<S> {
     type Output = Self;
     fn mul(self, other: f64) -> Self {
         self.scale(other)
     }
 }
-impl Div<f64> for Jet {
+impl<S: Scalar> Div<f64> for Jet<S> {
     type Output = Self;
     fn div(self, other: f64) -> Self {
         self.scale(other.recip())
     }
 }
-impl Mul<Jet> for f64 {
-    type Output = Jet;
-    fn mul(self, other: Jet) -> Jet {
-        other * self
+impl<S: Scalar> Mul<Jet<S>> for f64 {
+    type Output = Jet<S>;
+    fn mul(self, other: Jet<S>) -> Jet<S> {
+        other.scale(self)
     }
 }
-impl Add<Jet> for f64 {
-    type Output = Jet;
-    fn add(self, other: Jet) -> Jet {
+impl<S: Scalar> Add<Jet<S>> for f64 {
+    type Output = Jet<S>;
+    fn add(self, other: Jet<S>) -> Jet<S> {
         Jet::constant(self) + other
     }
 }
-impl Sub<Jet> for f64 {
-    type Output = Jet;
-    fn sub(self, other: Jet) -> Jet {
+impl<S: Scalar> Sub<Jet<S>> for f64 {
+    type Output = Jet<S>;
+    fn sub(self, other: Jet<S>) -> Jet<S> {
         Jet::constant(self) - other
     }
 }
-impl Div<Jet> for f64 {
-    type Output = Jet;
-    fn div(self, other: Jet) -> Jet {
+impl<S: Scalar> Div<Jet<S>> for f64 {
+    type Output = Jet<S>;
+    fn div(self, other: Jet<S>) -> Jet<S> {
         Jet::constant(self) / other
     }
 }
 
-fn log_cosh(v: f64) -> f64 {
-    v.abs() + (-2.0 * v.abs()).exp().ln_1p() - std::f64::consts::LN_2
+fn log_cosh<S: Scalar>(v: S) -> S {
+    v.abs() + v.abs().scale(-2.).exp().ln_1p() - S::constant(std::f64::consts::LN_2)
 }
 
-fn gate_charge(v: f64, params: GateCharge, mult: f64) -> (f64, f64) {
+fn gate_charge<S: Scalar>(v: S, params: GateCharge, mult: f64) -> (S, S) {
     let s = (params.cgdmax - params.cgdmin) / (1.0 + std::f64::consts::FRAC_PI_2);
     let y = params.cgdmax - s;
-    let av = params.a * v;
-    let base = if av >= 0.0 { av.tanh() } else { av.atan() };
+    let av = v.scale(params.a);
+    let positive = av.compare(0.) != Some(Ordering::Less);
+    let base = if positive { av.tanh() } else { av.atan() };
     let antiderivative = if params.a == 0.0 {
-        0.0
-    } else if av >= 0.0 {
-        log_cosh(av) / params.a
+        S::constant(0.)
+    } else if positive {
+        log_cosh(av) / S::constant(params.a)
     } else {
-        v.mul_add(av.atan(), -(av * av).ln_1p() / (2.0 * params.a))
+        v.mul_add(av.atan(), -(av * av).ln_1p() / S::constant(2. * params.a))
     };
     (
-        mult * y.mul_add(v, s * antiderivative),
-        mult * s.mul_add(base, y),
+        S::constant(y)
+            .mul_add(v, antiderivative.scale(s))
+            .scale(mult),
+        S::constant(s).mul_add(base, S::constant(y)).scale(mult),
     )
 }
 
-struct DiodeAt {
-    evaluation: DiodeEvaluation,
-    power: Jet,
+struct DiodeAt<S> {
+    evaluation: DiodeEvaluation<S>,
+    power: Jet<S>,
 }
 
 const K_OVER_Q: f64 = 8.617_333_262_145e-5;
@@ -1214,11 +1246,11 @@ const BOLTZ: f64 = 1.380_649e-23;
 const CHARGE: f64 = 1.602_176_634e-19;
 const REFERENCE_T: f64 = 300.15;
 
-fn silicon_bandgap(t: Jet) -> Jet {
+fn silicon_bandgap<S: Scalar>(t: Jet<S>) -> Jet<S> {
     1.16 - 7.02e-4 * t * t / (t + 1108.0)
 }
 
-fn pbfact(t: Jet) -> Jet {
+fn pbfact<S: Scalar>(t: Jet<S>) -> Jet<S> {
     let reference = 1.115_087_7 / (BOLTZ * (REFERENCE_T + REFERENCE_T));
     let fact = t / REFERENCE_T;
     let arg = -silicon_bandgap(t) / (2.0 * BOLTZ * t) + reference;
@@ -1227,25 +1259,23 @@ fn pbfact(t: Jet) -> Jet {
 
 // Stable integral of x^(-m) with respect to voltage, including the
 // m=1 logarithmic limit AND its temperature derivative through dm/dT.
-fn depletion_primitive(x: Jet, one_minus_m: Jet) -> Jet {
+fn depletion_primitive<S: Scalar>(x: Jet<S>, one_minus_m: Jet<S>) -> Jet<S> {
     let logarithm = x.ln();
-    if one_minus_m.v.abs() < 1e-4 {
-        let z = one_minus_m;
-        -logarithm
-            - 0.5 * z * logarithm * logarithm
-            - (z * z * logarithm * logarithm * logarithm) / 6.0
-            - (z * z * z * logarithm * logarithm * logarithm * logarithm) / 24.0
-    } else {
-        (1.0 - (one_minus_m * logarithm).exp()) / one_minus_m
-    }
+    -logarithm * (one_minus_m * logarithm).exprel()
 }
 
-fn depletion_charge(v: Jet, potential: Jet, cap_zero: Jet, grading: Jet, fc: f64) -> Jet {
+fn depletion_charge<S: Scalar>(
+    v: Jet<S>,
+    potential: Jet<S>,
+    cap_zero: Jet<S>,
+    grading: Jet<S>,
+    fc: f64,
+) -> Jet<S> {
     let fc_v = potential * fc;
     let arg_fc = 1.0 - fc;
     let z = 1.0 - grading;
     let q_fc = potential * cap_zero * depletion_primitive(Jet::constant(arg_fc), z);
-    if v.v < fc_v.v {
+    if v.v.compare_to(fc_v.v) == Some(Ordering::Less) {
         let x = 1.0 - v / potential;
         potential * cap_zero * depletion_primitive(x, z)
     } else {
@@ -1255,48 +1285,84 @@ fn depletion_charge(v: Jet, potential: Jet, cap_zero: Jet, grading: Jet, fc: f64
     }
 }
 
-fn diode_current(
-    vd: Jet,
-    saturation_current: Jet,
-    vte: Jet,
-    thermal_voltage: Jet,
-    avalanche: Option<Breakdown>,
-) -> Result<Jet, ModelError> {
-    if vd.v >= -3.0 * vte.v {
-        return Ok(saturation_current * ((vd / vte).exp() - 1.0));
+/// Keep the factored saturation law common to physical evaluation and
+/// the trial limiter. The latter must locate breakdown using the very
+/// same saturation current, including multiplicity and temperature.
+struct DiodeActivation<S: Scalar> {
+    thermal_voltage: Jet<S>,
+    vte: Jet<S>,
+    activation: Jet<S>,
+    log_prefactor: Jet<S>,
+}
+
+impl<S: Scalar> DiodeActivation<S> {
+    fn new(temperature: Jet<S>, mult: f64, d: BodyDiode, tnom: f64) -> Self {
+        let ratio = temperature / tnom;
+        let thermal_voltage = K_OVER_Q * temperature;
+        Self {
+            thermal_voltage,
+            vte: d.n * thermal_voltage,
+            activation: (ratio - 1.0) * d.eg,
+            log_prefactor: mult.ln() + d.is.ln() + (d.xti / d.n) * ratio.ln(),
+        }
     }
-    if let Some(parameters) = avalanche {
+
+    fn saturation_log(&self) -> Jet<S> {
+        self.log_prefactor + self.activation / self.vte
+    }
+}
+
+fn diode_current<S: Scalar>(
+    vd: Jet<S>,
+    temperature: Jet<S>,
+    mult: f64,
+    d: BodyDiode,
+    tnom: f64,
+) -> Result<Jet<S>, ModelError> {
+    let terms = DiodeActivation::new(temperature, mult, d, tnom);
+    let saturation_current = terms.saturation_log().exp();
+    let DiodeActivation {
+        thermal_voltage,
+        vte,
+        activation,
+        log_prefactor,
+    } = terms;
+    if vd.v.compare_to(vte.v.scale(-3.)) != Some(Ordering::Less) {
+        let exponent = vd / vte;
+        // Combine activation and bias before division to avoid cancellation
+        // between independently expanded thermal and forward exponentials.
+        return Ok(if exponent.v.compare(1.) == Some(Ordering::Greater) {
+            (log_prefactor + (activation + vd) / vte).exp() - saturation_current
+        } else {
+            saturation_current * exponent.exp_m1()
+        });
+    }
+    if let Some(parameters) = d.breakdown {
         let xbv = breakdown::effective_voltage(parameters, saturation_current, thermal_voltage)?;
-        if vd.v < -xbv.v {
-            return Ok(
-                -saturation_current * (-(xbv + vd) / (parameters.nbv * thermal_voltage)).exp()
-            );
+        if vd.v.compare_to(-xbv.v) == Some(Ordering::Less) {
+            return Ok(-(log_prefactor
+                + (activation / d.n - (xbv + vd) / parameters.nbv) / thermal_voltage)
+                .exp());
         }
     }
     let arg = 3.0 * vte / (vd * std::f64::consts::E);
     Ok(-saturation_current * (1.0 + arg * arg * arg))
 }
 
-// These temperature-dependent quantities serve both the physical equations
-// and the family numerical trial policy. Keep their operation order intact.
-fn junction_potential(prepared: &PreparedModel, temp: Jet) -> Jet {
+// The physical equations and numerical trial policy share the same
+// temperature-adjusted depletion potential.
+fn junction_potential<S: Scalar>(prepared: &PreparedModel, temp: Jet<S>) -> Jet<S> {
     let ratio = temp / prepared.model.tnom;
     pbfact(temp) + ratio * prepared.pbo * (prepared.model.tnom / REFERENCE_T)
 }
 
-fn saturation_exponent(model: &Model, temp: Jet, vte: Jet) -> Jet {
-    let ratio = temp / model.tnom;
-    let d = model.diode;
-    (ratio - 1.0) * d.eg / vte + (d.xti / d.n) * ratio.ln()
-}
-
-fn diode_at(
+fn diode_at<S: Scalar>(
     prepared: &PreparedModel,
     mult: f64,
-    temp: Jet,
-    vd: Jet,
-    qp: f64,
-) -> Result<DiodeAt, ModelError> {
+    temp: Jet<S>,
+    vd: Jet<S>,
+    qp: S,
+) -> Result<DiodeAt<S>, ModelError> {
     let model = &prepared.model;
     let d = model.diode;
     let dt = temp - model.tnom;
@@ -1304,18 +1370,14 @@ fn diode_at(
     let pbo = prepared.pbo;
     let gmaold = (d.vj - pbo) / pbo;
     let potential = junction_potential(prepared, temp);
-    if potential.v <= 0.0 {
+    if potential.v.value() <= 0.0 {
         return Err(ModelError::Invalid("temperature-adjusted diode potential"));
     }
     let gmanew = (potential - pbo) / pbo;
     let cap = mult * d.cjo
         / (1.0 + grading * (400e-6f64.mul_add(model.tnom - REFERENCE_T, -gmaold)))
         * (1.0 + grading * (400e-6 * (temp - REFERENCE_T) - gmanew));
-    let thermal_voltage = K_OVER_Q * temp;
-    let vte = d.n * thermal_voltage;
-    let scale = saturation_exponent(model, temp, vte).exp();
-    let isat = mult * d.is * scale;
-    let current = diode_current(vd, isat, vte, thermal_voltage, d.breakdown)?;
+    let current = diode_current(vd, temp, mult, d, model.tnom)?;
     // ngspice 47 vdmostemp.c limits the *temperature-adjusted* junction
     // potential when FC*VJ exceeds 2.5 V. The zero-bias capacitance is
     // computed using the original potential, before applying this limit.
@@ -1325,7 +1387,7 @@ fn diode_at(
     // a consistent continuation at that cutoff, bounded by ngspice's own
     // maximum admissible FC. This reproduces the C law below the cutoff
     // while keeping charge and dQ/dV continuous and real above it.
-    let (potential, fc) = if d.fc * potential.v > 2.5 {
+    let (potential, fc) = if potential.v.scale(d.fc).compare(2.5) == Some(Ordering::Greater) {
         (Jet::constant(2.5 / d.n), d.n.min(0.95))
     } else {
         (potential, d.fc)
@@ -1334,21 +1396,23 @@ fn diode_at(
     // Fitted catalog grading exponents can be negative. Admit the real,
     // passive charge law where it is valid, but reject a negative
     // temperature-adjusted capacitance or extrapolated differential C.
-    if cap.v < 0.0 || model.polarity.sign() * qdep.dx < 0.0 {
+    if cap.v.compare(0.) == Some(Ordering::Less)
+        || qdep.dx.scale(model.polarity.sign()).compare(0.) == Some(Ordering::Less)
+    {
         return Err(ModelError::Invalid("negative diode depletion capacitance"));
     }
     let transit = d.tt * (1.0 + d.ttt1 * dt + d.ttt2 * dt * dt);
-    if transit.v < 0.0 {
+    if transit.v.compare(0.) == Some(Ordering::Less) {
         return Err(ModelError::Invalid("temperature-adjusted transit time"));
     }
-    let has_recovery = d.vp > 0.0 && transit.v > 0.0;
+    let has_recovery = d.vp > 0.0 && transit.v.value() > 0.0;
     let (diffusion, recovery) = if has_recovery {
-        let residual = (qp - transit * current) / d.vp;
+        let residual = (Jet::constant_value(qp) - transit * current) / d.vp;
         (
             Charge::default(),
             Some(Recovery {
                 residual: residual.v,
-                d_node: 1.0 / d.vp,
+                d_node: S::constant(1.0 / d.vp),
                 d_voltage: residual.dx,
                 d_temperature: residual.dt,
                 stored_charge: Charge {
@@ -1356,8 +1420,9 @@ fn diode_at(
                     d_voltage: transit.v,
                     d_temperature: transit.dt * qp,
                 },
-                diode_charge_rate_gain: model.polarity.sign() * (1.0 - d.vp) / transit.v,
-                d_gain_d_temperature: -model.polarity.sign() * (1.0 - d.vp) * transit.dt
+                diode_charge_rate_gain: S::constant(model.polarity.sign() * (1.0 - d.vp))
+                    / transit.v,
+                d_gain_d_temperature: transit.dt.scale(-model.polarity.sign() * (1.0 - d.vp))
                     / (transit.v * transit.v),
             }),
         )
@@ -1365,9 +1430,9 @@ fn diode_at(
         let charge = transit * current;
         (
             Charge {
-                value: charge.v * model.polarity.sign(),
-                d_voltage: charge.dx * model.polarity.sign(),
-                d_temperature: charge.dt * model.polarity.sign(),
+                value: charge.v.scale(model.polarity.sign()),
+                d_voltage: charge.dx.scale(model.polarity.sign()),
+                d_temperature: charge.dt.scale(model.polarity.sign()),
             },
             None,
         )
@@ -1377,14 +1442,14 @@ fn diode_at(
     Ok(DiodeAt {
         evaluation: DiodeEvaluation {
             current: ChargeCurrent {
-                value: model.polarity.sign() * current.v,
-                d_voltage: model.polarity.sign() * current.dx,
-                d_temperature: model.polarity.sign() * current.dt,
+                value: current.v.scale(model.polarity.sign()),
+                d_voltage: current.dx.scale(model.polarity.sign()),
+                d_temperature: current.dt.scale(model.polarity.sign()),
             },
             depletion: Charge {
-                value: model.polarity.sign() * qdep.v,
-                d_voltage: model.polarity.sign() * qdep.dx,
-                d_temperature: model.polarity.sign() * qdep.dt,
+                value: qdep.v.scale(model.polarity.sign()),
+                d_voltage: qdep.dx.scale(model.polarity.sign()),
+                d_temperature: qdep.dt.scale(model.polarity.sign()),
             },
             diffusion,
             recovery,
@@ -1393,15 +1458,15 @@ fn diode_at(
     })
 }
 
-fn series_at(
+fn series_at<S: Scalar>(
     model: &Model,
     mult: f64,
-    ratio: Jet,
-    dt: Jet,
-    vds_external: f64,
-    intrinsic_vds: f64,
+    ratio: Jet<S>,
+    dt: Jet<S>,
+    vds_external: S,
+    intrinsic_vds: S,
     polarity: f64,
-) -> Result<SeriesEvaluation, ModelError> {
+) -> Result<SeriesEvaluation<S>, ModelError> {
     let s = model.series;
     let t_rd = s.texp0.map_or_else(
         || 1.0 + s.trd1 * dt + s.trd2 * dt * dt,
@@ -1412,7 +1477,7 @@ fn series_at(
     if let Some(quasi) = s.quasi_saturation {
         // Upstream uses external normalized Vds only in forward mode.
         let ext = Jet::drain(vds_external) * polarity;
-        if intrinsic_vds * polarity >= 0.0 {
+        if intrinsic_vds.scale(polarity).compare(0.) != Some(Ordering::Less) {
             let qres = quasi.rq * ratio.powf(s.texp1) / mult;
             let fraction = ext / (ext + quasi.vq.abs());
             drain = conductance(drain_r + qres * fraction)?;
@@ -1427,17 +1492,20 @@ fn series_at(
         source,
         gate,
         body,
-        shunt: mult / s.rds,
+        shunt: S::constant(mult / s.rds),
     })
 }
 
-fn conductance(r: Jet) -> Result<Conductance, ModelError> {
-    if r.v < 0.0 || !r.v.is_finite() {
+fn conductance<S: Scalar>(r: Jet<S>) -> Result<Conductance<S>, ModelError> {
+    if r.v.compare(0.) == Some(Ordering::Less) || !r.v.is_finite() {
         return Err(ModelError::Invalid(
             "temperature-adjusted series resistance",
         ));
     }
-    if r.v == 0.0 {
+    if r.v.value() == 0.0 {
+        if !r.v.is_zero() {
+            return Err(ModelError::Invalid("series topology at Taylor join"));
+        }
         return Ok(Conductance::default());
     }
     let g = 1.0 / r;

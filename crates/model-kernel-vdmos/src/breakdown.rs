@@ -6,43 +6,57 @@ use super::{Breakdown, Jet, ModelError};
 
 /// Computes XBV at the current temperature, including dXBV/dT for an exact
 /// thermal Jacobian. The limiter/bypass policy remains the solver's decision.
-pub fn effective_voltage(
+pub fn effective_voltage<S: model_kernel_api::taylor::arithmetic::Scalar>(
     parameters: Breakdown,
-    saturation_current: Jet,
-    thermal_voltage: Jet,
-) -> Result<Jet, ModelError> {
+    saturation_current: Jet<S>,
+    thermal_voltage: Jet<S>,
+) -> Result<Jet<S>, ModelError> {
     let bv = parameters.bv.abs();
     let cbv = parameters.ibv;
     // This is ngspice 47's no-shift case when the requested breakdown
     // current is below the reverse-region current at BV.
-    if cbv <= saturation_current.v * bv / thermal_voltage.v {
+    if (saturation_current.v.scale(bv) / thermal_voltage.v).compare(cbv)
+        != Some(std::cmp::Ordering::Less)
+    {
         return Ok(Jet::constant(bv));
     }
-
-    // Set XBV = BV - NBV*Vt*y. The C matching equation becomes
     // y = log(B + NBV*y), with B = 1 + IBV/Is - BV/Vt.
     let b = 1.0 + cbv / saturation_current - bv / thermal_voltage;
-    if !b.v.is_finite() || b.v < 1.0 {
+    if !b.v.is_finite() || b.v.value() < 1.0 {
         return Err(ModelError::Invalid("avalanche matching domain"));
     }
-
-    let y = solve_log_root(b.v, parameters.nbv)?;
-    // Differentiate the *converged* implicit equation:
-    // dy/dT = B'(T) / (B + NBV*y - NBV), independent of iteration count.
-    let denominator = parameters.nbv.mul_add(y - 1.0, b.v);
-    if !denominator.is_finite() || denominator <= 0.0 {
+    let root = solve_log_root(b.v.value(), parameters.nbv)?;
+    let mut y = S::constant(root);
+    let mut matched = 1;
+    // Formal Newton on the implicit law doubles the matched coefficient
+    // order. Keep the independently converged scalar root exactly fixed.
+    while matched <= b.v.degree() {
+        let argument = b.v + y.scale(parameters.nbv);
+        let residual = (y - argument.ln()).with_value(0.);
+        let derivative = S::constant(1.) - S::constant(parameters.nbv) / argument;
+        y = (y - residual / derivative).with_value(root);
+        matched *= 2;
+    }
+    let denominator = S::constant(parameters.nbv).mul_add(y.offset(-1.), b.v);
+    if !denominator.is_finite() || denominator.value() <= 0.0 {
         return Err(ModelError::Invalid("avalanche temperature derivative"));
     }
     let dydt = b.dt / denominator;
-    let value = (parameters.nbv * thermal_voltage.v).mul_add(-y, bv);
-    let dt = -parameters.nbv * thermal_voltage.dt.mul_add(y, thermal_voltage.v * dydt);
+    let value = thermal_voltage
+        .v
+        .scale(parameters.nbv)
+        .mul_add(-y, S::constant(bv));
+    let dt = thermal_voltage
+        .dt
+        .mul_add(y, thermal_voltage.v * dydt)
+        .scale(-parameters.nbv);
     if !value.is_finite() || !dt.is_finite() {
         return Err(ModelError::Invalid("avalanche voltage"));
     }
     Ok(Jet {
         v: value,
-        dx: 0.0,
-        dy: 0.0,
+        dx: S::constant(0.),
+        dy: S::constant(0.),
         dt,
     })
 }

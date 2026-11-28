@@ -9,7 +9,7 @@ use model_kernel_api::{
 };
 
 use super::{VdmosInstance, VdmosKernel};
-use crate::{Jet, K_OVER_Q, breakdown, junction_potential, saturation_exponent};
+use crate::{DiodeActivation, Jet, breakdown, junction_potential};
 
 // ngspice 47 VDMOSload uses DEVlimitlog with a 10 K step threshold.
 const THERMAL_STEP: f64 = 10.;
@@ -73,7 +73,7 @@ impl VdmosKernel {
             if temperature <= 0. || !temperature.is_finite() {
                 return false;
             }
-            let potential = junction_potential(&self.model, Jet::constant(temperature)).v;
+            let potential = junction_potential(&self.model, Jet::<f64>::constant(temperature)).v;
             potential > 0. && potential.is_finite()
         };
         let previous = reference[junction];
@@ -109,15 +109,20 @@ impl VdmosKernel {
     ) -> Result<f64> {
         let model = self.model.parameters();
         let diode = model.diode;
-        let thermal = K_OVER_Q * temperature;
-        let vte = diode.n * thermal;
-        let exponent = saturation_exponent(model, Jet::constant(temperature), Jet::constant(vte)).v;
-        let log_current = prepared.multiplier.ln() + diode.is.ln() + exponent;
+        let terms: DiodeActivation<f64> = DiodeActivation::new(
+            Jet::constant(temperature),
+            prepared.multiplier,
+            diode,
+            model.tnom,
+        );
+        let thermal = terms.thermal_voltage.v;
+        let vte = terms.vte.v;
+        let log_current = terms.saturation_log().v;
         if raw < -3. * vte
             && let Some(avalanche) = diode.breakdown
         {
-            let saturation = prepared.multiplier * diode.is * exponent.exp();
-            let knee = breakdown::effective_voltage(
+            let saturation = log_current.exp();
+            let knee: f64 = breakdown::effective_voltage(
                 avalanche,
                 Jet::constant(saturation),
                 Jet::constant(thermal),

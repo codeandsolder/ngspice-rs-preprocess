@@ -10,6 +10,10 @@ use model_kernel_api::{
     ABI_VERSION, Artifact, Binding, Capability, Descriptor, Equation, EquationKind, Error, Kernel,
     Parameter, Point, Result,
     noise::{Injection, Sink, Source},
+    taylor::{
+        MAX_ORDER, TaylorCapability, TaylorInput, TaylorPoint,
+        arithmetic::{Scalar, Series},
+    },
     trial::{TrialCapabilities, TrialPolicy, TrialReference},
 };
 
@@ -120,6 +124,9 @@ pub fn artifact(
             family: "vdmos".into(),
             fingerprint,
             abi: ABI_VERSION,
+            taylor: TaylorCapability::Computed {
+                max_order: MAX_ORDER,
+            },
             equations,
             parameters: vec![Parameter {
                 name: "multiplier".into(),
@@ -137,55 +144,96 @@ pub fn artifact(
     )
 }
 
-// Analytic local derivatives, propagated through the coordinate conversion
-// and elementary branch assembly. No independent physical model is copied.
+// The local bias coordinates are affine functions of the terminal and
+// hidden state. Their incidence derivatives are scalar constants, not series.
+// Keep that mapping compact and lift only the nonlinear partial derivatives.
 #[derive(Clone, Copy)]
-struct Differential {
-    value: f64,
-    derivative: [f64; MAX_ROWS],
+struct Coordinate<S> {
+    value: S,
+    incidence: [f64; MAX_ROWS],
 }
 
-impl Differential {
-    const fn constant(value: f64) -> Self {
+impl<S: Scalar> Coordinate<S> {
+    const fn constant(value: S) -> Self {
         Self {
             value,
-            derivative: [0.; MAX_ROWS],
+            incidence: [0.; MAX_ROWS],
         }
     }
-
-    const fn coordinate(value: f64, row: usize) -> Self {
+    const fn bound(value: S, row: usize) -> Self {
         let mut result = Self::constant(value);
-        result.derivative[row] = 1.;
+        result.incidence[row] = 1.;
         result
     }
+    fn minus(self, other: Self) -> Self {
+        let mut incidence = self.incidence;
+        for (dst, src) in incidence.iter_mut().zip(other.incidence) {
+            *dst -= src;
+        }
+        Self {
+            value: self.value - other.value,
+            incidence,
+        }
+    }
+    fn scale(self, factor: S) -> Differential<S> {
+        Differential::compose(self.value * factor, [(self, factor)])
+    }
+}
 
-    fn compose<const N: usize>(value: f64, terms: [(Self, f64); N]) -> Self {
-        let mut result = Self::constant(value);
+// Analytic local derivatives through the nonlinear branch assembly.
+#[derive(Clone, Copy)]
+struct Differential<S = f64> {
+    value: S,
+    derivative: [S; MAX_ROWS],
+}
+
+impl<S: Scalar> Differential<S> {
+    fn compose<const N: usize>(value: S, terms: [(Coordinate<S>, S); N]) -> Self {
+        let mut derivative = [S::constant(0.); MAX_ROWS];
         for (input, slope) in terms {
-            for (dst, dx) in result.derivative.iter_mut().zip(input.derivative) {
-                *dst = slope.mul_add(dx, *dst);
+            for (dst, dx) in derivative.iter_mut().zip(input.incidence) {
+                *dst = slope.mul_add(S::constant(dx), *dst);
             }
         }
-        result
+        Self { value, derivative }
     }
-
-    fn minus(self, other: Self) -> Self {
-        Self::compose(self.value - other.value, [(self, 1.), (other, -1.)])
+    fn minus(mut self, other: Self) -> Self {
+        self.value = self.value - other.value;
+        for (dst, src) in self.derivative.iter_mut().zip(other.derivative) {
+            *dst = *dst - src;
+        }
+        self
     }
-
-    fn plus(self, other: Self) -> Self {
-        Self::compose(self.value + other.value, [(self, 1.), (other, 1.)])
+    fn plus(mut self, other: Self) -> Self {
+        self.value = self.value + other.value;
+        for (dst, src) in self.derivative.iter_mut().zip(other.derivative) {
+            *dst = *dst + src;
+        }
+        self
     }
-
-    fn times(self, other: Self) -> Self {
-        Self::compose(
-            self.value * other.value,
-            [(self, other.value), (other, self.value)],
-        )
+    fn times(mut self, other: Self) -> Self {
+        for (dst, src) in self.derivative.iter_mut().zip(other.derivative) {
+            *dst = self.value.mul_add(src, *dst * other.value);
+        }
+        self.value = self.value * other.value;
+        self
     }
+    fn scale(mut self, factor: S) -> Self {
+        self.value = self.value * factor;
+        for dst in &mut self.derivative {
+            *dst = *dst * factor;
+        }
+        self
+    }
+}
 
-    fn scale(self, factor: f64) -> Self {
-        Self::compose(self.value * factor, [(self, factor)])
+trait Stamp<S: Scalar> {
+    fn add(&mut self, row: usize, term: Differential<S>, storage: bool);
+    fn branch(&mut self, positive: usize, negative: usize, term: Differential<S>, storage: bool) {
+        if positive != negative {
+            self.add(positive, term, storage);
+            self.add(negative, term.scale(S::constant(-1.)), storage);
+        }
     }
 }
 
@@ -194,7 +242,7 @@ struct Assembly<'a, 'b> {
     width: usize,
 }
 
-impl Assembly<'_, '_> {
+impl Stamp<f64> for Assembly<'_, '_> {
     fn add(&mut self, row: usize, term: Differential, storage: bool) {
         let (residual, jacobian) = if storage {
             (&mut self.point.charge, &mut self.point.capacitance)
@@ -210,34 +258,58 @@ impl Assembly<'_, '_> {
             *entry += derivative;
         }
     }
+}
 
-    fn branch(&mut self, positive: usize, negative: usize, term: Differential, storage: bool) {
-        if positive != negative {
-            self.add(positive, term, storage);
-            self.add(negative, term.scale(-1.), storage);
+struct TaylorAssembly<'a, 'b> {
+    point: &'a mut TaylorPoint<'b>,
+    width: usize,
+    order: usize,
+}
+
+impl Stamp<Series> for TaylorAssembly<'_, '_> {
+    fn add(&mut self, row: usize, term: Differential<Series>, storage: bool) {
+        let (residual, jacobian) = if storage {
+            (&mut self.point.charge, &mut self.point.capacitance)
+        } else {
+            (&mut self.point.current, &mut self.point.conductance)
+        };
+        let width = self.width;
+        for degree in 0..=self.order {
+            residual[degree * width + row] += term.value.coefficient(degree);
+            let start = (degree * width + row) * width;
+            for (entry, derivative) in jacobian[start..start + width]
+                .iter_mut()
+                .zip(&term.derivative)
+            {
+                *entry += derivative.coefficient(degree);
+            }
         }
     }
 }
 
-struct OperatingPoint {
-    bias: Bias,
-    vgs: Differential,
-    vds: Differential,
-    external_vds: Differential,
-    diode: Differential,
-    recovery: Differential,
-    temperature: Differential,
-    coordinates: [Differential; MAX_ROWS],
+struct OperatingPoint<S = f64> {
+    bias: Bias<S>,
+    vgs: Coordinate<S>,
+    vds: Coordinate<S>,
+    external_vds: Coordinate<S>,
+    diode: Coordinate<S>,
+    recovery: Coordinate<S>,
+    temperature: Coordinate<S>,
+    coordinates: [Coordinate<S>; MAX_ROWS],
 }
 
 impl VdmosKernel {
-    fn operating_point(&self, prepared: &VdmosInstance, x: &[f64]) -> Result<OperatingPoint> {
+    fn operating_point<S: Scalar>(
+        &self,
+        prepared: &VdmosInstance,
+        x: &[S],
+    ) -> Result<OperatingPoint<S>> {
         if x.len() != self.layout.width {
             return Err(Error::Shape("VDMOS coordinate count"));
         }
-        let mut coordinates = [Differential::constant(0.); MAX_ROWS];
+        let mut coordinates = [Coordinate::constant(S::constant(0.)); MAX_ROWS];
         for (index, (slot, &value)) in coordinates.iter_mut().zip(x).enumerate() {
-            *slot = Differential::coordinate(value, index);
+            *slot = Coordinate::bound(value, index);
         }
         let [d, g, s] = self.layout.intrinsic.map(|index| coordinates[index]);
         let [de, _, se] = self.layout.external.map(|index| coordinates[index]);
@@ -248,13 +320,13 @@ impl VdmosKernel {
         let recovery = self
             .layout
             .recovery
-            .map_or(Differential::constant(0.), |i| coordinates[i]);
+            .map_or_else(|| Coordinate::constant(S::constant(0.)), |i| coordinates[i]);
         let temperature = self.layout.thermal.map_or_else(
-            || Differential::constant(prepared.ambient_kelvin),
+            || Coordinate::constant(S::constant(prepared.ambient_kelvin)),
             |[j, _]| coordinates[j],
         );
         if let Some([_, case]) = self.layout.thermal
-            && (!coordinates[case].value.is_finite() || coordinates[case].value <= 0.)
+            && (!coordinates[case].value.is_finite() || coordinates[case].value.value() <= 0.)
         {
             return Err(Error::Domain("VDMOS case temperature".into()));
         }
@@ -293,11 +365,11 @@ impl VdmosKernel {
             .map_err(|error| Error::Domain(error.to_string()))
     }
 
-    fn intrinsic(
+    fn intrinsic<S: Scalar>(
         &self,
-        point: &OperatingPoint,
-        evaluation: &Evaluation,
-        out: &mut Assembly<'_, '_>,
+        point: &OperatingPoint<S>,
+        evaluation: &Evaluation<S>,
+        out: &mut impl Stamp<S>,
     ) -> Result<()> {
         let [drain, gate, source] = self.layout.intrinsic;
         let de = self.layout.external[0];
@@ -356,7 +428,7 @@ impl VdmosKernel {
             }
         }
         out.branch(dp, de, diode, false);
-        let charge = |q: super::Charge, voltage| {
+        let charge = |q: super::Charge<S>, voltage| {
             Differential::compose(
                 q.value,
                 [(voltage, q.d_voltage), (point.temperature, q.d_temperature)],
@@ -379,12 +451,12 @@ impl VdmosKernel {
         Ok(())
     }
 
-    fn series_and_heat(
+    fn series_and_heat<S: Scalar>(
         &self,
-        point: &OperatingPoint,
-        evaluation: &Evaluation,
+        point: &OperatingPoint<S>,
+        evaluation: &Evaluation<S>,
         ambient: f64,
-        out: &mut Assembly<'_, '_>,
+        out: &mut impl Stamp<S>,
     ) -> Result<()> {
         let [de, ge, se] = self.layout.external;
         let [drain, gate, source] = self.layout.intrinsic;
@@ -399,7 +471,7 @@ impl VdmosKernel {
         );
         let mut branch = |external: usize,
                           internal: usize,
-                          conductance: Conductance,
+                          conductance: Conductance<S>,
                           dissipates: bool|
          -> Result<()> {
             if external == internal {
@@ -411,7 +483,9 @@ impl VdmosKernel {
             let value = conductance
                 .value
                 .ok_or_else(|| Error::Domain("series branch collapsed at bias".into()))?;
-            let drop = point.coordinates[external].minus(point.coordinates[internal]);
+            let drop = point.coordinates[external]
+                .minus(point.coordinates[internal])
+                .scale(S::constant(1.));
             let differential_g = Differential::compose(
                 value,
                 [
@@ -443,11 +517,11 @@ impl VdmosKernel {
                 .minus(tcase)
                 .scale(evaluation.heat.junction_to_case);
             out.branch(junction, case, heat, false);
-            out.add(junction, power.scale(-1.), false);
+            out.add(junction, power.scale(S::constant(-1.)), false);
             out.add(
                 case,
                 tcase
-                    .minus(Differential::constant(ambient))
+                    .minus(Coordinate::constant(S::constant(ambient)))
                     .scale(evaluation.heat.case_to_ambient),
                 false,
             );
@@ -506,6 +580,44 @@ impl Kernel for VdmosKernel {
         out.conductance.fill(0.);
         out.capacitance.fill(0.);
         let mut assembly = Assembly { point: out, width };
+        self.intrinsic(&point, &evaluation, &mut assembly)?;
+        self.series_and_heat(&point, &evaluation, prepared.ambient_kelvin, &mut assembly)
+    }
+
+    fn evaluate_taylor(
+        &self,
+        prepared: &Self::Prepared,
+        input: TaylorInput<'_>,
+        out: &mut TaylorPoint<'_>,
+    ) -> Result<()> {
+        let width = self.layout.width;
+        let mut coordinates = [Series::default(); MAX_ROWS];
+        for (index, coordinate) in coordinates[..width].iter_mut().enumerate() {
+            *coordinate = input.coordinate(width, index)?;
+        }
+        let rows = width * (input.order + 1);
+        let matrices = rows * width;
+        if out.current.len() != rows
+            || out.charge.len() != rows
+            || out.conductance.len() != matrices
+            || out.capacitance.len() != matrices
+        {
+            return Err(Error::Shape("VDMOS Taylor point"));
+        }
+        let point = self.operating_point(prepared, &coordinates[..width])?;
+        let evaluation = self
+            .device(prepared)
+            .evaluate_physical(point.bias)
+            .map_err(|error| Error::Domain(error.to_string()))?;
+        out.current.fill(0.);
+        out.charge.fill(0.);
+        out.conductance.fill(0.);
+        out.capacitance.fill(0.);
+        let mut assembly = TaylorAssembly {
+            point: out,
+            width,
+            order: input.order,
+        };
         self.intrinsic(&point, &evaluation, &mut assembly)?;
         self.series_and_heat(&point, &evaluation, prepared.ambient_kelvin, &mut assembly)
     }
