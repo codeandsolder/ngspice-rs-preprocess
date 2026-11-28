@@ -17,9 +17,9 @@ use model_normalize_ngspice::{
 };
 use model_preprocess_simplis::{
     lower_spice_expression,
-    source_dialect::{DialectContext, SourceDialect},
+    source_dialect::{DialectContext, SourceDialect, model_mapping::ModelSelection},
 };
-use std::fmt::Write as _;
+use std::{collections::BTreeMap, fmt::Write as _};
 
 mod analysis;
 mod bsim4_catalog;
@@ -482,10 +482,12 @@ fn depletion_mode(
     for statement in statements {
         budget.charge(Resource::Statements, 1)?;
         budget.charge(Resource::ScannedBytes, statement.text.len())?;
-        if !matches!(
-            analysis_plan::command(&statement.text).as_str(),
-            ".OPTION" | ".OPTIONS" | ".OPT"
-        ) {
+        if statement.context.language != SourceDialect::Hspice
+            || !matches!(
+                analysis_plan::command(&statement.text).as_str(),
+                ".OPTION" | ".OPTIONS" | ".OPT"
+            )
+        {
             continue;
         }
         let tail = statement
@@ -510,12 +512,15 @@ fn depletion_mode(
     Ok(mode.unwrap_or(2))
 }
 
-type LoweredExpansion = (
-    Vec<u8>,
-    Vec<crate::OriginLine>,
-    Vec<model_preprocess_simplis::source_dialect::model_mapping::ModelSelection>,
-    DeckOptions,
-);
+type SelectedModels = BTreeMap<usize, ModelSelection>;
+
+struct LoweredExpansion {
+    bytes: Vec<u8>,
+    origins: Vec<crate::OriginLine>,
+    /// Keys index the emitted logical source rows before occurrence binding.
+    selections: SelectedModels,
+    state: DeckOptions,
+}
 
 fn append_lowered_line(
     bytes: &mut Vec<u8>,
@@ -551,7 +556,7 @@ fn lower_expansion(
         statements.len() == input_origins.len(),
         "HSPICE statement origin mismatch"
     );
-    let mut selections = Vec::new();
+    let mut selections = SelectedModels::new();
     let mut scope = Vec::new();
     let mut bytes = Vec::new();
     let mut origins = Vec::new();
@@ -600,7 +605,7 @@ fn lower_expansion(
                 budget,
             )
             .with_context(|| format!("{}:{}", statement.source, statement.first_line))?;
-            selections.push(selection);
+            selections.insert(origins.len(), selection);
             text
         } else {
             match analysis_plan::command(&statement.text).as_str() {
@@ -634,7 +639,12 @@ fn lower_expansion(
         append_lowered_line(&mut bytes, &mut origins, &text, origin, limit, budget)?;
     }
     ensure!(state.depth == 0, "unclosed HSPICE subcircuit");
-    Ok((bytes, origins, selections, state))
+    Ok(LoweredExpansion {
+        bytes,
+        origins,
+        selections,
+        state,
+    })
 }
 
 fn add_catalog(
@@ -710,19 +720,12 @@ pub(super) fn prepare(
         options.output_bytes,
         budget,
     )?;
-    let (mut bytes, mut origins, selections, state) =
-        lower_expansion(&statements, origins, options.output_bytes, budget)?;
+    let lowered = lower_expansion(&statements, origins, options.output_bytes, budget)?;
+    let (mut bytes, mut origins) = hierarchy::bind(&lowered, options.output_bytes, budget)?;
+    let LoweredExpansion {
+        selections, state, ..
+    } = lowered;
     {
-        (bytes, origins) = hierarchy::bind(
-            &bytes,
-            &origins,
-            state.parhier.unwrap_or_default(),
-            state.xmult_in_exp.unwrap_or_default(),
-            &state.mos,
-            options.output_bytes,
-            budget,
-        )?;
-
         // HSPICE defaults to 25 C for both device nominal and analysis
         // temperatures. Native ngspice defaults to 27 C.
         let mut defaults = Vec::new();
@@ -757,7 +760,6 @@ pub(super) fn prepare(
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
     }
-    bytes = models::resolve_breakdown(&bytes, RootKind::Deck, options.output_bytes, budget)?;
     let mut bundle = native_bundle(
         root.path.clone(),
         request.format,
@@ -767,6 +769,6 @@ pub(super) fn prepare(
         None,
         budget,
     )?;
-    bundle.model_selections = selections;
+    bundle.model_selections = selections.into_values().collect();
     Ok(bundle)
 }

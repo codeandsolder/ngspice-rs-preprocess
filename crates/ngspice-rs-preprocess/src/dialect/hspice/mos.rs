@@ -1,9 +1,8 @@
 //! Resolve HSPICE MOS model families before native loading. Bin bounds
 //! are source-only metadata; the selected card receives an exact name.
-use super::bsim4_catalog;
+use super::{SelectedModels, bsim4_catalog};
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
-    linked_source::RootKind,
     model_card::{
         ModelCard, ModelParameter, instance_fields, instance_vector_fields, parse_model_card,
         parse_spice_constant,
@@ -13,7 +12,8 @@ use model_normalize_ngspice::{
 };
 use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::{
-    lower_spice_expression, source_dialect::model_mapping::ModelSelection,
+    lower_spice_expression,
+    source_dialect::model_mapping::{Device, ModelSelection},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -146,14 +146,20 @@ pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
     Ok(())
 }
 
-pub struct Candidate {
+#[derive(Clone)]
+pub(super) struct ModelAlias<'a> {
     pub alias: String,
+    pub selection: &'a ModelSelection,
+}
+
+pub(super) struct Candidate<'a> {
+    pub model: ModelAlias<'a>,
     pub exact: bool,
 }
 
-pub struct Pending {
+pub(super) struct Pending<'a> {
     pub source_name: String,
-    pub candidates: Vec<Candidate>,
+    pub candidates: Vec<Candidate<'a>>,
 }
 
 type Fields = BTreeMap<String, Option<String>>;
@@ -277,32 +283,33 @@ fn geometry(library: &ModelLibrary, fields: &Fields, options: &Options) -> Resul
     Ok((l, if per_finger { w / nf } else { w }))
 }
 
-fn select<'a>(
-    pending: &Pending,
+fn select<'a, 's>(
+    pending: &Pending<'s>,
     models: &'a BTreeMap<String, &ModelCard>,
     library: &ModelLibrary,
     fields: &Fields,
     options: &Options,
     budget: &WorkBudget,
-) -> Result<&'a ModelCard> {
+) -> Result<(&'a ModelCard, &'s ModelSelection)> {
     let (length, width) = geometry(library, fields, options)?;
     for candidate in &pending.candidates {
         budget.charge(Resource::EvaluationSteps, 1)?;
         let card = models
-            .get(&candidate.alias.to_ascii_lowercase())
+            .get(&candidate.model.alias.to_ascii_lowercase())
             .context("missing bound MOS candidate")?;
+        let selection = candidate.model.selection;
         ensure!(
-            matches!(card.family.to_ascii_uppercase().as_str(), "NMOS" | "PMOS"),
+            selection.mapping.device == Device::Bsim4,
             "non-MOS model referenced by HSPICE MOS occurrence"
         );
         if candidate.exact {
-            return Ok(card);
+            return Ok((card, selection));
         }
         let fields = model_fields(card, budget)?;
         if axis_matches(library, &fields, 'L', length)?
             && axis_matches(library, &fields, 'W', width)?
         {
-            return Ok(card);
+            return Ok((card, selection));
         }
     }
     bail!(
@@ -333,16 +340,20 @@ fn initial_vector(expression: &str) -> Result<String> {
 fn bind_instance(
     text: &str,
     model_end: usize,
-    pending: &Pending,
+    pending: &Pending<'_>,
     models: &BTreeMap<String, &ModelCard>,
     library: &ModelLibrary,
     options: &Options,
     budget: &WorkBudget,
 ) -> Result<String> {
     let mut fields = instance_parameters(text, model_end, options, library)?;
-    let card = select(pending, models, library, &fields, options, budget)?;
-    let model = model_fields(card, budget)?;
-    let mask = version_mask(field(&model, "VERSION").context("missing bound BSIM4 version")?)?;
+    let (card, selection) = select(pending, models, library, &fields, options, budget)?;
+    let mask = version_mask(
+        selection
+            .effective_version
+            .as_deref()
+            .context("missing bound BSIM4 version")?,
+    )?;
     fields.remove("WNFLAG");
     let spans = statement_token_spans(text)?;
     let start = spans.get(5).context("missing MOS model token")?.start;
@@ -366,37 +377,21 @@ fn bind_instance(
     Ok(out)
 }
 
-pub fn finish(
+pub(super) fn finish(
     rows: &mut [(String, usize)],
-    requests: &BTreeMap<String, Pending>,
+    requests: &BTreeMap<String, Pending<'_>>,
+    selections: &SelectedModels,
+    library: &ModelLibrary,
     options: &Options,
     budget: &WorkBudget,
 ) -> Result<()> {
     budget.charge(Resource::Statements, rows.len())?;
-    if requests.is_empty()
-        && !rows.iter().skip(1).any(|(row, _)| {
-            super::analysis_plan::command(row) == ".MODEL"
-                && row.split_whitespace().nth(2).is_some_and(|family| {
-                    family.eq_ignore_ascii_case("NMOS") || family.eq_ignore_ascii_case("PMOS")
-                })
-        })
-    {
-        return Ok(());
-    }
-    let mut linked = String::new();
-    for (row, _) in rows.iter() {
-        budget.charge(Resource::ScannedBytes, row.len())?;
-        budget.charge(Resource::EmittedBytes, row.len().saturating_add(1))?;
-        writeln!(linked, "{row}")?;
-    }
-    let library =
-        ModelLibrary::parse_source_with_budget(linked.as_bytes(), RootKind::Deck, budget.clone())?;
     let models = library
         .models
         .iter()
         .map(|model| (model.card.name.to_ascii_lowercase(), &model.card))
         .collect::<BTreeMap<_, _>>();
-    for (row, _) in rows.iter_mut().skip(1) {
+    for (row, declaration) in rows.iter_mut().skip(1) {
         budget.charge(Resource::Statements, 1)?;
         budget.charge(Resource::ScannedBytes, row.len())?;
         let command = super::analysis_plan::command(row);
@@ -406,18 +401,19 @@ pub fn finish(
             let pending = requests
                 .get(&row[range.clone()])
                 .context("unbound HSPICE MOS occurrence")?;
-            *row = bind_instance(row, range.end, pending, &models, &library, options, budget)?;
-        } else if command == ".MODEL" {
+            *row = bind_instance(row, range.end, pending, &models, library, options, budget)?;
+        } else if command == ".MODEL"
+            && selections
+                .get(declaration)
+                .is_some_and(|selection| selection.mapping.device == Device::Bsim4)
+        {
             let mut card = parse_model_card(row, 0, &[])?;
-            if matches!(card.family.to_ascii_uppercase().as_str(), "NMOS" | "PMOS") {
-                card.parameters.retain(|field: &ModelParameter| {
-                    !BIN_FIELDS
-                        .iter()
-                        .any(|name| field.name.eq_ignore_ascii_case(name))
-                });
-                *row =
-                    super::models::render(&card, &card.name, budget, |value| Ok(value.to_owned()))?;
-            }
+            card.parameters.retain(|field: &ModelParameter| {
+                !BIN_FIELDS
+                    .iter()
+                    .any(|name| field.name.eq_ignore_ascii_case(name))
+            });
+            *row = super::models::render(&card, &card.name, budget, |value| Ok(value.to_owned()))?;
         }
     }
     Ok(())

@@ -991,3 +991,99 @@ V1 a 0 'outside(2)'
     );
     Ok(())
 }
+
+#[test]
+fn occurrence_model_binding_retains_typed_declarations_across_scopes() -> Result<()> {
+    use model_preprocess_simplis::source_dialect::model_mapping::Device;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("typed.sp");
+    fs::write(
+        &root,
+        r#"Typed model declaration identity
+.option parhier=local
+.param scale=1 f(x)='scale*x'
+Vd diode_node 0 0.6
+Vm mos_node 0 0.8
+Vg gate 0 1
+Xd diode_node dcell
+Xm mos_node gate mcell
+.subckt dcell p
+.param bv=0 isat=1e-14
+D1 p 0 shared
+.model shared D (IS='f(isat)' BV='bv')
+.ends dcell
+.subckt mcell d g
+M1 d g 0 0 shared L=1u W=2u
+.model shared NMOS LEVEL=54 VERSION=4.7 VTH0=0.4
+.ends mcell
+.op
+.end
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let [diode, mos] = bundle.model_selections.as_slice() else {
+        anyhow::bail!("expected exactly two typed model selections");
+    };
+    assert_eq!(diode.card.name.to_ascii_lowercase(), "shared");
+    assert_eq!(mos.card.name.to_ascii_lowercase(), "shared");
+    assert_eq!(diode.mapping.device, Device::Diode3);
+    assert_eq!(mos.mapping.device, Device::Bsim4);
+    assert_eq!(mos.effective_version.as_deref(), Some("4.70"));
+    assert_ne!(diode.scope, mos.scope);
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    measure_native(dir.path(), native, "op\nwrdata actual.dat i(vd) i(vm)")?;
+    let reference = tempfile::tempdir()?;
+    measure_native(
+        reference.path(),
+        r#"Independent native model cards
+.options TNOM=25
+.temp 25
+Vd diode_node 0 0.6
+Vm mos_node 0 0.8
+Vg gate 0 1
+D1 diode_node 0 dmodel
+.model dmodel D (LEVEL=3 IS=1e-14 FC=0 FCS=0)
+M1 mos_node gate 0 0 mmodel L=1u W=2u
+.model mmodel NMOS LEVEL=14 VERSION=4.70 VTH0=0.4
+.op
+.end
+"#,
+        "op\nwrdata expected.dat i(vd) i(vm)",
+    )?;
+    let actual = values(dir.path(), "actual.dat")?;
+    let expected = values(reference.path(), "expected.dat")?;
+    assert_eq!(actual.len(), expected.len());
+    for (&a, &e) in actual[0][1..].iter().zip(&expected[0][1..]) {
+        ensure!(
+            (a - e).abs() <= 1e-12 + e.abs() * 1e-8,
+            "{a:e} != {e:e}\n{native}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn typed_model_binding_rejects_cross_family_instance_references() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("mismatch.sp");
+    for (card, instance, diagnostic) in [
+        (
+            ".model wrong D(IS=1e-14)",
+            "M1 a b 0 0 wrong L=1u W=2u",
+            "non-MOS model",
+        ),
+        (
+            ".model wrong NMOS LEVEL=54 VERSION=4.7",
+            "D1 a 0 wrong",
+            "non-diode model",
+        ),
+    ] {
+        fs::write(
+            &root,
+            format!("Wrong model family\n{card}\n{instance}\n.end\n"),
+        )?;
+        let error = compile(&root, InputFormat::HspiceDeck).expect_err("wrong model family");
+        ensure!(format!("{error:#}").contains(diagnostic), "{error:#}");
+    }
+    Ok(())
+}

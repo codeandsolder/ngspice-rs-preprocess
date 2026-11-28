@@ -1,7 +1,7 @@
 //! Explicit HSPICE occurrence bindings. Symbolic aliases avoid evaluating
 //! parameters at preparation time, so native analysis still owns expressions.
 //! Electrical instance names and terminal identities are never flattened.
-use super::{analysis_plan, map_values, models, mos};
+use super::{LoweredExpansion, SelectedModels, analysis_plan, map_values, models, mos};
 use crate::OriginLine;
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
@@ -11,7 +11,7 @@ use model_normalize_ngspice::{
     statement_token_spans,
 };
 use model_preprocess_command::{Resource, WorkBudget};
-use model_preprocess_simplis::rewrite_parameter_symbols;
+use model_preprocess_simplis::{rewrite_parameter_symbols, source_dialect::model_mapping::Device};
 use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -233,18 +233,20 @@ fn multiplier_card(text: &str, factor: Option<&str>) -> Result<String> {
 }
 
 #[derive(Default)]
-struct ModelFrame {
-    exact: Names,
-    bins: BTreeMap<String, Vec<String>>,
+struct ModelFrame<'a> {
+    exact: BTreeMap<String, mos::ModelAlias<'a>>,
+    bins: BTreeMap<String, Vec<mos::ModelAlias<'a>>>,
 }
 
-impl ModelFrame {
-    fn insert(&mut self, name: String, alias: String, mos: bool) -> Result<()> {
+impl<'a> ModelFrame<'a> {
+    fn insert(&mut self, name: String, alias: mos::ModelAlias<'a>) -> Result<()> {
         ensure!(
             !self.exact.contains_key(&name),
             "duplicate HSPICE model {name}"
         );
-        if mos && let Some((base, extension)) = name.split_once('.') {
+        if alias.selection.mapping.device == Device::Bsim4
+            && let Some((base, extension)) = name.split_once('.')
+        {
             ensure!(
                 !base.is_empty() && !extension.is_empty(),
                 "invalid HSPICE bin name {name}"
@@ -264,6 +266,7 @@ struct Binder<'a> {
     source: &'a ModelLibrary,
     index: SubcircuitIndex,
     lines: &'a [&'a str],
+    selections: &'a SelectedModels,
     definitions: Vec<Definition>,
     known_functions: Arc<BTreeSet<String>>,
     precedence: Precedence,
@@ -271,15 +274,15 @@ struct Binder<'a> {
     prefix: String,
     serial: usize,
     active: Vec<usize>,
-    model_frames: Vec<(usize, ModelFrame)>,
-    pending_mos: BTreeMap<String, mos::Pending>,
+    model_frames: Vec<(usize, ModelFrame<'a>)>,
+    pending_mos: BTreeMap<String, mos::Pending<'a>>,
     parameters: Rows,
     emitted_definitions: Rows,
     emitted_bytes: usize,
     limit: usize,
 }
 
-impl Binder<'_> {
+impl<'a> Binder<'a> {
     fn account(&mut self, text: String, line: usize) -> Result<(String, usize)> {
         self.budget.charge(Resource::GeneratedNodes, 1)?;
         self.budget
@@ -383,13 +386,23 @@ impl Binder<'_> {
                 continue;
             }
             let card = parse_model_card(self.lines[line], line + 1, &[])?;
-            let mos = matches!(card.family.to_ascii_uppercase().as_str(), "NMOS" | "PMOS");
-            let alias = if scope == 0 && !mos {
+            let selection = self
+                .selections
+                .get(&line)
+                .context("missing typed model selection")?;
+            let alias = if scope == 0 && selection.mapping.device != Device::Bsim4 {
                 card.name.clone()
             } else {
                 self.fresh('d')?
             };
-            aliases.insert(card.name.to_ascii_uppercase(), alias.clone(), mos)?;
+            self.budget.charge(Resource::EmittedBytes, alias.len())?;
+            aliases.insert(
+                card.name.to_ascii_uppercase(),
+                mos::ModelAlias {
+                    alias: alias.clone(),
+                    selection,
+                },
+            )?;
             let text = models::render(&card, &alias, self.budget, |value| names.expression(value))?;
             let row = self.account(text, line)?;
             self.parameters.push(row);
@@ -398,7 +411,12 @@ impl Binder<'_> {
         Ok(())
     }
 
-    fn candidates(&self, mut scope: usize, model: &str, mos: bool) -> Result<Vec<mos::Candidate>> {
+    fn candidates(
+        &self,
+        mut scope: usize,
+        model: &str,
+        mos: bool,
+    ) -> Result<Vec<mos::Candidate<'a>>> {
         let mut candidates = Vec::new();
         loop {
             self.budget
@@ -411,9 +429,10 @@ impl Binder<'_> {
                 .context("inactive lexical HSPICE model scope")?;
             if let Some(alias) = aliases.exact.get(model) {
                 self.budget.charge(Resource::GeneratedNodes, 1)?;
-                self.budget.charge(Resource::EmittedBytes, alias.len())?;
+                self.budget
+                    .charge(Resource::EmittedBytes, alias.alias.len())?;
                 candidates.push(mos::Candidate {
-                    alias: alias.clone(),
+                    model: alias.clone(),
                     exact: true,
                 });
                 break;
@@ -421,9 +440,10 @@ impl Binder<'_> {
             if mos && let Some(bins) = aliases.bins.get(model) {
                 for alias in bins {
                     self.budget.charge(Resource::GeneratedNodes, 1)?;
-                    self.budget.charge(Resource::EmittedBytes, alias.len())?;
+                    self.budget
+                        .charge(Resource::EmittedBytes, alias.alias.len())?;
                     candidates.push(mos::Candidate {
-                        alias: alias.clone(),
+                        model: alias.clone(),
                         exact: false,
                     });
                 }
@@ -455,7 +475,12 @@ impl Binder<'_> {
             );
             marker
         } else {
-            candidates[0].alias.clone()
+            let model = &candidates[0].model;
+            ensure!(
+                model.selection.mapping.letter == 'D',
+                "non-diode model referenced by HSPICE diode occurrence"
+            );
+            model.alias.clone()
         };
         let mut output = text.to_owned();
         output.replace_range(range.clone(), &replacement);
@@ -612,20 +637,41 @@ impl Binder<'_> {
         result.append(&mut ends);
         super::analysis::validate_dc_sources(&result)?;
         let mos_options = mos_options.rewrite(|value| names.expression(value), self.budget)?;
-        mos::finish(&mut result, &self.pending_mos, &mos_options, self.budget)?;
+        let library = bound_model_library(&result, self.budget)?;
+        mos::finish(
+            &mut result,
+            &self.pending_mos,
+            self.selections,
+            &library,
+            &mos_options,
+            self.budget,
+        )?;
+        models::resolve_breakdown(&mut result, self.selections, &library, self.budget)?;
         Ok(result)
     }
 }
 
-pub fn bind(
-    bytes: &[u8],
-    origins: &[OriginLine],
-    precedence: Precedence,
-    xmult_in_exp: bool,
-    mos_options: &mos::Options,
+fn bound_model_library(rows: &Rows, budget: &WorkBudget) -> Result<ModelLibrary> {
+    let mut linked = String::new();
+    for (row, _) in rows {
+        budget.charge(Resource::ScannedBytes, row.len())?;
+        budget.charge(Resource::EmittedBytes, row.len().saturating_add(1))?;
+        writeln!(linked, "{row}")?;
+    }
+    ModelLibrary::parse_source_with_budget(linked.as_bytes(), RootKind::Deck, budget.clone())
+}
+
+pub(super) fn bind(
+    lowered: &LoweredExpansion,
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<(Vec<u8>, Vec<OriginLine>)> {
+    let LoweredExpansion {
+        bytes,
+        origins,
+        selections,
+        state,
+    } = lowered;
     budget.charge(Resource::ScannedBytes, bytes.len())?;
     let text = std::str::from_utf8(bytes)?;
     budget.charge(Resource::Statements, text.lines().count())?;
@@ -661,10 +707,11 @@ pub fn bind(
         source: &source,
         index,
         lines: &lines,
+        selections,
         definitions,
         known_functions,
-        precedence,
-        xmult_in_exp,
+        precedence: state.parhier.unwrap_or_default(),
+        xmult_in_exp: state.xmult_in_exp.unwrap_or_default(),
         prefix,
         serial: 0,
         active: Vec::new(),
@@ -675,7 +722,7 @@ pub fn bind(
         emitted_bytes: 0,
         limit,
     };
-    let rows = binder.finish(mos_options)?;
+    let rows = binder.finish(&state.mos)?;
     let mut output = Vec::new();
     let mut mapped = Vec::new();
     for (text, line) in rows {
