@@ -17,16 +17,17 @@ pub use identity::{
     DeviceIdentity, ResolvedDeviceSource, ScopedStatement, resolve_device_identities,
 };
 
-/// Explicit power-expression capability of the consumer. Native output never
-/// relies on solver-specific intrinsics. The prepared target selects the
-/// typed SIMetrix scalar/runtime operations (version 1 of that contract).
+/// Explicit power-expression capability of the consumer.
+///
+/// Native output never relies on solver-specific intrinsics. The prepared target
+/// selects typed `SIMetrix` scalar/runtime operations (version 1 of that contract).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PowerTarget {
     /// Portable native ngspice output, including the existing guarded laws.
     #[default]
     NativeNgspice,
-    /// Consumer implements the explicit SIMetrix power intrinsic contract.
+    /// Consumer implements the explicit `SIMetrix` power intrinsic contract.
     PreparedSolverV1,
 }
 
@@ -971,16 +972,14 @@ fn runtime_law(
 fn prepared_expression(input: &str, limit: usize, budget: &WorkBudget) -> Result<String> {
     let trimmed = input.trim();
     // Keep an outer expression delimiter, which carries source-card syntax.
-    let (body, wrapper) =
-        if trimmed.starts_with('{') && group_end(trimmed, 0, budget)? + 1 == trimmed.len() {
-            (&trimmed[1..trimmed.len() - 1], Some(('{', '}')))
-        } else if trimmed.starts_with('\'')
-            && trimmed[1..].find('\'') == Some(trimmed.len().saturating_sub(2))
-        {
-            (&trimmed[1..trimmed.len() - 1], Some(('{', '}')))
-        } else {
-            (trimmed, None)
-        };
+    let wrapped = (trimmed.starts_with('{') && group_end(trimmed, 0, budget)? + 1 == trimmed.len())
+        || (trimmed.starts_with('\'')
+            && trimmed[1..].find('\'') == Some(trimmed.len().saturating_sub(2)));
+    let body = if wrapped {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
     let lowered = power::lower_runtime(body, limit, budget)?;
     let lowered = rewrite_expression(
         &lowered,
@@ -989,13 +988,13 @@ fn prepared_expression(input: &str, limit: usize, budget: &WorkBudget) -> Result
         limit,
         budget,
     )?;
-    if let Some((open, close)) = wrapper {
+    if wrapped {
         budget.charge(Resource::EmittedBytes, lowered.len().saturating_add(2))?;
         ensure!(
             lowered.len().saturating_add(2) <= limit,
             "source power expansion byte budget exceeded"
         );
-        Ok(format!("{open}{lowered}{close}"))
+        Ok(format!("{{{lowered}}}"))
     } else {
         Ok(lowered)
     }
