@@ -377,6 +377,73 @@ fn switch_identity_tracks_source_scope_and_collision_free_native_name() -> Resul
 }
 
 #[test]
+fn continuous_switch_defaults_preserve_control_units() -> Result<()> {
+    let source = br"PSpice continuous default switch thresholds
+I1 0 c 0
+V1 c 0 0
+V2 supply 0 1
+V3 vc 0 0
+W1 supply outi V1 IMOD
+S1 supply outv vc 0 VMOD
+R1 outi 0 1k
+R2 outv 0 1k
+.model IMOD ISWITCH
+.model VMOD VSWITCH
+.control
+set wr_singlescale
+set wr_vecnames
+dc I1 -0.5m 1.5m 0.25m
+wrdata response.dat v(outi) i(V1)
+quit
+.endc
+.end
+";
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.cir");
+    fs::write(&path, source)?;
+    let prepared = prepare_source(&path, InputFormat::PspiceDeck)?;
+    let cards = model_normalize_ngspice::model_card::parse_model_cards(&prepared.primary.bytes)?;
+    for (name, expected_on) in [("IMOD", 1e-3_f64), ("VMOD", 1_f64)] {
+        let card = cards
+            .iter()
+            .find(|card| card.name.eq_ignore_ascii_case(name))
+            .context("missing continuous switch model")?;
+        assert_eq!(card.family, "pswitch");
+        for (field, expected) in [
+            ("cntl_on", expected_on),
+            ("cntl_off", 0.),
+            ("r_on", 1.),
+            ("r_off", 1e6),
+        ] {
+            let raw = card
+                .parameters
+                .iter()
+                .rev()
+                .find(|parameter| parameter.name.eq_ignore_ascii_case(field))
+                .and_then(|parameter| parameter.expression.as_deref())
+                .context("missing continuous switch default")?;
+            let actual = model_normalize_ngspice::model_card::parse_spice_constant(raw)?;
+            assert_eq!(actual.to_bits(), expected.to_bits(), "{name}.{field}");
+        }
+    }
+    if let Some(values) = rows(
+        &directory.path().join("native"),
+        &prepared.primary.bytes,
+        false,
+    )? {
+        assert_eq!(values.len(), 9);
+        for row in values {
+            let x = (row[0] / 1e-3).clamp(0., 1.);
+            let weight = x * x * 2.0_f64.mul_add(-x, 3.);
+            let resistance = (-1e6_f64.ln()).mul_add(weight, 1e6_f64.ln()).exp();
+            close(row[1], 1000. / (1000. + resistance));
+            close(row[2] * 1e3, row[0] * 1e3);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn continuous_current_switch_matches_vendor_cubic_log_resistance() -> Result<()> {
     let source = br"PSpice current switch
 I1 0 c -1

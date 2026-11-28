@@ -337,10 +337,10 @@ impl SwitchLaw {
                 }
             }
             Self::ContinuousVoltage | Self::ContinuousCurrent => {
-                let (on, off) = if matches!(self, Self::ContinuousVoltage) {
-                    ("von", "voff")
+                let (on, off, default_on) = if matches!(self, Self::ContinuousVoltage) {
+                    ("von", "voff", "1")
                 } else {
-                    ("ion", "ioff")
+                    ("ion", "ioff", "1m")
                 };
                 // PSpice specifies cubic log-resistance interpolation for
                 // both voltage and current control. Native aswitch is linear
@@ -355,7 +355,7 @@ impl SwitchLaw {
                     rename_parameter(card, from, to);
                 }
                 for (name, value) in [
-                    ("cntl_on", "1"),
+                    ("cntl_on", default_on),
                     ("cntl_off", "0"),
                     ("r_on", "1"),
                     ("r_off", "1e6"),
