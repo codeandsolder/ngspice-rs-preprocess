@@ -220,8 +220,14 @@ pub fn capture_linked(
             .map_or(bytes.len(), |index| index + 1)
     };
     let body = &bytes[offset..];
-    let normalized = lexical::normalize_nbsp(body);
-    let statements = lexical::statements(normalized.as_deref().unwrap_or(body))?;
+    let dollars = |line: usize| {
+        linked
+            .dialect_at(line + skip)
+            .map(lexical::DollarMode::for_dialect)
+            .context("missing linked digital lexical dialect")
+    };
+    let normalized = lexical::normalize_nbsp_with(body, dollars)?;
+    let statements = lexical::statements_with(normalized.as_deref().unwrap_or(body), dollars)?;
     budget.charge(Resource::GeneratedNodes, linked.origins.len())?;
     let origins = (skip + 1..=linked.origins.len()).collect::<Vec<_>>();
     let dialects = SourceDialects::Linked(linked);
@@ -263,6 +269,19 @@ mod tests {
                 .as_deref(),
             Some("{local_delay}")
         );
+        let paths = declaration.bind_timing(
+            super::super::digital_corners::TimingScales::default(),
+            |location, field| match (location.scope.as_slice(), field.expression.as_deref()) {
+                ([], Some("{global_delay}")) => Ok(10.),
+                ([cell], Some("{local_delay}")) if cell == "cell" => Ok(20.),
+                _ => anyhow::bail!("unexpected declaration scope or expression"),
+            },
+            &budget,
+        )?;
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].corners.typical.to_bits(), 10_f64.to_bits());
+        assert_eq!(paths[1].corners.typical.to_bits(), 20_f64.to_bits());
+        assert_eq!(paths[1].corners.maximum.to_bits(), 32_f64.to_bits());
         assert_eq!(declaration.io[0].location.input_line, 5);
         assert_eq!(
             declaration.io[0].declaration.assignments[0]
@@ -283,7 +302,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let root = dir.path().join("root.cir");
         let body = dir.path().join("gate.inc");
-        fs::write(&body, "U1 BUF p g a y local IO\n")?;
+        fs::write(
+            &body,
+            "U1 BUF ; comment\n+ $G_DPWR $G_DGND\u{a0}$D_HI y local IO\n",
+        )?;
         fs::write(
             &root,
             concat!(
@@ -328,6 +350,9 @@ mod tests {
         assert_eq!((left.line, right.line), (1, 1));
         assert_ne!(left.visit, right.visit);
         assert_ne!(left.scope, right.scope);
+        assert_eq!(one.instance.declaration.pins[0].node, "$G_DPWR");
+        assert_eq!(one.instance.declaration.pins[1].node, "$G_DGND");
+        assert_eq!(one.instance.declaration.pins[2].node, "$D_HI");
         assert_eq!(one.instance.location.scope, ["one"]);
         assert_eq!(two.instance.location.scope, ["two"]);
         assert_eq!(one.timing[0].location, two.timing[0].location);

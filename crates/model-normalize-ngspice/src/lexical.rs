@@ -10,6 +10,22 @@ pub fn ensure_textual(input: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Dollar tokens are comments in native/HSPICE syntax but identifiers in PSpice.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DollarMode {
+    Comment,
+    Identifier,
+}
+
+impl DollarMode {
+    pub(crate) const fn for_dialect(dialect: crate::linked_source::SourceDialect) -> Self {
+        match dialect {
+            crate::linked_source::SourceDialect::Pspice => Self::Identifier,
+            _ => Self::Comment,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Context {
     quote: Option<u8>,
@@ -37,24 +53,25 @@ impl Context {
         }
     }
 
-    fn comment(&self, line: &[u8], index: usize, separated: bool) -> bool {
+    fn comment(&self, line: &[u8], index: usize, separated: bool, dollars: DollarMode) -> bool {
         if self.quote.is_some() {
             return false;
         }
         match line[index] {
             b';' => true,
-            b'$' => self.braces == 0 && separated,
+            b'$' => dollars == DollarMode::Comment && self.braces == 0 && separated,
             b'/' => line.get(index + 1) == Some(&b'/'),
             _ => false,
         }
     }
 }
 
-const fn comment_line(line: &[u8]) -> bool {
-    matches!(
-        line.trim_ascii_start(),
-        [] | [b'*' | b'#' | b'$' | b';', ..] | [b'/', b'/', ..]
-    )
+const fn comment_line(line: &[u8], dollars: DollarMode) -> bool {
+    match line.trim_ascii_start() {
+        [] | [b'*' | b'#' | b';', ..] | [b'/', b'/', ..] => true,
+        [b'$', ..] => matches!(dollars, DollarMode::Comment),
+        _ => false,
+    }
 }
 
 pub fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
@@ -94,6 +111,13 @@ impl Statement {
 }
 
 pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
+    statements_with(input, |_| Ok(DollarMode::Comment))
+}
+
+pub(crate) fn statements_with(
+    input: &[u8],
+    mut dollars: impl FnMut(usize) -> Result<DollarMode>,
+) -> Result<Vec<Statement>> {
     ensure_textual(input)?;
     let mut statements: Vec<Statement> = Vec::new();
     let mut offset = 0;
@@ -102,7 +126,8 @@ pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
         let start = offset;
         offset += physical.len();
         let (body, _) = split_line_ending(physical);
-        if comment_line(body) {
+        let dollars = dollars(index + 1)?;
+        if comment_line(body, dollars) {
             continue;
         }
         let trimmed = body.trim_ascii_start();
@@ -118,6 +143,7 @@ pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
                 body,
                 at,
                 at == code_start || matches!(body[at - 1], b' ' | b'\t' | b','),
+                dollars,
             ) {
                 end = at;
                 break;
@@ -197,14 +223,27 @@ fn trim_lexical_indent(mut bytes: &[u8]) -> &[u8] {
 }
 
 pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
+    match normalize_nbsp_with(input, |_| {
+        Ok::<_, std::convert::Infallible>(DollarMode::Comment)
+    }) {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
+pub(crate) fn normalize_nbsp_with<E>(
+    input: &[u8],
+    mut dollars: impl FnMut(usize) -> std::result::Result<DollarMode, E>,
+) -> std::result::Result<Option<Vec<u8>>, E> {
     if !input.contains(&0xa0) {
-        return None;
+        return Ok(None);
     }
     let mut out = Vec::with_capacity(input.len());
     let mut context = Context::default();
-    for line in input.split_inclusive(|b| *b == b'\n') {
+    for (index, line) in input.split_inclusive(|b| *b == b'\n').enumerate() {
+        let dollars = dollars(index + 1)?;
         let tail = trim_lexical_indent(line);
-        let comment = comment_line(tail);
+        let comment = comment_line(tail, dollars);
         let scan_end = if comment {
             line.len() - tail.len()
         } else {
@@ -219,7 +258,7 @@ pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
                 || out
                     .last()
                     .is_some_and(|b| matches!(*b, b' ' | b'\t' | b','));
-            if !comment && context.comment(line, index, separated) {
+            if !comment && context.comment(line, index, separated, dollars) {
                 break;
             }
             let width = utf8_width(&line[index..scan_end]);
@@ -238,7 +277,7 @@ pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
         }
         out.extend_from_slice(&line[index..]);
     }
-    (out != input).then_some(out)
+    Ok((out != input).then_some(out))
 }
 
 /// Shared quote-aware delimiter tracking for logical source fields.

@@ -25,7 +25,7 @@ pub enum TimingFamily {
 }
 
 /// One declared timing corner, not a simulator-selected estimate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimingCorner {
     /// Minimum.
@@ -37,7 +37,7 @@ pub enum TimingCorner {
 }
 
 /// Directed propagation path or a timing check in the source model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimingPath {
     /// Input change to low-to-high output.
@@ -96,6 +96,28 @@ pub enum TimingPath {
     Transport,
 }
 
+impl TimingPath {
+    pub(super) const fn propagation(self) -> bool {
+        matches!(
+            self,
+            Self::Rise
+                | Self::Fall
+                | Self::LowToZ
+                | Self::HighToZ
+                | Self::ZToHigh
+                | Self::ZToLow
+                | Self::ClockRise
+                | Self::ClockFall
+                | Self::PresetClearRise
+                | Self::PresetClearFall
+                | Self::DataRise
+                | Self::DataFall
+                | Self::GateRise
+                | Self::GateFall
+        )
+    }
+}
+
 impl TimingFamily {
     fn parse(name: &str) -> Option<Self> {
         Some(match name.to_ascii_uppercase().as_str() {
@@ -108,38 +130,57 @@ impl TimingFamily {
         })
     }
 
-    fn path(self, name: &str) -> Option<TimingPath> {
+    const fn fields(self) -> &'static [(&'static str, TimingPath)] {
         use TimingPath as P;
-        Some(match (self, name) {
-            (Self::Gate | Self::Tristate, "TPLH") => P::Rise,
-            (Self::Gate | Self::Tristate, "TPHL") => P::Fall,
-            (Self::Tristate, "TPLZ") => P::LowToZ,
-            (Self::Tristate, "TPHZ") => P::HighToZ,
-            (Self::Tristate, "TPZH") => P::ZToHigh,
-            (Self::Tristate, "TPZL") => P::ZToLow,
-            (Self::EdgeFlipFlop, "TPCLKQLH") => P::ClockRise,
-            (Self::EdgeFlipFlop, "TPCLKQHL") => P::ClockFall,
-            (Self::EdgeFlipFlop | Self::GatedLatch, "TPPCQLH") => P::PresetClearRise,
-            (Self::EdgeFlipFlop | Self::GatedLatch, "TPPCQHL") => P::PresetClearFall,
-            (Self::EdgeFlipFlop, "TSUDCLK") => P::DataClockSetup,
-            (Self::EdgeFlipFlop, "THDCLK") => P::DataClockHold,
-            (Self::EdgeFlipFlop, "TSUPCCLKH") => P::PresetClearClockSetup,
-            (Self::EdgeFlipFlop, "TSUCECLK") => P::EnableClockSetup,
-            (Self::EdgeFlipFlop, "THCECLK") => P::EnableClockHold,
-            (Self::EdgeFlipFlop | Self::GatedLatch, "TWPCL") => P::PresetClearLowWidth,
-            (Self::EdgeFlipFlop, "TWCLKL") => P::ClockLowWidth,
-            (Self::EdgeFlipFlop, "TWCLKH") => P::ClockHighWidth,
-            (Self::GatedLatch, "TPDQLH") => P::DataRise,
-            (Self::GatedLatch, "TPDQHL") => P::DataFall,
-            (Self::GatedLatch, "TPGQLH") => P::GateRise,
-            (Self::GatedLatch, "TPGQHL") => P::GateFall,
-            (Self::GatedLatch, "TSUDG") => P::DataGateSetup,
-            (Self::GatedLatch, "THDG") => P::DataGateHold,
-            (Self::GatedLatch, "TSUPCGH") => P::PresetClearGateSetup,
-            (Self::GatedLatch, "TWGH") => P::GateHighWidth,
-            (Self::DelayLine, "DLY") => P::Transport,
-            _ => return None,
-        })
+        match self {
+            Self::Gate => &[("TPLH", P::Rise), ("TPHL", P::Fall)],
+            Self::Tristate => &[
+                ("TPLH", P::Rise),
+                ("TPHL", P::Fall),
+                ("TPLZ", P::LowToZ),
+                ("TPHZ", P::HighToZ),
+                ("TPZH", P::ZToHigh),
+                ("TPZL", P::ZToLow),
+            ],
+            Self::EdgeFlipFlop => &[
+                ("TPCLKQLH", P::ClockRise),
+                ("TPCLKQHL", P::ClockFall),
+                ("TPPCQLH", P::PresetClearRise),
+                ("TPPCQHL", P::PresetClearFall),
+                ("TSUDCLK", P::DataClockSetup),
+                ("THDCLK", P::DataClockHold),
+                ("TSUPCCLKH", P::PresetClearClockSetup),
+                ("TSUCECLK", P::EnableClockSetup),
+                ("THCECLK", P::EnableClockHold),
+                ("TWPCL", P::PresetClearLowWidth),
+                ("TWCLKL", P::ClockLowWidth),
+                ("TWCLKH", P::ClockHighWidth),
+            ],
+            Self::GatedLatch => &[
+                ("TPPCQLH", P::PresetClearRise),
+                ("TPPCQHL", P::PresetClearFall),
+                ("TWPCL", P::PresetClearLowWidth),
+                ("TPDQLH", P::DataRise),
+                ("TPDQHL", P::DataFall),
+                ("TPGQLH", P::GateRise),
+                ("TPGQHL", P::GateFall),
+                ("TSUDG", P::DataGateSetup),
+                ("THDG", P::DataGateHold),
+                ("TSUPCGH", P::PresetClearGateSetup),
+                ("TWGH", P::GateHighWidth),
+            ],
+            Self::DelayLine => &[("DLY", P::Transport)],
+        }
+    }
+
+    fn path(self, name: &str) -> Option<TimingPath> {
+        self.fields()
+            .iter()
+            .find_map(|(field, path)| (*field == name).then_some(*path))
+    }
+
+    pub(super) fn paths(self) -> impl Iterator<Item = TimingPath> {
+        self.fields().iter().map(|(_, path)| *path)
     }
 }
 

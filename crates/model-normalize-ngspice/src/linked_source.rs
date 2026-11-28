@@ -3,7 +3,7 @@
 //! This source-only stage expands library resources before `.param`/`.model`
 //! parsing. Each output physical line retains its original file and line.
 
-use crate::lexical::{normalize_nbsp, statements};
+use crate::lexical::{DollarMode, normalize_nbsp_with, statements_with};
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{AdmittedSource, Resource, SourceSession};
 use std::path::{Path, PathBuf};
@@ -343,9 +343,10 @@ struct Record {
     logical: Vec<u8>,
 }
 
-fn records(bytes: &[u8], first_line: usize) -> Result<Vec<Record>> {
+fn records(bytes: &[u8], first_line: usize, dialect: SourceDialect) -> Result<Vec<Record>> {
     let physical_count = bytes.split_inclusive(|byte| *byte == b'\n').count();
-    let normalized = normalize_nbsp(bytes);
+    let dollars = DollarMode::for_dialect(dialect);
+    let normalized = normalize_nbsp_with(bytes, |_| Ok::<_, anyhow::Error>(dollars))?;
     let normalized = normalized.as_deref().unwrap_or(bytes);
     let mut starts = vec![0];
     for line in normalized.split_inclusive(|byte| *byte == b'\n') {
@@ -353,7 +354,7 @@ fn records(bytes: &[u8], first_line: usize) -> Result<Vec<Record>> {
     }
     let mut result = Vec::new();
     let mut cursor = 0;
-    for statement in statements(normalized)? {
+    for statement in statements_with(normalized, |_| Ok(dollars))? {
         let start = statement.line - 1;
         let end = statement
             .source_ranges(0..statement.text.len())
@@ -798,7 +799,7 @@ impl LinkState<'_> {
         } else {
             (&decoded[..], 1)
         };
-        let records = records(body, first_line)?;
+        let records = records(body, first_line, self.dialect())?;
         if self.is_qspice_root() {
             self.collect_source_paths(path, &records, section)?;
         }

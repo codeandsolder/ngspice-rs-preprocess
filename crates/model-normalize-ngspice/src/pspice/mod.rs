@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeMap, fmt::Write as _};
 
+pub mod digital_corners;
 pub mod digital_instance;
 pub mod digital_io;
 pub mod digital_source;
@@ -772,7 +773,11 @@ fn lower_body(
     budget: &WorkBudget,
 ) -> Result<LoweredBody> {
     budget.charge(Resource::ScannedBytes, body.len())?;
-    let statements = lexical::statements(body)?;
+    let statements = lexical::statements_with(body, |line| {
+        Ok(lexical::DollarMode::for_dialect(
+            dialects.at_mapped(origins, line)?,
+        ))
+    })?;
     let scopes = Scopes::collect(&statements, origins, dialects, budget)?;
     let digital = digital_source::capture(&statements, &scopes, origins, dialects)?;
     if let Some(declaration) = digital.first() {
