@@ -728,11 +728,9 @@ fn pspice_capture_binds_independent_and_continuation_axes_separately() -> Result
     let Directive::Analysis { arguments, uic, .. } = &plan.entries[3].directive else {
         anyhow::bail!("missing transient request")
     };
-    assert!(!uic);
-    assert_eq!(
-        arguments,
-        &["1u", "4m", "0", "{SCHEDULE(0,5u,1m,10u)}", "SKIPBP"]
-    );
+    assert!(*uic);
+    assert_eq!(arguments, &["1u", "4m", "0", "{SCHEDULE(0,5u,1m,10u)}"]);
+    assert!(plan.entries[3].statement.ends_with("SKIPBP"));
     let budget = WorkBudget::default();
     for index in [2, 3] {
         let bound = plan.bind_independent_sweeps(
