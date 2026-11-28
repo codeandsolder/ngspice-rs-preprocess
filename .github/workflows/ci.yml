@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@5b073b2f545404d05f56ab674e9c4ace7295c525 # main
+      - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
         with:
           base-ref: ${{ github.event.merge_group.base_sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || 'origin/main' }}
           lockfile: auto
@@ -36,20 +36,19 @@ jobs:
 
   strict-rust:
     name: Strict Rust
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@535609a4878f34a6697afea7ba3da04a454cc5f4 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@707c9e77430c7feed80a39959b273501ca786825 # main
     with:
       allow-test-panics: true
 
   nightly:
     name: Source archive, locked tests and C reference
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5b073b2f545404d05f56ab674e9c4ace7295c525 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
     with:
-      apt-packages: ripgrep flex bison
       command: bash .github/scripts/verify-source.sh
 
   package-qualification:
     name: Standalone registry packages and install
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'tag')
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5b073b2f545404d05f56ab674e9c4ace7295c525 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
     with:
       command: bash .github/scripts/verify-packages.sh
