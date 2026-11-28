@@ -3,13 +3,15 @@
     reason = "exact deterministic identities and endpoints"
 )]
 use anyhow::{Context, Result};
-use model_statistics::{Function, Realization, Site};
+use model_statistics::{CounterStream, Function, Identity, Realization, Site};
 
-const SITE: Site<'_> = Site {
-    expression: b"model:bf/call:0",
-    occurrence: b"x1/q1",
-    lot: Some(b"model:global"),
-};
+fn site() -> Site {
+    Site {
+        expression: Identity::root(b"model:bf/call:0"),
+        occurrence: Identity::root(b"x1/q1"),
+        lot: Some(Identity::root(b"model:global")),
+    }
+}
 
 fn function(name: &str) -> Result<Function> {
     Function::simetrix(name).context("unknown distribution")
@@ -21,61 +23,55 @@ fn order_independent_identity_and_lot_scope() -> Result<()> {
         seed: u64::MAX,
         sample: 123,
     };
+    let site = site();
     let independent = function("gauss")?.prepare(&[0.2])?;
     let lot = function("GaussL")?.prepare(&[0.2])?;
     let other_device = Site {
-        occurrence: b"x2/q1",
-        ..SITE
+        occurrence: Identity::root(b"x2/q1"),
+        ..site
     };
     let other_local_model = Site {
-        lot: Some(b"x2/model"),
+        lot: Some(Identity::root(b"x2/model")),
         ..other_device
     };
     let other_call = Site {
-        expression: b"model:bf/call:1",
-        ..SITE
+        expression: Identity::root(b"model:bf/call:1"),
+        ..site
     };
-    let first = independent.sample(experiment, SITE)?;
-    assert_ne!(first, independent.sample(experiment, other_device)?);
-    assert_ne!(first, independent.sample(experiment, other_call)?);
+    let bound = independent.clone().bind(site)?;
+    let first = bound.sample(experiment)?;
     assert_ne!(
         first,
-        independent.sample(
-            Realization {
-                sample: 124,
-                ..experiment
-            },
-            SITE
-        )?
+        independent.clone().bind(other_device)?.sample(experiment)?
+    );
+    assert_ne!(first, independent.bind(other_call)?.sample(experiment)?);
+    assert_ne!(
+        first,
+        bound.sample(Realization {
+            sample: 124,
+            ..experiment
+        })?
     );
     assert_ne!(
         first,
-        independent.sample(
-            Realization {
-                seed: u64::MAX - 1,
-                ..experiment
-            },
-            SITE
-        )?
+        bound.sample(Realization {
+            seed: u64::MAX - 1,
+            ..experiment
+        })?
     );
-    assert_eq!(first, independent.sample(experiment, SITE)?);
-    assert_eq!(
-        lot.sample(experiment, SITE)?,
-        lot.sample(experiment, other_device)?
-    );
+    assert_eq!(first, bound.sample(experiment)?);
+    let common = lot.clone().bind(site)?.sample(experiment)?;
+    assert_eq!(common, lot.clone().bind(other_device)?.sample(experiment)?);
     assert_ne!(
-        lot.sample(experiment, SITE)?,
-        lot.sample(experiment, other_local_model)?
+        common,
+        lot.clone().bind(other_local_model)?.sample(experiment)?
     );
-    assert_ne!(
-        lot.sample(experiment, SITE)?,
-        lot.sample(experiment, other_call)?
-    );
-    assert!(lot.sample(experiment, Site { lot: None, ..SITE }).is_err());
-    let wider = function("gauss")?.prepare(&[0.4])?;
+    assert_ne!(common, lot.clone().bind(other_call)?.sample(experiment)?);
+    assert!(lot.bind(Site { lot: None, ..site }).is_err());
+    let wider = function("gauss")?.prepare(&[0.4])?.bind(site)?;
     assert!(
         2.0f64
-            .mul_add(-(first - 1.), wider.sample(experiment, SITE)? - 1.)
+            .mul_add(-(first - 1.), wider.sample(experiment)? - 1.)
             .abs()
             < 1e-15
     );
@@ -119,17 +115,14 @@ fn distribution_moments_and_exact_support() -> Result<()> {
     ];
     let count = 50_000_u32;
     for (name, args, mean, variance, low, high) in cases {
-        let law = function(name)?.prepare(&args)?;
+        let law = function(name)?.prepare(&args)?.bind(site())?;
         let mut sum = 0.;
         let mut squared = 0.;
         for sample in 0..count {
-            let value = law.sample(
-                Realization {
-                    seed: 987_654,
-                    sample: u64::from(sample),
-                },
-                SITE,
-            )?;
+            let value = law.sample(Realization {
+                seed: 987_654,
+                sample: u64::from(sample),
+            })?;
             assert!((low..=high).contains(&value), "{name}: {value}");
             if name.starts_with("wc") {
                 assert!(value == low || value == high);
@@ -174,12 +167,16 @@ fn validate_shapes_and_extreme_density() -> Result<()> {
         assert!(function(name)?.prepare(&args).is_err(), "{name} {args:?}");
     }
     assert_eq!(function("UD2L")?, function("distribution2l")?);
-    let law = function("ud2")?.prepare(&[1e-308, -1e308, 1e308, 1e308, 1e308])?;
-    let tiny = function("ud2")?.prepare(&[1e308, -1e-308, 1e-308, 1e-308, 1e-308])?;
+    let law = function("ud2")?
+        .prepare(&[1e-308, -1e308, 1e308, 1e308, 1e308])?
+        .bind(site())?;
+    let tiny = function("ud2")?
+        .prepare(&[1e308, -1e-308, 1e-308, 1e-308, 1e-308])?
+        .bind(site())?;
     for sample in 0..1000 {
         let context = Realization { seed: 3, sample };
-        assert!((0.0..=2.0).contains(&law.sample(context, SITE)?));
-        assert!((0.0..=2.0).contains(&tiny.sample(context, SITE)?));
+        assert!((0.0..=2.0).contains(&law.sample(context)?));
+        assert!((0.0..=2.0).contains(&tiny.sample(context)?));
     }
     Ok(())
 }
@@ -202,21 +199,111 @@ fn invocation_encoding_preserves_every_bit_and_bound_call_identity() -> Result<(
     assert_eq!(decoded, invocation);
     assert_eq!(law, arguments);
     assert_eq!(
-        decoded.sample(law, SITE)?,
-        invocation.sample(&arguments, SITE)?
+        decoded.sample(law, site())?,
+        invocation.sample(&arguments, site())?
     );
     assert_ne!(
-        decoded.sample(law, SITE)?,
+        decoded.sample(law, site())?,
         Invocation {
             site: invocation.site - 1,
             ..invocation
         }
-        .sample(law, SITE)?
+        .sample(law, site())?
     );
     for invalid in [-1., 0.5, f64::from(u32::MAX) + 1., f64::INFINITY, f64::NAN] {
         encoded[0] = invalid;
         assert!(Invocation::decode(&invocation.marker_name(), &encoded).is_err());
     }
     assert!(Invocation::decode("simetrix_stat_ud2l", &encoded).is_err());
+    Ok(())
+}
+
+#[test]
+fn identity_component_boundaries_and_domains() {
+    let root = Identity::root(b"root");
+    let other = Identity::root(b"other");
+    assert_ne!(root, root.child(b""));
+    assert_ne!(root.child(b"a").child(b"bc"), root.child(b"ab").child(b"c"));
+    assert_ne!(root.child(b"a\\0b"), root.child(b"a").child(b"b"));
+    assert_ne!(root.child(b"a"), other.child(b"a"));
+    assert_ne!(root.combine(other), other.combine(root));
+    assert_ne!(root.combine(other), root.child(&other.bytes()));
+    assert_eq!(root.bytes().len(), 16);
+}
+
+#[test]
+fn block_pair_scalar_and_parallel_streams_agree() -> Result<()> {
+    let key = Identity::root(b"test-stream").child(b"noise");
+    let realization = Realization {
+        seed: u64::MAX,
+        sample: u64::MAX,
+    };
+    let stream = CounterStream::new(key, realization);
+    for pair in [0, 1, 2, 1024, u64::MAX / 2] {
+        assert_eq!(
+            stream.uniform_pair(pair),
+            [stream.uniform(pair * 2), stream.uniform(pair * 2 + 1)]
+        );
+    }
+    assert_ne!(stream.block(0), stream.block(u64::MAX));
+    assert_ne!(
+        stream.block(0),
+        CounterStream::new(
+            key,
+            Realization {
+                seed: 0,
+                ..realization
+            }
+        )
+        .block(0)
+    );
+    assert_ne!(
+        stream.block(0),
+        CounterStream::new(
+            key,
+            Realization {
+                sample: 0,
+                ..realization
+            }
+        )
+        .block(0)
+    );
+    let law = function("gausstrunc")?.prepare(&[1., 0.4])?.bind(site())?;
+    let sequential = (0..4096)
+        .map(|sample| {
+            law.sample(Realization {
+                sample,
+                ..realization
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let parallel = std::thread::scope(|scope| {
+        let threads = (0..4)
+            .map(|lane| {
+                let law = &law;
+                scope.spawn(move || {
+                    (0..1024)
+                        .map(|i| {
+                            law.sample(Realization {
+                                sample: i * 4 + lane,
+                                ..realization
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("sample thread failed"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    for (index, value) in sequential.into_iter().enumerate() {
+        assert_eq!(value, parallel[index % 4][index / 4]);
+    }
     Ok(())
 }

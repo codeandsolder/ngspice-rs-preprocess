@@ -7,7 +7,10 @@
 //! process-global random generator.
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+mod random;
+
+pub use random::CounterStream;
+use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 /// Which physical occurrences share a random variate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,46 +221,72 @@ pub struct Realization {
     pub sample: u64,
 }
 
-/// Stable binding identity, constructed after lexical expansion.
-/// Byte strings are independent hash components, not concatenated names.
-#[derive(Clone, Copy, Debug)]
-pub struct Site<'a> {
+/// Stable binding identity, constructed once after lexical expansion.
+/// Callers keep the actual circuit occurrence identity for correctness;
+/// these compact keys identify pseudorandom streams, not circuit objects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Site {
     /// Expression declaration and static call path (including macro calls).
     /// Do not include parameter values or a mutable traversal counter.
-    pub expression: &'a [u8],
+    pub expression: Identity,
     /// Physical device or parameter occurrence, including its enclosing
     /// instance path. All reads of one resolved parameter reuse its identity.
-    pub occurrence: &'a [u8],
-    /// Bound model declaration occurrence, including the instance path of
-    /// its owner. Global models have a common owner across subcircuits.
-    pub lot: Option<&'a [u8]>,
+    pub occurrence: Identity,
+    /// Bound model declaration occurrence, including its owner's instance
+    /// path. Global models have a common owner across subcircuits.
+    pub lot: Option<Identity>,
 }
 
-/// An immutable hierarchical identity. Distinct component boundaries
-/// are retained; callers use lexical names and actual occurrence paths.
+/// A noncryptographic hierarchical sampling identity. Components have
+/// distinct domains and boundaries; never use this key to establish
+/// electrical identity or to deduplicate distinct declarations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Identity([u8; 32]);
+pub struct Identity(u128);
 
 impl Identity {
     /// Start an identity domain.
     #[must_use = "the returned identity establishes a sampling domain"]
+    #[inline]
     pub fn root(domain: &[u8]) -> Self {
-        Self(Sha256::digest(domain).into())
+        Self(xxh3_128_with_seed(domain, 0x726f_6f74_2d76_3200))
     }
 
-    /// Extend a path by one independent component.
+    /// Extend a path by one independent byte component.
     #[must_use = "the returned identity extends the immutable path"]
+    #[inline]
     pub fn child(self, component: &[u8]) -> Self {
-        let mut hash = Sha256::new();
-        hash.update(self.0);
-        hash.update(Sha256::digest(component));
-        Self(hash.finalize().into())
+        let component = Self(xxh3_128_with_seed(component, 0x636f_6d70_2d76_3200));
+        self.pair(component, 0x6368_696c_642d_7632)
     }
 
-    /// Stable identity bytes used by the sampling kernel.
+    /// Mix a previously bound identity without rehashing its path or
+    /// treating its bytes as a source-language string component.
+    #[must_use = "the returned identity combines two immutable identities"]
+    #[inline]
+    pub fn combine(self, other: Self) -> Self {
+        self.pair(other, 0x7061_6972_2d76_3200)
+    }
+
+    #[inline]
+    fn pair(self, other: Self, domain: u64) -> Self {
+        let mut bytes = [0; 32];
+        bytes[..16].copy_from_slice(&self.0.to_le_bytes());
+        bytes[16..].copy_from_slice(&other.0.to_le_bytes());
+        Self(xxh3_128_with_seed(&bytes, domain))
+    }
+
+    /// The canonical little-endian sampling identity bytes.
     #[must_use = "the returned bytes identify the immutable sampling path"]
-    pub const fn bytes(&self) -> &[u8; 32] {
-        &self.0
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0.to_le_bytes()
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "split the 128-bit identity into exact low and high limbs"
+    )]
+    const fn key(self) -> [u64; 2] {
+        [self.0 as u64, (self.0 >> 64) as u64]
     }
 }
 
@@ -381,85 +410,14 @@ impl Invocation {
     ///
     /// # Errors
     /// Invalid law, identity or non-finite realization.
-    pub fn sample(self, args: &[f64], site: Site<'_>) -> Result<f64> {
-        let expression = Identity::root(site.expression).child(&self.site.to_le_bytes());
-        self.function.prepare(args)?.sample(
-            self.realization,
-            Site {
-                expression: expression.bytes(),
+    pub fn sample(self, args: &[f64], site: Site) -> Result<f64> {
+        self.function
+            .prepare(args)?
+            .bind(Site {
+                expression: site.expression.child(&self.site.to_le_bytes()),
                 ..site
-            },
-        )
-    }
-}
-
-struct Random {
-    key: [u8; 32],
-}
-
-impl Random {
-    fn new(realization: Realization, function: Function, site: Site<'_>) -> Result<Self> {
-        let owner = match function.correlation {
-            Correlation::Independent => site.occurrence,
-            Correlation::Lot => site
-                .lot
-                .context("lot distribution requires a bound model identity")?,
-        };
-        // Hash each variable-length component separately to keep their
-        // boundaries unambiguous, including embedded zero bytes.
-        let mut hash = Sha256::new();
-        hash.update(b"model-statistics/v1");
-        hash.update(realization.seed.to_le_bytes());
-        hash.update(realization.sample.to_le_bytes());
-        hash.update(Sha256::digest(function.name().as_bytes()));
-        hash.update(Sha256::digest(site.expression));
-        hash.update(Sha256::digest(owner));
-        Ok(Self {
-            key: hash.finalize().into(),
-        })
-    }
-
-    fn uniform(&self, counter: u64) -> f64 {
-        let mut hash = Sha256::new();
-        hash.update(self.key);
-        hash.update(counter.to_le_bytes());
-        let digest = hash.finalize();
-        let mut bits = [0; 8];
-        bits.copy_from_slice(&digest[..8]);
-        // Midpoints of 2^52 equal intervals: both endpoints are excluded,
-        // including the largest representable variate.
-        let mantissa = u64::from_le_bytes(bits) >> 12;
-        0.5_f64.mul_add(
-            f64::EPSILON,
-            f64::from_bits(0x3ff0_0000_0000_0000 | mantissa) - 1.,
-        )
-    }
-
-    fn normal(&self, counter: u64) -> f64 {
-        (-2. * self.uniform(counter).ln()).sqrt()
-            * (std::f64::consts::TAU * self.uniform(counter + 1)).cos()
-    }
-
-    fn truncated(&self, sigma: f64) -> Result<f64> {
-        // Draw a normalized deviation in [-1, 1]. Uniform proposal is
-        // efficient even when sigma is tiny; normal proposal is efficient
-        // for the remaining range.
-        for attempt in 0..1024_u64 {
-            let counter = attempt * 2;
-            if sigma < 1. {
-                let fraction = 2_f64.mul_add(self.uniform(counter), -1.);
-                let z = sigma * fraction;
-                if self.uniform(counter + 1) <= (-0.5 * z * z).exp() {
-                    return Ok(fraction);
-                }
-            } else {
-                let z = self.normal(counter);
-                if z.abs() <= sigma {
-                    return Ok(z / sigma);
-                }
-            }
-        }
-        bail!("truncated Gaussian rejection budget exhausted")
+            })?
+            .sample(self.realization)
     }
 }
 
@@ -489,13 +447,43 @@ pub struct PreparedDistribution {
 }
 
 impl PreparedDistribution {
-    /// Realize one scalar multiplier. This is a preparation operation,
-    /// never a Newton residual or transient-time operation.
+    /// Bind an immutable law to its physical owner and declaration.
+    /// This does not depend on seed, sample index, or tolerance values.
     ///
     /// # Errors
-    /// Missing lot owner, exhausted rejection budget, or a non-finite result.
-    pub fn sample(&self, realization: Realization, site: Site<'_>) -> Result<f64> {
-        let random = Random::new(realization, self.function, site)?;
+    /// Lot-correlated distributions require a bound model owner.
+    pub fn bind(self, site: Site) -> Result<BoundDistribution> {
+        let owner = match self.function.correlation {
+            Correlation::Independent => site.occurrence,
+            Correlation::Lot => site
+                .lot
+                .context("lot distribution requires a bound model identity")?,
+        };
+        let key = Identity::root(b"model-statistics/v2")
+            .child(self.function.name().as_bytes())
+            .combine(site.expression)
+            .combine(owner);
+        Ok(BoundDistribution { key, law: self.law })
+    }
+}
+
+/// A validated distribution and immutable stream identity. Reuse it for
+/// arbitrary sample indices and seeds without revalidating its law or
+/// hashing its lexical paths.
+#[derive(Clone, Debug)]
+pub struct BoundDistribution {
+    key: Identity,
+    law: Law,
+}
+
+impl BoundDistribution {
+    /// Realize one scalar multiplier, independently of other samples.
+    ///
+    /// # Errors
+    /// Exhausted rejection budget or a non-finite result.
+    #[inline]
+    pub fn sample(&self, realization: Realization) -> Result<f64> {
+        let random = CounterStream::new(self.key, realization);
         let value = match &self.law {
             Law::Gaussian {
                 tolerance,
