@@ -27,30 +27,31 @@ pub(super) fn effective_voltage<S: Scalar>(
     ) {
         return Ok(Jet::constant(bv));
     }
-    // y = log(B + NBV*y). Factor the same comparison surface into
-    // B = 1 + (IBV - Is*BV/Vt)/Is: at an exact matching boundary
-    // B is exactly one, without subtracting independently rounded ratios.
-    let b = 1.0 + (cbv - reverse) / saturation_current;
-    if !b.v.is_finite() || b.v.value() < 1.0 {
+    // expm1(y) = delta + NBV*y. Keep delta separate from one:
+    // near the matching boundary adding one would erase its constant term.
+    let delta = (cbv - reverse) / saturation_current;
+    if !delta.v.is_finite() || delta.v.value() < 0. {
         return Err(ModelError::Invalid("avalanche matching domain"));
     }
-    let root = solve_log_root(b.v.value(), parameters.nbv)?;
+    let root = solve_log_root(delta.v.value(), parameters.nbv)?;
     let mut y = S::constant(root);
     let mut matched = 1;
     // Formal Newton on the implicit law doubles the matched coefficient
     // order. Keep the independently converged scalar root exactly fixed.
-    while matched <= b.v.degree() {
-        let argument = b.v + y.scale(parameters.nbv);
-        let residual = (y - argument.ln()).with_value(0.);
-        let derivative = S::constant(1.) - S::constant(parameters.nbv) / argument;
+    while matched <= delta.v.degree() {
+        let argument = delta.v + y.scale(parameters.nbv);
+        let residual = (y - argument.ln_1p()).with_value(0.);
+        let derivative = argument.offset(1. - parameters.nbv) / argument.offset(1.);
         y = (y - residual / derivative).with_value(root);
         matched *= 2;
     }
-    let denominator = S::constant(parameters.nbv).mul_add(y.offset(-1.), b.v);
+    let denominator = S::constant(parameters.nbv)
+        .mul_add(y, delta.v)
+        .offset(1. - parameters.nbv);
     if !denominator.is_finite() || denominator.value() <= 0.0 {
         return Err(ModelError::Invalid("avalanche temperature derivative"));
     }
-    let dydt = b.dt / denominator;
+    let dydt = delta.dt / denominator;
     let value = thermal_voltage
         .v
         .scale(parameters.nbv)
@@ -70,42 +71,98 @@ pub(super) fn effective_voltage<S: Scalar>(
     })
 }
 
-fn solve_log_root(b: f64, nbv: f64) -> Result<f64, ModelError> {
-    if b == 1. && nbv <= 1. {
+// (expm1(y)-y)/y, without cancellation at a small positive root.
+fn exponential_remainder(y: f64) -> f64 {
+    let mut term = y * 0.5;
+    let mut sum = term;
+    for n in 3..=16 {
+        term *= y / f64::from(n);
+        sum += term;
+    }
+    sum
+}
+
+fn solve_log_root(delta: f64, nbv: f64) -> Result<f64, ModelError> {
+    if delta == 0. && nbv <= 1. {
         return Ok(0.);
     }
-    let f = |y: f64| y - b.mul_add(1.0, nbv * y).ln();
-    let mut y = b.ln().max(1e-10);
+    let argument = |y: f64| nbv.mul_add(y, delta);
+    let f = |y: f64| {
+        if y <= 0.125 && y > 0. {
+            exponential_remainder(y) + (1. - nbv) - delta / y
+        } else {
+            y - argument(y).ln_1p()
+        }
+    };
+    // Fixed-point iteration is fast away from the tangent; accept its
+    // convergence only where the contraction has a useful error bound.
+    let mut y = delta.ln_1p().max(nbv.ln().max(0.));
     for _ in 0..24 {
-        let next = b.mul_add(1.0, nbv * y).ln();
-        if (next - y).abs() <= 1e-13 * (1.0 + next.abs()) {
+        let next = argument(y).ln_1p();
+        if next.is_finite()
+            && nbv / (1. + argument(y)) <= 0.5
+            && (next - y).abs() <= 2. * f64::EPSILON * next
+        {
             return Ok(next);
         }
         y = next;
     }
-    // Slow fixed-point convergence near the tangent bifurcation: bracket the
-    // positive root and bisect a monotone right-hand branch instead.
-    let mut low = 0.0;
-    let mut high = (b.ln() + nbv.ln_1p() + 1.0).max(1.0);
+    // The positive root lies above ln(NBV) for NBV > 1. The quadratic
+    // lower bound on expm1 gives a tight upper bound near a tangent,
+    // including arbitrarily small positive delta at NBV = 1.
+    let mut low = nbv.ln().max(0.);
+    let a = nbv - 1.;
+    let mut high = if delta <= 0.125 && a.abs() <= 1. {
+        let radius = a.hypot(delta.sqrt() * std::f64::consts::SQRT_2);
+        if a >= 0. {
+            a + radius
+        } else {
+            delta / (0.5 * (radius - a))
+        }
+    } else {
+        delta.ln_1p() + nbv.ln_1p() + 1.
+    };
+    high = high.max(low.next_up()).next_up();
     for _ in 0..64 {
-        if f(high) >= 0.0 {
+        if f(high) >= 0. {
             break;
         }
-        high *= 2.0;
+        high *= 2.;
         if !high.is_finite() {
             return Err(ModelError::Invalid("avalanche root bracket"));
         }
     }
-    if f(high) < 0.0 {
+    if !high.is_finite() || f(high) < 0. {
         return Err(ModelError::Invalid("avalanche root bracket"));
     }
-    for _ in 0..64 {
+    for _ in 0..128 {
         let mid = f64::midpoint(low, high);
-        if f(mid) >= 0.0 {
+        if mid == low || mid == high {
+            break;
+        }
+        if f(mid) >= 0. {
             high = mid;
         } else {
             low = mid;
         }
     }
     Ok(f64::midpoint(low, high))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_root_resolves_tangent_and_small_positive_excess() {
+        for (delta, nbv, expected) in [
+            (0., 1. + f64::EPSILON, 2. * f64::EPSILON),
+            (1e-24, 1., 2e-24_f64.sqrt()),
+            (1e-20, 0.5, 2e-20),
+            (0., 2., 1.256_431_208_626_169_7),
+        ] {
+            let root = solve_log_root(delta, nbv).unwrap();
+            assert!((root / expected - 1.).abs() < 1e-10, "{delta} {nbv} {root}");
+        }
+    }
 }
