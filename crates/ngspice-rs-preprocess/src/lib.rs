@@ -7,7 +7,7 @@ mod dialect;
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
     MappedNormalization, NormalizationDialect, NormalizationPass,
-    linked_source::{LibrarySyntax, LinkLimits, LinkedSource, RootKind, SourceLinker},
+    linked_source::{LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker},
     normalize_mapped,
 };
 pub use model_normalize_ngspice::{passive_ic, passive_storage, pwl_resistor, waveform};
@@ -471,18 +471,16 @@ fn native(
     }
     let syntax = match request.format {
         InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary | InputFormat::LtspiceSchematic => {
-            LibrarySyntax::Ltspice
+            SourceDialect::Ltspice
         }
-        InputFormat::PspiceDeck
-        | InputFormat::PspiceLibrary
-        | InputFormat::TinaDeck
-        | InputFormat::TinaLibrary => LibrarySyntax::Pspice,
-        InputFormat::QspiceDeck | InputFormat::QspiceLibrary => LibrarySyntax::Qspice,
-        _ => LibrarySyntax::NamedSections,
+        InputFormat::PspiceDeck | InputFormat::PspiceLibrary => SourceDialect::Pspice,
+        InputFormat::TinaDeck | InputFormat::TinaLibrary => SourceDialect::Tina,
+        InputFormat::QspiceDeck | InputFormat::QspiceLibrary => SourceDialect::Qspice,
+        _ => SourceDialect::Native,
     };
     let linked = SourceLinker {
         search_paths: request.search_paths.clone(),
-        library_syntax: syntax,
+        dialect: syntax,
     }
     .link_admitted(
         root,
@@ -492,6 +490,16 @@ fn native(
         },
         session,
     )?;
+    for visit in &linked.visits {
+        ensure!(
+            visit.dialect == syntax,
+            "{}:{}: explicit foreign source dialect {:?} requires scoped normalization (root {:?})",
+            visit.path.display(),
+            visit.declaration.unwrap_or(1),
+            visit.dialect,
+            syntax
+        );
+    }
     let projected = project_native(&linked, kind, request.format, session.budget())?;
     let origins = linked
         .origins
