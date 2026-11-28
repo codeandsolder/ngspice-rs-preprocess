@@ -7,9 +7,9 @@
 
 use super::{
     Bsim3JunctionTemperature, MosDepletionComponent, MosDepletionTemperatureCoefficients,
-    MosDiffusionDimensions, MosDiffusionRule, MosDiffusionTerminal, MosJunctionDepletion,
-    MosJunctionPoint, MosJunctionSaturation, MosSaturationFallback, MosSeriesResistance,
-    MosSeriesResistanceRule, MosSidewallRule, finite, nonnegative, positive, prepare_mos_diffusion,
+    MosDiffusionRule, MosJunctionDepletion, MosJunctionOccurrence, MosJunctionPoint,
+    MosJunctionSaturation, MosSaturationFallback, MosSeriesResistanceRule, MosSidewallRule, finite,
+    nonnegative, positive, prepare_mos_diffusion,
 };
 use crate::ModelError;
 
@@ -166,18 +166,6 @@ pub struct Bsim3JunctionModel {
     pub limiting_current_a: f64,
 }
 
-/// Occurrence-specific terminal parameters. Resistance squares and explicit
-/// diffusion geometry retain their presence flags.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Bsim3JunctionOccurrence {
-    pub dimensions: MosDiffusionDimensions,
-    pub terminal: MosDiffusionTerminal,
-    /// Electrical width used for the sidewall/gate-edge split.
-    pub gate_width_m: f64,
-    pub series: MosSeriesResistance,
-    pub operating_temperature_k: f64,
-}
-
 /// Immutable per-terminal physical coefficients, before polarity and multiplicity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreparedBsim3Junction {
@@ -195,7 +183,7 @@ impl Bsim3JunctionModel {
     pub fn prepare(
         self,
         rules: Bsim3JunctionRules,
-        occurrence: Bsim3JunctionOccurrence,
+        occurrence: MosJunctionOccurrence,
     ) -> Result<PreparedBsim3Junction, ModelError> {
         let temperature = Bsim3JunctionTemperature::new(
             self.nominal_temperature_k,

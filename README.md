@@ -640,3 +640,11 @@ assembles the BSIM1/2 generalized physical residual, charge and noise
 artifacts. Solver registration and additional BSIM3 revision physics are
 tracked separately; the existing native BSIM3 implementation remains
 the owner of its validated modes. See [the ownership audit](docs/legacy-bsim.md).
+
+### MOS junction physical preparation
+
+[Prepared MOS junction laws](docs/mos-junctions.md) distinguish source geometry,
+linear-reverse and Berkeley junction currents/charges, temperature policies,
+and series resistance independently of the channel. The typed BSIM3 source
+binder resolves these physical coefficients without claiming complete-device
+support or substituting a native ACM mode.

@@ -13,10 +13,15 @@
 use crate::ModelError;
 
 mod berkeley;
+mod linear_reverse;
 mod temperature;
 pub use berkeley::{
-    Bsim3BerkeleyJunction, Bsim3JunctionModel, Bsim3JunctionOccurrence, Bsim3JunctionRules,
-    Bsim3KneeReference, PreparedBsim3Junction,
+    Bsim3BerkeleyJunction, Bsim3JunctionModel, Bsim3JunctionRules, Bsim3KneeReference,
+    PreparedBsim3Junction,
+};
+pub use linear_reverse::{
+    MosDepletionThermalLaw, MosJunctionBandgap, MosLinearReverseGeometry, MosLinearReverseModel,
+    MosLinearReverseTemperature, PreparedMosLinearReverseJunction,
 };
 pub use temperature::{
     Bsim3JunctionTemperature, MosDepletionTemperatureCoefficients, mos_resistance_at_temperature,
@@ -303,6 +308,18 @@ impl MosSeriesResistance {
         };
         nonnegative(resistance + contact, "MOS series resistance")
     }
+}
+
+/// Occurrence-specific terminal parameters. Resistance squares and explicit
+/// diffusion geometry retain their presence flags.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MosJunctionOccurrence {
+    pub dimensions: MosDiffusionDimensions,
+    pub terminal: MosDiffusionTerminal,
+    /// Electrical width used for the sidewall/gate-edge split.
+    pub gate_width_m: f64,
+    pub series: MosSeriesResistance,
+    pub operating_temperature_k: f64,
 }
 
 /// One zero-bias capacitance contribution with a power-law depletion region

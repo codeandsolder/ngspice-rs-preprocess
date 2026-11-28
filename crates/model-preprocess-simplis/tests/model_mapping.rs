@@ -530,3 +530,205 @@ fn hspice_berkeley_junction_binding_converts_explicit_model_units() -> Result<()
     assert!(bind("SCALM=-1", 1.).is_err());
     Ok(())
 }
+
+#[test]
+fn hspice_linear_reverse_junctions_bind_source_laws_and_geometry() -> Result<()> {
+    use model_compact_intrinsic::MosDiffusionTerminal;
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        HspiceBsim3JunctionInput, HspiceJunctionSourceOptions,
+    };
+
+    const TNOM: f64 = 300.15;
+    const TEMP: f64 = 350.15;
+    const K: f64 = 8.617_087e-5;
+    fn close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 5e-13 * expected.abs().max(actual.abs()).max(1e-30),
+            "{actual:e} != {expected:e}"
+        );
+    }
+    let mapping = table(".options HSPICEMODELS=1")?;
+    let options = HspiceJunctionSourceOptions {
+        nominal_temperature_k: 298.15,
+        model_scale: 1.,
+        aspec: false,
+        update: 0,
+    };
+    let input = HspiceBsim3JunctionInput {
+        drawn_width_m: 10e-6,
+        gate_width_m: 2e-6,
+        diffusion: [
+            MosDiffusionTerminal {
+                area_m2: None,
+                perimeter_m: None,
+                shared: true,
+            },
+            MosDiffusionTerminal::default(),
+        ],
+        squares: [None, Some(0.)],
+        default_squares: [2.; 2],
+        operating_temperature_k: TEMP,
+    };
+    let eg = |t| 1.16 - 7.02e-4 * t * t / (t + 1108.);
+    let scale =
+        ((eg(TNOM) / (K * TNOM) - eg(TEMP) / (K * TEMP) + 2. * (TEMP / TNOM).ln()) / 1.5).exp();
+    for (level, version) in [(49, "3.24"), (53, "3.3")] {
+        for (acm, extent, perim, side, gate, drain_r, source_r) in [
+            (0, 0., 0., 0., 0., 93., 63.),
+            (1, 7.2e-6, 9e-6, 9e-6, 0., 100., 60. * 0.7 / 9. + 3.),
+            (
+                2,
+                28.8e-12,
+                24.4e-6,
+                15.4e-6,
+                9e-6,
+                18.,
+                60. * 0.7 / 9. + 3.,
+            ),
+            (3, 14.4e-12, 3.2e-6, 3.2e-6, 9e-6, 18., 60. * 0.7 / 9. + 3.),
+        ] {
+            let (js, cj) = if acm == 1 { (2e-8, 2e-10) } else { (0.1, 1e-3) };
+            let lines = statements(&format!(
+                ".model m NMOS LEVEL={level} VERSION={version} ACM={acm} WMLT=0.8 XW=1u HDIF=2u LD=0.2u LDIF=0.5u RD=90 RS=60 RDC=3 RSC=3 RSH=45 TNOM=27 N=1.5 NJ=0.25 XTI=2 JS={js} JSW=3e-8 IS=5e-14 CJ={cj} CBD=6e-14 CBS=7e-14 CJSW=3e-10 CJGATE=4e-10 CJSWG=1 PHP=0.8 PBSW=0.1 PB=0.9 MJ=0.4 MJSW=0.33 TT=4n VNDS=-0.7 NDS=5 TLEVC=1 CTA=0.001 PTA=0.0007 CTP=0.002 PTP=0.0005 TRD=0.002 TRS=0.001"
+            ));
+            let selection = mapping
+                .select_card(&lines[0], &[], &WorkBudget::default())?
+                .context("selection")?;
+            let [drain, source] = selection
+                .bind_hspice_bsim3_linear_reverse_junctions(options, |raw| {
+                    Ok(parse_spice_constant(raw)?)
+                })?
+                .prepare(input)?;
+            close(drain.resistance_ohm(), drain_r * 1.1);
+            close(source.resistance_ohm(), source_r * 1.05);
+            let weighted = js * extent + 3e-8 * perim;
+            let isat = if weighted > 0. { weighted } else { 5e-14 } * scale;
+            let bottom = if acm == 0 { 6e-14 } else { cj * extent } * 1.05;
+            let sidewall = (3e-10 * side + 4e-10 * gate) * 1.1;
+            let reverse = drain.evaluate(-2.)?;
+            close(reverse.current_a, isat * (-0.7 - 1.3 / 5.));
+            close(reverse.conductance_s, isat / 5.);
+            let zero = drain.evaluate(0.)?;
+            close(
+                zero.capacitance_f,
+                bottom + sidewall + 4e-9 * isat / (1.5 * K * TEMP),
+            );
+            let forward = drain.evaluate(0.3)?;
+            close(forward.current_a, isat * (0.3 / (1.5 * K * TEMP)).exp_m1());
+            close(
+                forward.capacitance_f,
+                bottom * (1. + 0.4 * 0.3 / 0.865)
+                    + sidewall * (1. + 0.33 * 0.3 / 0.775)
+                    + 4e-9 * forward.conductance_s,
+            );
+            if acm == 0 {
+                close(
+                    source.evaluate(0.)?.capacitance_f,
+                    7e-14 * 1.05 + 4e-9 * isat / (1.5 * K * TEMP),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_linear_reverse_source_options_and_unit_scaling() -> Result<()> {
+    use model_compact_intrinsic::MosDiffusionTerminal;
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        HspiceBsim3JunctionInput, HspiceJunctionSourceOptions,
+    };
+
+    let mapping = table(".options HSPICEMODELS=1")?;
+    let options = HspiceJunctionSourceOptions {
+        nominal_temperature_k: 300.15,
+        model_scale: 1.,
+        aspec: false,
+        update: 0,
+    };
+    let input = HspiceBsim3JunctionInput {
+        drawn_width_m: 10e-6,
+        gate_width_m: 8e-6,
+        diffusion: [MosDiffusionTerminal::default(); 2],
+        squares: [None, Some(0.)],
+        default_squares: [2.; 2],
+        operating_temperature_k: 340.,
+    };
+    let bind = |suffix: &str, settings: HspiceJunctionSourceOptions| -> Result<_> {
+        let lines = statements(&format!(".model m NMOS LEVEL=49 VERSION=3.24 {suffix}"));
+        let selection = mapping
+            .select_card(&lines[0], &[], &WorkBudget::default())?
+            .context("selection")?;
+        selection
+            .bind_hspice_bsim3_linear_reverse_junctions(settings, |raw| {
+                Ok(parse_spice_constant(raw)?)
+            })?
+            .prepare(input)
+    };
+    let aspec = HspiceJunctionSourceOptions {
+        aspec: true,
+        update: 1,
+        ..options
+    };
+    let ordinary = bind("ACM=0 CJ=0", options)?;
+    let absent = bind("ACM=0 CJ=0", aspec)?;
+    assert!(ordinary[0].evaluate(0.2)?.current_a > 0.);
+    assert_eq!(absent[0].evaluate(0.2)?.current_a, 0.);
+    assert_eq!(absent[0].evaluate(0.)?.capacitance_f, 0.);
+    let contact = bind("ACM=1 RD=30 RSH=5 RDC=3 CJ=0", aspec)?;
+    let old_update = bind(
+        "ACM=1 RD=30 RSH=5 RDC=3 CJ=0",
+        HspiceJunctionSourceOptions { update: 0, ..aspec },
+    )?;
+    assert_eq!(contact[0].resistance_ohm(), 43.);
+    assert_eq!(old_update[0].resistance_ohm(), 13.);
+    for (acm, physical_js, physical_cj, scaled_js, scaled_cj) in [
+        (1, 2e-8, 2e-10, 2e-14, 2e-16),
+        (2, 0.1, 0.001, 1e-13, 1e-15),
+        (3, 0.1, 0.001, 1e-13, 1e-15),
+    ] {
+        let physical = bind(
+            &format!(
+                "ACM={acm} HDIF=2u XW=1u LD=0.2u LDIF=0.5u JS={physical_js} CJ={physical_cj} JSW=3e-8 CJSW=3e-10 CJGATE=4e-10 TLEV=2 EG=0.75 GAP1=0.000456 GAP2=210 TLEVC=3 RD=90 RS=60 RSH=45"
+            ),
+            options,
+        )?;
+        let scaled = bind(
+            &format!(
+                "ACM={acm} SCALM=1u HDIF=2 XW=1 LD=0.2 LDIF=0.5 JS={scaled_js} CJ={scaled_cj} JSW=3e-14 CJSW=3e-16 CJGATE=4e-16 TLEV=2 EG=0.75 GAP1=0.000456 GAP2=210 TLEVC=3 RD=90 RS=60 RSH=45"
+            ),
+            options,
+        )?;
+        for (a, b) in physical.iter().zip(scaled) {
+            for bias in [-2., -0.5, 0., 0.4] {
+                let a = a.evaluate(bias)?;
+                let b = b.evaluate(bias)?;
+                for (left, right) in [
+                    (a.current_a, b.current_a),
+                    (a.conductance_s, b.conductance_s),
+                    (a.charge_c, b.charge_c),
+                    (a.capacitance_f, b.capacitance_f),
+                ] {
+                    assert!(
+                        (left - right).abs() <= 5e-13 * left.abs().max(right.abs()).max(1e-30),
+                        "{left:e} != {right:e}"
+                    );
+                }
+            }
+        }
+    }
+    for suffix in [
+        "ACM=10",
+        "ACM=0 TLEV=4",
+        "ACM=0 TLEVC=4",
+        "ACM=0 N=0",
+        "ACM=0 NDS=0",
+        "ACM=0 CJ=1e-3 CJA=2e-3",
+        "ACM=0 TLEV=2 GAP2=-1",
+    ] {
+        assert!(bind(suffix, options).is_err(), "{suffix}");
+    }
+    Ok(())
+}

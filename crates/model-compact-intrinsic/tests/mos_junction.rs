@@ -1,9 +1,9 @@
 use model_compact_intrinsic::{
-    Bsim3BerkeleyJunction, Bsim3JunctionModel, Bsim3JunctionOccurrence, Bsim3JunctionRules,
-    Bsim3JunctionTemperature, Bsim3KneeReference, MosBottomDensity, MosBottomMeasure,
-    MosDepletionComponent, MosDepletionShape, MosDepletionTemperatureCoefficients,
-    MosDiffusionDimensions, MosDiffusionGeometry, MosDiffusionRule, MosDiffusionTerminal,
-    MosJunctionDepletion, MosJunctionSaturation, MosLinearReverseJunction, MosSaturationFallback,
+    Bsim3BerkeleyJunction, Bsim3JunctionModel, Bsim3JunctionRules, Bsim3JunctionTemperature,
+    Bsim3KneeReference, MosBottomDensity, MosBottomMeasure, MosDepletionComponent,
+    MosDepletionShape, MosDepletionTemperatureCoefficients, MosDiffusionDimensions,
+    MosDiffusionGeometry, MosDiffusionRule, MosDiffusionTerminal, MosJunctionDepletion,
+    MosJunctionOccurrence, MosJunctionSaturation, MosLinearReverseJunction, MosSaturationFallback,
     MosSeriesResistance, MosSeriesResistanceRule, MosSidewallRule, PreparedBsim3Junction,
     mos_resistance_at_temperature, prepare_mos_diffusion,
 };
@@ -352,7 +352,7 @@ mod native_oracle {
                     Bsim3KneeReference::RawExplicit
                 },
             },
-            Bsim3JunctionOccurrence {
+            MosJunctionOccurrence {
                 dimensions: DIMENSIONS,
                 terminal,
                 gate_width_m: DIMENSIONS.diffusion_width()?,

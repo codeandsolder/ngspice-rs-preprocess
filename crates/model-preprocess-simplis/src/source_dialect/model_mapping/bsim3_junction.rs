@@ -5,11 +5,14 @@
 //! HSPICE MOSFET Models Manual X-2005.09, pp. 402–404 and 423–425.
 
 use super::{HspiceBsim3Defaults, HspiceMosJunctionMode, ModelSelection, one};
+
+mod linear_reverse;
 use anyhow::{Context, Result, bail, ensure};
+pub use linear_reverse::{HspiceBsim3LinearReverseJunctions, HspiceJunctionSourceOptions};
 use model_compact_intrinsic::{
-    Bsim3JunctionModel, Bsim3JunctionOccurrence, Bsim3JunctionRules, Bsim3KneeReference,
-    MosBottomDensity, MosDepletionShape, MosDepletionTemperatureCoefficients,
-    MosDiffusionDimensions, MosDiffusionRule, MosDiffusionTerminal, MosJunctionDepletion,
+    Bsim3JunctionModel, Bsim3JunctionRules, Bsim3KneeReference, MosBottomDensity,
+    MosDepletionShape, MosDepletionTemperatureCoefficients, MosDiffusionDimensions,
+    MosDiffusionRule, MosDiffusionTerminal, MosJunctionDepletion, MosJunctionOccurrence,
     MosJunctionSaturation, MosSaturationFallback, MosSeriesResistance, MosSeriesResistanceRule,
     MosSidewallRule, PreparedBsim3Junction,
 };
@@ -35,10 +38,7 @@ pub struct HspiceBsim3JunctionInput {
 pub struct HspiceBsim3BerkeleyJunctions {
     model: Bsim3JunctionModel,
     rules: Bsim3JunctionRules,
-    width_multiplier: f64,
-    width_offset_m: f64,
-    heavy_diffusion_m: f64,
-    series: [MosSeriesResistance; 2],
+    geometry: JunctionGeometry,
 }
 
 impl HspiceBsim3BerkeleyJunctions {
@@ -48,31 +48,41 @@ impl HspiceBsim3BerkeleyJunctions {
     /// # Errors
     /// Invalid physical occurrence geometry, temperature or coefficients.
     pub fn prepare(self, input: HspiceBsim3JunctionInput) -> Result<[PreparedBsim3Junction; 2]> {
+        let [drain, source] = self.geometry.occurrences(input);
+        Ok([
+            self.model.prepare(self.rules, drain)?,
+            self.model.prepare(self.rules, source)?,
+        ])
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct JunctionGeometry {
+    width_multiplier: f64,
+    width_offset_m: f64,
+    heavy_diffusion_m: f64,
+    series: [MosSeriesResistance; 2],
+}
+
+impl JunctionGeometry {
+    fn occurrences(self, input: HspiceBsim3JunctionInput) -> [MosJunctionOccurrence; 2] {
         let dimensions = MosDiffusionDimensions {
             width_m: input.drawn_width_m,
             width_multiplier: self.width_multiplier,
             width_offset_m: self.width_offset_m,
             heavy_diffusion_m: self.heavy_diffusion_m,
         };
-        let prepare = |index: usize| -> Result<PreparedBsim3Junction> {
-            self.model
-                .prepare(
-                    self.rules,
-                    Bsim3JunctionOccurrence {
-                        dimensions,
-                        terminal: input.diffusion[index],
-                        gate_width_m: input.gate_width_m,
-                        series: MosSeriesResistance {
-                            squares: input.squares[index],
-                            default_squares: input.default_squares[index],
-                            ..self.series[index]
-                        },
-                        operating_temperature_k: input.operating_temperature_k,
-                    },
-                )
-                .map_err(Into::into)
-        };
-        Ok([prepare(0)?, prepare(1)?])
+        std::array::from_fn(|index| MosJunctionOccurrence {
+            dimensions,
+            terminal: input.diffusion[index],
+            gate_width_m: input.gate_width_m,
+            series: MosSeriesResistance {
+                squares: input.squares[index],
+                default_squares: input.default_squares[index],
+                ..self.series[index]
+            },
+            operating_temperature_k: input.operating_temperature_k,
+        })
     }
 }
 
@@ -117,6 +127,45 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
         Ok(density)
     }
 
+    fn model_scale(&mut self, default: f64) -> Result<f64> {
+        let scale = self.real(&["SCALM"], default)?;
+        ensure!(
+            scale.is_finite() && scale > 0.,
+            "invalid BSIM3 model length scale"
+        );
+        Ok(scale)
+    }
+
+    fn geometry(&mut self, model_scale: f64, ldif: f64) -> Result<JunctionGeometry> {
+        let light_path_m = (self.real(&["LD", "DLAT", "LATD"], 0.)? + ldif) * model_scale;
+        let sheet = self.real(&["RSH", "RL"], 0.)?;
+        let drain = MosSeriesResistance {
+            terminal_resistance: self.real(&["RD"], 0.)?,
+            sheet_resistance_ohm_per_square: sheet,
+            contact_resistance_ohm: self.real(&["RDC"], 0.)?,
+            squares: None,
+            default_squares: 0.,
+            light_path_m,
+        };
+        let source = MosSeriesResistance {
+            terminal_resistance: self.real(&["RS"], 0.)?,
+            contact_resistance_ohm: self.real(&["RSC"], 0.)?,
+            ..drain
+        };
+        Ok(JunctionGeometry {
+            width_multiplier: self.real(&["WMLT"], 1.)?,
+            width_offset_m: self.real(&["XW"], 0.)? * model_scale,
+            heavy_diffusion_m: self.real(&["HDIF"], 0.)? * model_scale,
+            series: [drain, source],
+        })
+    }
+
+    fn nominal_temperature(&mut self, default_kelvin: f64) -> Result<f64> {
+        Ok(self
+            .optional(&["TNOM", "TREF"])?
+            .map_or(default_kelvin, |celsius| celsius + 273.15))
+    }
+
     fn junction_model(
         &mut self,
         nominal_temperature_k: f64,
@@ -134,9 +183,7 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
         )?;
         let sidewall_potential = self.real(&["PBSW"], 1.)?;
         let sidewall_grading = self.real(&["MJSW"], 0.33)?;
-        let nominal = self
-            .optional(&["TNOM", "TREF"])?
-            .map_or(nominal_temperature_k, |celsius| celsius + 273.15);
+        let nominal = self.nominal_temperature(nominal_temperature_k)?;
         Ok(Bsim3JunctionModel {
             saturation: MosJunctionSaturation {
                 bottom: MosBottomDensity::PerSquareMetre(self.density(
@@ -249,37 +296,14 @@ impl ModelSelection {
             selection: self,
             evaluate,
         };
-        let model_scale = c.real(&["SCALM"], model_scale)?;
-        ensure!(
-            model_scale.is_finite() && model_scale > 0.,
-            "invalid BSIM3 model length scale"
-        );
+        let model_scale = c.model_scale(model_scale)?;
         let model = c.junction_model(nominal_temperature_k, model_scale)?;
-        // Both light-diffusion lengths enter the extrinsic resistance law.
-        // BSIM3's separate intrinsic XJ is not itself a supplied lateral LD.
-        let light_path_m =
-            (c.real(&["LD", "DLAT", "LATD"], 0.)? + c.real(&["LDIF"], 0.)?) * model_scale;
-        let sheet = c.real(&["RSH", "RL"], 0.)?;
-        let drain = MosSeriesResistance {
-            terminal_resistance: c.real(&["RD"], 0.)?,
-            sheet_resistance_ohm_per_square: sheet,
-            contact_resistance_ohm: c.real(&["RDC"], 0.)?,
-            squares: None,
-            default_squares: 0.,
-            light_path_m,
-        };
-        let source = MosSeriesResistance {
-            terminal_resistance: c.real(&["RS"], 0.)?,
-            contact_resistance_ohm: c.real(&["RSC"], 0.)?,
-            ..drain
-        };
+        let ldif = c.real(&["LDIF"], 0.)?;
+        let geometry = c.geometry(model_scale, ldif)?;
         Ok(HspiceBsim3BerkeleyJunctions {
             model,
             rules,
-            width_multiplier: c.real(&["WMLT"], 1.)?,
-            width_offset_m: c.real(&["XW"], 0.)? * model_scale,
-            heavy_diffusion_m: c.real(&["HDIF"], 0.)? * model_scale,
-            series: [drain, source],
+            geometry,
         })
     }
 }
