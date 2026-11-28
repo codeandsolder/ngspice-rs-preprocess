@@ -1,0 +1,18 @@
+EKV independent witness
+.options abstol=1e-22 reltol=1e-10 vntol=1e-12
+.model ekv ekv_va type=1 vto=0.5 l=1u w=10u xd_js=0 xd_jsw=0 xd_jswg=0 xd_cj=0 xd_cjsw=0 xd_cjswg=0
+Vd d 0 1
+Vg g 0 0
+Vs s 0 0
+Vb b 0 0
+N1 d g s b ekv
+.control
+pre_osdi ./ekv.osdi
+dc Vg -0.5 2 0.25
+set wr_singlescale
+set wr_vecnames
+set numdgt=16
+wrdata reference-dc.tsv v(g) i(vd) i(vs) i(vb)
+quit
+.endc
+.end
