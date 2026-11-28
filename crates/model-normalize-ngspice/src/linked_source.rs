@@ -806,9 +806,11 @@ impl LinkState<'_> {
             .split_inclusive(|byte| *byte == b'\n')
             .collect::<Vec<_>>();
         for record in records {
-            // Non-ASCII QSPICE device designators require a qualified kernel.
+            // Retain external-module declarations for source-only inspection; other
+            // non-ASCII device designators require a qualified kernel.
             if self.dialect() == SourceDialect::Qspice
                 && record.logical.first().is_some_and(|byte| !byte.is_ascii())
+                && !crate::qspice::external_module::is_declaration(&record.logical)
             {
                 if selection.selected() {
                     crate::qspice::reject_special_device(path, record.line)?;
