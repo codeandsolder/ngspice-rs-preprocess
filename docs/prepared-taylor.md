@@ -1,4 +1,4 @@
-# Prepared physical Taylor evaluation (ABI 5)
+# Prepared physical Taylor evaluation (ABI 6)
 
 The immutable descriptor declares `TaylorCapability::Computed { max_order }`
 or `Unavailable`. There is no ordinary-point compatibility fallback. The
@@ -42,10 +42,41 @@ the same immutable physical data and validation. Selective tile replacements
 change the prepared recipe, not the physical history. `TaylorBuffer` is
 reusable; its dimensions are checked before evaluation. Input plus output
 are bounded to 1,048,576 scalars, order to 64; family arithmetic uses fixed
-capacity local series, and no allocation occurs on the successful evaluation
-path. Failed output must be discarded. All four arrays must be complete and
+capacity local series. The caller-owned guard trace lazily reserves bounded
+space and reuses it on subsequent evaluations. Failed output must be discarded. All four arrays must be complete and
 finite; electrical conservation and common-mode invariance are checked at
 every degree. Known-zero charge must remain zero.
+
+## Executed physical constitutive surfaces
+
+Each successful Taylor evaluation returns the executed, physically active
+branch sites in `TaylorPoint::guards.records()`. Every record contains a
+stable family-local `site`, the strict `Less` or `Greater` predicate, the
+actual selected boolean, and the normalized signed operand-difference
+polynomial. Constants and lower-degree operands broadcast zero. The same
+comparison chooses the constitutive branch and emits its surface, so a
+solver never reconstructs thresholds or relies on scalar evaluations at an
+ambiguous exact join. Equality with no nonzero higher coefficients selects
+the non-strict complementary branch. Inactive and unexecuted sites are
+absent, not assigned synthetic regions.
+
+The trace is reset on each checked standalone or lane evaluation. Duplicate
+sites, nonfinite or inconsistent surfaces, degrees beyond the input order,
+and more than 256 sites are rejected. Guard polynomials are prediction
+hints, not proof of crossings: the consumer must localize and verify actual
+one-sided solutions and handle rollback, coincidence and discontinuities.
+Stable site identity is scoped by artifact family and bound device instance;
+do not assign global meaning to site numbers or rely on trace order across
+different families.
+
+The SIMetrix diode records positive-current injection and depletion
+continuation when active. VDMOS records channel direction (including the
+quasi-saturation branch), mobility threshold, hard channel cutoff, triode/
+saturation boundary, gate-drain charge join, reverse diode continuation,
+avalanche, its temperature-dependent matching regime, and thermal depletion potential/continuation. Numerical
+rearrangements of analytic functions (scaled exponential, softplus, etc.)
+are not physical branch sites. Invalid constitutive domains are errors,
+not synthetic guards.
 
 ## Constitutive implementation
 
@@ -56,6 +87,8 @@ channel, body diode, gate charge, series resistance, electrothermal and
 hidden recovery equations to the same arithmetic, sharing nodal assembly.
 The avalanche temperature root uses the converged scalar root and formal
 series Newton iteration, not differentiation of a finite scalar iteration.
+The matching excess is retained separately from one and the positive root
+is bracketed above the tangent, avoiding cancellation near the matching boundary.
 The existing recovery row transformation is retained; no fictitious storage
 term is introduced for a temperature-dependent recovery rate gain.
 

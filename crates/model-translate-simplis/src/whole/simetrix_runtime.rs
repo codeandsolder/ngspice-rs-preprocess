@@ -490,8 +490,10 @@ struct ModelTemperature {
 type Temperatures = BTreeMap<String, ModelTemperature>;
 
 fn temperature_device(kind: &str) -> Option<u8> {
+    if model_normalize_ngspice::bjt_card::ClassicBjtFamily::parse(kind).is_some() {
+        return Some(b'Q');
+    }
     match kind {
-        "NPN" | "PNP" => Some(b'Q'),
         "D" => Some(b'D'),
         "R" | "RES" => Some(b'R'),
         _ => None,

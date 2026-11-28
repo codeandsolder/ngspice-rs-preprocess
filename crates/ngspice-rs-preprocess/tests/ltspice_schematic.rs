@@ -72,7 +72,26 @@ fn source_maps_retain_child_and_library_lines() -> Result<()> {
         assert_eq!(lines[index].source, source.canonicalize()?);
         assert_eq!(lines[index].line, expected);
     }
-    assert!(output.lines().any(|line| line == ".op"));
+    let plan = bundle
+        .analysis_plan
+        .as_ref()
+        .context("missing schematic analysis plan")?;
+    let request = plan
+        .native_requests()
+        .next()
+        .context("missing schematic operating point")?;
+    assert_eq!(request.command, ".OP");
+    assert_eq!(
+        request.origin,
+        ngspice_rs_preprocess::analysis_plan::DirectiveOrigin::SourceOccurrence {
+            path: root.canonicalize()?,
+            first_line: 11,
+            last_line: 11,
+            visit: 0,
+            scope: 0,
+        }
+    );
+    assert!(!output.lines().any(|line| line == ".op"));
     Ok(())
 }
 
