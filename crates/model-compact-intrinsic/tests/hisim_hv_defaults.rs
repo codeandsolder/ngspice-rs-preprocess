@@ -227,7 +227,7 @@ fn copy_dependencies_and_trials_are_independent() -> Result<(), ModelError> {
 #[test]
 fn hv2_native_parameter_resets_are_disclosed() -> Result<(), ModelError> {
     for (name, lower, upper) in [
-        ("scp22", 0., 0.),
+        ("scp22", 0_f64, 0_f64),
         ("rdrcx", 0., 1.),
         ("ndepm", 5e15, 2e17),
         ("tndep", 1e-7, 1e-6),
