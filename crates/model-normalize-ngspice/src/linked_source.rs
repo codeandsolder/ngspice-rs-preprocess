@@ -195,7 +195,7 @@ enum Projection {
 }
 
 impl Projection {
-    fn retain(&mut self, text: &str) -> Result<bool> {
+    fn retain(&mut self, text: &str, dialect: SourceDialect) -> Result<bool> {
         let Self::Library { depth } = self else {
             return Ok(true);
         };
@@ -208,11 +208,13 @@ impl Projection {
                 .checked_sub(1)
                 .context("unmatched .ends in LTspice library")?;
         } else if *depth == 0
-            && text
+            && (text
                 .trim_start()
                 .as_bytes()
                 .first()
                 .is_some_and(u8::is_ascii_alphabetic)
+                || (dialect == SourceDialect::Qspice
+                    && crate::qspice::external_module::is_declaration(text.as_bytes())))
         {
             return Ok(false);
         }
@@ -839,7 +841,7 @@ impl LinkState<'_> {
             if selected {
                 if in_control || control_end {
                     self.emit_record(path, &record, &physical)?;
-                } else if projection.retain(text)? {
+                } else if projection.retain(text, self.dialect())? {
                     if self.dialect() == SourceDialect::Qspice {
                         crate::qspice::check_topology_directive(path, record.line, text)?;
                     }

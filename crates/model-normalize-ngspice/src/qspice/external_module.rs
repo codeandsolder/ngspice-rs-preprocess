@@ -1,7 +1,7 @@
 //! Source declarations only: no module discovery, loading or execution.
 use super::{Feature, reject};
 use crate::{
-    lexical::{Statement, statements, tokens},
+    lexical::{Statement, normalize_nbsp, statements, tokens},
     linked_source::{LinkedSource, RootKind, SourceDialect, SourceOrigin},
     model_card::parse_parameter_fields,
 };
@@ -48,7 +48,8 @@ pub struct ExternalModuleDeclaration {
 }
 
 pub(crate) fn is_declaration(text: &[u8]) -> bool {
-    text.starts_with("Ø".as_bytes())
+    text.first().is_some_and(|byte| !byte.is_ascii())
+        && std::str::from_utf8(text).is_ok_and(|text| text.trim_start().starts_with(['Ø', 'ø']))
 }
 
 fn terminal(raw: &str) -> Result<ModuleTerminal> {
@@ -67,7 +68,7 @@ fn terminal(raw: &str) -> Result<ModuleTerminal> {
     })
 }
 
-fn group<'a>(tail: &mut &'a str) -> Result<Vec<ModuleTerminal>> {
+fn group(tail: &mut &str) -> Result<Vec<ModuleTerminal>> {
     let contents = tail
         .trim_start()
         .strip_prefix('«')
@@ -105,12 +106,13 @@ fn parameters(text: &str) -> Result<Vec<ModuleParameter>> {
 }
 
 fn parse(text: &str, origin: &SourceOrigin) -> Result<ExternalModuleDeclaration> {
+    let text = text.trim_start();
     let name_end = text
         .find(|character: char| character.is_whitespace() || character == '«')
         .context("external module declaration requires terminal groups")?;
     let instance = &text[..name_end];
     ensure!(
-        instance.len() > 'Ø'.len_utf8(),
+        instance.len() > 'Ø'.len_utf8() && !instance.contains('»'),
         "missing external module instance name"
     );
     let mut tail = &text[name_end..];
@@ -148,7 +150,8 @@ fn parse_statement(
             .len()
             .saturating_add(origin.path.as_os_str().len()),
     )?;
-    let declaration = std::str::from_utf8(&statement.text)
+    let normalized = normalize_nbsp(&statement.text);
+    let declaration = std::str::from_utf8(normalized.as_deref().unwrap_or(&statement.text))
         .context("external module source encoding")
         .and_then(|text| parse(text, origin))
         .map_err(|error| {

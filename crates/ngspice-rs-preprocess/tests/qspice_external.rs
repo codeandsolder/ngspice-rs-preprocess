@@ -165,3 +165,92 @@ fn malformed_declarations_have_physical_diagnostics() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn mixed_dialect_deck_title_and_lexical_separators() -> Result<()> {
+    use model_normalize_ngspice::linked_source::LinkLimits;
+    use model_preprocess_command::SourceSession;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let child = dir.path().join("device.lib");
+    fs::write(&root, "Øtitle «not a device»\n.include device.lib\n.end\n")?;
+    fs::write(&child, b"*#QSPICE\n\xa0\xf8demo\xa0\xabinput\xb4d\xbb\xa0\xaboutput\xb4b\xbb\xa0\xab\xbb\xa0module\xa0char* label=\"a ; $ // b\"\n")?;
+    let mut session = SourceSession::default();
+    let admitted = session.load(&root)?;
+    let linked = SourceLinker::default().link_admitted(
+        &admitted,
+        RootKind::Deck,
+        LinkLimits::default(),
+        &mut session,
+    )?;
+    let modules = external_modules(&linked, RootKind::Deck, session.budget())?;
+    let [module] = modules.as_slice() else {
+        anyhow::bail!("expected one declaration from QSPICE child")
+    };
+    assert_eq!(module.origin.path, child.canonicalize()?);
+    assert_eq!(module.origin.line, 2);
+    assert_eq!(module.instance, "ødemo");
+    assert_eq!(module.module_reference, "module");
+    assert_eq!(
+        module
+            .parameters
+            .first()
+            .context("missing string parameter")?
+            .value,
+        "\"a ; $ // b\""
+    );
+    let error =
+        model_normalize_ngspice::normalize_linked(&linked, RootKind::Deck, session.budget())
+            .err()
+            .context("native projection admitted external module")?;
+    assert_eq!(
+        error
+            .downcast_ref::<Unsupported>()
+            .context("missing external module diagnostic")?
+            .feature,
+        Feature::ExternalModule
+    );
+    Ok(())
+}
+
+#[test]
+fn library_projection_drops_external_cards_outside_subcircuits() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.lib");
+    let child = dir.path().join("child.lib");
+    fs::write(&root, b".lib child.lib\n")?;
+    fs::write(&child, b"*#QSPICE\n\xd8discard \xaba\xbb \xabb\xbb \xab\xbb outside\n.subckt cell a b\n\xd8keep \xaba\xbb \xabb\xbb \xab\xbb inside\n.ends cell\n")?;
+    let linked = SourceLinker {
+        dialect: SourceDialect::Ltspice,
+        ..SourceLinker::default()
+    }
+    .link(&root)?;
+    let modules = external_modules(&linked, RootKind::Include, &WorkBudget::default())?;
+    let [module] = modules.as_slice() else {
+        anyhow::bail!("expected one retained declaration")
+    };
+    assert_eq!(module.instance, "Økeep");
+    assert_eq!(module.origin.line, 4);
+    Ok(())
+}
+
+#[test]
+fn source_inspection_respects_the_shared_work_budget() -> Result<()> {
+    use model_preprocess_command::WorkLimits;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("deck.lib");
+    fs::write(
+        &path,
+        b"\xd8demo \xaba b c\xbb \xabd e f\xbb \xab0\xbb module int k=3\n",
+    )?;
+    let linked = linker().link(&path)?;
+    let budget = WorkBudget::new(
+        WorkLimits {
+            generated_nodes: 1,
+            ..WorkLimits::default()
+        },
+        Cancellation::default(),
+    );
+    assert!(external_modules(&linked, RootKind::Include, &budget).is_err());
+    Ok(())
+}
