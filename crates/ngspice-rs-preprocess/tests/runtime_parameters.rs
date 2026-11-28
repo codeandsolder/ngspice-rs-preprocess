@@ -73,11 +73,8 @@ fn run_case(fixtures: &Path, name: &str, outcome: &str, abs: f64, rel: f64) -> R
         return measured_scoped_diode_temperatures(&bundle, fixtures, abs, rel);
     }
 
-    if matches!(
-        name,
-        "global-model" | "instance-model" | "instance-precedence"
-    ) {
-        return measured_classic_bjt_temperatures(&bundle, fixtures, name);
+    if outcome == "legacy-bjt" {
+        return measured_classic_bjt_temperatures(&bundle, fixtures, name, abs, rel);
     }
 
     let dir = tempfile::tempdir()?;
