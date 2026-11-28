@@ -49,10 +49,19 @@ fn parse_model(text: &str, line: usize) -> Result<(ModelCard, Option<String>)> {
         };
         ensure!(!base.is_empty(), "missing PSpice AKO base model");
         let direct = format!("{}{}", &text[..family.start], &text[end..]);
-        return Ok((
-            parse_model_card(&direct, line, &[])?,
-            Some(base.to_ascii_lowercase()),
-        ));
+        let mut card = parse_model_card(&direct, line, &[])?;
+        // Restore offsets into the original logical declaration, not the
+        // synthetic card from which the AKO prefix was removed.
+        let removed = end - family.start;
+        for field in &mut card.parameters {
+            field.span.name.start += removed;
+            field.span.name.end += removed;
+            if let Some(value) = &mut field.span.value {
+                value.start += removed;
+                value.end += removed;
+            }
+        }
+        return Ok((card, Some(base.to_ascii_lowercase())));
     }
     Ok((parse_model_card(text, line, &[])?, None))
 }

@@ -322,6 +322,17 @@ mod tests {
                 .as_deref(),
             Some("{local_delay}")
         );
+        let local = ".model local AKO:base UGATE(TPHLTY={local_delay})";
+        let field = &declaration.timing[1].declaration.assignments[0].field;
+        assert_eq!(&local[field.span.name.clone()], "TPHLTY");
+        assert_eq!(
+            &local[field
+                .span
+                .value
+                .clone()
+                .context("missing expression span")?],
+            "{local_delay}"
+        );
         let paths = declaration.bind_timing(
             super::super::digital_corners::TimingScales::default(),
             |location, field| match (location.scope.as_slice(), field.expression.as_deref()) {

@@ -19,6 +19,7 @@ use std::{collections::BTreeMap, fmt::Write as _};
 pub mod digital_corners;
 pub mod digital_instance;
 pub mod digital_io;
+pub mod digital_options;
 pub mod digital_source;
 pub mod digital_timing;
 mod instances;
