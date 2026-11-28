@@ -4,6 +4,7 @@ mod pspice;
 mod simetrix;
 pub mod source_capture;
 pub mod sweep;
+pub mod timing;
 use anyhow::{Context, Result, ensure};
 use measurement::MeasurementIntent;
 use model_normalize_ngspice::ltspice::transient::TransientIntent;
@@ -154,6 +155,11 @@ pub enum Directive {
         /// Timing fields and initialization/termination modes.
         intent: TransientIntent,
     },
+    /// Segmented transient timing with separate integration policy.
+    ScheduledTransient {
+        /// Source timing and bias-selection policy.
+        intent: timing::ScheduleIntent,
+    },
     /// Ordered option settings.
     Options {
         /// Individual settings.
@@ -207,7 +213,10 @@ impl PlanEntry {
     pub const fn is_analysis(&self) -> bool {
         matches!(
             self.directive,
-            Directive::Analysis { .. } | Directive::Transient { .. } | Directive::DcSweep { .. }
+            Directive::Analysis { .. }
+                | Directive::Transient { .. }
+                | Directive::ScheduledTransient { .. }
+                | Directive::DcSweep { .. }
         )
     }
 }

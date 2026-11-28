@@ -169,11 +169,14 @@ fn unqualified_hspice_semantics_are_errors() -> Result<()> {
         (".option XMULT_IN_EXP=maybe", "invalid HSPICE XMULT_IN_EXP"),
         (".model mos NMOS LEVEL=49", "qualified native mapping"),
         (".temp 25 50", "multiple-temperature"),
-        (".tran 1n 10n 2n 20n", "multipoint transient"),
+        (
+            ".tran 1n 10n 2n 8n START=0",
+            "invalid or non-progressing transient timing segment",
+        ),
         (".dc gain 1 2 1", "parameter/temperature sweep"),
         (
-            ".ac lin 1 1k 2k SWEEP gain 1 2 1",
-            "unqualified HSPICE analysis",
+            ".ac lin 1 1k 2k SWEEP gain 1 2",
+            "unsupported HSPICE SWEEP coordinate syntax",
         ),
         (".option post=2", "unqualified HSPICE option"),
     ] {
@@ -417,21 +420,119 @@ Xinside p n inner
 }
 
 #[test]
-fn transient_start_is_normalized_without_reinterpreting_schedules() -> Result<()> {
+fn transient_start_is_bound_without_reinterpreting_schedules() -> Result<()> {
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use ngspice_rs_preprocess::analysis_plan::{Directive, timing::IntegrationCeiling};
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("tran.sp");
-    for (source, expected) in [
-        (".tran 1n 10n START=2n UIC", ".tran 1n 10n 2n UIC"),
-        (".tran 1n 10n 2n 0.5n", ".tran 1n 10n 2n 0.5n"),
+    for (source, count, start, cap, uic) in [
+        (".tran 1n 10n START=2n UIC", 1, 2e-9, 0.25e-9, true),
+        (".tran 1n 10n 2n 0.5n", 1, 2e-9, 0.5e-9, false),
+        (".tran 1n 10n 2n 20n START=2n", 2, 2e-9, 0.25e-9, false),
     ] {
         fs::write(
             &root,
-            format!("Transient\nV1 a 0 1\nR1 a 0 1k\n{source}\n.end\n"),
+            format!(
+                "Transient\nV1 a 0 1\nR1 a 0 1k\n{source}\n.option DELMAX=.25n RELTOL=1e-4\n.end\n"
+            ),
         )?;
         let bundle = compile(&root, InputFormat::HspiceDeck)?;
         let native = std::str::from_utf8(&bundle.primary.bytes)?;
-        ensure!(native.contains(expected), "{native}");
+        ensure!(
+            !native
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with(".tran")),
+            "{native}"
+        );
+        ensure!(
+            !native
+                .lines()
+                .any(|line| line.starts_with(".options")
+                    && line.to_ascii_uppercase().contains("DELMAX")),
+            "{native}"
+        );
+        ensure!(
+            native.to_ascii_lowercase().contains("reltol=1e-4"),
+            "{native}"
+        );
+        let plan = bundle.analysis_plan.context("missing HSPICE plan")?;
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].statement, source);
+        let Directive::ScheduledTransient { intent } = &plan.entries[0].directive else {
+            anyhow::bail!("missing schedule");
+        };
+        let timing = intent.bind(parse_spice_constant)?;
+        assert_eq!(timing.output.len(), count);
+        assert!((timing.start - start).abs() < 1e-22);
+        assert_eq!(timing.uic, uic);
+        let IntegrationCeiling::Explicit(ceiling) = timing.ceiling else {
+            anyhow::bail!("missing explicit integration ceiling");
+        };
+        assert!((ceiling[0].step - cap).abs() < 1e-22);
     }
+    Ok(())
+}
+
+#[test]
+fn segmented_transient_preserves_continuation_origins_and_candidate_axes() -> Result<()> {
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use model_preprocess_command::WorkBudget;
+    use ngspice_rs_preprocess::analysis_plan::{
+        Directive, DirectiveOrigin, sweep::SweepTarget, timing::IntegrationCeiling,
+    };
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("tran.sp");
+    let child = dir.path().join("analysis.sp");
+    fs::write(
+        &root,
+        "Timing\n.param duration=10n\n.param gain=1\nV1 a 0 1\nR1 a 0 1k\n.inc 'analysis.sp'\n.op\n.end\n",
+    )?;
+    fs::write(
+        &child,
+        ".tran 1n 'duration'\n+ 2n 30n START=2n SWEEP gain LIN 3 1 3 SWEEP TEMP 25 75 25\n",
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let plan = bundle.analysis_plan.context("missing plan")?;
+    assert_eq!(plan.entries.len(), 2);
+    let entry = &plan.entries[0];
+    assert!(
+        matches!(&entry.origin, DirectiveOrigin::Source { path, first_line: 1, last_line: 2 } if path == &child)
+    );
+    assert_eq!(entry.independent_axes.len(), 2);
+    assert_eq!(
+        entry.independent_axes[0].target,
+        SweepTarget::Parameter {
+            name: "gain".into()
+        }
+    );
+    assert_eq!(entry.independent_axes[1].target, SweepTarget::Temperature);
+    let bound = plan.bind_independent_sweeps(
+        0,
+        |_, _, raw| parse_spice_constant(raw),
+        &WorkBudget::default(),
+    )?;
+    assert_eq!(bound.count(), 9);
+    let Directive::ScheduledTransient { intent } = &entry.directive else {
+        anyhow::bail!("missing schedule");
+    };
+    let timing = intent.bind(|raw| {
+        if raw
+            .trim_matches(['{', '}', '\''])
+            .eq_ignore_ascii_case("duration")
+        {
+            Ok(10e-9)
+        } else {
+            parse_spice_constant(raw)
+        }
+    })?;
+    assert_eq!(timing.output.len(), 2);
+    assert_eq!(timing.ceiling, IntegrationCeiling::Automatic);
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(
+        !native
+            .lines()
+            .any(|line| line.starts_with(".tran") || line.starts_with(".op"))
+    );
     Ok(())
 }
 
