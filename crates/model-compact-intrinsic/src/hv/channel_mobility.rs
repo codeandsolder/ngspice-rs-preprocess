@@ -53,7 +53,7 @@ pub struct HiSimHvChannelMobilityPoint {
     pub drain_current_a: Jet,
 }
 
-fn saturation_factor(ratio: Jet, exponent: f64) -> Jet {
+pub(super) fn saturation_factor(ratio: Jet, exponent: f64) -> Jet {
     // Evaluate (1 + ratio^BB)^(-1/BB) without overflowing ratio^BB.
     let log_ratio = ratio.ln();
     if log_ratio.value > 0. {

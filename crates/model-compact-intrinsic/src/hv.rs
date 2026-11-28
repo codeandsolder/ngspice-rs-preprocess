@@ -12,6 +12,7 @@ mod channel_mobility;
 mod channel_modulation;
 mod depletion_drain;
 mod depletion_surface;
+mod depletion_transport;
 mod drain_smoothing;
 mod drift;
 mod edge_tunneling;
@@ -78,6 +79,10 @@ pub use depletion_drain::{
 pub use depletion_surface::{
     HiSimHvDepletionEndpointPoint, HiSimHvDepletionSurfaceInputs, HiSimHvDepletionSurfacePoint,
     evaluate_hisim_hv_depletion_endpoint, evaluate_hisim_hv_depletion_surface,
+};
+pub use depletion_transport::{
+    HiSimHvDepletionCarrierMobility, HiSimHvDepletionChannelCoefficients,
+    HiSimHvDepletionChannelInputs, HiSimHvDepletionChannelPoint,
 };
 pub use drain_smoothing::{
     HiSimHvDrainSmoothingInputs, HiSimHvDrainSmoothingPoint, evaluate_hisim_hv_drain_smoothing,

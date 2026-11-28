@@ -32,7 +32,7 @@ fn inputs(row: &[f64; 8], offset: [f64; 4], fermi: f64) -> HiSimHvDepletionSurfa
 fn evaluate(row: &[f64; 8], offset: [f64; 4]) -> Result<HiSimHvDepletionSurfacePoint, ModelError> {
     evaluate_hisim_hv_depletion_surface(&inputs(row, offset, 0.))
 }
-fn outputs(p: HiSimHvDepletionSurfacePoint) -> [Jet; 6] {
+fn outputs(p: &HiSimHvDepletionSurfacePoint) -> [Jet; 6] {
     [
         p.surface,
         p.buried,
@@ -70,7 +70,7 @@ fn native_depletion_surface() -> TestResult {
                 continue;
             }
         };
-        for (i, p) in outputs(p).into_iter().enumerate() {
+        for (i, p) in outputs(&p).into_iter().enumerate() {
             let expected = row[9 + i];
             let tol = 2e-8 * expected.abs().max(p.value.abs()) + if i < 3 { 2e-10 } else { 2e-12 };
             if (p.value - expected).abs() > tol {
@@ -95,13 +95,13 @@ fn independent_depletion_surface_jacobian() -> TestResult {
         for thickness in [1e-7, 2e-7, 5e-7] {
             for body in [-0.2, -1.2] {
                 let row = [gate, body, 38., 0.003, 1e23, 5e22, 1e16, thickness];
-                let p = outputs(evaluate(&row, [0.; 4])?);
+                let p = outputs(&evaluate(&row, [0.; 4])?);
                 for axis in 0..4 {
                     let step = if axis == 3 { 1e-3 } else { 1e-5 };
                     let ev = |n: f64| {
                         let mut offset = [0.; 4];
                         offset[axis] = n * step;
-                        evaluate(&row, offset).map(outputs)
+                        evaluate(&row, offset).map(|p| outputs(&p))
                     };
                     let a = ev(-2.)?;
                     let b = ev(-1.)?;
@@ -126,8 +126,8 @@ fn independent_depletion_surface_jacobian() -> TestResult {
     Ok(())
 }
 
-fn endpoint_outputs(p: HiSimHvDepletionEndpointPoint) -> [Jet; 13] {
-    let [a, b, c, d, e, f] = outputs(p.surface);
+fn endpoint_outputs(p: &HiSimHvDepletionEndpointPoint) -> [Jet; 13] {
+    let [a, b, c, d, e, f] = outputs(&p.surface);
     [
         a,
         b,
@@ -144,6 +144,40 @@ fn endpoint_outputs(p: HiSimHvDepletionEndpointPoint) -> [Jet; 13] {
         p.smoothing_charge,
     ]
 }
+fn transport_tolerance(
+    index: usize,
+    actual: f64,
+    expected: f64,
+    precise: f64,
+    parameters: &[f64; 8],
+    mut tolerance: f64,
+) -> f64 {
+    let precise_tolerance = 2e-8 * precise.abs().max(actual.abs()) + 2e-12;
+    assert!(
+        (actual - precise).abs() <= precise_tolerance,
+        "row {index}: extended precision transport {precise:e}, Rust {actual:e}"
+    );
+    // Native computes exp(chi)-1-chi directly. Near zero, cancellation
+    // loses the quadratic remainder. Bound the error in the squared sheet
+    // charge and convert it to charge error by the difference of squares.
+    let poisson_squared = 2. * 1.034_943e-10 * 1.602_191_8e-19 * parameters[4] / parameters[2];
+    let squared_roundoff = 2. * f64::EPSILON * poisson_squared;
+    if expected.is_nan() {
+        assert!(
+            precise * precise <= squared_roundoff,
+            "row {index}: native nonfinite transport outside roundoff regime"
+        );
+    } else if precise.abs() < 1e-3 * poisson_squared.sqrt() {
+        let sum = expected.abs() + precise.abs();
+        tolerance += if sum > squared_roundoff.sqrt() {
+            squared_roundoff / sum
+        } else {
+            squared_roundoff.sqrt()
+        };
+    }
+    tolerance
+}
+
 #[test]
 fn native_depletion_endpoint() -> TestResult {
     let mut failures = [0; 13];
@@ -173,33 +207,13 @@ fn native_depletion_endpoint() -> TestResult {
                 continue;
             }
         };
-        for (i, p) in endpoint_outputs(p).into_iter().enumerate() {
+        for (i, p) in endpoint_outputs(&p).into_iter().enumerate() {
             let expected = row[9 + i];
             let mut tol =
                 2e-8 * expected.abs().max(p.value.abs()) + if i < 3 { 2e-10 } else { 2e-12 };
             if i == 11 {
                 let precise = row[22];
-                let precise_tol = 2e-8 * precise.abs().max(p.value.abs()) + 2e-12;
-                assert!(
-                    (p.value - precise).abs() <= precise_tol,
-                    "row {index}: extended precision transport {precise:e}, Rust {:e}",
-                    p.value
-                );
-                // Native computes exp(chi)-1-chi directly. Near zero, the
-                // cancellation loses the quadratic remainder. Bound the
-                // absolute error in the squared sheet charge, then convert
-                // it to a charge error using the difference of squares.
-                let poisson_squared =
-                    2. * 1.034_943e-10 * 1.602_191_8e-19 * parameters[4] / parameters[2];
-                if precise.abs() < 1e-3 * poisson_squared.sqrt() {
-                    let sum = expected.abs() + precise.abs();
-                    let squared_roundoff = 2. * f64::EPSILON * poisson_squared;
-                    tol += if sum > squared_roundoff.sqrt() {
-                        squared_roundoff / sum
-                    } else {
-                        squared_roundoff.sqrt()
-                    };
-                }
+                tol = transport_tolerance(index, p.value, expected, precise, &parameters, tol);
             }
             let error = (p.value - expected).abs();
             if error > tol {
@@ -228,7 +242,7 @@ fn independent_depletion_endpoint_jacobian() -> TestResult {
                     let row = [gate, body, 38., 0.003, 1e23, 5e22, 1e16, thickness];
                     let eval = |offset| {
                         evaluate_hisim_hv_depletion_endpoint(&inputs(&row, offset, fermi))
-                            .map(endpoint_outputs)
+                            .map(|p| endpoint_outputs(&p))
                     };
                     let p = eval([0.; 4])?;
                     for axis in 0..4 {
@@ -290,7 +304,7 @@ fn native_depletion_drain_surface() -> TestResult {
                 continue;
             }
         };
-        for (i, p) in outputs(p).into_iter().enumerate() {
+        for (i, p) in outputs(&p).into_iter().enumerate() {
             let expected = row[10 + i];
             let tol = 2e-8 * expected.abs().max(p.value.abs()) + if i < 3 { 2e-10 } else { 2e-12 };
             if (p.value - expected).abs() > tol {
@@ -308,5 +322,80 @@ fn native_depletion_drain_surface() -> TestResult {
     assert_eq!(count, 6895);
     assert_eq!(errors, 0);
     assert_eq!(failures, [0; 6]);
+    Ok(())
+}
+
+#[test]
+fn native_depletion_drain_endpoint() -> TestResult {
+    let mut count = 0;
+    let mut errors = 0;
+    let mut failures = [0; 10];
+    let mut maximum = [0_f64; 10];
+    for (index, line) in include_str!("fixtures/hisim-hv-depletion-drain-endpoint-ngspice47.txt")
+        .lines()
+        .enumerate()
+    {
+        if line.starts_with('#') {
+            continue;
+        }
+        let row: Vec<f64> = line
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?;
+        let parameters: [f64; 8] = row[..8].try_into()?;
+        count += 1;
+        let endpoint =
+            match evaluate_hisim_hv_depletion_endpoint(&inputs(&parameters, [0.; 4], row[8])) {
+                Ok(point) => point,
+                Err(error) => {
+                    errors += 1;
+                    if errors <= 15 {
+                        eprintln!("row {index}: {error}: {:?}", &row[..9]);
+                    }
+                    continue;
+                }
+            };
+        let [surface, buried, junction, charge, buried_charge, substrate] =
+            outputs(&endpoint.surface);
+        let actual = [
+            surface,
+            buried,
+            junction,
+            charge,
+            buried_charge,
+            substrate,
+            endpoint.accumulation_charge,
+            endpoint.substrate_inversion,
+            endpoint.surface_depletion,
+            endpoint.transport_carrier,
+        ];
+        for (i, p) in actual.into_iter().enumerate() {
+            let expected = row[10 + i];
+            let mut tolerance =
+                2e-8 * expected.abs().max(p.value.abs()) + if i < 3 { 2e-10 } else { 2e-12 };
+            if i == 9 {
+                tolerance =
+                    transport_tolerance(index, p.value, expected, row[20], &parameters, tolerance);
+                if expected.is_nan() {
+                    continue;
+                }
+            }
+            let error = (p.value - expected).abs();
+            if error > tolerance {
+                failures[i] += 1;
+                if failures[i] <= 5 || error > maximum[i] {
+                    eprintln!(
+                        "row {index}, field {i}: native={expected:e}, Rust={:e}, inputs {:?}",
+                        p.value,
+                        &row[..9]
+                    );
+                }
+                maximum[i] = maximum[i].max(error);
+            }
+        }
+    }
+    assert_eq!(count, 6895);
+    assert_eq!(errors, 0);
+    assert_eq!(failures, [0; 10], "maximum errors {maximum:?}");
     Ok(())
 }
