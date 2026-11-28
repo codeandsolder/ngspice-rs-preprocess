@@ -98,6 +98,7 @@ pub fn artifact(
             family: FAMILY.into(),
             fingerprint,
             abi: ABI_VERSION,
+            taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
             equations,
             parameters,
             charge: Capability::Computed,
@@ -217,6 +218,9 @@ impl Kernel for SemiconductorKernel {
         frequency: f64,
         sink: &mut dyn Sink,
     ) -> Result<()> {
+        if instance.bulk.is_none() && instance.sidewall.is_none() {
+            return noise_branch(sink, "bulk_shot", 0, 1, 0.);
+        }
         for (junction, node, sidewall) in self.junctions(instance) {
             let Some(junction) = junction else {
                 continue;
