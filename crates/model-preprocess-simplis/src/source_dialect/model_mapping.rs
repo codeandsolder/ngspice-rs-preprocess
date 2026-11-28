@@ -569,6 +569,15 @@ impl MappingTable {
                     .map(|v| v.trim_matches(['\'', '"'])),
                 Some("4.5" | "4.50" | "4.5.0" | "4.64" | "4.6.4" | "4.7" | "4.70" | "4.7.0")
             );
+        if let Some(defaults) = selection.hspice_bsim3_defaults() {
+            bail!(
+                "HSPICE BSIM3 level {} VERSION={} (default ACM={}, CAPMOD={}) has no qualified native lowering",
+                selection.mapping.key.level,
+                selection.effective_version.as_deref().unwrap_or("unknown"),
+                defaults.acm,
+                defaults.capmod,
+            );
+        }
         ensure!(
             diode || bsim4,
             "HSPICE model {} has no qualified native mapping (BSIM4 requires an exact supported VERSION)",
@@ -696,10 +705,13 @@ impl MappingTable {
 fn resolve_version(device: Device, version: Option<&str>) -> Result<Option<String>> {
     let version = version.map(|value| value.trim_matches(['\'', '"']));
     let selected = match device {
-        Device::Bsim3Pspice
-        | Device::Bsim3Berkeley
-        | Device::Bsim3HspiceJunction
-        | Device::Bsim3HspiceBerkeleyJunction => match version {
+        Device::Bsim3HspiceJunction | Device::Bsim3HspiceBerkeleyJunction => match version {
+            Some("3.24" | "3.2.4") => "3.24",
+            Some("3.3" | "3.30" | "3.3.0") => "3.3",
+            Some(other) => bail!("unqualified HSPICE BSIM3 source VERSION={other}"),
+            None => bail!("HSPICE BSIM3 requires an exact supported VERSION"),
+        },
+        Device::Bsim3Pspice | Device::Bsim3Berkeley => match version {
             None | Some("3.3" | "3.30" | "3.3.0") => "3.3",
             Some(
                 "3.2" | "3.20" | "3.21" | "3.22" | "3.23" | "3.24" | "3.2.0" | "3.2.1" | "3.2.2"
@@ -753,7 +765,32 @@ pub struct MappedSource {
     pub selections: Vec<ModelSelection>,
 }
 
+/// Source defaults for BSIM3 levels 49 and 53. These differ from the native
+/// defaults even when the channel release has the same version number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HspiceBsim3Defaults {
+    pub acm: u8,
+    pub capmod: u8,
+}
+
+impl HspiceBsim3Defaults {
+    /// Both source levels use zero default bottom saturation-current density.
+    pub const JUNCTION_CURRENT_DENSITY: f64 = 0.;
+}
+
 impl ModelSelection {
+    /// Defaults of the source model, before explicit or occurrence-dependent
+    /// parameters are applied. This is not a native lowering qualification.
+    #[must_use]
+    pub const fn hspice_bsim3_defaults(&self) -> Option<HspiceBsim3Defaults> {
+        // HSPICE MOSFET Models Manual X-2005.09, pp. 403, 414–415.
+        match self.mapping.device {
+            Device::Bsim3HspiceJunction => Some(HspiceBsim3Defaults { acm: 0, capmod: 0 }),
+            Device::Bsim3HspiceBerkeleyJunction => Some(HspiceBsim3Defaults { acm: 10, capmod: 3 }),
+            _ => None,
+        }
+    }
+
     /// Canonical model card for the existing electrical lowering stage.
     ///
     /// Selection does not certify full numerical equivalence of a device

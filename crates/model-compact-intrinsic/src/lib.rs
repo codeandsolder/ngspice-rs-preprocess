@@ -8,6 +8,7 @@ mod catalog;
 mod defaults;
 mod hv;
 mod legacy_bsim;
+mod mos_junction;
 
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use legacy_bsim::{
@@ -16,6 +17,12 @@ pub use legacy_bsim::{
     LegacyBsimJunctionLaw, LegacyBsimOverlap, PreparedLegacyBsimInstance, PreparedLegacyBsimModel,
     evaluate_bsim1_intrinsic, evaluate_bsim2_intrinsic, evaluate_legacy_bsim_intrinsic,
     legacy_bsim_threshold, prepare_legacy_bsim_model,
+};
+
+pub use mos_junction::{
+    MosBottomMeasure, MosDiffusionDimensions, MosDiffusionGeometry, MosDiffusionRule,
+    MosDiffusionTerminal, MosSeriesResistance, MosSeriesResistanceRule, MosSidewallLengths,
+    MosSidewallRule, prepare_mos_diffusion,
 };
 
 pub use hv::{

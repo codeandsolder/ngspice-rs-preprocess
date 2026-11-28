@@ -239,3 +239,48 @@ fn diode_alias_uses_the_selected_kernel_parameter_grammar() -> Result<()> {
     assert!(card.contains("T_ABS={local_temp}"), "{card}");
     Ok(())
 }
+
+#[test]
+fn hspice_bsim3_selection_preserves_exact_release_and_level_defaults() -> Result<()> {
+    let mapping = table(".options HSPICEMODELS=1")?;
+    for (level, device, acm, capmod) in [
+        (49, Device::Bsim3HspiceJunction, 0, 0),
+        (53, Device::Bsim3HspiceBerkeleyJunction, 10, 3),
+    ] {
+        for (requested, canonical) in [("3.24", "3.24"), ("3.2.4", "3.24"), ("3.3.0", "3.3")] {
+            let lines = statements(&format!(
+                ".model m NMOS LEVEL={level} VERSION={requested} HSPVER=02.2"
+            ));
+            let selection = mapping
+                .select_card(&lines[0], &[], &WorkBudget::default())?
+                .context("selection")?;
+            assert_eq!(selection.mapping.device, device);
+            assert_eq!(selection.effective_version.as_deref(), Some(canonical));
+            let defaults = selection
+                .hspice_bsim3_defaults()
+                .context("source defaults")?;
+            assert_eq!(defaults.acm, acm);
+            assert_eq!(defaults.capmod, capmod);
+            assert!(selection.lower().is_err());
+            assert!(
+                MappingTable::select_standalone_hspice(&lines[0], &[], &WorkBudget::default())
+                    .is_err()
+            );
+        }
+        for suffix in [
+            "",
+            " VERSION=3.2",
+            " VERSION=3.21",
+            " VERSION=3.2.3",
+            " VERSION=3.4",
+        ] {
+            let lines = statements(&format!(".model m NMOS LEVEL={level}{suffix}"));
+            assert!(
+                mapping
+                    .select_card(&lines[0], &[], &WorkBudget::default())
+                    .is_err()
+            );
+        }
+    }
+    Ok(())
+}

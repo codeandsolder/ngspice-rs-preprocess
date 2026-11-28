@@ -96,7 +96,9 @@ fn supported(table: &[(&str, u8)], name: &str, mask: u8) -> bool {
         .is_ok_and(|index| table[index].1 & mask != 0)
 }
 
-const BIN_FIELDS: &[&str] = &["LMIN", "LMAX", "WMIN", "WMAX", "XLREF", "XWREF"];
+const SOURCE_ONLY_FIELDS: &[&str] = &[
+    "LMIN", "LMAX", "WMIN", "WMAX", "XLREF", "XWREF", "LMLT", "WMLT",
+];
 
 pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
     let mask = version_mask(
@@ -130,7 +132,7 @@ pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
             "CALCACM" => {
                 flag(parse_spice_constant(value)?, "CALCACM")?;
             }
-            "LEVEL" | "VERSION" | "XLREF" | "XWREF" => (),
+            "LEVEL" | "VERSION" | "XLREF" | "XWREF" | "LMLT" | "WMLT" => (),
             _ => ensure!(
                 supported(bsim4_catalog::MODEL, &field.name, mask),
                 "unqualified HSPICE BSIM4 model parameter {} for version {}",
@@ -330,6 +332,43 @@ fn initial_vector(expression: &str) -> Result<String> {
     Ok(native.join(","))
 }
 
+// HSPICE selects the bin using the drawn dimensions (Appendix A), then
+// applies the model-specific lithography multipliers to the selected device.
+// Keep parameter expressions symbolic so parameter changes do not freeze the
+// transformed channel geometry at source preparation time. The documented
+// nonpositive-factor reset is encoded in the native expression.
+fn scale_dimension(
+    fields: &mut Fields,
+    model: &Fields,
+    dimension: &str,
+    multiplier: &str,
+    budget: &WorkBudget,
+) -> Result<()> {
+    let Some(factor) = field(model, multiplier) else {
+        return Ok(());
+    };
+    let drawn = field(fields, dimension).context("missing drawn MOS dimension")?;
+    let drawn = super::hierarchy::inner(drawn);
+    let factor = super::hierarchy::inner(factor);
+    budget.charge(
+        Resource::EmittedBytes,
+        drawn
+            .len()
+            .saturating_add(factor.len().saturating_mul(2))
+            .saturating_add(32),
+    )?;
+    let scaled = if let Ok(value) = parse_spice_constant(factor) {
+        if value <= 0. || value == 1. {
+            return Ok(());
+        }
+        format!("{{({drawn})*({factor})}}")
+    } else {
+        format!("{{({drawn})*ternary_fcn(({factor})>0,({factor}),1)}}")
+    };
+    fields.insert(dimension.to_owned(), Some(scaled));
+    Ok(())
+}
+
 fn bind_instance(
     text: &str,
     model_end: usize,
@@ -344,6 +383,8 @@ fn bind_instance(
     let model = model_fields(card, budget)?;
     let mask = version_mask(field(&model, "VERSION").context("missing bound BSIM4 version")?)?;
     fields.remove("WNFLAG");
+    scale_dimension(&mut fields, &model, "L", "LMLT", budget)?;
+    scale_dimension(&mut fields, &model, "W", "WMLT", budget)?;
     let spans = statement_token_spans(text)?;
     let start = spans.get(5).context("missing MOS model token")?.start;
     let mut out = format!("{}{}", &text[..start], card.name);
@@ -411,7 +452,7 @@ pub fn finish(
             let mut card = parse_model_card(row, 0, &[])?;
             if matches!(card.family.to_ascii_uppercase().as_str(), "NMOS" | "PMOS") {
                 card.parameters.retain(|field: &ModelParameter| {
-                    !BIN_FIELDS
+                    !SOURCE_ONLY_FIELDS
                         .iter()
                         .any(|name| field.name.eq_ignore_ascii_case(name))
                 });

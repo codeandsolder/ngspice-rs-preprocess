@@ -991,3 +991,62 @@ V1 a 0 'outside(2)'
     );
     Ok(())
 }
+
+#[test]
+fn bsim4_lithography_scaling_preserves_occurrence_scope_and_drawn_bin_selection() -> Result<()> {
+    let actual = tempfile::tempdir()?;
+    let expected = tempfile::tempdir()?;
+    let source = r#"Model lithography scaling
+.option parhier=local
+Vg g 0 dc 0.8 ac 1
+Vd d 0 0.7
+Ve e 0 0.7
+Vf f 0 0.7
+Vh h 0 0.7
+X1 d g cell f=0.5
+X2 e g cell f=0.75
+X3 f g cell f=-1
+M4 h g 0 0 shrink L=1u W=4u NF=2
+.subckt cell d g f=1
+M1 d g 0 0 local L=1u W=4u NF=2
+.model local NMOS LEVEL=54 VERSION=4.7 VTH0=0.4 LMLT='f' WMLT='f'
+.ends cell
+.model shrink.1 NMOS LEVEL=54 VERSION=4.7 VTH0=0.7 LMIN=0.1u LMAX=0.9u WMIN=0.1u WMAX=4u
+.model shrink.2 NMOS LEVEL=54 VERSION=4.7 VTH0=0.4 LMIN=0.9u LMAX=2u WMIN=0.1u WMAX=4u LMLT=0.5 WMLT=0.5
+.end
+"#;
+    let reference = r#"Explicit scaled channel dimensions
+.options TNOM=25
+.temp 25
+Vg g 0 dc 0.8 ac 1
+Vd d 0 0.7
+Ve e 0 0.7
+Vf f 0 0.7
+Vh h 0 0.7
+Md d g 0 0 model L=0.5u W=2u NF=2
+Me e g 0 0 model L=0.75u W=3u NF=2
+Mf f g 0 0 model L=1u W=4u NF=2
+Mh h g 0 0 model L=0.5u W=2u NF=2
+.model model NMOS LEVEL=14 VERSION=4.70 VTH0=0.4
+.end
+"#;
+    let script = "dc Vg 0.4 1.2 0.1\nwrdata dc.dat i(vd) i(ve) i(vf) i(vh)\nop\nac lin 2 1k 1meg\nwrdata ac.dat i(vd) i(ve) i(vf) i(vh)";
+    let text = numeric_deck(actual.path(), source, script)?;
+    measure_native(expected.path(), reference, script)?;
+    for file in ["dc.dat", "ac.dat"] {
+        let rows = values(actual.path(), file)?;
+        let reference_values = values(expected.path(), file)?;
+        assert_eq!(rows.len(), reference_values.len());
+        for (row, reference) in rows.iter().zip(reference_values) {
+            assert_eq!(row.len(), reference.len());
+            for (&actual, expected) in row.iter().zip(reference) {
+                ensure!(
+                    (actual - expected).abs() <= expected.abs() * 1e-7 + 1e-13,
+                    "{file}: {actual:e} != {expected:e}\n{text}"
+                );
+            }
+        }
+    }
+    assert!(!text.contains("LMLT") && !text.contains("WMLT"), "{text}");
+    Ok(())
+}
