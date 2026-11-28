@@ -83,8 +83,8 @@ pub enum NormalizationPass {
     LtspiceOperators,
     /// Resolve source-specific independent waveform timing defaults.
     LtspiceSourceWaveforms,
-    /// Preserve the source idealized diode as an explicit native model family.
-    LtspiceIdealDiode,
+    /// Preserve source diode dialect for occurrence-resolved physical dispatch.
+    LtspiceDiode,
     /// Preserve source voltage-controlled switch physics as an explicit native family.
     LtspiceSwitch,
     /// Map `PSpice` `arctan()` to ngspice `atan()`.

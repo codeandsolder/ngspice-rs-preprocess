@@ -13,6 +13,10 @@ use model_kernel_api::{
     ABI_VERSION, Artifact, Binding, Capability, Descriptor, Equation, EquationKind, Error, Kernel,
     Parameter, Point, Result,
     noise::{Injection, Sink, Source},
+    taylor::{
+        MAX_ORDER, TaylorCapability, TaylorInput, TaylorPoint,
+        arithmetic::{Scalar, Series},
+    },
     trial::{Convergence, ConvergenceInput, TrialCapabilities, TrialPolicy},
 };
 
@@ -79,6 +83,9 @@ pub fn artifact(
             family: super::MODEL_FAMILY.into(),
             fingerprint,
             abi: ABI_VERSION,
+            taylor: TaylorCapability::Computed {
+                max_order: MAX_ORDER,
+            },
             equations,
             parameters,
             charge: Capability::Computed,
@@ -269,6 +276,76 @@ impl Kernel for DiodeKernel {
                 intrinsic,
                 (coordinates[0] - coordinates[intrinsic]) * conductance,
                 conductance,
+            );
+        }
+        Ok(())
+    }
+
+    fn evaluate_taylor(
+        &self,
+        prepared: &Self::Prepared,
+        input: TaylorInput<'_>,
+        out: &mut TaylorPoint<'_>,
+    ) -> Result<()> {
+        let width = if self.series { 3 } else { 2 };
+        let intrinsic = self.junction_anode();
+        let voltage = input.coordinate(width, intrinsic)? - input.coordinate(width, 1)?;
+        let evaluation = prepared.evaluate_physical(voltage).map_err(domain)?;
+        let series = if self.series {
+            let conductance = series_conductance(prepared)?;
+            Some((
+                (input.coordinate(width, 0)? - input.coordinate(width, intrinsic)?)
+                    .scale(conductance),
+                Series::constant(conductance),
+            ))
+        } else {
+            None
+        };
+        // Direct trait callers receive the same checked dimensions as the
+        // artifact interface. There is no partially indexed output on failure.
+        let rows = width * (input.order + 1);
+        let matrices = rows * width;
+        if out.current.len() != rows
+            || out.charge.len() != rows
+            || out.conductance.len() != matrices
+            || out.capacitance.len() != matrices
+        {
+            return Err(Error::Shape("diode Taylor point"));
+        }
+        out.current.fill(0.);
+        out.charge.fill(0.);
+        out.conductance.fill(0.);
+        out.capacitance.fill(0.);
+        for degree in 0..=input.order {
+            let row = degree * width;
+            let matrix = row * width;
+            let residual = &mut out.current[row..row + width];
+            let jacobian = &mut out.conductance[matrix..matrix + width * width];
+            branch(
+                residual,
+                jacobian,
+                intrinsic,
+                1,
+                evaluation.current.coefficient(degree),
+                evaluation.conductance.coefficient(degree),
+            );
+            if let Some((current, conductance)) = &series {
+                branch(
+                    residual,
+                    jacobian,
+                    0,
+                    intrinsic,
+                    current.coefficient(degree),
+                    conductance.coefficient(degree),
+                );
+            }
+            branch(
+                &mut out.charge[row..row + width],
+                &mut out.capacitance[matrix..matrix + width * width],
+                intrinsic,
+                1,
+                evaluation.charge.coefficient(degree),
+                evaluation.capacitance.coefficient(degree),
             );
         }
         Ok(())

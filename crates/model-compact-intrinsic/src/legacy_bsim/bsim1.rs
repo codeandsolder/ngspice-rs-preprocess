@@ -208,6 +208,10 @@ fn charge(c: &Bsim1Coefficients, x: Coordinates, s: Surface, oxide: f64) -> [Jet
     [drain, gate, source, bulk]
 }
 
+pub(super) fn threshold(c: &Bsim1Coefficients, bias: LegacyBsimBias) -> f64 {
+    surface(c, Coordinates::new(bias)).threshold.value
+}
+
 /// Evaluate the intrinsic BSIM1 channel and its exact local Jacobians.
 /// No numerical history, matrix rows, allocations or finite differencing.
 ///
@@ -220,15 +224,7 @@ pub fn evaluate_bsim1_intrinsic(
     let LegacyBsimChannel::Bsim1(c) = &instance.channel else {
         return Err(ModelError::WrongModelScope);
     };
-    if ![bias.vds, bias.vgs, bias.vbs]
-        .into_iter()
-        .all(f64::is_finite)
-        || bias.vds < 0.
-    {
-        return Err(ModelError::InvalidPhysicalParameter(
-            "normalized BSIM1 bias",
-        ));
-    }
+    super::validate_bias(bias)?;
     let x = Coordinates::new(bias);
     let s = surface(c, x);
     let length_um = instance.geometry.effective_length * 1e6;

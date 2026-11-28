@@ -5,31 +5,14 @@
 
 use model_kernel_api::{
     Error, Result,
-    trial::limiting::{ExponentialLimit, fetlim, limit_temperature, limvds},
+    trial::limiting::{ExponentialLimit, fetlim, limit_temperature, limvds, restrict_step},
 };
 
 use super::{VdmosInstance, VdmosKernel};
-use crate::{Jet, K_OVER_Q, breakdown, junction_potential, saturation_exponent};
+use crate::{DiodeActivation, Jet, breakdown, junction_potential};
 
 // ngspice 47 VDMOSload uses DEVlimitlog with a 10 K step threshold.
 const THERMAL_STEP: f64 = 10.;
-
-/// Restrict the common electrical step to the interval permitted by one
-/// controlling voltage. This preserves all aliased rows, including the case
-/// where the diode voltage and channel drain voltage are the same difference.
-fn restrict_step(scale: f64, raw: f64, previous: f64, limited: f64) -> f64 {
-    if raw.to_bits() == limited.to_bits() || raw.to_bits() == previous.to_bits() {
-        return scale;
-    }
-    let delta = raw - previous;
-    let allowed = limited - previous;
-    let fraction = if delta.is_finite() && allowed.is_finite() {
-        allowed / delta
-    } else {
-        previous.mul_add(-0.5, limited * 0.5) / previous.mul_add(-0.5, raw * 0.5)
-    };
-    scale.min(fraction.clamp(0., 1.))
-}
 
 fn fet_step(vgs: f64, vds: f64, previous_gate: f64, previous_drain: f64, vto: f64) -> f64 {
     // Select the conducting end from the previous point, then restrict each
@@ -73,7 +56,7 @@ impl VdmosKernel {
             if temperature <= 0. || !temperature.is_finite() {
                 return false;
             }
-            let potential = junction_potential(&self.model, Jet::constant(temperature)).v;
+            let potential = junction_potential(&self.model, Jet::<f64>::constant(temperature)).v;
             potential > 0. && potential.is_finite()
         };
         let previous = reference[junction];
@@ -109,15 +92,20 @@ impl VdmosKernel {
     ) -> Result<f64> {
         let model = self.model.parameters();
         let diode = model.diode;
-        let thermal = K_OVER_Q * temperature;
-        let vte = diode.n * thermal;
-        let exponent = saturation_exponent(model, Jet::constant(temperature), Jet::constant(vte)).v;
-        let log_current = prepared.multiplier.ln() + diode.is.ln() + exponent;
+        let terms: DiodeActivation<f64> = DiodeActivation::new(
+            Jet::constant(temperature),
+            prepared.multiplier,
+            diode,
+            model.tnom,
+        );
+        let thermal = terms.thermal_voltage.v;
+        let vte = terms.vte.v;
+        let log_current = terms.saturation_log().v;
         if raw < -3. * vte
             && let Some(avalanche) = diode.breakdown
         {
-            let saturation = prepared.multiplier * diode.is * exponent.exp();
-            let knee = breakdown::effective_voltage(
+            let saturation = log_current.exp();
+            let knee: f64 = breakdown::effective_voltage(
                 avalanche,
                 Jet::constant(saturation),
                 Jet::constant(thermal),

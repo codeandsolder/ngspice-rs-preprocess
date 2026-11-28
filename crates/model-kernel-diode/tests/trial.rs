@@ -212,7 +212,7 @@ fn additional_convergence_tests_the_exact_nonlinear_residual() -> Result<()> {
     compiled.evaluate(&prepared, &x, &mut old.point())?;
     for (y, expected) in [
         ([0.8, 0.], Convergence::Retry),
-        ([0.6000000001, 0.], Convergence::Satisfied),
+        ([0.600_000_000_1, 0.], Convergence::Satisfied),
     ] {
         compiled.evaluate(&prepared, &y, &mut new.point())?;
         let mut input = ConvergenceInput {
@@ -278,9 +278,10 @@ impl LoadLine<'_> {
             self.artifact
                 .evaluate(self.prepared, &point, &mut current.point())?;
             let nodal = current.point();
-            let residual = nodal.current[0]
-                + (point[0] - self.source) / 1000.
-                + self.capacitance_over_dt * (point[0] - self.accepted);
+            let residual = self.capacitance_over_dt.mul_add(
+                point[0] - self.accepted,
+                nodal.current[0] + (point[0] - self.source) / 1000.,
+            );
             let jacobian = nodal.conductance[0] + 0.001 + self.capacitance_over_dt;
             let correction = residual / jacobian;
             if iteration > 0
@@ -308,8 +309,8 @@ impl LoadLine<'_> {
             std::mem::swap(&mut current, &mut old);
         }
         Err(format!(
-            "Newton failed: source={} accepted={} proposed={:?}",
-            self.source, self.accepted, proposed
+            "Newton failed: source={} accepted={} proposed={proposed:?}",
+            self.source, self.accepted
         )
         .into())
     }
@@ -321,9 +322,10 @@ impl LoadLine<'_> {
         let mut hi = self.source.max(self.accepted).max(0.) + 1.;
         for _ in 0..80 {
             let x = f64::midpoint(lo, hi);
-            let residual = 1e-14 * (x / VT).exp_m1()
-                + (x - self.source) / 1000.
-                + self.capacitance_over_dt * (x - self.accepted);
+            let residual = self.capacitance_over_dt.mul_add(
+                x - self.accepted,
+                1e-14_f64.mul_add((x / VT).exp_m1(), (x - self.source) / 1000.),
+            );
             if residual > 0. {
                 hi = x;
             } else {
@@ -440,7 +442,6 @@ fn difficult_load_line_and_ramp_against_ngspice() -> Result<()> {
     let mut accepted = -2.;
     for tick in 1..=16000 {
         let source = match tick {
-            1..=2000 => -2.,
             2001..=2200 => -2. + 1002. * f64::from(tick - 2000) / 200.,
             2201..=6000 => 1000.,
             6001..=6200 => 1000. - 1002. * f64::from(tick - 6000) / 200.,

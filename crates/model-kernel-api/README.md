@@ -5,7 +5,7 @@ An artifact holds immutable model-specific data and its validated descriptor;
 the circuit engine binds coordinates and owns Newton iteration, numerical
 integration, limiting, accepted/rejected trial state and matrix assembly.
 
-## ABI version 4
+## ABI version 5
 
 The producer supplies a stable content fingerprint and an ordered descriptor.
 Every coordinate declares its physical domain and terminal/hidden binding.
@@ -75,3 +75,8 @@ Their circuit-coupled engine integration is a separate task. This is a native Ru
 contract, not a stable dynamic-library ABI.
 
 ABI 4 adds explicit family trial capabilities. See [prepared trial policy](../../docs/prepared-trial-policy.md) for engine integration, numerical units, and failure/acceptance semantics.
+
+ABI 5 adds explicit physical Taylor capability, normalized coefficient-major
+F/Q/G/C arrays, and direct evaluation of existing prepared tile lanes. See
+[prepared Taylor evaluation](../../docs/prepared-taylor.md) for the numerical
+contract and supported constitutive kernels.

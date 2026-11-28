@@ -94,6 +94,7 @@ fn artifact(counts: &Arc<Counts>) -> Result<Arc<Artifact<CountingKernel>>> {
             family: "witness".into(),
             fingerprint: [1; 16],
             abi: ABI_VERSION,
+            taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
             equations: ["p", "n"]
                 .into_iter()
                 .map(|name| Equation {
@@ -145,7 +146,7 @@ fn snapshot(tile: &PreparedTile<CountingKernel>, x: &[f64]) -> Result<Vec<Vec<u6
         .collect()
 }
 
-fn update(lane: usize, values: &[f64], ambient_kelvin: f64) -> LaneUpdate<'_> {
+const fn update(lane: usize, values: &[f64], ambient_kelvin: f64) -> LaneUpdate<'_> {
     LaneUpdate {
         lane,
         values,

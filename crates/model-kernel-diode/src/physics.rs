@@ -4,11 +4,32 @@ use super::{
     BOLTZMANN, ELEMENTARY_CHARGE, Instance, Junction, K_OVER_Q, Model, ModelError, Noise, finite,
     nonnegative, positive,
 };
+use model_kernel_api::taylor::arithmetic::Scalar;
+use std::cmp::Ordering;
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Slope {
-    value: f64,
-    derivative: f64,
+#[derive(Clone, Copy, Debug)]
+struct Slope<S> {
+    value: S,
+    derivative: S,
+}
+
+impl<S: Scalar> Slope<S> {
+    fn zero() -> Self {
+        Self {
+            value: S::constant(0.),
+            derivative: S::constant(0.),
+        }
+    }
+}
+
+// Shared scalar and Taylor evaluation. All constitutive laws, including the
+// exact incremental voltage slopes, are instantiated from these equations.
+pub struct JunctionEvaluation<S> {
+    pub(crate) current: S,
+    pub(crate) conductance: S,
+    pub(crate) physical_current: S,
+    pub(crate) charge: S,
+    pub(crate) capacitance: S,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,64 +61,75 @@ impl ExponentialJunction {
 
     // expm1 preserves small forward/reverse bias. For large arguments avoid
     // overflowing exp(x) when the scaled result is representable.
-    fn evaluate(self, voltage: f64, knee: Option<f64>) -> Slope {
+    fn evaluate<S: Scalar>(self, voltage: S, knee: Option<f64>) -> Slope<S> {
         if self.log_saturation == f64::NEG_INFINITY {
-            return Slope::default();
+            return Slope::zero();
         }
-        let x = voltage * self.inverse_vt;
-        let exponential = x.exp();
-        let raw = self.saturation * x.exp_m1();
-        if x <= 0.0 || (self.saturation > 0.0 && raw.is_finite() && exponential.is_finite()) {
-            let scaled_exponential = self.saturation * exponential;
+        let x = voltage.scale(self.inverse_vt);
+        let exponential = x.value().exp();
+        let raw_value = self.saturation * x.value().exp_m1();
+        if x.value() <= 0.0
+            || (self.saturation > 0.0 && raw_value.is_finite() && exponential.is_finite())
+        {
+            // Seed the scaled series directly. Computing unscaled high-order
+            // exp coefficients first can overflow even with finite F and G.
+            let scaled_exponential = x.exp_with_value(self.saturation * exponential);
+            let raw = scaled_exponential
+                .offset(-self.saturation)
+                .with_value(raw_value);
             if let Some(knee) = knee
-                && raw > 0.0
+                && raw.compare(0.) == Some(Ordering::Greater)
             {
-                let ratio = raw / knee;
+                let ratio = raw / S::constant(knee);
                 if ratio.is_finite() {
-                    let denominator = 1.0 + ratio;
+                    let denominator = ratio.offset(1.0);
                     let root = denominator.sqrt();
                     return Slope {
                         value: raw / root,
-                        derivative: scaled_exponential / root
-                            * self.inverse_vt
-                            * 0.5_f64.mul_add(-(ratio / denominator), 1.0),
+                        derivative: (scaled_exponential / root).scale(self.inverse_vt)
+                            * S::constant(0.5).mul_add(-(ratio / denominator), S::constant(1.0)),
                     };
                 }
             } else {
                 return Slope {
                     value: raw,
-                    derivative: scaled_exponential * self.inverse_vt,
+                    derivative: scaled_exponential.scale(self.inverse_vt),
                 };
             }
         }
         // This branch is also valid if I_s underflowed during preparation
         // but a large forward bias makes the physical current representable.
-        if x <= 0.0 {
+        if x.value() <= 0.0 {
             return Slope {
-                value: raw,
-                derivative: self.saturation * exponential * self.inverse_vt,
+                value: S::constant(raw_value),
+                derivative: S::constant(f64::NAN),
             };
         }
         let one_minus_exp = -(-x).exp_m1();
-        let log_raw = self.log_saturation + x + one_minus_exp.ln();
-        let (log_current, slope_factor) = knee.map_or((log_raw, 1.0), |knee| {
-            let log_ratio = log_raw - knee.ln();
-            // log(1+exp(r)) and its sigmoid without overflow.
-            let tail = (-log_ratio.abs()).exp();
-            let softplus = log_ratio.max(0.0) + tail.ln_1p();
-            let fraction = if log_ratio >= 0.0 {
-                (1.0 + tail).recip()
-            } else {
-                tail / (1.0 + tail)
-            };
-            (
-                0.5_f64.mul_add(-softplus, log_raw),
-                0.5_f64.mul_add(-fraction, 1.0),
-            )
-        });
+        let log_raw = S::constant(self.log_saturation) + x + one_minus_exp.ln();
+        let (log_current, slope_factor) = knee.map_or_else(
+            || (log_raw, S::constant(1.0)),
+            |knee| {
+                let log_ratio = log_raw.offset(-knee.ln());
+                // log(1+exp(r)) and its sigmoid without overflow.
+                let tail = (-log_ratio.abs()).exp();
+                let positive = log_ratio.compare(0.) != Some(Ordering::Less);
+                let softplus = if positive { log_ratio } else { S::constant(0.) } + tail.ln_1p();
+                let fraction = if positive {
+                    tail.offset(1.0).recip()
+                } else {
+                    tail / tail.offset(1.0)
+                };
+                (
+                    S::constant(0.5).mul_add(-softplus, log_raw),
+                    S::constant(0.5).mul_add(-fraction, S::constant(1.0)),
+                )
+            },
+        );
         let value = log_current.exp();
-        let derivative =
-            (log_current + self.inverse_vt.ln() + slope_factor.ln() - one_minus_exp.ln()).exp();
+        let derivative = (log_current.offset(self.inverse_vt.ln()) + slope_factor.ln()
+            - one_minus_exp.ln())
+        .exp();
         Slope { value, derivative }
     }
 }
@@ -110,16 +142,17 @@ struct Avalanche {
 }
 
 impl Avalanche {
-    fn evaluate(self, voltage: f64) -> Slope {
+    fn evaluate<S: Scalar>(self, voltage: S) -> Slope<S> {
         if self.log_current == f64::NEG_INFINITY {
-            return Slope::default();
+            return Slope::zero();
         }
-        let value = (voltage + self.voltage)
-            .mul_add(-self.inverse_vt, self.log_current)
+        let value = voltage
+            .offset(self.voltage)
+            .mul_add(S::constant(-self.inverse_vt), S::constant(self.log_current))
             .exp();
         Slope {
             value: -value,
-            derivative: value * self.inverse_vt,
+            derivative: value.scale(self.inverse_vt),
         }
     }
 }
@@ -166,41 +199,40 @@ impl Depletion {
         Ok(prepared)
     }
 
-    fn below_threshold(self, voltage: f64) -> Slope {
+    fn below_threshold<S: Scalar>(self, voltage: S) -> Slope<S> {
         if self.capacitance == 0.0 {
-            return Slope::default();
+            return Slope::zero();
         }
-        let log = (-voltage / self.potential).ln_1p();
+        let log = (-voltage / S::constant(self.potential)).ln_1p();
         let exponent = 1.0 - self.grading;
-        let scaled_log = exponent * log;
+        let scaled_log = log.scale(exponent);
         // Exact logarithmic M=1 limit, including the continuous tiny
         // exponent limit where multiplication may round to zero.
-        let integral = if scaled_log == 0.0 {
+        let integral = if scaled_log.is_zero() {
             log
         } else {
-            scaled_log.exp_m1() / exponent
+            scaled_log.exp_m1() / S::constant(exponent)
         };
         Slope {
-            value: -self.capacitance * self.potential * integral,
-            derivative: self.capacitance * (-self.grading * log).exp(),
+            value: integral.scale(-self.capacitance * self.potential),
+            derivative: log.scale(-self.grading).exp().scale(self.capacitance),
         }
     }
 
-    fn evaluate(self, voltage: f64) -> Slope {
+    fn evaluate<S: Scalar>(self, voltage: S) -> Slope<S> {
         if self.capacitance == 0.0 {
-            return Slope::default();
+            return Slope::zero();
         }
-        if voltage < self.threshold {
+        if voltage.compare(self.threshold) == Some(Ordering::Less) {
             return self.below_threshold(voltage);
         }
-        let delta = voltage - self.threshold;
+        let delta = voltage.offset(-self.threshold);
         Slope {
-            value: (0.5 * self.threshold_slope)
-                .mul_add(delta, self.threshold_capacitance)
-                .mul_add(delta, self.threshold_charge),
-            derivative: self
-                .threshold_slope
-                .mul_add(delta, self.threshold_capacitance),
+            value: S::constant(0.5 * self.threshold_slope)
+                .mul_add(delta, S::constant(self.threshold_capacitance))
+                .mul_add(delta, S::constant(self.threshold_charge)),
+            derivative: S::constant(self.threshold_slope)
+                .mul_add(delta, S::constant(self.threshold_capacitance)),
         }
     }
 }
@@ -382,22 +414,67 @@ impl PreparedInstance {
         })
     }
 
-    fn evaluate_recombination(&self, voltage: f64) -> Slope {
+    fn evaluate_recombination<S: Scalar>(&self, voltage: S) -> Slope<S> {
         if self.recombination.log_saturation == f64::NEG_INFINITY {
-            return Slope::default();
+            return Slope::zero();
         }
         let rec = self.recombination.evaluate(voltage, None);
-        let x = 1.0 - voltage / self.depletion.potential;
-        let base = x.mul_add(x, 0.005);
+        let x = S::constant(1.0) - voltage / S::constant(self.depletion.potential);
+        let base = x.mul_add(x, S::constant(0.005));
         let generation = base.powf(self.depletion.grading * 0.5);
         let generation_derivative =
-            -self.depletion.grading * x / self.depletion.potential / base * generation;
+            x.scale(-self.depletion.grading) / S::constant(self.depletion.potential) / base
+                * generation;
         Slope {
             value: rec.value * generation,
             derivative: rec
                 .derivative
                 .mul_add(generation, rec.value * generation_derivative),
         }
+    }
+
+    pub(crate) fn evaluate_physical<S: Scalar>(
+        &self,
+        voltage: S,
+    ) -> Result<JunctionEvaluation<S>, ModelError> {
+        if !voltage.is_finite() {
+            return Err(ModelError::Invalid("junction voltage"));
+        }
+        let transport = self.transport.evaluate(voltage, self.high_injection);
+        let recombination = self.evaluate_recombination(voltage);
+        let mut physical = Slope {
+            value: transport.value + recombination.value,
+            derivative: transport.derivative + recombination.derivative,
+        };
+        if let Some(terms) = self.avalanche {
+            for term in terms {
+                let term = term.evaluate(voltage);
+                physical.value = physical.value + term.value;
+                physical.derivative = physical.derivative + term.derivative;
+            }
+        }
+        let depletion = self.depletion.evaluate(voltage);
+        let result = JunctionEvaluation {
+            current: S::constant(self.gmin).mul_add(voltage, physical.value),
+            conductance: physical.derivative.offset(self.gmin),
+            physical_current: physical.value,
+            charge: S::constant(self.transit_time).mul_add(physical.value, depletion.value),
+            capacitance: S::constant(self.transit_time)
+                .mul_add(physical.derivative, depletion.derivative),
+        };
+        if ![
+            result.current,
+            result.conductance,
+            result.physical_current,
+            result.charge,
+            result.capacitance,
+        ]
+        .into_iter()
+        .all(Scalar::is_finite)
+        {
+            return Err(ModelError::Invalid("junction evaluation"));
+        }
+        Ok(result)
     }
 
     /// Evaluate the physical junction and both exact voltage derivatives.
@@ -408,41 +485,14 @@ impl PreparedInstance {
     /// # Errors
     /// A nonfinite voltage or nonrepresentable result is rejected.
     pub fn evaluate(&self, voltage: f64) -> Result<Evaluation, ModelError> {
-        finite("junction voltage", &[voltage])?;
-        let transport = self.transport.evaluate(voltage, self.high_injection);
-        let recombination = self.evaluate_recombination(voltage);
-        let mut physical = Slope {
-            value: transport.value + recombination.value,
-            derivative: transport.derivative + recombination.derivative,
-        };
-        if let Some(terms) = self.avalanche {
-            for term in terms {
-                let term = term.evaluate(voltage);
-                physical.value += term.value;
-                physical.derivative += term.derivative;
-            }
-        }
-        let depletion = self.depletion.evaluate(voltage);
-        let result = Evaluation {
-            current: self.gmin.mul_add(voltage, physical.value),
-            conductance: physical.derivative + self.gmin,
-            physical_current: physical.value,
-            charge: self.transit_time.mul_add(physical.value, depletion.value),
-            capacitance: self
-                .transit_time
-                .mul_add(physical.derivative, depletion.derivative),
-        };
-        finite(
-            "junction evaluation",
-            &[
-                result.current,
-                result.conductance,
-                result.physical_current,
-                result.charge,
-                result.capacitance,
-            ],
-        )?;
-        Ok(result)
+        let value = self.evaluate_physical(voltage)?;
+        Ok(Evaluation {
+            current: value.current,
+            conductance: value.conductance,
+            physical_current: value.physical_current,
+            charge: value.charge,
+            capacitance: value.capacitance,
+        })
     }
 }
 

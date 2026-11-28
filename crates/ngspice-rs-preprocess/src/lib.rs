@@ -8,7 +8,8 @@ use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
     MappedNormalization, NormalizationPass,
     linked_source::{
-        LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker, SourceScope, SourceVisit,
+        LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker, SourceOrigin, SourceScope,
+        SourceVisit,
     },
     normalize_mapped,
 };
@@ -468,37 +469,11 @@ fn native(
         .origins
         .into_iter()
         .map(|mapped| {
-            if let Some((_, origins)) = &imported
-                && mapped.path == origin
-            {
-                let original = origins
-                    .get(
-                        mapped
-                            .line
-                            .checked_sub(1)
-                            .context("invalid schematic source line")?,
-                    )
-                    .context("missing schematic source origin")?;
-                Ok(OriginLine {
-                    source: original.path.clone(),
-                    line: original.line,
-                    last_line: original.line,
-                    linked: Some(LinkedLocation {
-                        visit: mapped.visit,
-                        scope: mapped.scope,
-                    }),
-                })
-            } else {
-                Ok(OriginLine {
-                    source: mapped.path,
-                    line: mapped.line,
-                    last_line: mapped.line,
-                    linked: Some(LinkedLocation {
-                        visit: mapped.visit,
-                        scope: mapped.scope,
-                    }),
-                })
-            }
+            linked_origin(
+                mapped,
+                &origin,
+                imported.as_ref().map(|(_, origins)| origins.as_slice()),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     native_bundle(
@@ -513,6 +488,37 @@ fn native(
         }),
         session.budget(),
     )
+}
+
+fn linked_origin(
+    mapped: SourceOrigin,
+    root: &Path,
+    schematic: Option<&[model_import_ltspice::Origin]>,
+) -> Result<OriginLine> {
+    let (source, line) = if let Some(origins) = schematic
+        && mapped.path == root
+    {
+        let original = origins
+            .get(
+                mapped
+                    .line
+                    .checked_sub(1)
+                    .context("invalid schematic source line")?,
+            )
+            .context("missing schematic source origin")?;
+        (original.path.clone(), original.line)
+    } else {
+        (mapped.path, mapped.line)
+    };
+    Ok(OriginLine {
+        source,
+        line,
+        last_line: line,
+        linked: Some(LinkedLocation {
+            visit: mapped.visit,
+            scope: mapped.scope,
+        }),
+    })
 }
 
 fn native_bundle(

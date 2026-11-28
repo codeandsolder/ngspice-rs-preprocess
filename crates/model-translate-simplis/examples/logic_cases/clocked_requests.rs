@@ -81,7 +81,7 @@ impl CapturedCase {
         Ok(())
     }
 
-    fn capture(self, previous: bool, data: bool, reset: bool) -> bool {
+    const fn capture(self, previous: bool, data: bool, reset: bool) -> bool {
         match self.operation {
             7..=10 if data != reset => data,
             9 | 10 if data && reset => !previous,
@@ -126,7 +126,7 @@ impl CapturedCase {
     }
 }
 
-pub(super) fn qualify(runtime: &Path) -> Result<()> {
+pub fn qualify(runtime: &Path) -> Result<()> {
     let mut source = String::from(
         "* delayed clocked request regression\n.model bridge preprocess_logic_voltage(out_high=5)\n",
     );

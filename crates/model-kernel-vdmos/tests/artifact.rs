@@ -402,3 +402,198 @@ fn changing_temperature_backward_euler_recovery_is_equivalent()
     }
     Ok(())
 }
+
+#[test]
+fn physical_taylor_reconstructs_electrothermal_laws()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use model_kernel_api::taylor::{TaylorBuffer, TaylorInput};
+    const ORDER: usize = 64;
+    for polarity in [Polarity::N, Polarity::P] {
+        for thermal in [false, true] {
+            for (drain, grading_one) in [(2., false), (-0.5, false), (6., true)] {
+                let mut parameters = model(polarity);
+                if grading_one {
+                    parameters.diode.m = 1.;
+                    parameters.diode.tm1 = 0.002;
+                }
+                parameters.diode.breakdown = Some(model_kernel_vdmos::Breakdown {
+                    bv: 5.,
+                    ibv: 1e-4,
+                    nbv: 1.2,
+                });
+                let compiled = artifact(Arc::new(parameters.prepare()?), thermal, [8; 16])?;
+                let prepared = compiled.prepare(&[1.5], 310.)?;
+                let width = compiled.descriptor().equations.len();
+                let mut coefficients = vec![0.; width * (ORDER + 1)];
+                let sign = polarity.sign();
+                for (i, eq) in compiled.descriptor().equations.iter().enumerate() {
+                    let (value, slope, curvature) = match eq.name.as_str() {
+                        "drain" => (drain * sign, 0.02 * sign, 0.001),
+                        "gate" => (5.1 * sign, 0.03 * sign, -0.002),
+                        "source" => (0., -0.01, 0.001),
+                        "drain_prime" => ((drain - 0.1) * sign, 0.017 * sign, 0.002),
+                        "gate_prime" => (5. * sign, 0.025 * sign, -0.001),
+                        "source_prime" => (0.1 * sign, 0.003, -0.002),
+                        "body_prime" => (0.02 * sign, 0.007, 0.001),
+                        "junction" => (if grading_one { 300.15 } else { 340. }, 0.7, -0.1),
+                        "case" => (320., 0.3, 0.05),
+                        "recovery" => (1e-8, 2e-10, -1e-11),
+                        name => return Err(format!("unexpected coordinate {name}").into()),
+                    };
+                    coefficients[i] = value;
+                    coefficients[width + i] = slope;
+                    coefficients[2 * width + i] = curvature;
+                }
+                let mut series_buffer = TaylorBuffer::new(width, ORDER)?;
+                compiled.evaluate_taylor(
+                    &prepared,
+                    TaylorInput {
+                        order: ORDER,
+                        coefficients: &coefficients,
+                    },
+                    &mut series_buffer.point(),
+                )?;
+                let series_point = series_buffer.point();
+                // Independent 100-digit differentiation of the external drain
+                // row (series resistance, diode, recovery, and shunt) for this
+                // forward-body-diode case. The degree-22 value specifically
+                // detects cancellation in separately expanded exponentials.
+                if polarity == Polarity::N && thermal && drain == -0.5 {
+                    close(
+                        series_point.current[22 * width],
+                        -3.870_974_049_562_93e-35,
+                        0.,
+                        1e-8,
+                    );
+                }
+                let mut scalar = PointBuffer::new(width)?;
+                for tau in [0., -0.25, 0.25, 0.5] {
+                    let reconstruct = |coeff: &[f64], stride: usize, i: usize| -> f64 {
+                        (0..=ORDER)
+                            .rev()
+                            .fold(0., |v: f64, k| v.mul_add(tau, coeff[k * stride + i]))
+                    };
+                    let coords: Vec<_> = (0..width)
+                        .map(|i| reconstruct(&coefficients, width, i))
+                        .collect();
+                    compiled.evaluate(&prepared, &coords, &mut scalar.point())?;
+                    let scalar_point = scalar.point();
+                    for (series, expected, stride, atol) in [
+                        (&*series_point.current, &*scalar_point.current, width, 1e-11),
+                        (&*series_point.charge, &*scalar_point.charge, width, 1e-21),
+                        (
+                            &*series_point.conductance,
+                            &*scalar_point.conductance,
+                            width * width,
+                            1e-11,
+                        ),
+                        (
+                            &*series_point.capacitance,
+                            &*scalar_point.capacitance,
+                            width * width,
+                            1e-21,
+                        ),
+                    ] {
+                        for (i, expected) in expected.iter().enumerate() {
+                            close(reconstruct(series, stride, i), *expected, atol, 2e-8);
+                        }
+                    }
+                }
+                verify_taylor_chain_rule(width, ORDER, &coefficients, &series_point).map_err(|error| format!("polarity={polarity:?} thermal={thermal} drain={drain} grading_one={grading_one}: {error}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_taylor_chain_rule(
+    width: usize,
+    order: usize,
+    coefficients: &[f64],
+    series_point: &model_kernel_api::taylor::TaylorPoint<'_>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    for (quantity, values, jac) in [
+        ("F", &*series_point.current, &*series_point.conductance),
+        ("Q", &*series_point.charge, &*series_point.capacitance),
+    ] {
+        for k in 0..order {
+            let degree = f64::from(u32::try_from(k + 1)?);
+            for row in 0..width {
+                let mut sum = 0.;
+                let mut norm = 0.;
+                for j in 0..=k {
+                    let weight = f64::from(u32::try_from(k + 1 - j)?);
+                    for col in 0..width {
+                        let term = jac[j * width * width + row * width + col]
+                            * coefficients[(k + 1 - j) * width + col]
+                            * weight;
+                        sum += term;
+                        norm += term.abs();
+                    }
+                }
+                let actual = degree * values[(k + 1) * width + row];
+                // Normwise roundoff floor on the normalized polynomial:
+                // high-order coefficients can be exponentially smaller than
+                // the row scale, particularly in a thermal germ. Retain the
+                // coefficientwise check wherever it is numerically resolved.
+                let row_scale = (1..=order).try_fold(0_f64, |scale, n| {
+                    Ok::<_, std::num::TryFromIntError>(
+                        scale.max(f64::from(u32::try_from(n)?) * values[n * width + row].abs()),
+                    )
+                })?;
+                let rounding_floor = 256. * f64::EPSILON * row_scale;
+                if (actual - sum).abs()
+                    > rounding_floor + 1e-8 * (norm + actual.abs().max(sum.abs()))
+                {
+                    return Err(format!("{quantity} degree={} row={row} actual={actual:e} chain={sum:e} norm={norm:e}", k+1).into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn taylor_selects_vgd_join_from_right_germ() -> std::result::Result<(), Box<dyn std::error::Error>>
+{
+    use model_kernel_api::taylor::{TaylorBuffer, TaylorInput};
+    for polarity in [Polarity::N, Polarity::P] {
+        let m = Model::defaults(polarity);
+        let gate = m.gate;
+        let a = artifact(Arc::new(m.prepare()?), false, [11; 16])?;
+        let prepared = a.prepare(&[1.], 300.15)?;
+        let width = a.descriptor().equations.len();
+        assert_eq!(width, 3);
+        // Both tanh and atan have the same first and third coefficients;
+        // they diverge at degree five. Q is their physical antiderivative.
+        let scale = (gate.cgdmax - gate.cgdmin) / (1. + std::f64::consts::FRAC_PI_2);
+        let mut out = TaylorBuffer::new(width, 6)?;
+        let sign = polarity.sign();
+        for direction in [-1., 1.] {
+            let mut x = [0.; 21];
+            x[0] = 4. * sign;
+            x[1] = x[0];
+            x[4] = direction * sign;
+            a.evaluate_taylor(
+                &prepared,
+                TaylorInput {
+                    order: 6,
+                    coefficients: &x,
+                },
+                &mut out.point(),
+            )?;
+            let p = out.point();
+            let expected =
+                scale * gate.a.powi(5) * if direction > 0. { 2. / 15. } else { -1. / 5. };
+            // Gate-row, drain-column entry equals minus Cgd.
+            close(p.capacitance[5 * 9 + 3], -expected, 1e-22, 1e-12);
+            close(
+                p.charge[6 * 3 + 1],
+                sign * expected * direction / 6.,
+                1e-22,
+                1e-12,
+            );
+        }
+    }
+    Ok(())
+}
