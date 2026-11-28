@@ -41,7 +41,10 @@ from omission. Partial UDLY corners require independent qualification:
 the documented TP rule does not establish their behavior. Worst-case
 selection retains the minimum and maximum endpoints, not a nominal
 delay. The occurrence selector MNTYMXDLY delegates to DIGMNTYMX when
-absent or zero.
+absent or zero. DIGERRDEFAULT and DIGERRLIMIT retain the separate
+per-constraint and circuit-wide message limits (9.0, pp. 61, 308);
+zero means unlimited, not zero permitted messages. Unknown DIG-prefixed
+settings are rejected rather than passed to the native option parser.
 
 I/O binding retains source units: ohms, farads and seconds. IO_LEVEL
 selects AtoD/DtoA references (delegating to DIGIOLVL when absent or zero).

@@ -764,7 +764,7 @@ fn pspice_digital_options_are_bound_not_emitted_as_native_options() -> Result<()
     use ngspice_rs_preprocess::WorkBudget;
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.cir");
-    fs::write(&root, b"PSpice digital policy\nV1 in 0 1\nR1 in 0 1k\n.options DIGMNTYMX={unused} DIGIOLVL=3\n+ DIGINITSTATE=0 DIGFREQ=1G GMIN=1e-10\n.options DIGMNTYMX=4\n.end\n")?;
+    fs::write(&root, b"PSpice digital policy\nV1 in 0 1\nR1 in 0 1k\n.options DIGMNTYMX={unused} DIGIOLVL=3\n+ DIGINITSTATE=0 DIGFREQ=1G DIGERRDEFAULT=0 GMIN=1e-10\n.options DIGMNTYMX=4 DIGERRLIMIT=100\n.end\n")?;
     let bundle = prepare_path(&root, InputFormat::PspiceDeck)?;
     let plan = bundle
         .analysis_plan
@@ -780,6 +780,11 @@ fn pspice_digital_options_are_bound_not_emitted_as_native_options() -> Result<()
     assert_eq!(bound.interface_level, InterfaceLevel::Three);
     assert_eq!(bound.initial_state, InitialState::Clear);
     assert_eq!(bound.frequency.to_bits(), 1e9_f64.to_bits());
+    assert_eq!(bound.constraint_error_limit, None);
+    assert_eq!(
+        bound.total_error_limit.map(f64::to_bits),
+        Some(100_f64.to_bits())
+    );
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
     let active = text
         .lines()
@@ -792,6 +797,12 @@ fn pspice_digital_options_are_bound_not_emitted_as_native_options() -> Result<()
     assert!(!active.contains("DIGIOLVL"), "{text}");
     assert!(!active.contains("DIGINITSTATE"), "{text}");
     assert!(!active.contains("DIGFREQ"), "{text}");
+    assert!(!active.contains("DIGERR"), "{text}");
+    fs::write(
+        &root,
+        b"Unknown digital policy\n.options DIGUNQUALIFIED=1\n.end\n",
+    )?;
+    assert!(prepare_path(&root, InputFormat::PspiceDeck).is_err());
     Ok(())
 }
 

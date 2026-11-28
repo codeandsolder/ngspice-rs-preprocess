@@ -1,6 +1,6 @@
 //! Circuit-wide digital option values, resolved before instance binding.
 //!
-//! Reference: `PSpice` A/D Reference Guide 9.0, pp. 61 and 264.
+//! Reference: `PSpice` A/D Reference Guide 9.0, pp. 61, 264 and 308.
 
 use super::{
     digital_corners::{DelaySelection, TimingScales},
@@ -32,6 +32,10 @@ pub enum DigitalOption {
     DriveMaximum,
     /// Drive resistance ratio required to override another output.
     OverrideRatio,
+    /// Default diagnostic limit for a digital constraint checker.
+    ConstraintErrorLimit,
+    /// Global limit on reported digital violations.
+    TotalErrorLimit,
 }
 
 impl DigitalOption {
@@ -48,6 +52,8 @@ impl DigitalOption {
             "DIGDRVF" => Self::DriveMinimum,
             "DIGDRVZ" => Self::DriveMaximum,
             "DIGOVRDRV" => Self::OverrideRatio,
+            "DIGERRDEFAULT" => Self::ConstraintErrorLimit,
+            "DIGERRLIMIT" => Self::TotalErrorLimit,
             _ => return None,
         })
     }
@@ -85,6 +91,10 @@ pub struct DigitalOptions {
     pub drive_maximum: f64,
     /// Required drive override ratio.
     pub override_ratio: f64,
+    /// Default limit on messages from one constraint checker. `None` is unlimited.
+    pub constraint_error_limit: Option<f64>,
+    /// Limit on all reported digital violations. `None` is unlimited.
+    pub total_error_limit: Option<f64>,
 }
 
 impl DigitalOptions {
@@ -103,6 +113,16 @@ impl DigitalOptions {
             "nonfinite PSpice digital option"
         );
         let get = |option, default| values.get(&option).copied().unwrap_or(default);
+        let limit = |option, default| -> Result<Option<f64>> {
+            let value = get(option, default);
+            ensure!(
+                value >= 0.,
+                "negative PSpice digital error limit {option:?}"
+            );
+            // Retain the source threshold without assuming a rounding rule for
+            // nonintegral expressions. The event engine owns the message count.
+            Ok((value > 0.).then_some(value))
+        };
         let options = Self {
             delay_selection: DelaySelection::from_global(values.get(&O::DelaySelection).copied())?,
             interface_level: InterfaceLevel::from_global(values.get(&O::InterfaceLevel).copied())?,
@@ -116,6 +136,8 @@ impl DigitalOptions {
             drive_minimum: get(O::DriveMinimum, 2.),
             drive_maximum: get(O::DriveMaximum, 20_000.),
             override_ratio: get(O::OverrideRatio, 3.),
+            constraint_error_limit: limit(O::ConstraintErrorLimit, 20.)?,
+            total_error_limit: limit(O::TotalErrorLimit, 0.)?,
         };
         ensure!(
             options.frequency > 0. && options.frequency.recip().is_finite(),
@@ -143,17 +165,36 @@ mod tests {
         assert_eq!(options.frequency.to_bits(), 1e10_f64.to_bits());
         assert_eq!(options.drive_minimum.to_bits(), 2_f64.to_bits());
         assert_eq!(options.drive_maximum.to_bits(), 20_000_f64.to_bits());
+        assert_eq!(
+            options.constraint_error_limit.map(f64::to_bits),
+            Some(20_f64.to_bits())
+        );
+        assert_eq!(options.total_error_limit, None);
         let values = BTreeMap::from([
             (DigitalOption::DelaySelection, 4.),
             (DigitalOption::InterfaceLevel, 3.),
             (DigitalOption::InitialState, 0.),
             (DigitalOption::Frequency, 1e9),
+            (DigitalOption::ConstraintErrorLimit, 0.),
+            (DigitalOption::TotalErrorLimit, 5.),
         ]);
         let options = DigitalOptions::from_effective(&values)?;
         assert_eq!(options.delay_selection, DelaySelection::WorstCase);
         assert_eq!(options.interface_level, InterfaceLevel::Three);
         assert_eq!(options.initial_state, InitialState::Clear);
         assert_eq!(options.frequency.to_bits(), 1e9_f64.to_bits());
+        assert_eq!(options.constraint_error_limit, None);
+        assert_eq!(
+            options.total_error_limit.map(f64::to_bits),
+            Some(5_f64.to_bits())
+        );
+        assert!(
+            DigitalOptions::from_effective(&BTreeMap::from([(
+                DigitalOption::TotalErrorLimit,
+                -1.
+            )]))
+            .is_err()
+        );
         assert!(
             DigitalOptions::from_effective(&BTreeMap::from([(DigitalOption::Frequency, 0.)]))
                 .is_err()

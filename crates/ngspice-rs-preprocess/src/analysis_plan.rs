@@ -817,6 +817,12 @@ fn option_fields(
                 !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
                 "invalid option name {name:?}"
             );
+            ensure!(
+                dialect != AnalysisDialect::Pspice
+                    || !name.starts_with("DIG")
+                    || DigitalOption::from_name(&name).is_some(),
+                "unsupported PSpice digital option {name}"
+            );
             let disposition = option_disposition(&name, dialect);
             ensure!(
                 !matches!(
