@@ -12,17 +12,27 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runtime-expressions")
 }
 
-fn prepare_deck(name: &str, dir: &Path, analysis: &str) -> Result<()> {
-    let bundle = prepare(
+fn prepare_bundle(
+    name: &str,
+    power_target: ngspice_rs_preprocess::PowerTarget,
+) -> Result<ngspice_rs_preprocess::PreparedBundle> {
+    prepare(
         &Request {
             format: InputFormat::SimetrixDeck,
             input: SourceInput::File(fixtures().join(format!("{name}.net"))),
             libraries: Vec::new(),
             search_paths: Vec::new(),
         },
-        &Options::default(),
+        &Options {
+            power_target,
+            ..Options::default()
+        },
         &Cancellation::default(),
-    )?;
+    )
+}
+
+fn prepare_deck(name: &str, dir: &Path, analysis: &str) -> Result<()> {
+    let bundle = prepare_bundle(name, ngspice_rs_preprocess::PowerTarget::NativeNgspice)?;
     for companion in &bundle.companions {
         fs::write(dir.join(&companion.filename), &companion.bytes)?;
     }
@@ -233,4 +243,193 @@ fn capacitor_temperature_coefficients_preserve_ac_response() -> Result<()> {
         1e-9,
         0.,
     )
+}
+
+/// The prepared consumer is a separate repository. Run this explicit
+/// cross-repository gate with the qualified `spice-rs` executable on PATH.
+fn prepared_solver_deck(name: &str, dir: &Path, analysis: &str) -> Result<()> {
+    use ngspice_rs_preprocess::PowerTarget;
+    let bundle = prepare_bundle(name, PowerTarget::PreparedSolverV1)?;
+    ensure!(bundle.power_target == PowerTarget::PreparedSolverV1);
+    for companion in &bundle.companions {
+        fs::write(dir.join(&companion.filename), &companion.bytes)?;
+    }
+    let mut deck = String::new();
+    for line in std::str::from_utf8(&bundle.primary.bytes)?.lines() {
+        let directive = line.split_whitespace().next().unwrap_or_default();
+        if [".end", ".op", ".ac", ".tran", ".print"]
+            .iter()
+            .any(|d| directive.eq_ignore_ascii_case(d))
+        {
+            continue;
+        }
+        deck.push_str(line);
+        deck.push('\n');
+    }
+    deck.push_str(analysis);
+    deck.push_str("\n.end\n");
+    fs::write(dir.join("test.cir"), deck)?;
+    Ok(())
+}
+
+fn prepared_solver(dir: &Path) -> Result<std::process::Output> {
+    Command::new("spice-rs")
+        .current_dir(dir)
+        .args([
+            "simulate", "--format", "ascii", "--output", "test.raw", "test.cir",
+        ])
+        .output()
+        .context("run the qualified prepared solver")
+}
+
+/// Each analysis deliberately emits one point. Resolve vector names from
+/// the rawfile rather than assuming the consumer's variable ordering.
+fn prepared_solver_trace(dir: &Path, columns: &[String]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+    let raw = fs::read_to_string(dir.join("test.raw"))?;
+    let mut op = Vec::new();
+    let mut ac = Vec::new();
+    for plot in raw.split("Title:").filter(|p| !p.trim().is_empty()) {
+        let (header, values) = plot.split_once("Values:\n").context("missing values")?;
+        let (_, variables) = header
+            .split_once("Variables:\n")
+            .context("missing variables")?;
+        let names = variables
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .context("missing vector name")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let samples = values
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.split_whitespace().last().context("missing sample"))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            samples.len() == names.len(),
+            "expected one sample per variable"
+        );
+        let complex = header.contains("Flags: complex");
+        let lookup = |name: &str| -> Result<&str> {
+            let index = names
+                .iter()
+                .position(|candidate| candidate.eq_ignore_ascii_case(name))
+                .with_context(|| format!("missing {name}"))?;
+            Ok(samples[index])
+        };
+        if complex {
+            let (frequency, _) = lookup("frequency")?
+                .split_once(',')
+                .context("missing frequency parts")?;
+            let mut row = vec![frequency.parse()?];
+            for name in columns {
+                let (real, imaginary) = lookup(name)?
+                    .split_once(',')
+                    .context("missing complex sample")?;
+                row.extend([real.parse::<f64>()?, imaginary.parse::<f64>()?]);
+            }
+            ac.push(row);
+        } else {
+            ensure!(
+                header.contains("Plotname: Operating Point"),
+                "unexpected real plot"
+            );
+            let mut row = vec![0.];
+            for name in columns {
+                row.push(lookup(name)?.parse()?);
+            }
+            op.push(row);
+        }
+    }
+    ac.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    Ok((op, ac))
+}
+
+#[test]
+#[ignore = "cross-repository gate: requires qualified spice-rs on PATH"]
+fn prepared_absolute_power_matches_measured_values_and_jacobians() -> Result<()> {
+    for index in 0..4 {
+        let name = format!("power-{index}");
+        let dir = tempfile::tempdir()?;
+        let (columns, op) = reference(&name)?;
+        let (_, ac) = reference(&format!("{name}-ac"))?;
+        prepared_solver_deck(&name, dir.path(), ".op\n.ac lin 1 1k 1k\n.ac lin 1 2k 2k")?;
+        let execution = prepared_solver(dir.path())?;
+        ensure!(
+            execution.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&execution.stderr)
+        );
+        let (actual_op, actual_ac) = prepared_solver_trace(dir.path(), &columns)?;
+        compare(&actual_op, &op, false, 1e-9, 1e-9).with_context(|| name.clone())?;
+        compare(&actual_ac, &ac, true, 1e-9, 1e-9).with_context(|| name.clone())?;
+    }
+    let dir = tempfile::tempdir()?;
+    prepared_solver_deck("zero-negative", dir.path(), ".op")?;
+    let execution = prepared_solver(dir.path())?;
+    ensure!(
+        !execution.status.success() && !dir.path().join("test.raw").exists(),
+        "standalone singular power unexpectedly succeeded"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "cross-repository gate: requires qualified spice-rs on PATH"]
+fn prepared_signed_exponent_and_zero_product_follow_source_semantics() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    prepared_solver_deck("prepared-signed", dir.path(), ".op\n.ac lin 1 1k 1k")?;
+    let execution = prepared_solver(dir.path())?;
+    ensure!(
+        execution.status.success(),
+        "{}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    let columns = [
+        "caret",
+        "realpart",
+        "absolute",
+        "masked",
+        "caretzero",
+        "abszero",
+        "macro",
+    ]
+    .map(|name| format!("v({name})"));
+    let (op, ac) = prepared_solver_trace(dir.path(), &columns)?;
+    // Measured caret and POW exponent slopes for base -2, exponent 3;
+    // absolute-base slope is 2^3 ln(2). The scalar/behavioural zero floor
+    // is observable as a nonzero value, not just within an absolute tolerance.
+    compare(
+        &op,
+        &[vec![0., -8., -8., 8., 0., 1e-154, 0., 8.]],
+        false,
+        1e-12,
+        1e-9,
+    )?;
+    ensure!((op[0][5] / 1e-154 - 1.).abs() < 1e-9);
+    compare(
+        &ac,
+        &[vec![
+            1000.,
+            1842.0680744,
+            0.,
+            -5.5451774445,
+            0.,
+            5.5451774445,
+            0.,
+            0.,
+            0.,
+            5e99,
+            0.,
+            0.,
+            0.,
+            5.5451774445,
+            0.,
+        ]],
+        true,
+        1e-12,
+        1e-9,
+    )?;
+    Ok(())
 }
