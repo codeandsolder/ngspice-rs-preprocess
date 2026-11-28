@@ -3,7 +3,7 @@
 use crate::{IdentifierAllocator, NormalizationDialect, lexical};
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
-use std::{collections::BTreeSet, io::Write, ops::Range};
+use std::{io::Write, ops::Range};
 
 mod ltspice;
 
@@ -120,10 +120,10 @@ impl Rewriter<'_> {
     }
 }
 
-/// Identify lexical definitions rather than globally matching K references.
-/// A K card in one subcircuit never disables default loss in another.
-fn scoped(input: &[u8], budget: &WorkBudget) -> Result<Vec<(usize, lexical::Statement)>> {
-    let mut scopes = vec![0];
+/// Retain physical statements outside control scripts and validate nested
+/// subcircuit boundaries. Occurrence-dependent topology is not decided here.
+fn device_statements(input: &[u8], budget: &WorkBudget) -> Result<Vec<lexical::Statement>> {
+    let mut depth = 1usize;
     let mut control = false;
     let mut output = Vec::new();
     for statement in lexical::statements(input)? {
@@ -143,52 +143,23 @@ fn scoped(input: &[u8], budget: &WorkBudget) -> Result<Vec<(usize, lexical::Stat
             continue;
         }
         if first.eq_ignore_ascii_case(b".subckt") {
-            budget.check_depth(scopes.len())?;
-            scopes.push(statement.line);
+            budget.check_depth(depth)?;
+            depth += 1;
         } else if first.eq_ignore_ascii_case(b".ends") {
-            ensure!(scopes.len() > 1, "line {}: unmatched .ends", statement.line);
-            scopes.pop();
+            ensure!(depth > 1, "line {}: unmatched .ends", statement.line);
+            depth -= 1;
         } else {
-            output.push((
-                *scopes.last().context("missing passive definition scope")?,
-                statement,
-            ));
+            output.push(statement);
         }
     }
-    ensure!(scopes.len() == 1, "unterminated passive definition scope");
+    ensure!(depth == 1, "unterminated passive definition scope");
     Ok(output)
-}
-
-fn coupled_inductors(
-    statements: &[(usize, lexical::Statement)],
-    budget: &WorkBudget,
-) -> Result<BTreeSet<(usize, Vec<u8>)>> {
-    let mut coupled = BTreeSet::new();
-    for (scope, statement) in statements {
-        budget.charge(Resource::Statements, 1)?;
-        if !matches!(statement.text.first(), Some(b'k' | b'K')) {
-            continue;
-        }
-        let fields = lexical::tokens(&statement.text)?;
-        ensure!(
-            fields.len() >= 4,
-            "line {}: mutual inductance needs at least two inductors and a coefficient",
-            statement.line
-        );
-        for span in &fields[1..fields.len() - 1] {
-            budget.charge(Resource::GeneratedNodes, 1)?;
-            budget.charge(Resource::EmittedBytes, span.len())?;
-            coupled.insert((*scope, statement.text[span.clone()].to_ascii_uppercase()));
-        }
-    }
-    Ok(coupled)
 }
 
 pub fn rewrite(
     input: &[u8],
     inserted: &mut Vec<usize>,
     dialect: NormalizationDialect,
-    include: bool,
     budget: &WorkBudget,
 ) -> Result<Option<Vec<u8>>> {
     budget.charge(Resource::ScannedBytes, input.len())?;
@@ -200,7 +171,7 @@ pub fn rewrite(
         return Ok(None);
     }
     if dialect == NormalizationDialect::Ltspice {
-        return ltspice::rewrite(input, include, budget);
+        return ltspice::rewrite(input, budget);
     }
     let mut rewriter = Rewriter {
         input,

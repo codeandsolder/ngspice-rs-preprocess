@@ -2,101 +2,13 @@
 //! All scalar fields remain occurrence-bound; no source name or terminal is
 //! changed and no artificial electrical component is inserted here.
 
-use super::{assignments, coupled_inductors, scoped};
-use crate::{expression_start, lexical};
+use super::{assignments, device_statements};
+use crate::lexical;
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
-use std::{collections::BTreeSet, ops::Range};
+use std::ops::Range;
 
 mod thermal;
-
-type ScopedName = (usize, Vec<u8>);
-
-/// Direct controls, not display/save requests, select the physical source
-/// topology. Scope identity disambiguates identically named local devices.
-fn current_controls(
-    statements: &[(usize, lexical::Statement)],
-    budget: &WorkBudget,
-) -> Result<BTreeSet<ScopedName>> {
-    let mut references = BTreeSet::new();
-    for (scope, statement) in statements {
-        let text = &statement.text;
-        budget.charge(Resource::ScannedBytes, text.len())?;
-        let fields = lexical::tokens(text)?;
-        let Some(first) = fields.first().map(|span| &text[span.clone()]) else {
-            continue;
-        };
-        let family = first.first().map(u8::to_ascii_lowercase);
-        if matches!(family, Some(b'f' | b'h'))
-            && let Some(control) = fields.get(3)
-        {
-            let control = &text[control.clone()];
-            // Linear current-controlled cards name an explicit branch.
-            // POLY control lists have one branch name for each dimension.
-            if control
-                .get(..5)
-                .is_some_and(|word| word.eq_ignore_ascii_case(b"poly("))
-                || control.eq_ignore_ascii_case(b"poly")
-            {
-                let (dimensions, first_control) = if control.eq_ignore_ascii_case(b"poly") {
-                    (fields.get(4).map(|span| &text[span.clone()]), 5usize)
-                } else {
-                    (control.get(4..), 4usize)
-                };
-                let dimensions = dimensions
-                    .and_then(|tail| tail.strip_prefix(b"("))
-                    .and_then(|tail| tail.strip_suffix(b")"))
-                    .and_then(|n| std::str::from_utf8(n).ok())
-                    .and_then(|n| n.trim().parse::<usize>().ok())
-                    .context("invalid current-controlled POLY dimension")?;
-                let end = first_control
-                    .checked_add(dimensions)
-                    .context("POLY dimension overflow")?;
-                for span in fields
-                    .get(first_control..end)
-                    .context("incomplete POLY controls")?
-                {
-                    insert_reference(&mut references, *scope, &text[span.clone()], budget)?;
-                }
-            } else if !control.contains(&b'(') && !control.eq_ignore_ascii_case(b"value") {
-                insert_reference(&mut references, *scope, control, budget)?;
-            }
-        }
-        if !matches!(family, Some(b'b' | b'e' | b'g' | b'f' | b'h')) {
-            continue;
-        }
-        let Some(start) = expression_start(text, first)? else {
-            continue;
-        };
-        for call in lexical::function_names(text, b"i", start) {
-            let tail = text[call.end..].trim_ascii_start();
-            let Some(end) = tail.iter().position(|byte| *byte == b')') else {
-                continue;
-            };
-            let name = tail[1..end].trim_ascii();
-            if !name.is_empty()
-                && !name
-                    .iter()
-                    .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b',' | b'('))
-            {
-                insert_reference(&mut references, *scope, name, budget)?;
-            }
-        }
-    }
-    Ok(references)
-}
-
-fn insert_reference(
-    references: &mut BTreeSet<ScopedName>,
-    scope: usize,
-    name: &[u8],
-    budget: &WorkBudget,
-) -> Result<()> {
-    budget.charge(Resource::GeneratedNodes, 1)?;
-    budget.charge(Resource::EmittedBytes, name.len())?;
-    references.insert((scope, name.to_ascii_uppercase()));
-    Ok(())
-}
 
 struct Card<'a> {
     statement: &'a lexical::Statement,
@@ -252,7 +164,7 @@ fn storage_shunt(
     Ok(())
 }
 
-fn voltage(card: &mut Card<'_>, controlled: bool, budget: &WorkBudget) -> Result<()> {
+fn voltage(card: &mut Card<'_>, budget: &WorkBudget) -> Result<()> {
     for key in [b"rpar".as_slice(), b"lser", b"rlshunt", b"temp"] {
         card.reject(key)?;
     }
@@ -268,15 +180,9 @@ fn voltage(card: &mut Card<'_>, controlled: bool, budget: &WorkBudget) -> Result
         let r = expression(rser.unwrap_or("0"));
         let c = expression(cpar);
         let value = format!("{{ternary_fcn(({r})==0,0,({c}))}}");
-        card.derived(
-            if controlled {
-                "pn_cseries_shunt"
-            } else {
-                "pn_cparallel"
-            },
-            &value,
-            budget,
-        )?;
+        // The actual current-reference graph is only known after occurrence
+        // and macro elaboration. Do not select a topology in this file.
+        card.derived("pn_ccontrol", &value, budget)?;
     }
     if rser.is_some() || cpar.is_some() {
         card.push("pn_control", "1");
@@ -306,15 +212,13 @@ fn default_leakage(main: &str, multiplicity: &str, inductor: bool) -> String {
 fn storage_initialization(
     card: &mut Card<'_>,
     inductor: bool,
-    coupled: bool,
     multiplicity: &str,
     budget: &WorkBudget,
 ) -> Result<bool> {
     let Some(initial) = card.scalar(b"ic")? else {
         return Ok(false);
     };
-    let default_rser = if inductor && !coupled { "1m" } else { "0" };
-    let rser = expression(card.scalar(b"rser")?.unwrap_or(default_rser));
+    let rser = card.scalar(b"rser")?.map(expression);
     let g = if inductor {
         let m = expression(multiplicity);
         let parallel = if let Some(rpar) = card.scalar(b"rpar")? {
@@ -324,10 +228,18 @@ fn storage_initialization(
             let l = std::str::from_utf8(&card.statement.text[card.fields[3].clone()])?;
             format!("({m})*({})", default_leakage(l, multiplicity, true))
         };
-        format!("({parallel})+ternary_fcn(({rser})==0,1e-5,0)")
+        if let Some(rser) = rser {
+            format!("({parallel})+ternary_fcn(({rser})==0,1e-5,0)")
+        } else {
+            // The final series topology determines this extra aggregate
+            // startup conductance, including coupling across scope boundaries.
+            card.push("pn_terminal_bias_zero_series", "1e-5");
+            parallel
+        }
     } else {
         // Nonpositive series loss uses the finite 1000 S startup law.
         // Positive loss uses the reciprocal of the specified (unscaled) Rser.
+        let rser = rser.unwrap_or("0");
         format!("1/ternary_fcn(({rser})>0,({rser}),1m)")
     };
     let conductance = format!("{{{g}}}");
@@ -343,13 +255,7 @@ fn storage_initialization(
     Ok(true)
 }
 
-fn storage(
-    card: &mut Card<'_>,
-    coupled: bool,
-    include: bool,
-    scope: usize,
-    budget: &WorkBudget,
-) -> Result<()> {
+fn storage(card: &mut Card<'_>, budget: &WorkBudget) -> Result<()> {
     let text = &card.statement.text;
     if card.fields.len() < 4 {
         return Ok(());
@@ -367,16 +273,11 @@ fn storage(
     let multiplicity = card.scalar(b"m")?.unwrap_or("1");
     let lser = card.scalar(b"lser")?;
     let cpar = card.scalar(b"cpar")?;
-    let mut physical = storage_initialization(card, inductor, coupled, multiplicity, budget)?;
+    let mut physical = storage_initialization(card, inductor, multiplicity, budget)?;
     let explicit_rser = card.rename(b"rser", "pn_rseries")?;
     physical |= explicit_rser;
-    if inductor && !explicit_rser && !coupled {
-        ensure!(
-            !include || scope != 0,
-            "line {}: default inductor resistance needs the complete LTspice deck to resolve mutual coupling; specify Rser explicitly",
-            card.statement.line
-        );
-        card.push("pn_rseries", "1m");
+    if inductor && !explicit_rser {
+        card.push("pn_rseries_uncoupled", "1m");
         physical = true;
     }
     if card.scalar(b"rpar")?.is_none() {
@@ -393,7 +294,12 @@ fn storage(
         }
         physical = true;
     }
-    physical |= card.rename(b"rpar", "pn_rparallel")?;
+    if card.rename(b"rpar", "pn_rparallel")? {
+        // The parallel thermal source uses conductance magnitude even when
+        // the electrical resistor is negative. Series loss is different.
+        card.push("pn_rparallel_noise_abs", "1");
+        physical = true;
+    }
     physical |= card.rename(b"lser", "pn_lseries")?;
     physical |= card.rename(b"cpar", "pn_cparallel")?;
     if !inductor
@@ -437,12 +343,10 @@ fn storage(
     Ok(())
 }
 
-pub(super) fn rewrite(input: &[u8], include: bool, budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
-    let statements = scoped(input, budget)?;
-    let coupled = coupled_inductors(&statements, budget)?;
-    let controls = current_controls(&statements, budget)?;
+pub(super) fn rewrite(input: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+    let statements = device_statements(input, budget)?;
     let mut edits = Vec::new();
-    for (scope, statement) in &statements {
+    for statement in &statements {
         budget.charge(Resource::Statements, 1)?;
         let Some(family) = statement.text.first().map(u8::to_ascii_lowercase) else {
             continue;
@@ -451,17 +355,9 @@ pub(super) fn rewrite(input: &[u8], include: bool, budget: &WorkBudget) -> Resul
             continue;
         }
         let mut card = Card::new(statement)?;
-        let name = card.fields.first().context("missing device identifier")?;
-        let identity = (*scope, statement.text[name.clone()].to_ascii_uppercase());
         match family {
-            b'v' => voltage(&mut card, controls.contains(&identity), budget)?,
-            b'c' | b'l' => storage(
-                &mut card,
-                coupled.contains(&identity),
-                include,
-                *scope,
-                budget,
-            )?,
+            b'v' => voltage(&mut card, budget)?,
+            b'c' | b'l' => storage(&mut card, budget)?,
             _ => {
                 thermal::noise(&mut card, false)?;
                 for key in [b"rser".as_slice(), b"rpar", b"cpar", b"lser", b"rlshunt"] {
@@ -540,7 +436,7 @@ mod tests {
                     "V1",
                     vec![
                         ("pn_rseries", loss),
-                        ("pn_cparallel", if loss == 0. { 0. } else { 1e-6 }),
+                        ("pn_ccontrol", if loss == 0. { 0. } else { 1e-6 }),
                         ("pn_report_dc", 1.),
                         ("pn_control", 1.),
                     ],
@@ -602,8 +498,8 @@ mod tests {
             for (name, want, parallel) in [
                 ("C1", c_bias, Some(init)),
                 ("L1", l_bias, None),
-                ("L2", 1e-5 + 1e-12 / 3e-3, None),
-                ("L3", 1e-5 + 1e-12 / 3e-3, None),
+                ("L2", 1e-12 / 3e-3, None),
+                ("L3", 1e-12 / 3e-3, None),
             ] {
                 let card = statements
                     .iter()
@@ -631,6 +527,13 @@ mod tests {
                         (actual - want).abs() <= 1e-13 * want.abs().max(1e-12),
                         "{name}: {actual} != {want}"
                     );
+                }
+                if matches!(name, "L2" | "L3") {
+                    ensure!(value("pn_rseries_uncoupled")? == Some(1e-3));
+                    ensure!(value("pn_rseries")?.is_none());
+                    ensure!(value("pn_terminal_bias_zero_series")? == Some(1e-5));
+                } else {
+                    ensure!(value("pn_terminal_bias_zero_series")?.is_none());
                 }
                 ensure!(
                     value("pn_exact_ic")? == Some(1.),
@@ -724,17 +627,34 @@ mod tests {
     }
 
     #[test]
-    fn current_control_is_scoped_and_not_selected_by_save() -> Result<()> {
-        let source = b".subckt sensed a b\nV1 a b 1 Rser=2 Cpar=1u\nF1 b 0 V1 1\n.ends\n.subckt unsensed a b\nV1 a b 1 Rser=2 Cpar=1u\n.save i(V1)\n.ends\n.subckt behavioural a b\nV1 a b 1 Rser=2 Cpar=1u\nB1 b 0 V=I(V1)\n.ends\n";
-        let output =
-            super::rewrite(source, true, &WorkBudget::default())?.context("missing rewrite")?;
+    fn topology_selection_is_deferred_to_the_occurrence_reference_graph() -> Result<()> {
+        // Local and nested controls, display-only references and coupled
+        // descendants may differ between instances of the same definition.
+        let source = b".subckt sensed a b\nV1 a b 1 Rser=2 Cpar=1u\nF1 b 0 V1 1\n.ends\n.subckt unsensed a b\nV1 a b 1 Rser=2 Cpar=1u\n.save i(V1)\n.ends\n.subckt behavioural a b\nV1 a b 1 Rser=2 Cpar=1u\n.func sense() {I(V1)}\nB1 b 0 V=sense()\nL1 a b 3m IC=.1 Rpar=0\n.ends\nX1 p 0 behavioural\nX2 q 0 behavioural\nK1 L:1:1 L:2:1 0\n";
+        let output = super::rewrite(source, &WorkBudget::default())?.context("missing rewrite")?;
         let text = std::str::from_utf8(&output)?;
-        let mut sources = text.lines().filter(|line| line.starts_with("V1 "));
-        for key in ["pn_cseries_shunt", "pn_cparallel", "pn_cseries_shunt"] {
-            let line = sources.next().context("missing voltage source")?;
-            ensure!(line.contains(key), "{line}");
+        let sources: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("V1 "))
+            .collect();
+        ensure!(sources.len() == 3);
+        for line in sources {
+            ensure!(line.contains("pn_ccontrol=0.000001"), "{line}");
+            ensure!(
+                !line.contains("pn_cseries_shunt") && !line.contains("pn_cparallel"),
+                "{line}"
+            );
         }
-        ensure!(sources.next().is_none(), "extra source");
+        let winding = text
+            .lines()
+            .find(|line| line.starts_with("L1 "))
+            .context("missing winding")?;
+        ensure!(winding.contains("pn_rseries_uncoupled=1m"));
+        ensure!(winding.contains("pn_terminal_bias_zero_series=1e-5"));
+        ensure!(!winding.contains("pn_rseries="));
+        ensure!(text.contains("K1 L:1:1 L:2:1 0"));
+        ensure!(text.contains(".func sense() {I(V1)}"));
+        ensure!(text.contains(".save i(V1)"));
         Ok(())
     }
 }

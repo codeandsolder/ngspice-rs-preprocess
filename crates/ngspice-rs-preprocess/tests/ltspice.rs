@@ -436,7 +436,7 @@ fn series_parasitics_preserve_coefficients_and_coupling_scope() -> Result<()> {
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
     assert!(!text.contains("R__L"));
     assert!(!text.contains("R__C"));
-    assert!(text.contains("L2 a2 0 3m pn_rseries=1m"));
+    assert!(text.contains("L2 a2 0 3m pn_rseries_uncoupled=1m"));
     assert!(text.contains("L3 a3 0 3m pn_rseries=0 pn_rparallel=0"));
     let coupled = text
         .split_once(".subckt coupled a b\n")
@@ -451,7 +451,8 @@ fn series_parasitics_preserve_coefficients_and_coupling_scope() -> Result<()> {
             .lines()
             .find(|line| line.starts_with(name))
             .context("missing coupled inductor")?;
-        assert!(!line.contains("pn_rseries=1m"));
+        assert!(line.contains("pn_rseries_uncoupled=1m"));
+        assert!(!line.contains("pn_rseries="));
         assert!(line.contains("pn_gterminal_dc="));
     }
     assert!(coupled.contains("K1 L2 L3 .5"));
@@ -498,7 +499,12 @@ fn series_parasitics_preserve_coefficients_and_coupling_scope() -> Result<()> {
                 .transpose()
         };
         near(
-            value("pn_rseries")?.context("missing series resistance")?,
+            value(if device == "L2" {
+                "pn_rseries_uncoupled"
+            } else {
+                "pn_rseries"
+            })?
+            .context("missing series resistance")?,
             resistance,
         )?;
         near(value("m")?.unwrap_or(1.), copies)?;
@@ -507,7 +513,7 @@ fn series_parasitics_preserve_coefficients_and_coupling_scope() -> Result<()> {
 }
 
 #[test]
-fn unresolved_passive_topology_is_diagnostic_not_silent() -> Result<()> {
+fn library_topology_is_deferred_but_unsupported_setters_are_diagnostic() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("source.cir");
     for card in [
@@ -519,7 +525,10 @@ fn unresolved_passive_topology_is_diagnostic_not_silent() -> Result<()> {
         assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
     }
     fs::write(&root, "L1 a b 1m\n")?;
-    assert!(prepared(&root, InputFormat::LtspiceLibrary).is_err());
+    let bundle = prepared(&root, InputFormat::LtspiceLibrary)?;
+    assert!(
+        std::str::from_utf8(&bundle.primary.bytes)?.contains("L1 a b 1m pn_rseries_uncoupled=1m")
+    );
     fs::write(&root, "L1 a b 1m Rser=0\n")?;
     let bundle = prepared(&root, InputFormat::LtspiceLibrary)?;
     assert!(std::str::from_utf8(&bundle.primary.bytes)?.contains("L1 a b 1m pn_rseries=0"));

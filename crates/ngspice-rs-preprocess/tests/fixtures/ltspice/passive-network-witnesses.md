@@ -237,3 +237,32 @@ L=3m Rser=5 Rpar=20 Cpar=1u gives 0.6219468798426032. Source
 `noiseless=0` or `=1` and `noisy` are diagnosed by LTspice. Voltage
 source `noiseless` is likewise diagnosed. The explicit native
 `pn_noiseless=1` selector belongs to the loss/noise contract in solver #278.
+
+## Occurrence-dependent topology
+
+LTspice 24.0.12: a subcircuit with a single 3 mH winding, Rpar=0,
+instantiated three times with independent 10-ohm feeds from 2 V.
+A root-level K card references only the first two windings using
+`K1 L:1:1 L:2:1 0`. The two referenced terminal voltages are zero;
+the unreferenced one is 0.0001999800019998000 V. With IC=.1 on the
+shared winding definition, the first two become 0.9999000099990003 V
+and the third becomes 1 V. Even zero coupling coefficient selects
+the coupled winding's loss topology; the decision is per occurrence.
+
+The source projection therefore retains `pn_rseries_uncoupled=1m`
+when Rser is omitted, and the separate startup addition
+`pn_terminal_bias_zero_series=1e-5` when IC is written. The consumer
+must resolve these after coupling references have been elaborated.
+Explicit Rser always wins by emitting the direct field instead of the
+alternative. Root and library preprocessing no longer choose a
+series topology based on local definition scans. Likewise,
+`pn_ccontrol` expresses voltage source capacitance whose physical
+placement depends on actual electrical current-control references,
+not display requests or the spelling of an unexpanded macro.
+These are the deferred native contracts proposed in solver #275.
+
+For the signed loss contract (#278), explicit Rpar emits
+`pn_rparallel_noise_abs=1`; its signed electrical conductance is
+unmodified. Negative series or series-inductance shunt conductance
+does not define a finite nonnegative thermal generator, while the
+network-level noiseless selector suppresses all generators.

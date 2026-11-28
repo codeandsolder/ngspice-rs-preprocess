@@ -629,7 +629,7 @@ fn normalize_body(
         NormalizationPass::NormalizeNbspWhitespace,
         normalize_nbsp,
     );
-    if let Some(rewritten) = series::rewrite(&bytes, inserted_lines, dialect, strip_end, budget)? {
+    if let Some(rewritten) = series::rewrite(&bytes, inserted_lines, dialect, budget)? {
         bytes = rewritten;
         passes.push(if dialect == NormalizationDialect::Ltspice {
             NormalizationPass::LtspiceSeriesParasitics
