@@ -28,6 +28,7 @@ pub struct PreparedHiSimHvChannelElectrostatics {
     modulation: PreparedHiSimHvChannelModulation,
     charge_area: PreparedHiSimHvChannelChargeArea,
     symmetry_voltage: f64,
+    source_symmetry_voltage: f64,
     minimum_gate_voltage: f64,
 }
 
@@ -41,6 +42,8 @@ pub struct HiSimHvChannelElectrostaticPoint {
     pub threshold: HiSimHvThresholdPoint,
     pub poly: HiSimHvPolyDepletionPoint,
     pub effective_drain: Jet,
+    pub modified_source_surface: Jet,
+    pub classical_oxide_capacitance: f64,
     pub charge: HiSimHvChannelChargePoint,
     pub modulation: HiSimHvChannelModulationPoint,
     pub terminal_charges: HiSimHvChannelTerminalCharges,
@@ -80,6 +83,7 @@ pub fn prepare_hisim_hv_channel_electrostatics(
         threshold: prepare_hisim_hv_threshold(model, instance)?,
         poly: prepare_hisim_hv_poly_depletion(model, instance)?,
         symmetry_voltage,
+        source_symmetry_voltage: model_real(model, "pzadd0")?,
         minimum_gate_voltage,
     })
 }
@@ -134,6 +138,12 @@ impl PreparedHiSimHvChannelElectrostatics {
             &charge,
         )?;
         let terminal_charges = self.charge_area.evaluate(&charge)?;
+        let modified_source_surface = charge.source_surface
+            + super::smoothing::symmetry_add(
+                Jet::coordinate(bias.vds, 1, 1.) - charge.surface_difference,
+                self.source_symmetry_voltage,
+                10. * f64::EPSILON,
+            );
         Ok(HiSimHvChannelElectrostaticPoint {
             material,
             conditioned,
@@ -141,6 +151,9 @@ impl PreparedHiSimHvChannelElectrostatics {
             threshold,
             poly,
             effective_drain,
+            modified_source_surface: modified_source_surface
+                .checked("HiSIM-HV symmetric source surface")?,
+            classical_oxide_capacitance: self.oxide.zero_field_capacitance(),
             charge,
             modulation,
             terminal_charges,

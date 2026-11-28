@@ -287,7 +287,7 @@ fn compare_circuit(fixture: &str, expected_count: usize, mechanism: Mechanism) -
         };
         let actual = if matches!(mechanism, Mechanism::Impact) {
             let impact = channel
-                .evaluate_with_impact(intrinsic, external, 0., &temperature)?
+                .evaluate_with_parasitics(intrinsic, external, 0., &temperature)?
                 .impact;
             let point = impact.channel_current_a;
             [
@@ -526,7 +526,7 @@ fn native_drift_impact_and_bulk_feedback_at_independent_drain_nodes() -> TestRes
         let (model, instance) = prepare(&row, Mechanism::Drift)?;
         let channel = prepare_hisim_hv_normal_channel(&model, &instance)?;
         let temp = prepare_hisim_hv_transport(&model, &instance, row[2] + 273.15, 0.)?;
-        let state = channel.evaluate_with_impact(
+        let state = channel.evaluate_with_parasitics(
             HiSimHvIntrinsicBias {
                 vgs: row[8],
                 vds: row[11],
@@ -589,7 +589,7 @@ fn impact_and_feedback_independent_voltage_and_temperature_derivatives() -> Test
                 > {
                     let temp = prepare_hisim_hv_transport(&model, &instance, c[3], 0.)?;
                     let p = channel
-                        .evaluate_with_impact(
+                        .evaluate_with_parasitics(
                             HiSimHvIntrinsicBias {
                                 vgs: c[0],
                                 vds: c[1],

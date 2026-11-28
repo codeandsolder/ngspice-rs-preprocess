@@ -2,10 +2,8 @@
 use super::{
     HiSimHvChannelRegion, HiSimHvDrainCurrent, HiSimHvExternalBias, HiSimHvIntrinsicBias,
     HiSimHvIntrinsicScalar, HiSimHvNormalChannelWithAccessPoint, PreparedHiSimHvInstance,
-    PreparedHiSimHvModel, PreparedHiSimHvTemperature,
-    instance::model_real,
-    instance_real_at, lookup_slot, prepare_hisim_hv_quantum_oxide,
-    smoothing::{positive, symmetry_add},
+    PreparedHiSimHvModel, PreparedHiSimHvTemperature, instance::model_real, instance_real_at,
+    lookup_slot, smoothing::positive,
 };
 use crate::{ModelError, ModelVariant, ParameterScope, ParameterValue, differential::Differential};
 
@@ -14,7 +12,6 @@ use crate::{ModelError, ModelVariant, ParameterScope, ParameterValue, differenti
 pub type HiSimHvImpactScalar = Differential<8>;
 type Jet = HiSimHvImpactScalar;
 const SMALL: f64 = 1e-25;
-const EPS: f64 = 10. * f64::EPSILON;
 
 /// Impact currents in normalized physical orientation, including multiplicity.
 ///
@@ -41,8 +38,6 @@ pub(super) struct ImpactIonization {
     drain_coefficient: f64,
     amplitude: f64,
     barrier: f64,
-    classical_oxide: f64,
-    potential_symmetry: f64,
     drift_amplitude: f64,
     drift_barrier: f64,
     drift_screening: f64,
@@ -151,9 +146,6 @@ impl ImpactIonization {
             drain_coefficient: binned("svds")?,
             amplitude: binned("sub1")? * factor("sub1l", "sub1lp")?,
             barrier: binned("sub2")? * (1. + real("sub2l")? / cm),
-            classical_oxide: prepare_hisim_hv_quantum_oxide(model, instance)?
-                .zero_field_capacitance(),
-            potential_symmetry: real("pzadd0")?,
             drift_amplitude,
             drift_barrier,
             drift_screening,
@@ -180,8 +172,6 @@ impl ImpactIonization {
             self.drain_coefficient,
             self.amplitude,
             self.barrier,
-            self.classical_oxide,
-            self.potential_symmetry,
             self.drift_amplitude,
             self.drift_barrier,
             self.drift_screening,
@@ -233,11 +223,8 @@ impl ImpactIonization {
             });
         }
         let current = promote_current(state.access.current);
-        let drain = Jet::coordinate(bias.vds, 1, 1.);
         let surface = promote(charge.source_surface);
-        let difference = promote(charge.surface_difference);
-        let modified_source =
-            surface + symmetry_add(drain - difference, self.potential_symmetry, EPS);
+        let modified_source = promote(electro.modified_source_surface);
         let channel = if self.channel_enabled {
             let beta = Jet::coordinate(
                 temperature.inverse_thermal_voltage,
@@ -245,8 +232,8 @@ impl ImpactIonization {
                 temperature.inverse_thermal_voltage_derivative,
             );
             let gate = self.gate_coefficient * promote(electro.poly.effective_gate);
-            let factor =
-                electro.material.charge_density_permittivity / self.classical_oxide.powi(2);
+            let factor = electro.material.charge_density_permittivity
+                / electro.classical_oxide_capacitance.powi(2);
             let overdrive = gate
                 - 1. / beta
                 - self.body_coefficient * promote(electro.conditioned.modified_body);

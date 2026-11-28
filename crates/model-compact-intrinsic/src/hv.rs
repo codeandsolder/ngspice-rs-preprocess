@@ -23,6 +23,7 @@ mod instance;
 mod junction;
 mod junction_current;
 mod lateral_field;
+mod leakage;
 mod poly_depletion;
 mod quantum_oxide;
 mod rules;
@@ -56,7 +57,7 @@ pub use channel_electrostatics::{
 pub use channel_mobility::{
     HiSimHvChannelMobilityCoefficients, HiSimHvChannelMobilityInputs, HiSimHvChannelMobilityPoint,
     HiSimHvNormalChannelPoint, HiSimHvNormalChannelWithAccessPoint,
-    HiSimHvNormalChannelWithImpactPoint, PreparedHiSimHvNormalChannel,
+    HiSimHvNormalChannelWithParasiticsPoint, PreparedHiSimHvNormalChannel,
     prepare_hisim_hv_normal_channel,
 };
 pub use channel_modulation::{
@@ -103,6 +104,7 @@ pub use lateral_field::{
     HiSimHvLateralFieldCharge, PreparedHiSimHvLateralFieldCharge,
     prepare_hisim_hv_lateral_field_charge,
 };
+pub use leakage::HiSimHvLeakagePoint;
 pub use poly_depletion::{
     HiSimHvPolyDepletionPoint, PreparedHiSimHvPolyDepletion, prepare_hisim_hv_poly_depletion,
 };

@@ -138,6 +138,7 @@ pub struct PreparedHiSimHvNormalChannel {
     access: PreparedHiSimHvAccessCorrection,
     sti: super::sti::StiCorrection,
     impact: super::impact::ImpactIonization,
+    leakage: super::leakage::Leakage,
     identity: Arc<()>,
 }
 
@@ -160,11 +161,12 @@ pub struct HiSimHvNormalChannelWithAccessPoint {
     pub access: HiSimHvAccessCorrectionPoint,
 }
 
-/// Coupled normal-channel state including the substrate impact currents.
+/// Coupled normal-channel state with impact and gate/junction leakage currents.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HiSimHvNormalChannelWithImpactPoint {
+pub struct HiSimHvNormalChannelWithParasiticsPoint {
     pub channel: HiSimHvNormalChannelWithAccessPoint,
     pub impact: super::HiSimHvImpactPoint,
+    pub leakage: super::HiSimHvLeakagePoint,
 }
 
 /// Prepare the native enhancement-mode channel for repeated local evaluation.
@@ -208,22 +210,23 @@ pub fn prepare_hisim_hv_normal_channel(
         access: prepare_hisim_hv_access_correction(model, instance)?,
         sti: super::sti::StiCorrection::prepare(model, instance, mobility.multiplicity)?,
         impact: super::impact::ImpactIonization::prepare(model, instance)?,
+        leakage: super::leakage::Leakage::prepare(model, instance)?,
         identity: Arc::clone(&instance.identity),
     })
 }
 
 impl PreparedHiSimHvNormalChannel {
-    /// Evaluate normal channel, access and impact ionization with an independent
+    /// Evaluate normal channel, access, impact and leakage with an independent
     /// normalized HV2 drain drift-region voltage drop (unused for HV1).
     /// # Errors
     /// Invalid local constitutive state or mismatched context.
-    pub fn evaluate_with_impact(
+    pub fn evaluate_with_parasitics(
         &self,
         bias: HiSimHvIntrinsicBias,
         external: HiSimHvExternalBias,
         drift_voltage: f64,
         transport: &PreparedHiSimHvTransport,
-    ) -> Result<HiSimHvNormalChannelWithImpactPoint, ModelError> {
+    ) -> Result<HiSimHvNormalChannelWithParasiticsPoint, ModelError> {
         let channel = self.evaluate_with_access(bias, external, transport)?;
         let impact = self.impact.evaluate(
             bias,
@@ -232,7 +235,14 @@ impl PreparedHiSimHvNormalChannel {
             &channel,
             &transport.temperature,
         )?;
-        Ok(HiSimHvNormalChannelWithImpactPoint { channel, impact })
+        let leakage = self
+            .leakage
+            .evaluate(bias, &channel.intrinsic, &transport.temperature)?;
+        Ok(HiSimHvNormalChannelWithParasiticsPoint {
+            channel,
+            impact,
+            leakage,
+        })
     }
 
     /// Evaluate intrinsic charge and access-corrected channel current in their
