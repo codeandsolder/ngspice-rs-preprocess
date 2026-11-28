@@ -10,11 +10,20 @@ pub fn ensure_textual(input: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) enum CommentSyntax {
+    #[default]
+    Native,
+    Hspice,
+    Simetrix,
+}
+
 #[derive(Default)]
 struct Context {
     quote: Option<u8>,
     escaped: bool,
     braces: usize,
+    syntax: CommentSyntax,
 }
 
 impl Context {
@@ -41,11 +50,15 @@ impl Context {
         if self.quote.is_some() {
             return false;
         }
-        match line[index] {
-            b';' => true,
-            b'$' => self.braces == 0 && separated,
-            b'/' => line.get(index + 1) == Some(&b'/'),
-            _ => false,
+        match self.syntax {
+            CommentSyntax::Hspice => line[index] == b'$' && self.braces == 0,
+            CommentSyntax::Simetrix => line[index] == b';' && self.braces == 0,
+            CommentSyntax::Native => match line[index] {
+                b';' => true,
+                b'$' => self.braces == 0 && separated,
+                b'/' => line.get(index + 1) == Some(&b'/'),
+                _ => false,
+            },
         }
     }
 }
@@ -94,15 +107,30 @@ impl Statement {
 }
 
 pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
+    statements_with_syntax(input, CommentSyntax::Native)
+}
+
+pub(crate) fn statements_with_syntax(
+    input: &[u8],
+    syntax: CommentSyntax,
+) -> Result<Vec<Statement>> {
     ensure_textual(input)?;
     let mut statements: Vec<Statement> = Vec::new();
     let mut offset = 0;
-    let mut context = Context::default();
+    let mut context = Context {
+        syntax,
+        ..Context::default()
+    };
     for (index, physical) in input.split_inclusive(|b| *b == b'\n').enumerate() {
         let start = offset;
         offset += physical.len();
         let (body, _) = split_line_ending(physical);
-        if comment_line(body) {
+        if match syntax {
+            CommentSyntax::Native => comment_line(body),
+            CommentSyntax::Hspice | CommentSyntax::Simetrix => {
+                matches!(body.trim_ascii_start(), [] | [b'*', ..])
+            }
+        } {
             continue;
         }
         let trimmed = body.trim_ascii_start();
@@ -110,7 +138,10 @@ pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
         let continuation = trimmed.first() == Some(&b'+');
         let code_start = indent + usize::from(continuation);
         if !continuation {
-            context = Context::default();
+            context = Context {
+                syntax,
+                ..Context::default()
+            };
         }
         let mut end = body.len();
         for at in code_start..body.len() {

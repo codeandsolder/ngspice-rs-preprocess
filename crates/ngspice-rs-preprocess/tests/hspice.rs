@@ -1087,3 +1087,78 @@ fn typed_model_binding_rejects_cross_family_instance_references() -> Result<()> 
     }
     Ok(())
 }
+
+#[test]
+fn shared_linker_retains_repeated_resource_visits_and_restores_language() -> Result<()> {
+    use model_normalize_ngspice::linked_source::SourceDialect;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child_dir = dir.path().join("models");
+    fs::create_dir(&child_dir)?;
+    let shared = child_dir.join("shared.lib");
+    fs::write(&shared, ".param value={PWR(-2,\n+ 2)}\n")?;
+    fs::write(child_dir.join("ps.lib"), "*#PSPICE\n.inc shared.lib\n")?;
+    fs::write(
+        &root,
+        "Repeated physical declaration under distinct lexical contexts\n.option parhier=local\n.subckt hs p\n.inc 'models\\shared.lib'$attached comment\nV1 p 0 'value'\n.ends hs\n.subckt ps p\n.inc 'models\\ps.lib'\nV1 p 0 'value'\n.ends ps\nX1 hp hs\nX2 pp ps\n.param restored='PWR(-3,2)'\nV2 r 0 'restored'\n.op\n.end\n",
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let Provenance::Native {
+        lines,
+        source_graph: Some(graph),
+    } = &bundle.primary.provenance
+    else {
+        anyhow::bail!("missing common linked source graph");
+    };
+    let path = shared.canonicalize()?;
+    let origins = lines
+        .iter()
+        .filter(|origin| origin.source == path && origin.line == 1)
+        .collect::<Vec<_>>();
+    let [first, second] = origins.as_slice() else {
+        anyhow::bail!("expected two bound source declarations, got {origins:?}");
+    };
+    assert_eq!((first.last_line, second.last_line), (2, 2));
+    let first = first.linked.context("missing first linked occurrence")?;
+    let second = second.linked.context("missing second linked occurrence")?;
+    assert_ne!(first.visit, second.visit);
+    assert_ne!(first.scope, second.scope);
+    assert_eq!(graph.visits[first.visit].dialect, SourceDialect::Hspice);
+    assert_eq!(graph.visits[second.visit].dialect, SourceDialect::Pspice);
+    assert_eq!(graph.scopes[first.scope].name.as_deref(), Some("hs"));
+    assert_eq!(graph.scopes[second.scope].name.as_deref(), Some("ps"));
+    assert_eq!(graph.visits[first.visit].parent, Some(0));
+    assert_ne!(graph.visits[second.visit].parent, Some(0));
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    measure_native(dir.path(), text, "op\nwrdata actual.dat v(hp) v(pp) v(r)")?;
+    let observed = values(dir.path(), "actual.dat")?;
+    for (a, e) in observed[0][1..].iter().zip([4., -4., 9.]) {
+        ensure!((*a - e).abs() < 1e-12, "{a} != {e}\n{text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn shared_linker_rejects_resource_cycles_and_opaque_hspice_payloads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("child.lib");
+    fs::write(&root, "Resource cycle\n.inc child.lib\n.end\n")?;
+    fs::write(&child, ".inc root.sp\n")?;
+    let error = compile(&root, InputFormat::HspiceDeck).expect_err("include cycle");
+    ensure!(
+        format!("{error:#}").contains("recursive ngspice source include"),
+        "{error:#}"
+    );
+    for start in [".control", ".file hidden"] {
+        fs::write(&child, format!("{start}\n.inc missing.lib\n"))?;
+        let error = compile(&root, InputFormat::HspiceDeck).expect_err("opaque payload");
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains("unsupported standalone SPICE command") && text.contains("child.lib:1"),
+            "{text}"
+        );
+        ensure!(!text.contains("cannot resolve source file"), "{text}");
+    }
+    Ok(())
+}

@@ -3,9 +3,12 @@
 //! This source-only stage expands library resources before `.param`/`.model`
 //! parsing. Each output physical line retains its original file and line.
 
-use crate::lexical::{normalize_nbsp, statements};
+use crate::{
+    SourceStatement,
+    lexical::{CommentSyntax, normalize_nbsp, statements_with_syntax},
+};
 use anyhow::{Context, Result, bail, ensure};
-use model_preprocess_command::{AdmittedSource, Resource, SourceSession};
+use model_preprocess_command::{AdmittedSource, Resource, SourceSession, WorkBudget};
 use std::path::{Path, PathBuf};
 
 /// Physical source location corresponding to a linked output line.
@@ -90,6 +93,108 @@ impl LinkedSource {
     }
 }
 
+impl LinkedSource {
+    /// Project linked physical rows into logical source statements. The title
+    /// and standalone comments are retained. Line numbers index this graph,
+    /// not the underlying resource; use `origin` for the physical source.
+    /// Continuations cannot cross a resource occurrence or skipped source span.
+    ///
+    /// # Errors
+    /// Invalid provenance, malformed continuation or exhausted work budget.
+    pub fn logical_statements(
+        &self,
+        kind: RootKind,
+        budget: &WorkBudget,
+    ) -> Result<Vec<SourceStatement>> {
+        budget.charge(Resource::ScannedBytes, self.bytes.len())?;
+        budget.charge(Resource::Statements, self.origins.len())?;
+        budget.charge(Resource::GeneratedNodes, self.origins.len())?;
+        let mut offsets = Vec::with_capacity(self.origins.len().saturating_add(1));
+        offsets.push(0usize);
+        for line in self.bytes.split_inclusive(|byte| *byte == b'\n') {
+            offsets.push(offsets.last().copied().context("missing linked offset")? + line.len());
+        }
+        ensure!(
+            offsets.len() == self.origins.len().saturating_add(1),
+            "linked physical source map mismatch"
+        );
+        let mut output = Vec::new();
+        let mut begin = 0;
+        if kind == RootKind::Deck {
+            let end = *offsets.get(1).context("linked deck has no title")?;
+            append_statement(
+                &mut output,
+                1,
+                1,
+                self.bytes[..end].trim_ascii_end(),
+                budget,
+            )?;
+            begin = 1;
+        }
+        while begin < self.origins.len() {
+            let origin = &self.origins[begin];
+            let dialect = self
+                .visits
+                .get(origin.visit)
+                .context("missing linked visit")?
+                .dialect;
+            let mut end = begin + 1;
+            while end < self.origins.len() {
+                let previous = &self.origins[end - 1];
+                let next = &self.origins[end];
+                if next.visit != previous.visit || next.line != previous.line.saturating_add(1) {
+                    break;
+                }
+                end += 1;
+            }
+            let bytes = &self.bytes[offsets[begin]..offsets[end]];
+            for record in records(bytes, begin + 1, dialect)? {
+                if record.logical.is_empty() {
+                    for index in record.physical {
+                        let line = begin + index;
+                        let raw = self.bytes[offsets[line]..offsets[line + 1]].trim_ascii_end();
+                        if raw.trim_ascii_start().is_empty()
+                            || raw.trim_ascii_start().starts_with(b"*")
+                        {
+                            append_statement(&mut output, line + 1, line + 1, raw, budget)?;
+                        } else {
+                            let comment = [b"* ".as_slice(), raw].concat();
+                            append_statement(&mut output, line + 1, line + 1, &comment, budget)?;
+                        }
+                    }
+                } else {
+                    append_statement(
+                        &mut output,
+                        record.line,
+                        begin + record.physical.end,
+                        &record.logical,
+                        budget,
+                    )?;
+                }
+            }
+            begin = end;
+        }
+        Ok(output)
+    }
+}
+
+fn append_statement(
+    output: &mut Vec<SourceStatement>,
+    first_line: usize,
+    last_line: usize,
+    text: &[u8],
+    budget: &WorkBudget,
+) -> Result<()> {
+    budget.charge(Resource::GeneratedNodes, 1)?;
+    budget.charge(Resource::EmittedBytes, text.len())?;
+    output.push(SourceStatement {
+        first_line,
+        last_line,
+        text: text.to_vec(),
+    });
+    Ok(())
+}
+
 /// Explicit source search paths; no process-environment or working-directory
 /// dependence beyond the caller-supplied root and search directories.
 #[derive(Clone, Debug, Default)]
@@ -155,7 +260,18 @@ impl SourceDialect {
     }
 
     const fn portable_paths(self) -> bool {
-        matches!(self, Self::Pspice | Self::Ltspice | Self::Tina)
+        matches!(
+            self,
+            Self::Pspice | Self::Ltspice | Self::Tina | Self::Hspice | Self::Simetrix
+        )
+    }
+
+    const fn comment_syntax(self) -> CommentSyntax {
+        match self {
+            Self::Hspice => CommentSyntax::Hspice,
+            Self::Simetrix => CommentSyntax::Simetrix,
+            _ => CommentSyntax::Native,
+        }
     }
 }
 
@@ -224,6 +340,7 @@ impl Projection {
 
 struct LinkState<'a> {
     settings: &'a SourceLinker,
+    root_separator: Option<char>,
     admission: &'a mut SourceSession,
     limits: LinkLimits,
     stack: Vec<VisitFrame>,
@@ -343,24 +460,15 @@ struct Record {
     logical: Vec<u8>,
 }
 
-fn records(bytes: &[u8], first_line: usize) -> Result<Vec<Record>> {
+fn records(bytes: &[u8], first_line: usize, dialect: SourceDialect) -> Result<Vec<Record>> {
     let physical_count = bytes.split_inclusive(|byte| *byte == b'\n').count();
     let normalized = normalize_nbsp(bytes);
     let normalized = normalized.as_deref().unwrap_or(bytes);
-    let mut starts = vec![0];
-    for line in normalized.split_inclusive(|byte| *byte == b'\n') {
-        starts.push(starts.last().copied().unwrap_or_default() + line.len());
-    }
     let mut result = Vec::new();
     let mut cursor = 0;
-    for statement in statements(normalized)? {
+    for statement in statements_with_syntax(normalized, dialect.comment_syntax())? {
         let start = statement.line - 1;
-        let end = statement
-            .source_ranges(0..statement.text.len())
-            .last()
-            .map_or(start + 1, |range| {
-                starts.partition_point(|offset| *offset < range.end)
-            });
+        let end = statement.last_line;
         if cursor < start {
             result.push(Record {
                 line: first_line + cursor,
@@ -425,8 +533,32 @@ impl SourceLinker {
         limits: LinkLimits,
         admission: &mut SourceSession,
     ) -> Result<LinkedSource> {
+        self.link_admitted_with_separator(
+            source,
+            kind,
+            limits,
+            self.dialect.default_separator(),
+            admission,
+        )
+    }
+
+    /// Link a root with an explicitly inherited device identity separator.
+    /// The resource's own legal header still overrides inherited context.
+    ///
+    /// # Errors
+    /// Invalid source, missing or recursive resources, malformed sections,
+    /// or exceeded linked-output budget.
+    pub fn link_admitted_with_separator(
+        &self,
+        source: &AdmittedSource,
+        kind: RootKind,
+        limits: LinkLimits,
+        separator: Option<char>,
+        admission: &mut SourceSession,
+    ) -> Result<LinkedSource> {
         let mut state = LinkState {
             settings: self,
+            root_separator: separator,
             admission,
             limits,
             stack: Vec::new(),
@@ -739,7 +871,7 @@ impl LinkState<'_> {
             section: section_key,
             dialect: inherited,
             separator: self.stack.last().map_or_else(
-                || inherited.default_separator(),
+                || self.root_separator,
                 |frame| self.output.visits[frame.visit].separator,
             ),
             declaration: None,
@@ -798,7 +930,7 @@ impl LinkState<'_> {
         } else {
             (&decoded[..], 1)
         };
-        let records = records(body, first_line)?;
+        let records = records(body, first_line, self.dialect())?;
         if self.is_qspice_root() {
             self.collect_source_paths(path, &records, section)?;
         }
@@ -835,6 +967,16 @@ impl LinkState<'_> {
                 continue;
             }
             let selected = selection.selected();
+            if selected && self.settings.dialect == SourceDialect::Hspice {
+                ensure!(
+                    ![".control", ".endc", ".file", ".endf"]
+                        .iter()
+                        .any(|name| directive(text, name).is_some()),
+                    "unsupported standalone SPICE command at {}:{}: {text}",
+                    path.display(),
+                    record.line
+                );
+            }
             if control_start {
                 in_control = true;
             }

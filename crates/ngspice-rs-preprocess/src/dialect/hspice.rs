@@ -1,14 +1,15 @@
 //! Standalone HSPICE resource admission and native artifact preparation.
 //! HSPICE compatibility is local to source resources; no simulator global
 //! compatibility flag is set by this producer.
-use super::{SourceExpansion, analysis_plan};
+use super::analysis_plan;
 use crate::{
-    AdmittedSource, Cancellation, NativeProjection, Options, PreparedBundle, Request, Resource,
-    SourceSession, WorkBudget, native_bundle,
+    AdmittedSource, Cancellation, LinkedLocation, NativeProjection, Options, OriginLine,
+    PreparedBundle, Request, Resource, SourceGraph, SourceSession, WorkBudget, display_path,
+    native_bundle,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
-    linked_source::RootKind,
+    linked_source::{LinkLimits, RootKind, SourceLinker},
     model_card::{
         FunctionSignature, parse_function_signature, parse_parameter_declarations,
         parse_parameter_fields,
@@ -17,9 +18,14 @@ use model_normalize_ngspice::{
 };
 use model_preprocess_simplis::{
     lower_spice_expression,
-    source_dialect::{DialectContext, SourceDialect, model_mapping::ModelSelection},
+    source_dialect::{
+        DialectContext, ScopedStatement, SourceDialect, model_mapping::ModelSelection,
+    },
 };
-use std::{collections::BTreeMap, fmt::Write as _};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+};
 
 mod analysis;
 mod bsim4_catalog;
@@ -31,6 +37,132 @@ pub(super) const HSPICE: DialectContext = DialectContext {
     language: SourceDialect::Hspice,
     separator: None,
 };
+
+pub(super) struct LinkedExpansion {
+    pub(super) context: DialectContext,
+    pub(super) statements: Vec<ScopedStatement>,
+    pub(super) sources: BTreeSet<String>,
+    origins: Vec<OriginLine>,
+    graph: SourceGraph,
+}
+
+/// Resource admission and lexical projection are shared with native decks.
+/// HSPICE-specific semantics begin only after the graph has been admitted.
+pub(super) fn linked_resource(
+    source: &AdmittedSource,
+    inherited: DialectContext,
+    kind: RootKind,
+    request: &Request,
+    options: &Options,
+    session: &mut SourceSession,
+) -> Result<LinkedExpansion> {
+    let linked = SourceLinker {
+        search_paths: request.search_paths.clone(),
+        dialect: inherited.language,
+    }
+    .link_admitted_with_separator(
+        source,
+        kind,
+        LinkLimits {
+            output_bytes: options.output_bytes,
+        },
+        inherited.separator,
+        session,
+    )?;
+    let root = linked.visits.first().context("missing root source visit")?;
+    let context = DialectContext {
+        language: root.dialect,
+        separator: root.separator,
+    };
+    let budget = session.budget();
+    let mut statements = Vec::new();
+    let mut origins = Vec::new();
+    for row in linked.logical_statements(kind, budget)? {
+        let first = linked
+            .origin(row.first_line)
+            .context("missing logical source origin")?;
+        let last = linked
+            .origin(row.last_line)
+            .context("missing continuation source origin")?;
+        ensure!(
+            first.visit == last.visit,
+            "logical statement crosses source visits"
+        );
+        let visit = linked
+            .visits
+            .get(first.visit)
+            .context("missing source visit")?;
+        let text = if row.text.trim_ascii_start().starts_with(b"*") {
+            String::from_utf8_lossy(&row.text).into_owned()
+        } else {
+            String::from_utf8(row.text).with_context(|| {
+                format!(
+                    "{}:{}: invalid source encoding",
+                    first.path.display(),
+                    first.line
+                )
+            })?
+        };
+        if kind != RootKind::Deck || row.first_line != 1 {
+            ensure!(
+                !matches!(
+                    analysis_plan::command(&text).as_str(),
+                    ".CONTROL" | ".ENDC" | ".FILE" | ".ENDF"
+                ),
+                "unsupported standalone SPICE command at {}:{}: {text}",
+                first.path.display(),
+                first.line
+            );
+        }
+        let source = display_path(&first.path);
+        budget.charge(Resource::GeneratedNodes, 2)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            first
+                .path
+                .as_os_str()
+                .len()
+                .saturating_add(source.len())
+                .saturating_add(text.len()),
+        )?;
+        statements.push(ScopedStatement {
+            source,
+            context: DialectContext {
+                language: visit.dialect,
+                separator: visit.separator,
+            },
+            first_line: first.line,
+            last_line: last.line,
+            text,
+        });
+        origins.push(OriginLine {
+            source: first.path.clone(),
+            line: first.line,
+            last_line: last.line,
+            linked: Some(LinkedLocation {
+                visit: first.visit,
+                scope: first.scope,
+            }),
+        });
+    }
+    let mut sources = BTreeSet::new();
+    for visit in &linked.visits {
+        let name = display_path(&visit.path);
+        budget.charge(Resource::EmittedBytes, name.len())?;
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        sources.insert(name);
+    }
+    Ok(LinkedExpansion {
+        context,
+        statements,
+        sources,
+        origins,
+        graph: SourceGraph {
+            visits: linked.visits,
+            scopes: linked.scopes,
+        },
+    })
+}
 
 #[derive(Default)]
 struct DeckOptions {
@@ -704,13 +836,13 @@ pub(super) fn prepare(
     cancellation: &Cancellation,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let mut expansion = SourceExpansion::new(session, request, options);
-    let context = expansion.expand(root, HSPICE, RootKind::Deck, None)?;
-    let SourceExpansion {
+    let LinkedExpansion {
+        context,
         mut statements,
         mut origins,
+        graph,
         ..
-    } = expansion;
+    } = linked_resource(root, HSPICE, RootKind::Deck, request, options, session)?;
     let members = super::catalog_members(request, options, cancellation, session, context)?;
     let budget = session.budget();
     add_catalog(
@@ -766,7 +898,7 @@ pub(super) fn prepare(
         RootKind::Deck,
         NativeProjection::plain(&bytes, RootKind::Deck, budget)?,
         &origins,
-        None,
+        Some(graph),
         budget,
     )?;
     bundle.model_selections = selections.into_values().collect();
