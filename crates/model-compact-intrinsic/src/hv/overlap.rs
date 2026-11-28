@@ -292,8 +292,10 @@ impl PreparedHiSimHvOverlap {
             } else {
                 [self.source, self.drain]
             };
-            let qextra =
-                self.extra_drain_charge * (intrinsic[1] - channel.charge.surface_difference);
+            let orientation = if bias.reversed { -1. } else { 1. };
+            let qextra = orientation
+                * self.extra_drain_charge
+                * (intrinsic[1] - channel.charge.surface_difference);
             for (index, side) in sides.into_iter().enumerate() {
                 let drain = index == 1;
                 let physical_drain_side = drain != bias.reversed;
@@ -334,13 +336,7 @@ impl PreparedHiSimHvOverlap {
                     if !self.enabled {
                         continue;
                     }
-                    let additional = if drain && !bias.reversed {
-                        qextra
-                    } else if !drain && bias.reversed {
-                        -qextra
-                    } else {
-                        zero
-                    };
+                    let additional = if physical_drain_side { qextra } else { zero };
                     let area = self.width * side.length;
                     inner.add_side(
                         drain,
