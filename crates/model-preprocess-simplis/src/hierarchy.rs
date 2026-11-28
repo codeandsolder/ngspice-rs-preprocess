@@ -820,18 +820,11 @@ impl SubcircuitCatalog {
                 continue;
             }
             let (target, model_type) = self.resolve_model_statement(&alias.target, source_id)?;
-            let mut fields = Self::model_statement(&target, &alias.target)
-                .context("resolved SIMPLIS model alias target is not a .MODEL statement")?;
-            if !model_type.eq_ignore_ascii_case(&alias.kind) {
-                bail!(
-                    "SIMPLIS alias {} expects {} but target {} is model type {model_type}",
-                    alias.name,
-                    alias.kind,
-                    alias.target
-                );
-            }
-            fields[1] = &alias.name;
-            output.push(fields.join(" "));
+            output.push(source_aliases::model_alias_card(
+                alias,
+                &target,
+                Some(&model_type),
+            )?);
         }
         Ok(output)
     }
