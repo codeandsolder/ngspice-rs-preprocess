@@ -790,6 +790,30 @@ the comparison propagates a 16-epsilon endpoint rounding budget through
 that sensitivity, without changing the physical law or its derivatives.
 Independent finite differences check the intrinsic and thermal derivatives.
 
+### Physical and constant HiSIM-HV overlap charge network
+
+The prepared overlap evaluator implements the original constant, simplified
+and doped surface-potential branches, including original-given capacitance
+semantics, separate physical source/drain geometry, and HV2 QOVADD. The
+analytic modes use the native two-step depletion construction and cubic near
+flatband; mode 2 also limits the potential using the smoothed inversion bound.
+Mode 1 reuses the monotone native Poisson solver, and both families use the
+native bandgap confinement in overlap accumulation. Doped charge is split
+between intrinsic and external voltages by CVDSOVER. Reversal exchanges the
+physical source/drain parameters before evaluating normalized coordinates.
+The overlap-specific charge vectors conserve charge independently. All 6,720
+forward and 3,840 reverse paired native OPs and independent seven-coordinate
+finite differences passed. The mode-1 minority charge is evaluated as a
+rationalized difference to retain very small inversion density.
+
+The coupled evaluator exposes a quasistatic charge network: intrinsic channel
+plus lateral, physical overlap and gate/body overlap, independent external
+overlap, and gate-to-prime pairs (constant overlap plus fringing). The prime
+pair's other node receives the negative of its reported gate-oriented charge.
+The returned rows and derivatives are in normalized source-referenced
+coordinates; physical reversal must also swap the source/drain rows. Junction
+charges and NQS state remain separate mechanisms.
+
 ### Physical HiSIM-HV1/HV2 external fringing capacitance
 
 `prepare_hisim_hv_fringing(model, instance)` now prepares a real, original

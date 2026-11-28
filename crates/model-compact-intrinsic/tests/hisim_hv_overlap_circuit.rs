@@ -214,7 +214,7 @@ fn independent_overlap_coordinates_and_orientation() -> TestResult {
                     for drain in [0.12, 1.6, 8.] {
                         let x = [gate, drain, -0.23, 315., gate + 0.07, drain + 0.25, -0.31];
                         let point = evaluate(x)?;
-                        let rows = |q: model_compact_intrinsic::HiSimHvOverlapPoint| {
+                        let rows = |q: model_compact_intrinsic::HiSimHvChargeNetwork| {
                             [
                                 q.intrinsic.gate,
                                 q.intrinsic.drain,
@@ -269,5 +269,115 @@ fn independent_overlap_coordinates_and_orientation() -> TestResult {
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn native_constant_and_fringe_ac_network() -> TestResult {
+    let mut count = 0;
+    for (index, line) in include_str!("fixtures/hisim-hv-constant-capacitance-ngspice47.txt")
+        .lines()
+        .enumerate()
+    {
+        if line.starts_with('#') {
+            continue;
+        }
+        let row: [f64; 16] = line
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| "native AC fixture width")?;
+        let variant = if row[0] == 1. {
+            ModelVariant::HiSimHv1
+        } else {
+            ModelVariant::HiSimHv2
+        };
+        let mut fields = vec![
+            (
+                if row[1] < 0. { "pmos" } else { "nmos" },
+                ParameterValue::Flag(true),
+            ),
+            ("coadov", ParameterValue::Integer(1)),
+        ];
+        for name in [
+            "corsrd", "coisti", "coisub", "coovlp", "coovlps", "conqs", "coiigs", "cogidl",
+        ] {
+            fields.push((name, ParameterValue::Integer(0)));
+        }
+        if variant == ModelVariant::HiSimHv2 {
+            fields.push(("cordrift", ParameterValue::Integer(0)));
+        }
+        fields.extend(
+            [
+                ("xqy", 0.),
+                ("xqy1", 0.),
+                ("loverld", 5e-7),
+                ("lovers", 3e-7),
+                (
+                    "cgbo",
+                    if row[7] == 0. || row[7] == 3. {
+                        3e-10
+                    } else {
+                        0.
+                    },
+                ),
+                ("tpoly", if row[7] >= 2. { 150e-9 } else { 0. }),
+            ]
+            .map(|(n, v)| (n, ParameterValue::Real(v))),
+        );
+        if row[7] != 1. {
+            fields.extend(
+                [
+                    ("cgdo", if row[7] == 2. { 0. } else { 4e-10 }),
+                    ("cgso", if row[7] == 2. { 0. } else { 2e-10 }),
+                ]
+                .map(|(n, v)| (n, ParameterValue::Real(v))),
+            );
+        }
+        let model = prepare_hisim_hv_model(&BoundParameters::bind(
+            variant,
+            ParameterScope::Model,
+            fields,
+        )?)?;
+        let instance = prepare_hisim_hv_instance(
+            &model,
+            &BoundParameters::bind(
+                variant,
+                ParameterScope::Instance,
+                [("l", row[3]), ("w", row[4]), ("m", row[5]), ("nf", row[6])]
+                    .map(|(n, v)| (n, ParameterValue::Real(v))),
+            )?,
+        )?;
+        let channel = prepare_hisim_hv_normal_channel(&model, &instance)?;
+        let temp = prepare_hisim_hv_transport(&model, &instance, row[2] + 273.15, 0.)?;
+        let intrinsic = HiSimHvIntrinsicBias {
+            vgs: row[9],
+            vds: row[10],
+            vbs: row[11],
+        };
+        let external = HiSimHvExternalBias {
+            vgs: row[9],
+            vds: row[10],
+            vbs: row[11],
+        };
+        let reverse = row[8] == 1.;
+        let state = channel.evaluate_with_parasitics(intrinsic, external, 0., reverse, &temp)?;
+        let core = state.channel.intrinsic.electrostatics.terminal_charges;
+        let q = state.charges;
+        let drain = q.gate_drain_prime.gradient[0];
+        let source = q.gate_source_prime.gradient[0];
+        let bulk = core.bulk.gradient[0] - q.intrinsic.bulk.gradient[0];
+        let (d, s) = if reverse {
+            (source, drain)
+        } else {
+            (drain, source)
+        };
+        for (i, cap) in [d, s, bulk, -d - s - bulk].into_iter().enumerate() {
+            close(cap, row[12 + i], 5e-7, 1e-25, (index, i, &row[..12]));
+        }
+        count += 1;
+    }
+    assert_eq!(count, 1536);
     Ok(())
 }

@@ -2,12 +2,14 @@
 use super::{
     HiSimHvAccessCorrectionPoint, HiSimHvAccessInputs, HiSimHvChannelChargePoint,
     HiSimHvChannelCorrectionPoint, HiSimHvChannelElectrostaticPoint, HiSimHvChannelModulationPoint,
-    HiSimHvChannelRegion, HiSimHvExternalBias, HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar as Jet,
-    PreparedHiSimHvAccessCorrection, PreparedHiSimHvChannelElectrostatics, PreparedHiSimHvInstance,
-    PreparedHiSimHvLateralFieldCharge, PreparedHiSimHvModel, PreparedHiSimHvTransport,
-    channel_correction::ChannelCorrection, instance::model_real, instance_real_at, lookup_slot,
-    prepare_hisim_hv_access_correction, prepare_hisim_hv_channel_electrostatics,
-    prepare_hisim_hv_lateral_field_charge,
+    HiSimHvChannelRegion, HiSimHvChargeNetwork, HiSimHvExternalBias, HiSimHvIntrinsicBias,
+    HiSimHvIntrinsicScalar as Jet, HiSimHvOverlapBias, PreparedHiSimHvAccessCorrection,
+    PreparedHiSimHvChannelElectrostatics, PreparedHiSimHvFringing, PreparedHiSimHvInstance,
+    PreparedHiSimHvLateralFieldCharge, PreparedHiSimHvModel, PreparedHiSimHvOverlap,
+    PreparedHiSimHvTransport, channel_correction::ChannelCorrection, instance::model_real,
+    instance_real_at, lookup_slot, prepare_hisim_hv_access_correction,
+    prepare_hisim_hv_channel_electrostatics, prepare_hisim_hv_fringing,
+    prepare_hisim_hv_lateral_field_charge, prepare_hisim_hv_overlap,
 };
 use crate::{ModelError, ParameterScope};
 use std::sync::Arc;
@@ -141,6 +143,8 @@ pub struct PreparedHiSimHvNormalChannel {
     impact: super::impact::ImpactIonization,
     leakage: super::leakage::Leakage,
     lateral: PreparedHiSimHvLateralFieldCharge,
+    overlap: PreparedHiSimHvOverlap,
+    fringing: PreparedHiSimHvFringing,
     identity: Arc<()>,
 }
 
@@ -172,6 +176,8 @@ pub struct HiSimHvNormalChannelWithParasiticsPoint {
     /// Native Qy including multiplicity, added to gate and subtracted from drain.
     /// Derivatives use intrinsic voltage and device temperature coordinates.
     pub lateral_gate_charge_c: Jet,
+    /// Quasistatic channel, overlap, lateral and fringing charge network.
+    pub charges: HiSimHvChargeNetwork,
 }
 
 /// Prepare the native enhancement-mode channel for repeated local evaluation.
@@ -217,6 +223,8 @@ pub fn prepare_hisim_hv_normal_channel(
         impact: super::impact::ImpactIonization::prepare(model, instance)?,
         leakage: super::leakage::Leakage::prepare(model, instance)?,
         lateral: prepare_hisim_hv_lateral_field_charge(model, instance)?,
+        overlap: prepare_hisim_hv_overlap(model, instance)?,
+        fringing: prepare_hisim_hv_fringing(model, instance)?,
         identity: Arc::clone(&instance.identity),
     })
 }
@@ -224,6 +232,7 @@ pub fn prepare_hisim_hv_normal_channel(
 impl PreparedHiSimHvNormalChannel {
     /// Evaluate normal channel, access, impact and leakage with an independent
     /// normalized HV2 drain drift-region voltage drop (unused for HV1).
+    /// Overlap orientation explicitly selects the physical source/drain sides.
     /// # Errors
     /// Invalid local constitutive state or mismatched context.
     pub fn evaluate_with_parasitics(
@@ -231,6 +240,7 @@ impl PreparedHiSimHvNormalChannel {
         bias: HiSimHvIntrinsicBias,
         external: HiSimHvExternalBias,
         drift_voltage: f64,
+        reversed: bool,
         transport: &PreparedHiSimHvTransport,
     ) -> Result<HiSimHvNormalChannelWithParasiticsPoint, ModelError> {
         let channel = self.evaluate_with_access(bias, external, transport)?;
@@ -249,11 +259,38 @@ impl PreparedHiSimHvNormalChannel {
             &channel.intrinsic.electrostatics,
             &transport.temperature,
         )?;
+        let electrostatics = &channel.intrinsic.electrostatics;
+        let mut charges = self.overlap.evaluate(
+            HiSimHvOverlapBias {
+                intrinsic: bias,
+                external,
+                reversed,
+            },
+            electrostatics,
+            &transport.temperature,
+        )?;
+        let core = electrostatics.terminal_charges;
+        charges.intrinsic.gate = (charges.intrinsic.gate + core.gate + lateral_gate_charge_c)
+            .checked("HiSIM-HV assembled intrinsic gate charge")?;
+        charges.intrinsic.drain = (charges.intrinsic.drain + core.drain - lateral_gate_charge_c)
+            .checked("HiSIM-HV assembled intrinsic drain charge")?;
+        charges.intrinsic.source = (charges.intrinsic.source + core.source)
+            .checked("HiSIM-HV assembled intrinsic source charge")?;
+        charges.intrinsic.bulk = (charges.intrinsic.bulk + core.bulk)
+            .checked("HiSIM-HV assembled intrinsic bulk charge")?;
+        let outer_gate = Jet::coordinate(external.vgs, 0, 1.);
+        let outer_drain = Jet::coordinate(external.vds, 1, 1.);
+        let fringe = self.fringing.effective_capacitance_f;
+        charges.gate_drain_prime = (charges.gate_drain_prime + fringe * (outer_gate - outer_drain))
+            .checked("HiSIM-HV assembled gate/drain-prime charge")?;
+        charges.gate_source_prime = (charges.gate_source_prime + fringe * outer_gate)
+            .checked("HiSIM-HV assembled gate/source-prime charge")?;
         Ok(HiSimHvNormalChannelWithParasiticsPoint {
             channel,
             impact,
             leakage,
             lateral_gate_charge_c,
+            charges,
         })
     }
 

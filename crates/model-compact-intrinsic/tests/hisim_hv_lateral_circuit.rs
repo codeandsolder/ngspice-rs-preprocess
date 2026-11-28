@@ -142,7 +142,7 @@ fn paired_native_lateral_charge() -> TestResult {
             vds: bias.vds,
             vbs: bias.vbs,
         };
-        let state = channel.evaluate_with_parasitics(bias, external, 0., &temp)?;
+        let state = channel.evaluate_with_parasitics(bias, external, 0., false, &temp)?;
         let electrostatics = &state.channel.intrinsic.electrostatics;
         let q = lateral.evaluate_channel_charge(bias, electrostatics, &temp.temperature)?;
         assert_eq!(state.lateral_gate_charge_c, q);

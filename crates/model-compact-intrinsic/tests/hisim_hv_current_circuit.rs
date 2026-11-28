@@ -287,7 +287,7 @@ fn compare_circuit(fixture: &str, expected_count: usize, mechanism: Mechanism) -
         };
         let actual = if matches!(mechanism, Mechanism::Impact) {
             let impact = channel
-                .evaluate_with_parasitics(intrinsic, external, 0., &temperature)?
+                .evaluate_with_parasitics(intrinsic, external, 0., false, &temperature)?
                 .impact;
             let point = impact.channel_current_a;
             [
@@ -538,6 +538,7 @@ fn native_drift_impact_and_bulk_feedback_at_independent_drain_nodes() -> TestRes
                 vbs: row[10],
             },
             row[9] - row[11],
+            false,
             &temp,
         )?;
         let p = state.impact;
@@ -601,6 +602,7 @@ fn impact_and_feedback_independent_voltage_and_temperature_derivatives() -> Test
                                 vbs: c[6],
                             },
                             c[7],
+                            false,
                             &temp,
                         )?
                         .impact;

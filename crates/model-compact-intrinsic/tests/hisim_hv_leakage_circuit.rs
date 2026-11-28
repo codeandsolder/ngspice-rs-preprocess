@@ -138,6 +138,7 @@ fn native_terminal_leakage() -> TestResult {
                 vbs: bias.vbs,
             },
             0.,
+            false,
             &temp,
         )?;
         for (i, p) in currents(result.leakage).iter().enumerate() {
@@ -172,6 +173,7 @@ fn local_terminal_leakage_derivatives() -> TestResult {
                                     vbs: x[2],
                                 },
                                 0.,
+                                false,
                                 &temp,
                             )?
                             .leakage,

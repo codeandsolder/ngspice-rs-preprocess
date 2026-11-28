@@ -25,7 +25,7 @@ pub struct HiSimHvOverlapBias {
 /// Derivatives use intrinsic and external (Vgs,Vds,Vbs,T) coordinates
 /// respectively. Prime charges are gate-to-external-prime pairs.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HiSimHvOverlapPoint {
+pub struct HiSimHvChargeNetwork {
     pub intrinsic: HiSimHvChannelTerminalCharges,
     pub external: HiSimHvChannelTerminalCharges,
     pub gate_drain_prime: Jet,
@@ -228,7 +228,7 @@ impl PreparedHiSimHvOverlap {
         bias: HiSimHvOverlapBias,
         channel: &HiSimHvChannelElectrostaticPoint,
         temperature: &PreparedHiSimHvTemperature,
-    ) -> Result<HiSimHvOverlapPoint, ModelError> {
+    ) -> Result<HiSimHvChargeNetwork, ModelError> {
         let zero = Jet::constant(0.);
         let mut inner = Charges::default();
         let mut outer = Charges::default();
@@ -323,7 +323,7 @@ impl PreparedHiSimHvOverlap {
             inner.gate = inner.gate + bulk;
             inner.bulk = inner.bulk - bulk;
         }
-        Ok(HiSimHvOverlapPoint {
+        Ok(HiSimHvChargeNetwork {
             intrinsic: inner.finish()?,
             external: outer.finish()?,
             gate_source_prime: primes[0].checked("HiSIM-HV constant source overlap")?,

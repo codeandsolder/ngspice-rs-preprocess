@@ -107,7 +107,7 @@ pub use lateral_field::{
 };
 pub use leakage::HiSimHvLeakagePoint;
 pub use overlap::{
-    HiSimHvOverlapBias, HiSimHvOverlapPoint, PreparedHiSimHvOverlap, prepare_hisim_hv_overlap,
+    HiSimHvChargeNetwork, HiSimHvOverlapBias, PreparedHiSimHvOverlap, prepare_hisim_hv_overlap,
 };
 pub use poly_depletion::{
     HiSimHvPolyDepletionPoint, PreparedHiSimHvPolyDepletion, prepare_hisim_hv_poly_depletion,
