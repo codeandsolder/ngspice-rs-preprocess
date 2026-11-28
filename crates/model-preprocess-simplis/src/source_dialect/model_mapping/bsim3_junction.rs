@@ -330,21 +330,18 @@ impl HspiceMosJunctionMode {
         ldif: f64,
     ) -> MosSeriesResistanceRule {
         match self {
-            HspiceMosJunctionMode::HspiceExplicit | HspiceMosJunctionMode::BerkeleyExplicit => {
-                MosSeriesResistanceRule::Explicit
-            }
-            HspiceMosJunctionMode::HspiceWidthNormalized
-            | HspiceMosJunctionMode::BerkeleyWidthNormalized => {
+            Self::HspiceExplicit | Self::BerkeleyExplicit => MosSeriesResistanceRule::Explicit,
+            Self::HspiceWidthNormalized | Self::BerkeleyWidthNormalized => {
                 if options.aspec && options.update >= 1 && ldif == 0. {
                     MosSeriesResistanceRule::DirectContact
                 } else {
                     MosSeriesResistanceRule::WidthDependent
                 }
             }
-            HspiceMosJunctionMode::HspiceIsolated
-            | HspiceMosJunctionMode::HspiceStacked
-            | HspiceMosJunctionMode::BerkeleyIsolated
-            | HspiceMosJunctionMode::BerkeleyStacked => MosSeriesResistanceRule::AutomaticSquares,
+            Self::HspiceIsolated
+            | Self::HspiceStacked
+            | Self::BerkeleyIsolated
+            | Self::BerkeleyStacked => MosSeriesResistanceRule::AutomaticSquares,
         }
     }
 }

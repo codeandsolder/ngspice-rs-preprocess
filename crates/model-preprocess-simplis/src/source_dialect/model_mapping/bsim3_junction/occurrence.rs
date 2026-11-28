@@ -6,8 +6,9 @@ use anyhow::{Result, bail, ensure};
 use model_compact_intrinsic::{MosDiffusionRule, MosDiffusionTerminal, MosLinearReverseGeometry};
 use model_normalize_ngspice::model_card::ModelParameter;
 
-/// Global element options resolved in their own lexical scope. Explicit
-/// option dimensions are already SI; SCALE applies to raw instance fields.
+/// Global element options resolved in their own lexical scope.
+///
+/// Explicit option dimensions are already SI; SCALE applies to raw instance fields.
 /// The absent area/perimeter defaults are distinct from explicit zeroes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HspiceBsim3OccurrenceOptions {
