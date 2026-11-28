@@ -8,6 +8,7 @@ use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::ops::Range;
 
+mod references;
 mod thermal;
 
 struct Card<'a> {
@@ -367,7 +368,9 @@ pub(super) fn rewrite(input: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8
         }
         card.apply(input, &mut edits, budget)?;
     }
-    lexical::apply_budgeted_edits(input, edits, budget)
+    let networks = lexical::apply_budgeted_edits(input, edits, budget)?;
+    let references = references::rewrite(networks.as_deref().unwrap_or(input), budget)?;
+    Ok(references.or(networks))
 }
 
 #[cfg(test)]
@@ -652,9 +655,27 @@ mod tests {
         ensure!(winding.contains("pn_rseries_uncoupled=1m"));
         ensure!(winding.contains("pn_terminal_bias_zero_series=1e-5"));
         ensure!(!winding.contains("pn_rseries="));
-        ensure!(text.contains("K1 L:1:1 L:2:1 0"));
+        ensure!(text.contains("K1 x1::L1 x2::L1 0"));
         ensure!(text.contains(".func sense() {I(V1)}"));
         ensure!(text.contains(".save i(V1)"));
+        Ok(())
+    }
+
+    #[test]
+    fn qualified_current_and_coupling_paths_keep_full_instance_names() -> Result<()> {
+        let source = b".subckt outer a b\n.func sense() {I(V:inner:drive)}\nB1 q b V=sense()\nF1 q b V:inner:drive 1\n.ends\nB2 q 0 V=I( V:outer:inner:drive )\n.save I(V:outer:inner:drive)\nK1 L:1:1 L:2:1 0\n";
+        let result =
+            super::rewrite(source, &WorkBudget::default())?.context("missing path projection")?;
+        let text = std::str::from_utf8(&result)?;
+        for expected in [
+            ".func sense() {I(xinner::Vdrive)}",
+            "F1 q b xinner::Vdrive 1",
+            "I( xouter::xinner::Vdrive )",
+            ".save I(xouter::xinner::Vdrive)",
+            "K1 x1::L1 x2::L1 0",
+        ] {
+            ensure!(text.contains(expected), "{text}: missing {expected}");
+        }
         Ok(())
     }
 }
