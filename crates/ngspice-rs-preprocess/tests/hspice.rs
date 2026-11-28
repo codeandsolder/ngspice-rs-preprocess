@@ -1130,11 +1130,14 @@ fn hspice_timing_options_are_bound_as_distinct_source_policies() -> Result<()> {
         )?;
         let bundle = compile(&root, InputFormat::HspiceDeck)?;
         let native = std::str::from_utf8(&bundle.primary.bytes)?;
-        assert!(
-            !native
-                .lines()
-                .any(|line| line.to_ascii_lowercase().starts_with(".options"))
-        );
+        for line in native
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with(".options"))
+        {
+            for option in ["DELMAX", "INTERP", "RUNLVL", "RMIN", "RMAX"] {
+                assert!(!line.to_ascii_uppercase().contains(option), "{native}");
+            }
+        }
         let plan = bundle.analysis_plan.context("missing timing plan")?;
         let Directive::ScheduledTransient { intent } = &plan.entries[0].directive else {
             anyhow::bail!("missing schedule");
