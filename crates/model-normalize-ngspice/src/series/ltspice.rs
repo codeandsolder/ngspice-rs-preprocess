@@ -283,6 +283,22 @@ fn voltage(card: &mut Card<'_>, controlled: bool, budget: &WorkBudget) -> Result
     Ok(())
 }
 
+/// Default leakage follows the sign of the effective storage, not the
+/// unscaled value. The coefficient is still per copy. Compare signs rather
+/// than multiplying or dividing the storage and multiplicity to avoid an
+/// intermediate overflow. A zero-copy network has no leakage; a zero
+/// inductance with nonzero copies has undefined omitted-Rpar leakage.
+fn default_leakage(main: &str, multiplicity: &str, inductor: bool) -> String {
+    let v = expression(main);
+    let m = expression(multiplicity);
+    let enabled = format!("ternary_fcn(({m})>0,({v})>=0,ternary_fcn(({m})<0,({v})<=0,0))");
+    if inductor {
+        format!("({enabled})*1e-12/ternary_fcn({enabled},({v}),1)")
+    } else {
+        format!("({enabled})*({v})*1e-12")
+    }
+}
+
 /// Startup bias and storage history are separate physical laws. Only the
 /// terminal bias phase replaces the physical parasitic network.
 fn storage_initialization(
@@ -303,16 +319,14 @@ fn storage_initialization(
             let r = expression(rpar);
             format!("ternary_fcn(({r})==0,0,({m})/ternary_fcn(({r})==0,1,({r})))")
         } else {
-            let l = expression(std::str::from_utf8(
-                &card.statement.text[card.fields[3].clone()],
-            )?);
-            format!("1e-12*({m})/({l})")
+            let l = std::str::from_utf8(&card.statement.text[card.fields[3].clone()])?;
+            format!("({m})*({})", default_leakage(l, multiplicity, true))
         };
         format!("({parallel})+ternary_fcn(({rser})==0,1e-5,0)")
     } else {
-        // With no series loss the finite startup conductance is 1000 S.
-        // Otherwise use the reciprocal of the specified (unscaled) Rser.
-        format!("1/ternary_fcn(({rser})==0,1m,({rser}))")
+        // Nonpositive series loss uses the finite 1000 S startup law.
+        // Positive loss uses the reciprocal of the specified (unscaled) Rser.
+        format!("1/ternary_fcn(({rser})>0,({rser}),1m)")
     };
     let conductance = format!("{{{g}}}");
     card.derived("pn_terminal_bias_op", &conductance, budget)?;
@@ -369,12 +383,8 @@ fn storage(
     if card.scalar(b"rpar")?.is_none() {
         // Only omitted Rpar enables terminal leakage. Explicit zero disables
         // it. The default is active in DC and transient, not AC.
-        let main = expression(std::str::from_utf8(&text[card.fields[3].clone()])?);
-        let leakage = if inductor {
-            format!("{{1e-12/({main})}}")
-        } else {
-            format!("{{({main})*1e-12}}")
-        };
+        let main = std::str::from_utf8(&text[card.fields[3].clone()])?;
+        let leakage = format!("{{{}}}", default_leakage(main, multiplicity, inductor));
         card.derived("pn_gterminal_dc", &leakage, budget)?;
         card.derived("pn_gterminal_tran", &leakage, budget)?;
         physical = true;
@@ -390,7 +400,7 @@ fn storage(
         card.derived(
             "pn_cparallel",
             &format!(
-                "{{ternary_fcn(({})==0,0,({})*1e-6)}}",
+                "{{ternary_fcn(({})==0,0,max(({}),0)*1e-6)}}",
                 expression(lser),
                 expression(main)
             ),
@@ -480,6 +490,7 @@ mod tests {
             (3., 5., 3e-3, 20.),
             (0., 0., 0., 0.),
             (2., 0., 3e-3, 0.),
+            (-2., -2., -3e-3, -20.),
         ] {
             let overrides = [
                 (1, "copies", copies),
@@ -494,8 +505,8 @@ mod tests {
                     vec![
                         ("pn_rseries", loss),
                         ("pn_lseries", inductance),
-                        ("pn_gterminal_dc", 2e-18),
-                        ("pn_gterminal_tran", 2e-18),
+                        ("pn_gterminal_dc", if copies > 0. { 2e-18 } else { 0. }),
+                        ("pn_gterminal_tran", if copies > 0. { 2e-18 } else { 0. }),
                         ("pn_cparallel", if inductance == 0. { 0. } else { 2e-12 }),
                         ("pn_gseries_ac", if enabled { 1. / shunt } else { 0. }),
                         (
@@ -564,6 +575,8 @@ mod tests {
             (3., 5., 20., 0.),
             (0., 0., 0., 1.),
             (2., 0., 0., 0.5),
+            (-2., -2., -20., 0.5),
+            (1., 1e-4, 20., 0.5),
         ] {
             let overrides = [
                 (1, "copies", copies),
@@ -571,7 +584,7 @@ mod tests {
                 (1, "shunt", shunt),
                 (1, "init", init),
             ];
-            let c_bias = if loss == 0. { 1000. } else { 1. / loss };
+            let c_bias = if loss <= 0. { 1000. } else { 1. / loss };
             let l_bias =
                 if shunt == 0. { 0. } else { copies / shunt } + if loss == 0. { 1e-5 } else { 0. };
             for (name, want, parallel) in [
@@ -621,6 +634,79 @@ mod tests {
                     "{name}: incorrect auxiliary storage IC"
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn default_leakage_and_auxiliary_capacitance_use_distinct_signed_laws() -> Result<()> {
+        let source = b"title\n.subckt cell p n params: c=2u l=3m copies=1\nC1 p n {c} m={copies} Lser=3m IC=.5\nL1 p n {l} m={copies} Rser=5 IC=.1\n.ends\n.end\n";
+        let normalized = normalize_mapped(
+            source,
+            RootKind::Deck,
+            NormalizationDialect::Ltspice,
+            &WorkBudget::default(),
+        )?;
+        let bytes = &normalized.model.bytes;
+        let library = ModelLibrary::parse_source(bytes, RootKind::Deck)?;
+        let statements = crate::lexical::statements(bytes)?;
+        for (c, l, m, c_leak, l_leak, cpar) in [
+            (2e-6, 3e-3, 1., 2e-18, 1e-12 / 3e-3, 2e-12),
+            (-2e-6, -3e-3, 1., 0., 0., 0.),
+            (2e-6, 3e-3, -2., 0., 0., 2e-12),
+            (-2e-6, -3e-3, -2., -2e-18, -1e-12 / 3e-3, 0.),
+            (0., 0., 0., 0., 0., 0.),
+        ] {
+            let overrides = [(1, "c", c), (1, "l", l), (1, "copies", m)];
+            for (name, expected) in [
+                (
+                    "C1",
+                    vec![
+                        ("pn_gterminal_dc", c_leak),
+                        ("pn_gterminal_tran", c_leak),
+                        ("pn_cparallel", cpar),
+                    ],
+                ),
+                (
+                    "L1",
+                    vec![
+                        ("pn_gterminal_dc", l_leak),
+                        ("pn_gterminal_tran", l_leak),
+                        ("pn_terminal_bias_op", m * l_leak),
+                        ("pn_terminal_bias_tran", m * l_leak),
+                    ],
+                ),
+            ] {
+                let card = statements
+                    .iter()
+                    .find(|card| card.text.starts_with(format!("{name} ").as_bytes()))
+                    .context("missing device")?;
+                let text = std::str::from_utf8(&card.text)?;
+                let fields =
+                    parse_assignments(&text[text.find("pn_").context("missing coefficients")?..])?;
+                for (key, want) in expected {
+                    let expression = fields
+                        .iter()
+                        .find(|field| field.name == key)
+                        .and_then(|field| field.expression.as_deref())
+                        .context("missing expression")?;
+                    let got = library.evaluate_scalar(1, expression, &overrides)?;
+                    ensure!(
+                        (got - want).abs() <= 1e-13 * want.abs().max(1e-22),
+                        "{name} {key}: {got} != {want}"
+                    );
+                }
+            }
+        }
+        for copies in [1., -1.] {
+            let value = format!(
+                "{{{}}}",
+                super::default_leakage("0", &copies.to_string(), true)
+            );
+            ensure!(
+                library.evaluate_scalar(1, &value, &[]).is_err(),
+                "nonzero-copy zero-L omitted Rpar must be diagnosed"
+            );
         }
         Ok(())
     }
