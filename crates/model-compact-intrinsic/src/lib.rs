@@ -4,6 +4,7 @@
 //! constitutive routines. Binding alone is not proof of complete device support.
 //! Solver-ready residual/charge artifacts are provided by separate kernel crates.
 
+pub mod bsim3v33;
 mod catalog;
 mod defaults;
 mod hv;

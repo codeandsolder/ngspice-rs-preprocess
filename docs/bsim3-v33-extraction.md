@@ -1,0 +1,7 @@
+# BSIM3 v3.3 physical extraction
+
+The native Berkeley v3.3 constitutive equations and setup stages are being moved from the qualified solver implementation at revision `439ea0903380e7f5e2a651653f595150bad61e9e` to `model-compact-intrinsic::bsim3v33`. The port uses the existing generated model parameter catalog, native typed given bits, and absolute Kelvin operating temperature. Raw native TNOM retains its Celsius input convention. The caller supplies resolved ordered model polarity and SI instance geometry. Ordered IC vectors are expanded before instance preparation.
+
+`ModelSetup` owns the model check state and prepares immutable occurrences that share the defaulted model and temperature tables. The combined physical point evaluates DC and charge at the same normalized intrinsic bias. No numerical history, node numbering, limiting or load matrix is part of this producer module. Native capMod 3 / quasi-static / ACM 0 is the initial extraction boundary, not a substitute for other source families or versions. The existing in-tree solver remains authoritative until the new producer is independently verified and consumed; do not run both implementations in production.
+
+The next stage must assemble the physical residual and charge through the common model-kernel ABI, including source/drain exchange and explicit series branches, then migrate native consumers and reconcile the separately qualified extrinsic junction laws. Other capMod, NQS, and revision implementations must retain independent identities.
