@@ -103,7 +103,7 @@ impl HspiceBsim3Junctions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct JunctionGeometry {
+pub(super) struct JunctionGeometry {
     width_multiplier: f64,
     width_offset_m: f64,
     heavy_diffusion_m: f64,
@@ -112,31 +112,65 @@ struct JunctionGeometry {
 }
 
 impl JunctionGeometry {
-    fn occurrences(self, input: HspiceBsim3JunctionInput) -> [MosJunctionOccurrence; 2] {
-        let dimensions = MosDiffusionDimensions {
-            width_m: input.drawn_width_m,
+    const fn dimensions(self, width_m: f64) -> MosDiffusionDimensions {
+        MosDiffusionDimensions {
+            width_m,
             width_multiplier: self.width_multiplier,
             width_offset_m: self.width_offset_m,
             heavy_diffusion_m: self.heavy_diffusion_m,
+        }
+    }
+
+    pub(super) const fn reset_nonpositive_width_multiplier(&mut self) {
+        if self.width_multiplier <= 0. {
+            self.width_multiplier = 1.;
+        }
+    }
+
+    const fn series_for(
+        self,
+        index: usize,
+        squares: Option<f64>,
+        default_squares: f64,
+    ) -> MosSeriesResistance {
+        MosSeriesResistance {
+            squares,
+            default_squares,
+            ..self.series[index]
+        }
+    }
+
+    pub(super) fn nominal_resistances(
+        self,
+        rule: MosSeriesResistanceRule,
+        width_m: f64,
+        squares: [Option<f64>; 2],
+        defaults: [f64; 2],
+    ) -> Result<[f64; 2]> {
+        let dimensions = self.dimensions(width_m);
+        let prepare = |index: usize| {
+            self.series_for(index, squares[index], defaults[index])
+                .prepare(rule, dimensions)
         };
+        Ok([prepare(0)?, prepare(1)?])
+    }
+
+    fn occurrences(self, input: HspiceBsim3JunctionInput) -> [MosJunctionOccurrence; 2] {
+        let dimensions = self.dimensions(input.drawn_width_m);
         std::array::from_fn(|index| MosJunctionOccurrence {
             dimensions,
             terminal: input.diffusion[index],
             gate_width_m: input.gate_width_m,
-            series: MosSeriesResistance {
-                squares: input.squares[index],
-                default_squares: input.default_squares[index],
-                ..self.series[index]
-            },
+            series: self.series_for(index, input.squares[index], input.default_squares[index]),
             resistance_temperature_per_k: self.resistance_temperature_per_k[index],
             operating_temperature_k: input.operating_temperature_k,
         })
     }
 }
 
-struct Coefficients<'a, F> {
-    selection: &'a ModelSelection,
-    evaluate: F,
+pub(super) struct Coefficients<'a, F> {
+    pub(super) selection: &'a ModelSelection,
+    pub(super) evaluate: F,
 }
 
 impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
@@ -144,7 +178,7 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
         finite_coefficient(&self.selection.card.parameters, names, &mut self.evaluate)
     }
 
-    fn real(&mut self, names: &[&str], default: f64) -> Result<f64> {
+    pub(super) fn real(&mut self, names: &[&str], default: f64) -> Result<f64> {
         Ok(self.optional(names)?.unwrap_or(default))
     }
 
@@ -159,7 +193,7 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
         Ok(density)
     }
 
-    fn model_scale(&mut self, default: f64) -> Result<f64> {
+    pub(super) fn model_scale(&mut self, default: f64) -> Result<f64> {
         let scale = self.real(&["SCALM"], default)?;
         ensure!(
             scale.is_finite() && scale > 0.,
@@ -168,20 +202,23 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
         Ok(scale)
     }
 
-    fn geometry(&mut self, model_scale: f64, ldif: f64) -> Result<JunctionGeometry> {
+    pub(super) fn diffusion_geometry(
+        &mut self,
+        model_scale: f64,
+        ldif: f64,
+    ) -> Result<JunctionGeometry> {
         let light_path_m = (self.real(&["LD", "DLAT", "LATD"], 0.)? + ldif) * model_scale;
         let sheet = self.real(&["RSH", "RL"], 0.)?;
         let drain = MosSeriesResistance {
             terminal_resistance: self.real(&["RD"], 0.)?,
             sheet_resistance_ohm_per_square: sheet,
-            contact_resistance_ohm: self.real(&["RDC"], 0.)?,
+            contact_resistance_ohm: 0.,
             squares: None,
             default_squares: 0.,
             light_path_m,
         };
         let source = MosSeriesResistance {
             terminal_resistance: self.real(&["RS"], 0.)?,
-            contact_resistance_ohm: self.real(&["RSC"], 0.)?,
             ..drain
         };
         Ok(JunctionGeometry {
@@ -189,11 +226,20 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
             width_offset_m: self.real(&["XW"], 0.)? * model_scale,
             heavy_diffusion_m: self.real(&["HDIF"], 0.)? * model_scale,
             series: [drain, source],
-            resistance_temperature_per_k: [self.real(&["TRD"], 0.)?, self.real(&["TRS"], 0.)?],
+            resistance_temperature_per_k: [0.; 2],
         })
     }
 
-    fn nominal_temperature(&mut self, default_kelvin: f64) -> Result<f64> {
+    fn geometry(&mut self, model_scale: f64, ldif: f64) -> Result<JunctionGeometry> {
+        let mut geometry = self.diffusion_geometry(model_scale, ldif)?;
+        geometry.series[0].contact_resistance_ohm = self.real(&["RDC"], 0.)?;
+        geometry.series[1].contact_resistance_ohm = self.real(&["RSC"], 0.)?;
+        geometry.resistance_temperature_per_k =
+            [self.real(&["TRD"], 0.)?, self.real(&["TRS"], 0.)?];
+        Ok(geometry)
+    }
+
+    pub(super) fn nominal_temperature(&mut self, default_kelvin: f64) -> Result<f64> {
         Ok(self
             .optional(&["TNOM", "TREF"])?
             .map_or(default_kelvin, |celsius| celsius + 273.15))
@@ -277,6 +323,32 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
     }
 }
 
+impl HspiceMosJunctionMode {
+    pub(super) const fn series_rule(
+        self,
+        options: HspiceJunctionSourceOptions,
+        ldif: f64,
+    ) -> MosSeriesResistanceRule {
+        match self {
+            HspiceMosJunctionMode::HspiceExplicit | HspiceMosJunctionMode::BerkeleyExplicit => {
+                MosSeriesResistanceRule::Explicit
+            }
+            HspiceMosJunctionMode::HspiceWidthNormalized
+            | HspiceMosJunctionMode::BerkeleyWidthNormalized => {
+                if options.aspec && options.update >= 1 && ldif == 0. {
+                    MosSeriesResistanceRule::DirectContact
+                } else {
+                    MosSeriesResistanceRule::WidthDependent
+                }
+            }
+            HspiceMosJunctionMode::HspiceIsolated
+            | HspiceMosJunctionMode::HspiceStacked
+            | HspiceMosJunctionMode::BerkeleyIsolated
+            | HspiceMosJunctionMode::BerkeleyStacked => MosSeriesResistanceRule::AutomaticSquares,
+        }
+    }
+}
+
 impl ModelSelection {
     /// Bind the selected source junction law with an occurrence-aware scalar
     /// evaluator. ACM selects the constitutive law and resistance policy;
@@ -307,23 +379,7 @@ impl ModelSelection {
         };
         let scale = c.model_scale(options.model_scale)?;
         let ldif = c.real(&["LDIF"], 0.)?;
-        let resistance = match selected.mode {
-            HspiceMosJunctionMode::HspiceExplicit | HspiceMosJunctionMode::BerkeleyExplicit => {
-                MosSeriesResistanceRule::Explicit
-            }
-            HspiceMosJunctionMode::HspiceWidthNormalized
-            | HspiceMosJunctionMode::BerkeleyWidthNormalized => {
-                if options.aspec && options.update >= 1 && ldif == 0. {
-                    MosSeriesResistanceRule::DirectContact
-                } else {
-                    MosSeriesResistanceRule::WidthDependent
-                }
-            }
-            HspiceMosJunctionMode::HspiceIsolated
-            | HspiceMosJunctionMode::HspiceStacked
-            | HspiceMosJunctionMode::BerkeleyIsolated
-            | HspiceMosJunctionMode::BerkeleyStacked => MosSeriesResistanceRule::AutomaticSquares,
-        };
+        let resistance = selected.mode.series_rule(options, ldif);
         let mode = match selected.mode {
             HspiceMosJunctionMode::HspiceExplicit => Some(MosLinearReverseGeometry::Explicit),
             HspiceMosJunctionMode::HspiceWidthNormalized => {

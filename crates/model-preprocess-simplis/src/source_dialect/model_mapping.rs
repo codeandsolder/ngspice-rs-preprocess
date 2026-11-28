@@ -22,6 +22,7 @@ pub use bsim3_junction::{
     HspiceBsim3JunctionInput, HspiceBsim3Junctions, HspiceBsim3OccurrenceOptions,
     HspiceJunctionSourceOptions,
 };
+pub use bsim4_occurrence::{Bsim4SeriesInput, HspiceBsim4Occurrence};
 
 /// Simulator implementation identity. Different charge, temperature and
 /// geometry laws must not share an identity solely because a native

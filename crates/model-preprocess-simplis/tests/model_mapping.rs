@@ -986,3 +986,130 @@ fn hspice_bsim3_occurrence_geometry_preserves_defaults_scaling_and_sharing() -> 
     }
     Ok(())
 }
+
+#[test]
+fn hspice_bsim4_series_selects_diffusion_before_contacts_and_temperature() -> Result<()> {
+    use model_normalize_ngspice::model_card::{instance_fields, parse_spice_constant};
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        Bsim4SeriesInput, HspiceJunctionSourceOptions,
+    };
+
+    let mapping = table(".options HSPICEMODELS=1")?;
+    let instance = instance_fields("RDC=12 RSC=-8 MULU0=1.5", 3)?;
+    let options = HspiceJunctionSourceOptions {
+        nominal_temperature_k: 300.15,
+        model_scale: 1.,
+        aspec: false,
+        update: 1,
+    };
+    let input = Bsim4SeriesInput {
+        drawn_width_m: 4e-6,
+        finger_count: 4.,
+        squares: [None, Some(0.)],
+        default_squares: [2., 3.],
+        operating_temperature_k: 350.15,
+    };
+    // Width=4*2+2=10 um, heavy diffusion=1*2=2 um.
+    // Light path=1+1=2 um; RSH=10, RD=100, RS=200.
+    for version in ["4.5", "4.6.4", "4.70"] {
+        for (acm, nominal) in [
+            (0, [20., 200.]),
+            (1, [40., 40.]),
+            (2, [22., 40.]),
+            (3, [22., 40.]),
+            (10, [20., 200.]),
+            (11, [40., 40.]),
+            (12, [7., 8.]),
+            (13, [22., 40.]),
+        ] {
+            for calcacm in [0, 1] {
+                let model = statements(&format!(
+                    ".model m NMOS LEVEL=54 VERSION={version} ACM={acm} CALCACM={calcacm} \
+                     SCALM=1u WMLT=2 XW=2 HDIF=1 LD=1 LDIF=1 RD=100 RS=200 RSH=10 \
+                     TRD=0.002 TRS=-0.001 TNOM=27"
+                ));
+                let selected = mapping
+                    .select_card(&model[0], &[], &WorkBudget::default())?
+                    .context("selection")?;
+                let bound = selected.bind_hspice_bsim4_occurrence(
+                    &instance,
+                    options,
+                    |raw| Ok(parse_spice_constant(raw)?),
+                    |raw| Ok(parse_spice_constant(raw)?),
+                )?;
+                assert_eq!(bound.uses_native_diffusion(), acm == 12);
+                assert_eq!(bound.channel_modifiers().mobility_multiplier, 1.5);
+                let mut called = false;
+                let series = bound.prepare_series(input, || {
+                    called = true;
+                    Ok([7., 8.])
+                })?;
+                assert_eq!(called, acm == 12);
+                assert_eq!(series.reset_contact, [false, true]);
+                let expected = [(nominal[0] + 3.) * 1.1, nominal[1] * 0.95];
+                for (actual, expected) in series.resistance_ohm.into_iter().zip(expected) {
+                    assert!(
+                        (actual - expected).abs() < 1e-11,
+                        "ACM={acm}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_bsim4_series_preserves_native_ownership_and_aspec_width_reset() -> Result<()> {
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        Bsim4SeriesInput, HspiceJunctionSourceOptions,
+    };
+
+    let mapping = table(".options HSPICEMODELS=1")?;
+    let options = HspiceJunctionSourceOptions {
+        nominal_temperature_k: 300.,
+        model_scale: 1.,
+        aspec: true,
+        update: 1,
+    };
+    let input = Bsim4SeriesInput {
+        drawn_width_m: 4e-6,
+        finger_count: 2.,
+        squares: [Some(0.), None],
+        default_squares: [2., 3.],
+        operating_temperature_k: 300.,
+    };
+    let bind = |suffix: &str| {
+        let model = statements(&format!(".model m NMOS LEVEL=54 VERSION=4.70 {suffix}"));
+        mapping
+            .select_card(&model[0], &[], &WorkBudget::default())?
+            .context("selection")?
+            .bind_hspice_bsim4_occurrence(
+                &[],
+                options,
+                |raw| Ok(parse_spice_constant(raw)?),
+                |raw| Ok(parse_spice_constant(raw)?),
+            )
+    };
+    for acm in [1, 11] {
+        let series = bind(&format!("ACM={acm} LDIF=0 RD=100 RS=200 RSH=10"))?
+            .prepare_series(input, || anyhow::bail!("unexpected native geometry"))?;
+        assert_eq!(series.resistance_ohm, [100., 230.]);
+    }
+    let series = bind("ACM=3 WMLT=-1 HDIF=1u LDIF=1u RD=100 RS=200 RSH=10")?
+        .prepare_series(input, || anyhow::bail!("unexpected native geometry"))?;
+    assert_eq!(series.resistance_ohm, [25., 52.5]);
+    // Missing ACM defaults to native. Unused chapter-2 geometry must not
+    // be evaluated, including in an occurrence with CALCACM=0.
+    let native = bind("CALCACM=0 HDIF=unresolved RD=unresolved")?;
+    assert!(native.uses_native_diffusion());
+    assert_eq!(
+        native
+            .prepare_series(input, || Ok([5., 6.]))?
+            .resistance_ohm,
+        [5., 6.]
+    );
+    assert!(native.prepare_series(input, || Ok([-1., 6.])).is_err());
+    Ok(())
+}
