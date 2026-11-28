@@ -46,7 +46,7 @@ fn polynomial4(x: Jet) -> (Jet, Jet) {
         (reciprocal, slope)
     }
 }
-fn confined_body(body: Jet, maximum: Jet) -> (Jet, Jet) {
+pub(super) fn confined_body(body: Jet, maximum: Jet) -> (Jet, Jet) {
     let boundary = if maximum.value < 0.8 {
         maximum * 0.5
     } else {
