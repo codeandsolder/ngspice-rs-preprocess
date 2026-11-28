@@ -1,11 +1,11 @@
-//! Independently measured LTspice LEVEL=2 Fowler–Nordheim tunnelling law.
+//! Independently measured `LTspice` `LEVEL=2` Fowler–Nordheim tunnelling law.
 //!
 //! The kernel operates on terminal voltage, not per-junction voltage.
 //! It owns no Newton history, integration, or circuit stamping.
 
 use crate::{ModelError, finite};
 
-/// Historical coefficient measured in the LTspice oxide capacitance law.
+/// Historical coefficient measured in the `LTspice` oxide capacitance law.
 pub const OXIDE_CAPACITANCE_COEFFICIENT: f64 = 0.345_313_3;
 /// Historical electron charge used by this model, coulombs.
 pub const SHOT_ELEMENTARY_CHARGE: f64 = 1.602_176_462e-19;
@@ -14,7 +14,7 @@ const CURRENT_COEFFICIENT: f64 = 1e10;
 /// Resolved source model. Geometry is in the source model's own units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Model {
-    /// Oxide thickness Tox; negative nonzero values are signed vendor inputs.
+    /// Oxide thickness `Tox`; negative nonzero values are signed vendor inputs.
     pub oxide_thickness: f64,
     /// Default length L.
     pub length: f64,
@@ -79,6 +79,17 @@ pub struct PreparedInstance {
 }
 
 impl Model {
+    pub(super) fn validate(self) -> Result<(), ModelError> {
+        finite(
+            "F-N diode model",
+            &[self.oxide_thickness, self.length, self.width],
+        )?;
+        if self.oxide_thickness == 0. {
+            return Err(ModelError::Invalid("F-N diode zero Tox"));
+        }
+        Ok(())
+    }
+
     /// Resolve model and instance geometry before physical evaluation.
     ///
     /// Both resolved dimensions must be nonzero to specify an area; otherwise
@@ -88,18 +99,15 @@ impl Model {
     /// Nonfinite inputs, zero thickness/series count or nonfinite terminal
     /// capacitance are invalid.
     pub fn bind(self, instance: Instance) -> Result<PreparedInstance, ModelError> {
-        finite(
-            "F-N diode model",
-            &[self.oxide_thickness, self.length, self.width],
-        )?;
+        self.validate()?;
         let length = instance.length.unwrap_or(self.length);
         let width = instance.width.unwrap_or(self.width);
         finite(
             "F-N diode instance",
             &[length, width, instance.multiplier, instance.series],
         )?;
-        if self.oxide_thickness == 0. || instance.series == 0. {
-            return Err(ModelError::Invalid("F-N diode zero Tox or series count"));
+        if instance.series == 0. {
+            return Err(ModelError::Invalid("F-N diode zero series count"));
         }
         let dimensions = if length == 0. || width == 0. {
             [1., 1.]
@@ -162,7 +170,7 @@ fn signed_exp(log: f64, negative: bool) -> f64 {
 
 impl PreparedInstance {
     /// Terminal capacitance, constant with voltage.
-    #[must_use]
+    #[must_use = "the returned capacitance is needed for charge integration"]
     pub const fn capacitance(self) -> f64 {
         self.capacitance
     }
@@ -170,7 +178,7 @@ impl PreparedInstance {
     /// Evaluate the memoryless conduction and linear oxide storage laws.
     ///
     /// At exactly zero voltage, conduction and its derivative are zero even
-    /// for negative oxide thickness. Away from zero, signed negative Tox is
+    /// for negative oxide thickness. Away from zero, signed negative `Tox` is
     /// evaluated without artificial floors or saturation.
     ///
     /// # Errors

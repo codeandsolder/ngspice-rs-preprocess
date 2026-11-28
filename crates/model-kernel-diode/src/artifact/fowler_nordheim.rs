@@ -38,14 +38,7 @@ pub fn artifact(
 ) -> Result<Arc<Artifact<FowlerNordheimKernel>>> {
     // Validate the model itself, not a hypothetical default occurrence.
     // The actual instance may override either dimension or multiplicity.
-    crate::finite(
-        "F-N diode model",
-        &[model.oxide_thickness, model.length, model.width],
-    )
-    .map_err(domain)?;
-    if model.oxide_thickness == 0. {
-        return Err(domain(crate::ModelError::Invalid("F-N diode zero Tox")));
-    }
+    model.validate().map_err(domain)?;
     Artifact::new(
         Descriptor {
             family: FAMILY.into(),
