@@ -342,6 +342,7 @@ struct NativeProjection {
     normalized: MappedNormalization,
     device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
     waveforms: Vec<waveform::PreparedWaveform>,
+    initial_conditions: Option<passive_ic::InitialConditions>,
 }
 
 impl NativeProjection {
@@ -350,6 +351,7 @@ impl NativeProjection {
             normalized: normalize_mapped(bytes, kind, SourceDialect::Native, budget)?,
             device_identities: Vec::new(),
             waveforms: Vec::new(),
+            initial_conditions: None,
         })
     }
 }
@@ -392,10 +394,13 @@ fn project_native(
         .collect::<Result<Vec<_>>>()?;
     let mut mapped = normalized.mapped;
     let waveforms = std::mem::take(&mut mapped.waveforms);
+    let initial_conditions =
+        model_normalize_ngspice::pspice::capture_initialization(&mut mapped, linked, kind, budget)?;
     Ok(NativeProjection {
         normalized: mapped,
         device_identities: identities,
         waveforms,
+        initial_conditions,
     })
 }
 
@@ -531,20 +536,11 @@ fn native_bundle(
     budget: &WorkBudget,
 ) -> Result<PreparedBundle> {
     let NativeProjection {
-        mut normalized,
+        normalized,
         device_identities,
         waveforms,
+        initial_conditions,
     } = projection;
-    let initial_conditions =
-        if matches!(format, InputFormat::PspiceDeck | InputFormat::PspiceLibrary) {
-            model_normalize_ngspice::pspice::capture_initialization(
-                &mut normalized.model.bytes,
-                kind,
-                budget,
-            )?
-        } else {
-            None
-        };
     let lines = normalized
         .input_lines
         .into_iter()

@@ -239,3 +239,85 @@ fn device_ic_bias_policy_is_phase_specific_and_preserves_signed_occurrences() ->
     }
     Ok(())
 }
+
+#[test]
+fn mixed_source_initial_conditions_follow_their_own_occurrence_dialect() -> Result<()> {
+    use ngspice_rs_preprocess::{
+        Cancellation, InputFormat, Options, Provenance, Request, SourceInput, prepare,
+    };
+
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let vendor = dir.path().join("vendor.inc");
+    let native = dir.path().join("native.inc");
+    fs::write(&vendor, b"*#PSPICE\n.subckt cell p n\n.model CM CAP(VC1=0.1)\nCvendor p n CM 1n\n+ IC={-2}\n.include native.inc\nLvendor p n 1m IC=0\n.ends\n")?;
+    fs::write(
+        &native,
+        b"*#NATIVE\nCnative p n 1n IC=3\nLnative p n 1m IC=-4\n",
+    )?;
+    for (format, source, expected) in [
+        (
+            InputFormat::NativeDeck,
+            "Mixed native root\nCroot p 0 1n IC=6\n.include vendor.inc\nX1 p 0 cell\n.tran 1u 1m UIC\n.end\n",
+            2,
+        ),
+        (
+            InputFormat::PspiceDeck,
+            "Mixed PSpice root\nCroot p 0 1n IC=6\n.include vendor.inc\nX1 p 0 cell\n.tran 1u 1m SKIPBP\n.options NOICTRANSLATE\n.end\n",
+            3,
+        ),
+    ] {
+        fs::write(&root, source)?;
+        let bundle = prepare(
+            &Request {
+                format,
+                input: SourceInput::File(root.clone()),
+                libraries: Vec::new(),
+                search_paths: Vec::new(),
+            },
+            &Options::default(),
+            &Cancellation::default(),
+        )?;
+        let text = std::str::from_utf8(&bundle.primary.bytes)?;
+        let policy = bundle
+            .initial_conditions
+            .context("missing PSpice sidecar")?;
+        assert_eq!(policy.devices.len(), expected, "{text}");
+        assert!(text.contains("Cnative p n 1n IC=3"), "{text}");
+        assert!(text.contains("Lnative p n 1m IC=-4"), "{text}");
+        assert!(text.contains(".tran 1u 1m UIC"), "{text}");
+        assert!(!text.contains("NOICTRANSLATE"), "{text}");
+        assert_eq!(text.contains("Croot p 0 1n IC=6"), expected == 2, "{text}");
+        for (name, value) in [("Cvendor", "{-2}"), ("Lvendor", "0")] {
+            let device = policy
+                .devices
+                .iter()
+                .find(|d| d.device.eq_ignore_ascii_case(name))
+                .context("missing vendor device IC")?;
+            assert_eq!(device.scope, ["cell"]);
+            assert_eq!(device.target.as_deref(), Some(value));
+            assert_eq!(
+                device.mode.as_deref(),
+                Some(if expected == 2 { "2" } else { "0" })
+            );
+        }
+        let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+            anyhow::bail!("missing native source provenance");
+        };
+        assert_eq!(lines.len(), text.lines().count());
+        for (name, file, line) in [
+            ("Cvendor", &vendor, 4),
+            ("Cnative", &native, 2),
+            ("Lvendor", &vendor, 7),
+        ] {
+            let location = text
+                .lines()
+                .zip(lines)
+                .find_map(|(text, origin)| text.starts_with(name).then_some(origin))
+                .context("missing mapped device")?;
+            assert_eq!(location.source, file.canonicalize()?);
+            assert_eq!(location.line, line);
+        }
+    }
+    Ok(())
+}

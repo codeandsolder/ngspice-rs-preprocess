@@ -3,8 +3,9 @@
 
 use super::scope::Scopes;
 use crate::{
+    MappedNormalization, SourceDialects,
     lexical::{self, Edit, Statement},
-    linked_source::RootKind,
+    linked_source::{LinkedSource, RootKind, SourceDialect},
     passive_ic::{Capture, InitialConditions},
 };
 use anyhow::{Context, Result, ensure};
@@ -86,16 +87,25 @@ impl ContextState {
     }
 }
 
-fn collect_options(
-    statements: &[Statement],
-    scopes: &Scopes,
-    body: &[u8],
-    edits: &mut Vec<Edit>,
-) -> Result<bool> {
+struct Source<'a> {
+    statements: &'a [Statement],
+    scopes: Scopes,
+    body: &'a [u8],
+    origins: &'a [usize],
+    dialects: SourceDialects<'a>,
+}
+
+impl Source<'_> {
+    fn is_pspice(&self, statement: &Statement) -> Result<bool> {
+        Ok(self.dialects.at_mapped(self.origins, statement.line)? == SourceDialect::Pspice)
+    }
+}
+
+fn collect_options(source: &Source<'_>, edits: &mut Vec<Edit>) -> Result<bool> {
     let mut translate = true;
     let mut context = ContextState::default();
-    for statement in statements {
-        scopes.budget().charge(Resource::Statements, 1)?;
+    for statement in source.statements {
+        source.scopes.budget().charge(Resource::Statements, 1)?;
         let text = std::str::from_utf8(&statement.text)?;
         let command = text
             .split_ascii_whitespace()
@@ -103,15 +113,16 @@ fn collect_options(
             .unwrap_or_default()
             .to_ascii_lowercase();
         if context.electrical(&command)?
+            && source.is_pspice(statement)?
             && matches!(command.as_str(), ".opt" | ".option" | ".options")
             && let Some(replacement) = options(text)?
         {
             ensure!(
-                context.conditional_depth == 0 && scopes.scope(statement.line)? == 0,
+                context.conditional_depth == 0 && source.scopes.scope(statement.line)? == 0,
                 "NOICTRANSLATE requires unconditional deck scope"
             );
             translate = false;
-            replace_statement(statement, body, replacement, edits);
+            replace_statement(statement, source.body, replacement, edits);
         }
     }
     Ok(translate)
@@ -135,32 +146,30 @@ fn skip_bias(statement: &Statement, body: &[u8], edits: &mut Vec<Edit>) -> Resul
 }
 
 fn capture_devices(
-    statements: &[Statement],
-    scopes: &Scopes,
-    body: &[u8],
+    source: &Source<'_>,
     translate: bool,
     capture: &mut Capture<'_>,
     edits: &mut Vec<Edit>,
 ) -> Result<()> {
     let mut context = ContextState::default();
-    for statement in statements {
-        scopes.budget().charge(Resource::Statements, 1)?;
+    for statement in source.statements {
+        source.scopes.budget().charge(Resource::Statements, 1)?;
         let text = std::str::from_utf8(&statement.text)?;
         let command = text
             .split_ascii_whitespace()
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !context.electrical(&command)? {
+        if !context.electrical(&command)? || !source.is_pspice(statement)? {
             continue;
         }
         if command == ".tran" {
-            skip_bias(statement, body, edits)?;
+            skip_bias(statement, source.body, edits)?;
         } else if command.starts_with(['c', 'l']) {
-            let scope = scopes.path(scopes.scope(statement.line)?);
+            let scope = source.scopes.path(source.scopes.scope(statement.line)?);
             let rewritten = capture.pspice_device(scope, text, translate)?;
             if rewritten != text {
-                replace_statement(statement, body, rewritten, edits);
+                replace_statement(statement, source.body, rewritten, edits);
             }
         }
     }
@@ -176,10 +185,19 @@ fn capture_devices(
 /// Invalid IC syntax, malformed or ambiguous scopes,
 /// invalid source options or exhausted work budget.
 pub fn capture_initialization(
-    bytes: &mut Vec<u8>,
+    mapped: &mut MappedNormalization,
+    linked: &LinkedSource,
     kind: RootKind,
     budget: &WorkBudget,
 ) -> Result<Option<InitialConditions>> {
+    if !linked
+        .visits
+        .iter()
+        .any(|visit| visit.dialect == SourceDialect::Pspice)
+    {
+        return Ok(None);
+    }
+    let bytes = &mut mapped.model.bytes;
     budget.charge(Resource::ScannedBytes, bytes.len())?;
     let start = if kind == RootKind::Deck {
         bytes
@@ -191,9 +209,17 @@ pub fn capture_initialization(
     };
     let body = &bytes[start..];
     let statements = lexical::statements(body)?;
-    let scopes = Scopes::collect(&statements, budget)?;
+    let origins = &mapped.input_lines[usize::from(kind == RootKind::Deck)..];
+    let dialects = SourceDialects::Linked(linked);
+    let source = Source {
+        statements: &statements,
+        scopes: Scopes::collect(&statements, origins, dialects, budget)?,
+        body,
+        origins,
+        dialects,
+    };
     let mut edits = Vec::new();
-    let translate = collect_options(&statements, &scopes, body, &mut edits)?;
+    let translate = collect_options(&source, &mut edits)?;
     let filename = if kind == RootKind::Deck {
         "deck.cir"
     } else {
@@ -201,14 +227,7 @@ pub fn capture_initialization(
     };
     let mut conditions = InitialConditions::default();
     let mut capture = Capture::new(&mut conditions, filename, budget)?;
-    capture_devices(
-        &statements,
-        &scopes,
-        body,
-        translate,
-        &mut capture,
-        &mut edits,
-    )?;
+    capture_devices(&source, translate, &mut capture, &mut edits)?;
     for (range, _) in &mut edits {
         range.start += start;
         range.end += start;
