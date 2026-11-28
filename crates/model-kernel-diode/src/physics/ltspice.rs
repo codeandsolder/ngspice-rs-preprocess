@@ -154,6 +154,7 @@ fn capacitance_correction(
     nominal: f64,
     temperature: f64,
     potential: f64,
+    thermal_grading: f64,
 ) -> f64 {
     // The historical Berkeley reference bandgap is rounded independently
     // of the temperature-dependent bandgap formula.
@@ -163,15 +164,19 @@ fn capacitance_correction(
         bandgap(nominal) - nominal_ratio * REFERENCE_BANDGAP,
     );
     let pbo = (depletion.potential - offset) / nominal_ratio;
-    let adjustment = |t: f64, v: f64| {
-        depletion
-            .grading
-            .mul_add(4e-4 * (t - REFERENCE_TEMPERATURE) - (v - pbo) / pbo, 1.)
+    let adjustment = |t: f64, v: f64, grading: f64| {
+        grading.mul_add(4e-4 * (t - REFERENCE_TEMPERATURE) - (v - pbo) / pbo, 1.)
     };
-    adjustment(temperature, potential) / adjustment(nominal, depletion.potential)
+    adjustment(temperature, potential, thermal_grading)
+        / adjustment(nominal, depletion.potential, depletion.grading)
 }
 
-fn prepare_law(model: &Model, instance: Instance, factor: f64) -> Result<JunctionLaw, ModelError> {
+fn prepare_law(
+    model: &Model,
+    instance: Instance,
+    factor: f64,
+    thermal_grading: f64,
+) -> Result<JunctionLaw, ModelError> {
     let vt = K_OVER_Q * instance.temperature;
     let nominal = model.temperature.nominal;
     let potential =
@@ -179,7 +184,13 @@ fn prepare_law(model: &Model, instance: Instance, factor: f64) -> Result<Junctio
     let capacitance_factor = if model.depletion.capacitance == 0. {
         1.
     } else {
-        capacitance_correction(model.depletion, nominal, instance.temperature, potential)
+        capacitance_correction(
+            model.depletion,
+            nominal,
+            instance.temperature,
+            potential,
+            thermal_grading,
+        )
     };
     JunctionLaw::new(
         model,
@@ -199,7 +210,7 @@ impl PreparedBranch {
     fn bulk(model: &Model, instance: Instance, factor: f64) -> Result<Self, ModelError> {
         // The vendor caps the unit-area bulk current law before area/M scale.
         positive("LTspice bulk geometry", factor)?;
-        let law = prepare_law(model, instance, 1.)?;
+        let law = prepare_law(model, instance, 1., model.depletion.grading)?;
         let forward_tail = if model.transport.saturation_current > 0.
             || (model.recombination.saturation_current > 0. && model.recombination.emission > 0.)
         {
@@ -259,7 +270,9 @@ impl PreparedBranch {
                 .forward_coefficient
                 .unwrap_or(model.bulk.depletion.forward_coefficient),
         };
-        let law = prepare_law(&side, instance, factor)?;
+        // LTspice uses the sidewall emission coefficient NS in the thermal
+        // capacitance numerator, but MJSW in the nominal normalization.
+        let law = prepare_law(&side, instance, factor, source.transport.emission)?;
         let forward_tail = if source.transport.saturation_current > 0. {
             Some(Tail::sidewall(law.transport)?)
         } else {
@@ -397,6 +410,9 @@ impl SourceModel {
             .unwrap_or(self.sidewall.perimeter);
         finite("LTspice diode perimeter", &[perimeter])?;
         self.normalize()?;
+        if self.recovery > 0. && self.bulk.transit_time > 0. {
+            return Err(ModelError::Unsupported("LTspice dynamic VP recovery"));
+        }
         let disabled = instance.area == 0. || instance.multiplier <= 0.;
         let bulk = if disabled {
             None
@@ -514,9 +530,6 @@ impl SourceModel {
         )?;
         self.sidewall.transport.saturation_current =
             self.sidewall.transport.saturation_current.max(0.);
-        if self.sidewall.transport.saturation_current == 0. {
-            self.sidewall.transport.emission = 1.;
-        }
         if self.sidewall.transport.emission <= 0. {
             self.sidewall.transport.emission = 1.;
         }
@@ -533,27 +546,31 @@ impl SourceModel {
 }
 
 impl PreparedInstance {
-    /// Total intrinsic shot and flicker densities at the evaluated branch
-    /// currents. The floor is independent of geometry, and the historical
-    /// saturation offset belongs only to bulk transport.
+    /// Shot and flicker power densities for an individual junction branch.
+    /// Sidewall shot noise excludes its conductance-floor current; the bulk
+    /// law includes it and the historical saturation offset. Independent
+    /// series paths require distinct local noise injection coordinates.
     ///
     /// # Errors
-    /// Invalid bias/frequency or nonrepresentable/nonpositive noise.
-    pub fn junction_noise(
+    /// Invalid bias/frequency or nonrepresentable/negative noise.
+    pub fn branch_noise(
         self,
-        bulk: f64,
-        sidewall: f64,
+        evaluated: BranchEvaluation,
+        sidewall: bool,
         frequency: f64,
     ) -> Result<[f64; 2], ModelError> {
-        finite("LTspice diode noise current", &[bulk, sidewall])?;
         positive("LTspice diode noise frequency", frequency)?;
-        let Some(main) = self.bulk else {
+        let branch = if sidewall { self.sidewall } else { self.bulk };
+        let Some(branch) = branch else {
             return Ok([0., 0.]);
         };
-        let current = bulk + sidewall;
-        let floor = main.floor + self.sidewall.map_or(0., |side| side.floor);
-        let shot = ((2. * ELEMENTARY_CHARGE) * (current + main.shot_offset).abs()
-            + 4. * BOLTZMANN * main.temperature * floor)
+        let current = if sidewall {
+            evaluated.total.physical_current
+        } else {
+            evaluated.total.current
+        };
+        let shot = ((2. * ELEMENTARY_CHARGE) * (current + branch.shot_offset).abs()
+            + 4. * BOLTZMANN * branch.temperature * branch.floor)
             / self.series;
         let flicker = if self.noise.coefficient == 0. {
             0.
