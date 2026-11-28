@@ -429,7 +429,7 @@ fn vendor_duplicate_table_knots_preserve_both_macro_evaluation_phases() -> Resul
 }
 
 #[test]
-fn series_parasitics_preserve_terminal_admittance_and_coupling_scope() -> Result<()> {
+fn series_parasitics_preserve_coefficients_and_coupling_scope() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("source.cir");
     fs::write(&root, b"title\n.options reltol=1e-10 abstol=1e-14 vntol=1e-12\nV0 s0 0 AC 1\nRsrc0 s0 a0 .1\nC0 a0 0 2u Rser=5\nV1 s1 0 AC 1\nRsrc1 s1 a1 .1\nC1 a1 0 2u Rser=5 m=3\nV2 s2 0 AC 1\nRsrc2 s2 a2 .1\nL2 a2 0 3m\nV3 s3 0 AC 1\nRsrc3 s3 a3 .1\nL3 a3 0 3m Rser=0 Rpar=0\nV4 s4 0 AC 1\nRsrc4 s4 a4 .1\nL4 a4 0 3m Rser=5 m=3\nV5 s5 0 AC 1\nRsrc5 s5 a5 .1\nV6 s6 0 AC 1\nRsrc6 s6 a6 .1\nX1 a5 a6 coupled\n.subckt coupled a b\nL2 a 0 3m\nL3 b 0 3m\nK1 L2 L3 .5\n.ends coupled\n.end\n")?;
@@ -439,7 +439,23 @@ fn series_parasitics_preserve_terminal_admittance_and_coupling_scope() -> Result
     assert!(!text.contains("R__C"));
     assert!(text.contains("L2 a2 0 3m pn_rseries=1m"));
     assert!(text.contains("L3 a3 0 3m pn_rseries=0 pn_rparallel=0"));
-    assert!(text.contains(".subckt coupled a b\nL2 a 0 3m\nL3 b 0 3m\nK1"));
+    let coupled = text
+        .split_once(".subckt coupled a b\n")
+        .context("missing coupled scope")?
+        .1;
+    let coupled = coupled
+        .split_once(".ends coupled")
+        .context("missing scope end")?
+        .0;
+    for name in ["L2 a 0 3m", "L3 b 0 3m"] {
+        let line = coupled
+            .lines()
+            .find(|line| line.starts_with(name))
+            .context("missing coupled inductor")?;
+        assert!(!line.contains("pn_rseries=1m"));
+        assert!(line.contains("pn_gterminal_dc="));
+    }
+    assert!(coupled.contains("K1 L2 L3 .5"));
     let Provenance::Native { lines } = &bundle.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
@@ -896,7 +912,7 @@ fn vendor_sine_phase_and_finite_count_preserve_dc_and_startup() -> Result<()> {
 }
 
 #[test]
-fn voltage_source_series_resistance_preserves_identity_and_noise() -> Result<()> {
+fn voltage_source_series_resistance_preserves_identity_and_coefficients() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("source.cir");
     fs::write(&root, b"title\n.temp 27\nV1 a 0 DC 1 AC 1 Rser=2 Rser={500*2}\nRload a 0 1k noiseless\nV2 b 0 PULSE(0 1 0 1u 1u 2u 5u) Rser=2\nR2 b 0 3\nV3 c 0 1 Rser={2-2} Cpar=0\nR3 c 0 3\n.end\n")?;

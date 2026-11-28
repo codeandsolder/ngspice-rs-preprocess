@@ -314,17 +314,6 @@ fn storage(
     let lser = card.scalar(b"lser")?;
     let cpar = card.scalar(b"cpar")?;
     let mut physical = card.rename(b"rser", "pn_rseries")?;
-    if !inductor && card.scalar(b"rpar")?.is_none() {
-        // Omitted Rpar enables fixed terminal leakage during DC. An
-        // explicitly supplied Rpar, even zero, replaces this default.
-        let main = std::str::from_utf8(&text[card.fields[3].clone()])?;
-        card.derived(
-            "pn_gterminal_dc",
-            &format!("{{({})*1e-12}}", expression(main)),
-            budget,
-        )?;
-        physical = true;
-    }
     if inductor && !physical && !coupled {
         ensure!(
             !include || scope != 0,
@@ -332,6 +321,19 @@ fn storage(
             card.statement.line
         );
         card.push("pn_rseries", "1m");
+        physical = true;
+    }
+    if card.scalar(b"rpar")?.is_none() {
+        // Only omitted Rpar enables terminal leakage. Explicit zero disables
+        // it. The default is active in DC and transient, not AC.
+        let main = expression(std::str::from_utf8(&text[card.fields[3].clone()])?);
+        let leakage = if inductor {
+            format!("{{1e-12/({main})}}")
+        } else {
+            format!("{{({main})*1e-12}}")
+        };
+        card.derived("pn_gterminal_dc", &leakage, budget)?;
+        card.derived("pn_gterminal_tran", &leakage, budget)?;
         physical = true;
     }
     physical |= card.rename(b"rpar", "pn_rparallel")?;
@@ -449,6 +451,8 @@ mod tests {
                     vec![
                         ("pn_rseries", loss),
                         ("pn_lseries", inductance),
+                        ("pn_gterminal_dc", 2e-18),
+                        ("pn_gterminal_tran", 2e-18),
                         ("pn_cparallel", if inductance == 0. { 0. } else { 2e-12 }),
                         ("pn_gseries_ac", if enabled { 1. / shunt } else { 0. }),
                         (
