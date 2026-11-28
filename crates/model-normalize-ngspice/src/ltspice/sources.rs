@@ -44,17 +44,6 @@ fn arguments(text: &[u8], name_end: usize) -> Result<(Vec<Range<usize>>, usize)>
     anyhow::bail!("unterminated waveform arguments")
 }
 
-fn literal(text: &[u8], budget: &WorkBudget) -> Result<f64> {
-    let text = std::str::from_utf8(text)?.trim();
-    let grouped = text
-        .strip_prefix('{')
-        .and_then(|text| text.strip_suffix('}'));
-    let expression = grouped.unwrap_or(text);
-    parse_spice_constant(expression)
-        .or_else(|_| super::constants::evaluate(expression, grouped.is_none(), budget))
-        .context("waveform timing requires occurrence-specific parameter binding")
-}
-
 fn rewrite_tran(
     statement: &lexical::Statement,
     edits: &mut Vec<lexical::Edit>,
@@ -62,49 +51,26 @@ fn rewrite_tran(
 ) -> Result<()> {
     let text = &statement.text;
     let fields = lexical::tokens(text)?;
-    let mut timing = &fields[1..];
-    if timing
-        .last()
-        .is_some_and(|span| text[span.clone()].eq_ignore_ascii_case(b"uic"))
-    {
-        timing = &timing[..timing.len() - 1];
-    }
-    ensure!(
-        (1..=4).contains(&timing.len()),
-        "unsupported LTspice transient analysis options"
-    );
-    let values = timing.iter().map(|span| literal(&text[span.clone()], budget)).collect::<Result<Vec<_>>>()
-        .context("LTspice transient timing requires bound scalar fields; startup/steady modes require typed analysis")?;
-    let (interval, final_time, start, max_step) = if values.len() == 1 {
-        (0., values[0], 0., 0.)
+    let args = fields[1..]
+        .iter()
+        .map(|span| std::str::from_utf8(&text[span.clone()]))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let intent = super::transient::TransientIntent::parse(&args)?;
+    let bound = intent.bind_closed(budget)?;
+    let resolved = bound.native_timing()?;
+    let timing = if intent.modes.uic {
+        &fields[1..fields.len() - 1]
     } else {
-        (
-            values[0],
-            values[1],
-            values.get(2).copied().unwrap_or(0.).max(0.),
-            values.get(3).copied().unwrap_or(0.),
-        )
+        &fields[1..]
     };
-    ensure!(
-        final_time > start && max_step >= 0.,
-        "LTspice transient needs positive duration and nonnegative maximum step"
-    );
-    // Vendor adaptive default: exactly stop/1024, regardless of plotting step.
-    let max_step = if max_step > 0. {
-        max_step
-    } else {
-        final_time / 1024.
-    };
-    let interval = if interval > 0. { interval } else { max_step };
-    ensure!(
-        interval > 0. && max_step > 0.,
-        "unrepresentable LTspice transient timestep"
-    );
     if timing.len() == 1 {
-        let replacement = format!("{interval} {final_time} {start} {max_step}");
+        let replacement = resolved
+            .iter()
+            .map(f64::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
         lexical::replace_span(statement, timing[0].clone(), replacement.as_bytes(), edits);
     } else {
-        let resolved = [interval, final_time, start, max_step];
         for (index, span) in timing.iter().enumerate() {
             if index + 1 == timing.len() && timing.len() < resolved.len() {
                 let replacement = resolved[index..]
@@ -113,8 +79,11 @@ fn rewrite_tran(
                     .collect::<Vec<_>>()
                     .join(" ");
                 lexical::replace_span(statement, span.clone(), replacement.as_bytes(), edits);
-            } else if values[index].to_bits() != resolved[index].to_bits()
-                || !native_literal(&text[span.clone()])
+            } else if std::str::from_utf8(&text[span.clone()])
+                .ok()
+                .and_then(|value| parse_spice_constant(value).ok())
+                .map(f64::to_bits)
+                != Some(resolved[index].to_bits())
             {
                 lexical::replace_span(
                     statement,
@@ -126,13 +95,6 @@ fn rewrite_tran(
         }
     }
     Ok(())
-}
-
-fn native_literal(text: &[u8]) -> bool {
-    std::str::from_utf8(text)
-        .ok()
-        .and_then(|value| parse_spice_constant(value).ok())
-        .is_some()
 }
 
 fn scalar(text: &[u8], field: &Span) -> Result<String> {
