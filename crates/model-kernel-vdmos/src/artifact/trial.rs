@@ -64,7 +64,7 @@ impl VdmosKernel {
         let Some([junction, case]) = self.layout.thermal else {
             return Ok(());
         };
-        let valid_junction = |temperature| {
+        let valid_junction = |temperature: f64| {
             if temperature <= 0. || !temperature.is_finite() {
                 return false;
             }
