@@ -61,6 +61,15 @@ pub enum CoordinateLaw {
         /// Signed increment.
         increment: String,
     },
+    /// Arithmetic range whose positive increment is a magnitude, not a direction.
+    LinearMagnitude {
+        /// First coordinate.
+        start: String,
+        /// Requested final bound.
+        stop: String,
+        /// Positive increment magnitude.
+        increment: String,
+    },
     /// Uniform arithmetic grid including both endpoints, with a total point count.
     LinearCount {
         /// First coordinate.
@@ -80,6 +89,8 @@ pub enum CoordinateLaw {
         points_per_interval: String,
         /// Base of the logarithmic interval.
         interval: LogInterval,
+        /// Permitted direction.
+        direction: LogDirection,
     },
 }
 
@@ -102,6 +113,16 @@ impl LogInterval {
     }
 }
 
+/// Source-specific logarithmic range direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogDirection {
+    /// Either direction is permitted.
+    Either,
+    /// Stop must be greater than start.
+    Increasing,
+}
+
 /// Relationship between successive solves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +142,8 @@ pub enum CoordinateOrder {
     Declared,
     /// Increasing physical coordinate.
     Ascending,
+    /// Require monotonic source order without sorting.
+    Monotonic,
 }
 
 /// Source-specific minimum coordinate policy. A one-coordinate independent
@@ -160,7 +183,10 @@ pub(super) fn name(raw: &str) -> Result<String> {
     Ok(raw.to_owned())
 }
 
-fn target(args: &[String], allow_display_name: bool) -> Result<(SweepTarget, &[String])> {
+pub(super) fn target(
+    args: &[String],
+    allow_display_name: bool,
+) -> Result<(SweepTarget, &[String])> {
     let (first, rest) = args.split_first().context("missing sweep target")?;
     if first.eq_ignore_ascii_case("param") {
         let (parameter, rest) = rest.split_first().context("missing swept parameter name")?;
@@ -174,7 +200,7 @@ fn target(args: &[String], allow_display_name: bool) -> Result<(SweepTarget, &[S
     if first.eq_ignore_ascii_case("temp") {
         return Ok((SweepTarget::Temperature, rest));
     }
-    if rest.len() >= 4
+    if rest.len() >= 3
         && let Some(model) = rest.first()
         && let Some((model_name, parameter)) = model.split_once('(')
         && !model_name.starts_with(['{', '\'', '"'])
@@ -203,9 +229,18 @@ fn target(args: &[String], allow_display_name: bool) -> Result<(SweepTarget, &[S
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum RangeMode {
+pub(super) enum RangeMode {
     Linear,
     Logarithmic(LogInterval),
+}
+
+pub(super) fn range_mode(value: &str) -> Option<RangeMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "lin" => Some(RangeMode::Linear),
+        "oct" => Some(RangeMode::Logarithmic(LogInterval::Octave)),
+        "dec" => Some(RangeMode::Logarithmic(LogInterval::Decade)),
+        _ => None,
+    }
 }
 
 fn list(values: &[String]) -> Result<CoordinateLaw> {
@@ -249,6 +284,7 @@ fn law(args: &[String], mode: Option<RangeMode>) -> Result<CoordinateLaw> {
             stop: stop.clone(),
             points_per_interval: third.clone(),
             interval,
+            direction: LogDirection::Either,
         },
     })
 }
@@ -275,12 +311,7 @@ impl SweepAxis {
 
     fn compatibility_step(args: &[String], simetrix: bool) -> Result<Self> {
         let (first, rest) = args.split_first().context("missing STEP operands")?;
-        let mode = match first.to_ascii_lowercase().as_str() {
-            "lin" => Some(RangeMode::Linear),
-            "oct" => Some(RangeMode::Logarithmic(LogInterval::Octave)),
-            "dec" => Some(RangeMode::Logarithmic(LogInterval::Decade)),
-            _ => None,
-        };
+        let mode = range_mode(first);
         let (target, fields) = target(if mode.is_some() { rest } else { args }, simetrix)?;
         ensure!(
             !simetrix
@@ -372,7 +403,20 @@ impl SweepAxis {
         mut resolve: impl FnMut(&str) -> Result<f64>,
         budget: &WorkBudget,
     ) -> Result<BoundAxis> {
-        let coordinates = match &self.law {
+        let coordinates = self.bind_coordinates(&mut resolve, budget)?;
+        let count = coordinates.len();
+        ensure!(count > 0, "empty sweep axis");
+        budget.charge(Resource::EvaluationSteps, count)?;
+        self.validate_coordinates(&coordinates, count)?;
+        Ok(BoundAxis { coordinates })
+    }
+
+    fn bind_coordinates(
+        &self,
+        mut resolve: impl FnMut(&str) -> Result<f64>,
+        budget: &WorkBudget,
+    ) -> Result<Coordinates> {
+        Ok(match &self.law {
             CoordinateLaw::List { values } => {
                 budget.charge(Resource::GeneratedNodes, values.len())?;
                 let mut values = values
@@ -386,15 +430,33 @@ impl SweepAxis {
                 if self.order == CoordinateOrder::Ascending {
                     values.sort_by(f64::total_cmp);
                 }
+                if self.order == CoordinateOrder::Monotonic {
+                    ensure!(
+                        values.windows(2).all(|pair| pair[0] <= pair[1])
+                            || values.windows(2).all(|pair| pair[0] >= pair[1]),
+                        "sweep list must be monotonic"
+                    );
+                }
                 Coordinates::List(values)
             }
             CoordinateLaw::Linear {
                 start,
                 stop,
                 increment,
+            }
+            | CoordinateLaw::LinearMagnitude {
+                start,
+                stop,
+                increment,
             } => {
-                let (start, stop, increment) =
+                let (start, stop, mut increment) =
                     (resolve(start)?, resolve(stop)?, resolve(increment)?);
+                if matches!(self.law, CoordinateLaw::LinearMagnitude { .. }) {
+                    ensure!(increment > 0., "sweep increment magnitude must be positive");
+                    if stop < start {
+                        increment = -increment;
+                    }
+                }
                 Coordinates::Range(Range::linear(start, stop, increment, self.order)?)
             }
             CoordinateLaw::LinearCount { start, stop, count } => {
@@ -406,20 +468,25 @@ impl SweepAxis {
                 stop,
                 points_per_interval,
                 interval,
+                direction,
             } => {
                 let (start, stop, density) = (
                     resolve(start)?,
                     resolve(stop)?,
                     resolve(points_per_interval)?,
                 );
+                ensure!(
+                    *direction != LogDirection::Increasing || stop > start,
+                    "logarithmic sweep must increase"
+                );
                 Coordinates::Range(Range::logarithmic(
                     start, stop, density, *interval, self.order,
                 )?)
             }
-        };
-        let count = coordinates.len();
-        ensure!(count > 0, "empty sweep axis");
-        budget.charge(Resource::EvaluationSteps, count)?;
+        })
+    }
+
+    fn validate_coordinates(&self, coordinates: &Coordinates, count: usize) -> Result<()> {
         let mut previous = None;
         let mut distinct = false;
         for index in 0..count {
@@ -450,7 +517,7 @@ impl SweepAxis {
             self.cardinality == Cardinality::Nonempty || distinct,
             "source sweep requires at least two distinct coordinates"
         );
-        Ok(BoundAxis { coordinates })
+        Ok(())
     }
 }
 

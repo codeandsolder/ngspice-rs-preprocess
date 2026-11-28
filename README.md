@@ -498,7 +498,7 @@ operations, including periodic SIMPLIS analyses, remain visible in the
 plan. SIMPLIS transient and snapshot/output sampling semantics are
 not substituted with ordinary SPICE transient arguments.
 
-Directly linked LTspice analysis declarations are captured in the typed
+Directly linked LTspice and PSpice analysis declarations are captured in the typed
 analysis plan before electrical normalization. Each declaration retains
 its admitted source occurrence and lexical scope, including schematic
 directive origins. Independent parameter, source, temperature and model
@@ -511,6 +511,16 @@ consumer must bind this analysis plan; an electrical artifact alone is
 not a complete analysis request. Native-only decks retain native analysis
 cards. Unqualified conditional and mixed-dialect analysis is diagnosed
 rather than executed with guessed semantics.
+
+PSpice STEP uses positive linear increment magnitudes even for descending
+endpoints, and explicit sweep lists preserve monotonic source order. A
+nested DC request retains its continuation axes independently of STEP
+and multi-temperature repetition. Conflicting sweep declarations are
+rejected rather than multiplied indiscriminately. PSpice transient
+operands (including SKIPBP and scheduled ceilings) retain their original
+dialect for consumer binding. Statistical Monte Carlo, distribution and
+worst-case directives require a separate realization policy; they are
+not treated as ordinary numerical sweeps.
 
 SIMetrix compatibility STEP is a single independent axis around one
 eligible analysis. Explicit general SWEEP clauses belong to their

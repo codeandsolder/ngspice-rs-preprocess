@@ -111,6 +111,7 @@ fn grid(mode: &str, fields: &mut &[String]) -> Result<CoordinateLaw> {
             stop: third,
         },
         "DEC" | "OCT" => CoordinateLaw::Logarithmic {
+            direction: super::sweep::LogDirection::Either,
             points_per_interval: first,
             start: second,
             stop: third,

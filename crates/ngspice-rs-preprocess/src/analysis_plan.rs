@@ -1,5 +1,6 @@
 //! Source analysis intent, independent of the prepared electrical circuit.
 pub mod measurement;
+mod pspice;
 mod simetrix;
 pub mod source_capture;
 pub mod sweep;
@@ -302,6 +303,7 @@ impl AnalysisPlan {
                 "SIMetrix STEP requires one compatible analysis without inline sweeps"
             );
         }
+        pspice::validate(self)?;
         Ok(())
     }
 
@@ -638,6 +640,7 @@ pub(crate) fn tracked(command: &str) -> bool {
             | ".DC"
             | ".AC"
             | ".TRAN"
+            | ".TRAN/OP"
             | ".POP"
             | ".NOISE"
             | ".TF"
@@ -653,6 +656,8 @@ pub(crate) fn tracked(command: &str) -> bool {
             | ".MONTE"
             | ".MC"
             | ".WCASE"
+            | ".WORSTCASE"
+            | ".DISTRIBUTION"
             | ".SAVEBIAS"
             | ".LOADBIAS"
             | ".OPTIONS"
@@ -666,6 +671,8 @@ pub(crate) fn tracked(command: &str) -> bool {
             | ".KEEP"
             | ".SAVE"
             | ".PROBE"
+            | ".PROBE/CSDF"
+            | ".WATCH"
             | ".MEAS"
             | ".MEASURE"
             | ".FOUR"
@@ -808,7 +815,7 @@ pub(crate) fn analysis_kind(name: &str) -> AnalysisKind {
         ".OP" => AnalysisKind::OperatingPoint,
         ".DC" => AnalysisKind::DcSweep,
         ".AC" => AnalysisKind::Ac,
-        ".TRAN" => AnalysisKind::Transient,
+        ".TRAN" | ".TRAN/OP" => AnalysisKind::Transient,
         ".POP" => AnalysisKind::Pop,
         ".NOISE" => AnalysisKind::Noise,
         ".TF" => AnalysisKind::TransferFunction,
@@ -929,6 +936,45 @@ fn ltspice_directive(
     Ok(Some((directive, disposition)))
 }
 
+fn pspice_directive(
+    name: &str,
+    statement: &str,
+    scoped: bool,
+) -> Result<Option<(Directive, Disposition)>> {
+    let disposition = if scoped {
+        Disposition::Unsupported
+    } else {
+        Disposition::RequiresBinding
+    };
+    let directive = match name {
+        ".STEP" => Directive::Sweep {
+            axis: pspice::step(&pspice::arguments(statement)?)?,
+        },
+        ".DC" => Directive::DcSweep {
+            axes: pspice::dc_axes(&pspice::arguments(statement)?)?,
+        },
+        ".TEMP" => {
+            let args = pspice::arguments(statement)?;
+            let axis = pspice::temperature(&args)?;
+            if args.len() == 1 {
+                return Ok(None);
+            }
+            Directive::Sweep { axis }
+        }
+        ".TRAN" | ".TRAN/OP" => {
+            let args = pspice::arguments(statement)?;
+            pspice::validate_transient(&args)?;
+            Directive::Analysis {
+                analysis: AnalysisKind::Transient,
+                arguments: args,
+                uic: false,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some((directive, disposition)))
+}
+
 fn classify(
     name: &str,
     statement: &str,
@@ -971,6 +1017,11 @@ fn classify(
     {
         return Ok(directive);
     }
+    if dialect == AnalysisDialect::Pspice
+        && let Some(directive) = pspice_directive(name, statement, scoped)?
+    {
+        return Ok(directive);
+    }
     if matches!(
         name,
         ".CONTROL"
@@ -979,6 +1030,8 @@ fn classify(
             | ".MONTE"
             | ".MC"
             | ".WCASE"
+            | ".WORSTCASE"
+            | ".DISTRIBUTION"
             | ".SAVEBIAS"
             | ".LOADBIAS"
     ) {
@@ -987,7 +1040,11 @@ fn classify(
     if matches!(name, ".GRAPH" | ".LICENSE_FEATURE" | ".REQUIRED_VERSION") {
         return Ok((Directive::Metadata, Metadata));
     }
-    let args = arguments(statement)?;
+    let args = if dialect == AnalysisDialect::Pspice {
+        pspice::arguments(statement)?
+    } else {
+        arguments(statement)?
+    };
     if matches!(name, ".OPTIONS" | ".OPTION" | ".OPT") {
         return Ok((
             Directive::Options {
@@ -998,7 +1055,7 @@ fn classify(
     }
     if matches!(name, ".TEMP" | ".NODESET" | ".IC" | ".INIT") {
         let disposition = match (name, dialect) {
-            (".INIT", AnalysisDialect::Ltspice) => Unsupported,
+            (".INIT", AnalysisDialect::Ltspice | AnalysisDialect::Pspice) => Unsupported,
             (".INIT", _) | (".IC", AnalysisDialect::Simetrix) => Initialization,
             _ => Circuit,
         };
@@ -1010,6 +1067,8 @@ fn classify(
             | ".KEEP"
             | ".SAVE"
             | ".PROBE"
+            | ".PROBE/CSDF"
+            | ".WATCH"
             | ".MEAS"
             | ".MEASURE"
             | ".FOUR"

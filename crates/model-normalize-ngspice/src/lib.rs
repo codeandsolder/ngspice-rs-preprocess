@@ -12,6 +12,14 @@ mod series;
 pub fn statement_token_spans(text: &str) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
     lexical::tokens(text.as_bytes())
 }
+/// Token spans for a directive with comma or whitespace field separators.
+/// Nested expressions retain their original spelling.
+/// # Errors
+/// Unbalanced expression groups or quotes.
+pub fn statement_comma_field_spans(text: &str) -> Result<Vec<std::ops::Range<usize>>> {
+    lexical::waveform_tokens(text.as_bytes())
+}
+
 /// A logical source statement and its inclusive original physical line span.
 #[derive(Debug)]
 pub struct SourceStatement {
@@ -86,7 +94,37 @@ pub fn remove_statement_fields(
         "invalid logical field removal spans"
     );
     let mut edits = Vec::new();
-    lexical::remove_spans(&statement, input, fields, &mut edits);
+    let separator = |byte: u8| byte.is_ascii_whitespace() || byte == b',';
+    let mut regions: Vec<std::ops::Range<usize>> = Vec::new();
+    for span in fields {
+        let mut start = span.start;
+        let mut end = span.end;
+        while start > 0 && separator(statement.text[start - 1]) {
+            start -= 1;
+        }
+        while end < statement.text.len() && separator(statement.text[end]) {
+            end += 1;
+        }
+        if let Some(previous) = regions.last_mut()
+            && previous.end >= start
+        {
+            previous.end = previous.end.max(end);
+        } else {
+            regions.push(start..end);
+        }
+    }
+    let replacements = regions
+        .into_iter()
+        .map(|span| {
+            let replacement = if span.end < statement.text.len() {
+                vec![b' ']
+            } else {
+                Vec::new()
+            };
+            (span, replacement)
+        })
+        .collect::<Vec<_>>();
+    lexical::replace_spans(&statement, input, &replacements, &mut edits);
     Ok(lexical::apply_budgeted_edits(input, edits, budget)?.unwrap_or_else(|| input.to_vec()))
 }
 

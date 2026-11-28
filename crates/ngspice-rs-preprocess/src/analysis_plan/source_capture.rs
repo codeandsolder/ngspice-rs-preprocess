@@ -125,11 +125,12 @@ pub(crate) fn capture_linked(
     origins: &[OriginLine],
     budget: &WorkBudget,
 ) -> Result<Option<AnalysisPlan>> {
-    if !linked
-        .visits
-        .iter()
-        .any(|visit| visit.dialect == SourceDialect::Ltspice)
-    {
+    if !linked.visits.iter().any(|visit| {
+        matches!(
+            visit.dialect,
+            SourceDialect::Ltspice | SourceDialect::Pspice
+        )
+    }) {
         return Ok(None);
     }
     let root_dialect = dialect(
@@ -168,10 +169,22 @@ struct Candidate {
 
 impl Candidate {
     fn activates_plan(&self) -> Result<bool> {
+        let name = command(&self.text);
+        if self.location.dialect == AnalysisDialect::Pspice {
+            ensure!(
+                !super::pspice::statistical_directive(&name),
+                "PSpice statistical directive {name} requires a realization policy at {:?}",
+                self.location.origin
+            );
+            return Ok(match name.as_str() {
+                ".OPTIONS" | ".OPTION" | ".OPT" | ".IC" | ".NODESET" | ".CONTROL" => false,
+                ".TEMP" => super::pspice::arguments(&self.text)?.len() != 1,
+                _ => true,
+            });
+        }
         if self.location.dialect != AnalysisDialect::Ltspice {
             return Ok(false);
         }
-        let name = command(&self.text);
         Ok(match name.as_str() {
             ".OPTIONS" | ".OPTION" | ".OPT" => options(&self.text, self.location.dialect)?
                 .iter()
@@ -278,13 +291,15 @@ fn extract_entry(
             name.as_str(),
             ".OPTIONS" | ".OPTION" | ".OPT" | ".TEMP" | ".IC" | ".NODESET" | ".INIT"
         )
+        && !(location.dialect == AnalysisDialect::Pspice
+            && matches!(name.as_str(), ".TEMP" | ".INIT"))
     {
         return Ok(None);
     }
     ensure!(
         matches!(
             location.dialect,
-            AnalysisDialect::Native | AnalysisDialect::Ltspice
+            AnalysisDialect::Native | AnalysisDialect::Ltspice | AnalysisDialect::Pspice
         ),
         "mixed analysis binding for {:?} is not qualified at {:?}",
         location.dialect,

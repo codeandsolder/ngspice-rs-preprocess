@@ -414,6 +414,9 @@ pub fn replace_spans(
         let ranges = statement.source_ranges(span.clone());
         for (index, range) in ranges.into_iter().enumerate() {
             if index == 0 && !replacement.is_empty() {
+                if replacement.iter().all(u8::is_ascii_whitespace) {
+                    removed.push(range.clone());
+                }
                 edits.push((range, replacement.clone()));
             } else {
                 removed.push(range.clone());

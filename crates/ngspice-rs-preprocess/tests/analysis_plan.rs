@@ -637,7 +637,7 @@ fn simetrix_compatibility_step_and_continuation_are_not_interchangeable() -> Res
 fn raw_file_options_share_source_fields_with_analysis_options() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.cir");
-    fs::write(&root, b"Option ownership\n.param pw=0\nV1 x 0 1\nR1 x 0 1k\n.options RELTOL=1e-5 MAXSTEP=1u\n+ plotwinsize pw\n+ SSTOL=1m\n+ numdgt={7+8}\n.tran 1m\n.end\n")?;
+    fs::write(&root, b"Option ownership\n.param pw=0\nV1 x 0 1\nR1 x 0 1k\n.options MAXSTEP=1u,RELTOL=1e-5\n+ plotwinsize pw\n+ SSTOL=1m,\n+ numdgt={7+8}\n.tran 1m\n.end\n")?;
     let bundle = prepare_path(&root, InputFormat::LtspiceDeck)?;
     let plan = bundle
         .analysis_plan
@@ -652,8 +652,8 @@ fn raw_file_options_share_source_fields_with_analysis_options() -> Result<()> {
             .map(|setting| (&*setting.name, setting.disposition))
             .collect::<Vec<_>>(),
         [
-            ("RELTOL", Disposition::Circuit),
             ("MAXSTEP", Disposition::RequiresBinding),
+            ("RELTOL", Disposition::Circuit),
             ("PLOTWINSIZE", Disposition::Circuit),
             ("SSTOL", Disposition::RequiresBinding),
             ("NUMDGT", Disposition::Circuit),
@@ -683,5 +683,130 @@ fn raw_file_options_share_source_fields_with_analysis_options() -> Result<()> {
             .any(|line| line.contains("MAXSTEP") || line.contains("SSTOL")),
         "{text}"
     );
+    Ok(())
+}
+
+#[test]
+fn pspice_capture_binds_independent_and_continuation_axes_separately() -> Result<()> {
+    use ngspice_rs_preprocess::{
+        WorkBudget,
+        analysis_plan::sweep::{SweepExecution, SweepTarget},
+    };
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"PSpice numerical analysis\n.param rbase=1k other=1\nV1 in 0 1\nR1 in 0 {rbase}\n.temp 65\n.step PARAM rbase 3k,1k,1k\n.dc V1 LIST .1,.2 PARAM other 1,3,1\n.tran/OP 1u 4m 0 {SCHEDULE(0,5u,1m,10u)} SKIPBP\n.probe/CSDF V(in)\n.end\n")?;
+    let bundle = prepare_path(&root, InputFormat::PspiceDeck)?;
+    let plan = bundle
+        .analysis_plan
+        .as_ref()
+        .context("missing PSpice plan")?;
+    plan.validate_supported()?;
+    assert!(plan.requires_binding());
+    assert_eq!(plan.dialect, AnalysisDialect::Pspice);
+    assert_eq!(
+        plan.entries
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect::<Vec<_>>(),
+        [".TEMP", ".STEP", ".DC", ".TRAN/OP", ".PROBE/CSDF"]
+    );
+    let Directive::DcSweep { axes } = &plan.entries[2].directive else {
+        anyhow::bail!("missing DC continuation axes")
+    };
+    assert_eq!(axes.len(), 2);
+    assert!(
+        axes.iter()
+            .all(|axis| axis.execution == SweepExecution::Continuation)
+    );
+    assert_eq!(axes[0].target, SweepTarget::Source { name: "V1".into() });
+    assert_eq!(
+        axes[1].target,
+        SweepTarget::Parameter {
+            name: "other".into()
+        }
+    );
+    let Directive::Analysis { arguments, uic, .. } = &plan.entries[3].directive else {
+        anyhow::bail!("missing transient request")
+    };
+    assert!(!uic);
+    assert_eq!(
+        arguments,
+        &["1u", "4m", "0", "{SCHEDULE(0,5u,1m,10u)}", "SKIPBP"]
+    );
+    let budget = WorkBudget::default();
+    for index in [2, 3] {
+        let bound = plan.bind_independent_sweeps(
+            index,
+            |_, _, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+            &budget,
+        )?;
+        assert_eq!(bound.count(), 3);
+        for (ordinal, expected) in [3000_f64, 2000., 1000.].into_iter().enumerate() {
+            let coordinates = bound.candidate(ordinal)?.collect::<Result<Vec<_>>>()?;
+            assert_eq!(coordinates.len(), 1);
+            assert_eq!(coordinates[0].value.to_bits(), expected.to_bits());
+        }
+    }
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".temp 65"), "{text}");
+    assert!(
+        !text.lines().any(|line| [".step", ".dc", ".tran", ".probe"]
+            .iter()
+            .any(|prefix| line.to_ascii_lowercase().starts_with(prefix))),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn pspice_temperature_and_statistical_policies_are_not_interchangeable() -> Result<()> {
+    use ngspice_rs_preprocess::WorkBudget;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    for (directives, supported) in [
+        (".temp 65,-40,25\n.op", true),
+        (".temp 65,-40\n.step param r 1 2 1\n.op", false),
+        (".temp 65\n.step temp 25 50 25\n.op", false),
+        (".step param r 1 2 1\n.dc PARAM R 1 2 1", false),
+        (".dc V1 1 2 1 v1 2 3 1", false),
+    ] {
+        fs::write(
+            &root,
+            format!("PSpice policy\n.param r=1\nV1 in 0 1\nR1 in 0 1k\n{directives}\n.end\n"),
+        )?;
+        let bundle = prepare_path(&root, InputFormat::PspiceDeck)?;
+        let plan = bundle
+            .analysis_plan
+            .as_ref()
+            .context("missing analysis plan")?;
+        assert_eq!(plan.validate_supported().is_ok(), supported, "{directives}");
+        if supported {
+            let budget = WorkBudget::default();
+            let bound = plan.bind_independent_sweeps(
+                1,
+                |_, _, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+                &budget,
+            )?;
+            assert_eq!(bound.count(), 3);
+            let coordinates = bound.candidate(1)?.collect::<Result<Vec<_>>>()?;
+            assert_eq!(coordinates[0].value.to_bits(), (-40_f64).to_bits());
+        }
+    }
+    for statistical in [
+        ".mc 10 dc V(in) YMAX",
+        ".WCASE DC V(in) YMAX",
+        ".distribution test 1 2",
+    ] {
+        fs::write(
+            &root,
+            format!("PSpice statistical\nV1 in 0 1\nR1 in 0 1k\n{statistical}\n.end\n"),
+        )?;
+        let error = prepare_path(&root, InputFormat::PspiceDeck)
+            .expect_err("statistical request must not be reduced to nominal execution");
+        assert!(
+            format!("{error:#}").contains("realization policy"),
+            "{error:#}"
+        );
+    }
     Ok(())
 }
