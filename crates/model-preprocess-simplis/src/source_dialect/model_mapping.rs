@@ -802,6 +802,7 @@ pub struct HspiceMosJunctionSelection {
 pub struct HspiceBsim3Defaults {
     pub acm: u8,
     pub capmod: u8,
+    pub xpart: u8,
 }
 
 impl HspiceBsim3Defaults {
@@ -820,8 +821,16 @@ impl ModelSelection {
     pub const fn hspice_bsim3_defaults(&self) -> Option<HspiceBsim3Defaults> {
         // HSPICE MOSFET Models Manual X-2005.09, pp. 403, 414–415.
         match self.mapping.device {
-            Device::Bsim3HspiceJunction => Some(HspiceBsim3Defaults { acm: 0, capmod: 0 }),
-            Device::Bsim3HspiceBerkeleyJunction => Some(HspiceBsim3Defaults { acm: 10, capmod: 3 }),
+            Device::Bsim3HspiceJunction => Some(HspiceBsim3Defaults {
+                acm: 0,
+                capmod: 0,
+                xpart: 1,
+            }),
+            Device::Bsim3HspiceBerkeleyJunction => Some(HspiceBsim3Defaults {
+                acm: 10,
+                capmod: 3,
+                xpart: 0,
+            }),
             _ => None,
         }
     }

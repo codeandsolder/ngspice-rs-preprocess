@@ -1,8 +1,9 @@
 //! Prepared Berkeley BSIM3 junction conduction and depletion storage.
 //!
 //! The 3.2.4 and 3.3.0 source revisions use the exponential junction
-//! and forward continuation at IJTH, but differ in their knee geometry. The solver supplies limiting, regularizing
-//! conductance and polarity/multiplicity; they are not physical parameters.
+//! and forward continuation at IJTH, but differ in their knee geometry. The
+//! solver supplies limiting, regularizing conductance and polarity/multiplicity;
+//! they are not physical parameters.
 
 use super::{
     Bsim3JunctionTemperature, MosDepletionComponent, MosDepletionTemperatureCoefficients,

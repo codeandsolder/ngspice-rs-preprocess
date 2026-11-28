@@ -245,9 +245,9 @@ fn diode_alias_uses_the_selected_kernel_parameter_grammar() -> Result<()> {
 #[test]
 fn hspice_bsim3_selection_preserves_exact_release_and_level_defaults() -> Result<()> {
     let mapping = table(".options HSPICEMODELS=1")?;
-    for (level, device, acm, capmod) in [
-        (49, Device::Bsim3HspiceJunction, 0, 0),
-        (53, Device::Bsim3HspiceBerkeleyJunction, 10, 3),
+    for (level, device, acm, capmod, xpart) in [
+        (49, Device::Bsim3HspiceJunction, 0, 0, 1),
+        (53, Device::Bsim3HspiceBerkeleyJunction, 10, 3, 0),
     ] {
         for (requested, canonical) in [("3.24", "3.24"), ("3.2.4", "3.24"), ("3.3.0", "3.3")] {
             let lines = statements(&format!(
@@ -263,6 +263,7 @@ fn hspice_bsim3_selection_preserves_exact_release_and_level_defaults() -> Result
                 .context("source defaults")?;
             assert_eq!(defaults.acm, acm);
             assert_eq!(defaults.capmod, capmod);
+            assert_eq!(defaults.xpart, xpart);
             assert!(selection.lower().is_err());
             assert!(
                 MappingTable::select_standalone_hspice(&lines[0], &[], &WorkBudget::default())
@@ -460,5 +461,72 @@ fn hspice_berkeley_junction_binding_separates_geometry_and_series_modes() -> Res
                 .is_err()
         );
     }
+    Ok(())
+}
+
+#[test]
+fn hspice_berkeley_junction_binding_converts_explicit_model_units() -> Result<()> {
+    use model_compact_intrinsic::MosDiffusionTerminal;
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use model_preprocess_simplis::source_dialect::model_mapping::HspiceBsim3JunctionInput;
+
+    let mapping = table(".options HSPICEMODELS=1")?;
+    let input = HspiceBsim3JunctionInput {
+        drawn_width_m: 10e-6,
+        gate_width_m: 8e-6,
+        diffusion: [MosDiffusionTerminal::default(); 2],
+        squares: [None, Some(0.)],
+        default_squares: [2.; 2],
+        operating_temperature_k: 325.,
+    };
+    let prefix = ".model m NMOS LEVEL=53 VERSION=3.3 ACM=12 CALCACM=1 WMLT=0.8 RD=90 RS=60 RDC=3 RSC=3 RSH=45 TNOM=27";
+    let bind = |suffix: &str, global_scale: f64| -> Result<_> {
+        let lines = statements(&format!("{prefix} {suffix}"));
+        let selection = mapping
+            .select_card(&lines[0], &[], &WorkBudget::default())?
+            .context("selection")?;
+        selection
+            .bind_hspice_bsim3_berkeley_junctions(298.15, global_scale, |raw| {
+                Ok(parse_spice_constant(raw)?)
+            })?
+            .prepare(input)
+    };
+    for (si, scaled) in [
+        (
+            "XW=1u HDIF=2u LD=0.2u LDIF=0.5u",
+            "XW=1 HDIF=2 LD=0.2 LDIF=0.5",
+        ),
+        (
+            "XW=1u HDIF=2u LD=0.2u LDIF=0.5u CJ=2e-3 CJSW=1e-10 JS=1e-4 JSW=2e-8",
+            "XW=1 HDIF=2 LD=0.2 LDIF=0.5 CJ=2e-15 CJSW=1e-16 JS=1e-16 JSW=2e-14",
+        ),
+    ] {
+        let physical = bind(si, 1.)?;
+        for converted in [
+            bind(scaled, 1e-6)?,
+            bind(&format!("SCALM=1u {scaled}"), 1.)?,
+        ] {
+            for (reference, actual) in physical.iter().zip(converted) {
+                for voltage in [-0.5, 0., 0.3, 0.7] {
+                    let a = reference.evaluate(voltage)?;
+                    let b = actual.evaluate(voltage)?;
+                    for (left, right) in [
+                        (a.current_a, b.current_a),
+                        (a.conductance_s, b.conductance_s),
+                        (a.capacitance_f, b.capacitance_f),
+                        (a.charge_c, b.charge_c),
+                        (reference.resistance_ohm(), actual.resistance_ohm()),
+                    ] {
+                        assert!(
+                            (left - right).abs() <= 2e-13 * left.abs().max(1e-30),
+                            "{left:e} != {right:e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(bind("SCALM=0", 1.).is_err());
+    assert!(bind("SCALM=-1", 1.).is_err());
     Ok(())
 }

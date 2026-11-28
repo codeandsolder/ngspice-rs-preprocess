@@ -105,13 +105,104 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
     fn real(&mut self, names: &[&str], default: f64) -> Result<f64> {
         Ok(self.optional(names)?.unwrap_or(default))
     }
+
+    /// Model-unit density inputs are converted to SI; documented defaults
+    /// and inherited values have already been expressed in physical units.
+    fn density(&mut self, names: &[&str], default_si: f64, scale: f64) -> Result<f64> {
+        let density = self.optional(names)?.map_or(default_si, |raw| raw / scale);
+        ensure!(
+            density.is_finite(),
+            "nonrepresentable BSIM3 density {names:?}"
+        );
+        Ok(density)
+    }
+
+    fn junction_model(
+        &mut self,
+        nominal_temperature_k: f64,
+        model_scale: f64,
+    ) -> Result<Bsim3JunctionModel> {
+        let bottom_scale = model_scale * model_scale;
+        ensure!(
+            bottom_scale.is_finite() && bottom_scale > 0.,
+            "unrepresentable BSIM3 model area scale"
+        );
+        let sidewall_cap = self.density(
+            &["CJSW"],
+            HspiceBsim3Defaults::SIDEWALL_CAPACITANCE_DENSITY,
+            model_scale,
+        )?;
+        let sidewall_potential = self.real(&["PBSW"], 1.)?;
+        let sidewall_grading = self.real(&["MJSW"], 0.33)?;
+        let nominal = self
+            .optional(&["TNOM", "TREF"])?
+            .map_or(nominal_temperature_k, |celsius| celsius + 273.15);
+        Ok(Bsim3JunctionModel {
+            saturation: MosJunctionSaturation {
+                bottom: MosBottomDensity::PerSquareMetre(self.density(
+                    &["JS"],
+                    HspiceBsim3Defaults::JUNCTION_CURRENT_DENSITY,
+                    bottom_scale,
+                )?),
+                sidewall_a_per_m: self.density(
+                    &["JSW"],
+                    HspiceBsim3Defaults::SIDEWALL_CURRENT_DENSITY,
+                    model_scale,
+                )?,
+                // The original Berkeley current law uses a direct current
+                // only when both junction geometry measures are zero.
+                fallback: MosSaturationFallback::ZeroGeometry(1e-14),
+            },
+            depletion: MosJunctionDepletion {
+                bottom: MosBottomDensity::PerSquareMetre(self.density(
+                    &["CJ"],
+                    HspiceBsim3Defaults::BOTTOM_CAPACITANCE_DENSITY,
+                    bottom_scale,
+                )?),
+                bottom_shape: MosDepletionShape {
+                    potential_v: self.real(&["PB", "PHIB"], 1.)?,
+                    grading: self.real(&["MJ"], 0.5)?,
+                },
+                sidewall_f_per_m: sidewall_cap,
+                sidewall_shape: MosDepletionShape {
+                    potential_v: sidewall_potential,
+                    grading: sidewall_grading,
+                },
+                gate_edge_f_per_m: self.density(&["CJSWG"], sidewall_cap, model_scale)?,
+                gate_edge_shape: MosDepletionShape {
+                    potential_v: self.real(&["PBSWG"], sidewall_potential)?,
+                    grading: self.real(&["MJSWG"], sidewall_grading)?,
+                },
+                fallback_f: 0.,
+            },
+            depletion_temperature: [
+                MosDepletionTemperatureCoefficients {
+                    capacitance_per_k: self.real(&["TCJ"], 0.)?,
+                    potential_v_per_k: self.real(&["TPB"], 0.)?,
+                },
+                MosDepletionTemperatureCoefficients {
+                    capacitance_per_k: self.real(&["TCJSW"], 0.)?,
+                    potential_v_per_k: self.real(&["TPBSW"], 0.)?,
+                },
+                MosDepletionTemperatureCoefficients {
+                    capacitance_per_k: self.real(&["TCJSWG"], 0.)?,
+                    potential_v_per_k: self.real(&["TPBSWG"], 0.)?,
+                },
+            ],
+            nominal_temperature_k: nominal,
+            emission_coefficient: self.real(&["NJ"], 1.)?,
+            saturation_temperature_exponent: self.real(&["XTI"], 3.)?,
+            limiting_current_a: self.real(&["IJTH", "JTH"], 0.1)?,
+        })
+    }
 }
 
 impl ModelSelection {
     /// Resolve the source's Berkeley-mode junction coefficients using the
     /// caller's occurrence-aware expression evaluator.
     ///
-    /// `model_scale` is the positive model length-unit scale; the instance
+    /// `model_scale` is the global model length-unit scale, overridden by an
+    /// explicit card-local SCALM; the instance
     /// dimensions supplied later are in SI. The source's junction geometry
     /// and parasitic resistance modes are intentionally resolved separately.
     /// This API prepares the junction branch only, not a complete BSIM3 model.
@@ -130,10 +221,6 @@ impl ModelSelection {
         ensure!(
             matches!(self.effective_version.as_deref(), Some("3.24" | "3.3")),
             "unqualified BSIM3 junction revision"
-        );
-        ensure!(
-            model_scale.is_finite() && model_scale > 0.,
-            "invalid BSIM3 model length scale"
         );
         let selected = self
             .hspice_mos_junction()?
@@ -162,69 +249,12 @@ impl ModelSelection {
             selection: self,
             evaluate,
         };
-        let bottom_scale = model_scale * model_scale;
+        let model_scale = c.real(&["SCALM"], model_scale)?;
         ensure!(
-            bottom_scale.is_finite() && bottom_scale > 0.,
-            "unrepresentable BSIM3 model area scale"
+            model_scale.is_finite() && model_scale > 0.,
+            "invalid BSIM3 model length scale"
         );
-        let sidewall_cap = c.real(&["CJSW"], HspiceBsim3Defaults::SIDEWALL_CAPACITANCE_DENSITY)?;
-        let sidewall_potential = c.real(&["PBSW"], 1.)?;
-        let sidewall_grading = c.real(&["MJSW"], 0.33)?;
-        let nominal = c
-            .optional(&["TNOM", "TREF"])?
-            .map_or(nominal_temperature_k, |celsius| celsius + 273.15);
-        let model = Bsim3JunctionModel {
-            saturation: MosJunctionSaturation {
-                bottom: MosBottomDensity::PerSquareMetre(
-                    c.real(&["JS"], HspiceBsim3Defaults::JUNCTION_CURRENT_DENSITY)? / bottom_scale,
-                ),
-                sidewall_a_per_m: c
-                    .real(&["JSW"], HspiceBsim3Defaults::SIDEWALL_CURRENT_DENSITY)?
-                    / model_scale,
-                // The original Berkeley current law uses a direct current
-                // only when both junction geometry measures are zero.
-                fallback: MosSaturationFallback::ZeroGeometry(1e-14),
-            },
-            depletion: MosJunctionDepletion {
-                bottom: MosBottomDensity::PerSquareMetre(
-                    c.real(&["CJ"], HspiceBsim3Defaults::BOTTOM_CAPACITANCE_DENSITY)?
-                        / bottom_scale,
-                ),
-                bottom_shape: MosDepletionShape {
-                    potential_v: c.real(&["PB", "PHIB"], 1.)?,
-                    grading: c.real(&["MJ"], 0.5)?,
-                },
-                sidewall_f_per_m: sidewall_cap / model_scale,
-                sidewall_shape: MosDepletionShape {
-                    potential_v: sidewall_potential,
-                    grading: sidewall_grading,
-                },
-                gate_edge_f_per_m: c.real(&["CJSWG"], sidewall_cap)? / model_scale,
-                gate_edge_shape: MosDepletionShape {
-                    potential_v: c.real(&["PBSWG"], sidewall_potential)?,
-                    grading: c.real(&["MJSWG"], sidewall_grading)?,
-                },
-                fallback_f: 0.,
-            },
-            depletion_temperature: [
-                MosDepletionTemperatureCoefficients {
-                    capacitance_per_k: c.real(&["TCJ"], 0.)?,
-                    potential_v_per_k: c.real(&["TPB"], 0.)?,
-                },
-                MosDepletionTemperatureCoefficients {
-                    capacitance_per_k: c.real(&["TCJSW"], 0.)?,
-                    potential_v_per_k: c.real(&["TPBSW"], 0.)?,
-                },
-                MosDepletionTemperatureCoefficients {
-                    capacitance_per_k: c.real(&["TCJSWG"], 0.)?,
-                    potential_v_per_k: c.real(&["TPBSWG"], 0.)?,
-                },
-            ],
-            nominal_temperature_k: nominal,
-            emission_coefficient: c.real(&["NJ"], 1.)?,
-            saturation_temperature_exponent: c.real(&["XTI"], 3.)?,
-            limiting_current_a: c.real(&["IJTH", "JTH"], 0.1)?,
-        };
+        let model = c.junction_model(nominal_temperature_k, model_scale)?;
         // Both light-diffusion lengths enter the extrinsic resistance law.
         // BSIM3's separate intrinsic XJ is not itself a supplied lateral LD.
         let light_path_m =

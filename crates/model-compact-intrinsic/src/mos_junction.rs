@@ -568,7 +568,6 @@ impl MosJunctionSaturation {
             MosBottomMeasure::AreaM2(value) | MosBottomMeasure::WidthM(value) => value,
         };
         let direct = match self.fallback {
-            MosSaturationFallback::None => None,
             MosSaturationFallback::ZeroGeometry(value) if extent == 0. && perimeter == 0. => {
                 Some(value)
             }
