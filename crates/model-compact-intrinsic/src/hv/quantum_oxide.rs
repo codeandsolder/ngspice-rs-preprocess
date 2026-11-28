@@ -76,7 +76,7 @@ pub fn prepare_hisim_hv_quantum_oxide(
 }
 impl PreparedHiSimHvQuantumOxide {
     /// Classical oxide capacitance, before any QME correction.
-    #[must_use]
+    #[must_use = "the capacitance is the classical oxide coefficient before quantum correction"]
     pub fn zero_field_capacitance(&self) -> f64 {
         self.permittivity / self.oxide
     }

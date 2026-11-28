@@ -235,6 +235,7 @@ impl BsimSoiGroup {
                 parameters,
                 charge: Capability::Computed,
                 noise: Capability::Computed,
+                trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
             },
             BsimSoiKernel {
                 group: Arc::clone(self),

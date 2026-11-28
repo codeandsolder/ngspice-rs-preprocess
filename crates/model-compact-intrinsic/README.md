@@ -773,6 +773,23 @@ tests**, and **95,806 independent source/executable numerical comparisons**.
 These are physical additive component checks rather than complete intrinsic
 MOS channel I/Q or operating-point/transient solver conformance.
 
+### Coupled nonlinear HiSIM-HV lateral-field charge
+
+The complete native lateral-field law combines the existing body-dependent
+`XQY1/XQY2` term with the gate/drain field contribution
+`-1.3*epsilon_si*Wcv*M*wdpl*(1-clm1)/XQY * (Vds-Idd/(beta*Qn0))`.
+The transport drop is zero in native `flg_noqi` regions or when `Idd < 1e-15`;
+HV1 applies its native positive-XQY minimum of 1 nm. The expression uses the
+same solved charge/transport state, including all four local derivatives,
+and is exposed by `evaluate_with_parasitics` as `lateral_gate_charge_c`.
+Subtract that charge from the intrinsic drain; source and bulk are unchanged.
+The coupled native oracle measures 3,360 paired operating points with the
+lateral mechanism toggled. In nearly depleted cases the native subtraction
+of endpoint potentials magnifies floating-point error when divided by Qn0;
+the comparison propagates a 16-epsilon endpoint rounding budget through
+that sensitivity, without changing the physical law or its derivatives.
+Independent finite differences check the intrinsic and thermal derivatives.
+
 ### Physical HiSIM-HV1/HV2 external fringing capacitance
 
 `prepare_hisim_hv_fringing(model, instance)` now prepares a real, original

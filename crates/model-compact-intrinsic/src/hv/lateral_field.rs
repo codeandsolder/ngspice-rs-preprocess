@@ -1,17 +1,14 @@
-//! Independent body-bias-induced charge contribution to the HiSIM-HV1/HV2
-//! lateral-field channel-charge branch, from original `hsmhv[2]temp.c`
-//! and the `Qy`/terminal-charge updates in original `hsmhv[2]eval.c`.
-//!
-//! This is *only* the complete, additive `XQY1/XQY2` charge term. The
-//! separate bias-dependent base `Qy` and channel Ids/Q remain distinct.
+//! Native HiSIM-HV lateral-field gate-drain charge, including the additive body term.
 
 use std::sync::OnceLock;
 
 use super::{
-    AdditiveChargeSlots, PreparedHiSimHvInstance, PreparedHiSimHvModel,
-    compile_additive_charge_slots, compiled_hv_by_family, instance_real_at, source_real_at,
+    AdditiveChargeSlots, HiSimHvChannelElectrostaticPoint, HiSimHvChannelRegion,
+    HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar as Jet, PreparedHiSimHvInstance,
+    PreparedHiSimHvModel, PreparedHiSimHvTemperature, compile_additive_charge_slots,
+    compiled_hv_by_family, instance::model_real, instance_real_at, lookup_slot, source_real_at,
 };
-use crate::{ModelError, ParameterValue};
+use crate::{ModelError, ModelVariant, ParameterValue};
 
 const METER_TO_MICROMETER: f64 = 1e6;
 
@@ -24,6 +21,7 @@ pub struct PreparedHiSimHvLateralFieldCharge {
     /// Signed gate/body contribution, `M*cqyb0` when `COADOV==1`.
     pub effective_body_capacitance_f: f64,
     pub output_enabled: bool,
+    field_coefficient: f64,
 }
 
 /// Complete terminal contribution of the additive `XQY1/XQY2` term.
@@ -37,6 +35,42 @@ pub struct HiSimHvLateralFieldCharge {
 }
 
 impl PreparedHiSimHvLateralFieldCharge {
+    /// Total native Qy on the gate, with equal and opposite charge on the drain.
+    /// # Errors
+    /// Invalid local electrostatic state or nonfinite charge.
+    pub fn evaluate_channel_charge(
+        &self,
+        bias: HiSimHvIntrinsicBias,
+        channel: &HiSimHvChannelElectrostaticPoint,
+        temperature: &PreparedHiSimHvTemperature,
+    ) -> Result<Jet, ModelError> {
+        let body = Jet::coordinate(bias.vbs, 2, 1.);
+        let additive = self.effective_body_capacitance_f * body;
+        if self.field_coefficient == 0. {
+            return additive.checked("HiSIM-HV lateral body charge");
+        }
+        let charge = &channel.charge;
+        let drop = if matches!(
+            charge.region,
+            HiSimHvChannelRegion::Transition | HiSimHvChannelRegion::StrongInversion
+        ) && charge.drift_diffusion_integral.value >= 1e-15
+        {
+            let beta = Jet::coordinate(
+                temperature.inverse_thermal_voltage,
+                3,
+                temperature.inverse_thermal_voltage_derivative,
+            );
+            charge.drift_diffusion_integral / (beta * charge.source_inversion_density)
+        } else {
+            Jet::constant(0.)
+        };
+        (additive
+            - self.field_coefficient
+                * channel.material.bulk_depletion_width_factor
+                * (Jet::coordinate(bias.vds, 1, 1.) - drop))
+            .checked("HiSIM-HV lateral field charge")
+    }
+
     /// Evaluate the original additive `Qy += cqyb0*Vbs` term.
     ///
     /// `Vbs` is the **internal** source-referenced body bias from the original
@@ -70,7 +104,7 @@ impl PreparedHiSimHvLateralFieldCharge {
 static HV1_LATERAL_SLOTS: OnceLock<Result<AdditiveChargeSlots, ModelError>> = OnceLock::new();
 static HV2_LATERAL_SLOTS: OnceLock<Result<AdditiveChargeSlots, ModelError>> = OnceLock::new();
 
-/// Prepare the complete independently additive body/lateral-field Q term.
+/// Prepare the complete native lateral-field and additive body Q terms.
 ///
 /// Original C geometry is in **micrometers**: `LG=(L+XL)*1e6`, and
 /// `cqyb0=1e6*Weff*NF*XQY1/pow(LG,XQY2)`. It is added to original `Qy`
@@ -115,9 +149,34 @@ pub fn prepare_hisim_hv_lateral_field_charge(
             "HiSIM-HV lateral-field capacitance",
         ));
     }
+    let xqy = model_real(model, "xqy")?;
+    let xqy = if model.variant() == ModelVariant::HiSimHv1 && xqy > 0. {
+        xqy.max(1e-9)
+    } else {
+        xqy
+    };
+    let clm_slot = lookup_slot(model.variant(), "clm1")?;
+    let clm1 = instance
+        .binned_model_slot(clm_slot)
+        .ok_or(ModelError::MissingDefaultDependency(clm_slot))?;
+    let field_coefficient = if output_enabled && xqy != 0. {
+        1.3 * 1.034_943e-10
+            * instance.effective_geometry().capacitance_width_total_m
+            * multiplier
+            * (1. - clm1)
+            / xqy
+    } else {
+        0.
+    };
+    if !field_coefficient.is_finite() {
+        return Err(ModelError::InvalidPhysicalParameter(
+            "HiSIM-HV lateral field coefficient",
+        ));
+    }
     Ok(PreparedHiSimHvLateralFieldCharge {
         raw_body_capacitance_f: raw,
         effective_body_capacitance_f: effective,
         output_enabled,
+        field_coefficient,
     })
 }

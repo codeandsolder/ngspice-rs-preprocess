@@ -69,7 +69,7 @@ impl PreparedHiSimHvInstance {
     }
 
     /// Whether the original instance card supplied this canonical slot.
-    #[must_use]
+    #[must_use = "the original-card flag distinguishes supplied and defaulted parameters"]
     pub fn explicitly_given(&self, slot: u16) -> bool {
         self.original_given
             .get(usize::from(slot))

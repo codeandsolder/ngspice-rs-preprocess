@@ -4,9 +4,10 @@ use super::{
     HiSimHvChannelCorrectionPoint, HiSimHvChannelElectrostaticPoint, HiSimHvChannelModulationPoint,
     HiSimHvChannelRegion, HiSimHvExternalBias, HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar as Jet,
     PreparedHiSimHvAccessCorrection, PreparedHiSimHvChannelElectrostatics, PreparedHiSimHvInstance,
-    PreparedHiSimHvModel, PreparedHiSimHvTransport, channel_correction::ChannelCorrection,
-    instance::model_real, instance_real_at, lookup_slot, prepare_hisim_hv_access_correction,
-    prepare_hisim_hv_channel_electrostatics,
+    PreparedHiSimHvLateralFieldCharge, PreparedHiSimHvModel, PreparedHiSimHvTransport,
+    channel_correction::ChannelCorrection, instance::model_real, instance_real_at, lookup_slot,
+    prepare_hisim_hv_access_correction, prepare_hisim_hv_channel_electrostatics,
+    prepare_hisim_hv_lateral_field_charge,
 };
 use crate::{ModelError, ParameterScope};
 use std::sync::Arc;
@@ -139,6 +140,7 @@ pub struct PreparedHiSimHvNormalChannel {
     sti: super::sti::StiCorrection,
     impact: super::impact::ImpactIonization,
     leakage: super::leakage::Leakage,
+    lateral: PreparedHiSimHvLateralFieldCharge,
     identity: Arc<()>,
 }
 
@@ -167,6 +169,9 @@ pub struct HiSimHvNormalChannelWithParasiticsPoint {
     pub channel: HiSimHvNormalChannelWithAccessPoint,
     pub impact: super::HiSimHvImpactPoint,
     pub leakage: super::HiSimHvLeakagePoint,
+    /// Native Qy including multiplicity, added to gate and subtracted from drain.
+    /// Derivatives use intrinsic voltage and device temperature coordinates.
+    pub lateral_gate_charge_c: Jet,
 }
 
 /// Prepare the native enhancement-mode channel for repeated local evaluation.
@@ -211,6 +216,7 @@ pub fn prepare_hisim_hv_normal_channel(
         sti: super::sti::StiCorrection::prepare(model, instance, mobility.multiplicity)?,
         impact: super::impact::ImpactIonization::prepare(model, instance)?,
         leakage: super::leakage::Leakage::prepare(model, instance)?,
+        lateral: prepare_hisim_hv_lateral_field_charge(model, instance)?,
         identity: Arc::clone(&instance.identity),
     })
 }
@@ -238,10 +244,16 @@ impl PreparedHiSimHvNormalChannel {
         let leakage = self
             .leakage
             .evaluate(bias, &channel.intrinsic, &transport.temperature)?;
+        let lateral_gate_charge_c = self.lateral.evaluate_channel_charge(
+            bias,
+            &channel.intrinsic.electrostatics,
+            &transport.temperature,
+        )?;
         Ok(HiSimHvNormalChannelWithParasiticsPoint {
             channel,
             impact,
             leakage,
+            lateral_gate_charge_c,
         })
     }
 
