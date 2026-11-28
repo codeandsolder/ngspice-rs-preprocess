@@ -16,9 +16,9 @@ mod runtime_params;
 mod source_aliases;
 mod source_includes;
 use runtime_params::RuntimeScope;
-pub(crate) use source_includes::RootIncludes;
+pub(super) use source_includes::RootIncludes;
 
-const PARSED_LIBRARY_FORMAT_VERSION: u32 = 7;
+const PARSED_LIBRARY_FORMAT_VERSION: u32 = 8;
 
 fn lower_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -601,7 +601,7 @@ impl SubcircuitCatalog {
         let parent_target = parent
             .filter(|_| {
                 !target.starts_with('/')
-                    && !target.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+                    && target.as_bytes().get(1).is_none_or(|byte| *byte != b':')
             })
             .map(|name| {
                 let name = name.replace('\\', "/");
@@ -1036,9 +1036,19 @@ pub fn parse_library_with_budget(
             budget,
         );
     }
+    parse_simplis_library(source_name, sources, input, budget)
+}
+
+fn parse_simplis_library(
+    source_name: String,
+    sources: BTreeSet<String>,
+    input: &[u8],
+    budget: &WorkBudget,
+) -> Result<ParsedLibrary> {
+    use crate::source_dialect::{DialectContext, ScopedStatement};
     let decoded = decode_simplis_text(input)?;
     let lines = decoded.lines().collect::<Vec<_>>();
-    let selected = selected_library_lines(lines.iter().copied(), simulator)?;
+    let selected = selected_library_lines(lines.iter().copied(), LibrarySimulator::Simplis)?;
     let context = DialectContext::default();
     let mut view = String::new();
     let mut statements = Vec::new();
@@ -1067,7 +1077,7 @@ pub fn parse_library_with_budget(
         sources,
         &view,
         LibraryProjection {
-            simulator,
+            simulator: LibrarySimulator::Simplis,
             dialect: None,
             scoped_statements: statements,
         },
@@ -1660,7 +1670,7 @@ fn parsed_library_digest(
 ) -> String {
     let semantic_digest = library_digest(support_lines, aliases, definitions);
     let mut hasher = Sha256::new();
-    hasher.update(b"ngspice-rs-preprocess-parsed-library-v7\0");
+    hasher.update(b"ngspice-rs-preprocess-parsed-library-v8\0");
     if let Some(context) = dialect {
         hasher.update([match context.language {
             crate::source_dialect::SourceLanguage::Simetrix => 1,
@@ -2972,16 +2982,21 @@ pub fn preprocess_netlist(
     preprocess_netlist_at(input, external, None)
 }
 
-/// Expand a source snapshot in its original path context, if known.
-///
-/// # Errors
-///
-/// Returns an error if source preprocessing or library resolution fails.
-pub fn preprocess_netlist_at(
+struct RootCatalog {
+    extracted: Extracted,
+    statements: Vec<String>,
+    globals: GlobalBindings,
+    explicit_sources: BTreeSet<IncludedSource>,
+    local: SubcircuitCatalog,
+    root_source_id: String,
+    root_support: Vec<String>,
+}
+
+fn prepare_root_catalog(
     input: &[u8],
     external: &SubcircuitCatalog,
     origin: Option<&str>,
-) -> Result<PreprocessedNetlist> {
+) -> Result<RootCatalog> {
     let PreparedRoot {
         mut extracted,
         statements: mut root_statements,
@@ -3004,6 +3019,34 @@ pub fn preprocess_netlist_at(
     if external.simulator != Some(LibrarySimulator::Simetrix) {
         local.active_aliases = source_aliases::materialize(&mut root_statements, external)?;
     }
+    Ok(RootCatalog {
+        extracted,
+        statements: root_statements,
+        globals,
+        explicit_sources,
+        local,
+        root_source_id,
+        root_support,
+    })
+}
+
+/// Expand a source snapshot in its original path context, if known.
+///
+/// # Errors
+///
+/// Returns an error if source preprocessing or library resolution fails.
+pub fn preprocess_netlist_at(
+    input: &[u8],
+    external: &SubcircuitCatalog,
+    origin: Option<&str>,
+) -> Result<PreprocessedNetlist> {
+    let RootCatalog {
+        extracted,
+        statements: root_statements,
+        globals,
+        mut local,
+        ..
+    } = prepare_root_catalog(input, external, origin)?;
     let mut retained_local = Vec::new();
     let mut removed_local = 0usize;
     for definition in extracted.definitions {
@@ -3579,16 +3622,62 @@ fn preprocess_root_statements(
     Ok((logical_statements(&lines), processed.environment.globals))
 }
 
+struct LinkedOccurrence<'a> {
+    inherited: &'a Environment,
+    parent_runtime: Option<&'a RuntimeScope>,
+    external: &'a SubcircuitCatalog,
+    imports: Option<std::sync::Arc<IncludeScope>>,
+}
+
+fn is_protected_pwm(definition: &Definition) -> bool {
+    definition.name.eq_ignore_ascii_case("Complemetary_PWM")
+        && String::from_utf8_lossy(&definition.bytes)
+            .contains("MICROCHIP COMPLEMENTARY_PWM Encryption")
+}
+
+fn make_protected_pwm_unit(
+    definition: Definition,
+    overrides: Environment,
+    init: InitTree,
+    inherited: &Environment,
+    imports: Option<std::sync::Arc<IncludeScope>>,
+) -> Result<LinkedUnit> {
+    if !init.is_empty() {
+        bail!("SIMPLIS .INIT is not supported inside protected Microchip PWM replacement");
+    }
+    let emitted_name = linked_specialization_name(
+        &definition,
+        None,
+        &overrides,
+        &inherited.globals,
+        &init,
+        imports.as_deref(),
+    );
+    Ok(LinkedUnit {
+        definition,
+        emitted_name,
+        body: LinkedBody::Microchip(overrides),
+        globals: inherited.globals.clone(),
+        runtime: None,
+        init,
+        imports,
+        included_sources: BTreeSet::new(),
+    })
+}
+
 fn make_linked_unit(
     definition: Definition,
     explicit_vars: bool,
     override_text: &str,
-    inherited: &Environment,
     init: InitTree,
-    parent_runtime: Option<&RuntimeScope>,
-    external: &SubcircuitCatalog,
-    imports: Option<std::sync::Arc<IncludeScope>>,
+    occurrence: LinkedOccurrence<'_>,
 ) -> Result<LinkedUnit> {
+    let LinkedOccurrence {
+        inherited,
+        parent_runtime,
+        external,
+        imports,
+    } = occurrence;
     let overrides = if explicit_vars {
         bind_call_overrides(&definition, override_text, inherited)?
     } else {
@@ -3598,31 +3687,8 @@ fn make_linked_unit(
     external
         .budget
         .charge(Resource::ScannedBytes, definition.bytes.len())?;
-    let protected_pwm = definition.name.eq_ignore_ascii_case("Complemetary_PWM")
-        && String::from_utf8_lossy(&definition.bytes)
-            .contains("MICROCHIP COMPLEMENTARY_PWM Encryption");
-    if protected_pwm {
-        if !init.is_empty() {
-            bail!("SIMPLIS .INIT is not supported inside protected Microchip PWM replacement");
-        }
-        let emitted_name = linked_specialization_name(
-            &definition,
-            None,
-            &overrides,
-            &inherited.globals,
-            &init,
-            imports.as_deref(),
-        );
-        return Ok(LinkedUnit {
-            definition,
-            emitted_name,
-            body: LinkedBody::Microchip(overrides),
-            globals: inherited.globals.clone(),
-            runtime: None,
-            init,
-            imports,
-            included_sources: BTreeSet::new(),
-        });
+    if is_protected_pwm(&definition) {
+        return make_protected_pwm_unit(definition, overrides, init, inherited, imports);
     }
 
     let scoped = definition.owner_scope_id.is_some();
@@ -3726,11 +3792,13 @@ fn link_call(
         definition,
         compile_time_vars,
         override_text,
-        &inherited,
         init,
-        caller.runtime,
-        external,
-        imports,
+        LinkedOccurrence {
+            inherited: &inherited,
+            parent_runtime: caller.runtime,
+            external,
+            imports,
+        },
     )?;
     let rewritten = if !compile_time_vars
         && let (Some(caller), Some(callee)) = (caller.runtime, &unit.runtime)
@@ -4100,7 +4168,7 @@ fn validate_linked_model_namespace(
 
 fn link_root_statements(
     root_statements: Vec<String>,
-    globals: GlobalBindings,
+    globals: &GlobalBindings,
     local: &SubcircuitCatalog,
     external: &SubcircuitCatalog,
     runtime: Option<&RuntimeScope>,
@@ -4284,29 +4352,15 @@ pub fn preprocess_netlist_linked_at(
 ) -> Result<LinkedPreprocessedNetlist> {
     use std::fmt::Write as _;
 
-    let PreparedRoot {
-        mut extracted,
-        statements: mut root_statements,
+    let RootCatalog {
+        extracted,
+        statements: root_statements,
         globals,
         explicit_sources,
-    } = prepare_root(input, external, origin)?;
-    let (root_support, root_aliases) = parse_library_root(&extracted.root_lines)?;
-    let root_source_id = library_digest(&root_support, &root_aliases, &extracted.definitions);
-    for definition in &mut extracted.definitions {
-        if definition.source_id.is_none() {
-            definition.source_id = Some(root_source_id.clone());
-            definition.source_name = Some(origin.unwrap_or("<root>").to_owned());
-        }
-    }
-
-    let mut local = SubcircuitCatalog::new().with_budget(external.budget.clone());
-    local.explicit_sources = explicit_sources
-        .iter()
-        .map(|source| source.source_id.clone())
-        .collect();
-    if external.simulator != Some(LibrarySimulator::Simetrix) {
-        local.active_aliases = source_aliases::materialize(&mut root_statements, external)?;
-    }
+        mut local,
+        root_source_id,
+        root_support,
+    } = prepare_root_catalog(input, external, origin)?;
     for definition in &extracted.definitions {
         insert_local_definition(&mut local, definition.clone())?;
     }
@@ -4314,8 +4368,13 @@ pub fn preprocess_netlist_linked_at(
     let runtime = (external.simulator == Some(LibrarySimulator::Simetrix))
         .then(|| RuntimeScope::root_with_symbols(&root_source_id, &root_support, &external.budget))
         .transpose()?;
-    let (mut root_output, root_units, end_statement) =
-        link_root_statements(root_statements, globals, &local, external, runtime.as_ref())?;
+    let (mut root_output, root_units, end_statement) = link_root_statements(
+        root_statements,
+        &globals,
+        &local,
+        external,
+        runtime.as_ref(),
+    )?;
 
     let root_specializations = root_units
         .iter()

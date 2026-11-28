@@ -962,6 +962,21 @@ fn attach_initial_conditions(
     Ok(())
 }
 
+fn prepare_linked_runtime(
+    linked: &mut model_preprocess_simplis::LinkedPreprocessedNetlist,
+    format: InputFormat,
+    options: &Options,
+    budget: &WorkBudget,
+) -> Result<Option<super::passive_ic::InitialConditions>> {
+    let initial_conditions = if format == InputFormat::SimetrixDeck {
+        lower_simetrix_linked_runtime(linked, options.statistical_sample, budget)?;
+        Some(capture_passive_initial_conditions(linked, budget)?)
+    } else {
+        None
+    };
+    Ok(initial_conditions)
+}
+
 fn linked(
     root: &AdmittedSource,
     request: &Request,
@@ -999,15 +1014,8 @@ fn linked(
     if request.format == InputFormat::SimetrixDeck {
         plan.select_statistical_sample(options.statistical_sample, session.budget())?;
     }
-    let mut initial_conditions = if request.format == InputFormat::SimetrixDeck {
-        lower_simetrix_linked_runtime(&mut linked, options.statistical_sample, session.budget())?;
-        Some(capture_passive_initial_conditions(
-            &mut linked,
-            session.budget(),
-        )?)
-    } else {
-        None
-    };
+    let mut initial_conditions =
+        prepare_linked_runtime(&mut linked, request.format, options, session.budget())?;
     let waveforms = capture_linked_waveforms(&mut linked, session.budget())?;
     let known = linked
         .libraries

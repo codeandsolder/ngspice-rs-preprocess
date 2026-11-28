@@ -15,16 +15,17 @@ use std::{
 mod hierarchy;
 pub mod source_dialect;
 pub use hierarchy::{
-    BoundExpression, FunctionAlias, IncludedSource, LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist,
-    NetlistPreprocessStats, ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog,
-    active_statement_prefix, capacitor_charge_assignments, linked_library_filename,
-    lower_scoped_statements, lower_simetrix_source_view, lower_simetrix_source_view_with_budget,
-    lower_spice_expression, parse_init_statement, parse_init_target_path, parse_library,
-    parse_library_file, parse_library_for_simulator, parse_library_with_budget,
-    parse_scoped_library, parse_standalone_library, preprocess_netlist, preprocess_netlist_at,
-    preprocess_netlist_file, preprocess_netlist_linked, preprocess_netlist_linked_at,
-    preprocess_netlist_linked_file, project_resource, project_simetrix_source, project_source,
-    project_spice_resource, render_projection, rewrite_bound_symbols, rewrite_parameter_symbols, source_include_target,
+    BoundExpression, FunctionAlias, IncludedSource, LibrarySimulator, LinkedGeneratedLibrary,
+    LinkedPreprocessedNetlist, NetlistPreprocessStats, ParsedLibrary, PreprocessedNetlist,
+    SubcircuitCatalog, active_statement_prefix, capacitor_charge_assignments,
+    linked_library_filename, lower_scoped_statements, lower_simetrix_source_view,
+    lower_simetrix_source_view_with_budget, lower_spice_expression, parse_init_statement,
+    parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
+    parse_library_with_budget, parse_scoped_library, parse_standalone_library, preprocess_netlist,
+    preprocess_netlist_at, preprocess_netlist_file, preprocess_netlist_linked,
+    preprocess_netlist_linked_at, preprocess_netlist_linked_file, project_resource,
+    project_simetrix_source, project_source, project_spice_resource, render_projection,
+    rewrite_bound_symbols, rewrite_parameter_symbols, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
@@ -1374,6 +1375,71 @@ fn process_while(
     }
 }
 
+fn process_include_statement(
+    lines: &[&str],
+    index: usize,
+    end: usize,
+    state: &mut PreprocessState<'_, '_>,
+) -> Result<Option<usize>> {
+    let Some(includes) = state.includes.as_deref_mut() else {
+        return Ok(None);
+    };
+    includes.set_position(index);
+    if let Some(next) = includes.capture_definition(lines, index, end)? {
+        return Ok(Some(next));
+    }
+    let line = lines[index];
+    if let Some(target) = hierarchy::source_include_target(line)? {
+        let source = includes.enter(target)?;
+        state
+            .env
+            .budget
+            .charge(Resource::GeneratedNodes, source.lines().count())?;
+        let nested = source.lines().collect::<Vec<_>>();
+        let result = process_range(&nested, 0, nested.len(), state);
+        state
+            .includes
+            .as_deref_mut()
+            .context("missing include executor")?
+            .leave(result)?;
+        return Ok(Some(index.saturating_add(1)));
+    }
+    // A source include's .END terminates only that resource.
+    Ok(includes
+        .finish_source(line)
+        .then(|| index.saturating_add(1)))
+}
+
+fn process_assignment(
+    line: &str,
+    index: usize,
+    state: &mut PreprocessState<'_, '_>,
+) -> Result<bool> {
+    if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
+        let (name, value) = parse_assignment(assignment, state.env)
+            .with_context(|| format!("SIMPLIS assignment at line {}", index + 1))?;
+        if directive(line, "GLOBALVAR").is_some() {
+            state.env.set_global(&name, value)?;
+        } else {
+            state.env.ensure_local_name(&name)?;
+            state.env.set(name, value);
+        }
+        *state.assigned_variables = state.assigned_variables.saturating_add(1);
+        return Ok(true);
+    }
+    if state.evaluate_parameters
+        && let Some(assignment) = directive(line, "PARAM")
+    {
+        let (name, value) = parse_assignment(assignment, state.env)
+            .with_context(|| format!("SIMPLIS .PARAM assignment at line {}", index + 1))?;
+        state.env.set(&name, value);
+        state.parameter_names.insert(name);
+        *state.assigned_variables = state.assigned_variables.saturating_add(1);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn process_range(
     lines: &[&str],
     start: usize,
@@ -1396,33 +1462,9 @@ fn process_range(
             .env
             .budget
             .charge(Resource::ScannedBytes, line.len())?;
-        if let Some(includes) = state.includes.as_deref_mut() {
-            includes.set_position(index);
-            if let Some(end_index) = includes.capture_definition(lines, index, end)? {
-                index = end_index;
-                continue;
-            }
-            if let Some(target) = hierarchy::source_include_target(line)? {
-                let source = includes.enter(target)?;
-                state
-                    .env
-                    .budget
-                    .charge(Resource::GeneratedNodes, source.lines().count())?;
-                let nested = source.lines().collect::<Vec<_>>();
-                let result = process_range(&nested, 0, nested.len(), state);
-                state
-                    .includes
-                    .as_deref_mut()
-                    .context("missing include executor")?
-                    .leave(result)?;
-                index += 1;
-                continue;
-            }
-            // A source include's .END terminates only that resource.
-            if includes.finish_source(line) {
-                index = index.saturating_add(1);
-                continue;
-            }
+        if let Some(next) = process_include_statement(lines, index, end, state)? {
+            index = next;
+            continue;
         }
         if let Some(condition) = directive(line, "IF") {
             let (else_index, endif_index) = find_if_bounds(lines, index, end, &state.env.budget)?;
@@ -1464,27 +1506,7 @@ fn process_range(
             index = index.saturating_add(1);
             continue;
         }
-        if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
-            let (name, value) = parse_assignment(assignment, state.env)
-                .with_context(|| format!("SIMPLIS assignment at line {}", index + 1))?;
-            if directive(line, "GLOBALVAR").is_some() {
-                state.env.set_global(&name, value)?;
-            } else {
-                state.env.ensure_local_name(&name)?;
-                state.env.set(name, value);
-            }
-            *state.assigned_variables = state.assigned_variables.saturating_add(1);
-            index = index.saturating_add(1);
-            continue;
-        }
-        if state.evaluate_parameters
-            && let Some(assignment) = directive(line, "PARAM")
-        {
-            let (name, value) = parse_assignment(assignment, state.env)
-                .with_context(|| format!("SIMPLIS .PARAM assignment at line {}", index + 1))?;
-            state.env.set(&name, value);
-            state.parameter_names.insert(name);
-            *state.assigned_variables = state.assigned_variables.saturating_add(1);
+        if process_assignment(line, index, state)? {
             index = index.saturating_add(1);
             continue;
         }

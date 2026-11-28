@@ -19,7 +19,7 @@ struct ActiveSource<'a> {
     ended: bool,
 }
 
-pub(crate) struct RootIncludes<'a> {
+pub struct RootIncludes<'a> {
     catalog: &'a SubcircuitCatalog,
     active: Vec<ActiveSource<'a>>,
     definitions: Vec<Definition>,
@@ -29,7 +29,7 @@ pub(crate) struct RootIncludes<'a> {
 }
 
 impl<'a> RootIncludes<'a> {
-    pub(super) fn new(catalog: &'a SubcircuitCatalog) -> Self {
+    pub(super) const fn new(catalog: &'a SubcircuitCatalog) -> Self {
         Self {
             catalog,
             active: Vec::new(),
@@ -48,17 +48,17 @@ impl<'a> RootIncludes<'a> {
         }
     }
 
-    pub(crate) fn clear_pass(&mut self) {
+    pub fn clear_pass(&mut self) {
         self.active.clear();
         self.definitions.clear();
         self.imported.clear();
     }
 
-    pub(crate) fn ended(&self) -> bool {
+    pub fn ended(&self) -> bool {
         self.active.last().is_some_and(|source| source.ended)
     }
 
-    pub(crate) fn finish_source(&mut self, line: &str) -> bool {
+    pub fn finish_source(&mut self, line: &str) -> bool {
         if let Some(source) = self.active.last_mut() {
             if is_directive(line, "END") {
                 source.ended = true;
@@ -75,7 +75,7 @@ impl<'a> RootIncludes<'a> {
         (self.definitions, self.imported)
     }
 
-    pub(crate) fn enter(&mut self, target: &str) -> Result<&'a str> {
+    pub fn enter(&mut self, target: &str) -> Result<&'a str> {
         let parent = self
             .active
             .last()
@@ -115,20 +115,20 @@ impl<'a> RootIncludes<'a> {
         Ok(&metadata.explicit_source)
     }
 
-    pub(crate) fn set_position(&mut self, index: usize) {
+    pub fn set_position(&mut self, index: usize) {
         if let Some(source) = self.active.last_mut() {
             source.position = index;
         }
     }
 
-    pub(crate) fn leave(&mut self, result: Result<()>) -> Result<()> {
+    pub fn leave(&mut self, result: Result<()>) -> Result<()> {
         let source = self.active.pop().context("missing active include")?;
         result.with_context(|| {
             let line = source
                 .positions
                 .get(source.position)
                 .copied()
-                .unwrap_or(source.position.saturating_add(1));
+                .unwrap_or_else(|| source.position.saturating_add(1));
             format!("executing SIMPLIS include {}:{line}", source.name)
         })
     }
@@ -136,7 +136,7 @@ impl<'a> RootIncludes<'a> {
     /// Definitions are declarations, not instructions in the importing
     /// lexical environment. Preserve the body for instance specialization.
     /// An inactive root branch never reaches this method.
-    pub(crate) fn capture_definition(
+    pub fn capture_definition(
         &mut self,
         lines: &[&str],
         start: usize,
