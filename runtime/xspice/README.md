@@ -95,7 +95,7 @@ to the checks, not outputs from the implementation under test.
 cargo test --locked -p model-alb-experimental -p model-alb-xspice-ffi --all-targets
 runtime/xspice/smoke.sh MODEL.cm SCRATCH_ROOT
 runtime/xspice/smoke-stateful.sh MODEL.cm SCRATCH_ROOT
-runtime/xspice/smoke-stateful-compiled.sh MODEL.cm BUILD_DIR/debug SCRATCH_ROOT
+runtime/xspice/smoke-stateful-compiled.sh MODEL.cm BUILD_DIR/debug SCRATCH_ROOT EXTERNAL_MODEL_JSON
 runtime/xspice/smoke-logical-alb-auto.sh MODEL.cm BUILD_DIR/debug SCRATCH_ROOT
 ```
 
@@ -149,3 +149,5 @@ are not included.
 The measured semantics apply to the explicit experimental path and its
 documented numerical controls. They do not establish comprehensive
 SIMetrix parity or enable production translation of ALB models.
+
+Vendor-physical smoke runners take the external UNIV model JSON as their final argument. The synthetic UNIV wiring fixture is not vendor numerical evidence.

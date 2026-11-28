@@ -202,7 +202,7 @@ fn original_clocked_alb_discovery_and_native_bundle_wiring() -> Result<()> {
             .arg(temp.path().join("lowered.cir"))
             .arg(&library)
             .arg(&config)
-            .arg(source_dir().join("vendor-univ-models.json"))
+            .arg(source_dir().join("synthetic-univ-wiring.json"))
             .arg(temp.path().join("final.cir"))
             .output()
     };

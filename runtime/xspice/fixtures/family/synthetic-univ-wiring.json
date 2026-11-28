@@ -1,0 +1,51 @@
+{
+  "models": [
+    {
+      "name": "UNIV_ADC",
+      "family": "UNIV",
+      "nominal_supply_v": 5,
+      "native": {
+        "kind": "adc_bridge",
+        "parameters": {
+          "adc": {
+            "in_low": 1.5,
+            "in_high": 3,
+            "rise_delay": 1E-9,
+            "fall_delay": 1E-9,
+            "time_tol": 1E-11,
+            "out_low": 0,
+            "out_high": 5,
+            "clamp_res": 100,
+            "clamp_bias": 0.1
+          },
+          "clamp_low": 0,
+          "clamp_high": 5
+        }
+      }
+    },
+    {
+      "name": "UNIV_DAC",
+      "family": "UNIV",
+      "nominal_supply_v": 5,
+      "native": {
+        "kind": "dac",
+        "parameters": {
+          "out_low": 0,
+          "out_high": 5,
+          "g_pullup": 0.02,
+          "g_pulldown": 0.02,
+          "g_resistive": 0.002,
+          "g_hiz": 1E-9,
+          "knee_low": 1.5,
+          "knee_high": 3,
+          "v_smooth": 0.5,
+          "input_load": 0,
+          "t_rise": 1E-9,
+          "t_fall": 1E-9,
+          "sink_current": 0,
+          "source_current": 0
+        }
+      }
+    }
+  ]
+}

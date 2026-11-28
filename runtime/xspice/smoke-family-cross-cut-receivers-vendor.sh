@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Physical analog net/domain grouping survives independently observed lexical cuts.
 set -euo pipefail
-if (( $# != 3 )); then
-    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT\n' "$0" >&2
+if (( $# != 4 )); then
+    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT EXTERNAL_MODEL_JSON\n' "$0" >&2
     exit 2
 fi
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 cm="$(realpath -- "$1")"
 bins="$(realpath -- "$2")"
 scratch="$(realpath -- "$3")"
+models="$(realpath -e -- "$4")"
 fixture="$here/fixtures/vendor-cross-cut-receivers"
 work="$(mktemp -d "$scratch/ngspice_preprocess_cross_cut_XXXXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
@@ -17,7 +18,7 @@ while IFS=$'\t' read -r name hash pins adc dac; do
     source="$fixture/$name.net"
     [[ $(sha256sum -- "$source" | cut -d' ' -f1) == "$hash" ]]
     runner_pins="$(printf '%s\n' "$pins" | sed -E 's/v\(([a-z0-9_]+)\)/\1/g')"
-    "$here/run-compiled-vendor-physical.sh" "$source" "$runner_pins" "$cm" "$bins" "$work"
+    "$here/run-compiled-vendor-physical.sh" "$source" "$runner_pins" "$cm" "$bins" "$work" "$models"
     # All expected ADC owners in these root-driven circuits are root nets,
     # not one copy per INNER instance.
     jq -e --argjson adc "$adc" --argjson dac "$dac" '

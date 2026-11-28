@@ -2,14 +2,15 @@
 # Compile original clocked ALB source with its original electrical
 # parameters and compare to independent source-identical vendor oracles.
 set -euo pipefail
-if (( $# != 3 )); then
-    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT\n' "$0" >&2
+if (( $# != 4 )); then
+    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT EXTERNAL_MODEL_JSON\n' "$0" >&2
     exit 2
 fi
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 cm="$(realpath -- "$1")"
 bins="$(realpath -- "$2")"
 scratch="$(realpath -- "$3")"
+models="$(realpath -e -- "$4")"; s|"$family/vendor-univ-models.json"|"$models"|
 work="$(mktemp -d "$scratch/ngspice_preprocess_stateful_compiled_XXXXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 printf 'codemodel %s\n' "$cm" > "$work/.spiceinit"

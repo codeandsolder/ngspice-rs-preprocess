@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Independently measured original model lexical semantics (including failures).
 set -euo pipefail
-if (( $# != 3 )); then
-    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT\n' "$0" >&2
+if (( $# != 4 )); then
+    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT EXTERNAL_MODEL_JSON\n' "$0" >&2
     exit 2
 fi
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 cm="$(realpath -- "$1")"
 bins="$(realpath -- "$2")"
 scratch="$(realpath -- "$3")"
+models="$(realpath -e -- "$4")"
 fixture="$here/fixtures/vendor-inline-def"
 family="$here/fixtures/family"
 manifest="$fixture/oracle-manifest.json"
@@ -30,7 +31,7 @@ while IFS=$'\t' read -r name expected hash pins adc dac; do
         continue
     fi
     runner_pins="$(printf '%s\n' "$pins" | sed -E 's/v\(([a-z0-9_]+)\)/\1/g')"
-    "$here/run-compiled-vendor-physical.sh" "$source" "$runner_pins" "$cm" "$bins" "$work"
+    "$here/run-compiled-vendor-physical.sh" "$source" "$runner_pins" "$cm" "$bins" "$work" "$models"
     # Check actual automatically selected vendor family, not just output
     # voltage equality (HC and UNIV share nominal thresholds and rails).
     jq -e --arg adc "$adc" --arg dac "$dac" '

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Original mixed-supply ALBs: no hand-assigned pin groups or voltage scales.
 set -euo pipefail
-if (( $# != 3 )); then
-    printf 'Usage: %s MODEL_CM RUST_BIN_DIR SCRATCH_ROOT\n' "$0" >&2
+if (( $# != 4 )); then
+    printf 'Usage: %s MODEL_CM RUST_BIN_DIR SCRATCH_ROOT EXTERNAL_MODEL_JSON\n' "$0" >&2
     exit 2
 fi
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 model="$(realpath -- "$1")"
 bins="$(realpath -- "$2")"
 scratch="$(realpath -- "$3")"
+models="$(realpath -e -- "$4")"
 work="$(mktemp -d "$scratch/ngspice_preprocess_supply_XXXXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 for name in implicit-supply-matrix implicit-supply-loaded implicit-supply-fine implicit-supply-matrix-univ implicit-supply-loaded-univ implicit-supply-fine-univ shared-receivers; do
@@ -44,7 +45,7 @@ for name in implicit-supply-matrix implicit-supply-loaded implicit-supply-fine i
     fi
     pins="$(head -1 "$ref" | cut -d, -f2-)"
     runner_pins="$(printf '%s\n' "$pins" | sed -E 's/v\(([a-z0-9_]+)\)/\1/g')"
-    "$here/run-compiled-vendor-physical.sh" "$vendor/$name.net" "$runner_pins" "$model" "$bins" "$work"
+    "$here/run-compiled-vendor-physical.sh" "$vendor/$name.net" "$runner_pins" "$model" "$bins" "$work" "$models"
     [[ $(rg -c '^\.model .*sr_family_adc\(' "$work/circuit.cir") == 3 ]]
     [[ $(rg -c '^\.model .*sr_family_dac\(' "$work/circuit.cir") == "$dac_count" ]]
     # Check all retained current values and dynamic voltage crossings.
