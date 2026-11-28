@@ -15,16 +15,17 @@ use std::{
 mod hierarchy;
 pub mod source_dialect;
 pub use hierarchy::{
-    BoundExpression, FunctionAlias, LibrarySimulator, LinkedGeneratedLibrary,
+    BoundExpression, FunctionAlias, IncludedSource, LibrarySimulator, LinkedGeneratedLibrary,
     LinkedPreprocessedNetlist, NetlistPreprocessStats, ParsedLibrary, PreprocessedNetlist,
     SubcircuitCatalog, active_statement_prefix, capacitor_charge_assignments,
     linked_library_filename, lower_scoped_statements, lower_simetrix_source_view,
     lower_simetrix_source_view_with_budget, lower_spice_expression, parse_init_statement,
     parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
     parse_library_with_budget, parse_scoped_library, parse_standalone_library, preprocess_netlist,
-    preprocess_netlist_file, preprocess_netlist_linked, preprocess_netlist_linked_file,
-    project_resource, project_simetrix_source, project_source, project_spice_resource,
-    render_projection, rewrite_bound_symbols, rewrite_parameter_symbols, source_include_target,
+    preprocess_netlist_at, preprocess_netlist_file, preprocess_netlist_linked,
+    preprocess_netlist_linked_at, preprocess_netlist_linked_file, project_resource,
+    project_simetrix_source, project_source, project_spice_resource, render_projection,
+    rewrite_bound_symbols, rewrite_parameter_symbols, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
@@ -1308,7 +1309,7 @@ fn find_while_end(lines: &[&str], start: usize, end: usize, budget: &WorkBudget)
     bail!("unterminated SIMPLIS .WHILE at line {}", start + 1)
 }
 
-struct PreprocessState<'a> {
+struct PreprocessState<'a, 'catalog> {
     env: &'a mut Environment,
     output: &'a mut String,
     assigned_variables: &'a mut usize,
@@ -1317,6 +1318,7 @@ struct PreprocessState<'a> {
     parameter_names: &'a mut BTreeSet<String>,
     substitution: Substitution,
     evaluate_parameters: bool,
+    includes: Option<&'a mut hierarchy::RootIncludes<'catalog>>,
 }
 
 fn process_while(
@@ -1324,7 +1326,7 @@ fn process_while(
     start: usize,
     end: usize,
     header: &str,
-    state: &mut PreprocessState<'_>,
+    state: &mut PreprocessState<'_, '_>,
 ) -> Result<()> {
     let line = start + 1;
     let (condition, source_limit) =
@@ -1362,25 +1364,108 @@ fn process_while(
             "SIMPLIS .WHILE at line {line} exceeded implementation ceiling {MAX_WHILE_ITERATIONS} iterations"
         );
         process_range(lines, start + 1, end, state)?;
+        if state
+            .includes
+            .as_ref()
+            .is_some_and(|includes| includes.ended())
+        {
+            return Ok(());
+        }
         iterations += 1;
     }
+}
+
+fn process_include_statement(
+    lines: &[&str],
+    index: usize,
+    end: usize,
+    state: &mut PreprocessState<'_, '_>,
+) -> Result<Option<usize>> {
+    let Some(includes) = state.includes.as_deref_mut() else {
+        return Ok(None);
+    };
+    includes.set_position(index);
+    if let Some(next) = includes.capture_definition(lines, index, end)? {
+        return Ok(Some(next));
+    }
+    let line = lines[index];
+    if let Some(target) = hierarchy::source_include_target(line)? {
+        let source = includes.enter(target)?;
+        state
+            .env
+            .budget
+            .charge(Resource::GeneratedNodes, source.lines().count())?;
+        let nested = source.lines().collect::<Vec<_>>();
+        let result = process_range(&nested, 0, nested.len(), state);
+        state
+            .includes
+            .as_deref_mut()
+            .context("missing include executor")?
+            .leave(result)?;
+        return Ok(Some(index.saturating_add(1)));
+    }
+    // A source include's .END terminates only that resource.
+    Ok(includes
+        .finish_source(line)
+        .then(|| index.saturating_add(1)))
+}
+
+fn process_assignment(
+    line: &str,
+    index: usize,
+    state: &mut PreprocessState<'_, '_>,
+) -> Result<bool> {
+    if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
+        let (name, value) = parse_assignment(assignment, state.env)
+            .with_context(|| format!("SIMPLIS assignment at line {}", index + 1))?;
+        if directive(line, "GLOBALVAR").is_some() {
+            state.env.set_global(&name, value)?;
+        } else {
+            state.env.ensure_local_name(&name)?;
+            state.env.set(name, value);
+        }
+        *state.assigned_variables = state.assigned_variables.saturating_add(1);
+        return Ok(true);
+    }
+    if state.evaluate_parameters
+        && let Some(assignment) = directive(line, "PARAM")
+    {
+        let (name, value) = parse_assignment(assignment, state.env)
+            .with_context(|| format!("SIMPLIS .PARAM assignment at line {}", index + 1))?;
+        state.env.set(&name, value);
+        state.parameter_names.insert(name);
+        *state.assigned_variables = state.assigned_variables.saturating_add(1);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn process_range(
     lines: &[&str],
     start: usize,
     end: usize,
-    state: &mut PreprocessState<'_>,
+    state: &mut PreprocessState<'_, '_>,
 ) -> Result<()> {
     let _depth = state.env.budget.enter()?;
     let mut index = start;
     while index < end {
+        if state
+            .includes
+            .as_ref()
+            .is_some_and(|includes| includes.ended())
+        {
+            break;
+        }
         let line = lines[index];
         state.env.budget.charge(Resource::Statements, 1)?;
         state
             .env
             .budget
             .charge(Resource::ScannedBytes, line.len())?;
+        if let Some(next) = process_include_statement(lines, index, end, state)? {
+            index = next;
+            continue;
+        }
         if let Some(condition) = directive(line, "IF") {
             let (else_index, endif_index) = find_if_bounds(lines, index, end, &state.env.budget)?;
             let active = Evaluation::new(state.env)
@@ -1421,27 +1506,7 @@ fn process_range(
             index = index.saturating_add(1);
             continue;
         }
-        if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
-            let (name, value) = parse_assignment(assignment, state.env)
-                .with_context(|| format!("SIMPLIS assignment at line {}", index + 1))?;
-            if directive(line, "GLOBALVAR").is_some() {
-                state.env.set_global(&name, value)?;
-            } else {
-                state.env.ensure_local_name(&name)?;
-                state.env.set(name, value);
-            }
-            *state.assigned_variables = state.assigned_variables.saturating_add(1);
-            index = index.saturating_add(1);
-            continue;
-        }
-        if state.evaluate_parameters
-            && let Some(assignment) = directive(line, "PARAM")
-        {
-            let (name, value) = parse_assignment(assignment, state.env)
-                .with_context(|| format!("SIMPLIS .PARAM assignment at line {}", index + 1))?;
-            state.env.set(&name, value);
-            state.parameter_names.insert(name);
-            *state.assigned_variables = state.assigned_variables.saturating_add(1);
+        if process_assignment(line, index, state)? {
             index = index.saturating_add(1);
             continue;
         }
@@ -1492,12 +1557,13 @@ pub fn preprocess_body(input: &[u8], initial: &Environment) -> Result<Preprocess
     preprocess_body_with_mode(input, initial, true)
 }
 
-fn run_preprocess_body(
+fn run_preprocess_body_with_includes(
     input: &[u8],
     initial: &Environment,
     substitution: Substitution,
     evaluate_parameters: bool,
     parameter_names: &mut BTreeSet<String>,
+    includes: Option<&mut hierarchy::RootIncludes<'_>>,
 ) -> Result<Preprocessed> {
     initial.budget.charge(Resource::ScannedBytes, input.len())?;
     let text = decode_simplis_text(input)?;
@@ -1520,6 +1586,7 @@ fn run_preprocess_body(
             parameter_names,
             substitution,
             evaluate_parameters,
+            includes,
         },
     )?;
     Ok(Preprocessed {
@@ -1531,6 +1598,23 @@ fn run_preprocess_body(
             substituted_expressions,
         },
     })
+}
+
+fn run_preprocess_body(
+    input: &[u8],
+    initial: &Environment,
+    substitution: Substitution,
+    evaluate_parameters: bool,
+    parameter_names: &mut BTreeSet<String>,
+) -> Result<Preprocessed> {
+    run_preprocess_body_with_includes(
+        input,
+        initial,
+        substitution,
+        evaluate_parameters,
+        parameter_names,
+        None,
+    )
 }
 
 // Execute source controls and substitute known compile-time expressions
@@ -1551,18 +1635,38 @@ fn preprocess_body_with_mode(
     initial: &Environment,
     substitute_active_lines: bool,
 ) -> Result<Preprocessed> {
+    preprocess_body_with_includes(input, initial, substitute_active_lines, None)
+}
+
+fn preprocess_body_with_includes(
+    input: &[u8],
+    initial: &Environment,
+    substitute_active_lines: bool,
+    mut includes: Option<&mut hierarchy::RootIncludes<'_>>,
+) -> Result<Preprocessed> {
     if !substitute_active_lines {
-        return preprocess_control_flow(input, initial);
+        return run_preprocess_body_with_includes(
+            input,
+            initial,
+            Substitution::Known,
+            false,
+            &mut BTreeSet::new(),
+            includes,
+        );
     }
 
     let mut discovered_names = BTreeSet::new();
-    let discovery = run_preprocess_body(
+    let discovery = run_preprocess_body_with_includes(
         input,
         initial,
         Substitution::None,
         true,
         &mut discovered_names,
+        includes.as_deref_mut(),
     )?;
+    if let Some(include) = includes.as_deref_mut() {
+        include.clear_pass();
+    }
     let mut seeded = initial.charged_clone()?;
     for name in discovered_names {
         let value = discovery
@@ -1572,12 +1676,13 @@ fn preprocess_body_with_mode(
             .clone();
         seeded.set(name, value);
     }
-    run_preprocess_body(
+    run_preprocess_body_with_includes(
         input,
         &seeded,
         Substitution::All,
         true,
         &mut BTreeSet::new(),
+        includes,
     )
 }
 
@@ -2388,15 +2493,7 @@ fn specialize_subcircuit_with_base(
     inherited: &Environment,
     overrides: &Environment,
 ) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base_mode(input, inherited, overrides, true)
-}
-
-fn specialize_subcircuit_control_flow_with_base(
-    input: &[u8],
-    inherited: &Environment,
-    overrides: &Environment,
-) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base_mode(input, inherited, overrides, false)
+    specialize_subcircuit_with_base_mode(input, inherited, overrides, true, None)
 }
 
 fn read_subcircuit_header(lines: &[&str]) -> Result<(String, usize)> {
@@ -2445,6 +2542,7 @@ fn specialize_subcircuit_with_base_mode(
     inherited: &Environment,
     overrides: &Environment,
     substitute_active_lines: bool,
+    includes: Option<&mut hierarchy::RootIncludes<'_>>,
 ) -> Result<SpecializedSubcircuit> {
     inherited
         .budget
@@ -2497,7 +2595,12 @@ fn specialize_subcircuit_with_base_mode(
         body_source.push_str(line);
         body_source.push('\n');
     }
-    let body = preprocess_body_with_mode(body_source.as_bytes(), &env, substitute_active_lines)?;
+    let body = preprocess_body_with_includes(
+        body_source.as_bytes(),
+        &env,
+        substitute_active_lines,
+        includes,
+    )?;
 
     let mut output = format!(".SUBCKT {name} {nodes}\n");
     output.push_str(std::str::from_utf8(&body.bytes)?);

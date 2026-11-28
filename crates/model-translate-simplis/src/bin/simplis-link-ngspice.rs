@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use model_preprocess_command::WorkBudget;
 use model_preprocess_simplis::{
-    LibrarySimulator, ParsedLibrary, SubcircuitCatalog, preprocess_netlist_linked,
+    LibrarySimulator, ParsedLibrary, SubcircuitCatalog, preprocess_netlist_linked_at,
 };
 use model_translate_simplis::{
     capture_passive_initial_conditions, lower_simetrix_linked_runtime,
@@ -169,7 +169,8 @@ fn main() -> Result<()> {
         definitions = definitions.saturating_add(added);
     }
 
-    let mut linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
+    let mut linked =
+        preprocess_netlist_linked_at(&input_bytes, &catalog, Some(&input.to_string_lossy()))?;
     if simulator == LibrarySimulator::Simetrix {
         lower_simetrix_linked_runtime(&mut linked, None, &budget)?;
         let initialization = capture_passive_initial_conditions(&mut linked, &budget)?;

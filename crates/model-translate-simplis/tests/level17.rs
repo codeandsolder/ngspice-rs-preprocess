@@ -346,9 +346,10 @@ fn level17_global_models_bind_across_linked_artifacts() -> Result<()> {
         LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
     };
     let linked = LinkedPreprocessedNetlist {
+        included_sources: Default::default(),
         root_bytes: b"* Linked global source model\nVg g 0 3\nVroot d 0 1\nVchild d2 0 1\n.model RootMos NMOS (LEVEL=17 VTO=2 KP=.1)\nM1 d g 0 0 LibraryMos\nX1 d2 g 0 cell\n.include \"models.lib\"\n.end\n".to_vec(),
         libraries: vec![LinkedGeneratedLibrary {
-            source_id: "synthetic-models".into(), source_name: "models.lb".into(), filename: "models.lib".into(), dependencies: vec![],
+            source_id: "synthetic-models".into(), source_name: "models.lb".into(), filename: "models.lib".into(), dependencies: vec![], included_sources: Default::default(),
             bytes: b".model LibraryMos NMOS (LEVEL=17 VTO=1 KP=.1)\n.subckt cell d g s\nM1 d g s s RootMos\n.ends cell\n".to_vec(),
         }],
         stats: NetlistPreprocessStats { root_specializations: 0, generated_subcircuits: 1, local_parameterized_definitions_removed: 0 },
@@ -373,6 +374,34 @@ fn level17_global_models_bind_across_linked_artifacts() -> Result<()> {
     ensure!(
         translate_simplis_linked_netlist(&ambiguous, &WorkBudget::default()).is_err(),
         "conflicting global model accepted"
+    );
+    Ok(())
+}
+
+#[test]
+fn linked_source_include_specializations_match_analytic_resistance() -> Result<()> {
+    use model_preprocess_simplis::{SubcircuitCatalog, preprocess_netlist_linked};
+    let budget = WorkBudget::default();
+    let mut catalog = SubcircuitCatalog::new().with_budget(budget.clone());
+    catalog.add_library_named(
+        "parent.lb",
+        b".SUBCKT LOAD a b VARS: A=1\n.include resistance.lb\nR1 a b {B}\n.ENDS\n",
+    )?;
+    catalog.add_library_named("resistance.lb", b".VAR B={A+1}\n")?;
+    let source = b"* Explicit include occurrence witness\nV1 a 0 1\nV2 b 0 1\nX1 a 0 LOAD VARS: A=1\nX2 b 0 LOAD VARS: A=4\n.END\n";
+    let linked = preprocess_netlist_linked(source, &catalog)?;
+    let (root, libraries) = translate_simplis_linked_netlist(&linked, &budget)?;
+    let companions = linked
+        .libraries
+        .iter()
+        .zip(&libraries)
+        .map(|(library, translated)| (library.filename.as_str(), translated.bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let actual = run_native(&root.bytes, &companions, "op", "i(V1) i(V2)")?;
+    let row = actual.last().context("missing linked OP")?;
+    ensure!(
+        row.len() == 3 && (row[1] + 0.5).abs() < 1e-8 && (row[2] + 0.2).abs() < 1e-8,
+        "resistance witness: {row:?}"
     );
     Ok(())
 }

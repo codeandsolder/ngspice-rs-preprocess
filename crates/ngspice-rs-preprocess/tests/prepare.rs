@@ -312,3 +312,49 @@ fn virtual_source_can_reference_its_own_named_section_and_detect_cycles() -> Res
     assert!(format!("{error:#}").contains("recursive ngspice source include"));
     Ok(())
 }
+
+#[test]
+fn explicit_source_include_provenance_retains_the_selected_origin() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let left = dir.path().join("left");
+    let right = dir.path().join("right");
+    fs::create_dir(&left)?;
+    fs::create_dir(&right)?;
+    let selected = left.join("values.lb");
+    let unused = right.join("values.lb");
+    for path in [&selected, &unused] {
+        fs::write(path, b".VAR R=47\n")?;
+    }
+    let root = left.join("root.net");
+    fs::write(
+        &root,
+        b"* relative source include\n.include values.lb\nR1 a 0 {R}\n.end\n",
+    )?;
+    for parsed in [false, true] {
+        let mut req = request(InputFormat::SimplisDeck, &root);
+        for path in [&selected, &unused] {
+            let input = if parsed {
+                let bundle = prepare_default(&request(InputFormat::SimplisLibrary, path))?;
+                LibraryInput::Parsed(ParsedLibrary::from_json(&bundle.primary.bytes)?)
+            } else {
+                LibraryInput::Source(SourceInput::File(path.clone()))
+            };
+            req.libraries.push(input);
+        }
+        let output = prepare_default(&req)?;
+        assert!(std::str::from_utf8(&output.primary.bytes)?.contains("R1 a 0 47"));
+        assert!(output.companions.is_empty());
+        let Provenance::Generated { sources, .. } = &output.primary.provenance else {
+            anyhow::bail!("missing generated origins");
+        };
+        let expected = [root.canonicalize()?, selected.canonicalize()?];
+        for path in &expected {
+            assert!(
+                sources.contains(&path.to_string_lossy().into_owned()),
+                "{sources:?}"
+            );
+        }
+        assert_eq!(sources.len(), 2);
+    }
+    Ok(())
+}
