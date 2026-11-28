@@ -26,20 +26,25 @@ fn restrict_step(scale: f64, raw: f64, previous: f64, limited: f64) -> f64 {
     let fraction = if delta.is_finite() && allowed.is_finite() {
         allowed / delta
     } else {
-        (limited * 0.5 - previous * 0.5) / (raw * 0.5 - previous * 0.5)
+        previous.mul_add(-0.5, limited * 0.5) / previous.mul_add(-0.5, raw * 0.5)
     };
     scale.min(fraction.clamp(0., 1.))
 }
 
-fn fet_step(vgs: f64, vds: f64, old_vgs: f64, old_vds: f64, vto: f64) -> f64 {
+fn fet_step(vgs: f64, vds: f64, previous_gate: f64, previous_drain: f64, vto: f64) -> f64 {
     // Select the conducting end from the previous point, then restrict each
     // independent controlling voltage along the same proposed direction.
     // Reconstructing C's independently limited VGS/VDS pair could demand
     // a drain step opposite to the proposal when the gate is also limited.
-    let (gate, old_gate, drain, old_drain) = if old_vds >= 0. {
-        (vgs, old_vgs, vds, old_vds)
+    let (gate, old_gate, drain, old_drain) = if previous_drain >= 0. {
+        (vgs, previous_gate, vds, previous_drain)
     } else {
-        (vgs - vds, old_vgs - old_vds, -vds, -old_vds)
+        (
+            vgs - vds,
+            previous_gate - previous_drain,
+            -vds,
+            -previous_drain,
+        )
     };
     let scale = restrict_step(1., gate, old_gate, fetlim(gate, old_gate, vto));
     restrict_step(scale, drain, old_drain, limvds(drain, old_drain))
