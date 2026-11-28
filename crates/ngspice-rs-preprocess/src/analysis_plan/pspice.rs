@@ -241,27 +241,47 @@ pub(super) fn statistical_directive(name: &str) -> bool {
     )
 }
 
-/// Preserve the original transient operands. The print interval, bias policy,
-/// output gate and adaptive step ceiling (possibly SCHEDULE) are not a native
-/// .TRAN default. They must be bound by the source-aware consumer.
-pub(super) fn validate_transient(args: &[String]) -> Result<()> {
-    let timing = if args
+/// Keep source timing operands for candidate binding, but capture the
+/// bias-skip selector once as a typed flag. The original source statement
+/// retains SKIPBP and the consumer uses the flag with the passive IC policy.
+pub(super) fn transient(mut args: Vec<String>) -> Result<(Vec<String>, bool)> {
+    let uic = args
         .last()
-        .is_some_and(|field| field.eq_ignore_ascii_case("SKIPBP"))
-    {
-        &args[..args.len() - 1]
-    } else {
-        args
-    };
+        .is_some_and(|field| field.eq_ignore_ascii_case("SKIPBP"));
+    if uic {
+        args.pop();
+    }
     ensure!(
-        (2..=4).contains(&timing.len()) && timing.iter().all(|field| scalar(field)),
+        (2..=4).contains(&args.len()) && args.iter().all(|field| scalar(field)),
         "PSpice TRAN requires print step, stop, optional output start/ceiling, and optional SKIPBP"
     );
-    Ok(())
+    Ok((args, uic))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transient_bias_flag_is_not_a_timing_operand() -> Result<()> {
+        for (text, skip) in [
+            (".TRAN 1u 1m", false),
+            (".TRAN 1u 1m skipbp", true),
+            (".TRAN/OP 1u 1m SKIPBP", true),
+        ] {
+            let (timing, flag) = super::transient(super::arguments(text)?)?;
+            assert_eq!(timing, ["1u", "1m"]);
+            assert_eq!(flag, skip);
+        }
+        for text in [
+            ".TRAN 1u 1m UIC",
+            ".TRAN 1u 1m SKIPBP SKIPBP",
+            ".TRAN 1u SKIPBP",
+            ".TRAN SKIPBP 1u 1m",
+        ] {
+            assert!(super::transient(super::arguments(text)?).is_err(), "{text}");
+        }
+        Ok(())
+    }
+
     use super::*;
     use model_preprocess_command::WorkBudget;
 

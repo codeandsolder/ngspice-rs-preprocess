@@ -136,7 +136,7 @@ pub enum Directive {
         analysis: AnalysisKind,
         /// Canonical native arguments for native requests; otherwise source operands.
         arguments: Vec<String>,
-        /// Native transient UIC flag, removed from arguments.
+        /// Skip transient bias; native UIC or PSpice SKIPBP, removed from arguments.
         uic: bool,
     },
     /// Independent analysis repetitions or continuation coordinates.
@@ -958,12 +958,11 @@ fn pspice_directive(
             Directive::Sweep { axis }
         }
         ".TRAN" | ".TRAN/OP" => {
-            let args = pspice::arguments(statement)?;
-            pspice::validate_transient(&args)?;
+            let (arguments, uic) = pspice::transient(pspice::arguments(statement)?)?;
             Directive::Analysis {
                 analysis: AnalysisKind::Transient,
-                arguments: args,
-                uic: false,
+                arguments,
+                uic,
             }
         }
         _ => return Ok(None),

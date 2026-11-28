@@ -517,8 +517,9 @@ endpoints, and explicit sweep lists preserve monotonic source order. A
 nested DC request retains its continuation axes independently of STEP
 and multi-temperature repetition. Conflicting sweep declarations are
 rejected rather than multiplied indiscriminately. PSpice transient
-operands (including SKIPBP and scheduled ceilings) retain their original
-dialect for consumer binding. Statistical Monte Carlo, distribution and
+timing operands (including scheduled ceilings) retain their original
+dialect for consumer binding. SKIPBP is represented by the typed bias-skip
+flag, with the original statement retained for provenance. Statistical Monte Carlo, distribution and
 worst-case directives require a separate realization policy; they are
 not treated as ordinary numerical sweeps.
 
