@@ -21,15 +21,84 @@ use crate::{ModelError, ModelVariant, MosPolarity};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreparedHiSimHvChannelElectrostatics {
     variant: ModelVariant,
-    material: PreparedHiSimHvElectrostaticMaterial,
-    oxide: PreparedHiSimHvQuantumOxide,
-    threshold: PreparedHiSimHvThreshold,
-    poly: PreparedHiSimHvPolyDepletion,
+    frontend: ElectrostaticFrontEnd,
     modulation: PreparedHiSimHvChannelModulation,
     charge_area: PreparedHiSimHvChannelChargeArea,
-    symmetry_voltage: f64,
     source_symmetry_voltage: f64,
     minimum_gate_voltage: f64,
+}
+
+/// The common source-model front end, prior to the choice of Poisson law.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ElectrostaticFrontEnd {
+    pub(super) material: PreparedHiSimHvElectrostaticMaterial,
+    pub(super) oxide: PreparedHiSimHvQuantumOxide,
+    threshold: PreparedHiSimHvThreshold,
+    poly: PreparedHiSimHvPolyDepletion,
+    symmetry_voltage: f64,
+}
+
+/// Common local state shared by normal and depletion channels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiSimHvElectrostaticFrontEndPoint {
+    pub material: HiSimHvElectrostaticMaterialPoint,
+    pub conditioned: HiSimHvBiasConditioningPoint,
+    pub oxide: HiSimHvQuantumOxidePoint,
+    pub threshold: HiSimHvThresholdPoint,
+    pub poly: HiSimHvPolyDepletionPoint,
+}
+
+impl ElectrostaticFrontEnd {
+    pub(super) fn prepare(
+        model: &PreparedHiSimHvModel,
+        instance: &PreparedHiSimHvInstance,
+        material: PreparedHiSimHvElectrostaticMaterial,
+    ) -> Result<Self, ModelError> {
+        Ok(Self {
+            material,
+            oxide: prepare_hisim_hv_quantum_oxide(model, instance)?,
+            threshold: prepare_hisim_hv_threshold(model, instance)?,
+            poly: prepare_hisim_hv_poly_depletion(model, instance)?,
+            symmetry_voltage: model_real(model, "vzadd0")?,
+        })
+    }
+
+    pub(super) fn evaluate(
+        &self,
+        bias: HiSimHvIntrinsicBias,
+        temperature: &PreparedHiSimHvTemperature,
+    ) -> Result<HiSimHvElectrostaticFrontEndPoint, ModelError> {
+        let material = self.material.evaluate(temperature)?;
+        let conditioned = evaluate_hisim_hv_bias_conditioning(&HiSimHvBiasConditioningInputs {
+            bias,
+            twice_bulk_potential: material.twice_bulk_potential,
+            reference_channel_potential: self.material.reference_channel_potential,
+            reference_bulk_potential: self.material.reference_bulk_potential,
+            symmetry_voltage: self.symmetry_voltage,
+        })?;
+        let oxide = self.oxide.evaluate(
+            bias,
+            conditioned.modified_gate,
+            material.poisson_coefficient,
+        )?;
+        let threshold = self.threshold.evaluate(
+            &conditioned,
+            &oxide,
+            &material,
+            temperature,
+            self.oxide.zero_field_capacitance(),
+        )?;
+        let poly = self
+            .poly
+            .evaluate(bias, &conditioned, threshold.total_shift, temperature)?;
+        Ok(HiSimHvElectrostaticFrontEndPoint {
+            material,
+            conditioned,
+            oxide,
+            threshold,
+            poly,
+        })
+    }
 }
 
 /// Coupled electrostatic state consumed by the intrinsic transport and leakage
@@ -72,17 +141,12 @@ pub fn prepare_hisim_hv_channel_electrostatics(
     } else {
         0.
     };
-    let symmetry_voltage = model_real(model, "vzadd0")?;
     let (modulation, charge_area) = prepare_hisim_hv_channel_modulation(model, instance)?;
     Ok(PreparedHiSimHvChannelElectrostatics {
         variant: model.variant(),
         modulation,
         charge_area,
-        material,
-        oxide: prepare_hisim_hv_quantum_oxide(model, instance)?,
-        threshold: prepare_hisim_hv_threshold(model, instance)?,
-        poly: prepare_hisim_hv_poly_depletion(model, instance)?,
-        symmetry_voltage,
+        frontend: ElectrostaticFrontEnd::prepare(model, instance, material)?,
         source_symmetry_voltage: model_real(model, "pzadd0")?,
         minimum_gate_voltage,
     })
@@ -98,29 +162,13 @@ impl PreparedHiSimHvChannelElectrostatics {
         bias: HiSimHvIntrinsicBias,
         temperature: &PreparedHiSimHvTemperature,
     ) -> Result<HiSimHvChannelElectrostaticPoint, ModelError> {
-        let material = self.material.evaluate(temperature)?;
-        let conditioned = evaluate_hisim_hv_bias_conditioning(&HiSimHvBiasConditioningInputs {
-            bias,
-            twice_bulk_potential: material.twice_bulk_potential,
-            reference_channel_potential: self.material.reference_channel_potential,
-            reference_bulk_potential: self.material.reference_bulk_potential,
-            symmetry_voltage: self.symmetry_voltage,
-        })?;
-        let oxide = self.oxide.evaluate(
-            bias,
-            conditioned.modified_gate,
-            material.poisson_coefficient,
-        )?;
-        let threshold = self.threshold.evaluate(
-            &conditioned,
-            &oxide,
-            &material,
-            temperature,
-            self.oxide.zero_field_capacitance(),
-        )?;
-        let poly = self
-            .poly
-            .evaluate(bias, &conditioned, threshold.total_shift, temperature)?;
+        let HiSimHvElectrostaticFrontEndPoint {
+            material,
+            conditioned,
+            oxide,
+            threshold,
+            poly,
+        } = self.frontend.evaluate(bias, temperature)?;
         let beta = Jet::coordinate(
             temperature.inverse_thermal_voltage,
             3,
@@ -153,7 +201,7 @@ impl PreparedHiSimHvChannelElectrostatics {
             effective_drain,
             modified_source_surface: modified_source_surface
                 .checked("HiSIM-HV symmetric source surface")?,
-            classical_oxide_capacitance: self.oxide.zero_field_capacitance(),
+            classical_oxide_capacitance: self.frontend.oxide.zero_field_capacitance(),
             charge,
             modulation,
             terminal_charges,
@@ -221,7 +269,7 @@ impl PreparedHiSimHvChannelElectrostatics {
                 thermal_voltage: 1. / beta,
                 oxide_capacitance: oxide.capacitance,
                 charge_density_permittivity: material.charge_density_permittivity,
-                exponent: self.material.drain_smoothing_exponent,
+                exponent: self.frontend.material.drain_smoothing_exponent,
             },
         )?
         .effective_drain;

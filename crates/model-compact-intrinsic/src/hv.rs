@@ -10,6 +10,7 @@ mod channel_correction;
 mod channel_electrostatics;
 mod channel_mobility;
 mod channel_modulation;
+mod depletion_channel;
 mod depletion_drain;
 mod depletion_surface;
 mod depletion_transport;
@@ -59,8 +60,8 @@ pub use channel_charge::{
 };
 pub use channel_correction::HiSimHvChannelCorrectionPoint;
 pub use channel_electrostatics::{
-    HiSimHvChannelElectrostaticPoint, PreparedHiSimHvChannelElectrostatics,
-    prepare_hisim_hv_channel_electrostatics,
+    HiSimHvChannelElectrostaticPoint, HiSimHvElectrostaticFrontEndPoint,
+    PreparedHiSimHvChannelElectrostatics, prepare_hisim_hv_channel_electrostatics,
 };
 pub use channel_mobility::{
     HiSimHvChannelMobilityCoefficients, HiSimHvChannelMobilityInputs, HiSimHvChannelMobilityPoint,
@@ -72,6 +73,10 @@ pub use channel_modulation::{
     HiSimHvChannelModulationInputs, HiSimHvChannelModulationPoint, HiSimHvChannelTerminalCharges,
     PreparedHiSimHvChannelChargeArea, PreparedHiSimHvChannelModulation,
     prepare_hisim_hv_channel_modulation,
+};
+pub use depletion_channel::{
+    HiSimHvDepletionChannelEvaluation, HiSimHvDepletionChannelWithAccessPoint,
+    PreparedHiSimHvDepletionChannel, prepare_hisim_hv_depletion_channel,
 };
 pub use depletion_drain::{
     HiSimHvDepletionDrainInputs, HiSimHvDepletionDrainPoint, evaluate_hisim_hv_depletion_drain,

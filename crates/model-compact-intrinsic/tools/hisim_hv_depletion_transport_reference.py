@@ -11,7 +11,7 @@ def program(root):
     eval_c=source('hsmhv2eval.c')
     macros=eval_c[eval_c.index('#define Fn_CP('):eval_c.index('/*---------------------------------------------------*',eval_c.index('#define Fn_SL_CP('))]
     def values(chunk):
-        chunk = re.sub(r'(?m)^\s*\w+_d\w*\s*(?:/=|=)[^;]*;', '', chunk)
+        chunk = re.sub(r'(?m)^\s*\w+_d(?:V\w+|T)\s*(?:/=|=)[^;]*;', '', chunk)
         return re.sub(r'(?m)^\s*T3\s*=\s*here->HSMHV2_(?:dep)?mphn1[^;]*;', '', chunk)
     surface=dep[dep.index('       Ps0 = phi_s0_DEP ;'):dep.index('     //*  resistor region current.')]
     neutral_start=dep.index('       Qiu = - Qn_res0 ;')

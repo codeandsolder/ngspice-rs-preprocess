@@ -181,9 +181,22 @@ impl PreparedHiSimHvChannelChargeArea {
         self,
         charge: &HiSimHvChannelChargePoint,
     ) -> Result<HiSimHvChannelTerminalCharges, ModelError> {
-        let bulk = -self.area_m2 * charge.bulk_density;
-        let inversion = -self.area_m2 * charge.inversion_density;
-        let drain = inversion * charge.drain_fraction;
+        self.evaluate_densities(
+            charge.bulk_density,
+            charge.inversion_density,
+            charge.drain_fraction,
+        )
+    }
+
+    pub(super) fn evaluate_densities(
+        self,
+        bulk_density: Jet,
+        inversion_density: Jet,
+        drain_fraction: Jet,
+    ) -> Result<HiSimHvChannelTerminalCharges, ModelError> {
+        let bulk = -self.area_m2 * bulk_density;
+        let inversion = -self.area_m2 * inversion_density;
+        let drain = inversion * drain_fraction;
         let source = inversion - drain;
         let gate = -(bulk + inversion);
         Ok(HiSimHvChannelTerminalCharges {

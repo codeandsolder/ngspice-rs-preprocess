@@ -27,6 +27,19 @@ pub struct HiSimHvChannelCorrectionPoint {
     pub ohmic_leakage_a: Jet,
 }
 
+/// Shared physical inputs for the enhancement and depletion channel corrections.
+#[derive(Clone, Copy)]
+pub(super) struct CorrectionInputs {
+    pub(super) bias: HiSimHvIntrinsicBias,
+    pub(super) conditioned: super::HiSimHvBiasConditioningPoint,
+    pub(super) surface: Jet,
+    pub(super) surface_difference: Jet,
+    pub(super) oxide: Jet,
+    pub(super) mobility: Jet,
+    pub(super) length: Jet,
+    pub(super) active: bool,
+}
+
 impl ChannelCorrection {
     pub(super) fn prepare(
         model: &PreparedHiSimHvModel,
@@ -85,18 +98,33 @@ impl ChannelCorrection {
         state: &HiSimHvChannelElectrostaticPoint,
         mobility: &HiSimHvChannelMobilityPoint,
     ) -> Result<HiSimHvChannelCorrectionPoint, ModelError> {
-        let drain = Jet::coordinate(bias.vds, 1, 1.);
+        self.evaluate_core(&CorrectionInputs {
+            bias,
+            conditioned: state.conditioned,
+            surface: state.charge.source_surface,
+            surface_difference: state.charge.surface_difference,
+            oxide: state.oxide.capacitance,
+            mobility: mobility.mobility_m2_per_vs,
+            length: state.modulation.effective_length_m,
+            active: !matches!(
+                state.charge.region,
+                HiSimHvChannelRegion::Accumulation | HiSimHvChannelRegion::NoInversion
+            ),
+        })
+    }
+
+    pub(super) fn evaluate_core(
+        &self,
+        input: &CorrectionInputs,
+    ) -> Result<HiSimHvChannelCorrectionPoint, ModelError> {
+        let drain = Jet::coordinate(input.bias.vds, 1, 1.);
         let leakage = self.ohmic_conductance * drain;
         let zero = Jet::constant(0.);
-        let active = !matches!(
-            state.charge.region,
-            HiSimHvChannelRegion::Accumulation | HiSimHvChannelRegion::NoInversion
-        );
         let mut correction = zero;
-        if active && (self.punchthrough != 0. || self.drain_induced != 0.) {
-            let conditioned = state.conditioned;
-            let surface = state.charge.source_surface;
-            let difference = state.charge.surface_difference;
+        if input.active && (self.punchthrough != 0. || self.drain_induced != 0.) {
+            let conditioned = input.conditioned;
+            let surface = input.surface;
+            let difference = input.surface_difference;
             let drain_modified = conditioned.modified_drain;
             let mut coefficient = self.drain_induced * drain_modified;
             if self.punchthrough != 0. {
@@ -115,11 +143,11 @@ impl ChannelCorrection {
             if coefficient.value > 0. {
                 // beta cancels between Idd1 and the betaWL transport factor.
                 correction = self.width_multiplicity
-                    * state.oxide.capacitance
+                    * input.oxide
                     * difference
                     * coefficient
-                    * mobility.mobility_m2_per_vs
-                    / state.modulation.effective_length_m;
+                    * input.mobility
+                    / input.length;
             }
         }
         Ok(HiSimHvChannelCorrectionPoint {
