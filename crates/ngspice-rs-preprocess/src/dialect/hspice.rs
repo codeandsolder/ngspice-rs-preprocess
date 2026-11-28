@@ -8,7 +8,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
-    linked_source::RootKind, model_card::parse_parameter_fields, statement_token_spans,
+    linked_source::RootKind,
+    model_card::{
+        FunctionSignature, parse_function_signature, parse_parameter_declarations,
+        parse_parameter_fields,
+    },
+    statement_token_spans,
 };
 use model_preprocess_simplis::{
     lower_spice_expression,
@@ -294,6 +299,88 @@ fn map_values(
     Ok(output)
 }
 
+fn lower_function(
+    signature: &FunctionSignature,
+    body: &str,
+    context: DialectContext,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<String> {
+    budget.charge(Resource::ScannedBytes, body.len())?;
+    let body = body.trim().trim_start_matches('=').trim();
+    ensure!(!body.is_empty(), "empty HSPICE function body");
+    let value = lower_spice_expression(body, context, limit, budget)?;
+    let value = value
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .unwrap_or(&value);
+    budget.charge(
+        Resource::EmittedBytes,
+        signature
+            .name
+            .len()
+            .saturating_add(value.len())
+            .saturating_add(
+                signature
+                    .formals
+                    .iter()
+                    .map(|formal| formal.len().saturating_add(1))
+                    .sum::<usize>(),
+            )
+            .saturating_add(12),
+    )?;
+    let output = format!(
+        ".func {}({}) {{{value}}}",
+        signature.name,
+        signature.formals.join(",")
+    );
+    ensure!(
+        output.len() <= limit,
+        "HSPICE function declaration byte budget exceeded"
+    );
+    Ok(output)
+}
+
+fn lower_parameter_functions(
+    text: &str,
+    context: DialectContext,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<Option<Vec<String>>> {
+    let tail = text
+        .split_once(char::is_whitespace)
+        .context("empty parameter declaration")?
+        .1;
+    budget.charge(Resource::ScannedBytes, tail.len())?;
+    let declarations = parse_parameter_declarations(tail)?;
+    budget.charge(Resource::GeneratedNodes, declarations.len())?;
+    if declarations
+        .iter()
+        .all(|declaration| declaration.function.is_none())
+    {
+        return Ok(None);
+    }
+    let mut output = Vec::new();
+    let mut remaining = limit;
+    for declaration in declarations {
+        let value = declaration
+            .field
+            .expression
+            .context("missing HSPICE parameter value")?;
+        let line = if let Some(signature) = declaration.function {
+            lower_function(&signature, &value, context, remaining, budget)?
+        } else {
+            let lowered = lower_spice_expression(&value, context, remaining, budget)?;
+            format!(".param {}={lowered}", declaration.field.name)
+        };
+        remaining = remaining
+            .checked_sub(line.len().saturating_add(1))
+            .context("HSPICE parameter declarations exceed source byte budget")?;
+        output.push(line);
+    }
+    Ok(Some(output))
+}
+
 fn lower_card(
     text: &str,
     context: DialectContext,
@@ -315,10 +402,20 @@ fn lower_card(
         state.depth = state.depth.checked_sub(1).context("unmatched .ENDS")?;
     }
     if state.depth > 0
-        && (matches!(command.as_str(), ".FUNC" | ".OPTION" | ".OPTIONS" | ".OPT")
+        && (matches!(command.as_str(), ".OPTION" | ".OPTIONS" | ".OPT")
             || matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN" | ".TEMP"))
     {
         bail!("HSPICE scoped parameters/options require hierarchy lowering");
+    }
+    if command == ".FUNC" {
+        let tail = text
+            .split_once(char::is_whitespace)
+            .context("empty function declaration")?
+            .1;
+        budget.charge(Resource::ScannedBytes, tail.len())?;
+        let (signature, body) = parse_function_signature(tail)?;
+        budget.charge(Resource::GeneratedNodes, signature.formals.len())?;
+        return lower_function(&signature, body, context, limit, budget);
     }
     if !command.starts_with('.') {
         let kind = command.as_bytes()[0];
@@ -420,6 +517,26 @@ type LoweredExpansion = (
     DeckOptions,
 );
 
+fn append_lowered_line(
+    bytes: &mut Vec<u8>,
+    origins: &mut Vec<crate::OriginLine>,
+    text: &str,
+    origin: crate::OriginLine,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<()> {
+    ensure!(
+        text.len().saturating_add(1) <= limit.saturating_sub(bytes.len()),
+        "standalone SPICE output byte budget exceeded"
+    );
+    budget.charge(Resource::EmittedBytes, text.len().saturating_add(1))?;
+    budget.charge(Resource::GeneratedNodes, 1)?;
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.push(b'\n');
+    origins.push(origin);
+    Ok(())
+}
+
 fn lower_expansion(
     statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
     input_origins: Vec<crate::OriginLine>,
@@ -442,6 +559,30 @@ fn lower_expansion(
     for (index, (statement, origin)) in statements.iter().zip(input_origins).enumerate() {
         budget.charge(Resource::Statements, 1)?;
         budget.charge(Resource::ScannedBytes, statement.text.len())?;
+        if index != 0
+            && statement.context.language == SourceLanguage::Hspice
+            && analysis_plan::command(&statement.text) == ".PARAM"
+            && let Some(lines) = lower_parameter_functions(
+                &statement.text,
+                statement.context,
+                limit.saturating_sub(bytes.len()),
+                budget,
+            )
+            .with_context(|| format!("{}:{}", statement.source, statement.first_line))?
+        {
+            for line in lines {
+                budget.charge(Resource::EmittedBytes, origin.source.as_os_str().len())?;
+                append_lowered_line(
+                    &mut bytes,
+                    &mut origins,
+                    &line,
+                    origin.clone(),
+                    limit,
+                    budget,
+                )?;
+            }
+            continue;
+        }
         let text = if index == 0 {
             // Native ngspice may expand resource directives before discarding
             // the title. Protect the title without changing its source span.
@@ -490,15 +631,7 @@ fn lower_expansion(
                 )
             })?
         };
-        ensure!(
-            text.len().saturating_add(1) <= limit.saturating_sub(bytes.len()),
-            "standalone SPICE output byte budget exceeded"
-        );
-        budget.charge(Resource::EmittedBytes, text.len().saturating_add(1))?;
-        budget.charge(Resource::GeneratedNodes, 1)?;
-        bytes.extend_from_slice(text.as_bytes());
-        bytes.push(b'\n');
-        origins.push(origin);
+        append_lowered_line(&mut bytes, &mut origins, &text, origin, limit, budget)?;
     }
     ensure!(state.depth == 0, "unclosed HSPICE subcircuit");
     Ok((bytes, origins, selections, state))

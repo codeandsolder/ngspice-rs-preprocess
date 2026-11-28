@@ -115,10 +115,12 @@ impl Scalar {
 fn contains_s(expr: &Expr, budget: &WorkBudget) -> Result<bool> {
     budget.charge(Resource::EvaluationSteps, 1)?;
     Ok(match expr {
-        Expr::Number(_) => false,
+        Expr::Number(_) | Expr::SourceAtom(_) => false,
         Expr::Symbol(name) => name == "s",
-        Expr::Unary(_, value) => contains_s(value, budget)?,
-        Expr::Binary(_, left, right) => contains_s(left, budget)? || contains_s(right, budget)?,
+        Expr::Unary(_, value) | Expr::ParameterGroup(value) => contains_s(value, budget)?,
+        Expr::Binary(_, left, right) | Expr::SourceBinary(_, left, right) => {
+            contains_s(left, budget)? || contains_s(right, budget)?
+        }
         Expr::Conditional(condition, yes, no) => {
             contains_s(condition, budget)? || contains_s(yes, budget)? || contains_s(no, budget)?
         }
@@ -151,6 +153,9 @@ fn scalar_text(expr: &Expr, text: &mut String, budget: &WorkBudget) -> Result<()
             append_scalar(text, &scalar.0, budget)?;
         }
         Expr::Symbol(name) => append_scalar(text, name, budget)?,
+        Expr::SourceAtom(_) | Expr::ParameterGroup(_) | Expr::SourceBinary(_, _, _) => {
+            bail!("source-only expression cannot be a native Laplace coefficient")
+        }
         Expr::Unary(op, value) => {
             append_scalar(text, "(", budget)?;
             append_scalar(text, op.symbol(), budget)?;

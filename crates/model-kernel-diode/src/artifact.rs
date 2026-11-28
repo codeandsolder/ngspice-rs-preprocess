@@ -10,6 +10,7 @@ use model_kernel_api::{
     ABI_VERSION, Artifact, Binding, Capability, Descriptor, Equation, EquationKind, Error, Kernel,
     Parameter, Point, Result,
     noise::{Injection, Sink, Source},
+    trial::{Convergence, ConvergenceInput, TrialCapabilities, TrialPolicy},
 };
 
 use super::{Instance, ModelError, PreparedInstance, PreparedModel};
@@ -79,6 +80,11 @@ pub fn artifact(
             parameters,
             charge: Capability::Computed,
             noise: Capability::Computed,
+            trial: TrialCapabilities {
+                initialization: TrialPolicy::Kernel,
+                limiting: TrialPolicy::Kernel,
+                convergence: TrialPolicy::Kernel,
+            },
         },
         DiodeKernel {
             model,
@@ -118,6 +124,19 @@ impl DiodeKernel {
             (true, [_, cathode, intrinsic]) => Ok(intrinsic - cathode),
             _ => Err(Error::Shape("diode coordinate count")),
         }
+    }
+
+    fn set_junction_voltage(&self, coordinates: &mut [f64], voltage: f64) -> Result<()> {
+        self.junction_voltage(coordinates)?;
+        let intrinsic = self.junction_anode();
+        let potential = coordinates[1] + voltage;
+        if !potential.is_finite() {
+            return Err(Error::Domain(
+                "nonrepresentable diode trial potential".into(),
+            ));
+        }
+        coordinates[intrinsic] = potential;
+        Ok(())
     }
 }
 
@@ -250,6 +269,56 @@ impl Kernel for DiodeKernel {
             );
         }
         Ok(())
+    }
+
+    fn initialize_trial(&self, prepared: &Self::Prepared, coordinates: &mut [f64]) -> Result<()> {
+        self.set_junction_voltage(coordinates, prepared.initial_junction_voltage())
+    }
+
+    fn limit_trial(
+        &self,
+        prepared: &Self::Prepared,
+        reference: model_kernel_api::trial::TrialReference<'_>,
+        coordinates: &mut [f64],
+    ) -> Result<()> {
+        let raw = self.junction_voltage(coordinates)?;
+        let previous = self.junction_voltage(reference.coordinates())?;
+        let limited = prepared
+            .limit_junction_voltage(raw, previous)
+            .map_err(domain)?;
+        if limited.to_bits() != raw.to_bits() {
+            self.set_junction_voltage(coordinates, limited)?;
+        }
+        Ok(())
+    }
+
+    fn trial_convergence(
+        &self,
+        _prepared: &Self::Prepared,
+        input: ConvergenceInput<'_>,
+    ) -> Result<Convergence> {
+        // The cathode row contains only the negative intrinsic junction
+        // current even when the anode has a separate series resistor.
+        let old_voltage = self.junction_voltage(input.previous.coordinates)?;
+        let new_voltage = self.junction_voltage(input.candidate.coordinates)?;
+        let width = input.previous.coordinates.len();
+        let old_current = *input
+            .previous
+            .residual
+            .get(1)
+            .ok_or(Error::Shape("diode convergence residual"))?;
+        let new_current = *input
+            .candidate
+            .residual
+            .get(1)
+            .ok_or(Error::Shape("diode convergence residual"))?;
+        let derivative = *input
+            .previous
+            .jacobian
+            .get(width + self.junction_anode())
+            .ok_or(Error::Shape("diode convergence Jacobian"))?;
+        let predicted = derivative.mul_add(new_voltage - old_voltage, old_current);
+        input.compare_residual(1, predicted, new_current)
     }
 
     fn evaluate_noise(

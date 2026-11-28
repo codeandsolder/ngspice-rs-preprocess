@@ -268,6 +268,7 @@ pub fn legacy_bsim_artifact(
             parameters,
             charge: Capability::Computed,
             noise: Capability::Computed,
+            trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
         },
         LegacyBsimKernel { model, layout },
     )

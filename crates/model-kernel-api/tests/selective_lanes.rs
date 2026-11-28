@@ -116,6 +116,7 @@ fn artifact(counts: &Arc<Counts>) -> Result<Arc<Artifact<CountingKernel>>> {
             ],
             charge: Capability::Computed,
             noise: Capability::Computed,
+            trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
         },
         CountingKernel(Arc::clone(counts)),
     )

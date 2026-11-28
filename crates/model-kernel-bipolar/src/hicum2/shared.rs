@@ -153,6 +153,7 @@ pub fn artifact(
             parameters,
             charge: Capability::Computed,
             noise: Capability::Computed,
+            trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
         },
         HicumKernel {
             model: *model,

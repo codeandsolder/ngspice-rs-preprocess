@@ -5,7 +5,7 @@ An artifact holds immutable model-specific data and its validated descriptor;
 the circuit engine binds coordinates and owns Newton iteration, numerical
 integration, limiting, accepted/rejected trial state and matrix assembly.
 
-## ABI version 3
+## ABI version 4
 
 The producer supplies a stable content fingerprint and an ordered descriptor.
 Every coordinate declares its physical domain and terminal/hidden binding.
@@ -47,7 +47,9 @@ Source-level parameter parsing is not part of this interface.
   instances into the tile without invoking physical preparation again.
   Scalar and noise evaluation of grouped instances use `evaluate_lane`
   and `evaluate_lane_noise` on that same tile, with the same validation as
-  standalone evaluation. No lane handle can outlive its tile or be
+  standalone evaluation. The trial equivalents `linearize_lane_trial` and
+  `check_lane_trial_convergence` use that lane's current prepared data,
+  including after a committed selective replacement. No lane handle can outlive its tile or be
   retained across a replacement; ordinals are local to the owning tile.
 - Static residual and Jacobian are mandatory. Charge/flux and noise can be
   computed, explicitly zero, or unavailable; unavailable is never
@@ -71,3 +73,5 @@ cargo test --locked -p model-kernel-vdmos --test ngspice47 -- --ignored
 The VDMOS and SIMetrix level-1 diode artifacts implement this contract.
 Their circuit-coupled engine integration is a separate task. This is a native Rust source-level
 contract, not a stable dynamic-library ABI.
+
+ABI 4 adds explicit family trial capabilities. See [prepared trial policy](../../docs/prepared-trial-policy.md) for engine integration, numerical units, and failure/acceptance semantics.

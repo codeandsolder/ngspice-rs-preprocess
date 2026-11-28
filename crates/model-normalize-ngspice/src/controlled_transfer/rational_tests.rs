@@ -105,7 +105,12 @@ fn malformed_or_nonrational_forms_fail_without_changing_ordinary_sources() -> Re
 #[test]
 fn lowering_keeps_scope_branch_names_source_lines_and_collision_free_ids() -> Result<()> {
     let input = b"rational transfer\r\n.subckt filter in ref out p=2 g=3\r\nE1 out ref LAPLACE {V(in,ref)} =\r\n+ {g/(s+p)} ; source\r\nR1 __laplace_2_out 0 1k\r\n.ends filter\r\n.control\r\necho laplace\r\n.endc\r\n.end\r\n";
-    let result = normalize_mapped(input, RootKind::Deck, &WorkBudget::default())?;
+    let result = normalize_mapped(
+        input,
+        RootKind::Deck,
+        crate::NormalizationDialect::Native,
+        &WorkBudget::default(),
+    )?;
     let text = std::str::from_utf8(&result.model.bytes)?;
     assert!(
         text.contains("E1 out ref __laplace_2_out_1 0 1\r\n"),
@@ -118,11 +123,17 @@ fn lowering_keeps_scope_branch_names_source_lines_and_collision_free_ids() -> Re
     assert!(text.contains("; source"));
     assert!(text.contains("echo laplace"));
     assert_eq!(result.input_lines, [1, 2, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10]);
-    let repeated = normalize_mapped(&result.model.bytes, RootKind::Deck, &WorkBudget::default())?;
+    let repeated = normalize_mapped(
+        &result.model.bytes,
+        RootKind::Deck,
+        crate::NormalizationDialect::Native,
+        &WorkBudget::default(),
+    )?;
     assert_eq!(repeated.model.bytes, result.model.bytes);
     let bad = normalize_mapped(
         b"title\nL1 a 0 1m Rser=1\nE1 b 0 a 0 Laplace={exp(-s)}\n.end\n",
         RootKind::Deck,
+        crate::NormalizationDialect::Native,
         &WorkBudget::default(),
     );
     assert!(format!("{:#}", bad.err().context("expected positioned failure")?).contains("line 3"));
@@ -150,7 +161,12 @@ fn native_rational_reference_ac_transient_scope_and_current_polarity() -> Result
     // Independent first-order oracle, nonzero common mode and distinct
     // lexical overrides of one physical subcircuit.
     let source = b"Rational scoped reference\n.subckt filter p n out gout params: tau=1m gainv=2\nE1 out 0 LAPLACE {v(p,n)}={gainv/(1+tau*s)}\nG1 gout 0 p n Laplace={gainv/(1+tau*s)}\n.ends filter\nV1 in ref dc 0 ac 1 PWL(0 0 1u 1 5m 1)\nVref ref 0 2\nX1 in ref out1 gout1 filter tau=1m gainv=2\nX2 in ref out2 gout2 filter tau=2m gainv=3\nR1 out1 0 1k\nR2 out2 0 1k\nRg1 gout1 0 1\nRg2 gout2 0 1\n.options reltol=1e-7 abstol=1e-12 vntol=1e-9\n.control\nset wr_singlescale\nset wr_vecnames\nac lin 5 100 500\nwrdata ac.dat v(out1) v(gout1) v(out2) v(gout2)\ntran 0.1u 5m 0 0.1u\nwrdata tran.dat v(out1) v(gout1) v(out2) v(gout2)\nquit\n.endc\n.end\n";
-    let normalized = normalize_mapped(source, RootKind::Deck, &WorkBudget::default())?;
+    let normalized = normalize_mapped(
+        source,
+        RootKind::Deck,
+        crate::NormalizationDialect::Native,
+        &WorkBudget::default(),
+    )?;
     fs::write(
         directory.path().join("reference.cir"),
         normalized.model.bytes,

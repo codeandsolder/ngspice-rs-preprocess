@@ -3,7 +3,7 @@
 //! Electrical instance names and terminal identities are never flattened.
 use super::{analysis_plan, map_values, models, mos};
 use crate::OriginLine;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
     linked_source::RootKind,
     model_card::{parse_assignments, parse_model_card, positional_prefix},
@@ -12,8 +12,14 @@ use model_normalize_ngspice::{
 };
 use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::rewrite_parameter_symbols;
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+mod functions;
+use functions::{BindContext, Functions, Scope};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Precedence {
@@ -38,6 +44,7 @@ type Parameters = BTreeMap<String, Parameter>;
 struct Definition {
     body: Vec<usize>,
     parameters: Parameters,
+    functions: Functions,
 }
 
 fn collect_parameters(
@@ -119,6 +126,8 @@ fn collect_definitions(
                     &mut definitions[owner].parameters,
                     budget,
                 )?;
+            } else if analysis_plan::command(text) == ".FUNC" {
+                functions::collect(text, line, &mut definitions[owner].functions, budget)?;
             }
         }
     }
@@ -134,14 +143,16 @@ fn inner(expression: &str) -> &str {
         .unwrap_or_else(|| expression.trim())
 }
 
-fn bind_values(text: &str, names: &Names, limit: usize, budget: &WorkBudget) -> Result<String> {
+fn bind_values(text: &str, scope: &Scope, limit: usize, budget: &WorkBudget) -> Result<String> {
     map_values(text, limit, budget, |value, remaining| {
         // Explicit braces make standalone positional parameters native values;
         // the common expression scanner handles expressions without renaming
         // node/current probes, function names or assignment destinations.
         budget.charge(Resource::EvaluationSteps, value.len())?;
+        let value = scope.calls(value)?;
         budget.charge(Resource::EmittedBytes, value.len())?;
-        let tokens = statement_token_spans(value)?;
+        let tokens = statement_token_spans(&value)?;
+        let names = &scope.names;
         let mut output = String::new();
         let mut previous = 0;
         for (index, range) in tokens.iter().enumerate() {
@@ -254,6 +265,7 @@ struct Binder<'a> {
     index: SubcircuitIndex,
     lines: &'a [&'a str],
     definitions: Vec<Definition>,
+    known_functions: Arc<BTreeSet<String>>,
     precedence: Precedence,
     xmult_in_exp: bool,
     prefix: String,
@@ -298,11 +310,36 @@ impl Binder<'_> {
         Ok(())
     }
 
-    fn visible(&mut self, scope: usize, parent: &Names, actuals: Parameters) -> Result<Names> {
+    fn bind_scope(&mut self, scope: usize, names: Names, parent: Option<&Scope>) -> Result<Scope> {
+        let budget = self.budget.clone();
+        functions::charge_declarations(&self.definitions[scope].functions, &budget)?;
+        let local = self.definitions[scope].functions.clone();
+        let precedence = self.precedence;
+        let limit = self.limit.saturating_sub(self.emitted_bytes);
+        let (scope, rows) = Scope::bind(
+            names,
+            parent,
+            local,
+            BindContext {
+                precedence,
+                known: Arc::clone(&self.known_functions),
+                limit,
+                budget: &budget,
+            },
+            |kind| self.fresh(kind),
+        )?;
+        for (text, line) in rows {
+            let row = self.account(text, line)?;
+            self.parameters.push(row);
+        }
+        Ok(scope)
+    }
+
+    fn visible(&mut self, scope: usize, parent: &Scope, actuals: Parameters) -> Result<Scope> {
         let parameters = &self.definitions[scope].parameters;
         self.budget.charge(
             Resource::GeneratedNodes,
-            parameters.len().saturating_add(parent.len()),
+            parameters.len().saturating_add(parent.names.len()),
         )?;
         for (name, parameter) in parameters {
             self.budget.charge(
@@ -310,7 +347,7 @@ impl Binder<'_> {
                 name.len().saturating_add(parameter.value.len()),
             )?;
         }
-        for (name, alias) in parent {
+        for (name, alias) in &parent.names {
             self.budget.charge(
                 Resource::EmittedBytes,
                 name.len().saturating_add(alias.len()),
@@ -319,22 +356,22 @@ impl Binder<'_> {
         let mut definitions = parameters.clone();
         definitions.extend(actuals);
         if self.precedence == Precedence::Global {
-            definitions.retain(|name, _| !parent.contains_key(name));
+            definitions.retain(|name, _| !parent.names.contains_key(name));
         }
-        let mut names = parent.clone();
+        let mut names = parent.names.clone();
         for name in definitions.keys() {
             names.insert(name.clone(), self.fresh('p')?);
         }
+        let scope = self.bind_scope(scope, names, Some(parent))?;
         for (name, parameter) in definitions {
-            let visible = if parameter.actual { parent } else { &names };
-            let expression =
-                rewrite_parameter_symbols(&parameter.value, visible, false, self.budget)?;
-            self.declare(&names[&name], &expression, parameter.line)?;
+            let visible = if parameter.actual { parent } else { &scope };
+            let expression = visible.expression(&parameter.value)?;
+            self.declare(&scope.names[&name], &expression, parameter.line)?;
         }
-        Ok(names)
+        Ok(scope)
     }
 
-    fn enter_models(&mut self, scope: usize, names: &Names) -> Result<()> {
+    fn enter_models(&mut self, scope: usize, names: &Scope) -> Result<()> {
         let mut aliases = ModelFrame::default();
         self.budget
             .charge(Resource::GeneratedNodes, self.definitions[scope].body.len())?;
@@ -353,9 +390,7 @@ impl Binder<'_> {
                 self.fresh('d')?
             };
             aliases.insert(card.name.to_ascii_uppercase(), alias.clone(), mos)?;
-            let text = models::render(&card, &alias, self.budget, |value| {
-                rewrite_parameter_symbols(value, names, false, self.budget)
-            })?;
+            let text = models::render(&card, &alias, self.budget, |value| names.expression(value))?;
             let row = self.account(text, line)?;
             self.parameters.push(row);
         }
@@ -431,7 +466,7 @@ impl Binder<'_> {
         &mut self,
         owner: usize,
         line: usize,
-        parent: &Names,
+        parent: &Scope,
         inherited_multiplier: Option<&str>,
     ) -> Result<String> {
         let (positional, fields) = positional_prefix(self.lines[line]);
@@ -461,9 +496,7 @@ impl Binder<'_> {
         collect_parameters(fields, line, true, &mut actuals, self.budget)?;
         let local_multiplier = actuals
             .get("M")
-            .map(|parameter| {
-                rewrite_parameter_symbols(&parameter.value, parent, false, self.budget)
-            })
+            .map(|parameter| parent.expression(&parameter.value))
             .transpose()?;
         // The X multiplier affects device multiplicity independently of the
         // ordinary M expression parameter. HSPICE defaults XMULT_IN_EXP to NO.
@@ -498,7 +531,7 @@ impl Binder<'_> {
             self.budget.charge(Resource::Statements, 1)?;
             if matches!(
                 analysis_plan::command(self.lines[card]).as_str(),
-                ".PARAM" | ".MODEL"
+                ".PARAM" | ".MODEL" | ".FUNC"
             ) {
                 continue;
             }
@@ -521,7 +554,7 @@ impl Binder<'_> {
         &mut self,
         owner: usize,
         line: usize,
-        names: &Names,
+        names: &Scope,
         multiplier: Option<&str>,
     ) -> Result<String> {
         let text = self.lines[line];
@@ -531,12 +564,11 @@ impl Binder<'_> {
         if command.starts_with('X') {
             return self.call(owner, line, names, multiplier);
         }
-        if command.is_empty()
-            || command.starts_with('*')
-            || command == ".PARAM"
-            || command == ".FUNC"
-        {
+        if command.is_empty() || command.starts_with('*') {
             return Ok(text.to_owned());
+        }
+        if command == ".PARAM" {
+            return names.calls(text);
         }
         let bound = bind_values(text, names, self.limit, self.budget)?;
         let bound = if command.starts_with(['D', 'M']) {
@@ -554,11 +586,15 @@ impl Binder<'_> {
             .keys()
             .map(|name| (name.clone(), name.clone()))
             .collect();
+        let names = self.bind_scope(0, names, None)?;
         self.enter_models(0, &names)?;
         let mut root = Vec::new();
         let mut ends = Vec::new();
         for card in self.definitions[0].body.clone() {
-            if analysis_plan::command(self.lines[card]) == ".MODEL" {
+            if matches!(
+                analysis_plan::command(self.lines[card]).as_str(),
+                ".MODEL" | ".FUNC"
+            ) {
                 continue;
             }
             let text = self.card(0, card, &names, None)?;
@@ -575,7 +611,8 @@ impl Binder<'_> {
         result.append(&mut self.emitted_definitions);
         result.append(&mut ends);
         super::analysis::validate_dc_sources(&result)?;
-        mos::finish(&mut result, &self.pending_mos, mos_options, self.budget)?;
+        let mos_options = mos_options.rewrite(|value| names.expression(value), self.budget)?;
+        mos::finish(&mut result, &self.pending_mos, &mos_options, self.budget)?;
         Ok(result)
     }
 }
@@ -610,24 +647,22 @@ pub fn bind(
         budget.charge(Resource::ScannedBytes, lower.len())?;
         prefix.push('_');
     }
-    // Source function macros have simulator-specific visibility; don't
-    // silently reinterpret them across specialized parameter scopes.
-    if definitions
-        .iter()
-        .skip(1)
-        .any(|definition| !definition.parameters.is_empty())
-        && lines
-            .iter()
-            .any(|line| analysis_plan::command(line) == ".FUNC")
-    {
-        bail!("HSPICE functions with hierarchical parameters require qualified binding");
+    for definition in &definitions {
+        functions::charge_declarations(&definition.functions, budget)?;
     }
+    let known_functions = Arc::new(
+        definitions
+            .iter()
+            .flat_map(|definition| definition.functions.keys().cloned())
+            .collect(),
+    );
     let binder = Binder {
         budget,
         source: &source,
         index,
         lines: &lines,
         definitions,
+        known_functions,
         precedence,
         xmult_in_exp,
         prefix,

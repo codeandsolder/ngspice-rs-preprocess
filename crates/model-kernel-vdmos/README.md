@@ -198,7 +198,7 @@ These are power-stage reconstructions, not full controller-IC replicas.
 ## Shared prepared artifact
 
 `artifact::artifact` binds the existing immutable prepared model to
-`model-kernel-api` ABI v3. The descriptor exposes three electrical terminals
+`model-kernel-api` ABI v4. The descriptor exposes three electrical terminals
 and, when enabled, junction and case thermal terminals in absolute kelvin.
 Positive series resistances add local electrical coordinates, while exact
 zero-ohm branches coalesce at preparation. The recovery coordinate, when

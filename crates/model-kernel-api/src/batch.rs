@@ -274,6 +274,82 @@ impl<K: Kernel> PreparedTile<K> {
             .evaluate_noise_data(data, coordinates, frequency, sink)
     }
 
+    /// Linearize one existing prepared lane without copying or repreparing it.
+    ///
+    /// # Errors
+    /// Invalid lane, trial coordinates or unsupported declared policy.
+    pub fn linearize_lane_trial(
+        &self,
+        lane: usize,
+        input: crate::trial::TrialInput<'_>,
+        coordinates: &mut [f64],
+    ) -> Result<crate::trial::TrialOutcome> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        crate::trial::linearize(&self.artifact, data, input, coordinates)
+    }
+
+    /// Check the additional convergence condition for one existing lane.
+    ///
+    /// # Errors
+    /// Invalid lane, sample, tolerance or unsupported declared policy.
+    pub fn check_lane_trial_convergence(
+        &self,
+        lane: usize,
+        input: crate::trial::ConvergenceInput<'_>,
+    ) -> Result<crate::trial::Convergence> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        crate::trial::convergence(&self.artifact, data, input)
+    }
+
+    /// Linearize each lane independently using exactly the scalar trial contract.
+    /// Discard all output on failure; no prepared lane or history is modified.
+    ///
+    /// # Errors
+    /// Shape, invalid trial point or an unsupported declared policy.
+    pub fn linearize_trials(
+        &self,
+        inputs: &[crate::trial::TrialInput<'_>],
+        coordinates: &mut [f64],
+        outcomes: &mut [crate::trial::TrialOutcome],
+    ) -> Result<()> {
+        let width = self.artifact.descriptor().equations.len();
+        if inputs.len() != self.data.len()
+            || outcomes.len() != self.data.len()
+            || self.data.len().checked_mul(width) != Some(coordinates.len())
+        {
+            return Err(Error::Shape("trial tile input"));
+        }
+        for (((prepared, input), point), outcome) in self
+            .data
+            .iter()
+            .zip(inputs)
+            .zip(coordinates.chunks_exact_mut(width))
+            .zip(outcomes)
+        {
+            *outcome = crate::trial::linearize(&self.artifact, prepared, *input, point)?;
+        }
+        Ok(())
+    }
+
+    /// Apply the same independent additional convergence test in every lane.
+    ///
+    /// # Errors
+    /// Shape, invalid samples or unsupported declared policy. Discard outputs
+    /// on failure, including any completed earlier lanes.
+    pub fn check_trial_convergence(
+        &self,
+        inputs: &[crate::trial::ConvergenceInput<'_>],
+        results: &mut [crate::trial::Convergence],
+    ) -> Result<()> {
+        if inputs.len() != self.data.len() || results.len() != self.data.len() {
+            return Err(Error::Shape("convergence tile input"));
+        }
+        for ((prepared, input), result) in self.data.iter().zip(inputs).zip(results) {
+            *result = crate::trial::convergence(&self.artifact, prepared, *input)?;
+        }
+        Ok(())
+    }
+
     /// Evaluate contiguous lanes with no new allocation.
     ///
     /// # Errors

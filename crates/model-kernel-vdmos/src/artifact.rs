@@ -125,6 +125,7 @@ pub fn artifact(
             }],
             charge: Capability::Computed,
             noise: Capability::Computed,
+            trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
         },
         VdmosKernel { model, layout },
     )

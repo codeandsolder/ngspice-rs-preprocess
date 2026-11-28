@@ -14,6 +14,12 @@ The simulator owns numerical circuit orchestration. Source admission is
 handled by `model-preprocess-command` before normalization, linking or model
 preparation. The default does not launch any external process.
 
+## Distribution
+
+See [standalone package qualification](docs/package-release.md) for release
+metadata, licenses, and registry-format verification. The tracked workspace
+remains publication-disabled until a reviewed and authorized release.
+
 ## Unified library and CLI
 
 Use the `ngspice-rs-preprocess` package for source preparation. The library
@@ -43,6 +49,8 @@ ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
 | `qspice-library` | QSPICE plaintext models; include-safe native source | `model.lib` |
 | `tina-deck` | TINA/TINA-TI plaintext SPICE export, with local parameter normalization | `deck.cir` |
 | `tina-library` | TINA/TINA-TI plaintext SPICE macro source | `model.lib` |
+| `ltspice-deck` | Explicit LTspice source normalization (partial dialect coverage) | `deck.cir` |
+| `ltspice-library` | Explicit LTspice library normalization (partial dialect coverage) | `model.lib` |
 | `simplis-deck` | Select SIMPLIS projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `simetrix-deck` | Select SIMetrix projection, specialize hierarchy and lower electrical primitives | `deck.cir` plus referenced companions |
 | `expanded-deck` | Lower already expanded dialect source without hierarchy specialization | `deck.cir` |
@@ -69,6 +77,10 @@ kept separate. Source metadata in comments remains intact. See
 The inline declaration is observed in the public ISO224X export discussion
 ([reference](https://electronics.stackexchange.com/questions/518473/error-importing-third-party-model-to-ltspice-from-tina));
 the regression fixtures are independently authored and contain no vendor model text.
+
+The LTspice formats normalize whole-file library imports, relative Windows-style paths, `noiseless` resistor flags, `.backanno`, scalar intrinsics and operator precedence, runtime versus parameter-phase evaluation, endpoint-clamped numeric tables (including phase-specialized macros), explicit capacitor/inductor series resistance, the uncoupled inductor default series resistance, closed nonnegative voltage-source series resistance, and explicit transient timing (including omitted or zero plotting step). PULSE, PWL, SINE and explicitly timed EXP share occurrence-bound prepared waveform declarations with the native source binder. Relative PWL times are accumulated, signed scales applied, and duplicate-time ordinates averaged before interpolation. Closed waveforms with exact native representations are emitted directly; symbolic coefficients or finite sine trains require the typed waveform manifest, which separates explicit DC bias from transient startup. These passes preserve source provenance and do not require a simulator-wide compatibility mode.
+
+The source-specific transformations have native ngspice OP/DC/AC/transient/noise regressions based on independent LTspice XVII and 24.0.12 measurements. Successful normalization alone does not establish equivalence for arbitrary decks. Idealized diode and voltage-controlled switch models select explicit native physical families. Passive IC and richer parasitic networks, structured/triggered waveforms, analysis-dependent EXP timing defaults, source shunt capacitance, negative or occurrence-parametric voltage-source series resistance, and unsupported expression forms require additional typed preparation or solver support. End-to-end Rust solver acceptance of the generated scalar functions and mandatory waveform declarations depends on its native parameter-expression, macro-expansion and prepared-waveform binding support.
 
 No extension-based format guessing or implicit transformation is performed.
 For example:
@@ -156,6 +168,11 @@ Raw catalog members and compiled members use the same occurrence binding.
 The root deck owns `PARHIER`, `XMULT_IN_EXP`, temperature defaults and
 model-selection policies. Source parameter and model aliases preserve
 electrical terminal names, nested multiplier products, and source spans.
+Mixed scalar/function `.PARAM` declarations and `.FUNC` macros use the same
+occurrence binding: `PARHIER` selects visible declarations, free symbols
+resolve in the calling occurrence and formals shadow parameters. Native
+function aliases retain nested calls and electrical probes without expanding
+expression trees in the producer. Cyclic and out-of-scope calls are diagnosed.
 Native output retains qualified OP, source DC, AC and single-interval
 transient commands. The supported model subset is nongeometric level-1
 junction diodes (including AREA/PJ, breakdown and depletion charge) and
@@ -166,8 +183,8 @@ WNFLAG, rather than native fuzzy bin matching. Version-specific parameter
 inventories reject unknown fields instead of allowing a native parser to
 ignore them.
 
-This is not blanket HSPICE equivalence. Other physical variants, source
-function hierarchy, non-HSPICE model cards inside an overridden resource,
+This is not blanket HSPICE equivalence. Other physical variants,
+non-HSPICE model cards inside an overridden resource,
 controlled transfer extensions, statistical or multi-interval analyses
 and unqualified output directives are diagnosed rather than guessed.
 See issues [#68](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/68),

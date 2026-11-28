@@ -94,6 +94,7 @@ fn descriptor() -> Descriptor {
         }],
         charge: Capability::Computed,
         noise: Capability::Computed,
+        trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
     }
 }
 
@@ -174,5 +175,114 @@ fn metadata_structural_edits_and_noise() -> Result<()> {
     );
     d.equations[1].name = d.equations[0].name.clone();
     assert!(Artifact::new(d, Linear).is_err());
+    Ok(())
+}
+
+#[test]
+fn explicit_trial_capabilities_and_validation() -> Result<()> {
+    use model_kernel_api::trial::{
+        Convergence, ConvergenceInput, TrialInput, TrialOutcome, TrialPhase, TrialPolicy,
+        TrialSample,
+    };
+
+    let model = Artifact::new(descriptor(), Linear)?;
+    let prepared = model.prepare(&[2.], 300.)?;
+    let proposed = [2., 1., 310.];
+    let mut output = [0.; 3];
+    let input = TrialInput {
+        proposed: &proposed,
+        phase: TrialPhase::ColdStart,
+    };
+    assert_eq!(
+        model.linearize_trial(&prepared, input, &mut output)?,
+        TrialOutcome::Exact
+    );
+    assert_eq!(output, proposed);
+    let foreign = Artifact::new(descriptor(), Linear)?;
+    assert_eq!(
+        foreign.linearize_trial(&prepared, input, &mut output),
+        Err(Error::ForeignArtifact)
+    );
+    for phase in [
+        TrialPhase::Newton {
+            previous: &[0., 0.],
+        },
+        TrialPhase::Predictor {
+            accepted: &[0., 0., 0.],
+        },
+    ] {
+        assert!(
+            model
+                .linearize_trial(
+                    &prepared,
+                    TrialInput {
+                        proposed: &proposed,
+                        phase
+                    },
+                    &mut output
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        model
+            .linearize_trial(
+                &prepared,
+                TrialInput {
+                    proposed: &[0., 0., -1.],
+                    phase: TrialPhase::Exact
+                },
+                &mut output
+            )
+            .is_err()
+    );
+    let mut d = descriptor();
+    d.trial.initialization = TrialPolicy::Kernel;
+    let declared = Artifact::new(d, Linear)?;
+    let candidate = declared.prepare(&[2.], 300.)?;
+    assert_eq!(
+        declared.linearize_trial(&candidate, input, &mut output),
+        Err(Error::Unsupported("trial initialization"))
+    );
+
+    let sample = TrialSample {
+        coordinates: &proposed,
+        residual: &[2., -2., 10.],
+        jacobian: &[0.; 9],
+    };
+    let mut convergence = ConvergenceInput {
+        previous: sample,
+        candidate: sample,
+        candidate_outcome: TrialOutcome::Exact,
+        relative_tolerance: 1e-6,
+        absolute_tolerances: &[1e-12; 3],
+    };
+    assert_eq!(
+        model.check_trial_convergence(&prepared, convergence)?,
+        Convergence::Satisfied
+    );
+    assert_eq!(
+        convergence.compare_residual(0, f64::MAX, -f64::MAX)?,
+        Convergence::Retry
+    );
+    assert_eq!(
+        convergence.compare_residual(0, f64::MAX, f64::MAX)?,
+        Convergence::Satisfied
+    );
+    assert_eq!(
+        convergence.compare_residual(0, f64::INFINITY, 0.)?,
+        Convergence::Retry
+    );
+    convergence.candidate_outcome = TrialOutcome::Limited;
+    assert_eq!(
+        model.check_trial_convergence(&prepared, convergence)?,
+        Convergence::Retry
+    );
+    convergence.absolute_tolerances = &[];
+    assert!(
+        model
+            .check_trial_convergence(&prepared, convergence)
+            .is_err()
+    );
     Ok(())
 }
