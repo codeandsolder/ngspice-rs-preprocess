@@ -1,4 +1,4 @@
-//! Diffusion geometry and extrinsic series resistance preparation.
+//! MOS junction geometry, resistance preparation and constitutive primitives.
 //!
 //! The input lengths and explicit areas already include any source-level
 //! unit/global scaling. Lithographic width scaling is applied here only
@@ -7,8 +7,8 @@
 //! Models Manual X-2005.09, pp. 44–54 and 403–404, for the distinct
 //! explicit, width-normalized and folded diffusion geometries.
 //!
-//! This is not a diode current/charge implementation or a qualification of
-//! an entire compact-model revision.
+//! The constitutive primitives operate on prepared coefficients. They do not
+//! select a complete model revision or resolve source-specific defaults.
 
 use crate::ModelError;
 
@@ -101,7 +101,8 @@ impl MosDiffusionDimensions {
         positive(self.width_m, "drawn MOS diffusion width")?;
         positive(self.width_multiplier, "MOS diffusion width multiplier")?;
         positive(
-            self.width_m * self.width_multiplier + self.width_offset_m,
+            self.width_m
+                .mul_add(self.width_multiplier, self.width_offset_m),
             "effective MOS diffusion width",
         )
     }
@@ -163,8 +164,10 @@ pub fn prepare_mos_diffusion(
             let heavy = dimensions.heavy_length()?;
             match (rule, terminal.shared) {
                 (MosDiffusionRule::Stacked, true) => (heavy * width, 2. * heavy),
-                (MosDiffusionRule::Stacked, false) => (2. * heavy * width, 4. * heavy + width),
-                _ => (2. * heavy * width, 4. * heavy + 2. * width),
+                (MosDiffusionRule::Stacked, false) => {
+                    (2. * heavy * width, 4.0f64.mul_add(heavy, width))
+                }
+                _ => (2. * heavy * width, 2.0f64.mul_add(width, 4. * heavy)),
             }
         }
         _ => {
@@ -269,7 +272,7 @@ impl MosSeriesResistance {
                     terminal
                 }
             }
-            MosSeriesResistanceRule::DirectContact => terminal + squares()? * sheet,
+            MosSeriesResistanceRule::DirectContact => squares()?.mul_add(sheet, terminal),
             MosSeriesResistanceRule::WidthDependent | MosSeriesResistanceRule::AutomaticSquares => {
                 let width = dimensions.diffusion_width()?;
                 let light = nonnegative(self.light_diffusion_m, "light MOS diffusion length")?;
@@ -279,9 +282,324 @@ impl MosSeriesResistance {
                     }
                     _ => squares()?,
                 };
-                light / width * terminal + squares * sheet
+                squares.mul_add(sheet, light / width * terminal)
             }
         };
         nonnegative(resistance + contact, "MOS series resistance")
+    }
+}
+
+/// One zero-bias capacitance contribution with a power-law depletion region
+/// below zero bias and its tangent continuation above zero bias.
+///
+/// Geometry and temperature correction are applied before construction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MosDepletionComponent {
+    capacitance_f: f64,
+    potential_v: f64,
+    grading: f64,
+}
+
+/// Stored depletion charge and its voltage derivative, relative to zero bias.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MosDepletionPoint {
+    pub charge_c: f64,
+    pub capacitance_f: f64,
+}
+
+const fn finite(value: f64, name: &'static str) -> Result<f64, ModelError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(ModelError::InvalidPhysicalParameter(name))
+    }
+}
+
+impl MosDepletionComponent {
+    /// Prepare a single bottom, sidewall, or gate-edge depletion contribution.
+    ///
+    /// # Errors
+    /// Nonphysical capacitance, potential, or grading.
+    pub fn new(capacitance_f: f64, potential_v: f64, grading: f64) -> Result<Self, ModelError> {
+        Ok(Self {
+            capacitance_f: nonnegative(capacitance_f, "MOS depletion capacitance")?,
+            potential_v: positive(potential_v, "MOS depletion potential")?,
+            grading: nonnegative(grading, "MOS depletion grading")?,
+        })
+    }
+
+    /// Integrate the depletion C-V law analytically. The logarithmic grading=1
+    /// limit is continuous, including for nearly unity grading and tiny bias.
+    ///
+    /// # Errors
+    /// Nonfinite voltage or nonrepresentable charge/capacitance.
+    pub fn evaluate(self, voltage_v: f64) -> Result<MosDepletionPoint, ModelError> {
+        finite(voltage_v, "MOS depletion voltage")?;
+        let c0 = self.capacitance_f;
+        if c0 == 0. {
+            return Ok(MosDepletionPoint {
+                charge_c: 0.,
+                capacitance_f: 0.,
+            });
+        }
+        let (charge, capacitance) = if voltage_v < 0. {
+            let log = (-voltage_v / self.potential_v).ln_1p();
+            let exponent = 1. - self.grading;
+            let scaled = exponent * log;
+            let integral = if scaled == 0. {
+                log
+            } else {
+                scaled.exp_m1() / exponent
+            };
+            (
+                -c0 * self.potential_v * integral,
+                c0 * (-self.grading * log).exp(),
+            )
+        } else {
+            let delta = self.grading * (voltage_v / self.potential_v);
+            (
+                c0 * voltage_v * 0.5f64.mul_add(delta, 1.),
+                c0 * (1. + delta),
+            )
+        };
+        Ok(MosDepletionPoint {
+            charge_c: finite(charge, "MOS depletion charge")?,
+            capacitance_f: nonnegative(capacitance, "MOS depletion capacitance")?,
+        })
+    }
+}
+
+/// A junction with exponential forward conduction and two linear reverse
+/// branches.
+///
+/// Unlike the Berkeley reverse diode, the reverse conductance is
+/// numerically equal to the prepared saturation current, in siemens.
+/// The consuming circuit supplies any artificial parallel conductance.
+/// See HSPICE MOSFET Models Manual X-2005.09, pp. 55–58.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MosLinearReverseJunction {
+    saturation_current_a: f64,
+    emission_thermal_voltage_v: f64,
+    reverse_transition_v: f64,
+    deep_reverse_conductance_s: f64,
+    transit_time_s: f64,
+}
+
+/// Junction current and total stored charge, with their voltage derivatives.
+/// The voltage is forward-positive and all results are per device.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MosJunctionPoint {
+    pub current_a: f64,
+    pub conductance_s: f64,
+    pub charge_c: f64,
+    pub capacitance_f: f64,
+}
+
+impl MosLinearReverseJunction {
+    /// Prepare the physical junction parameters after geometry/temperature.
+    /// `emission_thermal_voltage_v` is the product of emission coefficient
+    /// and thermal voltage; `reverse_slope_divisor` is the deep reverse divisor.
+    ///
+    /// # Errors
+    /// Nonphysical coefficients or unrepresentable deep-reverse conductance.
+    pub fn new(
+        saturation_current_a: f64,
+        emission_thermal_voltage_v: f64,
+        reverse_transition_v: f64,
+        reverse_slope_divisor: f64,
+        transit_time_s: f64,
+    ) -> Result<Self, ModelError> {
+        let saturation_current_a =
+            nonnegative(saturation_current_a, "MOS junction saturation current")?;
+        let reverse_transition_v =
+            -nonnegative(-reverse_transition_v, "MOS junction reverse transition")?;
+        let divisor = positive(reverse_slope_divisor, "MOS junction reverse slope divisor")?;
+        Ok(Self {
+            saturation_current_a,
+            emission_thermal_voltage_v: positive(
+                emission_thermal_voltage_v,
+                "MOS junction emission thermal voltage",
+            )?,
+            reverse_transition_v,
+            deep_reverse_conductance_s: nonnegative(
+                saturation_current_a / divisor,
+                "MOS junction deep reverse conductance",
+            )?,
+            transit_time_s: nonnegative(transit_time_s, "MOS junction transit time")?,
+        })
+    }
+
+    fn conduction(self, voltage_v: f64) -> (f64, f64) {
+        let saturation = self.saturation_current_a;
+        if saturation == 0. {
+            return (0., 0.);
+        }
+        if voltage_v >= 0. {
+            let exponent = voltage_v / self.emission_thermal_voltage_v;
+            let exponential = exponent.exp_m1();
+            let current = if exponential.is_finite() {
+                saturation * exponential
+            } else {
+                (saturation.ln() + exponent).exp() - saturation
+            };
+            (
+                current,
+                (current + saturation) / self.emission_thermal_voltage_v,
+            )
+        } else if voltage_v >= self.reverse_transition_v {
+            (saturation * voltage_v, saturation)
+        } else {
+            (
+                self.deep_reverse_conductance_s.mul_add(
+                    voltage_v - self.reverse_transition_v,
+                    saturation * self.reverse_transition_v,
+                ),
+                self.deep_reverse_conductance_s,
+            )
+        }
+    }
+
+    /// Evaluate conduction, diffusion storage and each prepared depletion
+    /// component. Derivatives at the two branch boundaries are taken from the
+    /// more-positive branch, while current and charge themselves are continuous.
+    /// No solver limiting, artificial conductance or instance multiplication.
+    ///
+    /// # Errors
+    /// Nonfinite bias or nonrepresentable physical output.
+    pub fn evaluate(
+        self,
+        voltage_v: f64,
+        depletion: &[MosDepletionComponent],
+    ) -> Result<MosJunctionPoint, ModelError> {
+        finite(voltage_v, "MOS junction voltage")?;
+        let (current, conductance) = self.conduction(voltage_v);
+        let mut charge = self.transit_time_s * current;
+        let mut capacitance = self.transit_time_s * conductance;
+        for component in depletion {
+            let point = component.evaluate(voltage_v)?;
+            charge += point.charge_c;
+            capacitance += point.capacitance_f;
+        }
+        Ok(MosJunctionPoint {
+            current_a: finite(current, "MOS junction current")?,
+            conductance_s: nonnegative(conductance, "MOS junction conductance")?,
+            charge_c: finite(charge, "MOS junction charge")?,
+            capacitance_f: nonnegative(capacitance, "MOS junction capacitance")?,
+        })
+    }
+}
+
+/// Bottom junction density in the dimensional unit selected by the geometry.
+/// The quantity may be saturation current or zero-bias capacitance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MosBottomDensity {
+    PerSquareMetre(f64),
+    PerMetre(f64),
+}
+
+impl MosBottomDensity {
+    /// Resolve a current/capacitance density to a single-device quantity.
+    ///
+    /// # Errors
+    /// Incompatible dimensional units, negative values, or overflow.
+    pub fn weight(self, extent: MosBottomMeasure) -> Result<f64, ModelError> {
+        let ((Self::PerSquareMetre(density), MosBottomMeasure::AreaM2(extent))
+        | (Self::PerMetre(density), MosBottomMeasure::WidthM(extent))) = (self, extent)
+        else {
+            return Err(ModelError::InvalidPhysicalParameter(
+                "MOS bottom density units",
+            ));
+        };
+        let density = nonnegative(density, "MOS bottom density")?;
+        let extent = nonnegative(extent, "MOS bottom extent")?;
+        nonnegative(density * extent, "MOS weighted bottom density")
+    }
+}
+
+/// Per-device saturation current preparation, after temperature correction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MosJunctionSaturation {
+    pub bottom: MosBottomDensity,
+    pub sidewall_a_per_m: f64,
+    pub fallback_a: f64,
+}
+
+impl MosJunctionSaturation {
+    /// Use the explicit per-device saturation current only when both
+    /// geometric contributions are zero. No multiplicity is applied here.
+    ///
+    /// # Errors
+    /// Invalid geometry, units or nonrepresentable saturation current.
+    pub fn prepare(self, geometry: MosDiffusionGeometry) -> Result<f64, ModelError> {
+        let bottom = self.bottom.weight(geometry.bottom)?;
+        let perimeter = nonnegative(geometry.perimeter_m, "MOS junction perimeter")?;
+        let sidewall = nonnegative(self.sidewall_a_per_m, "MOS sidewall saturation density")?;
+        let total = nonnegative(
+            sidewall.mul_add(perimeter, bottom),
+            "MOS junction saturation current",
+        )?;
+        if total > 0. {
+            Ok(total)
+        } else {
+            nonnegative(self.fallback_a, "MOS fallback saturation current")
+        }
+    }
+}
+
+/// Voltage shape of a depletion contribution, at device temperature.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MosDepletionShape {
+    pub potential_v: f64,
+    pub grading: f64,
+}
+
+impl MosDepletionShape {
+    fn component(self, capacitance_f: f64) -> Result<MosDepletionComponent, ModelError> {
+        MosDepletionComponent::new(capacitance_f, self.potential_v, self.grading)
+    }
+}
+
+/// Zero-bias junction capacitance densities and their voltage dependence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MosJunctionDepletion {
+    pub bottom: MosBottomDensity,
+    pub bottom_shape: MosDepletionShape,
+    pub sidewall_f_per_m: f64,
+    pub sidewall_shape: MosDepletionShape,
+    pub gate_edge_f_per_m: f64,
+    pub gate_edge_shape: MosDepletionShape,
+    pub fallback_f: f64,
+}
+
+impl MosJunctionDepletion {
+    /// Convert density/geometry into three physical depletion contributions.
+    /// A nonzero direct capacitance is a fallback only for zero geometric
+    /// capacitance, and follows the bottom voltage law.
+    ///
+    /// # Errors
+    /// Invalid density, geometry, voltage law or nonrepresentable capacitance.
+    pub fn prepare(
+        self,
+        geometry: MosDiffusionGeometry,
+        sidewall: MosSidewallRule,
+        gate_width_m: f64,
+    ) -> Result<[MosDepletionComponent; 3], ModelError> {
+        let lengths = geometry.sidewall_lengths(sidewall, gate_width_m)?;
+        let bottom = self.bottom.weight(geometry.bottom)?;
+        let side = nonnegative(self.sidewall_f_per_m, "MOS sidewall capacitance density")?
+            * lengths.sidewall_m;
+        let gate = nonnegative(self.gate_edge_f_per_m, "MOS gate-edge capacitance density")?
+            * lengths.gate_edge_m;
+        let total = nonnegative(bottom + side + gate, "MOS zero-bias junction capacitance")?;
+        let bottom = if total > 0. {
+            bottom
+        } else {
+            nonnegative(self.fallback_f, "MOS fallback junction capacitance")?
+        };
+        Ok([
+            self.bottom_shape.component(bottom)?,
+            self.sidewall_shape.component(side)?,
+            self.gate_edge_shape.component(gate)?,
+        ])
     }
 }

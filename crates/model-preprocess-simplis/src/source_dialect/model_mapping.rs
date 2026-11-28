@@ -781,7 +781,7 @@ impl HspiceBsim3Defaults {
 impl ModelSelection {
     /// Defaults of the source model, before explicit or occurrence-dependent
     /// parameters are applied. This is not a native lowering qualification.
-    #[must_use]
+    #[must_use = "source defaults must be applied before explicit parameters"]
     pub const fn hspice_bsim3_defaults(&self) -> Option<HspiceBsim3Defaults> {
         // HSPICE MOSFET Models Manual X-2005.09, pp. 403, 414–415.
         match self.mapping.device {

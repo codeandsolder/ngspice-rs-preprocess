@@ -358,7 +358,7 @@ fn scale_dimension(
             .saturating_add(32),
     )?;
     let scaled = if let Ok(value) = parse_spice_constant(factor) {
-        if value <= 0. || value == 1. {
+        if value <= 0. || value.to_bits() == 1.0f64.to_bits() {
             return Ok(());
         }
         format!("{{({drawn})*({factor})}}")

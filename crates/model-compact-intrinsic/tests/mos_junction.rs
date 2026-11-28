@@ -1,7 +1,8 @@
 use model_compact_intrinsic::{
-    MosBottomMeasure, MosDiffusionDimensions, MosDiffusionGeometry, MosDiffusionRule,
-    MosDiffusionTerminal, MosSeriesResistance, MosSeriesResistanceRule, MosSidewallRule,
-    prepare_mos_diffusion,
+    MosBottomDensity, MosBottomMeasure, MosDepletionComponent, MosDepletionShape,
+    MosDiffusionDimensions, MosDiffusionGeometry, MosDiffusionRule, MosDiffusionTerminal,
+    MosJunctionDepletion, MosJunctionSaturation, MosLinearReverseJunction, MosSeriesResistance,
+    MosSeriesResistanceRule, MosSidewallRule, prepare_mos_diffusion,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -289,40 +290,46 @@ mod native_oracle {
         geometry: MosDiffusionGeometry,
         bias: f64,
     ) -> Result<f64, Box<dyn std::error::Error>> {
-        let MosBottomMeasure::AreaM2(area) = geometry.bottom else {
-            return Err("expected area".into());
-        };
-        let wall = geometry.sidewall_lengths(
+        let components = MosJunctionDepletion {
+            bottom: MosBottomDensity::PerSquareMetre(0.001),
+            bottom_shape: MosDepletionShape {
+                potential_v: 0.9,
+                grading: 0.5,
+            },
+            sidewall_f_per_m: 2e-10,
+            sidewall_shape: MosDepletionShape {
+                potential_v: 0.8,
+                grading: 0.3,
+            },
+            gate_edge_f_per_m: 3e-10,
+            gate_edge_shape: MosDepletionShape {
+                potential_v: 0.7,
+                grading: 0.2,
+            },
+            fallback_f: 0.,
+        }
+        .prepare(
+            geometry,
             MosSidewallRule::SplitPerimeter,
             DIMENSIONS.diffusion_width()?,
         )?;
-        let components = [
-            (area * 0.001, 0.9, 0.5),
-            (wall.sidewall_m * 2e-10, 0.8, 0.3),
-            (wall.gate_edge_m * 3e-10, 0.7, 0.2),
-        ];
-        Ok(MULTIPLICITY
-            * components
-                .into_iter()
-                .map(|(zero, potential, grading)| {
-                    let shape = if bias < 0. {
-                        (1. - bias / potential).powf(-grading)
-                    } else {
-                        1. + grading * bias / potential
-                    };
-                    zero * shape
-                })
-                .sum::<f64>())
+        let mut capacitance = 0.;
+        for component in components {
+            capacitance += component.evaluate(bias)?.capacitance_f;
+        }
+        Ok(MULTIPLICITY * capacitance)
     }
 
     fn current(
         geometry: MosDiffusionGeometry,
         bias: f64,
     ) -> Result<f64, Box<dyn std::error::Error>> {
-        let MosBottomMeasure::AreaM2(area) = geometry.bottom else {
-            return Err("expected area".into());
-        };
-        let saturation = area * 0.1 + geometry.perimeter_m * 2e-8;
+        let saturation = MosJunctionSaturation {
+            bottom: MosBottomDensity::PerSquareMetre(0.1),
+            sidewall_a_per_m: 2e-8,
+            fallback_a: 0.,
+        }
+        .prepare(geometry)?;
         Ok(MULTIPLICITY * (saturation * (bias / THERMAL_VOLTAGE).exp_m1() + 1e-18 * bias))
     }
 
@@ -392,4 +399,139 @@ mod native_oracle {
         }
         Ok(())
     }
+}
+
+#[test]
+fn linear_reverse_junction_current_and_diffusion_charge() -> TestResult {
+    let saturation = 2e-9;
+    let thermal = 0.05;
+    let transit = 4e-9;
+    let junction = MosLinearReverseJunction::new(saturation, thermal, -1., 4., transit)?;
+    for (voltage, current, conductance) in [
+        (-3., -3e-9, 0.5e-9),
+        (-1., -2e-9, 2e-9),
+        (-0.5, -1e-9, 2e-9),
+        (0., 0., 4e-8),
+        (thermal * 2f64.ln(), saturation, 8e-8),
+    ] {
+        let point = junction.evaluate(voltage, &[])?;
+        near(point.current_a, current);
+        near(point.conductance_s, conductance);
+        near(point.charge_c, transit * current);
+        near(point.capacitance_f, transit * conductance);
+    }
+    let zero = MosLinearReverseJunction::new(0., thermal, -1., 4., transit)?;
+    near(zero.evaluate(f64::MAX, &[])?.current_a, 0.);
+    let tiny = MosLinearReverseJunction::new(1e-300, thermal, -1., 4., 0.)?;
+    let exponent = 800.;
+    near(
+        tiny.evaluate(exponent * thermal, &[])?.current_a,
+        (1e-300_f64.ln() + exponent).exp(),
+    );
+    Ok(())
+}
+
+#[test]
+fn depletion_charge_matches_closed_form_and_numeric_derivatives() -> TestResult {
+    let c0 = 5e-12;
+    let potential = 0.8;
+    let root = MosDepletionComponent::new(c0, potential, 0.5)?;
+    let log = MosDepletionComponent::new(c0, potential, 1.)?;
+    near(
+        root.evaluate(-3. * potential)?.charge_c,
+        -2. * c0 * potential,
+    );
+    near(root.evaluate(-3. * potential)?.capacitance_f, 0.5 * c0);
+    near(
+        log.evaluate(-3. * potential)?.charge_c,
+        -c0 * potential * 4f64.ln(),
+    );
+    near(log.evaluate(-3. * potential)?.capacitance_f, 0.25 * c0);
+    near(root.evaluate(potential)?.charge_c, 1.25 * c0 * potential);
+    near(root.evaluate(potential)?.capacitance_f, 1.5 * c0);
+    let junction = MosLinearReverseJunction::new(1e-12, 0.04, -1., 3., 1e-8)?;
+    for grading in [0., 0.33, 0.5, 1. - 1e-12, 1., 1. + 1e-12, 1.5] {
+        let depletion = MosDepletionComponent::new(c0, potential, grading)?;
+        near(depletion.evaluate(-1e-18)?.charge_c, -1e-18 * c0);
+        for voltage in [-3., -0.5, -1e-4, 1e-4, 0.3, 0.6] {
+            let step = 1e-7;
+            let center = junction.evaluate(voltage, &[depletion])?;
+            let below = junction.evaluate(voltage - step, &[depletion])?;
+            let above = junction.evaluate(voltage + step, &[depletion])?;
+            let current_derivative = (above.current_a - below.current_a) / (2. * step);
+            let charge_derivative = (above.charge_c - below.charge_c) / (2. * step);
+            assert!(
+                (current_derivative - center.conductance_s).abs() <= 2e-8 * center.conductance_s
+            );
+            assert!(
+                (charge_derivative - center.capacitance_f).abs() <= 2e-8 * center.capacitance_f
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_constitutive_parameters_are_rejected() -> TestResult {
+    assert!(MosDepletionComponent::new(-1., 1., 0.5).is_err());
+    assert!(MosDepletionComponent::new(1., 0., 0.5).is_err());
+    assert!(MosDepletionComponent::new(1., 1., f64::NAN).is_err());
+    assert!(MosLinearReverseJunction::new(1., 0., -1., 1., 0.).is_err());
+    assert!(MosLinearReverseJunction::new(1., 1., 1., 1., 0.).is_err());
+    assert!(MosLinearReverseJunction::new(1., 1., -1., 0., 0.).is_err());
+    let junction = MosLinearReverseJunction::new(1., 1., -1., 1., 0.)?;
+    assert!(junction.evaluate(f64::INFINITY, &[]).is_err());
+    assert!(junction.evaluate(f64::MAX, &[]).is_err());
+    Ok(())
+}
+
+#[test]
+fn junction_densities_preserve_units_and_zero_geometry_fallback() -> TestResult {
+    let width = MosDiffusionGeometry {
+        bottom: MosBottomMeasure::WidthM(9e-6),
+        perimeter_m: 4e-6,
+    };
+    let zero = MosDiffusionGeometry {
+        bottom: MosBottomMeasure::WidthM(0.),
+        perimeter_m: 0.,
+    };
+    let shape = MosDepletionShape {
+        potential_v: 1.,
+        grading: 0.5,
+    };
+    let saturation = MosJunctionSaturation {
+        bottom: MosBottomDensity::PerMetre(2e-8),
+        sidewall_a_per_m: 3e-8,
+        fallback_a: 1e-14,
+    };
+    near(saturation.prepare(width)?, 3e-13);
+    near(saturation.prepare(zero)?, 1e-14);
+    assert!(
+        MosBottomDensity::PerSquareMetre(1.)
+            .weight(width.bottom)
+            .is_err()
+    );
+    assert!(
+        MosBottomDensity::PerMetre(1.)
+            .weight(MosBottomMeasure::AreaM2(1.))
+            .is_err()
+    );
+    let depletion = MosJunctionDepletion {
+        bottom: MosBottomDensity::PerMetre(2e-10),
+        bottom_shape: shape,
+        sidewall_f_per_m: 3e-10,
+        sidewall_shape: shape,
+        gate_edge_f_per_m: 4e-10,
+        gate_edge_shape: shape,
+        fallback_f: 5e-14,
+    };
+    let [bottom, side, gate] = depletion.prepare(width, MosSidewallRule::SplitPerimeter, 1e-6)?;
+    near(bottom.evaluate(0.)?.capacitance_f, 1.8e-15);
+    near(side.evaluate(0.)?.capacitance_f, 9e-16);
+    near(gate.evaluate(0.)?.capacitance_f, 4e-16);
+    let [bottom, side, gate] = depletion.prepare(zero, MosSidewallRule::SplitPerimeter, 1e-6)?;
+    near(bottom.evaluate(0.)?.capacitance_f, 5e-14);
+    near(side.evaluate(0.)?.capacitance_f, 0.);
+    near(gate.evaluate(0.)?.capacitance_f, 0.);
+    Ok(())
 }
