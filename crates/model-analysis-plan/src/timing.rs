@@ -235,7 +235,7 @@ impl ScheduleIntent {
             }
         };
         ensure!(start.is_finite() && start >= 0., "invalid transient START");
-        let mut previous = start;
+        let mut previous = 0.;
         for segment in &output {
             ensure!(
                 segment.until.is_finite()
@@ -248,7 +248,10 @@ impl ScheduleIntent {
             );
             previous = segment.until;
         }
-        ensure!(!output.is_empty(), "empty transient output schedule");
+        ensure!(
+            !output.is_empty() && start < previous,
+            "invalid transient output gate"
+        );
         let mut option = |option: &Option<SymbolicTimingOption>, default: f64| {
             option
                 .as_ref()
@@ -443,9 +446,12 @@ mod tests {
         assert!((result.start - 10e-9).abs() < 1e-22);
         assert_eq!(result.output.len(), 2);
         assert_eq!(result.ceiling, IntegrationCeiling::Automatic);
+        let late = parse(".tran 1n 10n 2n 20n START=19n")?.bind(parse_spice_constant)?;
+        assert_eq!(late.output.len(), 2);
+        assert!((late.start - 19e-9).abs() < 1e-22);
         for invalid in [
             ".tran 1n 10n 2n",
-            ".tran 1n 10n START=9.5n",
+            ".tran 1n 10n START=10n",
             ".tran 1n 10n 2n 8n START=0",
             ".tran 0 1n",
             ".tran 1n 10n UIC UIC",
