@@ -128,9 +128,12 @@ impl ParsedLibrary {
         let parsed = parse_scoped_parts(
             self.source_name.clone(),
             self.source_names.clone(),
-            dialect,
             &mapped.statements,
-            clone_scoped_statements(&self.scoped_statements, budget)?,
+            LibraryProjection {
+                simulator: LibrarySimulator::Simetrix,
+                dialect: Some(dialect),
+                scoped_statements: clone_scoped_statements(&self.scoped_statements, budget)?,
+            },
             target,
             limit,
             budget,
@@ -1025,9 +1028,12 @@ pub fn parse_scoped_library(
     parse_scoped_parts(
         source_name,
         source_names,
-        dialect,
         statements,
-        clone_scoped_statements(statements, budget)?,
+        LibraryProjection {
+            simulator: LibrarySimulator::Simetrix,
+            dialect: Some(dialect),
+            scoped_statements: clone_scoped_statements(statements, budget)?,
+        },
         crate::source_dialect::PowerTarget::NativeNgspice,
         limit,
         budget,
@@ -1086,9 +1092,8 @@ pub fn lower_scoped_statements(
 fn parse_scoped_parts(
     source_name: String,
     source_names: BTreeSet<String>,
-    dialect: crate::source_dialect::DialectContext,
     statements: &[crate::source_dialect::ScopedStatement],
-    original: Vec<crate::source_dialect::ScopedStatement>,
+    projection: LibraryProjection,
     target: crate::source_dialect::PowerTarget,
     limit: usize,
     budget: &WorkBudget,
@@ -1111,11 +1116,7 @@ fn parse_scoped_parts(
         source_name,
         source_names,
         &resolved.text,
-        LibraryProjection {
-            simulator: LibrarySimulator::Simetrix,
-            dialect: Some(dialect),
-            scoped_statements: original,
-        },
+        projection,
         resolved.identities,
         budget,
     )

@@ -370,14 +370,36 @@ pub(super) fn split_arguments<'a>(input: &'a str, budget: &WorkBudget) -> Result
     Ok(args)
 }
 
+#[derive(Clone, Copy)]
+struct ExpressionProjection {
+    language: SourceLanguage,
+    target: PowerTarget,
+    numeric_suffixes: bool,
+}
+
+impl ExpressionProjection {
+    const fn native(language: SourceLanguage, numeric_suffixes: bool) -> Self {
+        Self {
+            language,
+            target: PowerTarget::NativeNgspice,
+            numeric_suffixes,
+        }
+    }
+
+    const fn prepared(self) -> bool {
+        matches!(self.language, SourceLanguage::Simetrix)
+            && matches!(self.target, PowerTarget::PreparedSolverV1)
+    }
+}
+
 fn lower_call(
     name: &str,
     body: &str,
-    language: SourceLanguage,
+    projection: ExpressionProjection,
     limit: usize,
-    numeric_suffixes: bool,
     budget: &WorkBudget,
 ) -> Result<String> {
+    let language = projection.language;
     if name.eq_ignore_ascii_case("LOG") {
         let args = split_arguments(body, budget)?;
         ensure!(
@@ -389,7 +411,7 @@ fn lower_call(
         } else {
             "ln"
         };
-        let argument = rewrite_expression(body, language, true, limit, numeric_suffixes, budget)?;
+        let argument = rewrite_expression(body, projection, true, limit, budget)?;
         budget.charge(
             Resource::EmittedBytes,
             target
@@ -401,14 +423,32 @@ fn lower_call(
     }
     let args = split_arguments(body, budget)?;
     let [base, exponent] = args.as_slice() else {
-        bail!("PWR requires two arguments")
+        bail!("{name} requires two arguments")
     };
     ensure!(
         !base.is_empty() && !exponent.is_empty(),
-        "PWR requires two arguments"
+        "{name} requires two arguments"
     );
-    let base = rewrite_expression(base, language, true, limit, numeric_suffixes, budget)?;
-    let exponent = rewrite_expression(exponent, language, true, limit, numeric_suffixes, budget)?;
+    let base = rewrite_expression(base, projection, true, limit, budget)?;
+    let exponent = rewrite_expression(exponent, projection, true, limit, budget)?;
+    if projection.prepared() {
+        let operation = if name.eq_ignore_ascii_case("PWR") {
+            "simetrix_abs_pow"
+        } else {
+            "simetrix_pow"
+        };
+        let len = operation
+            .len()
+            .saturating_add(base.len())
+            .saturating_add(exponent.len())
+            .saturating_add(3);
+        ensure!(
+            len <= limit,
+            "source expression expansion byte budget exceeded"
+        );
+        budget.charge(Resource::EmittedBytes, len)?;
+        return Ok(format!("{operation}({base},{exponent})"));
+    }
     if language == SourceLanguage::Simetrix {
         return power::guarded(&base, &exponent, limit, budget);
     }
@@ -493,16 +533,21 @@ pub(super) fn lower_expression(
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<String> {
-    rewrite_expression(input, language, false, limit, true, budget)
+    rewrite_expression(
+        input,
+        ExpressionProjection::native(language, true),
+        false,
+        limit,
+        budget,
+    )
 }
 
 fn append_expression_identifier(
     input: &str,
     start: usize,
     output: &mut String,
-    language: SourceLanguage,
+    projection: ExpressionProjection,
     limit: usize,
-    numeric_suffixes: bool,
     budget: &WorkBudget,
 ) -> Result<usize> {
     let bytes = input.as_bytes();
@@ -516,9 +561,10 @@ fn append_expression_identifier(
         open += 1;
     }
     if bytes.get(open) == Some(&b'(')
-        && ["LOG", "PWR", "V", "I"]
+        && (["LOG", "PWR", "V", "I"]
             .iter()
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
+            || projection.prepared() && name.eq_ignore_ascii_case("POW"))
     {
         let end = group_end(input, open, budget)?;
         if name.eq_ignore_ascii_case("V") || name.eq_ignore_ascii_case("I") {
@@ -528,9 +574,8 @@ fn append_expression_identifier(
             let lowered = lower_call(
                 name,
                 &input[open + 1..end],
-                language,
+                projection,
                 limit.saturating_sub(output.len()),
-                numeric_suffixes,
                 budget,
             )?;
             budget.charge(
@@ -548,12 +593,22 @@ fn append_expression_identifier(
 
 fn rewrite_expression(
     input: &str,
-    language: SourceLanguage,
+    projection: ExpressionProjection,
     grouped: bool,
     limit: usize,
-    numeric_suffixes: bool,
     budget: &WorkBudget,
 ) -> Result<String> {
+    let language = projection.language;
+    if grouped && projection.prepared() {
+        let lowered = power::lower_runtime(input, limit, budget)?;
+        return rewrite_expression(
+            &lowered,
+            ExpressionProjection::native(language, projection.numeric_suffixes),
+            true,
+            limit,
+            budget,
+        );
+    }
     let _frame = budget.enter()?;
     budget.charge(Resource::EvaluationSteps, input.len())?;
     ensure!(
@@ -592,10 +647,9 @@ fn rewrite_expression(
             output.push(if grouped { '(' } else { '{' });
             let lowered = rewrite_expression(
                 &input[offset + 1..end],
-                language,
+                projection,
                 true,
                 limit.saturating_sub(output.len()),
-                numeric_suffixes,
                 budget,
             )?;
             budget.charge(
@@ -605,7 +659,7 @@ fn rewrite_expression(
             output.push_str(&lowered);
             output.push(if grouped { ')' } else { '}' });
             offset = end + 1;
-        } else if numeric_suffixes
+        } else if projection.numeric_suffixes
             && language == SourceLanguage::Hspice
             && (offset == 0 || !symbol_byte(bytes[offset - 1]))
             && (ch.is_ascii_digit()
@@ -619,9 +673,8 @@ fn rewrite_expression(
                 input,
                 offset,
                 &mut output,
-                language,
+                projection,
                 limit,
-                numeric_suffixes,
                 budget,
             )?;
         } else {
@@ -676,9 +729,9 @@ pub(super) fn lower_statement_with_budget(
 }
 
 /// The prepared target projects source runtime laws before portable guarded
-/// power lowering can erase their operation identity. Static fields retain
-/// their ordinary scalar preparation path; shared function bodies carry the
-/// explicit operation names and are parsed separately in each phase.
+/// power lowering can erase their operation identity. Scalar expressions
+/// and shared function bodies carry explicit operation names, interpreted
+/// by the consumer in their actual evaluation phase.
 pub(super) fn lower_statement_targeted(
     statement: &str,
     context: DialectContext,
@@ -730,56 +783,23 @@ pub(super) fn lower_statement_targeted(
         };
         (prefix, language)
     };
-    if target == PowerTarget::PreparedSolverV1 && language == SourceLanguage::Simetrix {
-        if upper == ".FUNC" {
-            let start =
-                prefix_end + trimmed[prefix_end..].len() - trimmed[prefix_end..].trim_start().len();
-            let body = trimmed[start..]
-                .strip_prefix('=')
-                .map_or(&trimmed[start..], str::trim_start);
-            let mut output = trimmed[..prefix_end].to_owned();
-            output.push(' ');
-            output.push_str(&runtime_expression(
-                body.trim_start_matches('=').trim(),
-                limit.saturating_sub(output.len()),
-                budget,
-            )?);
-            ensure!(
-                output.len() <= limit,
-                "source power expansion byte budget exceeded"
-            );
-            return Ok(output);
-        }
-        if let Some((start, end)) = runtime_law(trimmed, &upper, budget)? {
-            let mut output = trimmed[..start].to_owned();
-            output.push_str(&runtime_expression(
-                &trimmed[start..end],
-                limit.saturating_sub(output.len()),
-                budget,
-            )?);
-            let setters = rewrite_expression(
-                &trimmed[end..],
-                language,
-                false,
-                limit.saturating_sub(output.len()),
-                false,
-                budget,
-            )?;
-            output.push_str(&setters);
-            ensure!(
-                output.len() <= limit,
-                "source power expansion byte budget exceeded"
-            );
-            return Ok(output);
-        }
+    let projection = ExpressionProjection {
+        language,
+        target,
+        numeric_suffixes: false,
+    };
+    if projection.prepared()
+        && let Some(output) =
+            prepared_statement(trimmed, &upper, prefix_end, projection, limit, budget)?
+    {
+        return Ok(output);
     }
     let mut output = trimmed[..prefix_end].to_owned();
     output.push_str(&rewrite_expression(
         &trimmed[prefix_end..],
-        language,
+        projection,
         false,
         limit.saturating_sub(prefix_end),
-        false,
         budget,
     )?);
     if language == SourceLanguage::Simetrix && output.contains("**") {
@@ -794,6 +814,71 @@ pub(super) fn lower_statement_targeted(
             power::lower_with_budget(&output[start..], limit.saturating_sub(start), budget)?;
         output.truncate(start);
         output.push_str(&lowered);
+    }
+    Ok(output)
+}
+
+fn prepared_statement(
+    statement: &str,
+    directive: &str,
+    prefix_end: usize,
+    projection: ExpressionProjection,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<Option<String>> {
+    if directive == ".PARAM" {
+        return prepared_parameters(statement, prefix_end, limit, budget).map(Some);
+    }
+    if directive == ".FUNC" {
+        let body = statement[prefix_end..].trim_start();
+        let body = body.strip_prefix('=').unwrap_or(body);
+        let mut output = statement[..prefix_end].to_owned();
+        power::append(&mut output, " ", limit, budget)?;
+        let expression = prepared_expression(body, limit.saturating_sub(output.len()), budget)?;
+        power::append(&mut output, &expression, limit, budget)?;
+        return Ok(Some(output));
+    }
+    let Some((start, end)) = runtime_law(statement, directive, budget)? else {
+        return Ok(None);
+    };
+    let mut output = statement[..start].to_owned();
+    let expression = prepared_expression(
+        &statement[start..end],
+        limit.saturating_sub(output.len()),
+        budget,
+    )?;
+    power::append(&mut output, &expression, limit, budget)?;
+    let setters = rewrite_expression(
+        &statement[end..],
+        projection,
+        false,
+        limit.saturating_sub(output.len()),
+        budget,
+    )?;
+    power::append(&mut output, &setters, limit, budget)?;
+    Ok(Some(output))
+}
+
+/// Static parameter assignments use the same explicit source operation names,
+/// but the consumer evaluates them with its separate scalar grammar and
+/// arithmetic contract. Do not copy the behavioural zero guard into numparam.
+fn prepared_parameters(
+    statement: &str,
+    prefix_end: usize,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<String> {
+    let tail = &statement[prefix_end..];
+    budget.charge(Resource::ScannedBytes, tail.len())?;
+    let assignments = crate::parameter_assignments(tail)?;
+    let mut output = statement[..prefix_end].to_owned();
+    for (name, value) in assignments {
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        for part in [" ", name, "="] {
+            power::append(&mut output, part, limit, budget)?;
+        }
+        let value = prepared_expression(value, limit.saturating_sub(output.len()), budget)?;
+        power::append(&mut output, &value, limit, budget)?;
     }
     Ok(output)
 }
@@ -883,7 +968,7 @@ fn runtime_law(
     Ok(Some((start, statement.len())))
 }
 
-fn runtime_expression(input: &str, limit: usize, budget: &WorkBudget) -> Result<String> {
+fn prepared_expression(input: &str, limit: usize, budget: &WorkBudget) -> Result<String> {
     let trimmed = input.trim();
     // Keep an outer expression delimiter, which carries source-card syntax.
     let (body, wrapper) =
@@ -899,10 +984,9 @@ fn runtime_expression(input: &str, limit: usize, budget: &WorkBudget) -> Result<
     let lowered = power::lower_runtime(body, limit, budget)?;
     let lowered = rewrite_expression(
         &lowered,
-        SourceLanguage::Simetrix,
+        ExpressionProjection::native(SourceLanguage::Simetrix, false),
         true,
         limit,
-        false,
         budget,
     )?;
     if let Some((open, close)) = wrapper {
@@ -920,6 +1004,41 @@ fn runtime_expression(input: &str, limit: usize, budget: &WorkBudget) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_scalar_and_runtime_regions_preserve_phase_specific_names() -> Result<()> {
+        let budget = WorkBudget::default();
+        let context = DialectContext::default();
+        for (input, expected) in [
+            (
+                ".param a={0**.5} b=-2^3 c={PWR(2,-3)}",
+                ".param a={simetrix_abs_pow(0,.5)} b=simetrix_caret_pow(-2,3) c={simetrix_abs_pow(2,-3)}",
+            ),
+            (
+                ".func f(x,p) = {x**p}",
+                ".func f(x,p) {simetrix_abs_pow(x,p)}",
+            ),
+            (
+                "B1 a 0 V=0*PWR(V(x),-1) TC1={2^3}",
+                "B1 a 0 V=simetrix_abs_pow_product(0,V(x),-1) TC1={simetrix_caret_pow(2,3)}",
+            ),
+            ("R1 a 0 {PWR(v(x),2)}", "R1 a 0 {simetrix_abs_pow(v(x),2)}"),
+            (
+                ".model m d(is={0**.5})",
+                ".model m d(is={simetrix_abs_pow(0,.5)})",
+            ),
+        ] {
+            let actual = lower_statement_targeted(
+                input,
+                context,
+                PowerTarget::PreparedSolverV1,
+                4096,
+                &budget,
+            )?;
+            assert_eq!(actual, expected, "{input}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn header_overrides_are_local_and_late_declarations_are_comments() -> Result<()> {

@@ -300,6 +300,7 @@ fn remainder(left: f64, right: f64) -> f64 {
 macro_rules! functions {
     ($($variant:ident => $name:literal / $arity:literal,)*) => {
         /// Native numparam functions and explicitly named prepared operations.
+        ///
         /// Native spellings follow `fmathS` in `xpressn.c`; prepared
         /// spellings do not change the native arithmetic contract.
         /// Statistical calls are realized separately.

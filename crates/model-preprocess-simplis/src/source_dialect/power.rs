@@ -322,7 +322,12 @@ impl Lowerer<'_> {
     }
 }
 
-fn append(output: &mut String, text: &str, limit: usize, budget: &WorkBudget) -> Result<()> {
+pub(super) fn append(
+    output: &mut String,
+    text: &str,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<()> {
     ensure!(
         text.len() <= limit.saturating_sub(output.len()),
         "source power expansion byte budget exceeded"
