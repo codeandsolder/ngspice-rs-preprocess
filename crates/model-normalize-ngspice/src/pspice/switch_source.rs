@@ -211,6 +211,7 @@ impl Capture<'_> {
         &self,
         text: &str,
         line: usize,
+        last_line: usize,
     ) -> Result<Option<DelayedSwitchDeclaration>> {
         let (positions, tail) = positional_prefix(text);
         let fields = positions
@@ -263,6 +264,10 @@ impl Capture<'_> {
         if !delayed {
             return Ok(None);
         }
+        ensure!(
+            chain.iter().all(|model| !model.conditional),
+            "conditional PSpice delayed switch model requires topology binding"
+        );
         let control = match (law, voltage_instance, fields.as_slice()) {
             (SwitchLaw::ThresholdVoltage, true, [_, _, _, positive, negative, _]) => {
                 ControlConnection::Voltage {
@@ -290,14 +295,18 @@ impl Capture<'_> {
             .map(|model| {
                 charge_card(&model.card, self.scopes.budget())?;
                 Ok(Located {
-                    location: self.location(model.card.source_line, model.scope)?,
+                    location: self.location(
+                        model.card.source_line,
+                        model.last_line,
+                        model.scope,
+                    )?,
                     declaration: model.card.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Some(DelayedSwitchDeclaration {
             name: (*name).to_owned(),
-            location: self.location(line, scope)?,
+            location: self.location(line, last_line, scope)?,
             terminals: [fields[1].to_owned(), fields[2].to_owned()],
             control,
             models,

@@ -231,10 +231,6 @@ impl Primitive {
             (None, true, [width, groups]) => (*width, *groups),
             _ => anyhow::bail!("incorrect dimensions for PSpice primitive {name}"),
         };
-        ensure!(
-            operation.fixed_inputs().is_some() || width >= 2,
-            "logic gate requires at least two inputs"
-        );
         Ok(Self::Logic {
             operation,
             width,
@@ -336,6 +332,66 @@ pub enum PinRole {
     QBar,
 }
 
+/// A named node is not necessarily local: explicit global declarations and
+/// enclosing formal ports are resolved at occurrence binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKind {
+    /// Ordinary named node, subject to normal hierarchy and port binding.
+    Named,
+    /// Implicit global reference (zero or a dollar-G-underscore name).
+    Global,
+    /// Fixed logic zero.
+    LogicLow,
+    /// Fixed logic one.
+    LogicHigh,
+    /// Fixed unknown logic value.
+    LogicUnknown,
+    /// A disconnected terminal; each occurrence is independent, not a net.
+    NotConnected,
+}
+
+/// Source node reference, with original spelling and explicit special semantics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeReference {
+    /// Original source node spelling.
+    pub name: String,
+    /// Source naming semantics.
+    pub kind: NodeKind,
+}
+
+impl NodeReference {
+    /// Classify a source node without assigning a numerical voltage or row.
+    ///
+    /// # Errors
+    /// Malformed node or an unqualified reserved digital constant.
+    pub fn parse(name: &str) -> Result<Self> {
+        ensure!(
+            !name.is_empty()
+                && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+                && !name.contains(['=', '(', ')', '{', '}', ',', '"', '\'']),
+            "invalid PSpice node {name}"
+        );
+        let upper = name.to_ascii_uppercase();
+        let kind = match upper.as_str() {
+            "$D_HI" => NodeKind::LogicHigh,
+            "$D_LO" => NodeKind::LogicLow,
+            "$D_X" => NodeKind::LogicUnknown,
+            "$D_NC" => NodeKind::NotConnected,
+            "0" => NodeKind::Global,
+            _ if upper.starts_with("$G_") => NodeKind::Global,
+            _ if upper.starts_with("$D_") => {
+                anyhow::bail!("unsupported reserved PSpice digital node {name}")
+            }
+            _ => NodeKind::Named,
+        };
+        Ok(Self {
+            name: name.to_owned(),
+            kind,
+        })
+    }
+}
+
 /// A named source node, with its role and ordinal within that role.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Pin {
@@ -344,7 +400,7 @@ pub struct Pin {
     /// Zero-based ordinal within the group.
     pub ordinal: usize,
     /// Original node name (including special digital constants).
-    pub node: String,
+    pub node: NodeReference,
 }
 
 /// Complete logical U-device declaration, before occurrence elaboration.
@@ -414,7 +470,7 @@ impl DigitalInstance {
     /// Malformed primitive, dimensions, pins, model references or selectors.
     pub fn parse(text: &str, source_line: usize, budget: &WorkBudget) -> Result<Self> {
         budget.charge(Resource::ScannedBytes, text.len())?;
-        let spans = lexical::tokens(text.as_bytes())?;
+        let spans = lexical::waveform_tokens(text.as_bytes())?;
         let fields = spans
             .iter()
             .map(|span| &text[span.clone()])
@@ -463,6 +519,11 @@ impl DigitalInstance {
         // Keep duplicate assignments and their original order for source binding.
         for field in &selectors {
             ensure!(
+                field.expression.is_some(),
+                "missing U-device selector value {}",
+                field.name
+            );
+            ensure!(
                 field.name.eq_ignore_ascii_case("IO_LEVEL")
                     || (primitive.timing_family().is_some()
                         && field.name.eq_ignore_ascii_case("MNTYMXDLY")),
@@ -479,7 +540,7 @@ impl DigitalInstance {
                 pins.push(Pin {
                     role,
                     ordinal,
-                    node: (*node).to_owned(),
+                    node: NodeReference::parse(node)?,
                 });
             }
         }
@@ -517,7 +578,7 @@ mod tests {
             }
         );
         assert_eq!(card.pins[6].role, PinRole::Enable);
-        assert_eq!(card.pins[7].node, "y0");
+        assert_eq!(card.pins[7].node.name, "y0");
         assert_eq!(card.selectors[0].expression.as_deref(), Some("{corner}"));
         let card = DigitalInstance::parse("U2 OA(2,2) P G a b c d y T IO", 6, &budget)?;
         assert_eq!(
@@ -529,7 +590,17 @@ mod tests {
                 tristate: false
             }
         );
-        assert_eq!(card.pins.last().context("missing output")?.node, "y");
+        assert_eq!(card.pins.last().context("missing output")?.node.name, "y");
+        let card = DigitalInstance::parse("U3 AND(1),P,G,a,y,T,IO", 7, &budget)?;
+        assert_eq!(
+            card.primitive,
+            Primitive::Logic {
+                operation: Gate::And,
+                width: 1,
+                groups: 1,
+                tristate: false
+            }
+        );
         Ok(())
     }
 
@@ -556,12 +627,42 @@ mod tests {
     }
 
     #[test]
+    fn special_connections_are_not_ordinary_named_nets() -> Result<()> {
+        let budget = WorkBudget::default();
+        let card = DigitalInstance::parse(
+            "U1 DFF(1) $g_pwr 0 $d_hi $D_LO $D_X in $D_NC $d_nc T IO",
+            1,
+            &budget,
+        )?;
+        assert_eq!(
+            card.pins
+                .iter()
+                .map(|pin| pin.node.kind)
+                .collect::<Vec<_>>(),
+            [
+                NodeKind::Global,
+                NodeKind::Global,
+                NodeKind::LogicHigh,
+                NodeKind::LogicLow,
+                NodeKind::LogicUnknown,
+                NodeKind::Named,
+                NodeKind::NotConnected,
+                NodeKind::NotConnected,
+            ]
+        );
+        assert_eq!(card.pins[0].node.name, "$g_pwr");
+        assert!(NodeReference::parse("$D_unqualified").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn rejects_wrong_dimensions_pin_counts_and_selectors() -> Result<()> {
         let budget = WorkBudget::default();
         for text in [
             "U1 AND(0) P G a y T IO",
             "U1 AND(2) P G a y T IO",
             "U1 BUF P G a y T IO UNKNOWN=0",
+            "U1 BUF P G a y T IO IO_LEVEL",
             "U1 PULLUP(1) P G a IO MNTYMXDLY=1",
             "U1 AO3(2,2) P G a b c d e y T IO",
             "U1 ANDA(18446744073709551615,2) P G a y T IO",

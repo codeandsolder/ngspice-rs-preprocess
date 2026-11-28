@@ -14,16 +14,26 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::Serialize;
+use std::ops::RangeInclusive;
+
+/// Original physical span in one admitted resource occurrence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceSpan {
+    /// First source line, include visit and lexical source scope.
+    pub first: SourceOrigin,
+    /// Last physical line in the same source occurrence.
+    pub last_line: usize,
+}
 
 /// Exact declaration address within the supplied source stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Location {
-    /// Physical input line in the admitted stream.
-    pub input_line: usize,
+    /// Inclusive physical input span, before normalization.
+    pub input_lines: RangeInclusive<usize>,
     /// Lexical subcircuit path (not a flattened occurrence name).
     pub scope: Vec<String>,
     /// Original resource and occurrence identity for a linked stream.
-    pub linked: Option<SourceOrigin>,
+    pub linked: Option<SourceSpan>,
 }
 
 /// A declaration with its own scope, even if inherited from another model.
@@ -79,27 +89,47 @@ pub(super) struct Capture<'a> {
 }
 
 impl Capture<'_> {
-    pub(super) fn location(&self, line: usize, scope: usize) -> Result<Location> {
-        let input_line = *self
+    pub(super) fn location(&self, line: usize, last_line: usize, scope: usize) -> Result<Location> {
+        let lines = self
             .origins
-            .get(line.checked_sub(1).context("invalid digital source line")?)
-            .context("missing digital source line")?;
+            .get(line.checked_sub(1).context("invalid PSpice source line")?..last_line)
+            .context("missing PSpice physical source span")?;
+        let &input_line = lines.first().context("empty PSpice source span")?;
+        let &last_input_line = lines.last().context("empty PSpice source span")?;
         let path = self.scopes.path(scope);
         charge_scope(path, self.scopes.budget())?;
         let linked = match self.dialects {
             SourceDialects::Linked(linked) => {
                 let origin = linked
                     .origin(input_line)
-                    .context("missing linked digital source origin")?;
+                    .context("missing linked PSpice source origin")?;
+                let mut previous = origin.line;
+                for &line in lines {
+                    self.scopes.budget().charge(Resource::EvaluationSteps, 1)?;
+                    let next = linked
+                        .origin(line)
+                        .context("missing linked PSpice source origin")?;
+                    ensure!(
+                        next.path == origin.path
+                            && next.visit == origin.visit
+                            && next.scope == origin.scope
+                            && next.line >= previous,
+                        "PSpice statement spans unrelated source occurrences"
+                    );
+                    previous = next.line;
+                }
                 self.scopes
                     .budget()
                     .charge(Resource::EmittedBytes, origin.path.as_os_str().len())?;
-                Some(origin.clone())
+                Some(SourceSpan {
+                    first: origin.clone(),
+                    last_line: previous,
+                })
             }
             SourceDialects::Uniform(_) => None,
         };
         Ok(Location {
-            input_line,
+            input_lines: input_line..=last_input_line,
             scope: path.to_vec(),
             linked,
         })
@@ -123,6 +153,10 @@ impl Capture<'_> {
                     model.dialect == SourceDialect::Pspice,
                     "PSpice digital model {name} resolves to an unqualified source dialect"
                 );
+                ensure!(
+                    !model.conditional,
+                    "conditional PSpice model {name} requires topology binding"
+                );
                 charge_card(&model.card, self.scopes.budget())?;
                 let declaration = parse(&model.card)?.with_context(|| {
                     format!(
@@ -131,14 +165,18 @@ impl Capture<'_> {
                     )
                 })?;
                 Ok(Located {
-                    location: self.location(model.card.source_line, model.scope)?,
+                    location: self.location(
+                        model.card.source_line,
+                        model.last_line,
+                        model.scope,
+                    )?,
                     declaration,
                 })
             })
             .collect()
     }
 
-    fn instance(&self, text: &str, line: usize) -> Result<DigitalDeclaration> {
+    fn instance(&self, text: &str, line: usize, last_line: usize) -> Result<DigitalDeclaration> {
         let scope = self.scopes.scope(line)?;
         let instance = DigitalInstance::parse(text, line, self.scopes.budget())?;
         let timing = if let Some(name) = &instance.timing_model {
@@ -159,7 +197,7 @@ impl Capture<'_> {
         let io = self.model(scope, &instance.io_model, IoModel::from_card)?;
         Ok(DigitalDeclaration {
             instance: Located {
-                location: self.location(line, scope)?,
+                location: self.location(line, last_line, scope)?,
                 declaration: instance,
             },
             timing,
@@ -220,12 +258,14 @@ pub(super) fn capture(
                 "conditional PSpice digital primitive requires topology binding"
             );
             let text = std::str::from_utf8(&statement.text)?;
-            let declaration = capture.instance(text, statement.line).with_context(|| {
-                format!(
-                    "{}: PSpice digital declaration",
-                    dialects.describe_mapped(origins, statement.line)
-                )
-            })?;
+            let declaration = capture
+                .instance(text, statement.line, statement.last_line)
+                .with_context(|| {
+                    format!(
+                        "{}: PSpice digital declaration",
+                        dialects.describe_mapped(origins, statement.line)
+                    )
+                })?;
             declarations.digital.push(declaration);
         } else if first
             .first()
@@ -233,7 +273,9 @@ pub(super) fn capture(
             && dialects.at_mapped(origins, statement.line)?.is_pspice()
         {
             let text = std::str::from_utf8(&statement.text)?;
-            if let Some(declaration) = capture.delayed_switch(text, statement.line)? {
+            if let Some(declaration) =
+                capture.delayed_switch(text, statement.line, statement.last_line)?
+            {
                 ensure!(
                     conditional_depth == 0,
                     "conditional PSpice delayed switch requires topology binding"
@@ -346,7 +388,7 @@ mod tests {
         assert_eq!(paths[0].corners.typical.to_bits(), 10_f64.to_bits());
         assert_eq!(paths[1].corners.typical.to_bits(), 20_f64.to_bits());
         assert_eq!(paths[1].corners.maximum.to_bits(), 32_f64.to_bits());
-        assert_eq!(declaration.io[0].location.input_line, 5);
+        assert_eq!(declaration.io[0].location.input_lines, 5..=5);
         assert_eq!(
             declaration.io[0].declaration.assignments[0]
                 .field
@@ -530,14 +572,15 @@ U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
             .linked
             .as_ref()
             .context("missing linked origin")?;
-        assert_eq!(left.path, body.canonicalize()?);
-        assert_eq!(left.path, right.path);
-        assert_eq!((left.line, right.line), (1, 1));
-        assert_ne!(left.visit, right.visit);
-        assert_ne!(left.scope, right.scope);
-        assert_eq!(one.instance.declaration.pins[0].node, "$G_DPWR");
-        assert_eq!(one.instance.declaration.pins[1].node, "$G_DGND");
-        assert_eq!(one.instance.declaration.pins[2].node, "$D_HI");
+        assert_eq!(left.first.path, body.canonicalize()?);
+        assert_eq!(left.first.path, right.first.path);
+        assert_eq!((left.first.line, right.first.line), (1, 1));
+        assert_eq!((left.last_line, right.last_line), (2, 2));
+        assert_ne!(left.first.visit, right.first.visit);
+        assert_ne!(left.first.scope, right.first.scope);
+        assert_eq!(one.instance.declaration.pins[0].node.name, "$G_DPWR");
+        assert_eq!(one.instance.declaration.pins[1].node.name, "$G_DGND");
+        assert_eq!(one.instance.declaration.pins[2].node.name, "$D_HI");
         assert_eq!(one.instance.location.scope, ["one"]);
         assert_eq!(two.instance.location.scope, ["two"]);
         assert_eq!(one.timing[0].location, two.timing[0].location);
@@ -580,6 +623,7 @@ U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
             ".model t UGATE\n.model io D\nU1 BUF p g a y t io\n",
             ".model t UGATE\nU1 BUF p g a y t io\n",
             ".model t UGATE\n.model io UIO\n.if 1\nU1 BUF p g a y t io\n.endif\n",
+            ".if 0\n.model t UGATE\n.endif\n.model io UIO\nU1 BUF p g a y t io\n",
         ] {
             let statements = lexical::statements(input.as_bytes())?;
             let origins = (1..=input.lines().count()).collect::<Vec<_>>();

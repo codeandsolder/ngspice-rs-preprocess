@@ -23,6 +23,8 @@ pub(super) struct Declaration {
     pub card: ModelCard,
     base: Option<String>,
     pub dialect: SourceDialect,
+    pub last_line: usize,
+    pub conditional: bool,
 }
 
 pub(super) struct Scopes {
@@ -82,6 +84,7 @@ impl Scopes {
         };
         let mut scope = 0usize;
         let mut control = false;
+        let mut conditional_depth = 0usize;
         for statement in statements {
             budget.charge(Resource::Statements, 1)?;
             budget.charge(Resource::ScannedBytes, statement.text.len())?;
@@ -101,6 +104,16 @@ impl Scopes {
             }
             if control {
                 continue;
+            }
+            if first == ".if" {
+                conditional_depth = conditional_depth
+                    .checked_add(1)
+                    .context("PSpice conditional depth overflow")?;
+                budget.check_depth(conditional_depth)?;
+            } else if first == ".endif" {
+                conditional_depth = conditional_depth
+                    .checked_sub(1)
+                    .context("unmatched PSpice .ENDIF")?;
             }
             if first == ".subckt" {
                 let parent = scope;
@@ -128,7 +141,13 @@ impl Scopes {
                     .parent
                     .context("unmatched PSpice .ENDS")?;
             } else if first == ".model" {
-                result.collect_model(scope, statement.line, text, origins, dialects)?;
+                result.collect_model(
+                    scope,
+                    statement,
+                    origins,
+                    dialects,
+                    conditional_depth != 0,
+                )?;
             } else if first == ".global" {
                 result.global_ground |= text
                     .split_ascii_whitespace()
@@ -155,11 +174,13 @@ impl Scopes {
     fn collect_model(
         &mut self,
         scope: usize,
-        line: usize,
-        text: &str,
+        statement: &lexical::Statement,
         origins: &[usize],
         dialects: SourceDialects<'_>,
+        conditional: bool,
     ) -> Result<()> {
+        let line = statement.line;
+        let text = std::str::from_utf8(&statement.text)?;
         let dialect = dialects.at_mapped(origins, line)?;
         let location = || dialects.describe_mapped(origins, line);
         let (card, base) = if dialect.is_pspice() {
@@ -183,6 +204,8 @@ impl Scopes {
                 card,
                 base,
                 dialect,
+                last_line: statement.last_line,
+                conditional,
             },
         );
         Ok(())

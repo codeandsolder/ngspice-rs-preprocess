@@ -265,7 +265,7 @@ fn reference(
         budget.charge(Resource::EmittedBytes, name.len())?;
         charge_scope(&location.scope, budget)?;
         if let Some(origin) = &location.linked {
-            budget.charge(Resource::EmittedBytes, origin.path.as_os_str().len())?;
+            budget.charge(Resource::EmittedBytes, origin.first.path.as_os_str().len())?;
         }
         Ok(InterfaceReference {
             name,
