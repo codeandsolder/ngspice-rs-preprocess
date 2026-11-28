@@ -512,8 +512,6 @@ fn unresolved_passive_topology_is_diagnostic_not_silent() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("source.cir");
     for card in [
-        "C1 a 0 1u IC=.75",
-        "L1 a 0 1m IC=.1",
         "L1 a 0 1m Lser=1m",
         "L1 a 0 1m RLshunt=20",
         "C1 a 0 Q={v(a)*v(a)}",

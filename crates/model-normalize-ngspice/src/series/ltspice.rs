@@ -283,6 +283,50 @@ fn voltage(card: &mut Card<'_>, controlled: bool, budget: &WorkBudget) -> Result
     Ok(())
 }
 
+/// Startup bias and storage history are separate physical laws. Only the
+/// terminal bias phase replaces the physical parasitic network.
+fn storage_initialization(
+    card: &mut Card<'_>,
+    inductor: bool,
+    coupled: bool,
+    multiplicity: &str,
+    budget: &WorkBudget,
+) -> Result<bool> {
+    let Some(initial) = card.scalar(b"ic")? else {
+        return Ok(false);
+    };
+    let default_rser = if inductor && !coupled { "1m" } else { "0" };
+    let rser = expression(card.scalar(b"rser")?.unwrap_or(default_rser));
+    let g = if inductor {
+        let m = expression(multiplicity);
+        let parallel = if let Some(rpar) = card.scalar(b"rpar")? {
+            let r = expression(rpar);
+            format!("ternary_fcn(({r})==0,0,({m})/ternary_fcn(({r})==0,1,({r})))")
+        } else {
+            let l = expression(std::str::from_utf8(
+                &card.statement.text[card.fields[3].clone()],
+            )?);
+            format!("1e-12*({m})/({l})")
+        };
+        format!("({parallel})+ternary_fcn(({rser})==0,1e-5,0)")
+    } else {
+        // With no series loss the finite startup conductance is 1000 S.
+        // Otherwise use the reciprocal of the specified (unscaled) Rser.
+        format!("1/ternary_fcn(({rser})==0,1m,({rser}))")
+    };
+    let conductance = format!("{{{g}}}");
+    card.derived("pn_terminal_bias_op", &conductance, budget)?;
+    card.derived("pn_terminal_bias_tran", &conductance, budget)?;
+    card.push("pn_exact_ic", "1");
+    if !inductor && (card.scalar(b"cpar")?.is_some() || card.scalar(b"lser")?.is_some()) {
+        // Both the primary and external capacitor get the prescribed voltage.
+        // An occurrence whose parallel capacitance resolves to zero has no
+        // corresponding storage state.
+        card.push("pn_parallel_ic", initial);
+    }
+    Ok(true)
+}
+
 fn storage(
     card: &mut Card<'_>,
     coupled: bool,
@@ -302,13 +346,6 @@ fn storage(
         "line {}: nonlinear LTspice passive requires typed lowering",
         card.statement.line
     );
-    // The source requires a distinct bias network and exact initial history;
-    // ordinary native IC or the existing storage bias alone cannot represent it.
-    ensure!(
-        card.scalar(b"ic")?.is_none(),
-        "line {}: LTspice passive IC requires independent bias topology and storage history",
-        card.statement.line
-    );
     if inductor {
         // LTspice diagnoses these capacitor-only setters on L cards.
         card.reject(b"lser")?;
@@ -317,8 +354,10 @@ fn storage(
     let multiplicity = card.scalar(b"m")?.unwrap_or("1");
     let lser = card.scalar(b"lser")?;
     let cpar = card.scalar(b"cpar")?;
-    let mut physical = card.rename(b"rser", "pn_rseries")?;
-    if inductor && !physical && !coupled {
+    let mut physical = storage_initialization(card, inductor, coupled, multiplicity, budget)?;
+    let explicit_rser = card.rename(b"rser", "pn_rseries")?;
+    physical |= explicit_rser;
+    if inductor && !explicit_rser && !coupled {
         ensure!(
             !include || scope != 0,
             "line {}: default inductor resistance needs the complete LTspice deck to resolve mutual coupling; specify Rser explicitly",
@@ -503,6 +542,84 @@ mod tests {
                         "{key}: {got} != {want}"
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_bias_and_parallel_history_are_occurrence_bound() -> Result<()> {
+        let source = b"title\n.subckt cell p n params: copies=1 loss=2 shunt=20 init=.75\nC1 p n 2u m={copies} Rser={loss} IC={init} Cpar=1u\nL1 p n 3m m={copies} Rser={loss} Rpar={shunt} IC=.1 Cpar=1u\nL2 p n 3m IC=.1\nL3 p n 3m IC=.1\nK1 L2 L3 .5\n.ends\n.end\n";
+        let normalized = normalize_mapped(
+            source,
+            RootKind::Deck,
+            NormalizationDialect::Ltspice,
+            &WorkBudget::default(),
+        )?;
+        let bytes = &normalized.model.bytes;
+        let library = ModelLibrary::parse_source(bytes, RootKind::Deck)?;
+        let statements = crate::lexical::statements(bytes)?;
+        for (copies, loss, shunt, init) in [
+            (1., 2., 20., 0.75),
+            (3., 5., 20., 0.),
+            (0., 0., 0., 1.),
+            (2., 0., 0., 0.5),
+        ] {
+            let overrides = [
+                (1, "copies", copies),
+                (1, "loss", loss),
+                (1, "shunt", shunt),
+                (1, "init", init),
+            ];
+            let c_bias = if loss == 0. { 1000. } else { 1. / loss };
+            let l_bias =
+                if shunt == 0. { 0. } else { copies / shunt } + if loss == 0. { 1e-5 } else { 0. };
+            for (name, want, parallel) in [
+                ("C1", c_bias, Some(init)),
+                ("L1", l_bias, None),
+                ("L2", 1e-5 + 1e-12 / 3e-3, None),
+                ("L3", 1e-5 + 1e-12 / 3e-3, None),
+            ] {
+                let card = statements
+                    .iter()
+                    .find(|card| card.text.starts_with(format!("{name} ").as_bytes()))
+                    .context("missing device")?;
+                let text = std::str::from_utf8(&card.text)?;
+                let start = text.find("pn_").context("missing coefficients")?;
+                let fields = parse_assignments(&text[start..])?;
+                let value = |key: &str| -> Result<Option<f64>> {
+                    fields
+                        .iter()
+                        .find(|f| f.name == key)
+                        .map(|f| {
+                            library.evaluate_scalar(
+                                1,
+                                f.expression.as_deref().context("missing expression")?,
+                                &overrides,
+                            )
+                        })
+                        .transpose()
+                };
+                for phase in ["pn_terminal_bias_op", "pn_terminal_bias_tran"] {
+                    let actual = value(phase)?.context("missing bias")?;
+                    ensure!(
+                        (actual - want).abs() <= 1e-13 * want.abs().max(1e-12),
+                        "{name}: {actual} != {want}"
+                    );
+                }
+                ensure!(
+                    value("pn_exact_ic")? == Some(1.),
+                    "{name}: no exact history"
+                );
+                ensure!(
+                    value("pn_terminal_bias_dc")?.is_none()
+                        && value("pn_terminal_bias_ac")?.is_none(),
+                    "{name}: bias leaked into DC sweep or AC"
+                );
+                ensure!(
+                    value("pn_parallel_ic")? == parallel,
+                    "{name}: incorrect auxiliary storage IC"
+                );
             }
         }
         Ok(())
