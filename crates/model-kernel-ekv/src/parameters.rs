@@ -123,7 +123,7 @@ pub struct Prepared {
     pub(crate) impact_saturation: f64,
 }
 
-fn bandgap(t: f64) -> f64 {
+pub fn bandgap(t: f64) -> f64 {
     1.16 - 7.02e-4 * t * t / (t + 1108.)
 }
 
@@ -182,10 +182,29 @@ impl Model {
     /// # Errors
     /// Nonphysical or nonfinite model, geometry, or absolute temperature.
     pub fn prepare(self, g: Geometry, temperature: f64) -> Result<Prepared> {
+        self.prepare_dimensions(g, temperature, false)
+    }
+
+    /// Prepare a compact series/parallel device from per-element drawn
+    /// dimensions. Length is NS*(L+DL), width is M*(W+DW), while the
+    /// short/narrow effects use each individual element's dimensions.
+    ///
+    /// # Errors
+    /// Invalid model, geometry, temperature, or aggregate dimensions.
+    pub fn prepare_segmented(self, g: Geometry, temperature: f64) -> Result<Prepared> {
+        self.prepare_dimensions(g, temperature, true)
+    }
+
+    fn prepare_dimensions(
+        self,
+        g: Geometry,
+        temperature: f64,
+        segmented: bool,
+    ) -> Result<Prepared> {
         self.validate(g, temperature)?;
-        let length = g.length + self.dl;
-        let width = g.width + self.dw;
-        if length <= 0. || width <= 0. {
+        let length = (g.length + self.dl) * if segmented { g.series } else { 1. };
+        let width = (g.width + self.dw) * if segmented { g.parallel } else { 1. };
+        if !length.is_finite() || !width.is_finite() || length <= 0. || width <= 0. {
             return Err(Error::Domain("nonpositive EKV effective geometry".into()));
         }
         let vt = K_OVER_Q * temperature;

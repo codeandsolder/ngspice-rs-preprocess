@@ -9,6 +9,9 @@
 
 pub mod artifact;
 mod channel;
+pub mod device;
+pub mod geometry;
+pub mod junction;
 mod parameters;
 
 pub use parameters::{Geometry, Model, Polarity, Prepared};
