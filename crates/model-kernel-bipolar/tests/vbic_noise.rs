@@ -161,7 +161,6 @@ fn noise_batch_validation_and_negative_conductance_fail_closed() -> TestResult {
         prepared.evaluate(bad, 150.0),
         Err(EvaluationError::InvalidPhysicalDomain)
     ));
-    bad = operating[0];
     let sentinel = noise::Output::default();
     let mut outputs = [sentinel; 3];
     prepared.evaluate_batch(&[], &mut [], 0.0)?;
