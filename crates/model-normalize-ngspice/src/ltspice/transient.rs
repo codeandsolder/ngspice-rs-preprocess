@@ -273,10 +273,12 @@ mod tests {
 
     #[test]
     fn timing_resolves_per_candidate_and_keeps_saved_window_separate() -> Result<()> {
-        let intent = TransientIntent::parse(&["0", "{duration}", "-1m", "0"])?;
+        let parameter_name = "duration";
+        let expression = format!("{{{parameter_name}}}");
+        let intent = TransientIntent::parse(&["0", &expression, "-1m", "0"])?;
         for duration in [1e-3, 5e-3, 0.2] {
             let bound = intent.bind(|raw| {
-                if raw == "{duration}" {
+                if raw == expression {
                     Ok(duration)
                 } else {
                     parse_spice_constant(raw)
