@@ -727,7 +727,9 @@ pub fn normalize_mapped(
 }
 
 /// Normalize occurrence-bound rows while retaining their source transfer
-/// syntax. Expressions and model declarations have already been bound and
+/// syntax.
+///
+/// Expressions and model declarations have already been bound and
 /// lowered by the producer. Do not rerun dialect-specific physical passes.
 ///
 /// # Errors
@@ -919,6 +921,31 @@ fn normalize_selected(
     }
 }
 
+fn expanded_line_origins(
+    input: &[u8],
+    inserted_lines: &[usize],
+    budget: &WorkBudget,
+) -> Result<Option<Vec<usize>>> {
+    if inserted_lines.is_empty() {
+        return Ok(None);
+    }
+    let count = input.split_inclusive(|byte| *byte == b'\n').count();
+    budget.charge(
+        Resource::GeneratedNodes,
+        count.saturating_add(inserted_lines.len()),
+    )?;
+    let mut origins = Vec::new();
+    let mut previous = inserted_lines.iter().copied().peekable();
+    for line in 1..=count {
+        while previous.peek() == Some(&line) {
+            origins.push(line);
+            previous.next();
+        }
+        origins.push(line);
+    }
+    Ok(Some(origins))
+}
+
 fn normalize_body(
     input: &[u8],
     strip_end: bool,
@@ -981,27 +1008,7 @@ fn normalize_body(
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
     let prior_origins = origins;
-    let origins = if inserted_lines.is_empty() {
-        None
-    } else {
-        budget.charge(
-            Resource::GeneratedNodes,
-            input
-                .split_inclusive(|byte| *byte == b'\n')
-                .count()
-                .saturating_add(inserted_lines.len()),
-        )?;
-        let mut origins = Vec::new();
-        let mut previous = inserted_lines.iter().copied().peekable();
-        for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
-            while previous.peek() == Some(&line) {
-                origins.push(line);
-                previous.next();
-            }
-            origins.push(line);
-        }
-        Some(origins)
-    };
+    let origins = expanded_line_origins(input, inserted_lines, budget)?;
     let original_line = |line: usize| {
         origins.as_ref().map_or(Ok(line), |mapping| {
             mapping

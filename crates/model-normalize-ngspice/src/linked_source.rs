@@ -122,8 +122,7 @@ impl LinkedSource {
             "linked physical source map mismatch"
         );
         let mut output = Vec::new();
-        let mut begin = 0;
-        if kind == RootKind::Deck {
+        let mut begin = if kind == RootKind::Deck {
             let end = *offsets.get(1).context("linked deck has no title")?;
             append_statement(
                 &mut output,
@@ -132,8 +131,10 @@ impl LinkedSource {
                 self.bytes[..end].trim_ascii_end(),
                 budget,
             )?;
-            begin = 1;
-        }
+            1
+        } else {
+            0
+        };
         while begin < self.origins.len() {
             let origin = &self.origins[begin];
             let dialect = self
@@ -873,10 +874,9 @@ impl LinkState<'_> {
             scope: self.scope,
             section: section_key,
             dialect: inherited,
-            separator: self.stack.last().map_or_else(
-                || self.root_separator,
-                |frame| self.output.visits[frame.visit].separator,
-            ),
+            separator: self.stack.last().map_or(self.root_separator, |frame| {
+                self.output.visits[frame.visit].separator
+            }),
             declaration: None,
         });
         self.stack.push(VisitFrame {

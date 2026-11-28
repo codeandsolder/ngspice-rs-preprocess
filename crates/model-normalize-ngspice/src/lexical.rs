@@ -11,7 +11,7 @@ pub fn ensure_textual(input: &[u8]) -> Result<()> {
 }
 
 #[derive(Clone, Copy, Default)]
-pub(crate) enum CommentSyntax {
+pub enum CommentSyntax {
     #[default]
     Native,
     Hspice,
@@ -110,10 +110,7 @@ pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
     statements_with_syntax(input, CommentSyntax::Native)
 }
 
-pub(crate) fn statements_with_syntax(
-    input: &[u8],
-    syntax: CommentSyntax,
-) -> Result<Vec<Statement>> {
+pub fn statements_with_syntax(input: &[u8], syntax: CommentSyntax) -> Result<Vec<Statement>> {
     ensure_textual(input)?;
     let mut statements: Vec<Statement> = Vec::new();
     let mut offset = 0;
