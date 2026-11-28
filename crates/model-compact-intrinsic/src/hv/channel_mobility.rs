@@ -136,6 +136,7 @@ pub struct PreparedHiSimHvNormalChannel {
     mobility: HiSimHvChannelMobilityCoefficients,
     correction: ChannelCorrection,
     access: PreparedHiSimHvAccessCorrection,
+    sti: super::sti::StiCorrection,
     identity: Arc<()>,
 }
 
@@ -145,6 +146,8 @@ pub struct HiSimHvNormalChannelPoint {
     pub electrostatics: HiSimHvChannelElectrostaticPoint,
     pub mobility: HiSimHvChannelMobilityPoint,
     pub correction: HiSimHvChannelCorrectionPoint,
+    /// Edge-channel current added after nonlinear access resistance.
+    pub sti_current_a: Jet,
     /// Total intrinsic channel current before external access correction.
     pub drain_current_a: Jet,
 }
@@ -195,6 +198,7 @@ pub fn prepare_hisim_hv_normal_channel(
         mobility,
         correction: ChannelCorrection::prepare(model, instance, mobility.multiplicity)?,
         access: prepare_hisim_hv_access_correction(model, instance)?,
+        sti: super::sti::StiCorrection::prepare(model, instance, mobility.multiplicity)?,
         identity: Arc::clone(&instance.identity),
     })
 }
@@ -216,7 +220,7 @@ impl PreparedHiSimHvNormalChannel {
             external,
             preaccess_current_a: intrinsic.mobility.drain_current_a
                 + intrinsic.correction.parasitic_channel_current_a,
-            postaccess_leakage_a: intrinsic.correction.ohmic_leakage_a,
+            postaccess_current_a: intrinsic.correction.ohmic_leakage_a + intrinsic.sti_current_a,
             conducting_channel: !matches!(
                 intrinsic.electrostatics.charge.region,
                 HiSimHvChannelRegion::Accumulation | HiSimHvChannelRegion::NoInversion
@@ -264,7 +268,9 @@ impl PreparedHiSimHvNormalChannel {
             self.mobility
                 .evaluate(&inputs, &electrostatics.charge, &electrostatics.modulation)?;
         let correction = self.correction.evaluate(bias, &electrostatics, &mobility)?;
+        let sti_current_a = self.sti.evaluate(bias, &electrostatics, &mobility, t)?;
         let drain_current_a = (mobility.drain_current_a
+            + sti_current_a
             + correction.parasitic_channel_current_a
             + correction.ohmic_leakage_a)
             .checked("HiSIM-HV intrinsic channel current")?;
@@ -272,6 +278,7 @@ impl PreparedHiSimHvNormalChannel {
             electrostatics,
             mobility,
             correction,
+            sti_current_a,
             drain_current_a,
         })
     }

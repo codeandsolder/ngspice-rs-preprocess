@@ -26,6 +26,7 @@ mod poly_depletion;
 mod quantum_oxide;
 mod rules;
 mod smoothing;
+mod sti;
 mod surface;
 mod temperature;
 mod threshold;

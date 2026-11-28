@@ -96,21 +96,6 @@ fn nonnegative(value: Jet) -> Jet {
     }
 }
 
-// Native Fn_CP with xmax=1 and pw=4. Factor by the larger term so
-// the eighth power never overflows at a large inversion-voltage ratio.
-fn partition_clamp(x: Jet) -> Jet {
-    if x.value.abs() <= 1. {
-        let square = x * x;
-        let fourth = square * square;
-        x / (1. + fourth * fourth).sqrt().sqrt().sqrt()
-    } else {
-        let reciprocal = 1. / x;
-        let square = reciprocal * reciprocal;
-        let fourth = square * square;
-        x.value.signum() / (1. + fourth * fourth).sqrt().sqrt().sqrt()
-    }
-}
-
 #[derive(Clone, Copy)]
 struct IntegralFactors {
     f00: Jet,
@@ -189,7 +174,7 @@ fn integrate(
             + cox * ((inputs.effective_gate + 1. / beta) * factors.f10 - factors.f11));
     let bulk = beta * numerator / fdd;
     let achi = pds + 2. * coefficient / cox * factors.f10_delta;
-    let clamped = partition_clamp(achi / point.inversion_voltage);
+    let clamped = super::smoothing::unit_ceiling_power4(achi / point.inversion_voltage);
     let alpha = 1. - clamped;
     let qinm = 1. + alpha * (1. + alpha);
     let denominator = 1. + alpha;

@@ -1,4 +1,4 @@
-//! Converged native CORSRD=2 currents and independent external/internal derivatives.
+//! Converged native channel-current corrections and independent derivatives.
 use model_compact_intrinsic::{
     BoundParameters, HiSimHvAccessInputs, HiSimHvExternalBias, HiSimHvIntrinsicBias,
     HiSimHvIntrinsicScalar as Jet, ModelError, ModelVariant, ParameterScope, ParameterValue,
@@ -8,23 +8,45 @@ use model_compact_intrinsic::{
 };
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn prepare(row: &[f64; 15]) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance), ModelError> {
-    let variant = match row[0] {
-        1. => ModelVariant::HiSimHv1,
-        2. => ModelVariant::HiSimHv2,
-        _ => return Err(ModelError::InvalidPhysicalParameter("native model family")),
-    };
-    let mut fields = vec![
-        (
-            if row[1] < 0. { "pmos" } else { "nmos" },
-            ParameterValue::Flag(true),
-        ),
-        ("corsrd", ParameterValue::Integer(2)),
-    ];
-    for name in ["coisti", "coisub", "coadov", "coovlp", "conqs"] {
-        fields.push((name, ParameterValue::Integer(0)));
+#[derive(Clone, Copy)]
+enum Mechanism {
+    Access,
+    Sti,
+}
+
+fn card_parameters(
+    mechanism: Mechanism,
+    config: f64,
+) -> Result<&'static [(&'static str, f64)], ModelError> {
+    match mechanism {
+        Mechanism::Sti => match config {
+            0. => Ok(&[("wsti", 0.1e-6), ("nsti", 1e17), ("vthsti", 0.1)]),
+            1. => Ok(&[
+                ("wsti", 0.35e-6),
+                ("nsti", 5e17),
+                ("vthsti", -0.2),
+                ("vdsti", 0.02),
+                ("scsti1", 0.1),
+                ("scsti2", 0.2),
+                ("wstil", 0.5),
+                ("wstiw", 0.3),
+            ]),
+            2. => Ok(&[
+                ("wsti", 0.05e-6),
+                ("nsti", 1e18),
+                ("vthsti", 0.2),
+                ("vdsti", -0.01),
+                ("scsti1", 0.3),
+                ("scsti2", 0.1),
+            ]),
+            _ => Err(ModelError::InvalidPhysicalParameter("native STI card")),
+        },
+        Mechanism::Access => access_card_parameters(config),
     }
-    let parameters: &[(&str, f64)] = match row[7] {
+}
+
+fn access_card_parameters(config: f64) -> Result<&'static [(&'static str, f64)], ModelError> {
+    Ok(match config {
         0. => &[("rd", 0.03), ("rs", 0.03), ("rd23", 0.1), ("rd21", 0.6)],
         1. => &[
             ("rd", 0.04),
@@ -43,7 +65,40 @@ fn prepare(row: &[f64; 15]) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInst
         ],
         2. => &[("rd", 0.), ("rs", 0.), ("rd23", 0.1), ("rd21", 0.6)],
         _ => return Err(ModelError::InvalidPhysicalParameter("native access card")),
+    })
+}
+
+fn prepare(
+    row: &[f64; 15],
+    mechanism: Mechanism,
+) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance), ModelError> {
+    let variant = match row[0] {
+        1. => ModelVariant::HiSimHv1,
+        2. => ModelVariant::HiSimHv2,
+        _ => return Err(ModelError::InvalidPhysicalParameter("native model family")),
     };
+    let mut fields = vec![
+        (
+            if row[1] < 0. { "pmos" } else { "nmos" },
+            ParameterValue::Flag(true),
+        ),
+        (
+            "corsrd",
+            ParameterValue::Integer(if matches!(mechanism, Mechanism::Access) {
+                2
+            } else {
+                0
+            }),
+        ),
+        (
+            "coisti",
+            ParameterValue::Integer(i32::from(matches!(mechanism, Mechanism::Sti))),
+        ),
+    ];
+    for name in ["coisub", "coadov", "coovlp", "conqs"] {
+        fields.push((name, ParameterValue::Integer(0)));
+    }
+    let parameters = card_parameters(mechanism, row[7])?;
     fields.extend(
         parameters
             .iter()
@@ -51,21 +106,23 @@ fn prepare(row: &[f64; 15]) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInst
     );
     if variant == ModelVariant::HiSimHv2 {
         fields.push(("cordrift", ParameterValue::Integer(0)));
-        fields.extend(
-            [
-                ("ptl", 0.02),
-                ("ptlp", 0.7),
-                ("ptp", 3.7),
-                ("pt2", 0.12),
-                ("pt4", 0.4),
-                ("pt4p", 0.8),
-                ("gdl", 0.001),
-                ("gdld", 0.2e-6),
-                ("gdlp", 0.4),
-                ("gdsleak", 1e-7),
-            ]
-            .map(|(n, v)| (n, ParameterValue::Real(v))),
-        );
+        if matches!(mechanism, Mechanism::Access) {
+            fields.extend(
+                [
+                    ("ptl", 0.02),
+                    ("ptlp", 0.7),
+                    ("ptp", 3.7),
+                    ("pt2", 0.12),
+                    ("pt4", 0.4),
+                    ("pt4p", 0.8),
+                    ("gdl", 0.001),
+                    ("gdld", 0.2e-6),
+                    ("gdlp", 0.4),
+                    ("gdsleak", 1e-7),
+                ]
+                .map(|(n, v)| (n, ParameterValue::Real(v))),
+            );
+        }
     }
     let model = prepare_hisim_hv_model(&BoundParameters::bind(
         variant,
@@ -95,21 +152,16 @@ fn close(value: f64, reference: f64, relative: f64, absolute: f64, context: impl
     );
 }
 
-#[test]
-fn native_access_corrected_current_and_tied_terminal_derivatives() -> TestResult {
+fn compare_circuit(fixture: &str, expected_count: usize, mechanism: Mechanism) -> TestResult {
     let mut count = 0;
-    for (index, line) in include_str!("fixtures/hisim-hv-access-circuit-ngspice47.txt")
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .enumerate()
-    {
+    for (index, line) in fixture.lines().filter(|l| !l.starts_with('#')).enumerate() {
         let row: [f64; 15] = line
             .split_whitespace()
             .map(str::parse::<f64>)
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .map_err(|_| "native access fixture width")?;
-        let (model, instance) = prepare(&row)?;
+        let (model, instance) = prepare(&row, mechanism)?;
         let channel = prepare_hisim_hv_normal_channel(&model, &instance)?;
         let temperature = prepare_hisim_hv_transport(&model, &instance, row[2] + 273.15, 0.)?;
         let intrinsic = HiSimHvIntrinsicBias {
@@ -150,8 +202,26 @@ fn native_access_corrected_current_and_tied_terminal_derivatives() -> TestResult
         }
         count += 1;
     }
-    assert_eq!(count, 1536);
+    assert_eq!(count, expected_count);
     Ok(())
+}
+
+#[test]
+fn native_access_corrected_current_and_tied_terminal_derivatives() -> TestResult {
+    compare_circuit(
+        include_str!("fixtures/hisim-hv-access-circuit-ngspice47.txt"),
+        1536,
+        Mechanism::Access,
+    )
+}
+
+#[test]
+fn native_sti_current_and_tied_terminal_derivatives() -> TestResult {
+    compare_circuit(
+        include_str!("fixtures/hisim-hv-sti-circuit-ngspice47.txt"),
+        1920,
+        Mechanism::Sti,
+    )
 }
 
 #[test]
@@ -159,7 +229,7 @@ fn independent_access_coordinates_and_near_zero_smoothing() -> TestResult {
     let row = [
         2., 1., 27., 3e-6, 10e-6, 3., 2., 1., 0., 0., 0., 0., 0., 0., 0.,
     ];
-    let (model, instance) = prepare(&row)?;
+    let (model, instance) = prepare(&row, Mechanism::Access)?;
     let access = prepare_hisim_hv_access_correction(&model, &instance)?;
     for outer_drain in [-0.1, 1e-12, 1e-11, 4e-11, 0.2, 2.] {
         let coordinates = [3., 0.2, -0.1, 310., 4., outer_drain, -0.3];
@@ -187,7 +257,7 @@ fn independent_access_coordinates_and_near_zero_smoothing() -> TestResult {
                     value: preaccess,
                     gradient: grad,
                 },
-                postaccess_leakage_a: Jet {
+                postaccess_current_a: Jet {
                     value: leakage,
                     gradient: leakage_grad,
                 },
@@ -251,6 +321,58 @@ fn independent_access_coordinates_and_near_zero_smoothing() -> TestResult {
                 1e-8,
                 (outer_drain, axis, "resistance"),
             );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sti_current_has_independent_temperature_and_bias_gradients() -> TestResult {
+    for family in [1., 2.] {
+        for polarity in [-1., 1.] {
+            for config in [0., 1., 2.] {
+                let row = [
+                    family, polarity, 27., 3e-6, 10e-6, 2., 1., config, 0., 0., 0., 0., 0., 0., 0.,
+                ];
+                let (model, instance) = prepare(&row, Mechanism::Sti)?;
+                let channel = prepare_hisim_hv_normal_channel(&model, &instance)?;
+                let evaluate = |coordinates: [f64; 4]| -> Result<Jet, ModelError> {
+                    let transport =
+                        prepare_hisim_hv_transport(&model, &instance, coordinates[3], 0.)?;
+                    Ok(channel
+                        .evaluate(
+                            HiSimHvIntrinsicBias {
+                                vgs: coordinates[0],
+                                vds: coordinates[1],
+                                vbs: coordinates[2],
+                            },
+                            &transport,
+                        )?
+                        .sti_current_a)
+                };
+                for gate in [3., 5., 8.] {
+                    for drain in [0.1, 1., 5.] {
+                        let coordinates = [gate, drain, -0.3, 315.];
+                        let point = evaluate(coordinates)?;
+                        for axis in 0..4 {
+                            let step = if axis == 3 { 0.01 } else { 1e-5 };
+                            let mut high = coordinates;
+                            let mut low = coordinates;
+                            high[axis] += step;
+                            low[axis] -= step;
+                            let numerical =
+                                (evaluate(high)?.value - evaluate(low)?.value) / (2. * step);
+                            close(
+                                point.gradient[axis],
+                                numerical,
+                                1e-5,
+                                1e-16,
+                                (family, polarity, config, coordinates, axis),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())

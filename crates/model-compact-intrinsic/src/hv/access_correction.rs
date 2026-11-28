@@ -28,7 +28,7 @@ pub struct HiSimHvAccessInputs {
     pub intrinsic: HiSimHvIntrinsicBias,
     pub external: HiSimHvExternalBias,
     pub preaccess_current_a: HiSimHvIntrinsicScalar,
-    pub postaccess_leakage_a: HiSimHvIntrinsicScalar,
+    pub postaccess_current_a: HiSimHvIntrinsicScalar,
     /// False for accumulation or the native no-inversion cutoff.
     pub conducting_channel: bool,
 }
@@ -197,7 +197,7 @@ impl PreparedHiSimHvAccessCorrection {
     }
 
     /// Apply the nonlinear access correction before adding the independent
-    /// channel leakage term. All seven Jacobian coordinates are physical.
+    /// postaccess current terms. All seven Jacobian coordinates are physical.
     /// # Errors
     /// Nonfinite local state or singular current correction.
     pub fn evaluate(
@@ -219,8 +219,8 @@ impl PreparedHiSimHvAccessCorrection {
             return Err(ModelError::InvalidPhysicalParameter("HiSIM-HV access bias"));
         }
         let current = promote(inputs.preaccess_current_a).checked("HiSIM-HV preaccess current")?;
-        let leakage =
-            promote(inputs.postaccess_leakage_a).checked("HiSIM-HV postaccess leakage")?;
+        let postaccess =
+            promote(inputs.postaccess_current_a).checked("HiSIM-HV postaccess current")?;
         let resistance = if self.enabled && inputs.conducting_channel {
             self.resistance(inputs.external)
         } else {
@@ -231,7 +231,7 @@ impl PreparedHiSimHvAccessCorrection {
         // physical current includes M. Do not count M in the voltage drop.
         let corrected = (current
             / (1. + resistance * current / (self.multiplicity * (drain + SMALL)))
-            + leakage)
+            + postaccess)
             .checked("HiSIM-HV access current")?;
         let resistance = resistance.checked("HiSIM-HV access resistance")?;
         Ok(HiSimHvAccessCorrectionPoint {

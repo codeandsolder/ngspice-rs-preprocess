@@ -1062,8 +1062,15 @@ uses the native low-drain smoothing. The 1,536 native CORSRD=2 circuit
 points include finite-difference gradients; separate seven-coordinate tests
 exercise the access law and its near-zero drain limit. Explicit CORSRD=3
 series-node topology is not part of this intrinsic qualification.
-HV2 depletion-mode transport, explicit series/drift and STI corrections,
-parasitic assembly, noise and full circuit-level qualification remain work.
+The STI edge channel is composed after nonlinear access resistance, with
+size-dependent width, doping, short-channel shift and the native surface
+potential smoothing. Rationalized inversion charge avoids cancellation of
+two nearly equal smoothed square roots. The 1,920 native STI circuit points
+include three cards, both polarities and families, multifinger geometry and
+finite-difference gradients; independent local temperature and bias
+derivatives are also tested.
+HV2 depletion-mode transport, explicit series/drift corrections, parasitic
+assembly, noise and full circuit-level qualification remain work.
 
 ## Reference test coverage
 

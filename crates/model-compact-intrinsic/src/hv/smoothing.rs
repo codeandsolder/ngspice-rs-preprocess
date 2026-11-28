@@ -47,3 +47,18 @@ pub(super) fn upper<const N: usize>(value: Jet<N>, limit: Jet<N>, delta: f64) ->
 pub(super) fn lower<const N: usize>(value: Jet<N>, limit: Jet<N>, delta: f64) -> Jet<N> {
     -upper(-value, -limit, delta)
 }
+
+// Native Fn_CP with xmax=1 and pw=4. Factor by the larger term so
+// the eighth power never overflows at a large inversion-voltage ratio.
+pub(super) fn unit_ceiling_power4<const N: usize>(x: Jet<N>) -> Jet<N> {
+    if x.value.abs() <= 1. {
+        let square = x * x;
+        let fourth = square * square;
+        x / (1. + fourth * fourth).sqrt().sqrt().sqrt()
+    } else {
+        let reciprocal = 1. / x;
+        let square = reciprocal * reciprocal;
+        let fourth = square * square;
+        x.value.signum() / (1. + fourth * fourth).sqrt().sqrt().sqrt()
+    }
+}
