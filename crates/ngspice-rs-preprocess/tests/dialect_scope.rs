@@ -446,12 +446,12 @@ fn emitted_line_map_keeps_repeated_resource_occurrences_and_scope() -> Result<()
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.cir");
     let shared = dir.path().join("shared.inc");
-    fs::write(&root, b"Repeated resources\n.include ps.inc\n.subckt native_cell out 0\n.include shared.inc\n.ends\nX1 p 0 ps_cell\nX2 n 0 native_cell\n.end\n")?;
+    fs::write(&root, b"Repeated resources\n.include ps.inc\n.subckt native_cell out rtn\n.include shared.inc\n.ends\nX1 p 0 ps_cell\nX2 n 0 native_cell\n.end\n")?;
     fs::write(
         dir.path().join("ps.inc"),
-        b"*#PSPICE\n.subckt ps_cell out 0\n.include shared.inc\n.ends\n",
+        b"*#PSPICE\n.subckt ps_cell out rtn\n.include shared.inc\n.ends\n",
     )?;
-    fs::write(&shared, b".param gain={pwr(-2,3)}\nV1 out 0 {gain}\n")?;
+    fs::write(&shared, b".param gain={pwr(-2,3)}\nV1 out rtn {gain}\n")?;
     let bundle = prepare(
         &Request {
             format: InputFormat::NativeDeck,
