@@ -85,3 +85,34 @@ Shared integration work:
 [idealized diode laws](https://github.com/codeandsolder/ngspice-rs-fast/issues/226),
 [switch laws](https://github.com/codeandsolder/ngspice-rs-fast/issues/229),
 [soft-recovery charge state](https://github.com/codeandsolder/ngspice-rs-fast/issues/238).
+
+## Specialized built-in declaration inspection
+
+The source-only `qspice::builtin_device::builtin_devices` inspector retains
+fixed-width declarations in the selected linked graph, independently of
+whether an executable family is supported. It preserves physical origin,
+lexical scope, repeated resource visits, model/function selector spelling,
+and the uninterpreted instance parameter tail.
+
+| Designator | Source slots | Selector class |
+| --- | ---: | --- |
+| `Ã` | 16 | MultGmAmp, RRopAmp or source model identity |
+| `¥` | 16 | Logic and other built-in functions |
+| `€` | 32 | DAC |
+| `£` | 64 | Dual gate driver |
+
+A standalone `¥` slot is unassigned; it must not be joined to another
+unassigned slot, ground, or a named node such as `¥7`. Fixed-width
+inspection does not determine electrical pin roles, model defaults,
+parameter expressions, timing, supply currents or saturation behavior.
+Preparation continues to reject these declarations until the selected
+physical or event kernel is independently qualified. The variable-layout
+`×` transformer remains explicitly unqualified. The external module
+designator `Ø` is a distinct source and execution contract.
+
+Source grammar references:
+[device layout inventory](https://spicelib.readthedocs.io/en/latest/readme.html),
+[unused slots and EN behavior](https://forum.qorvo.com/t/some-notes-about-10-06-2023-added-and-an-en-input-for-the-d-flop-to-alway-the-outputs-to-go-tristate/15649),
+[AND pin-order example](https://forum.qorvo.com/t/how-to-see-the-implementation-of-a-symbol-if-we-do-not-have-any-schematic-description-on-how-that-symbol-was-implemented/17095),
+and [RRopAmp instance parameters](https://forum.qorvo.com/t/rail-to-rail-output-opamp-a-device-rropamp-instance-param/17030).
+The grammar-shaped regression cases are not vendor simulation traces.

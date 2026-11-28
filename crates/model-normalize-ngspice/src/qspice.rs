@@ -1,7 +1,10 @@
 //! Source-scoped QSPICE plaintext normalization. No compiled device execution.
 mod analysis;
 mod bindings;
+/// Source-only fixed-width built-in device declarations.
+pub mod builtin_device;
 mod numeric;
+mod source_declarations;
 mod sources;
 use crate::{
     lexical::{Edit, Statement, apply_budgeted_edits, remove_spans, statements, tokens},
@@ -591,6 +594,7 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind, budget: &WorkBudget) 
         let origin = linked
             .origin(line)
             .context("missing QSPICE source location")?;
+        builtin_device::reject_unqualified(&statement, origin, budget)?;
         numeric::rewrite(&statement, origin, &declarations, &mut numeric_edits)?;
     }
     let lowered = apply_budgeted_edits(body, numeric_edits, budget)?;
