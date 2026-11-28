@@ -33,6 +33,7 @@ mod bsim4_catalog;
 mod hierarchy;
 mod models;
 mod mos;
+mod pspice;
 
 pub(super) const HSPICE: DialectContext = DialectContext {
     language: SourceDialect::Hspice,
@@ -560,6 +561,19 @@ fn lower_parameter_functions(
     Ok(Some(output))
 }
 
+fn validate_diode_geometry(text: &str, fields: &[std::ops::Range<usize>]) -> Result<()> {
+    for field in fields.iter().skip(4) {
+        let token = &text[field.clone()];
+        ensure!(
+            !["W", "L", "LM", "LP", "WM", "WP", "THERMAL"]
+                .iter()
+                .any(|name| token.eq_ignore_ascii_case(name)),
+            "geometric or thermal HSPICE diode instance is not qualified"
+        );
+    }
+    Ok(())
+}
+
 fn validate_device(
     command: &str,
     text: &str,
@@ -587,15 +601,7 @@ fn validate_device(
             "HSPICE device {command} requires qualified model/device lowering"
         );
         if hspice && kind == b'D' {
-            for field in fields.iter().skip(4) {
-                let token = &text[field.clone()];
-                ensure!(
-                    !["W", "L", "LM", "LP", "WM", "WP", "THERMAL"]
-                        .iter()
-                        .any(|name| token.eq_ignore_ascii_case(name)),
-                    "geometric or thermal HSPICE diode instance is not qualified"
-                );
-            }
+            validate_diode_geometry(text, fields)?;
         }
     }
     Ok(())
@@ -639,6 +645,25 @@ fn lower_card(
             || matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN" | ".TEMP"))
     {
         bail!("HSPICE scoped parameters/options require hierarchy lowering");
+    }
+    if context.language == SourceDialect::Pspice {
+        validate_device(&command, text, &fields, false)?;
+        ensure!(
+            !command.starts_with('.')
+                || matches!(
+                    command.as_str(),
+                    ".PARAM"
+                        | ".FUNC"
+                        | ".SUBCKT"
+                        | ".ENDS"
+                        | ".GLOBAL"
+                        | ".END"
+                        | ".IC"
+                        | ".NODESET"
+                ),
+            "unqualified PSpice directive in occurrence-bound deck {command}"
+        );
+        return Ok(text.to_owned());
     }
     if command == ".FUNC" {
         let tail = text
@@ -843,6 +868,10 @@ fn lower_expansion(
             } else {
                 statement.text.clone()
             }
+        } else if analysis_plan::command(&statement.text) == ".MODEL"
+            && statement.context.language == SourceDialect::Pspice
+        {
+            statement.text.clone()
         } else if analysis_plan::command(&statement.text) == ".MODEL" {
             let (text, mut selection) = models::lower(
                 statement,
@@ -995,6 +1024,7 @@ pub(super) fn prepare(
         budget,
     )?;
     let lowered = lower_expansion(&statements, origins, options.output_bytes, budget)?;
+    let lowered = pspice::project(lowered, options.output_bytes, budget)?;
     let hierarchy::BoundExpansion {
         mut bytes,
         mut origins,

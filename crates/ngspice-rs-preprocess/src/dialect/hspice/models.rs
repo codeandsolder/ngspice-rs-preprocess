@@ -65,20 +65,16 @@ pub fn render(
     let mut text = format!(".model {name} {} (", card.family);
     for parameter in &card.parameters {
         budget.charge(Resource::EvaluationSteps, 1)?;
-        let value = parameter
-            .expression
-            .as_deref()
-            .context("model field requires a value")?;
-        let mapped = map(value)?;
         budget.charge(
             Resource::EmittedBytes,
-            parameter
-                .name
-                .len()
-                .saturating_add(mapped.len())
-                .saturating_add(2),
+            parameter.name.len().saturating_add(1),
         )?;
-        write!(text, " {}={mapped}", parameter.name)?;
+        write!(text, " {}", parameter.name)?;
+        if let Some(value) = &parameter.expression {
+            let mapped = map(value)?;
+            budget.charge(Resource::EmittedBytes, mapped.len().saturating_add(1))?;
+            write!(text, "={mapped}")?;
+        }
     }
     text.push(')');
     Ok(text)

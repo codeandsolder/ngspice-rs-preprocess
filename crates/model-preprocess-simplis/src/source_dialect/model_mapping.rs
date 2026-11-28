@@ -13,6 +13,7 @@ use model_normalize_ngspice::linked_source::LinkedLocation;
 use model_normalize_ngspice::model_card::{
     ModelCard, ModelParameter, parse_model_card, parse_parameter_fields, parse_spice_constant,
 };
+use model_normalize_ngspice::pspice::{JunctionKind, JunctionProjection};
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,7 @@ use super::{DialectContext, OpaqueSource, ScopedStatement};
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Device {
+    NativeDiode,
     Diode1,
     Diode3,
     Resistor,
@@ -51,7 +53,7 @@ pub enum Device {
 impl Device {
     const fn letter(self) -> char {
         match self {
-            Self::Diode1 | Self::Diode3 => 'D',
+            Self::NativeDiode | Self::Diode1 | Self::Diode3 => 'D',
             Self::Resistor | Self::HspiceResistor => 'R',
             Self::GummelPoonLegacy
             | Self::GummelPoonNative
@@ -88,7 +90,8 @@ impl Device {
     #[must_use = "the returned level identifies the source-model variant"]
     pub const fn source_level(self) -> u16 {
         match self {
-            Self::Diode1
+            Self::NativeDiode
+            | Self::Diode1
             | Self::Resistor
             | Self::Mos1
             | Self::GummelPoonLegacy
@@ -145,6 +148,7 @@ pub enum SelectionOrigin {
     DeviceConfiguration,
     HspicePreset,
     StandaloneHspice,
+    StandalonePspice,
     NetlistMap,
     LegacyMos17Signature,
 }
@@ -778,6 +782,67 @@ pub struct MappedSource {
 }
 
 impl ModelSelection {
+    /// Retain the actual qualified model selected by the PSpice frontend.
+    ///
+    /// The physical card is already lowered by that frontend; do not
+    /// reinterpret its native spelling using SIMetrix mappings.
+    ///
+    /// # Errors
+    /// Invalid source model selector or a non-PSpice source context.
+    pub fn from_pspice(
+        line: &ScopedStatement,
+        projection: JunctionProjection,
+        budget: &WorkBudget,
+    ) -> Result<Self> {
+        let JunctionProjection {
+            mut declaration,
+            scope,
+            source_level,
+            kind,
+        } = projection;
+        ensure!(
+            line.context.language == super::SourceDialect::Pspice,
+            "PSpice physical selection has a foreign lexical context"
+        );
+        let device = match kind {
+            JunctionKind::Diode => Device::NativeDiode,
+            JunctionKind::Mos1 => Device::Mos1,
+            JunctionKind::Mos2 => Device::Mos2,
+            JunctionKind::Mos3 => Device::Mos3,
+            JunctionKind::Bsim3V324 => Device::Bsim3Berkeley,
+            JunctionKind::Bsim4V450 => Device::Bsim4,
+        };
+        let declared_level = one(&declaration.parameters, "LEVEL")?
+            .map(unsigned_level)
+            .transpose()?;
+        let declared_version = one(&declaration.parameters, "VERSION")?.map(str::to_owned);
+        declaration.source_line = line.first_line;
+        let key = ModelKey::new(&declaration.family, source_level)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            line.source.len().saturating_add(line.text.len()),
+        )?;
+        Ok(Self {
+            source: line.source.clone(),
+            linked: None,
+            scope,
+            context: line.context,
+            original: line.text.clone(),
+            card: declaration,
+            last_line: line.last_line,
+            declared_level,
+            declared_version,
+            effective_version: kind.version().map(str::to_owned),
+            mapping: Mapping {
+                key,
+                device,
+                letter: device.letter(),
+                origin: SelectionOrigin::StandalonePspice,
+                source: None,
+            },
+        })
+    }
+
     /// Canonical model card for the existing electrical lowering stage.
     ///
     /// Selection does not certify full numerical equivalence of a device
@@ -787,6 +852,10 @@ impl ModelSelection {
     /// # Errors
     /// Unsupported device family, version or access letter.
     pub fn lower(&self) -> Result<String> {
+        ensure!(
+            self.mapping.origin != SelectionOrigin::StandalonePspice,
+            "PSpice selection is lowered by the PSpice physical frontend"
+        );
         use Device::{
             Bsim3Berkeley, Bsim4, Diode1, Diode3, GummelPoonLegacy, GummelPoonNative, Mos1, Mos2,
             Mos3, Mos17, Resistor, Vbic,

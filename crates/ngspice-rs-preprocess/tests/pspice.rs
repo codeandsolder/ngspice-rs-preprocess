@@ -611,7 +611,7 @@ quit
     let emitted = std::str::from_utf8(&prepared.primary.bytes)?;
     assert_eq!(lines.len(), emitted.lines().count());
     for (text, origin) in emitted.lines().zip(lines) {
-        if text.starts_with(".param __ps_passive_") {
+        if text.starts_with(".param ps_passive_") {
             assert!(
                 std::str::from_utf8(source)?
                     .lines()
@@ -734,7 +734,7 @@ X2 l 0 cell a=0 base=4
     assert!(text.contains("c1 c 0 cm 1n ic=-2"), "{text}");
     assert!(text.contains("l1 l 0 lm 1m ic=-0.5"), "{text}");
     assert!(text.contains("c2 p n cm {base*1n} ic={-a}"), "{text}");
-    assert!(!text.contains("__ps_passive_"), "{text}");
+    assert!(!text.contains("ps_passive_"), "{text}");
     Ok(())
 }
 

@@ -157,7 +157,12 @@ pub(super) struct Candidate<'a> {
     pub exact: bool,
 }
 
-pub(super) struct Pending<'a> {
+pub(super) enum Pending<'a> {
+    Hspice(BinBinding<'a>),
+    Native(ModelAlias<'a>),
+}
+
+pub(super) struct BinBinding<'a> {
     pub source_name: String,
     pub candidates: Vec<Candidate<'a>>,
 }
@@ -284,7 +289,7 @@ fn geometry(library: &ModelLibrary, fields: &Fields, options: &Options) -> Resul
 }
 
 fn select<'a, 's>(
-    pending: &Pending<'s>,
+    pending: &BinBinding<'s>,
     models: &'a BTreeMap<String, &ModelCard>,
     library: &ModelLibrary,
     fields: &Fields,
@@ -340,7 +345,7 @@ fn initial_vector(expression: &str) -> Result<String> {
 fn bind_instance(
     text: &str,
     model_end: usize,
-    pending: &Pending<'_>,
+    pending: &BinBinding<'_>,
     models: &BTreeMap<String, &ModelCard>,
     library: &ModelLibrary,
     options: &Options,
@@ -401,11 +406,22 @@ pub(super) fn finish(
             let pending = requests
                 .get(&row[range.clone()])
                 .context("unbound HSPICE MOS occurrence")?;
-            *row = bind_instance(row, range.end, pending, &models, library, options, budget)?;
+            match pending {
+                Pending::Hspice(binding) => {
+                    *row =
+                        bind_instance(row, range.end, binding, &models, library, options, budget)?;
+                }
+                Pending::Native(model) => {
+                    budget.charge(Resource::EmittedBytes, model.alias.len())?;
+                    row.replace_range(range.clone(), &model.alias);
+                }
+            }
         } else if command == ".MODEL"
-            && selections
-                .get(declaration)
-                .is_some_and(|selection| selection.mapping.device == Device::Bsim4)
+            && selections.get(declaration).is_some_and(|selection| {
+                selection.context.language
+                    == model_preprocess_simplis::source_dialect::SourceDialect::Hspice
+                    && selection.mapping.device == Device::Bsim4
+            })
         {
             let mut card = parse_model_card(row, 0, &[])?;
             card.parameters.retain(|field: &ModelParameter| {

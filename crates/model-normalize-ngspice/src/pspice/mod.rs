@@ -17,6 +17,8 @@ use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeMap, fmt::Write as _};
 
 mod instances;
+mod junction;
+pub use junction::{JunctionKind, JunctionProjection};
 mod nodes;
 mod options;
 mod passive;
@@ -56,6 +58,7 @@ struct Functions {
     gmin_name: String,
     options: options::GlobalOptions,
     renamed: Vec<RenamedDevice>,
+    junctions: BTreeMap<usize, JunctionProjection>,
 }
 
 impl Functions {
@@ -63,15 +66,15 @@ impl Functions {
         let mut identifiers = crate::IdentifierAllocator::new(input, scopes.budget())?;
         let mut names = BTreeMap::new();
         for (name, _) in FUNCTIONS {
-            let base = format!("__ps_{name}");
+            let base = format!("ps_{name}");
             let chosen = identifiers.fresh(base.as_bytes())?;
             names.insert((*name).to_owned(), String::from_utf8(chosen)?);
         }
         let ground = String::from_utf8(identifiers.fresh(b"__ps_gnd")?)?;
         let passives = passive::PassiveModels::collect(&scopes, &mut identifiers)?;
-        let temperature_name = String::from_utf8(identifiers.fresh(b"__ps_temperature")?)?;
-        let thermal_voltage_name = String::from_utf8(identifiers.fresh(b"__ps_thermal_voltage")?)?;
-        let gmin_name = String::from_utf8(identifiers.fresh(b"__ps_gmin")?)?;
+        let temperature_name = String::from_utf8(identifiers.fresh(b"ps_temperature")?)?;
+        let thermal_voltage_name = String::from_utf8(identifiers.fresh(b"ps_thermal_voltage")?)?;
+        let gmin_name = String::from_utf8(identifiers.fresh(b"ps_gmin")?)?;
         Ok(Self {
             names,
             used: BTreeMap::new(),
@@ -88,6 +91,7 @@ impl Functions {
             gmin_name,
             options,
             renamed: Vec::new(),
+            junctions: BTreeMap::new(),
         })
     }
 
@@ -557,28 +561,34 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
     ] {
         rename_parameter(&mut card, from, to);
     }
-    if matches!(family.as_str(), "nmos" | "pmos" | "npn" | "pnp")
+    if let Some((kind, source_level)) = junction::project(&mut card)? {
+        let declaration = functions.scopes.declaration(line)?;
+        scope::charge_scope(
+            functions.scopes.path(functions.scope),
+            functions.scopes.budget(),
+        )?;
+        functions
+            .scopes
+            .budget()
+            .charge(Resource::GeneratedNodes, 1)?;
+        functions.junctions.insert(
+            line,
+            JunctionProjection {
+                declaration,
+                scope: functions.scopes.path(functions.scope).to_vec(),
+                source_level,
+                kind,
+            },
+        );
+    } else if matches!(family.as_str(), "npn" | "pnp")
         && let Some(level) = parameter(&card, "level")
     {
         let level =
             parse_spice_constant(&level).context("PSpice physical model level must be constant")?;
-        // Model levels are discrete identifiers, not measured quantities.
-        if matches!(family.as_str(), "nmos" | "pmos") {
-            match level {
-                5.0 => bail!("PSpice MOS level 5 requires an EKV physical kernel"),
-                6.0 | 7.0 => {
-                    set_parameter(&mut card, "level", "8")?;
-                    set_parameter(&mut card, "version", "3.2.4")?;
-                }
-                8.0 => {
-                    set_parameter(&mut card, "level", "14")?;
-                    set_parameter(&mut card, "version", "4.5.0")?;
-                }
-                _ => {}
-            }
-        } else if matches!(level, 2.0) {
-            bail!("PSpice BJT level 2 requires a MEXTRAM physical kernel");
-        }
+        ensure!(
+            level != 2.,
+            "PSpice BJT level 2 requires a MEXTRAM physical kernel"
+        );
     }
     if family == "lpnp" {
         "PNP".clone_into(&mut card.family);
@@ -658,6 +668,7 @@ struct LoweredBody {
     lines: Vec<usize>,
     definitions: (String, Vec<usize>),
     renamed: Vec<RenamedDevice>,
+    junctions: BTreeMap<usize, JunctionProjection>,
 }
 
 fn rewrite_statements(
@@ -819,6 +830,7 @@ fn lower_body(
         lines,
         definitions: functions.definitions()?,
         renamed: functions.renamed,
+        junctions: functions.junctions,
     })
 }
 
@@ -838,6 +850,42 @@ pub fn normalize_mapped(
         shared,
         kind,
         SourceDialects::Uniform(SourceDialect::Pspice),
+        budget,
+    )
+}
+
+/// Project PSpice rows in a complete mixed-language declaration graph.
+///
+/// The caller has already joined logical statements and projected other
+/// source dialects, but has not specialized hierarchy or controlled transfers.
+/// The map includes the title when preparing a deck.
+///
+/// # Errors
+/// Invalid row map, malformed source, or unsupported PSpice semantics.
+pub fn project_rows(
+    input: &[u8],
+    kind: RootKind,
+    dialects: &[SourceDialect],
+    budget: &WorkBudget,
+) -> Result<NativeNormalization> {
+    let count = input.split_inclusive(|byte| *byte == b'\n').count();
+    ensure!(
+        count == dialects.len(),
+        "PSpice source dialect map mismatch"
+    );
+    budget.charge(Resource::GeneratedNodes, count)?;
+    budget.charge(Resource::EmittedBytes, input.len())?;
+    lower_mapped(
+        MappedNormalization {
+            model: crate::NormalizedModel {
+                bytes: input.to_vec(),
+                passes: Vec::new(),
+            },
+            input_lines: (1..=count).collect(),
+            waveforms: Vec::new(),
+        },
+        kind,
+        SourceDialects::Rows(dialects),
         budget,
     )
 }
@@ -865,6 +913,7 @@ pub(crate) fn lower_mapped(
         lines,
         definitions: (definitions, definition_lines),
         mut renamed,
+        junctions,
     } = lower_body(
         &shared.model.bytes[title_end..],
         &shared.input_lines[first..],
@@ -877,6 +926,16 @@ pub(crate) fn lower_mapped(
             .get(first + device.input_line - 1)
             .context("missing renamed device origin")?;
     }
+    let junctions = junctions
+        .into_iter()
+        .map(|(line, selection)| {
+            let original = *shared
+                .input_lines
+                .get(first + line - 1)
+                .context("missing PSpice model declaration origin")?;
+            Ok((original, selection))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     budget.charge(
         Resource::EmittedBytes,
         title_end
@@ -918,5 +977,6 @@ pub(crate) fn lower_mapped(
             input_lines,
         },
         renamed,
+        pspice_junctions: junctions,
     })
 }

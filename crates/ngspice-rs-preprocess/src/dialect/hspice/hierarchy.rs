@@ -253,7 +253,8 @@ impl<'a> ModelFrame<'a> {
             !self.exact.contains_key(&name),
             "duplicate HSPICE model {name}"
         );
-        if alias.selection.mapping.device == Device::Bsim4
+        if alias.selection.context.language == SourceDialect::Hspice
+            && alias.selection.mapping.device == Device::Bsim4
             && let Some((base, extension)) = name.split_once('.')
         {
             ensure!(
@@ -497,7 +498,13 @@ impl<'a> Binder<'a> {
         Ok(candidates)
     }
 
-    fn model_reference(&mut self, scope: usize, text: &str, mos: bool) -> Result<String> {
+    fn model_reference(
+        &mut self,
+        scope: usize,
+        text: &str,
+        mos: bool,
+        language: SourceDialect,
+    ) -> Result<String> {
         let spans = statement_token_spans(text)?;
         let range = spans
             .get(if mos { 5 } else { 3 })
@@ -506,21 +513,25 @@ impl<'a> Binder<'a> {
         let candidates = self.candidates(scope, &model, mos)?;
         ensure!(!candidates.is_empty(), "unknown HSPICE model {model}");
         let replacement = if mos {
-            let marker = self.fresh('b')?;
-            self.pending_mos.insert(
-                marker.clone(),
-                mos::Pending {
-                    source_name: model,
-                    candidates,
-                },
+            ensure!(
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.model.selection.mapping.letter == 'M'),
+                "non-MOS model referenced by MOS occurrence"
             );
+            let marker = self.fresh('b')?;
+            let pending = mos_binding(model, candidates, language)?;
+            self.pending_mos.insert(marker.clone(), pending);
             marker
         } else {
             let model = &candidates[0].model;
             ensure!(
                 model.selection.mapping.letter == 'D',
-                "non-diode model referenced by HSPICE diode occurrence"
+                "non-diode model referenced by diode occurrence"
             );
+            if model.selection.context.language == SourceDialect::Hspice {
+                super::validate_diode_geometry(text, &spans)?;
+            }
             model.alias.clone()
         };
         let mut output = text.to_owned();
@@ -652,7 +663,12 @@ impl<'a> Binder<'a> {
             self.budget,
         )?;
         let bound = if command.starts_with(['D', 'M']) {
-            self.model_reference(owner, &bound, command.starts_with('M'))?
+            self.model_reference(
+                owner,
+                &bound,
+                command.starts_with('M'),
+                self.contexts[line].language,
+            )?
         } else {
             bound
         };
@@ -703,6 +719,37 @@ impl<'a> Binder<'a> {
         )?;
         models::resolve_breakdown(&mut result, self.selections, &library, self.budget)?;
         Ok(result)
+    }
+}
+
+fn mos_binding(
+    source_name: String,
+    candidates: Vec<mos::Candidate<'_>>,
+    language: SourceDialect,
+) -> Result<mos::Pending<'_>> {
+    let first = candidates.first().context("missing MOS candidate")?;
+    let selected = first.model.selection.context.language;
+    ensure!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.model.selection.context.language == selected),
+        "MOS model family {source_name} combines incompatible source-dialect binning policies"
+    );
+    ensure!(
+        selected == language,
+        "MOS instance dialect {language:?} cannot yet use {selected:?} geometry semantics for {source_name}"
+    );
+    if selected == SourceDialect::Hspice {
+        Ok(mos::Pending::Hspice(mos::BinBinding {
+            source_name,
+            candidates,
+        }))
+    } else {
+        ensure!(
+            candidates.len() == 1 && first.exact,
+            "non-HSPICE MOS model requires an exact declaration"
+        );
+        Ok(mos::Pending::Native(first.model.clone()))
     }
 }
 

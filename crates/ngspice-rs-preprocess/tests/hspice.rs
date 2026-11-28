@@ -1391,3 +1391,108 @@ fn foreign_resources_cannot_override_root_analysis_policy() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn same_named_pspice_and_hspice_junctions_use_independent_physical_variants() -> Result<()> {
+    use model_preprocess_simplis::source_dialect::model_mapping::{Device, SelectionOrigin};
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("ps.lib");
+    fs::write(
+        &child,
+        r#"*#PSPICE
+.subckt ps d m g params: sat=2p
+.model diode_base D(IS={sat} N=1.2 BV=5 IBV=1m)
+.model junction AKO:diode_base D(RS=2)
+.model channel NMOS(LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02)
+D1 d 0 junction 2
+M1 m g 0 0 channel L=1u W=2u
+.ends ps
+"#,
+    )?;
+    fs::write(
+        &root,
+        r#"Mixed physical junction declarations
+.option parhier=local
+.inc ps.lib
+Vd1 hd 0 0.6
+Vd2 pd 0 0.6
+Vm1 hm 0 0.8
+Vm2 pm 0 0.8
+Vg g 0 1
+Xh hd hm g hs
+Xp pd pm g ps sat=2p
+.subckt hs d m g sat=1p
+.model junction D(IS='sat' N=1.2 BV=5 IBV=1m RS=2)
+.model channel NMOS(LEVEL=54 VERSION=4.7 VTH0=0.4)
+D1 d 0 junction AREA=2
+M1 m g 0 0 channel L=1u W=2u
+.ends hs
+.op
+.end
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let selections = &bundle.model_selections;
+    assert_eq!(selections.len(), 5);
+    for (name, devices) in [
+        ("junction", [Device::NativeDiode, Device::Diode3]),
+        ("channel", [Device::Mos1, Device::Bsim4]),
+    ] {
+        let matches = selections
+            .iter()
+            .filter(|selection| selection.card.name.eq_ignore_ascii_case(name))
+            .collect::<Vec<_>>();
+        let [ps, hs] = matches.as_slice() else {
+            anyhow::bail!("missing mixed typed model {name}");
+        };
+        assert_eq!([ps.mapping.device, hs.mapping.device], devices);
+        assert_eq!(ps.mapping.origin, SelectionOrigin::StandalonePspice);
+        assert_eq!(hs.mapping.origin, SelectionOrigin::StandaloneHspice);
+        assert_ne!(
+            ps.linked.context("missing PSpice location")?.scope,
+            hs.linked.context("missing HSPICE location")?.scope
+        );
+    }
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    let script = "op\nwrdata actual.dat i(vd1) i(vd2) i(vm1) i(vm2)\ndc Vg 0 1.2 0.2\nwrdata dc.dat i(vm1) i(vm2)\nac lin 3 1k 3k\nwrdata ac.dat i(vd1) i(vd2)";
+    measure_native(dir.path(), native, script)?;
+    let reference = tempfile::tempdir()?;
+    measure_native(
+        reference.path(),
+        r#"Independent physical reference
+.options TNOM=25
+.temp 25
+Vd1 hd 0 0.6
+Vd2 pd 0 0.6
+Vm1 hm 0 0.8
+Vm2 pm 0 0.8
+Vg g 0 1
+D1 hd 0 hdiode AREA=2
+D2 pd 0 pdiode AREA=2
+M1 hm g 0 0 hmos L=1u W=2u
+M2 pm g 0 0 pmos L=1u W=2u
+.model hdiode D(LEVEL=3 IS=1p N=1.2 BV=5 IBV=1m RS=2 FC=0 FCS=0)
+.model pdiode D(IS=2p N=1.2 BV=5 IBV=1m RS=2 TNOM=27)
+.model hmos NMOS(LEVEL=14 VERSION=4.70 VTH0=0.4)
+.model pmos NMOS(LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02 TNOM=27)
+.end
+"#,
+        script,
+    )?;
+    for file in ["actual.dat", "dc.dat", "ac.dat"] {
+        let actual = values(dir.path(), file)?;
+        let expected = values(reference.path(), file)?;
+        assert_eq!(actual.len(), expected.len());
+        for (row, reference) in actual.iter().zip(expected) {
+            assert_eq!(row.len(), reference.len());
+            for (&a, e) in row.iter().zip(reference) {
+                ensure!(
+                    (a - e).abs() <= 1e-12 + e.abs() * 1e-8,
+                    "{file}: {a:e} != {e:e}\n{native}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
