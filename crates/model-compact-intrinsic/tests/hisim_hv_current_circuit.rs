@@ -13,6 +13,7 @@ enum Mechanism {
     Access,
     Sti,
     Impact,
+    Drift,
 }
 
 fn card_parameters(
@@ -44,7 +45,42 @@ fn card_parameters(
         },
         Mechanism::Access => access_card_parameters(config),
         Mechanism::Impact => impact_card_parameters(config),
+        Mechanism::Drift => drift_card_parameters(config),
     }
+}
+
+fn drift_card_parameters(config: f64) -> Result<&'static [(&'static str, f64)], ModelError> {
+    Ok(match config {
+        0. => &[
+            ("sub1", 0.1),
+            ("sub2", 12.),
+            ("svgs", 0.5),
+            ("svbs", 0.5),
+            ("svds", 0.9),
+            ("subld1", 0.),
+            ("ibpc1", 1.5),
+            ("ibpc2", 0.3),
+        ],
+        1. => &[
+            ("sub1", 0.),
+            ("subld1", 0.04),
+            ("subld2", 2000.),
+            ("ibpc1", 2.),
+            ("ibpc2", 0.2),
+        ],
+        2. => &[
+            ("sub1", 0.2),
+            ("sub2", 8.),
+            ("svgs", 0.7),
+            ("svbs", 0.3),
+            ("svds", 0.85),
+            ("subld1", 0.06),
+            ("subld2", 4000.),
+            ("ibpc1", 3.),
+            ("ibpc2", 0.4),
+        ],
+        _ => return Err(ModelError::InvalidPhysicalParameter("native drift card")),
+    })
 }
 
 fn impact_card_parameters(config: f64) -> Result<&'static [(&'static str, f64)], ModelError> {
@@ -103,48 +139,35 @@ fn access_card_parameters(config: f64) -> Result<&'static [(&'static str, f64)],
     })
 }
 
-fn prepare(
-    row: &[f64; 15],
+fn add_hv2_fields(
+    fields: &mut Vec<(&'static str, ParameterValue)>,
+    variant: ModelVariant,
     mechanism: Mechanism,
-) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance), ModelError> {
-    let variant = match row[0] {
-        1. => ModelVariant::HiSimHv1,
-        2. => ModelVariant::HiSimHv2,
-        _ => return Err(ModelError::InvalidPhysicalParameter("native model family")),
-    };
-    let mut fields = vec![
-        (
-            if row[1] < 0. { "pmos" } else { "nmos" },
-            ParameterValue::Flag(true),
-        ),
-        (
-            "corsrd",
-            ParameterValue::Integer(if matches!(mechanism, Mechanism::Access) {
-                2
-            } else {
-                0
-            }),
-        ),
-        (
-            "coisti",
-            ParameterValue::Integer(i32::from(matches!(mechanism, Mechanism::Sti))),
-        ),
-    ];
-    fields.push((
-        "coisub",
-        ParameterValue::Integer(i32::from(matches!(mechanism, Mechanism::Impact))),
-    ));
-    for name in ["coadov", "coovlp", "conqs"] {
-        fields.push((name, ParameterValue::Integer(0)));
-    }
-    let parameters = card_parameters(mechanism, row[7])?;
-    fields.extend(
-        parameters
-            .iter()
-            .map(|(name, value)| (*name, ParameterValue::Real(*value))),
-    );
+    config: f64,
+) {
     if variant == ModelVariant::HiSimHv2 {
         fields.push(("cordrift", ParameterValue::Integer(0)));
+        if matches!(mechanism, Mechanism::Drift) {
+            fields.extend(
+                [("rd", 0.002), ("rs", 0.), ("rdvd", 0.)]
+                    .map(|(n, v)| (n, ParameterValue::Real(v))),
+            );
+            if matches!(config, 2.) {
+                fields.extend(
+                    [
+                        ("xpdv", 2e5),
+                        ("xldld", 1e-6),
+                        ("xpvdth", 0.2),
+                        ("xpvdthg", 0.1),
+                        ("subld1l", 0.3),
+                        ("subld1lp", 0.8),
+                        ("ibpc1l", 0.5),
+                        ("ibpc1lp", 0.7),
+                    ]
+                    .map(|(n, v)| (n, ParameterValue::Real(v))),
+                );
+            }
+        }
         if matches!(mechanism, Mechanism::Access) {
             fields.extend(
                 [
@@ -163,6 +186,55 @@ fn prepare(
             );
         }
     }
+}
+
+fn prepare(
+    row: &[f64],
+    mechanism: Mechanism,
+) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance), ModelError> {
+    let variant = match row[0] {
+        1. => ModelVariant::HiSimHv1,
+        2. => ModelVariant::HiSimHv2,
+        _ => return Err(ModelError::InvalidPhysicalParameter("native model family")),
+    };
+    let mut fields = vec![
+        (
+            if row[1] < 0. { "pmos" } else { "nmos" },
+            ParameterValue::Flag(true),
+        ),
+        (
+            "corsrd",
+            ParameterValue::Integer(match mechanism {
+                Mechanism::Access => 2,
+                Mechanism::Drift if variant == ModelVariant::HiSimHv2 => 1,
+                _ => 0,
+            }),
+        ),
+        (
+            "coisti",
+            ParameterValue::Integer(i32::from(matches!(mechanism, Mechanism::Sti))),
+        ),
+    ];
+    fields.push((
+        "coisub",
+        ParameterValue::Integer(i32::from(matches!(
+            mechanism,
+            Mechanism::Impact | Mechanism::Drift
+        ))),
+    ));
+    for name in ["coadov", "coovlp", "conqs"] {
+        fields.push((name, ParameterValue::Integer(0)));
+    }
+    let parameters = card_parameters(mechanism, row[7])?;
+    fields.extend(
+        parameters
+            .iter()
+            .map(|(name, value)| (*name, ParameterValue::Real(*value))),
+    );
+    if matches!(mechanism, Mechanism::Drift) && variant == ModelVariant::HiSimHv1 {
+        fields.push(("coldrift", ParameterValue::Integer(0)));
+    }
+    add_hv2_fields(&mut fields, variant, mechanism, row[7]);
     let model = prepare_hisim_hv_model(&BoundParameters::bind(
         variant,
         ParameterScope::Model,
@@ -435,4 +507,138 @@ fn native_channel_impact_current_and_tied_terminal_derivatives() -> TestResult {
         1920,
         Mechanism::Impact,
     )
+}
+
+#[test]
+fn native_drift_impact_and_bulk_feedback_at_independent_drain_nodes() -> TestResult {
+    let mut count = 0;
+    for (index, line) in include_str!("fixtures/hisim-hv-drift-impact-ngspice47.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .enumerate()
+    {
+        let row: [f64; 16] = line
+            .split_whitespace()
+            .map(str::parse::<f64>)
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| "native drift impact fixture width")?;
+        let (model, instance) = prepare(&row, Mechanism::Drift)?;
+        let channel = prepare_hisim_hv_normal_channel(&model, &instance)?;
+        let temp = prepare_hisim_hv_transport(&model, &instance, row[2] + 273.15, 0.)?;
+        let state = channel.evaluate_with_impact(
+            HiSimHvIntrinsicBias {
+                vgs: row[8],
+                vds: row[11],
+                vbs: row[10],
+            },
+            HiSimHvExternalBias {
+                vgs: row[8],
+                vds: row[9],
+                vbs: row[10],
+            },
+            row[9] - row[11],
+            &temp,
+        )?;
+        let p = state.impact;
+        let ids = state.channel.access.current.current_a;
+        let actual = if model.variant() == ModelVariant::HiSimHv1 {
+            [
+                ids + p.bulk_feedback_current_a.value,
+                p.channel_current_a.value + p.drift_current_a.value,
+                0.,
+                0.,
+            ]
+        } else {
+            [
+                ids,
+                p.channel_current_a.value,
+                p.drift_current_a.value,
+                p.bulk_feedback_current_a.value,
+            ]
+        };
+        for (field, value) in actual.into_iter().enumerate() {
+            close(
+                value,
+                row[12 + field],
+                5e-7,
+                1e-19,
+                (index, field, &row[..12]),
+            );
+        }
+        count += 1;
+    }
+    assert_eq!(count, 1536);
+    Ok(())
+}
+
+#[test]
+fn impact_and_feedback_independent_voltage_and_temperature_derivatives() -> TestResult {
+    for family in [1., 2.] {
+        for polarity in [-1., 1.] {
+            for config in [0., 1., 2.] {
+                let row = [
+                    family, polarity, 27., 3e-6, 10e-6, 3., 1., config, 0., 0., 0., 0., 0., 0., 0.,
+                    0.,
+                ];
+                let (model, instance) = prepare(&row, Mechanism::Drift)?;
+                let channel = prepare_hisim_hv_normal_channel(&model, &instance)?;
+                let evaluate = |c: [f64; 8]| -> Result<
+                    [model_compact_intrinsic::HiSimHvImpactScalar; 4],
+                    ModelError,
+                > {
+                    let temp = prepare_hisim_hv_transport(&model, &instance, c[3], 0.)?;
+                    let p = channel
+                        .evaluate_with_impact(
+                            HiSimHvIntrinsicBias {
+                                vgs: c[0],
+                                vds: c[1],
+                                vbs: c[2],
+                            },
+                            HiSimHvExternalBias {
+                                vgs: c[4],
+                                vds: c[5],
+                                vbs: c[6],
+                            },
+                            c[7],
+                            &temp,
+                        )?
+                        .impact;
+                    Ok([
+                        p.channel_current_a,
+                        p.drift_current_a,
+                        p.bulk_potential_change_v,
+                        p.bulk_feedback_current_a,
+                    ])
+                };
+                for gate in [3., 5., 8.] {
+                    for drain in [0.2, 2., 10.] {
+                        let c = [gate, drain, -0.3, 315., gate + 0.2, drain + 1.5, -0.25, 1.3];
+                        let point = evaluate(c)?;
+                        for axis in 0..8 {
+                            let step = if axis == 3 { 0.01 } else { 1e-5 };
+                            let mut hi = c;
+                            let mut lo = c;
+                            hi[axis] += step;
+                            lo[axis] -= step;
+                            let high = evaluate(hi)?;
+                            let low = evaluate(lo)?;
+                            for field in 0..4 {
+                                let numerical =
+                                    (high[field].value - low[field].value) / (2. * step);
+                                close(
+                                    point[field].gradient[axis],
+                                    numerical,
+                                    2e-5,
+                                    1e-16,
+                                    (family, polarity, config, c, axis, field),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

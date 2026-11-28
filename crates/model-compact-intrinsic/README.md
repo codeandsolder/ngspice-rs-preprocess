@@ -1073,8 +1073,10 @@ Channel and drift impact-ionization components retain independent intrinsic,
 external and HV2 drain-to-prime voltage derivatives (eight coordinates
 including temperature). The channel law is qualified against 1,920 native
 substrate-current points with same-branch finite differences at the HV1 D1
-cutoff. The drift impact branch and impact-induced bulk-potential feedback
-are qualified separately. HV2 depletion-mode transport, explicit series/drift
+cutoff. The drift impact branch and impact-induced bulk-potential feedback are
+qualified at 1,536 native operating points, including explicit drain-prime
+voltage drops. Independent finite differences verify all eight coordinates
+of channel impact, drift impact, bulk potential and feedback current. HV2 depletion-mode transport, explicit series/drift
 resistance, parasitic assembly, noise and full circuit-level qualification
 remain work.
 

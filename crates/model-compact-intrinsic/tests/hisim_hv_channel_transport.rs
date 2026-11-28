@@ -51,6 +51,7 @@ fn values(fields: &[f64; 72]) -> Result<[Jet; 8], ModelError> {
         inversion_density: j(6),
         drain_fraction: zero,
         transition_weight: j(10),
+        bulk_feedback_shape: zero,
     };
     let clm = PreparedHiSimHvChannelModulation {
         channel_length_m: v(11),

@@ -49,6 +49,8 @@ pub struct HiSimHvChannelChargePoint {
     pub inversion_density: Jet,
     pub drain_fraction: Jet,
     pub transition_weight: Jet,
+    /// Native endpoint depletion-integral shape for impact-induced bulk-potential feedback.
+    pub bulk_feedback_shape: Jet,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +60,9 @@ struct DepletionPowers {
     cube: Jet,
 }
 impl DepletionPowers {
+    fn feedback(self) -> Jet {
+        (self.cube - 0.5 * self.root) / self.square
+    }
     fn from_surface(point: &HiSimHvSurfacePoint) -> Self {
         let root = point.depletion_root;
         if point.chi.value < 5. {
@@ -143,6 +148,7 @@ impl HiSimHvChannelChargePoint {
             self.inversion_density,
             self.drain_fraction,
             self.transition_weight,
+            self.bulk_feedback_shape,
         ] {
             value.checked("HiSIM-HV channel charge integral")?;
         }
@@ -266,6 +272,7 @@ pub fn evaluate_hisim_hv_channel_charge(
         inversion_density: inversion,
         drain_fraction: Jet::constant(0.5),
         transition_weight: transition_weight(source.chi),
+        bulk_feedback_shape: Jet::constant(0.),
     };
     if region == HiSimHvChannelRegion::NoInversion {
         point.inversion_density = Jet::constant(0.);
@@ -280,5 +287,14 @@ pub fn evaluate_hisim_hv_channel_charge(
     )?;
     point.drain_surface = drain.potential;
     point.surface_difference = difference;
+    let xil = DepletionPowers::from_surface(&drain);
+    point.bulk_feedback_shape = if source.chi.value >= 5. && drain.chi.value >= 5. {
+        // (sqrt(Xil) - sqrt(Xi0)) * (1 + 1/(2 sqrt(Xil Xi0))).
+        // Factor the endpoint difference to preserve the zero-drain derivative.
+        inputs.inverse_thermal_voltage * difference / (xil.root + xi.root)
+            * (1. + 0.5 / (xil.root * xi.root))
+    } else {
+        xil.feedback() - xi.feedback()
+    };
     integrate(inputs, &source, &drain, point)
 }

@@ -24,6 +24,10 @@ const EPS: f64 = 10. * f64::EPSILON;
 pub struct HiSimHvImpactPoint {
     pub channel_current_a: Jet,
     pub drift_current_a: Jet,
+    /// Impact-ionization induced bulk-potential change, per unit device.
+    pub bulk_potential_change_v: Jet,
+    /// Additional drain-source current induced by the bulk potential.
+    pub bulk_feedback_current_a: Jet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,6 +48,10 @@ pub(super) struct ImpactIonization {
     drift_screening: f64,
     drift_threshold: f64,
     drift_gate_factor: f64,
+    feedback_coefficient: f64,
+    feedback_threshold_factor: f64,
+    width_m: f64,
+    multiplicity: f64,
 }
 
 const fn promote(value: HiSimHvIntrinsicScalar) -> Jet {
@@ -151,21 +159,38 @@ impl ImpactIonization {
             drift_screening,
             drift_threshold,
             drift_gate_factor,
+            feedback_coefficient: binned("ibpc1")?
+                * if model.variant() == ModelVariant::HiSimHv2 {
+                    1. + real("ibpc1l")? / (length * 1e6).powf(real("ibpc1lp")?)
+                } else {
+                    1.
+                },
+            feedback_threshold_factor: binned("ibpc2")?,
+            width_m: instance.effective_geometry().channel_width_total_m,
+            multiplicity: local("m")?,
         };
+        result.validate()
+    }
+
+    fn validate(self) -> Result<Self, ModelError> {
         if ![
-            result.gate_coefficient,
-            result.body_coefficient,
-            result.length_ratio,
-            result.drain_coefficient,
-            result.amplitude,
-            result.barrier,
-            result.classical_oxide,
-            result.potential_symmetry,
-            drift_amplitude,
-            drift_barrier,
-            drift_screening,
-            drift_threshold,
-            drift_gate_factor,
+            self.gate_coefficient,
+            self.body_coefficient,
+            self.length_ratio,
+            self.drain_coefficient,
+            self.amplitude,
+            self.barrier,
+            self.classical_oxide,
+            self.potential_symmetry,
+            self.drift_amplitude,
+            self.drift_barrier,
+            self.drift_screening,
+            self.drift_threshold,
+            self.drift_gate_factor,
+            self.feedback_coefficient,
+            self.feedback_threshold_factor,
+            self.width_m,
+            self.multiplicity,
         ]
         .into_iter()
         .all(f64::is_finite)
@@ -174,7 +199,7 @@ impl ImpactIonization {
                 "HiSIM-HV impact coefficients",
             ));
         }
-        Ok(result)
+        Ok(self)
     }
 
     pub(super) fn evaluate(
@@ -203,6 +228,8 @@ impl ImpactIonization {
             return Ok(HiSimHvImpactPoint {
                 channel_current_a: zero,
                 drift_current_a: zero,
+                bulk_potential_change_v: zero,
+                bulk_feedback_current_a: zero,
             });
         }
         let current = promote_current(state.access.current);
@@ -266,9 +293,41 @@ impl ImpactIonization {
                 * voltage
                 * (-self.drift_barrier / (voltage * inversion)).exp()
         };
+        let (bulk_potential_change_v, bulk_feedback_current_a) =
+            self.bulk_feedback(state, channel + drift)?;
         Ok(HiSimHvImpactPoint {
+            bulk_potential_change_v,
+            bulk_feedback_current_a,
             channel_current_a: channel.checked("HiSIM-HV channel impact current")?,
             drift_current_a: drift.checked("HiSIM-HV drift impact current")?,
         })
+    }
+    fn bulk_feedback(
+        &self,
+        state: &HiSimHvNormalChannelWithAccessPoint,
+        impact: Jet,
+    ) -> Result<(Jet, Jet), ModelError> {
+        let zero = Jet::constant(0.);
+        if impact.value <= 0. || self.feedback_coefficient == 0. {
+            return Ok((zero, zero));
+        }
+        let electro = &state.intrinsic.electrostatics;
+        let delta = self.feedback_coefficient
+            * (1. + self.feedback_threshold_factor * promote(electro.threshold.total_shift))
+            * impact
+            / self.multiplicity;
+        // beta cancels between dIdd and betaWL. Apply the per-unit bulk
+        // change to the full device geometry, including M exactly once.
+        let current = self.width_m
+            * self.multiplicity
+            * promote(state.intrinsic.mobility.mobility_m2_per_vs)
+            * promote(electro.material.poisson_coefficient)
+            * delta
+            * promote(electro.charge.bulk_feedback_shape)
+            / promote(electro.modulation.effective_length_m);
+        Ok((
+            delta.checked("HiSIM-HV impact bulk-potential change")?,
+            current.checked("HiSIM-HV impact bulk-feedback current")?,
+        ))
     }
 }

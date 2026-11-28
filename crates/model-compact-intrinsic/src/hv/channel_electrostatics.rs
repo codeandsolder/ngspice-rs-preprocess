@@ -194,6 +194,7 @@ impl PreparedHiSimHvChannelElectrostatics {
                     inversion_density: zero,
                     drain_fraction: zero,
                     transition_weight: zero,
+                    bulk_feedback_shape: zero,
                 },
             ));
         }
