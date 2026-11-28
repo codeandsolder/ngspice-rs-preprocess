@@ -75,7 +75,7 @@ pub enum NormalizationPass {
     LtspiceSeriesParasitics,
     /// Comment the schematic-only `LTspice` backannotation directive.
     LtspiceBackannotation,
-    /// Retain qualified LTspice raw-file options as explicit source controls.
+    /// Retain qualified `LTspice` raw-file options as explicit source controls.
     LtspiceOutputOptions,
     /// Disable native resistor noise for the explicit `LTspice` flag.
     LtspiceNoiselessResistor,
