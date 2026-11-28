@@ -1,4 +1,4 @@
-//! Independent LTspice reference measurements and analytic range witnesses.
+//! Independent `LTspice` reference measurements and analytic range witnesses.
 use model_kernel_diode::fowler_nordheim::{Instance, Model, PreparedInstance};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -216,25 +216,37 @@ fn high_precision_scaled_products_keep_representable_outputs() -> Result<()> {
             .split_ascii_whitespace()
             .map(str::parse::<f64>)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let [t, n, l, w, m, v, i, g, q, c] = values.as_slice() else {
+        let [
+            thickness,
+            series,
+            length,
+            width,
+            multiplier,
+            voltage,
+            current,
+            conductance,
+            charge,
+            capacitance,
+        ] = values.as_slice()
+        else {
             return Err("invalid extreme witness width".into());
         };
         let diode = Model {
-            oxide_thickness: *t,
-            length: *l,
-            width: *w,
+            oxide_thickness: *thickness,
+            length: *length,
+            width: *width,
         }
         .bind(Instance {
-            multiplier: *m,
-            series: *n,
+            multiplier: *multiplier,
+            series: *series,
             ..Instance::default()
         })?;
-        let value = diode.evaluate(*v)?;
+        let value = diode.evaluate(*voltage)?;
         for (quantity, actual, expected) in [
-            ("I", value.current, *i),
-            ("g", value.conductance, *g),
-            ("Q", value.charge, *q),
-            ("C", value.capacitance, *c),
+            ("I", value.current, *current),
+            ("g", value.conductance, *conductance),
+            ("Q", value.charge, *charge),
+            ("C", value.capacitance, *capacitance),
         ] {
             row_error(name, quantity, actual, expected, 3e-12, 0.)?;
         }

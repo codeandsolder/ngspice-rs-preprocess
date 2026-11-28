@@ -152,3 +152,23 @@ pub fn limit_temperature(proposed: f64, reference: f64, threshold: f64) -> f64 {
     let next = reference + (threshold + log).copysign(delta);
     next.clamp(reference.min(proposed), reference.max(proposed))
 }
+
+/// Restrict the common electrical step to the interval permitted by one
+/// controlling voltage.
+///
+/// This preserves all aliased rows, including the case
+/// where different branches refer to the same voltage difference.
+#[must_use = "the returned fraction restricts a common coordinate step"]
+pub fn restrict_step(scale: f64, raw: f64, previous: f64, limited: f64) -> f64 {
+    if raw.to_bits() == limited.to_bits() || raw.to_bits() == previous.to_bits() {
+        return scale;
+    }
+    let delta = raw - previous;
+    let allowed = limited - previous;
+    let fraction = if delta.is_finite() && allowed.is_finite() {
+        allowed / delta
+    } else {
+        previous.mul_add(-0.5, limited * 0.5) / previous.mul_add(-0.5, raw * 0.5)
+    };
+    scale.min(fraction.clamp(0., 1.))
+}

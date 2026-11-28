@@ -1,5 +1,7 @@
 //! Headless schematic import through the ordinary source preparation API.
 use anyhow::{Context, Result, ensure};
+use model_normalize_ngspice::linked_source::{LibrarySyntax, LinkLimits, RootKind, SourceLinker};
+use model_preprocess_command::{AdmissionConfig, AdmittedSource, SourceSession};
 use ngspice_rs_preprocess::{
     Cancellation, InputFormat, Options, PreparedBundle, Provenance, Request, SourceInput, prepare,
 };
@@ -206,10 +208,17 @@ fn imported_semiconductor_terminal_and_library_bindings_match_native_deck() -> R
             "TEXT 0 32 Left 2 !.op\n",
         ),
     )?;
-    let bundle = prepared_with_search(&root, vec![lib])?;
+    let bundle = prepared_with_search(&root, vec![lib.clone()])?;
     let output = std::str::from_utf8(&bundle.primary.bytes)?;
     assert!(output.lines().any(|line| line == "Q1 out base 0 0 qm"));
     assert!(output.lines().any(|line| line == "M1 out in 0 0 mm"));
+    assert!(output.lines().any(|line| line == "D1 0 out dm"));
+    assert!(
+        output
+            .lines()
+            .any(|line| line == ".model dm ltspice_diode(IS=2e-14 N=1.1)")
+    );
+    assert!(output.lines().any(|line| line == ".model D ltspice_diode"));
     let Provenance::Native { lines } = &bundle.primary.provenance else {
         anyhow::bail!("missing provenance")
     };
@@ -228,7 +237,34 @@ fn imported_semiconductor_terminal_and_library_bindings_match_native_deck() -> R
         ".model NPN NPN\n.model PNP PNP\n.model qm NPN(IS=3e-15 BF=120 VAF=100)\n",
         ".model NMOS NMOS\n.model PMOS PMOS\n.model mm NMOS(LEVEL=1 VTO=.65 KP=.001)\n.end\n",
     );
-    let observed = numerical_data(dir.path(), &bundle.primary.bytes, "device-import")?;
+    // Stock C ngspice cannot execute solver-specific dialect markers. Use
+    // the importer's original LTspice source for this independent topology
+    // and binding oracle, on the ordinary shared semiconductor subset. The
+    // prepared output and provenance above separately check dialect lowering.
+    let mut session = SourceSession::new(AdmissionConfig::default(), Cancellation::default());
+    let admitted = session.load(&root)?;
+    let imported = model_import_ltspice::import(
+        &admitted,
+        std::slice::from_ref(&lib),
+        &mut session,
+        Options::default().output_bytes,
+    )?;
+    let linked = SourceLinker {
+        search_paths: vec![lib],
+        library_syntax: LibrarySyntax::Ltspice,
+    }
+    .link_admitted(
+        &AdmittedSource {
+            path: admitted.path.clone(),
+            bytes: imported.bytes.into(),
+        },
+        RootKind::Deck,
+        LinkLimits {
+            output_bytes: Options::default().output_bytes,
+        },
+        &mut session,
+    )?;
+    let observed = numerical_data(dir.path(), &linked.bytes, "device-import")?;
     let expected = numerical_data(dir.path(), reference.as_bytes(), "device-reference")?;
     for (observed, expected) in observed.iter().zip(&expected) {
         ensure!(!observed.is_empty(), "empty numerical trace");

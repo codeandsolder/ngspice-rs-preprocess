@@ -39,7 +39,7 @@ fn links_whole_files_and_named_sections_with_original_line_mapping() -> Result<(
     assert!(output.starts_with("ordinary title\n"));
     assert!(output.contains(".subckt cell p n"));
     assert!(output.contains("+ noisy=0 ; flag"));
-    assert!(output.contains(".model right D"));
+    assert!(output.contains(".model right ltspice_diode"));
     assert!(output.contains("Rliteral a 0 2k"));
     assert!(output.contains("*backanno"));
     assert!(!output.contains("Vignored"));
@@ -93,7 +93,6 @@ fn rejects_ambiguous_flags_and_shadowed_intrinsics() -> Result<()> {
         "R1 a 0 1k noisy=1 noiseless",
         ".func limit(x,y,z) {x}",
         ".backanno unexpected",
-        ".model ambiguous D(Ilimit=1 Epsilon=0.2)",
         ".model reactive C(Rser=1)",
         ".func min(x,y) {x}",
         "B1 y 0 V=table(v(x),0,0,1)",
@@ -117,7 +116,7 @@ fn explicit_library_format_preserves_first_model_and_include_safety() -> Result<
     assert_eq!(bundle.primary.filename, "model.lib");
     let output = std::str::from_utf8(&bundle.primary.bytes)?;
     assert!(output.contains(".param x={__lt_intrinsic_limit(5,2,-1)}"));
-    assert!(output.contains(".model dtest D(Is=1n)"));
+    assert!(output.contains(".model dtest ltspice_diode(Is=1n)"));
     assert!(!output.lines().any(|line| line.eq_ignore_ascii_case(".end")));
     Ok(())
 }
@@ -1014,7 +1013,7 @@ fn exp_analysis_dependent_defaults_require_binding_instead_of_native_substitutio
 }
 
 #[test]
-fn idealized_diode_selects_explicit_family_without_rewriting_identity() -> Result<()> {
+fn diode_dialect_retains_model_identity_and_ordered_setters() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("ideal.cir");
     let source = b"ideal diode\nD1 a 0 dm m=3 n=2\n.model dm D(Ron={r}\n+ Roff=100 Vfwd=1 Ilimit=0.25 Epsilon=0.4)\n.param r=2\n.subckt nested a b\nD2 a b dm\n.model dm D(IS=1p)\n.ends\n.end\n";
@@ -1024,9 +1023,9 @@ fn idealized_diode_selects_explicit_family_without_rewriting_identity() -> Resul
     let translated = prepared(&root, InputFormat::LtspiceDeck)?;
     let text = std::str::from_utf8(&translated.primary.bytes)?;
     assert!(text.contains("D1 a 0 dm m=3 n=2"));
-    assert!(text.contains(".model dm ltspice_ideal_diode(Ron={r}"));
+    assert!(text.contains(".model dm ltspice_diode(Ron={r}"));
     assert!(text.contains("+ Roff=100 Vfwd=1 Ilimit=0.25 Epsilon=0.4)"));
-    assert!(text.contains(".model dm D(IS=1p)"));
+    assert!(text.contains(".model dm ltspice_diode(IS=1p)"));
     let Provenance::Native { lines } = &translated.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
@@ -1055,5 +1054,31 @@ fn switch_selection_retains_ordered_setters_flags_and_native_isolation() -> Resu
     assert_eq!(lines.len(), expected.lines().count());
     assert_eq!(lines[2].line, 3);
     assert_eq!(lines[3].line, 4);
+    Ok(())
+}
+
+#[test]
+fn diode_dispatch_is_deferred_to_each_resolved_occurrence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    let source = b"title\n.model plain D\n.model fn D(Level=2 Tox=50 L=2 W=3)\n.model limit_only D(Ilimit=1 Epsilon=0.2)\n.model ordered d(Level=1 level=2 Ron=2)\n.model reversed D(level=2 LEVEL=1 Ron=2)\n.subckt cell p n sel=1\n.model dm D(Level={sel} Ron=2\n+ Roff=100 Vfwd=1)\nD1 p n dm m=2 n=3\n.ends cell\nX1 a 0 cell sel=1\nX2 b 0 cell sel=2\nX3 c 0 cell sel=3\n.end\n";
+    fs::write(&root, source)?;
+    assert_eq!(
+        prepared(&root, InputFormat::NativeDeck)?.primary.bytes,
+        source
+    );
+    let translated = prepared(&root, InputFormat::LtspiceDeck)?;
+    let expected = std::str::from_utf8(source)?
+        .replace(" D(", " ltspice_diode(")
+        .replace(" d(", " ltspice_diode(")
+        .replace("plain D\n", "plain ltspice_diode\n");
+    assert_eq!(translated.primary.bytes, expected.as_bytes());
+    let Provenance::Native { lines } = &translated.primary.provenance else {
+        anyhow::bail!("missing source mapping");
+    };
+    assert_eq!(lines.len(), expected.lines().count());
+    for (index, line) in lines.iter().enumerate() {
+        assert_eq!(line.line, index + 1);
+    }
     Ok(())
 }

@@ -31,6 +31,40 @@ pub fn evaluate_legacy_bsim_intrinsic(
     }
 }
 
+fn validate_bias(bias: LegacyBsimBias) -> Result<(), ModelError> {
+    if ![bias.vds, bias.vgs, bias.vbs]
+        .into_iter()
+        .all(f64::is_finite)
+        || bias.vds < 0.
+    {
+        return Err(ModelError::InvalidPhysicalParameter(
+            "normalized legacy BSIM bias",
+        ));
+    }
+    Ok(())
+}
+
+/// Evaluate the threshold at an already oriented bias using the same body and
+/// drain-voltage law as the intrinsic channel, without evaluating charge/current.
+///
+/// This is used by numerical trial policy, not an additional constitutive law.
+///
+/// # Errors
+/// Invalid normalized bias or nonfinite threshold.
+pub fn legacy_bsim_threshold(
+    instance: &PreparedLegacyBsimInstance,
+    bias: LegacyBsimBias,
+) -> Result<f64, ModelError> {
+    validate_bias(bias)?;
+    finite(
+        match &instance.channel {
+            LegacyBsimChannel::Bsim1(c) => bsim1::threshold(c, bias),
+            LegacyBsimChannel::Bsim2(c) => bsim2::threshold(c, bias),
+        },
+        "legacy BSIM threshold",
+    )
+}
+
 pub use coefficients::{Bsim1Coefficients, Bsim2Coefficients, LegacyBsimChannel};
 
 use crate::{
@@ -326,6 +360,29 @@ impl PreparedLegacyBsimModel {
         })
     }
 
+    fn series_conductance(&self, squares: f64) -> Result<f64, ModelError> {
+        let squares = nonnegative(squares, "series-resistance squares")?;
+        let sheet = nonnegative(self.real("rsh")?, "rsh")?;
+        if sheet == 0. || squares == 0. {
+            Ok(0.)
+        } else {
+            let resistance = positive(sheet * squares, "series resistance")?;
+            positive(resistance.recip(), "series conductance")
+        }
+    }
+
+    /// Determine the drain/source series conductances without preparing the
+    /// channel, junction charge, or geometry-dependent coefficients.
+    ///
+    /// # Errors
+    /// Invalid sheet resistance or either series-resistance square count.
+    pub fn series_conductances(&self, squares: [f64; 2]) -> Result<[f64; 2], ModelError> {
+        Ok([
+            self.series_conductance(squares[0])?,
+            self.series_conductance(squares[1])?,
+        ])
+    }
+
     fn junction(
         &self,
         source: &BoundParameters,
@@ -334,14 +391,7 @@ impl PreparedLegacyBsimModel {
         let [area_name, perimeter_name, squares_name] = names;
         let area = nonnegative(real_input(source, area_name, 0.)?, area_name)?;
         let perimeter = nonnegative(real_input(source, perimeter_name, 0.)?, perimeter_name)?;
-        let squares = nonnegative(real_input(source, squares_name, 1.)?, squares_name)?;
-        let sheet = nonnegative(self.real("rsh")?, "rsh")?;
-        let series_conductance = if sheet == 0. || squares == 0. {
-            0.
-        } else {
-            let resistance = positive(sheet * squares, "series resistance")?;
-            positive(resistance.recip(), "series conductance")?
-        };
+        let series_conductance = self.series_conductance(real_input(source, squares_name, 1.)?)?;
         let saturation_current = finite(
             area * nonnegative(self.real("js")?, "js")?,
             "junction saturation current",

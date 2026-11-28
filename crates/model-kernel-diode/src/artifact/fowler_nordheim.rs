@@ -44,6 +44,7 @@ pub fn artifact(
             family: FAMILY.into(),
             fingerprint,
             abi: ABI_VERSION,
+            taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
             equations: ["anode", "cathode"]
                 .into_iter()
                 .map(|name| Equation {

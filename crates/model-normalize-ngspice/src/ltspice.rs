@@ -136,8 +136,9 @@ fn reject_shadowed_helpers(statement: &lexical::Statement) -> Result<()> {
     Ok(())
 }
 
-/// Select the explicit native physical family without changing ordered
-/// setters, names or their lexical scope.
+/// Preserve source model identity without changing ordered setters, names
+/// or lexical scope. The consumer resolves diode LEVEL and selects its
+/// constitutive family per occurrence, not per source spelling.
 fn select_model(
     statement: &lexical::Statement,
     edits: &mut Vec<Edit>,
@@ -150,18 +151,7 @@ fn select_model(
                 b"ltspice_switch".as_slice(),
                 NormalizationPass::LtspiceSwitch,
             )),
-            "d" if model.parameters.iter().any(|field| {
-                matches!(
-                    field.name.to_ascii_lowercase().as_str(),
-                    "ron" | "roff" | "vfwd" | "vrev" | "rrev"
-                )
-            }) =>
-            {
-                Some((
-                    b"ltspice_ideal_diode".as_slice(),
-                    NormalizationPass::LtspiceIdealDiode,
-                ))
-            }
+            "d" => Some((b"ltspice_diode".as_slice(), NormalizationPass::LtspiceDiode)),
             _ => None,
         };
         if let Some((replacement, pass)) = selection {
@@ -183,15 +173,6 @@ fn select_model(
         for field in &model.parameters {
             let name = field.name.to_ascii_lowercase();
             match family.as_str() {
-                "d" => ensure!(
-                    !matches!(
-                        name.as_str(),
-                        "epsilon" | "revepsilon" | "ilimit" | "revilimit"
-                    ),
-                    "line {}: LTspice idealized diode parameter {} requires typed model lowering",
-                    statement.line,
-                    field.name
-                ),
                 "c" | "cap" | "l" | "ind" => ensure!(
                     !matches!(
                         name.as_str(),
