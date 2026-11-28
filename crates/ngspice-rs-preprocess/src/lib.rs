@@ -7,7 +7,9 @@ mod dialect;
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
     MappedNormalization, NormalizationPass,
-    linked_source::{LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker},
+    linked_source::{
+        LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker, SourceScope, SourceVisit,
+    },
     normalize_mapped,
 };
 pub use model_normalize_ngspice::{passive_ic, passive_storage, pwl_resistor, waveform};
@@ -207,6 +209,26 @@ pub struct OriginLine {
     pub line: usize,
     /// Inclusive end of the admitted physical source span, or zero for a generated dialect default.
     pub last_line: usize,
+    /// Admitted source occurrence and lexical scope, when linked directly.
+    pub linked: Option<LinkedLocation>,
+}
+
+/// Stable indices into the artifact's admitted source graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct LinkedLocation {
+    /// Zero-based index of the resource occurrence.
+    pub visit: usize,
+    /// Zero-based index of the lexical subcircuit scope.
+    pub scope: usize,
+}
+
+/// Admitted source occurrences and electrical lexical scopes.
+#[derive(Clone, Debug, Serialize)]
+pub struct SourceGraph {
+    /// Include occurrences in traversal order, including repeated resources.
+    pub visits: Vec<SourceVisit>,
+    /// Lexical scopes in declaration order, starting with the root scope.
+    pub scopes: Vec<SourceScope>,
 }
 
 /// Provenance of an artifact. Generated dialect output is not falsely given
@@ -218,6 +240,8 @@ pub enum Provenance {
     Native {
         /// Exact ordered line mapping.
         lines: Vec<OriginLine>,
+        /// Graph underlying the line map for directly linked artifacts.
+        source_graph: Option<SourceGraph>,
     },
     /// Generated source or parsed library.
     Generated {
@@ -459,12 +483,20 @@ fn native(
                     source: original.path.clone(),
                     line: original.line,
                     last_line: original.line,
+                    linked: Some(LinkedLocation {
+                        visit: mapped.visit,
+                        scope: mapped.scope,
+                    }),
                 })
             } else {
                 Ok(OriginLine {
                     source: mapped.path,
                     line: mapped.line,
                     last_line: mapped.line,
+                    linked: Some(LinkedLocation {
+                        visit: mapped.visit,
+                        scope: mapped.scope,
+                    }),
                 })
             }
         })
@@ -475,6 +507,10 @@ fn native(
         kind,
         projected,
         &origins,
+        Some(SourceGraph {
+            visits: linked.visits,
+            scopes: linked.scopes,
+        }),
         session.budget(),
     )
 }
@@ -485,6 +521,7 @@ fn native_bundle(
     kind: RootKind,
     projection: NativeProjection,
     origins: &[OriginLine],
+    source_graph: Option<SourceGraph>,
     budget: &WorkBudget,
 ) -> Result<PreparedBundle> {
     let NativeProjection {
@@ -519,7 +556,10 @@ fn native_bundle(
             }
             .to_owned(),
             bytes: normalized.model.bytes,
-            provenance: Provenance::Native { lines },
+            provenance: Provenance::Native {
+                lines,
+                source_graph,
+            },
             dependencies: Vec::new(),
             required_code_models: Vec::new(),
             current_scalings: Vec::new(),

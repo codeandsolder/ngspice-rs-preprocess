@@ -44,7 +44,7 @@ fn tina_deck_and_library_keep_formals_local_parameters_and_provenance() -> Resul
         "PARAMS:",
         "rbase=500"
     ])));
-    let Provenance::Native { lines } = &result.primary.provenance else {
+    let Provenance::Native { lines, .. } = &result.primary.provenance else {
         anyhow::bail!("missing source map");
     };
     assert_eq!(lines.len(), source.lines().count());
@@ -193,7 +193,7 @@ fn shared_dialect_linking_and_renamed_device_origins_compose() -> Result<()> {
     assert_eq!(identity.scope, ["CELL"]);
     assert_eq!(identity.declared, "S1");
     assert_ne!(identity.linked.to_ascii_lowercase(), "a__ps_s1");
-    let Provenance::Native { lines } = &result.primary.provenance else {
+    let Provenance::Native { lines, .. } = &result.primary.provenance else {
         anyhow::bail!("missing composed source map");
     };
     let output = std::str::from_utf8(&result.primary.bytes)?;

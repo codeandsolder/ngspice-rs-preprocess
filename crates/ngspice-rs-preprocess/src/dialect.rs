@@ -397,6 +397,7 @@ impl<'a> SourceExpansion<'a> {
                 source: source.path.clone(),
                 line: original.first_line,
                 last_line: original.last_line,
+                linked: None,
             });
         }
         if self.standalone || self.simulator == LibrarySimulator::Simetrix {

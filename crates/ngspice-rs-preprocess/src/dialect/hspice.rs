@@ -671,6 +671,7 @@ fn add_catalog(
                 source: std::path::PathBuf::from(&statement.source),
                 line: statement.first_line,
                 last_line: statement.last_line,
+                linked: None,
             });
             linked.push(statement.clone_with_budget(budget)?);
         }
@@ -740,6 +741,7 @@ pub(super) fn prepare(
             source: root.path.clone(),
             line: 0,
             last_line: 0,
+            linked: None,
         };
         let default_text = defaults.concat();
         ensure!(
@@ -762,6 +764,7 @@ pub(super) fn prepare(
         RootKind::Deck,
         NativeProjection::plain(&bytes, RootKind::Deck, budget)?,
         &origins,
+        None,
         budget,
     )?;
     bundle.model_selections = selections;

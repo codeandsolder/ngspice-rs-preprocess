@@ -34,7 +34,7 @@ fn virtual_native_deck_keeps_title_terminator_scope_and_exact_line_mapping() -> 
     assert!(output.contains("* keep this comment"));
     assert!(output.contains("* control comment"));
     assert!(!output.contains("unwanted"));
-    let Provenance::Native { lines } = &prepared.primary.provenance else {
+    let Provenance::Native { lines, .. } = &prepared.primary.provenance else {
         anyhow::bail!("missing native origins");
     };
     assert_eq!(lines.len(), output.lines().count());

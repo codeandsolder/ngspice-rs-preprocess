@@ -9,9 +9,10 @@ use model_preprocess_command::{AdmittedSource, Resource, SourceSession};
 use std::path::{Path, PathBuf};
 
 /// Physical source location corresponding to a linked output line.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct SourceOrigin {
     /// Canonical input path whose bytes contained this statement.
+    #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     /// 1-based admitted-source line.
     /// External commands may change line numbering; the path remains original.
@@ -36,7 +37,7 @@ pub struct LinkedSource {
 }
 
 /// A subcircuit declaration in the linked statement stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct SourceScope {
     /// Parent lexical scope, absent at the deck level.
     pub parent: Option<usize>,
@@ -47,9 +48,10 @@ pub struct SourceScope {
 }
 
 /// One lexical source occurrence, independent of the cached source bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct SourceVisit {
     /// Canonical source identity.
+    #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     /// Parent occurrence; absent for the root.
     pub parent: Option<usize>,
@@ -63,6 +65,13 @@ pub struct SourceVisit {
     pub separator: Option<char>,
     /// Physical declaration line; absent for an inherited dialect.
     pub declaration: Option<usize>,
+}
+
+fn serialize_path<S: serde::Serializer>(
+    path: &Path,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
 }
 
 impl LinkedSource {

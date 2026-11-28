@@ -352,7 +352,7 @@ fn native_and_ltspice_statements_keep_separate_laws_in_one_deck() -> Result<()> 
     assert!(text.contains("Lnative p n 1m"));
     assert!(!text.contains("R__Lnative_RSER"));
     assert!(text.contains("R__Lvendor_RSER"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing native line map");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -419,7 +419,7 @@ fn nested_pspice_qspice_and_tina_resources_keep_their_own_scalar_laws() -> Resul
     ensure!(text.contains(".param temp=7"), "{text}");
     ensure!(!text.contains("3k4"), "{text}");
     ensure!(!text.contains("tina_cell o n .param"), "{text}");
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing native line map");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -438,4 +438,60 @@ fn nested_pspice_qspice_and_tina_resources_keep_their_own_scalar_laws() -> Resul
         "v(a) v(b) v(temp_out) i(vdrive) v(qout) v(t)",
         &[15.0, -8.0, 40.0, -0.0005, 1.0, 3.0],
     )
+}
+
+#[test]
+fn emitted_line_map_keeps_repeated_resource_occurrences_and_scope() -> Result<()> {
+    use model_normalize_ngspice::linked_source::SourceDialect;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let shared = dir.path().join("shared.inc");
+    fs::write(&root, b"Repeated resources\n.include ps.inc\n.subckt native_cell out 0\n.include shared.inc\n.ends\nX1 p 0 ps_cell\nX2 n 0 native_cell\n.end\n")?;
+    fs::write(
+        dir.path().join("ps.inc"),
+        b"*#PSPICE\n.subckt ps_cell out 0\n.include shared.inc\n.ends\n",
+    )?;
+    fs::write(&shared, b".param gain={pwr(-2,3)}\nV1 out 0 {gain}\n")?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let Provenance::Native {
+        lines,
+        source_graph: Some(graph),
+    } = &bundle.primary.provenance
+    else {
+        anyhow::bail!("missing linked source graph");
+    };
+    let path = shared.canonicalize()?;
+    let occurrences = lines
+        .iter()
+        .filter(|line| line.source == path && line.line == 2)
+        .map(|line| line.linked.context("missing linked occurrence"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(occurrences.len(), 2);
+    assert_ne!(occurrences[0], occurrences[1]);
+    assert_eq!(
+        graph.visits[occurrences[0].visit].dialect,
+        SourceDialect::Pspice
+    );
+    assert_eq!(
+        graph.visits[occurrences[1].visit].dialect,
+        SourceDialect::Native
+    );
+    assert_eq!(
+        graph.scopes[occurrences[0].scope].name.as_deref(),
+        Some("ps_cell")
+    );
+    assert_eq!(
+        graph.scopes[occurrences[1].scope].name.as_deref(),
+        Some("native_cell")
+    );
+    run_prepared(&bundle, "v(p) v(n)", &[-8.0, 8.0])
 }

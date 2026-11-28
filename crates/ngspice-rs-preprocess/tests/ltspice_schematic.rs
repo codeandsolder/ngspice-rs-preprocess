@@ -53,7 +53,7 @@ fn source_maps_retain_child_and_library_lines() -> Result<()> {
     )?;
     let bundle = prepared(&root)?;
     let output = std::str::from_utf8(&bundle.primary.bytes)?;
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing provenance")
     };
     assert_eq!(lines.len(), output.lines().count());
@@ -210,7 +210,7 @@ fn imported_semiconductor_terminal_and_library_bindings_match_native_deck() -> R
     let output = std::str::from_utf8(&bundle.primary.bytes)?;
     assert!(output.lines().any(|line| line == "Q1 out base 0 0 qm"));
     assert!(output.lines().any(|line| line == "M1 out in 0 0 mm"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing provenance")
     };
     let qm = output
