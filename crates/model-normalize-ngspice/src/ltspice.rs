@@ -6,6 +6,7 @@
 mod constants;
 mod functions;
 mod operators;
+pub mod output_options;
 mod sources;
 mod table;
 
@@ -455,6 +456,14 @@ pub fn normalize(
     };
     let title_lines = usize::from(title != 0);
     normalize_sources(&mut input, kind, title, title_lines, budget)?;
+    if let Some(lowered) = output_options::rewrite(&input.model.bytes[title..], budget)? {
+        input.model.bytes.truncate(title);
+        input.model.bytes.extend_from_slice(&lowered);
+        input
+            .model
+            .passes
+            .push(NormalizationPass::LtspiceOutputOptions);
+    }
     if let Some(lowered) = operators::rewrite(&input.model.bytes[title..], budget)? {
         input.model.bytes.truncate(title);
         input.model.bytes.extend_from_slice(&lowered);

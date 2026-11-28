@@ -74,6 +74,8 @@ pub enum NormalizationPass {
     LtspiceSeriesParasitics,
     /// Comment the schematic-only `LTspice` backannotation directive.
     LtspiceBackannotation,
+    /// Retain qualified LTspice raw-file options as explicit source controls.
+    LtspiceOutputOptions,
     /// Disable native resistor noise for the explicit `LTspice` flag.
     LtspiceNoiselessResistor,
     /// Translate source-specific scalar intrinsic functions.
@@ -239,7 +241,7 @@ fn expression_start(text: &[u8], first: &[u8]) -> Result<Option<usize>> {
     };
     let lower = first.to_ascii_lowercase();
     let index = match lower.as_slice() {
-        b".param" | b".if" | b".elseif" => Some(1),
+        b".param" | b".if" | b".elseif" | b".options" | b".option" | b".opt" => Some(1),
         b".model" => Some(2),
         b".func" => Some(
             if fields
