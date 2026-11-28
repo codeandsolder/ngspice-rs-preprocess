@@ -1,4 +1,5 @@
 //! Intrinsic physical current, charge and derivatives at bound temperature.
+pub mod ltspice;
 mod trial;
 use super::{
     BOLTZMANN, ELEMENTARY_CHARGE, Instance, Junction, K_OVER_Q, Model, ModelError, Noise, finite,
@@ -127,9 +128,10 @@ impl ExponentialJunction {
             },
         );
         let value = log_current.exp();
-        let derivative = (log_current.offset(self.inverse_vt.ln()) + slope_factor.ln()
+        let derivative = (log_current.offset(self.inverse_vt.abs().ln()) + slope_factor.ln()
             - one_minus_exp.ln())
-        .exp();
+        .exp()
+        .scale(self.inverse_vt.signum());
         Slope { value, derivative }
     }
 }
@@ -241,6 +243,24 @@ fn bandgap(temperature: f64) -> f64 {
     1.16 - 7.02e-4 * temperature * temperature / (temperature + 1108.0)
 }
 
+fn adjusted_potential(potential: f64, nominal: f64, temperature: f64, vt: f64) -> f64 {
+    let ratio = temperature / nominal;
+    // Algebraically cancel the arbitrary bandgap reference temperature.
+    (3.0 * vt).mul_add(
+        -ratio.ln(),
+        ratio.mul_add(potential - bandgap(nominal), bandgap(temperature)),
+    )
+}
+
+fn saturation_exponent(model: &Model, temperature: f64, k_over_q: f64) -> f64 {
+    let nominal = model.temperature.nominal;
+    let delta = temperature - nominal;
+    model.temperature.exponent.mul_add(
+        (temperature / nominal).ln(),
+        model.temperature.energy_gap / k_over_q * (delta / nominal / temperature),
+    )
+}
+
 const fn temperature_factor(linear: f64, quadratic: f64, delta: f64) -> f64 {
     quadratic.mul_add(delta, linear).mul_add(delta, 1.0)
 }
@@ -259,17 +279,137 @@ fn effective_temperature(model: &Model, instance: Instance) -> Result<f64, Model
     Ok(temperature)
 }
 
+/// Shared intrinsic current and depletion law. Source-specific binding
+/// determines geometry, historical constants and temperature corrections.
+#[derive(Clone, Copy, Debug)]
+struct JunctionLaw {
+    transport: ExponentialJunction,
+    recombination: ExponentialJunction,
+    high_injection: Option<f64>,
+    depletion: Depletion,
+    avalanche: Option<[Avalanche; 2]>,
+}
+
+#[derive(Clone, Copy)]
+struct JunctionEnvironment {
+    factor: f64,
+    thermal_voltage: f64,
+    saturation_exponent: f64,
+    temperature_delta: f64,
+    potential: f64,
+    capacitance_factor: f64,
+    signed_breakdown: bool,
+}
+
+impl JunctionLaw {
+    fn new(model: &Model, env: JunctionEnvironment) -> Result<Self, ModelError> {
+        let transport = ExponentialJunction::new(
+            model.transport,
+            env.factor,
+            env.thermal_voltage,
+            env.saturation_exponent,
+        )?;
+        let recombination = ExponentialJunction::new(
+            model.recombination,
+            env.factor,
+            env.thermal_voltage,
+            env.saturation_exponent,
+        )?;
+        let high_injection = model.high_injection.map(|knee| {
+            env.factor
+                * knee.current
+                * knee
+                    .temperature_coefficient
+                    .mul_add(env.temperature_delta, 1.)
+        });
+        if let Some(value) = high_injection {
+            positive("temperature-adjusted IKF", value)?;
+        }
+        let avalanche = prepare_avalanche(
+            model,
+            env.factor,
+            env.thermal_voltage,
+            env.temperature_delta,
+            env.signed_breakdown,
+        )?;
+        let depletion = Depletion::new(
+            model.depletion,
+            env.potential,
+            env.factor * env.capacitance_factor,
+        )?;
+        Ok(Self {
+            transport,
+            recombination,
+            high_injection,
+            depletion,
+            avalanche,
+        })
+    }
+
+    fn trial_limits(self) -> trial::TrialLimits {
+        trial::TrialLimits::new(self.transport, self.recombination, self.avalanche)
+    }
+
+    fn evaluate_recombination<S: Scalar>(&self, voltage: S) -> Slope<S> {
+        if self.recombination.log_saturation == f64::NEG_INFINITY {
+            return Slope::zero();
+        }
+        let rec = self.recombination.evaluate(voltage, None);
+        let x = S::constant(1.0) - voltage / S::constant(self.depletion.potential);
+        let base = x.mul_add(x, S::constant(0.005));
+        let generation = base.powf(self.depletion.grading * 0.5);
+        let generation_derivative =
+            x.scale(-self.depletion.grading) / S::constant(self.depletion.potential) / base
+                * generation;
+        Slope {
+            value: rec.value * generation,
+            derivative: rec
+                .derivative
+                .mul_add(generation, rec.value * generation_derivative),
+        }
+    }
+
+    fn forward<S: Scalar>(&self, voltage: S) -> Slope<S> {
+        let transport = self.transport.evaluate(voltage, self.high_injection);
+        let recombination = self.evaluate_recombination(voltage);
+        Slope {
+            value: transport.value + recombination.value,
+            derivative: transport.derivative + recombination.derivative,
+        }
+    }
+
+    fn reverse(&self, voltage: f64) -> Slope<f64> {
+        let mut result = Slope::zero();
+        if let Some(terms) = self.avalanche {
+            for term in terms {
+                let term = term.evaluate(voltage);
+                result.value += term.value;
+                result.derivative += term.derivative;
+            }
+        }
+        result
+    }
+
+    fn conduction<S: Scalar>(&self, voltage: S) -> Slope<S> {
+        let mut physical = self.forward(voltage);
+        if let Some(terms) = self.avalanche {
+            for term in terms {
+                let term = term.evaluate(voltage);
+                physical.value = physical.value + term.value;
+                physical.derivative = physical.derivative + term.derivative;
+            }
+        }
+        physical
+    }
+}
+
 /// An immutable, temperature- and geometry-bound physical instance.
 ///
 /// Intrinsic bias is anode minus cathode. The solver binds an external
 /// resistor node only if the prepared series resistance is nonzero.
 #[derive(Clone, Copy, Debug)]
 pub struct PreparedInstance {
-    transport: ExponentialJunction,
-    recombination: ExponentialJunction,
-    high_injection: Option<f64>,
-    depletion: Depletion,
-    avalanche: Option<[Avalanche; 2]>,
+    law: JunctionLaw,
     gmin: f64,
     transit_time: f64,
     series_resistance: f64,
@@ -317,32 +457,23 @@ impl PreparedInstance {
         let temperature = effective_temperature(model, instance)?;
         let nominal = model.temperature.nominal;
         let delta = temperature - nominal;
-        let ratio = temperature / nominal;
         let vt = K_OVER_Q * temperature;
         positive("thermal voltage", vt)?;
-        // Algebraically cancel the arbitrary bandgap reference temperature.
-        let potential = (3.0 * vt).mul_add(
-            -ratio.ln(),
-            ratio.mul_add(
-                model.depletion.potential - bandgap(nominal),
-                bandgap(temperature),
-            ),
-        );
+        let potential = adjusted_potential(model.depletion.potential, nominal, temperature, vt);
         positive("temperature-adjusted VJ", potential)?;
-        let exponent = model.temperature.exponent.mul_add(
-            ratio.ln(),
-            model.temperature.energy_gap / K_OVER_Q * (delta / nominal / temperature),
-        );
-        let transport = ExponentialJunction::new(model.transport, factor, vt, exponent)?;
-        let recombination = ExponentialJunction::new(model.recombination, factor, vt, exponent)?;
-        let high_injection = model
-            .high_injection
-            .map(|knee| factor * knee.current * knee.temperature_coefficient.mul_add(delta, 1.0));
-        if let Some(value) = high_injection {
-            positive("temperature-adjusted IKF", value)?;
-        }
-        let avalanche = prepare_avalanche(model, factor, vt, delta)?;
-        let depletion = Depletion::new(model.depletion, potential, factor)?;
+        let exponent = saturation_exponent(model, temperature, K_OVER_Q);
+        let law = JunctionLaw::new(
+            model,
+            JunctionEnvironment {
+                factor,
+                thermal_voltage: vt,
+                saturation_exponent: exponent,
+                temperature_delta: delta,
+                potential,
+                capacitance_factor: 1.,
+                signed_breakdown: false,
+            },
+        )?;
         let series_resistance = model.series.resistance
             * temperature_factor(
                 model.series.linear_temperature,
@@ -354,18 +485,14 @@ impl PreparedInstance {
         let gmin = instance.multiplier * instance.gmin;
         nonnegative("scaled gmin", gmin)?;
         Ok(Self {
-            transport,
-            recombination,
-            high_injection,
-            depletion,
-            avalanche,
+            law,
             gmin,
             transit_time: model.transit_time,
             series_resistance,
             temperature,
             multiplier: instance.multiplier,
             noise: model.noise,
-            trial_limits: trial::TrialLimits::new(transport, recombination, avalanche),
+            trial_limits: law.trial_limits(),
         })
     }
 
@@ -414,25 +541,6 @@ impl PreparedInstance {
         })
     }
 
-    fn evaluate_recombination<S: Scalar>(&self, voltage: S) -> Slope<S> {
-        if self.recombination.log_saturation == f64::NEG_INFINITY {
-            return Slope::zero();
-        }
-        let rec = self.recombination.evaluate(voltage, None);
-        let x = S::constant(1.0) - voltage / S::constant(self.depletion.potential);
-        let base = x.mul_add(x, S::constant(0.005));
-        let generation = base.powf(self.depletion.grading * 0.5);
-        let generation_derivative =
-            x.scale(-self.depletion.grading) / S::constant(self.depletion.potential) / base
-                * generation;
-        Slope {
-            value: rec.value * generation,
-            derivative: rec
-                .derivative
-                .mul_add(generation, rec.value * generation_derivative),
-        }
-    }
-
     pub(crate) fn evaluate_physical<S: Scalar>(
         &self,
         voltage: S,
@@ -440,20 +548,8 @@ impl PreparedInstance {
         if !voltage.is_finite() {
             return Err(ModelError::Invalid("junction voltage"));
         }
-        let transport = self.transport.evaluate(voltage, self.high_injection);
-        let recombination = self.evaluate_recombination(voltage);
-        let mut physical = Slope {
-            value: transport.value + recombination.value,
-            derivative: transport.derivative + recombination.derivative,
-        };
-        if let Some(terms) = self.avalanche {
-            for term in terms {
-                let term = term.evaluate(voltage);
-                physical.value = physical.value + term.value;
-                physical.derivative = physical.derivative + term.derivative;
-            }
-        }
-        let depletion = self.depletion.evaluate(voltage);
+        let physical = self.law.conduction(voltage);
+        let depletion = self.law.depletion.evaluate(voltage);
         let result = JunctionEvaluation {
             current: S::constant(self.gmin).mul_add(voltage, physical.value),
             conductance: physical.derivative.offset(self.gmin),
@@ -501,6 +597,7 @@ fn prepare_avalanche(
     factor: f64,
     vt: f64,
     delta: f64,
+    signed: bool,
 ) -> Result<Option<[Avalanche; 2]>, ModelError> {
     let Some(breakdown) = model.breakdown else {
         return Ok(None);
@@ -511,14 +608,27 @@ fn prepare_avalanche(
             breakdown.quadratic_temperature,
             delta,
         );
-    positive("temperature-adjusted BV", voltage)?;
+    if signed {
+        finite("temperature-adjusted BV", &[voltage])?;
+    } else {
+        positive("temperature-adjusted BV", voltage)?;
+    }
     let terms = [breakdown.primary, breakdown.low_current].map(|term| Avalanche {
         voltage,
         log_current: term.current.ln() + factor.ln(),
         inverse_vt: (term.emission * vt).recip(),
     });
     for term in terms {
-        positive("avalanche inverse thermal voltage", term.inverse_vt)?;
+        if signed {
+            finite("avalanche inverse thermal voltage", &[term.inverse_vt])?;
+            if term.inverse_vt == 0. {
+                return Err(ModelError::Invalid(
+                    "zero avalanche inverse thermal voltage",
+                ));
+            }
+        } else {
+            positive("avalanche inverse thermal voltage", term.inverse_vt)?;
+        }
     }
     Ok(Some(terms))
 }

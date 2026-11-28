@@ -1,0 +1,18 @@
+base|is=1e-12 n=1.5|
+perim|is=1e-12 n=1.5 perim=2.0|
+side_is|is=1e-12 n=1.5 perim=2.0 isw=1e-10|
+side_c|is=1e-12 n=1.5 perim=2.0 cjsw=2e-09|
+side_r|is=1e-12 n=1.5 perim=2.0 rsw=4.0|
+side_all|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09 rsw=4.0|
+side_rs|is=1e-12 n=1.5 rs=3.0 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09|
+side_rs_rsw|is=1e-12 n=1.5 rs=3.0 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09 rsw=4.0|
+side_zero|is=1e-12 n=1.5 perim=0.0 isw=1e-10 ns=2.0 cjsw=2e-09 rsw=4.0|
+side_negative|is=1e-12 n=1.5 perim=-2.0 isw=1e-10 ns=2.0 cjsw=2e-09|
+side_override|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09|perim=3.0
+side_zero_override|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09|perim=0.0
+side_area0|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09|area=0.0
+side_area2|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09|area=2.0
+side_negm|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09|m=-2.0
+side_temp|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09|temp=100.0
+side_tt|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09 tt=5e-09|
+side_vj|is=1e-12 n=1.5 perim=2.0 isw=1e-10 ns=2.0 cjsw=2e-09 vjsw=0.6 mjsw=0.4 fcs=0.3|

@@ -1,0 +1,68 @@
+* Sidewall thermal capacitance characterization
+Vx x 0 DC 0 AC 1
+V0 x a0 0
+D0 a0 0 m0 temp=-40
+.model m0 D(Is=0 Cjsw=1n Perim=1)
+V1 x a1 0
+D1 a1 0 m1 temp=-40
+.model m1 D(Is=0 Cjsw=1n Perim=1 Mjsw=.5)
+V2 x a2 0
+D2 a2 0 m2 temp=-40
+.model m2 D(Is=0 Cjsw=1n Perim=1 Mjsw=.2)
+V3 x a3 0
+D3 a3 0 m3 temp=-40
+.model m3 D(Is=0 Cjsw=1n Perim=1 Vjsw=.6)
+V4 x a4 0
+D4 a4 0 m4 temp=-40
+.model m4 D(Is=0 Cjsw=1n Perim=1 Vj=.6)
+V5 x a5 0
+D5 a5 0 m5 temp=-40
+.model m5 D(Is=0 Cjsw=1n Perim=1 M=.2)
+V6 x a6 0
+D6 a6 0 m6 temp=-40
+.model m6 D(Is=0 Cjo=1n M=.33)
+V7 x a7 0
+D7 a7 0 m7 temp=27
+.model m7 D(Is=0 Cjsw=1n Perim=1)
+V8 x a8 0
+D8 a8 0 m8 temp=27
+.model m8 D(Is=0 Cjsw=1n Perim=1 Mjsw=.5)
+V9 x a9 0
+D9 a9 0 m9 temp=27
+.model m9 D(Is=0 Cjsw=1n Perim=1 Mjsw=.2)
+V10 x a10 0
+D10 a10 0 m10 temp=27
+.model m10 D(Is=0 Cjsw=1n Perim=1 Vjsw=.6)
+V11 x a11 0
+D11 a11 0 m11 temp=27
+.model m11 D(Is=0 Cjsw=1n Perim=1 Vj=.6)
+V12 x a12 0
+D12 a12 0 m12 temp=27
+.model m12 D(Is=0 Cjsw=1n Perim=1 M=.2)
+V13 x a13 0
+D13 a13 0 m13 temp=27
+.model m13 D(Is=0 Cjo=1n M=.33)
+V14 x a14 0
+D14 a14 0 m14 temp=100
+.model m14 D(Is=0 Cjsw=1n Perim=1)
+V15 x a15 0
+D15 a15 0 m15 temp=100
+.model m15 D(Is=0 Cjsw=1n Perim=1 Mjsw=.5)
+V16 x a16 0
+D16 a16 0 m16 temp=100
+.model m16 D(Is=0 Cjsw=1n Perim=1 Mjsw=.2)
+V17 x a17 0
+D17 a17 0 m17 temp=100
+.model m17 D(Is=0 Cjsw=1n Perim=1 Vjsw=.6)
+V18 x a18 0
+D18 a18 0 m18 temp=100
+.model m18 D(Is=0 Cjsw=1n Perim=1 Vj=.6)
+V19 x a19 0
+D19 a19 0 m19 temp=100
+.model m19 D(Is=0 Cjsw=1n Perim=1 M=.2)
+V20 x a20 0
+D20 a20 0 m20 temp=100
+.model m20 D(Is=0 Cjo=1n M=.33)
+.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12 plotwinsize=0 numdgt=15
+.ac lin 3 1k 1Meg
+.end

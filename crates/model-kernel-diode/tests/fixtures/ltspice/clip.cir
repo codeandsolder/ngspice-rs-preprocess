@@ -1,0 +1,47 @@
+* semiconductor conductance ceiling
+Vx x 0 DC 0 AC 1
+V0 x a0 0
+D0 a0 0 m0
+.model m0 D(Is=1e-12 N=0)
+V1 x a1 0
+D1 a1 0 m1
+.model m1 D(Is=1e-12 N=-1)
+V2 x a2 0
+D2 a2 0 m2
+.model m2 D(Is=1e-12 N=.05)
+V3 x a3 0
+D3 a3 0 m3
+.model m3 D(Is=1e-12 N=.1)
+V4 x a4 0
+D4 a4 0 m4
+.model m4 D(Is=1e-12 N=1)
+V5 x a5 0
+D5 a5 0 m5 2
+.model m5 D(Is=1e-12 N=0)
+V6 x a6 0
+D6 a6 0 m6 m=2
+.model m6 D(Is=1e-12 N=0)
+V7 x a7 0
+D7 a7 0 m7 n=2
+.model m7 D(Is=1e-12 N=0)
+V8 x a8 0
+D8 a8 0 m8
+.model m8 D(Is=1e-14 N=0)
+V9 x a9 0
+D9 a9 0 m9
+.model m9 D(Is=1e-6 N=0)
+V10 x a10 0
+D10 a10 0 m10 temp=100
+.model m10 D(Is=1e-12 N=0)
+V11 x a11 0
+D11 a11 0 m11
+.model m11 D(Is=1e-12 N=0 Ikf=.01)
+V12 x a12 0
+D12 a12 0 m12
+.model m12 D(Is=0 Isr=1e-12 Nr=.1)
+V13 x a13 0
+D13 a13 0 m13
+.model m13 D(Is=0 Isw=1e-12 Ns=.1 Perim=2)
+.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12 plotwinsize=0 numdgt=15
+.dc Vx 0 2 .005
+.end

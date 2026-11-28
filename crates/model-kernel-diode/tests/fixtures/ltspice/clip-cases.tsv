@@ -1,0 +1,14 @@
+zero|is=1e-12 n=0.0|
+negative|is=1e-12 n=-1.0|
+small|is=1e-12 n=0.05|
+min|is=1e-12 n=0.1|
+normal|is=1e-12 n=1.0|
+area|is=1e-12 n=0.0|area=2.0
+m|is=1e-12 n=0.0|m=2.0
+n|is=1e-12 n=0.0|n=2.0
+is_small|is=1e-14 n=0.0|
+is_large|is=1e-06 n=0.0|
+hot|is=1e-12 n=0.0|temp=100.0
+ikf|is=1e-12 n=0.0 ikf=0.01|
+rec|is=0.0 isr=1e-12 nr=0.1|
+side|is=0.0 isw=1e-12 ns=0.1 perim=2.0|

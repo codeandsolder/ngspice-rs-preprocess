@@ -1,0 +1,6 @@
+both|is=1e-12 n=1.5 isw=1e-10 ns=2 perim=2 rs=2000 rsw=4000|
+bigside|is=1e-12 n=1.5 isw=1e-10 ns=2 perim=2 rs=20 rsw=40000|
+bigbulk|is=1e-12 n=1.5 isw=1e-10 ns=2 perim=2 rs=20000 rsw=4|
+both_n|is=1e-12 n=1.5 isw=1e-10 ns=2 perim=2 rs=2000 rsw=4000|n=2
+both_m|is=1e-12 n=1.5 isw=1e-10 ns=2 perim=2 rs=2000 rsw=4000|m=2
+both_flicker|is=1e-12 n=1.5 isw=1e-10 ns=2 perim=2 rs=2000 rsw=4000 kf=1e-12 af=1.5|
