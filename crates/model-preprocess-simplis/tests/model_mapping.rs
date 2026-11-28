@@ -243,7 +243,7 @@ fn diode_alias_uses_the_selected_kernel_parameter_grammar() -> Result<()> {
 #[test]
 fn classic_bjt_implementation_selection_is_not_the_lexical_dialect() -> Result<()> {
     let mut source = statements(
-        ".map ModelName=PNP Level=69 Device=BJT\n.model n NPN(IS=3p)\n.model p PNP(LEVEL=69 IS=4p TNOM=29)\n.model v NPN(LEVEL=4 IS=1p)\n",
+        ".map ModelName=PNP Level=69 Device=BJT Letter=Q\n.model n NPN(IS=3p)\n.model p PNP(LEVEL=69 IS=4p TNOM=29)\n.model v NPN(LEVEL=4 IS=1p)\n",
     );
     source[2].context.language = SourceDialect::Hspice;
     let mapped = MappingTable::resolve(
