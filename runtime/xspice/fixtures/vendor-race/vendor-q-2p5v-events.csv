@@ -1,7 +1,0 @@
-scenario,pin,direction,time_ns
-assert-on-clock,q,rise,22.091834141
-assert-on-clock,q,fall,25.069659011
-assert-on-clock,q,rise,32.073591936
-release-on-clock,q,rise,12.073591936
-assert-during-pending,q,rise,22.092890293
-short-reset-during-pending,q,rise,22.073591936

@@ -1,9 +1,0 @@
-* actual references formal default without global
-V1 a 0 10
-X1 a x helper params: q={2*r}
-R1 x 0 1k
-.subckt helper p n params: r=2k
-R1 p n {q}
-.ends
-.op
-.end

@@ -1,5 +1,0 @@
-PORT A in[0] ;
-PORT Y out[0] ;
-COMB (WIDTH=1, DELAY=2n) D = 0 ;
-D = 1 ;
-Y = D ;

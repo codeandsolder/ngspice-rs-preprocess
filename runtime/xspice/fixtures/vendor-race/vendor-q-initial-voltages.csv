@@ -1,5 +1,0 @@
-scenario,pin,initial_v
-assert-during-pending,q,0
-assert-on-clock,q,0
-release-on-clock,q,0
-short-reset-during-pending,q,0

@@ -1,5 +1,0 @@
-scenario,pin,initial_v
-comb-async-assert,q,0.0000000000
-comb-async-pulse-reject,q,0.0000000000
-comb-async-before-edge-commit,q,0.0000000000
-comb-async-zero-delay,q,0.0000000000

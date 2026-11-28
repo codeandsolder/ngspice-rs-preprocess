@@ -1,7 +1,0 @@
-{
-  "supply_v": 5,
-  "bridge_models": [
-    {"name":"HC_ADC","kind":"adc","family":"HC","nominal_supply_v":5},
-    {"name":"HC_DAC","kind":"dac","family":"HC","nominal_supply_v":5}
-  ]
-}

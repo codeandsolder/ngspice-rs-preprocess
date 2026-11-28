@@ -1,8 +1,0 @@
-* Independently authored ngspice-native TI TPS22986 comparator model.
-* Real analog output feedback V(OUT)*vhys controls the switching decision.
-* Native u() expression and physical RC network, not copied vendor E IF.
-.subckt SR_TI_COMP_HYS OUT INP INN PARAMS: vhys=.05 td=0 tt=2n
-Bcondition stage 0 V=u(v(INP)+v(OUT)*vhys-v(INN))
-Rdrive stage OUT 10
-Coutput OUT 0 {(td+0.5*tt)/6.93}
-.ends SR_TI_COMP_HYS

@@ -1,8 +1,0 @@
-scenario,pin,direction,time_ns
-release-clock-minus-10ps,q,rise,32.069567815
-release-clock-minus-2ps,q,rise,32.069567815
-release-clock-equal,q,rise,13.068567815
-release-clock-plus-2ps,q,rise,13.070567815
-release-clock-plus-10ps,q,rise,13.078567815
-release-clock-early-control,q,rise,13.068567815
-release-clock-late-control,q,rise,32.069567815

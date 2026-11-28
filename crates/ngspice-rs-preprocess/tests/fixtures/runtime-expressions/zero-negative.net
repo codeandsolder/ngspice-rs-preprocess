@@ -1,5 +1,0 @@
-* independent power domain witness
-V1 in 0 0
-B1 out 0 V=V(in)**(-.5)
-.op
-.end

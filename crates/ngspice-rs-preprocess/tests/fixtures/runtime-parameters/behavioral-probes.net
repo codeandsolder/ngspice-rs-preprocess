@@ -1,8 +1,0 @@
-* behavioral source parameter and node overlap
-V1 a 0 2
-X1 a x helper params: gain=3 p=9 r=2
-.subckt helper p n
-B1 n 0 V=gain*V(p)+p+r
-.ends
-.op
-.end

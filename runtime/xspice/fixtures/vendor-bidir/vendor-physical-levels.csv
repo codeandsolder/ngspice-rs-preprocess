@@ -1,8 +1,0 @@
-scenario,signal,time_ns,volts
-strong-high,pin,22,4.799999906
-strong-high,observe,26,4.9979175344
-strong-high,pin,38,0.1079128618
-strong-low,pin,4,4.9999975
-strong-low,pin,22,0.1428571429
-strong-low,pin,25,0.1428571429
-strong-low,pin,35,4.4987230115

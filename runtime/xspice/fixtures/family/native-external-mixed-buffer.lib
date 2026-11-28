@@ -1,6 +1,0 @@
-* The native digital pins have the verified state/sink/source event ABI.
-* The final TAP is genuine analog, carrying the 1k physical load.
-.subckt SR_NATIVE_MIXED_BUFFER D D_SINK D_SOURCE Q Q_SINK Q_SOURCE TAP
-Xcore D D_SINK D_SOURCE Q Q_SINK Q_SOURCE SRALB0
-Rphysical TAP 0 1k
-.ends SR_NATIVE_MIXED_BUFFER

@@ -1,8 +1,0 @@
-PORT Data in[0:1] ;
-PORT Clock in[2] ;
-PORT Q out[0:3] ;
-EDGE (WIDTH=2, DELAY=1n, HOLD=800p, BITWISE=1, CLOCK=in[2]) R[2]=0,3 ;
-R[0]=Data ;
-R[1]=Data^3 ;
-OUT[0:1]=R[0] ;
-OUT[2:3]=R[1] ;

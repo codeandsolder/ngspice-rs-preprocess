@@ -1,8 +1,0 @@
-* Ground connectivity probes
-.model M d_logic_block family="HC" vsupply=3.3 input_load=2p sink_current=-1m source_current=2m out_res=40 out_delay=1n def="out[0]=in[0];"
-.model M5 d_logic_block family="HC" vsupply=5 input_load=2p sink_current=-1m source_current=2m out_res=40 out_delay=1n def="out[0]=in[0];"
-A1 [GND] [q] M
-R1 q 0 100k
-.PRINT TRAN V(q)
-.tran 5p 20n 0 5p
-.end

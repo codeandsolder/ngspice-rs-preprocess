@@ -1,7 +1,0 @@
-.lib shared
-.param gain=4
-.endl shared
-.lib merged
-.lib sections_parts.lib shared
-.model dut vdmos(vto=3 kp={gain})
-.endl merged

@@ -1,5 +1,0 @@
-* function formal names shadow builtins?
-.func f(pi) {pi}
-V1 x 0 {f(2)}
-.op
-.end

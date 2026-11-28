@@ -1,9 +1,0 @@
-* independent bare passive parameter witness
-V1 a 0 10
-X1 a x T params: rlocal=2k
-R1 x 0 1k
-.subckt T p n
-R1 p n rlocal
-.ends
-.op
-.end

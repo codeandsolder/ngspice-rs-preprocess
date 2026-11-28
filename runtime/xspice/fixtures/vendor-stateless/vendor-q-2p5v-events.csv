@@ -1,7 +1,0 @@
-scenario,pin,direction,time_ns
-plain-port,q,rise,11.197995139
-plain-port,q,fall,14.967175039
-plain-direct,q,rise,11.197995139
-plain-direct,q,fall,14.967175039
-literal-one,q,rise,11.197995139
-literal-one,q,fall,14.967175039

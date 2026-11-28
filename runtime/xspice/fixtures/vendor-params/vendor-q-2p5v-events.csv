@@ -1,9 +1,0 @@
-scenario,pin,direction,time_ns
-user-scaled,q,rise,12.173591936
-user-scaled,q,fall,15.959019343
-device-indexed,q,rise,12.173591936
-device-indexed,q,fall,15.959019343
-user-device-combined,q,rise,12.173591936
-user-device-combined,q,fall,15.959019343
-device-delay-two-ns,q,rise,13.173591936
-device-delay-two-ns,q,fall,16.947672064

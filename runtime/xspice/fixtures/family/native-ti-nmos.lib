@@ -1,7 +1,0 @@
-* Independently expressed native ngspice model of TI's public nmos_simple
-* with separate continuously variable gate enhancement, forward-only limit
-* and signed reverse current. No copied original E/G PSpice VALUE sources.
-.subckt SR_TI_NMOS D G S PARAMS: von=3 vth=.75 ron=50 roff=1e10 imax=.01
-Bdrive internal 0 V=5*(min(1,max(0,(v(G,S)-vth)/(von-vth)))-1)
-Bchannel D S I=min(imax,v(D,S)*(1/roff+(exp(0.6931471805599453*v(internal))+.00625*v(internal))/ron))
-.ends SR_TI_NMOS

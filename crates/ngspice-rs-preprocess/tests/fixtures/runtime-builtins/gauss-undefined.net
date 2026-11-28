@@ -1,5 +1,0 @@
-* nominal gauss argument evaluation
-.param a={gauss(unknown_param)}
-V1 x 0 {a}
-.op
-.end

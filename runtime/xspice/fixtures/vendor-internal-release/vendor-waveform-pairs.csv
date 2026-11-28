@@ -1,3 +1,0 @@
-source,control,expected_relation
-release-clock-equal,release-clock-early-control,identical
-release-clock-equal,release-clock-late-control,different

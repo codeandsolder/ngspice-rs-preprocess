@@ -1,5 +1,0 @@
-* Check predefined function name redefinition
-.func LNCOSH(x) {2*x}
-B1 x 0 V=lncosh(3)
-.op
-.end

@@ -1,9 +1,0 @@
-signal,direction,time_ns
-pin,rise,8.884324554
-pin,fall,14.568515849
-pin,rise,20.307950020
-pin,fall,31.714589020
-observe,rise,12.153591936
-observe,fall,18.587148057
-observe,rise,24.147724337
-observe,fall,35.729721605
