@@ -8,6 +8,8 @@ use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeSet, ops::Range};
 
+mod thermal;
+
 type ScopedName = (usize, Vec<u8>);
 
 /// Direct controls, not display/save requests, select the physical source
@@ -254,6 +256,7 @@ fn voltage(card: &mut Card<'_>, controlled: bool, budget: &WorkBudget) -> Result
     for key in [b"rpar".as_slice(), b"lser", b"rlshunt", b"temp"] {
         card.reject(key)?;
     }
+    thermal::noise(card, false)?;
     let rser = card.take(b"rser")?;
     let cpar = card.take(b"cpar")?;
     if let Some(rser) = rser {
@@ -359,18 +362,8 @@ fn storage(
         "line {}: nonlinear LTspice passive requires typed lowering",
         card.statement.line
     );
-    // The source families do not share the native passive temperature
-    // setter vocabulary. Do not reinterpret a source-diagnosed setter.
-    card.reject(b"dtemp")?;
-    if inductor {
-        for key in [b"lser".as_slice(), b"rlshunt", b"tc", b"tc3"] {
-            card.reject(key)?;
-        }
-    } else {
-        for key in [b"tc1".as_slice(), b"tc2", b"tnom"] {
-            card.reject(key)?;
-        }
-    }
+    let contextual_leakage = thermal::storage(card, inductor, budget)?;
+    thermal::noise(card, true)?;
     let multiplicity = card.scalar(b"m")?.unwrap_or("1");
     let lser = card.scalar(b"lser")?;
     let cpar = card.scalar(b"cpar")?;
@@ -389,10 +382,15 @@ fn storage(
     if card.scalar(b"rpar")?.is_none() {
         // Only omitted Rpar enables terminal leakage. Explicit zero disables
         // it. The default is active in DC and transient, not AC.
-        let main = std::str::from_utf8(&text[card.fields[3].clone()])?;
-        let leakage = format!("{{{}}}", default_leakage(main, multiplicity, inductor));
-        card.derived("pn_gterminal_dc", &leakage, budget)?;
-        card.derived("pn_gterminal_tran", &leakage, budget)?;
+        if contextual_leakage {
+            card.push("pn_gterminal_positive_storage_dc", "1e-12");
+            card.push("pn_gterminal_positive_storage_tran", "1e-12");
+        } else {
+            let main = std::str::from_utf8(&text[card.fields[3].clone()])?;
+            let leakage = format!("{{{}}}", default_leakage(main, multiplicity, inductor));
+            card.derived("pn_gterminal_dc", &leakage, budget)?;
+            card.derived("pn_gterminal_tran", &leakage, budget)?;
+        }
         physical = true;
     }
     physical |= card.rename(b"rpar", "pn_rparallel")?;
@@ -416,7 +414,7 @@ fn storage(
     storage_shunt(card, lser, multiplicity, budget)?;
     // A symbolic multiplicity may remove the network at elaboration. Keep
     // its original name and scalar instead of dividing by M here.
-    if !physical && card.scalar(b"m")?.is_some() {
+    if !physical && (!card.appended.is_empty() || card.scalar(b"m")?.is_some()) {
         card.push("pn_rseries", "0");
         physical = true;
     }
@@ -465,6 +463,7 @@ pub(super) fn rewrite(input: &[u8], include: bool, budget: &WorkBudget) -> Resul
                 budget,
             )?,
             _ => {
+                thermal::noise(&mut card, false)?;
                 for key in [b"rser".as_slice(), b"rpar", b"cpar", b"lser", b"rlshunt"] {
                     card.reject(key)?;
                 }

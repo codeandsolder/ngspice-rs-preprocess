@@ -209,3 +209,31 @@ does not depend on linearity of the expression. Linear F/H source
 controls accept a true winding or voltage-output branch, not R/C/I.
 Behavioral read policy must be selected by the actual bound occurrence,
 after macro expansion, rather than a source-text prefix heuristic.
+
+The TC vector accepts optional enclosing parentheses, comma/whitespace
+separators (including repeated/trailing commas), braced scalar expressions
+and an empty reset. Repeated TC setters replace the entire previous
+polynomial, not just its prefix. Independent tests at delta-T=100 °C
+confirmed isolated eighth-order coefficient 1e-16 produces a factor of
+two. The explicit physical projection is `pn_storage_tc={a1} {a2} ...`,
+with implicit constant 1 and occurrence-bound entries. For L, optional
+`pn_storage_tnom` selects nominal temperature (27 °C by default in the
+source) and `pn_coupling_nominal=1` selects the pre-temperature coupling
+base. For temperature-dependent C with omitted Rpar, the explicit
+`pn_gterminal_positive_storage_dc` and `_tran` coefficients multiply
+positive effective aggregate primary capacitance; ordinary per-copy
+constant damping must not be added as well. These new native setters are
+the contract proposed in solver #284, not yet an end-to-end acceptance
+claim.
+
+## Noiseless storage networks
+
+Bare `noiseless` on C or L disables every physical parasitic thermal
+generator, without altering any electrical stamp. In the 127 °C noise
+witnesses above, adding this flag produces exactly zero input and output
+noise with the external load also noiseless. With C=2u Rser=5 Rpar=20
+Lser=3m RLshunt=20 Cpar=1u, gain remains 0.4963351202196508 at 10 kHz;
+L=3m Rser=5 Rpar=20 Cpar=1u gives 0.6219468798426032. Source
+`noiseless=0` or `=1` and `noisy` are diagnosed by LTspice. Voltage
+source `noiseless` is likewise diagnosed. The explicit native
+`pn_noiseless=1` selector belongs to the loss/noise contract in solver #278.
