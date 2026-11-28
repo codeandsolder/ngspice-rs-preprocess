@@ -356,11 +356,12 @@ fn plan_rewrites(
         {
             continue;
         }
+        let location = || dialects.describe_mapped(origins, statement.line + title_lines);
         if first.eq_ignore_ascii_case(b".backanno") {
             ensure!(
                 text.eq_ignore_ascii_case(b".backanno"),
-                "line {}: unexpected .backanno operands",
-                statement.line
+                "{}: unexpected .backanno operands",
+                location()
             );
             lexical::replace_span(&statement, 0..1, b"*", &mut edits);
             annotation_changed = true;
@@ -371,22 +372,22 @@ fn plan_rewrites(
             .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'r'))
         {
             let before = edits.len();
-            resistor_flags(&statement, &mut edits)?;
+            resistor_flags(&statement, &mut edits).with_context(location)?;
             flags_changed |= before != edits.len();
         }
         if first.eq_ignore_ascii_case(b".func") {
-            reject_shadowed_helpers(&statement)?;
+            reject_shadowed_helpers(&statement).with_context(location)?;
         }
         if first.eq_ignore_ascii_case(b".model")
-            && let Some(pass) = select_model(&statement, &mut edits)?
+            && let Some(pass) = select_model(&statement, &mut edits).with_context(location)?
             && !model_passes.contains(&pass)
         {
             model_passes.push(pass);
         }
-        let Some(start) = expression_start(text, first)? else {
+        let Some(start) = expression_start(text, first).with_context(location)? else {
             continue;
         };
-        validate_expression(&statement, start)?;
+        validate_expression(&statement, start).with_context(location)?;
         rewrite_intrinsics(
             &statement,
             start,
@@ -395,7 +396,8 @@ fn plan_rewrites(
             &mut helpers,
             &mut edits,
             static_macros,
-        )?;
+        )
+        .with_context(location)?;
     }
     Ok(RewritePlan {
         edits,

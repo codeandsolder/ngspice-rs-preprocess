@@ -495,3 +495,40 @@ fn emitted_line_map_keeps_repeated_resource_occurrences_and_scope() -> Result<()
     );
     run_prepared(&bundle, "v(p) v(n)", &[-8.0, 8.0])
 }
+
+#[test]
+fn mixed_dialect_error_identifies_physical_source_occurrence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let vendor = dir.path().join("vendor.lib");
+    fs::write(
+        &root,
+        b"Mixed source diagnostics\n.include vendor.lib\n.end\n",
+    )?;
+    fs::write(&vendor, b"*#LTSPICE\n.backanno invalid\n")?;
+    let error = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )
+    .err()
+    .context("invalid .backanno accepted")?;
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains(&format!(
+            "{}:2 (source occurrence 1)",
+            vendor.canonicalize()?.display()
+        )),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("unexpected .backanno operands"),
+        "{diagnostic}"
+    );
+    Ok(())
+}

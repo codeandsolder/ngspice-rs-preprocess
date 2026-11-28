@@ -69,7 +69,8 @@ impl Projection {
                 && first.eq_ignore_ascii_case(b".subckt")
                 && dialects.at(statement.line + title_lines)? == SourceDialect::Tina
             {
-                split_inline_parameters(body, &line_starts, &statement, &mut edits, &mut inserted)?;
+                split_inline_parameters(body, &line_starts, &statement, &mut edits, &mut inserted)
+                    .with_context(|| dialects.describe(statement.line + title_lines))?;
             }
         }
         let output = lexical::apply_budgeted_edits(body, edits, budget)?;

@@ -590,10 +590,15 @@ pub(super) fn rewrite(
             == crate::linked_source::SourceDialect::Ltspice
         {
             if first.eq_ignore_ascii_case(b".tran") {
-                rewrite_tran(&statement, &mut pass.edits, budget)?;
+                rewrite_tran(&statement, &mut pass.edits, budget)
+                    .with_context(|| dialects.describe_mapped(origins, statement.line))?;
             } else if matches!(first.first(), Some(b'V' | b'v' | b'I' | b'i')) {
-                pass.source(&statement)
-                    .with_context(|| format!("line {}: LTspice source waveform", statement.line))?;
+                pass.source(&statement).with_context(|| {
+                    format!(
+                        "{}: LTspice source waveform",
+                        dialects.describe_mapped(origins, statement.line)
+                    )
+                })?;
             }
         }
     }

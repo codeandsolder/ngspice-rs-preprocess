@@ -545,6 +545,32 @@ impl SourceDialects<'_> {
         }
     }
 
+    pub(crate) fn describe(self, line: usize) -> String {
+        match self {
+            Self::Linked(linked) => linked.origin(line).map_or_else(
+                || format!("linked line {line}"),
+                |origin| {
+                    format!(
+                        "{}:{} (source occurrence {})",
+                        origin.path.display(),
+                        origin.line,
+                        origin.visit
+                    )
+                },
+            ),
+            Self::Uniform(_) => format!("line {line}"),
+        }
+    }
+
+    pub(crate) fn describe_mapped(self, origins: &[usize], line: usize) -> String {
+        line.checked_sub(1)
+            .and_then(|index| origins.get(index))
+            .map_or_else(
+                || format!("unmapped line {line}"),
+                |origin| self.describe(*origin),
+            )
+    }
+
     pub(crate) fn at_mapped(
         self,
         origins: &[usize],

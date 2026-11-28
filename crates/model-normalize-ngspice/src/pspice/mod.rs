@@ -716,8 +716,12 @@ fn rewrite_statements(
                 &functions.scopes,
                 source,
             )?;
-            let rewritten = rewrite(&text, statement.line, functions)
-                .with_context(|| format!("PSpice source line {}", statement.line))?;
+            let rewritten = rewrite(&text, statement.line, functions).with_context(|| {
+                format!(
+                    "{}: PSpice source statement",
+                    dialects.describe_mapped(origins, statement.line)
+                )
+            })?;
             if first.eq_ignore_ascii_case(".model") {
                 functions
                     .scopes

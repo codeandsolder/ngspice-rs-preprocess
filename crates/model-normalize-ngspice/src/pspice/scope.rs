@@ -121,9 +121,14 @@ impl Scopes {
             } else if first == ".model" {
                 let dialect = dialects.at_mapped(origins, statement.line)?;
                 let (card, base) = if dialect.is_pspice() {
-                    parse_model(text, statement.line)?
+                    parse_model(text, statement.line)
+                        .with_context(|| dialects.describe_mapped(origins, statement.line))?
                 } else {
-                    (parse_model_card(text, statement.line, &[])?, None)
+                    (
+                        parse_model_card(text, statement.line, &[])
+                            .with_context(|| dialects.describe_mapped(origins, statement.line))?,
+                        None,
+                    )
                 };
                 charge_card(&card, budget)?;
                 result.entries[scope]

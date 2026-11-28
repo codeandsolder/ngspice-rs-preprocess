@@ -4,7 +4,7 @@
 //! model or device identifier as arithmetic.
 
 use crate::{expression_start, lexical, param_expression::lower_ltspice};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::ops::Range;
 
@@ -222,7 +222,8 @@ pub(super) fn rewrite(
             && dialects.at_mapped(origins, statement.line)?
                 == crate::linked_source::SourceDialect::Ltspice
         {
-            rewrite_card(&statement, first, &mut edits, budget)?;
+            rewrite_card(&statement, first, &mut edits, budget)
+                .with_context(|| dialects.describe_mapped(origins, statement.line))?;
         }
     }
     lexical::apply_budgeted_edits(body, edits, budget)
