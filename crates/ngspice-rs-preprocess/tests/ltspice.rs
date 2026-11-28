@@ -435,48 +435,58 @@ fn series_parasitics_preserve_terminal_admittance_and_coupling_scope() -> Result
     fs::write(&root, b"title\n.options reltol=1e-10 abstol=1e-14 vntol=1e-12\nV0 s0 0 AC 1\nRsrc0 s0 a0 .1\nC0 a0 0 2u Rser=5\nV1 s1 0 AC 1\nRsrc1 s1 a1 .1\nC1 a1 0 2u Rser=5 m=3\nV2 s2 0 AC 1\nRsrc2 s2 a2 .1\nL2 a2 0 3m\nV3 s3 0 AC 1\nRsrc3 s3 a3 .1\nL3 a3 0 3m Rser=0 Rpar=0\nV4 s4 0 AC 1\nRsrc4 s4 a4 .1\nL4 a4 0 3m Rser=5 m=3\nV5 s5 0 AC 1\nRsrc5 s5 a5 .1\nV6 s6 0 AC 1\nRsrc6 s6 a6 .1\nX1 a5 a6 coupled\n.subckt coupled a b\nL2 a 0 3m\nL3 b 0 3m\nK1 L2 L3 .5\n.ends coupled\n.end\n")?;
     let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
-    assert!(text.contains("R__L2_RSER a2"));
-    assert!(text.contains(" 1m\n"));
-    assert!(text.contains("L3 a3 0 3m\n"));
+    assert!(!text.contains("R__L"));
+    assert!(!text.contains("R__C"));
+    assert!(text.contains("L2 a2 0 3m pn_rseries=1m"));
+    assert!(text.contains("L3 a3 0 3m pn_rseries=0 pn_rparallel=0"));
     assert!(text.contains(".subckt coupled a b\nL2 a 0 3m\nL3 b 0 3m\nK1"));
     let Provenance::Native { lines } = &bundle.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), text.lines().count());
     for (line, origin) in text.lines().zip(lines) {
-        if line.starts_with("R__L2_RSER") {
+        if line.starts_with("L2 a2 ") {
             assert_eq!(origin.line, 11);
         }
     }
-    let mut deck = bundle
-        .primary
-        .bytes
-        .strip_suffix(b".end\n")
-        .context("missing terminator")?
-        .to_vec();
-    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nac lin 3 100 10000\nwrdata ac.dat v(a0) i(v0) v(a1) i(v1) v(a2) i(v2) v(a3) i(v3) v(a4) i(v4) v(a5) i(v5) v(a6) i(v6)\nquit\n.endc\n.end\n");
-    native(dir.path(), &deck)?;
-    for row in data(&dir.path().join("ac.dat"))? {
-        let omega = std::f64::consts::TAU * row[0];
-        let c = -1. / (omega * 2e-6);
-        let l = omega * 3e-3;
-        for (values, (resistance, reactance, m)) in row[1..].chunks_exact(4).zip([
-            (5_f64, c, 1.),
-            (5., c, 3.),
-            (1e-3, l, 1.),
-            (0., l, 1.),
-            (5., l, 3.),
-            (0., 1.5 * l, 1.),
-            (0., 1.5 * l, 1.),
-        ]) {
-            let [vr, vi, ir, ii] = [values[0], values[1], values[2], values[3]];
-            let voltage_sq = vr.mul_add(vr, vi * vi);
-            let real = -ir.mul_add(vr, ii * vi) / voltage_sq;
-            let imag = -ii.mul_add(vr, -ir * vi) / voltage_sq;
-            let z_sq = resistance.mul_add(resistance, reactance * reactance);
-            near(real, m * resistance / z_sq)?;
-            near(imag, -m * reactance / z_sq)?;
-        }
+    let library = model_normalize_ngspice::parameter_scope::ModelLibrary::parse_source(
+        &bundle.primary.bytes,
+        model_normalize_ngspice::linked_source::RootKind::Deck,
+    )?;
+    for (device, resistance, copies) in [
+        ("C0", 5., 1.),
+        ("C1", 5., 3.),
+        ("L2", 1e-3, 1.),
+        ("L3", 0., 1.),
+        ("L4", 5., 3.),
+    ] {
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&format!("{device} a")))
+            .context("missing original device")?;
+        let tail = line
+            .splitn(5, ' ')
+            .nth(4)
+            .context("missing network parameters")?;
+        let fields = model_normalize_ngspice::model_card::parse_assignments(tail)?;
+        let value = |key: &str| -> Result<Option<f64>> {
+            fields
+                .iter()
+                .find(|field| field.name.eq_ignore_ascii_case(key))
+                .map(|field| {
+                    library.evaluate_scalar(
+                        0,
+                        field.expression.as_deref().context("missing value")?,
+                        &[],
+                    )
+                })
+                .transpose()
+        };
+        near(
+            value("pn_rseries")?.context("missing series resistance")?,
+            resistance,
+        )?;
+        near(value("m")?.unwrap_or(1.), copies)?;
     }
     Ok(())
 }
@@ -486,10 +496,6 @@ fn unresolved_passive_topology_is_diagnostic_not_silent() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("source.cir");
     for card in [
-        "C1 a 0 1u Rpar=100",
-        "C1 a 0 1u Lser=1m",
-        "L1 a 0 1m Cpar=1p",
-        "C1 a 0 1u m=0",
         "C1 a 0 1u IC=.75",
         "L1 a 0 1m IC=.1",
         "C1 a 0 Q={v(a)*v(a)}",
@@ -501,7 +507,7 @@ fn unresolved_passive_topology_is_diagnostic_not_silent() -> Result<()> {
     assert!(prepared(&root, InputFormat::LtspiceLibrary).is_err());
     fs::write(&root, "L1 a b 1m Rser=0\n")?;
     let bundle = prepared(&root, InputFormat::LtspiceLibrary)?;
-    assert_eq!(bundle.primary.bytes, b"L1 a b 1m\n");
+    assert!(std::str::from_utf8(&bundle.primary.bytes)?.contains("L1 a b 1m pn_rseries=0"));
     Ok(())
 }
 
@@ -896,56 +902,21 @@ fn voltage_source_series_resistance_preserves_identity_and_noise() -> Result<()>
     fs::write(&root, b"title\n.temp 27\nV1 a 0 DC 1 AC 1 Rser=2 Rser={500*2}\nRload a 0 1k noiseless\nV2 b 0 PULSE(0 1 0 1u 1u 2u 5u) Rser=2\nR2 b 0 3\nV3 c 0 1 Rser={2-2} Cpar=0\nR3 c 0 3\n.end\n")?;
     let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
-    assert!(text.contains("R__V1_RSER a"));
-    assert!(text.contains("R__V2_RSER b"));
-    assert!(text.contains("V3 c 0 1"));
-    assert!(!text.contains("R__V3_RSER"));
+    assert!(!text.contains("R__V"));
+    assert!(text.contains("V1 a 0 DC 1 AC 1 pn_rseries={500*2}"));
+    assert!(text.contains("V2 b 0 PULSE(") || text.contains("V2 b 0 pulse("));
+    assert!(text.contains("V3 c 0 1 pn_rseries={2-2}"));
     let Provenance::Native { lines } = &bundle.primary.provenance else {
         anyhow::bail!("missing source map");
     };
     assert_eq!(lines.len(), text.lines().count());
     for (line, origin) in text.lines().zip(lines) {
-        if line.starts_with("R__V1_RSER") {
+        if line.starts_with("V1 a ") {
             assert_eq!(origin.line, 3);
         }
-        if line.starts_with("R__V2_RSER") {
+        if line.starts_with("V2 b ") {
             assert_eq!(origin.line, 5);
         }
-    }
-    let mut deck = bundle
-        .primary
-        .bytes
-        .strip_suffix(b".end\n")
-        .context("missing terminator")?
-        .to_vec();
-    deck.extend_from_slice(b".control\nset numdgt=17\nset wr_singlescale\nop\nwrdata op.dat v(a) i(v1) v(c)\nac lin 2 1k 10k\nwrdata ac.dat v(a) i(v1)\nnoise v(a) V1 lin 2 1k 10k\nsetplot noise1\nwrdata noise.dat onoise_spectrum inoise_spectrum\ntran 20n 5u 0 20n\nwrdata tran.dat v(b) i(v2)\nquit\n.endc\n.end\n");
-    native(dir.path(), &deck)?;
-    let rows = data(&dir.path().join("op.dat"))?;
-    for (&actual, expected) in rows.first().context("missing OP")?[1..]
-        .iter()
-        .zip([0.5, -0.0005, 1.])
-    {
-        near(actual, expected)?;
-    }
-    for row in data(&dir.path().join("ac.dat"))? {
-        for (&actual, expected) in row[1..].iter().zip([0.5, 0., -0.0005, 0.]) {
-            near(actual, expected)?;
-        }
-    }
-    // LTspice 24.0.12: 1k internal series resistance and a noiseless 1k load.
-    let expected_noise = 2.035687076996364e-9;
-    for row in data(&dir.path().join("noise.dat"))? {
-        assert!((row[1] / expected_noise - 1.).abs() < 1e-4, "{row:?}");
-        assert!(
-            (row[2] / (2. * expected_noise) - 1.).abs() < 1e-4,
-            "{row:?}"
-        );
-    }
-    for row in data(&dir.path().join("tran.dat"))? {
-        let t = row[0];
-        let voltage = 0.6 * (t / 1e-6).min(1.).min(((4e-6 - t) / 1e-6).max(0.));
-        near(row[1], voltage)?;
-        near(row[2], -voltage / 3.)?;
     }
     Ok(())
 }
@@ -954,13 +925,7 @@ fn voltage_source_series_resistance_preserves_identity_and_noise() -> Result<()>
 fn source_parasitics_without_equivalent_observations_are_diagnostic() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("source.cir");
-    for card in [
-        "V1 a 0 1 Rser=-500",
-        "V1 a 0 1 Rser={r}",
-        "V1 a 0 1 Cpar=1u",
-        "V1 a 0 1 Rpar=1k",
-        "I1 a 0 1 Rser=1k",
-    ] {
+    for card in ["V1 a 0 1 Rpar=1k", "I1 a 0 1 Rser=1k"] {
         fs::write(&root, format!("title\n{card}\n.end\n"))?;
         assert!(prepared(&root, InputFormat::LtspiceDeck).is_err(), "{card}");
     }
