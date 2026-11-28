@@ -2544,13 +2544,17 @@ fn plain_dependency_closure(
             if explicit_vars {
                 return Ok(None);
             }
-            if let Some((child, _)) = resolve_definition(
-                model,
-                local,
-                external,
-                current.source_id.as_deref(),
-                Some(&current.scope_id),
-            )? {
+            let site = CallSite {
+                definition: Some(&current),
+                imports: None,
+            };
+            if let Some((child, _)) = site.resolve(model, local, external)? {
+                // A plain wrapper that invokes an alias cannot retain its
+                // original call text: the active source alias is not a
+                // native subcircuit declaration.
+                if !model.eq_ignore_ascii_case(&child.name) {
+                    return Ok(None);
+                }
                 pending.push(child);
             }
         }

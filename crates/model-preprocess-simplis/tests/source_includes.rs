@@ -275,3 +275,20 @@ fn active_include_diagnostics_use_physical_projected_source_positions() -> Resul
     }
     Ok(())
 }
+
+#[test]
+fn active_alias_in_plain_wrapper_requires_call_rewriting() -> Result<()> {
+    let source = ".IF 1\n.ALIAS SELECTED CELL SUBCKT\n.ENDIF\n.SUBCKT CELL a b\nR1 a b 47\n.ENDS\n.SUBCKT WRAPPER a b\nXCHILD a b SELECTED\n.ENDS\n";
+    for parsed in [false, true] {
+        for output in outputs(
+            ".include parts.lb\nX1 a 0 WRAPPER\n.end\n",
+            &[("parts.lb", source)],
+            parsed,
+        )? {
+            assert!(output.contains("R1 a b 47"), "{output}");
+            assert!(!output.contains("XCHILD a b SELECTED"), "{output}");
+            assert!(!output.contains(".ALIAS"), "{output}");
+        }
+    }
+    Ok(())
+}
