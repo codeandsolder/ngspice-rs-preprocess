@@ -302,7 +302,7 @@ fn compare_native(
     let result = prepared.evaluate(actual_bias, 1e-12)?;
     let dc = &result.dc;
     for name in [
-        "vth", "id", "gm", "gds", "gmbs", "vdsat", "ibs", "ibd", "gbs", "gbd",
+        "vth", "id", "gm", "gds", "vdsat", "ibs", "ibd", "gbs", "gbd",
     ] {
         close(
             &format!("{name} {bias:?}"),
@@ -311,6 +311,12 @@ fn compare_native(
             1e-9,
             1e-16,
         );
+    }
+    // C differentiates the discarded smoothing law even when the
+    // body-potential clamp is active. The correct branch derivative is
+    // separately verified by terminal finite differences.
+    if dc.vbs < 0. {
+        close("gmbs", dc.gmbs, asks["gmbs"], 1e-9, 1e-16);
     }
     let charge = result.charge;
     let q = charge.with_overlap(dc.mode, actual_bias.vgs - actual_bias.vbs);
@@ -363,8 +369,20 @@ fn native_v33_dc_charge_reference_matrix() -> TestResult {
     for polarity in [MosPolarity::Nmos, MosPolarity::Pmos] {
         for model in &cards {
             for temp in [0., 27., 85.] {
-                for (vgs, vds) in [(0.3, 0.1), (1.2, 0.05), (1.5, 0.8), (1.2, -0.5)] {
-                    compare_native(model, &geometry, polarity, temp, Bias { vbs: 0., vgs, vds })?;
+                for (vgs, vds) in [(0.3, 0.1f64), (1.2, 0.05), (1.5, 0.8), (1.2, -0.5)] {
+                    for body in [-0.3, 0., 0.1] {
+                        compare_native(
+                            model,
+                            &geometry,
+                            polarity,
+                            temp,
+                            Bias {
+                                vbs: vds.min(0.) + body,
+                                vgs,
+                                vds,
+                            },
+                        )?;
+                    }
                 }
             }
         }
@@ -401,9 +419,13 @@ fn terminal_jacobians_cover_both_polarities_and_modes() -> TestResult {
             ("pd", Real(3e-6)),
             ("ps", Real(4e-6)),
         ])?)?;
-        for drain in [0.07, 0.9, -0.07, -0.9] {
-            for gate in [0.3, 0.9, 1.8] {
-                let voltage = [drain, gate, 0., -1.1].map(|v| f64::mul_add(sign, v, 0.2));
+        for drain in [0.07f64, 0.9, -0.07, -0.9] {
+            for (gate, body) in [0.3, 0.9, 1.8]
+                .into_iter()
+                .flat_map(|gate| [-1.1, -0.02, 0.02, 0.2].map(|body| (gate, body)))
+            {
+                let voltage =
+                    [drain, gate, 0., drain.min(0.) + body].map(|v| f64::mul_add(sign, v, 0.2));
                 let point = instance.terminal_point(voltage, 1e-12)?;
                 close("KCL", point.current.iter().sum(), 0., 0., 1e-15);
                 close(

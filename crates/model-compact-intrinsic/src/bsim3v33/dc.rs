@@ -243,9 +243,21 @@ impl DcModel<'_> {
         let phi = p.derived.phi;
         let t0 = vbs - vbsc - 0.001;
         let t1 = 0.004f64.mul_add(-vbsc, t0 * t0).sqrt();
-        let vbseff_raw = vbsc + f64::midpoint(t0, t1);
-        let dvbseff_dvb = f64::midpoint(1.0, t0 / t1);
-        let vbseff = if vbseff_raw < vbs { vbs } else { vbseff_raw };
+        // The reference clamps the smoothed potential to the applied
+        // body voltage. In exact arithmetic the clamp is active for VBS > 0;
+        // differentiate the active branch, not the discarded smoothing law.
+        // At the kink VBS = 0 choose the forward-side derivative.
+        let (vbseff, dvbseff_dvb) = if vbs >= 0. {
+            (vbs, 1.)
+        } else {
+            let conjugate = t1 + (vbs - vbsc + 0.001);
+            let value = if t0 >= 0. {
+                vbs - 0.002 * vbs / conjugate
+            } else {
+                vbsc + f64::midpoint(t0, t1)
+            };
+            (value, f64::midpoint(1.0, t0 / t1))
+        };
         let (sqrt_phis, dsqrt_phis_dvb, phis, dphis_dvb);
         if vbseff > 0.0 {
             let t0 = phi / (phi + vbseff);
