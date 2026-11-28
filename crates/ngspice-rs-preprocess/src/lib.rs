@@ -531,10 +531,20 @@ fn native_bundle(
     budget: &WorkBudget,
 ) -> Result<PreparedBundle> {
     let NativeProjection {
-        normalized,
+        mut normalized,
         device_identities,
         waveforms,
     } = projection;
+    let initial_conditions =
+        if matches!(format, InputFormat::PspiceDeck | InputFormat::PspiceLibrary) {
+            model_normalize_ngspice::pspice::capture_initialization(
+                &mut normalized.model.bytes,
+                kind,
+                budget,
+            )?
+        } else {
+            None
+        };
     let lines = normalized
         .input_lines
         .into_iter()
@@ -574,7 +584,7 @@ fn native_bundle(
         normalization: normalized.model.passes,
         device_identities,
         model_selections: Vec::new(),
-        initial_conditions: None,
+        initial_conditions,
         analysis_plan: None,
         waveforms,
         pwl_resistors: Vec::new(),

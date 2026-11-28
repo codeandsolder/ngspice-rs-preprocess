@@ -16,7 +16,9 @@ use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeMap, fmt::Write as _};
 
+mod initialization;
 mod instances;
+pub use initialization::capture_initialization;
 mod nodes;
 mod options;
 mod passive;

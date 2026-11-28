@@ -492,7 +492,29 @@ impl<'a> Capture<'a> {
                 format!("{first} {}", retained.join(" "))
             });
         }
-        self.capture_device(scope, statement, &fields)
+        self.capture_device(scope, statement, &fields, None)
+    }
+
+    /// Capture only the device IC property of a PSpice storage instance.
+    /// Source NOICTRANSLATE selects whether to generate a finite bias equation;
+    /// the explicit storage coordinate remains available for skipped bias.
+    ///
+    /// # Errors
+    /// Malformed or duplicate IC fields, invalid scalars or exhausted budget.
+    pub fn pspice_device(
+        &mut self,
+        scope: &[String],
+        statement: &str,
+        translate_ic: bool,
+    ) -> Result<String> {
+        self.budget
+            .charge(Resource::ScannedBytes, statement.len())?;
+        self.budget.charge(Resource::Statements, 1)?;
+        let fields = crate::lexical::tokens(statement.as_bytes())?
+            .into_iter()
+            .map(|span| &statement[span])
+            .collect::<Vec<_>>();
+        self.capture_device(scope, statement, &fields, Some(translate_ic))
     }
 
     fn capture_device(
@@ -500,6 +522,7 @@ impl<'a> Capture<'a> {
         scope: &[String],
         statement: &str,
         fields: &[&str],
+        pspice_translate: Option<bool>,
     ) -> Result<String> {
         let Some(first) = fields.first() else {
             return Ok(statement.to_owned());
@@ -526,9 +549,9 @@ impl<'a> Capture<'a> {
                 .context("missing passive assignment value")?;
             let slot = if field.eq_ignore_ascii_case("IC") {
                 Some(&mut target)
-            } else if field.eq_ignore_ascii_case("BRANCH") {
+            } else if pspice_translate.is_none() && field.eq_ignore_ascii_case("BRANCH") {
                 Some(&mut branch)
-            } else if field.eq_ignore_ascii_case("ICMODE") {
+            } else if pspice_translate.is_none() && field.eq_ignore_ascii_case("ICMODE") {
                 Some(&mut mode)
             } else {
                 None
@@ -543,6 +566,9 @@ impl<'a> Capture<'a> {
         }
         if target.is_none() && branch.is_none() && mode.is_none() {
             return Ok(statement.to_owned());
+        }
+        if let Some(translate) = pspice_translate {
+            mode = Some(if translate { "2" } else { "0" }.to_owned());
         }
         ensure!(fields.len() >= 4, "incomplete passive declaration {first}");
         // All ICs are bound by the typed policy, including analysis-dependent
