@@ -8,6 +8,7 @@ mod functions;
 mod operators;
 mod sources;
 mod table;
+pub mod transient;
 
 use crate::{
     IdentifierAllocator, MappedNormalization, NormalizationPass, expression_start,
