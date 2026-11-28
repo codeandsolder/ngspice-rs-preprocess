@@ -128,23 +128,6 @@ fn collect_options(source: &Source<'_>, edits: &mut Vec<Edit>) -> Result<bool> {
     Ok(translate)
 }
 
-fn skip_bias(statement: &Statement, body: &[u8], edits: &mut Vec<Edit>) -> Result<()> {
-    let fields = lexical::tokens(&statement.text)?;
-    if let Some(last) = fields.last()
-        && statement.text[last.clone()].eq_ignore_ascii_case(b"SKIPBP")
-    {
-        ensure!(
-            !fields[..fields.len() - 1].iter().any(|field| {
-                statement.text[field.clone()].eq_ignore_ascii_case(b"UIC")
-                    || statement.text[field.clone()].eq_ignore_ascii_case(b"SKIPBP")
-            }),
-            "duplicate transient bias-skip flag"
-        );
-        lexical::replace_spans(statement, body, &[(last.clone(), b"UIC".to_vec())], edits);
-    }
-    Ok(())
-}
-
 fn capture_devices(
     source: &Source<'_>,
     translate: bool,
@@ -163,9 +146,7 @@ fn capture_devices(
         if !context.electrical(&command)? || !source.is_pspice(statement)? {
             continue;
         }
-        if command == ".tran" {
-            skip_bias(statement, source.body, edits)?;
-        } else if command.starts_with(['c', 'l']) {
+        if command.starts_with(['c', 'l']) {
             let scope = source.scopes.path(source.scopes.scope(statement.line)?);
             let rewritten = capture.pspice_device(scope, text, translate)?;
             if rewritten != text {

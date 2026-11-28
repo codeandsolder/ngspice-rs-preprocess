@@ -62,7 +62,7 @@ The latter uses the integrated physical storage law above. The
 [PSpice Reference Guide](https://rincon-mora.gatech.edu/spice/pspice.pdf),
 .OPTIONS and .IC, documents NOICTRANSLATE and the distinction from a DC
 sweep. NOICTRANSLATE suppresses device bias equations, not skipped-bias
-initial coordinates. SKIPBP is normalized to UIC.
+initial coordinates. SKIPBP is captured as the analysis plan’s typed bias-skip flag; the original statement retains its source spelling. No executable transient card is emitted for an extracted analysis.
 
 Scalar and polynomial C/L use the same typed declaration keyed by emitted
 artifact, lexical definition and device name; IC expressions are evaluated
