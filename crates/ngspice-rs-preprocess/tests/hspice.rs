@@ -1211,3 +1211,52 @@ fn shared_linker_rejects_resource_cycles_and_opaque_hspice_payloads() -> Result<
     }
     Ok(())
 }
+
+#[test]
+fn pspice_definitions_keep_local_scope_and_ordinary_m_actuals() -> Result<()> {
+    for (policy, hs_current) in [("GLOBAL", -0.0001), ("LOCAL", -0.0005)] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root.sp");
+        fs::write(
+            dir.path().join("ps.lib"),
+            r#"*#PSPICE
+.subckt outer p n params: gain=2
+.param rbase=100 local=4
+X1 p n inner params: factor={gain} m={local}
+.ends outer
+.subckt inner p n params: factor=1 m=1
+R1 p n {rbase*factor*m}
+.ends inner
+"#,
+        )?;
+        fs::write(
+            &root,
+            format!(
+                r#"Mixed hierarchy
+.option parhier={policy} xmult_in_exp=no
+.param gain=10 rbase=1000
+.inc ps.lib
+Vps p 0 1
+Vhs h 0 1
+Xps p 0 outer gain=3
+Xhs h 0 hcell
+.subckt hcell p n gain=2
+R1 p n 'gain*1k'
+.ends hcell
+.end
+"#
+            ),
+        )?;
+        let bundle = compile(&root, InputFormat::HspiceDeck)?;
+        let text = std::str::from_utf8(&bundle.primary.bytes)?;
+        measure_native(dir.path(), text, "op\nwrdata actual.dat i(vps) i(vhs)")?;
+        let observed = values(dir.path(), "actual.dat")?;
+        // PSpice inner sees the main-circuit RBASE=1000, not its caller's
+        // RBASE=100; FACTOR and M actuals evaluate in OUTER. M is an
+        // ordinary argument, not an additional physical scaling factor.
+        for (a, e) in observed[0][1..].iter().zip([-1. / 12000., hs_current]) {
+            ensure!((*a - e).abs() < 1e-12, "{policy}: {a} != {e}\n{text}");
+        }
+    }
+    Ok(())
+}

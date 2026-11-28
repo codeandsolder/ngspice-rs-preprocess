@@ -192,11 +192,14 @@ statement locations; independent catalog admission roots are retained and
 scope indices remapped into the consuming deck. Graph topology participates
 in the catalog digest, while resource relocation does not.
 The root deck owns `PARHIER`, `XMULT_IN_EXP`, temperature defaults and
-model-selection policies. Source parameter and model aliases preserve
-electrical terminal names, nested multiplier products, and source spans.
-Mixed scalar/function `.PARAM` declarations and `.FUNC` macros use the same
-occurrence binding: `PARHIER` selects visible declarations, free symbols
-resolve in the calling occurrence and formals shadow parameters. Native
+model-selection policies. HSPICE definitions use its parameter precedence
+policy; PSpice definitions instead inherit root globals and bind private
+local declarations, with actual expressions evaluated in the calling
+occurrence. HSPICE X-call multipliers are distinct from PSpice X-call
+parameters named M. Source parameter and model aliases preserve electrical
+terminal names, nested multiplier products, and source spans. Mixed
+scalar/function `.PARAM` declarations and `.FUNC` macros use the same
+occurrence binding, with definition-specific visibility and formal shadowing. Native
 function aliases retain nested calls and electrical probes without expanding
 expression trees in the producer. Cyclic and out-of-scope calls are diagnosed.
 Native output retains qualified OP, source DC, AC and single-interval
@@ -235,7 +238,7 @@ are qualified. The source-language header controls expression and
 lexical semantics independently of model selection. The mapping table is
 shared across the deck's admitted includes; indexed catalog libraries
 cannot independently introduce global selection directives. Include such
-resources explicitly instead. Parsed-library format v8 retains projected
+resources explicitly instead. Parsed-library format v9 retains projected
 source statements so that a catalog can be selected again under a new
 request's mapping rather than baking in a previous request's defaults.
 

@@ -552,6 +552,19 @@ fn lower_card(
     }
     let command = analysis_plan::command(text);
     let hspice = context.language == SourceDialect::Hspice;
+    ensure!(
+        matches!(
+            context.language,
+            SourceDialect::Hspice | SourceDialect::Pspice | SourceDialect::Simetrix
+        ),
+        "foreign source dialect {:?} requires physical occurrence lowering",
+        context.language
+    );
+    ensure!(
+        context.language != SourceDialect::Simetrix
+            || !(command == ".SUBCKT" || command.starts_with('X')),
+        "SIMetrix hierarchy requires its own occurrence binding"
+    );
     let fields = statement_token_spans(text)?;
     if command == ".SUBCKT" {
         state.depth += 1;
@@ -621,7 +634,8 @@ fn lower_card(
         | ".TRAN" | ".IC" | ".NODESET" => text.to_owned(),
         ".MODEL" => bail!("model selection requires a qualified native mapping"),
         _ if command.starts_with('.') => bail!("unqualified HSPICE directive {command}"),
-        _ => lower_source(text)?,
+        _ if hspice => lower_source(text)?,
+        _ => text.to_owned(),
     };
     source = map_values(&source, limit, budget, |value, remaining| {
         lower_spice_expression(value, context, remaining, budget)
@@ -675,6 +689,7 @@ type SelectedModels = BTreeMap<usize, ModelSelection>;
 struct LoweredExpansion {
     bytes: Vec<u8>,
     origins: Vec<crate::OriginLine>,
+    contexts: Vec<DialectContext>,
     /// Keys index the emitted logical source rows before occurrence binding.
     selections: SelectedModels,
     state: DeckOptions,
@@ -718,6 +733,7 @@ fn lower_expansion(
     let mut scope = Vec::new();
     let mut bytes = Vec::new();
     let mut origins = Vec::new();
+    let mut contexts = Vec::new();
     let mut state = DeckOptions::default();
     for (index, (statement, origin)) in statements.iter().zip(input_origins).enumerate() {
         budget.charge(Resource::Statements, 1)?;
@@ -743,6 +759,7 @@ fn lower_expansion(
                     limit,
                     budget,
                 )?;
+                contexts.push(statement.context);
             }
             continue;
         }
@@ -795,11 +812,13 @@ fn lower_expansion(
             })?
         };
         append_lowered_line(&mut bytes, &mut origins, &text, origin, limit, budget)?;
+        contexts.push(statement.context);
     }
     ensure!(state.depth == 0, "unclosed HSPICE subcircuit");
     Ok(LoweredExpansion {
         bytes,
         origins,
+        contexts,
         selections,
         state,
     })
@@ -886,6 +905,11 @@ pub(super) fn prepare(
         mut graph,
         ..
     } = linked_resource(root, HSPICE, RootKind::Deck, request, options, session)?;
+    ensure!(
+        context.language == SourceDialect::Hspice,
+        "HSPICE deck requires HSPICE root analysis policy, got {:?}",
+        context.language
+    );
     let members = super::catalog_members(request, options, cancellation, session, context)?;
     let budget = session.budget();
     add_catalog(

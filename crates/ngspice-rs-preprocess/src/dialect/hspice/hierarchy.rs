@@ -11,7 +11,10 @@ use model_normalize_ngspice::{
     statement_token_spans,
 };
 use model_preprocess_command::{Resource, WorkBudget};
-use model_preprocess_simplis::{rewrite_parameter_symbols, source_dialect::model_mapping::Device};
+use model_preprocess_simplis::{
+    rewrite_parameter_symbols,
+    source_dialect::{DialectContext, SourceDialect, model_mapping::Device},
+};
 use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -266,6 +269,7 @@ struct Binder<'a> {
     source: &'a ModelLibrary,
     index: SubcircuitIndex,
     lines: &'a [&'a str],
+    contexts: &'a [DialectContext],
     selections: &'a SelectedModels,
     definitions: Vec<Definition>,
     known_functions: Arc<BTreeSet<String>>,
@@ -313,11 +317,27 @@ impl<'a> Binder<'a> {
         Ok(())
     }
 
+    fn definition_language(&self, scope: usize) -> SourceDialect {
+        if scope == 0 {
+            self.contexts[0].language
+        } else {
+            self.contexts[self.source.scopes[scope].source_line - 1].language
+        }
+    }
+
+    fn precedence(&self, scope: usize) -> Precedence {
+        if self.definition_language(scope) == SourceDialect::Hspice {
+            self.precedence
+        } else {
+            Precedence::Local
+        }
+    }
+
     fn bind_scope(&mut self, scope: usize, names: Names, parent: Option<&Scope>) -> Result<Scope> {
         let budget = self.budget.clone();
         functions::charge_declarations(&self.definitions[scope].functions, &budget)?;
         let local = self.definitions[scope].functions.clone();
-        let precedence = self.precedence;
+        let precedence = self.precedence(scope);
         let limit = self.limit.saturating_sub(self.emitted_bytes);
         let (scope, rows) = Scope::bind(
             names,
@@ -338,7 +358,22 @@ impl<'a> Binder<'a> {
         Ok(scope)
     }
 
-    fn visible(&mut self, scope: usize, parent: &Scope, actuals: Parameters) -> Result<Scope> {
+    fn visible(
+        &mut self,
+        scope: usize,
+        caller: &Scope,
+        root: &Scope,
+        actuals: Parameters,
+    ) -> Result<Scope> {
+        // PSpice parameters/functions defined in a subcircuit are private to
+        // that definition. Only main-circuit declarations are inherited;
+        // actual argument expressions still evaluate in the calling instance.
+        // PSpice A/D Reference Guide 10.5, .SUBCKT and X, pp. 99–101, 317.
+        let parent = if self.definition_language(scope) == SourceDialect::Pspice {
+            root
+        } else {
+            caller
+        };
         let parameters = &self.definitions[scope].parameters;
         self.budget.charge(
             Resource::GeneratedNodes,
@@ -358,7 +393,7 @@ impl<'a> Binder<'a> {
         }
         let mut definitions = parameters.clone();
         definitions.extend(actuals);
-        if self.precedence == Precedence::Global {
+        if self.precedence(scope) == Precedence::Global {
             definitions.retain(|name, _| !parent.names.contains_key(name));
         }
         let mut names = parent.names.clone();
@@ -367,7 +402,7 @@ impl<'a> Binder<'a> {
         }
         let scope = self.bind_scope(scope, names, Some(parent))?;
         for (name, parameter) in definitions {
-            let visible = if parameter.actual { parent } else { &scope };
+            let visible = if parameter.actual { caller } else { &scope };
             let expression = visible.expression(&parameter.value)?;
             self.declare(&scope.names[&name], &expression, parameter.line)?;
         }
@@ -492,6 +527,7 @@ impl<'a> Binder<'a> {
         owner: usize,
         line: usize,
         parent: &Scope,
+        root: &Scope,
         inherited_multiplier: Option<&str>,
     ) -> Result<String> {
         let (positional, fields) = positional_prefix(self.lines[line]);
@@ -519,15 +555,21 @@ impl<'a> Binder<'a> {
         self.budget.charge(Resource::EvaluationSteps, 1)?;
         let mut actuals = Parameters::new();
         collect_parameters(fields, line, true, &mut actuals, self.budget)?;
-        let local_multiplier = actuals
-            .get("M")
-            .map(|parameter| parent.expression(&parameter.value))
-            .transpose()?;
-        // The X multiplier affects device multiplicity independently of the
-        // ordinary M expression parameter. HSPICE defaults XMULT_IN_EXP to NO.
-        if !self.xmult_in_exp {
-            actuals.remove("M");
-        }
+        // HSPICE X syntax gives M a separate physical multiplier meaning.
+        // PSpice X PARAMS: values are ordinary actual arguments; do not turn
+        // them into a multiplier or apply the HSPICE XMULT_IN_EXP option.
+        let local_multiplier = if self.contexts[line].language == SourceDialect::Hspice {
+            let multiplier = actuals
+                .get("M")
+                .map(|parameter| parent.expression(&parameter.value))
+                .transpose()?;
+            if !self.xmult_in_exp {
+                actuals.remove("M");
+            }
+            multiplier
+        } else {
+            None
+        };
         let multiplier = if let Some(local) = local_multiplier {
             let alias = self.fresh('m')?;
             let expression = inherited_multiplier.map_or_else(
@@ -539,7 +581,7 @@ impl<'a> Binder<'a> {
         } else {
             inherited_multiplier.map(str::to_owned)
         };
-        let visible = self.visible(scope, parent, actuals)?;
+        let visible = self.visible(scope, parent, root, actuals)?;
         let native_name = self.fresh('s')?;
         self.active.push(scope);
         self.enter_models(scope, &visible)?;
@@ -560,7 +602,7 @@ impl<'a> Binder<'a> {
             ) {
                 continue;
             }
-            let text = self.card(scope, card, &visible, multiplier.as_deref())?;
+            let text = self.card(scope, card, &visible, root, multiplier.as_deref())?;
             body.push(self.account(text, card)?);
         }
         body.push(self.account(format!(".ends {native_name}"), closing)?);
@@ -580,6 +622,7 @@ impl<'a> Binder<'a> {
         owner: usize,
         line: usize,
         names: &Scope,
+        root: &Scope,
         multiplier: Option<&str>,
     ) -> Result<String> {
         let text = self.lines[line];
@@ -587,7 +630,7 @@ impl<'a> Binder<'a> {
         self.budget.charge(Resource::Statements, 1)?;
         let command = analysis_plan::command(text);
         if command.starts_with('X') {
-            return self.call(owner, line, names, multiplier);
+            return self.call(owner, line, names, root, multiplier);
         }
         if command.is_empty() || command.starts_with('*') {
             return Ok(text.to_owned());
@@ -622,7 +665,7 @@ impl<'a> Binder<'a> {
             ) {
                 continue;
             }
-            let text = self.card(0, card, &names, None)?;
+            let text = self.card(0, card, &names, &names, None)?;
             let row = self.account(text, card)?;
             if analysis_plan::command(self.lines[card]) == ".END" {
                 ends.push(row);
@@ -669,6 +712,7 @@ pub(super) fn bind(
     let LoweredExpansion {
         bytes,
         origins,
+        contexts,
         selections,
         state,
     } = lowered;
@@ -677,7 +721,7 @@ pub(super) fn bind(
     budget.charge(Resource::Statements, text.lines().count())?;
     let lines = text.lines().collect::<Vec<_>>();
     ensure!(
-        lines.len() == origins.len() && !lines.is_empty(),
+        lines.len() == origins.len() && lines.len() == contexts.len() && !lines.is_empty(),
         "inconsistent HSPICE source span map"
     );
     let source = ModelLibrary::parse_source_with_budget(bytes, RootKind::Deck, budget.clone())?;
@@ -707,6 +751,7 @@ pub(super) fn bind(
         source: &source,
         index,
         lines: &lines,
+        contexts,
         selections,
         definitions,
         known_functions,
