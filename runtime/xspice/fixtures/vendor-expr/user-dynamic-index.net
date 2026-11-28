@@ -1,0 +1,15 @@
+* Experimental vendor oracle: fractional USER/DEVICE inside ALB general expressions
+.model MUSER_DYNAMIC_INDEX d_logic_block file=FUSER_DYNAMIC_INDEX family="UNIV" user=[1.5 2]
+.file FUSER_DYNAMIC_INDEX
+PORT Data in[0] ;
+PORT Q out[0] ;
+COMB (WIDTH=1, DELAY=1n) Stage=0 ;
+Stage=(USER[USER[0]]==2) ? Data : 0 ;
+Q=Stage ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 5.4n 5 5.5n 0 10n 0 10.1n 5 14n 5 14.1n 0 24n 0)
+Aalb [d] [q] MUSER_DYNAMIC_INDEX
+Rout q 0 100k
+.tran 20p 24n 0 20p
+.PRINT TRAN V(d) V(q)
+.end

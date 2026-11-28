@@ -1,0 +1,89 @@
+NAME_TABLE:
+Spice_Model_Name:      sr_alb_stateful
+C_Function_Name:       cm_sr_alb_stateful
+Description:           "Rust-backed experimental COMB/EDGE/LEVEL source ALB event model"
+
+PORT_TABLE:
+Port_Name:             in                    out                    wake                  sink_meta              source_meta
+Description:           "source digital pins" "driven digital pins"  "initial analog event" "sink metadata"        "source metadata"
+Direction:             in                    out                    in                     out                    out
+Default_Type:          d                     d                      v                      d                      d
+Allowed_Types:         [d]                   [d]                    [v]                    [d]                    [d]
+Vector:                yes                   yes                    no                     yes                    yes
+Vector_Bounds:         -                     -                      -                      -                      -
+Null_Allowed:          no                    no                     no                     no                     no
+
+PARAMETER_TABLE:
+Parameter_Name:        source_hex          reg_delay            port_delay
+Description:           "hex-encoded ALB body"  "default clock delay" "default output delay"
+Data_Type:             string               real                  real
+Default_Value:         -                    1e-9                  1e-9
+Limits:                -                    -                     -
+Vector:                no                   no                    no
+Vector_Bounds:         -                    -                     -
+Null_Allowed:          no                   yes                   yes
+
+PARAMETER_TABLE:
+Parameter_Name:        setup_time           hold_time            min_clock
+Description:           "default LEVEL setup" "default EDGE hold" "default EDGE minimum clock"
+Data_Type:             real                 real                 real
+Default_Value:         0                    0                    0
+Limits:                -                    -                    -
+Vector:                no                   no                   no
+Vector_Bounds:         -                    -                    -
+Null_Allowed:          yes                  yes                  yes
+
+PARAMETER_TABLE:
+Parameter_Name:        user_values
+Description:           "ALB USER indexed parameter vector"
+Data_Type:             real
+Default_Value:         0
+Limits:                -
+Vector:                yes
+Vector_Bounds:         -
+Null_Allowed:          yes
+
+PARAMETER_TABLE:
+Parameter_Name:        device_values
+Description:           "ALB DEVICE indexed instance parameter vector"
+Data_Type:             real
+Default_Value:         0
+Limits:                -
+Vector:                yes
+Vector_Bounds:         -
+Null_Allowed:          yes
+
+PARAMETER_TABLE:
+Parameter_Name:        user_scale
+Description:           "scales each ALB USER value"
+Data_Type:             real
+Default_Value:         1
+Limits:                -
+Vector:                no
+Vector_Bounds:         -
+Null_Allowed:          yes
+
+PARAMETER_TABLE:
+Parameter_Name:        input_load
+Description:           "digital pin load"
+Data_Type:             real
+Default_Value:         0
+Limits:                [0 -]
+Vector:                no
+Vector_Bounds:         -
+Null_Allowed:          yes
+
+PARAMETER_TABLE:
+Parameter_Name:        out_res_pos          out_res_neg          min_sink             max_source
+Description:           "positive resistance" "negative resistance" "sink current floor" "source current ceiling"
+Data_Type:             real                 real                 real                 real
+Default_Value:         100                  100                  -1e99                1e99
+Limits:                -                    -                    -                    -
+Vector:                no                   no                   no                   no
+Vector_Bounds:         -                    -                    -                    -
+Null_Allowed:          yes                  yes                  yes                  yes
+
+STATIC_VAR_TABLE:
+Static_Var_Name:       runtime                transient_wake_queued
+Description:           "Rust state handle"   "startup event requested"
+Data_Type:             pointer               boolean

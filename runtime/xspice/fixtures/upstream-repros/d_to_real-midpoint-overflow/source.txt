@@ -1,0 +1,5 @@
+* Every configured 0/1 endpoint equals the same FINITE 1e308.
+0n 0s
+1n Us
+2n 1s
+3n Us

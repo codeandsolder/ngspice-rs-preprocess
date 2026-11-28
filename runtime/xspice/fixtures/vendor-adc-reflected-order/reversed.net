@@ -1,0 +1,10 @@
+* ADC reflected load current parameter order reversed
+Vd d 0 PWL(0 -3 1n -3 3n 10 5n 10 7n -3 12n -3)
+.model ADC adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1n fall_delay=1n time_tol=0 out_low=5 out_high=0 clamp_low=-100 clamp_high=100 clamp_res=10 clamp_bias=.5 out_family="HC")
+.model DAC dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0 t_rise=100p t_fall=100p knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-10m source_current=20m)
+Aadc d din ADC
+Adac din q DAC
+Rload q 0 100k
+.PRINT TRAN I(Vd) V(q)
+.tran 2p 12n 0 2p
+.end

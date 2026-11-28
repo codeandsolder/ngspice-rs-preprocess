@@ -1,0 +1,24 @@
+* Original ngspice47 XSPICE user-defined real event nodes (stock reference).
+Vdata adata 0 PWL(0 0 14n 0 14.1n 3.3 34n 3.3 34.1n 0 54n 0 54.1n 3.3 74n 3.3 74.1n 0 94n 0 94.1n 3.3 115n 3.3 120n 3.3)
+Vclock aclock 0 PWL(0 0 22n 0 22.1n 3.3 27n 3.3 27.1n 0 42n 0 42.1n 3.3 47n 3.3 47.1n 0 62n 0 62.1n 3.3 67n 3.3 67.1n 0 82n 0 82.1n 3.3 87n 3.3 87.1n 0 102n 0 102.1n 3.3 107n 3.3 107.1n 0 120n 0)
+Adata [adata] [ddata] ORIGINAL_ADC
+Aclock [aclock] [dclock] ORIGINAL_ADC
+.model ORIGINAL_ADC adc_bridge(in_low=1.386 in_high=1.452 rise_delay=1p fall_delay=1p)
+Ad2r ddata NULL rdata ORIGINAL_D2R
+.model ORIGINAL_D2R d_to_real(zero=-0.5 one=2 delay=350p)
+Adelay rdata dclock rheld ORIGINAL_DELAY
+.model ORIGINAL_DELAY real_delay(delay=800p)
+Aobserve rdata analog_raw ORIGINAL_R2V
+Aheld rheld analog_sampled ORIGINAL_R2V
+.model ORIGINAL_R2V real_to_v(gain=1 transition_time=400p)
+Rraw analog_raw 0 1k
+Rheld analog_sampled 0 1k
+Craw analog_raw 0 2p
+Cheld analog_sampled 0 2p
+.tran 20p 120n 0 20p
+.control
+run
+wrdata result.dat v(analog_raw) v(analog_sampled) v(adata) v(aclock)
+quit
+.endc
+.end

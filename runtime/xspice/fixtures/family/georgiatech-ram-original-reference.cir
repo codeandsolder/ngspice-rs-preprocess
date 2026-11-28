@@ -1,0 +1,24 @@
+* Original public-domain Georgia Tech d_ram 2-bit x 4-word native event oracle.
+Vd0 ad0 0 PWL(0 3.3 27n 3.3 27.1n 0 128n 0)
+Vd1 ad1 0 PWL(0 0 27n 0 27.1n 3.3 128n 3.3)
+Va0 aa0 0 PWL(0 0 19n 0 19.1n 3.3 46n 3.3 46.1n 0 128n 0)
+Va1 aa1 0 PWL(0 0 106n 0 106.1n 3.3 128n 3.3)
+Vwe awe 0 PWL(0 0 6n 0 6.1n 3.3 12n 3.3 12.1n 0 29n 0 29.1n 3.3 38n 3.3 38.1n 0 128n 0)
+Vs0 as0 0 PWL(0 0 2n 0 2.1n 3.3 57n 3.3 57.1n 0 68n 0 68.1n 3.3 128n 3.3)
+Vs1 as1 0 PWL(0 0 82n 0 82.1n 3.3 94n 3.3 94.1n 0 128n 0)
+Ainputs [ad0 ad1 aa0 aa1 awe as0 as1] [d0 d1 a0 a1 we s0 s1] GT_ADC
+.model GT_ADC adc_bridge(in_low=1.386 in_high=1.452 rise_delay=1p fall_delay=1p)
+Aram [d0 d1] [q0 q1] [a0 a1] we [s0 s1] GT_RAM
+.model GT_RAM d_ram(select_value=1 ic=2 read_delay=600p data_load=0 address_load=0 select_load=0 enable_load=0)
+Aout [q0 q1] [analog_q0 analog_q1] GT_DAC
+.model GT_DAC dac_bridge(out_low=0 out_high=3.3 out_undef=1.65 input_load=0 t_rise=50p t_fall=50p)
+Rpull0 vpull analog_q0 1k
+Rpull1 vpull analog_q1 1k
+Vpull vpull 0 1.2
+.tran 20p 128n 0 20p
+.control
+run
+wrdata result.dat v(analog_q0) v(analog_q1) v(ad0) v(ad1) v(aa0) v(aa1) v(awe) v(as0) v(as1)
+quit
+.endc
+.end

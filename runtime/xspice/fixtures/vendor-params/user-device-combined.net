@@ -1,0 +1,15 @@
+* SIMetrix Elements 9.40d original-source USER/DEVICE runtime parameter oracle
+.model MUSER_DEVICE_COMBINED d_logic_block file=FUSER_DEVICE_COMBINED family="UNIV" user=[250p] user_scale=4
+.file FUSER_DEVICE_COMBINED
+PORT Data in[0] ;
+PORT Q out[0] ;
+COMB (WIDTH=DEVICE[0], DELAY=USER[0], BITWISE=DEVICE[1]) Stage=0 ;
+Stage=Data ;
+Q=Stage ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 5.4n 5 5.5n 0 10n 0 10.1n 5 14n 5 14.1n 0 42n 0)
+Aalb [d] [q] MUSER_DEVICE_COMBINED : USER=[1 1]
+Rout q 0 100k
+.tran 20p 42n 0 20p
+.PRINT TRAN V(d) V(q)
+.end

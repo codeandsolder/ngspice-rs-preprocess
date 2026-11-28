@@ -1,0 +1,43 @@
+* Independent ALB default current limit matrix
+Vinput d 0 PULSE(0 5 2n 1n 1n 5n 15n)
+.model DRV d_logic_block family="UNIV" vsupply=5 input_load=0 out_res=40 out_delay=1n def="out[0]=in[0];"
+.model OVERRIDE d_logic_block family="UNIV" vsupply=5 input_load=0 out_res=40 out_delay=1n min_sink=-2m max_source=2m def="out[0]=in[0];"
+Aprod1 [d] [p1] DRV
+Acons1 [p1] [q1] RCV1
+ .model RCV1 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=0 source_current=0 def="out[0]=in[0];"
+Rload1 q1 0 100k
+Aprod2 [d] [p2] DRV
+Acons2 [p2] [q2] RCV2
+ .model RCV2 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=-.999m source_current=.999m def="out[0]=in[0];"
+Rload2 q2 0 100k
+Aprod3 [d] [p3] DRV
+Acons3 [p3] [q3] RCV3
+ .model RCV3 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=-1m source_current=1m def="out[0]=in[0];"
+Rload3 q3 0 100k
+Aprod4 [d] [p4] DRV
+Acons4 [p4] [q4] RCV4
+ .model RCV4 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=-1.001m source_current=1.001m def="out[0]=in[0];"
+Rload4 q4 0 100k
+Aprod5 [d] [p5] DRV
+Acons5 [p5] [q5] RCV5
+ .model RCV5 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=-2m source_current=0 def="out[0]=in[0];"
+Rload5 q5 0 100k
+Aprod6 [d] [p6] DRV
+Acons6 [p6] [q6] RCV6
+ .model RCV6 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=0 source_current=2m def="out[0]=in[0];"
+Rload6 q6 0 100k
+Aprod7 [d] [p7] DRV
+Acons7 [p7] [q7] RCV7
+ .model RCV7 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=-2m source_current=2m def="out[0]=in[0];"
+Rload7 q7 0 100k
+Aprod8 [d] [p8] OVERRIDE
+Acons8 [p8] [q8] RCV8
+ .model RCV8 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=-2m source_current=2m def="out[0]=in[0];"
+Rload8 q8 0 100k
+Aprod9 [d] [p9] OVERRIDE
+Acons9 [p9] [q9] RCV9
+ .model RCV9 d_logic_block family="UNIV" vsupply=5 input_load=2p out_res=40 out_delay=1n sink_current=-2.001m source_current=2.001m def="out[0]=in[0];"
+Rload9 q9 0 100k
+.PRINT TRAN V(q1) V(q2) V(q3) V(q4) V(q5) V(q6) V(q7) V(q8) V(q9)
+.tran 5p 20n 0 5p
+.end

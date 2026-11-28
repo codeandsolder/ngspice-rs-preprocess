@@ -1,0 +1,9 @@
+scenario,pin,direction,time_ns
+comb-async-assert,q,rise,13.073163671
+comb-async-assert,q,fall,17.159019343
+comb-async-assert,q,rise,33.091999951
+comb-async-pulse-reject,q,rise,13.073163671
+comb-async-before-edge-commit,q,rise,33.091999951
+comb-async-zero-delay,q,rise,13.073163671
+comb-async-zero-delay,q,fall,16.159019343
+comb-async-zero-delay,q,rise,33.091999951

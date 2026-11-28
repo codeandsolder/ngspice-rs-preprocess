@@ -1,0 +1,9 @@
+# Keep exact upstream interface specifications and reference oracle source
+# bytes intact. Whitespace in the upstream IFS files is deliberate.
+runtime/xspice/fixtures/family/*-original.ifs -text whitespace=-trailing-space,-blank-at-eof
+runtime/xspice/fixtures/family/original-xtraevt-*.ifs -text whitespace=-trailing-space,-blank-at-eof
+runtime/xspice/fixtures/**/*.net -text
+runtime/xspice/fixtures/**/*.csv -text
+runtime/xspice/fixtures/**/*.dat -text
+runtime/xspice/fixtures/vendor-inline-def/continuation-only.net whitespace=-trailing-space
+runtime/xspice/fixtures/vendor-signed-domains/signed-stateful-drive.net whitespace=-trailing-space

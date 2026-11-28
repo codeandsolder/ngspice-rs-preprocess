@@ -1,0 +1,14 @@
+scenario,pin,direction,time_ns
+comb-pulse,q,rise,12.173591936
+comb-pulse,q,fall,15.959019343
+comb-bitwise-0,q0,rise,30.173591936
+comb-bitwise-0,q1,rise,7.404997545
+comb-bitwise-0,q1,fall,14.960526316
+comb-bitwise-0,q1,rise,30.173591936
+comb-bitwise-1,q0,rise,30.173591936
+comb-bitwise-1,q1,rise,7.184997545
+comb-bitwise-1,q1,fall,14.960526316
+comb-bitwise-1,q1,rise,30.173591936
+comb-edge-level,q0,rise,13.073163671
+comb-edge-level,q0,fall,28.856339680
+comb-edge-level,q1,rise,29.102713681

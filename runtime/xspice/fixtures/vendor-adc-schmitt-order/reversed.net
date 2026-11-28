@@ -1,0 +1,10 @@
+* Original SIMetrix Schmitt in-band hysteresis: reversed
+Vd d 0 PWL(0 0 1n 0 2n 5 4n 5 5n 2.15 10n 2.15 11n 5 14n 5 15n 2.15 20n 2.15 21n 0 24n 0 25n 2.15 30n 2.15 31n 5 35n 5 36n 0 40n 0)
+.model ADC adc_schmitt(in_low=2.2 in_high=2.1 rise_delay=1n fall_delay=1n time_tol=0 out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+.model DAC dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0 t_rise=100p t_fall=100p knee_low=2 knee_high=2.75 v_smooth=.5)
+Aadc d din ADC
+Adac din q DAC
+Rload q 0 100k
+.PRINT TRAN V(q) I(Vd)
+.tran 2p 40n 0 2p
+.end

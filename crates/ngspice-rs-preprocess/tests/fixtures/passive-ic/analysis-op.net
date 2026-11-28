@@ -1,0 +1,19 @@
+* SIMetrix analysis-dependent and nested IC witness
+.options initCondMode=2 icres=2
+Vs s 0 10 AC 1
+R1 s cp 10
+R2 cn 0 20
+C1 cp cn 1m IC=3 BRANCH={IF(ANALYSIS=2,1,0)}
+R3 s lp 10
+L1 lp 0 1m IC=3 BRANCH={IF(ANALYSIS=2,0,1)}
+.subckt cell P N params: vinit=1
+Cinner P N 1m IC={vinit} BRANCH={IF(ANALYSIS=2,1,0)}
+.ends
+R4 s xp 10
+R5 xn 0 20
+X1 xp xn cell params: vinit=2
+R6 s yp 10
+R7 yn 0 20
+X2 yp yn cell params: vinit=-1
+.op
+.end

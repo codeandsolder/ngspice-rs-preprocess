@@ -5,16 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 publish.workspace = true
+description = "SIMPLIS and SIMetrix electrical source lowering and waveform preparation"
 
 [lints]
 workspace = true
 
 [dependencies]
+model-statistics.workspace = true
 anyhow = "1"
+model-preprocess-command.workspace = true
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-model-preprocess-simplis = { path = "../model-preprocess-simplis" }
+model-normalize-ngspice.workspace = true
+model-preprocess-simplis.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

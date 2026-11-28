@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # The upstream release archive is pinned to the independently published Arch
-# packaging checksum. Build locally for the host libc, with XSPICE and KLU.
+# packaging checksum. Build the simulator and supplemental runtime from
+# the same configured source tree so their XSPICE ABIs are identical.
 set -euo pipefail
-[[ $# == 1 && -n "$1" ]] || exit 64
-: "${RUSTC_WRAPPER:?mandatory sccache wrapper required for source compilation}"
-[[ -x "$RUSTC_WRAPPER" ]]
+[[ $# -ge 1 && $# -le 3 && -n "$1" ]] || exit 64
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+wrapper=$(realpath -- "${2:-/usr/local/libexec/sccache-client}")
+jobs=${3:-$(nproc)}
+[[ -x "$wrapper" && "$jobs" =~ ^[1-9][0-9]*$ ]]
 destination=$(realpath -m -- "$1")
 [[ ! -e "$destination" && -d "$(dirname "$destination")" ]]
 [[ ! "$destination" =~ [[:space:][:cntrl:]] && "$destination" != *'"'* ]]
@@ -24,14 +27,20 @@ curl -fsSL --retry 3 --max-time 120 \
 printf '%s  %s\n' "$digest" "$destination/$archive" | sha512sum -c -
 tar -xzf "$destination/$archive" -C "$destination"
 rm -- "$destination/$archive"
-mkdir "$destination/build"
 (
-    cd "$destination/build"
-    ../ngspice-47/configure --prefix="$destination" --without-x --with-readline=no \
+    cd "$destination/ngspice-47"
+    # cmpp parses multiple interfaces using one scanner; restart it on
+    # the new stream rather than assigning yyin after an EOF restart.
+    # This only changes the interface generator, not simulation semantics.
+    sed -i 's/^   ifs_yyin = fp;$/   ifs_yyrestart(fp);/' src/xspice/cmpp/read_ifs.c
+    rg -q '^   ifs_yyrestart\(fp\);$' src/xspice/cmpp/read_ifs.c
+    ./configure --prefix="$destination" --without-x --with-readline=no \
         --enable-xspice --enable-cider --enable-openmp --disable-debug \
-        CC="$RUSTC_WRAPPER gcc" CXX="$RUSTC_WRAPPER g++"
-    make -j"$(nproc)"
+        CC="$wrapper gcc" CXX="$wrapper g++"
+    make -j"$jobs"
     make install
 )
-rm -rf -- "$destination/build" "$destination/ngspice-47"
+bash "$script_dir/../../runtime/logic-xspice/build.sh" \
+    "$destination/ngspice-47" "$destination/lib/ngspice" "$wrapper"
+rm -rf -- "$destination/ngspice-47"
 complete=true

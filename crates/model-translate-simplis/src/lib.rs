@@ -5,35 +5,29 @@
 //! unsupported primitive/model variants fail closed.
 
 use anyhow::{Context, Result, bail};
+use model_normalize_ngspice::pwl_resistor::{Axis, Knot, NativeBinding, validate_curve};
 use serde::Serialize;
 use std::fmt::Write as _;
 
-mod alb;
-pub use alb::{
-    AlbDigitalBit, AlbDriveStrength, AlbLogicLevel, AnalogBoundaryPin, AnalogBridgeKind,
-    AnalogDigitalConnection, BridgeCatalog, BridgeModel, DigitalFamilyResolution,
-    DigitalPinDirection, DiscoveredAlbPin, KnownLutSourceBit, KnownTimedLutSet, KnownTruthTable,
-    LegacyCompatibilityTable, LogicFamily, LogicFamilyAssignment, NativeAdcParameters,
-    NativeDacParameters, NativeDigitalBundle, NativeFamilyModel, NativeFamilyParameters,
-    NativeFamilySpecification, NativePinWiring, PlannedAnalogBridge, ScopedAnalogDigitalConnection,
-    TimingEnvironment, XspiceElectrical, XspiceLutTarget, XspiceTimedBit, XspiceTimedPlan,
-    derive_family_wiring, discover_alb_pins, materialize_scoped_family_bridges,
-    plan_analog_bridges, render_native_family_bridges,
-};
+pub mod syntax;
+use syntax::{normalized_statement, parse_numeric, statement_tokens, validate_node};
+mod digital_output;
+use digital_output::{OutputDrive, OutputPins, OutputSignal, OutputStage, emit_logic_voltage};
 mod whole;
 pub use whole::{
-    AlbOutputProducer, FamilySpecialization, LogicalAlbBoundary, LogicalAlbExpansion,
-    OccurrenceFamilyBoundary, SplitDeckTranslation, WholeModelTranslation,
-    expand_logical_alb_source, specialize_family_occurrences, translate_simplis_deck,
-    translate_simplis_deck_split, translate_simplis_expanded_library,
+    SplitDeckTranslation, WholeModelTranslation, capture_artifact_initial_conditions,
+    capture_artifact_waveforms, capture_linked_waveforms, capture_passive_initial_conditions,
+    lower_simetrix_linked_runtime, translate_simplis_deck, translate_simplis_deck_split,
+    translate_simplis_deck_with_budget, translate_simplis_expanded_library,
+    translate_simplis_expanded_library_with_budget, translate_simplis_linked_netlist,
 };
 
 /// One numeric point on a piecewise-linear characteristic.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
-    /// Independent voltage coordinate.
+    /// First model coordinate (voltage for resistors/capacitors, current for inductors).
     pub voltage: f64,
-    /// Dependent current or charge coordinate.
+    /// Second model coordinate (current, charge or flux linkage).
     pub value: f64,
 }
 
@@ -47,8 +41,14 @@ pub enum TranslationKind {
     Ipwlr,
     /// SIMPLIS `PWLC` / `NON_LINEAR_CAP_V1` voltage/charge characteristic.
     ChargeCapacitor,
-    /// SIMPLIS voltage-controlled switch mapped to ngspice `SW`.
+    /// SIMPLIS `PWLL` current/flux-linkage characteristic.
+    FluxInductor,
+    /// Voltage-controlled switch lowered to native ngspice.
     VoltageControlledSwitch,
+    /// SIMPLIS switch with strict hysteresis and initial-state suggestion.
+    HystereticSwitch,
+    /// `SIMetrix` voltage-controlled switch with explicit delay and slew phase.
+    TimedVoltageControlledSwitch,
     /// SIMPLIS LEVEL=1 simple transistor switch.
     TransistorSwitchLevel1,
     /// SIMPLIS LEVEL=2 transistor switch with active/saturated/reverse-biased regions.
@@ -65,6 +65,10 @@ pub enum TranslationKind {
     SrLatch,
     /// SIMPLIS simple S-R flip flop.
     SrFlipFlop,
+    /// Classic edge-triggered SR, JK, D or T state element.
+    ClockedFlipFlop,
+    /// Classic level-sensitive transparent data latch.
+    DataLatch,
     /// SIMPLIS pulse source mapped to native/behavioral ngspice.
     PulseSource,
     /// SIMPLIS sawtooth source mapped to a periodic behavioral source.
@@ -87,6 +91,45 @@ pub enum TranslationKind {
     DeviceVoltageControlledSource,
 }
 
+/// Code-model library needed by generated native-ngspice statements.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeModelRuntime {
+    /// Event-timed gates, hysteretic receivers and committed latches.
+    Logic,
+}
+
+impl CodeModelRuntime {
+    /// Matching C-reference module filename. Native execution may implement
+    /// the corresponding model schemas directly instead of loading a C module.
+    #[must_use = "the filename identifies the reference runtime module"]
+    pub const fn reference_module(self) -> &'static str {
+        match self {
+            Self::Logic => "ngspice_preprocess_logic.cm",
+        }
+    }
+}
+
+impl TranslationKind {
+    /// Additional simulator runtime required by this electrical primitive.
+    #[must_use = "the result declares the primitive runtime dependency"]
+    pub const fn required_runtime(self) -> Option<CodeModelRuntime> {
+        match self {
+            Self::AndGate
+            | Self::OrGate
+            | Self::SrLatch
+            | Self::SrFlipFlop
+            | Self::ClockedFlipFlop
+            | Self::DataLatch
+            | Self::HystereticSwitch
+            | Self::TimedVoltageControlledSwitch
+            | Self::TransistorSwitchLevel1
+            | Self::TransistorSwitchLevel2 => Some(CodeModelRuntime::Logic),
+            _ => None,
+        }
+    }
+}
+
 /// One translated primitive plus provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Translation {
@@ -107,19 +150,7 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_node(node: &str) -> Result<()> {
-    if node.is_empty()
-        || !node.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'_' | b'$' | b'.' | b'#' | b':' | b'+' | b'-' | b'*')
-        })
-    {
-        bail!("invalid SPICE node {node:?}");
-    }
-    Ok(())
-}
-
-fn validate_points(points: &[Point]) -> Result<()> {
+fn validate_finite_points(points: &[Point]) -> Result<()> {
     if points.len() < 2 {
         bail!("piecewise-linear characteristic requires at least two points");
     }
@@ -129,6 +160,11 @@ fn validate_points(points: &[Point]) -> Result<()> {
     {
         bail!("piecewise-linear characteristic contains a non-finite coordinate");
     }
+    Ok(())
+}
+
+fn validate_points(points: &[Point]) -> Result<()> {
+    validate_finite_points(points)?;
     if points
         .windows(2)
         .any(|window| window[0].voltage >= window[1].voltage)
@@ -155,6 +191,40 @@ fn write_pwl(output: &mut String, node_p: &str, node_n: &str, points: &[Point]) 
     Ok(())
 }
 
+fn resistor_knots(points: &[Point]) -> impl Iterator<Item = Knot> + '_ {
+    points.iter().map(|point| Knot {
+        voltage: point.voltage,
+        current: point.value,
+    })
+}
+
+fn validate_resistor_end_slopes(points: &[Point], current_defined: bool) -> Result<()> {
+    validate_curve(
+        if current_defined {
+            Axis::Current
+        } else {
+            Axis::Voltage
+        },
+        resistor_knots(points),
+    )
+}
+
+fn resistor_binding(name: &str, axis: Axis) -> NativeBinding {
+    match axis {
+        Axis::Voltage => NativeBinding::CurrentLaw {
+            source: format!("B{name}"),
+        },
+        Axis::Current => {
+            let stem = sanitized_name(name);
+            NativeBinding::VoltageLaw {
+                sensor: format!("V__{stem}_IPWLR_SENSE"),
+                source: format!("B__{stem}_IPWLR"),
+                intermediate: format!("__{stem}_IPWLR_MID"),
+            }
+        }
+    }
+}
+
 /// Translate a SIMPLIS `VPWLR` two-terminal V-I primitive to an ngspice
 /// behavioral current source.
 ///
@@ -168,55 +238,80 @@ pub fn translate_vpwlr(
     node_n: &str,
     points: &[Point],
 ) -> Result<Translation> {
-    validate_name(name)?;
-    validate_node(node_p)?;
-    validate_node(node_n)?;
-    validate_points(points)?;
-
-    let mut output = String::new();
-    write!(output, "B{name} {node_p} {node_n} I=")?;
-    write_pwl(&mut output, node_p, node_n, points)?;
-    output.push('\n');
-    Ok(Translation {
-        bytes: output.into_bytes(),
-        kind: TranslationKind::Vpwlr,
-    })
+    translate_pwl_resistor(
+        name,
+        node_p,
+        node_n,
+        points,
+        &resistor_binding(name, Axis::Voltage),
+    )
 }
 
 /// Translate a SIMPLIS `IPWLR` two-terminal I-V primitive to an ngspice
 /// series current sensor plus behavioral voltage source.
 ///
+/// As with VPWLR, points are voltage/current pairs; only the independent coordinate
+/// changes. Interior voltage slopes may be negative or zero.
+///
 /// # Errors
 ///
 /// Returns an error for invalid identifiers, fewer than two points, non-finite
-/// coordinates, or non-monotonic current coordinates.
+/// coordinates, non-monotonic current coordinates, or nonpositive end slopes.
 pub fn translate_ipwlr(
     name: &str,
     node_p: &str,
     node_n: &str,
     points: &[Point],
 ) -> Result<Translation> {
+    translate_pwl_resistor(
+        name,
+        node_p,
+        node_n,
+        points,
+        &resistor_binding(name, Axis::Current),
+    )
+}
+
+fn translate_pwl_resistor(
+    name: &str,
+    node_p: &str,
+    node_n: &str,
+    points: &[Point],
+    binding: &NativeBinding,
+) -> Result<Translation> {
     validate_name(name)?;
     validate_node(node_p)?;
     validate_node(node_n)?;
-    validate_points(points)?;
-
-    let stem = sanitized_name(name);
-    let sense = format!("V__{stem}_IPWLR_SENSE");
-    let middle = format!("__{stem}_IPWLR_MID");
     let mut output = String::new();
-    writeln!(output, "{sense} {node_p} {middle} 0")?;
-    write!(output, "B__{stem}_IPWLR {middle} {node_n} V=pwl(i({sense})")?;
-    for point in points {
-        output.push_str(", ");
-        write_number(&mut output, point.voltage)?;
-        output.push_str(", ");
-        write_number(&mut output, point.value)?;
-    }
-    output.push_str(")\n");
+    let kind = match binding {
+        NativeBinding::CurrentLaw { source } => {
+            validate_resistor_end_slopes(points, false)?;
+            write!(output, "{source} {node_p} {node_n} I=")?;
+            write_pwl(&mut output, node_p, node_n, points)?;
+            output.push('\n');
+            TranslationKind::Vpwlr
+        }
+        NativeBinding::VoltageLaw {
+            sensor,
+            source,
+            intermediate,
+        } => {
+            validate_resistor_end_slopes(points, true)?;
+            writeln!(output, "{sensor} {node_p} {intermediate} 0")?;
+            write!(output, "{source} {intermediate} {node_n} V=pwl(i({sensor})")?;
+            for point in points {
+                output.push_str(", ");
+                write_number(&mut output, point.value)?;
+                output.push_str(", ");
+                write_number(&mut output, point.voltage)?;
+            }
+            output.push_str(")\n");
+            TranslationKind::Ipwlr
+        }
+    };
     Ok(Translation {
         bytes: output.into_bytes(),
-        kind: TranslationKind::Ipwlr,
+        kind,
     })
 }
 
@@ -232,22 +327,52 @@ fn strictly_increasing_values(points: &[Point]) -> bool {
 // charge state there can make the transient operating point singular.
 const EXPLICIT_CHARGE_STATE_MIN_SPAN_COULOMBS: f64 = 1.0e-9;
 
-fn write_inverse_charge_pwl(
+fn write_inverse_storage_pwl(
     output: &mut String,
     state_node: &str,
     points: &[Point],
-    charge_offset: f64,
-    charge_span: f64,
+    storage_offset: f64,
+    storage_span: f64,
 ) -> Result<()> {
     write!(output, "pwl(v({state_node})")?;
+    let mut previous = f64::NEG_INFINITY;
     for point in points {
+        let coordinate = (point.value - storage_offset) / storage_span;
+        anyhow::ensure!(
+            coordinate.is_finite() && coordinate > previous,
+            "normalized storage knots must be finite and strictly increasing"
+        );
+        previous = coordinate;
         output.push_str(", ");
-        write_number(output, (point.value - charge_offset) / charge_span)?;
+        write_number(output, coordinate)?;
         output.push_str(", ");
         write_number(output, point.voltage)?;
     }
     output.push(')');
     Ok(())
+}
+
+fn normalized_initial_storage(
+    points: &[Point],
+    voltage: f64,
+    offset: f64,
+    span: f64,
+) -> Result<f64> {
+    let upper = points
+        .partition_point(|point| point.voltage <= voltage)
+        .clamp(1, points.len() - 1);
+    let left = points[upper - 1];
+    let right = points[upper];
+    let fraction = (voltage - left.voltage) / (right.voltage - left.voltage);
+    let charge = fraction.mul_add(
+        (right.value - left.value) / span,
+        (left.value - offset) / span,
+    );
+    anyhow::ensure!(
+        charge.is_finite(),
+        "non-finite normalized PWLC initial charge"
+    );
+    Ok(charge)
 }
 
 /// Translate a SIMPLIS `PWLC` / `NON_LINEAR_CAP_V1` voltage-charge primitive.
@@ -259,6 +384,12 @@ fn write_inverse_charge_pwl(
 /// V(Q) PWL source constrains terminal voltage, and mirrored source current
 /// updates the state, preserving `i = dQ/dt`.
 ///
+/// Explicit initial voltages are converted to charge using the same
+/// piecewise-linear characteristic (including end-segment extrapolation).
+/// They require an invertible positive differential capacitance curve,
+/// even if its charge span is small. Native Q= ignores the voltage IC
+/// on the reference simulator's hidden storage element.
+///
 /// The 1 nC charge-span boundary is an ngspice conditioning policy established
 /// by transient regression, not a SIMPLIS semantic boundary. Smaller, decreasing,
 /// or non-invertible curves conservatively keep ngspice's native `Q=` lowering.
@@ -266,39 +397,46 @@ fn write_inverse_charge_pwl(
 /// # Errors
 ///
 /// Returns an error for invalid identifiers, fewer than two points, non-finite
-/// coordinates, or non-monotonic voltage coordinates.
+/// coordinates, non-monotonic voltage coordinates, or an initial condition
+/// on a non-invertible charge curve.
 pub fn translate_charge_capacitor(
     name: &str,
     node_p: &str,
     node_n: &str,
     points: &[Point],
+    initial_voltage: Option<f64>,
 ) -> Result<Translation> {
     validate_name(name)?;
     validate_node(node_p)?;
     validate_node(node_n)?;
     validate_points(points)?;
 
+    if let Some(voltage) = initial_voltage {
+        anyhow::ensure!(voltage.is_finite(), "non-finite PWLC initial voltage");
+        anyhow::ensure!(
+            strictly_increasing_values(points),
+            "initialized PWLC requires strictly increasing charge; nonpositive differential capacitance is invalid in SIMPLIS"
+        );
+    }
     let mut output = String::new();
     if strictly_increasing_values(points) {
-        let charge_min = points
-            .iter()
-            .map(|point| point.value)
-            .fold(f64::INFINITY, f64::min);
-        let charge_max = points
-            .iter()
-            .map(|point| point.value)
-            .fold(f64::NEG_INFINITY, f64::max);
+        let charge_min = points[0].value;
+        let charge_max = points[points.len() - 1].value;
         let charge_span = charge_max - charge_min;
-        if charge_span >= EXPLICIT_CHARGE_STATE_MIN_SPAN_COULOMBS {
+        if initial_voltage.is_some() || charge_span >= EXPLICIT_CHARGE_STATE_MIN_SPAN_COULOMBS {
+            anyhow::ensure!(
+                charge_span.is_finite() && charge_span > 0.,
+                "invalid PWLC charge span"
+            );
             let stem = sanitized_name(name);
             let state_node = format!("__{stem}_PWLC_Q");
             let voltage_source = format!("B__{stem}_PWLC_V");
             writeln!(
                 output,
-                "* ngspice-rs-preprocess: explicit normalized charge state for large increasing SIMPLIS PWLC"
+                "* ngspice-rs-preprocess: explicit normalized charge state for SIMPLIS PWLC"
             )?;
             write!(output, "{voltage_source} {node_p} {node_n} V='")?;
-            write_inverse_charge_pwl(&mut output, &state_node, points, charge_min, charge_span)?;
+            write_inverse_storage_pwl(&mut output, &state_node, points, charge_min, charge_span)?;
             output.push_str("'\n");
             writeln!(
                 output,
@@ -306,6 +444,11 @@ pub fn translate_charge_capacitor(
             )?;
             write!(output, "C__{stem}_PWLC_Q {state_node} 0 ")?;
             write_number(&mut output, charge_span)?;
+            if let Some(voltage) = initial_voltage {
+                let charge = normalized_initial_storage(points, voltage, charge_min, charge_span)?;
+                output.push_str(" IC=");
+                write_number(&mut output, charge)?;
+            }
             output.push('\n');
             return Ok(Translation {
                 bytes: output.into_bytes(),
@@ -323,256 +466,59 @@ pub fn translate_charge_capacitor(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExprToken {
-    Number,
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    LeftParen,
-    RightParen,
-    End,
-}
-
-struct ExprParser<'a> {
-    input: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> ExprParser<'a> {
-    const fn new(input: &'a [u8]) -> Self {
-        Self { input, offset: 0 }
+/// Translate a SIMPLIS `PWLL` current/flux-linkage primitive.
+///
+/// The independent point coordinate is signed terminal current, and the
+/// dependent coordinate is flux linkage. A normalized storage capacitor
+/// integrates terminal voltage; the inverse characteristic determines
+/// branch current. The initial current is converted to flux exactly as
+/// PWLC converts initial voltage to charge.
+///
+/// # Errors
+/// Invalid identifiers, coordinates, nonpositive differential inductance,
+/// or a non-finite initial storage coordinate.
+pub fn translate_flux_inductor(
+    name: &str,
+    node_p: &str,
+    node_n: &str,
+    points: &[Point],
+    initial_current: Option<f64>,
+) -> Result<Translation> {
+    validate_name(name)?;
+    validate_node(node_p)?;
+    validate_node(node_n)?;
+    validate_points(points)?;
+    anyhow::ensure!(
+        strictly_increasing_values(points),
+        "PWLL requires positive differential inductance"
+    );
+    let offset = points[0].value;
+    let span = points[points.len() - 1].value - offset;
+    anyhow::ensure!(span.is_finite() && span > 0., "invalid PWLL flux span");
+    let stem = sanitized_name(name);
+    let state = format!("__{stem}_PWLL_FLUX");
+    let mut output = String::new();
+    write!(output, "B__{stem}_PWLL_I {node_p} {node_n} I='")?;
+    write_inverse_storage_pwl(&mut output, &state, points, offset, span)?;
+    output.push_str("'\n");
+    writeln!(
+        output,
+        "B__{stem}_PWLL_V {state} 0 I='-v({node_p},{node_n})'"
+    )?;
+    write!(output, "C__{stem}_PWLL_FLUX {state} 0 ")?;
+    write_number(&mut output, span)?;
+    if let Some(current) = initial_current {
+        output.push_str(" IC=");
+        write_number(
+            &mut output,
+            normalized_initial_storage(points, current, offset, span)?,
+        )?;
     }
-
-    fn skip_space(&mut self) {
-        while self
-            .input
-            .get(self.offset)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            self.offset += 1;
-        }
-    }
-
-    fn token(&mut self) -> ExprToken {
-        self.skip_space();
-        match self.input.get(self.offset) {
-            Some(b'+') => ExprToken::Plus,
-            Some(b'-') => ExprToken::Minus,
-            Some(b'*') => ExprToken::Star,
-            Some(b'/') => ExprToken::Slash,
-            Some(b'(') => ExprToken::LeftParen,
-            Some(b')') => ExprToken::RightParen,
-            Some(byte) if byte.is_ascii_digit() || *byte == b'.' => ExprToken::Number,
-            None | Some(_) => ExprToken::End,
-        }
-    }
-
-    fn consume(&mut self, token: ExprToken) -> bool {
-        if self.token() != token {
-            return false;
-        }
-        self.offset += 1;
-        true
-    }
-
-    fn parse(mut self) -> Result<f64> {
-        let value = self.parse_sum()?;
-        self.skip_space();
-        if self.offset != self.input.len() {
-            bail!(
-                "unsupported SIMPLIS numeric expression {:?}",
-                String::from_utf8_lossy(self.input)
-            );
-        }
-        if !value.is_finite() {
-            bail!("SIMPLIS numeric expression evaluated to a non-finite value");
-        }
-        Ok(value)
-    }
-
-    fn parse_sum(&mut self) -> Result<f64> {
-        let mut value = self.parse_product()?;
-        loop {
-            if self.consume(ExprToken::Plus) {
-                value += self.parse_product()?;
-            } else if self.consume(ExprToken::Minus) {
-                value -= self.parse_product()?;
-            } else {
-                return Ok(value);
-            }
-        }
-    }
-
-    fn parse_product(&mut self) -> Result<f64> {
-        let mut value = self.parse_unary()?;
-        loop {
-            if self.consume(ExprToken::Star) {
-                value *= self.parse_unary()?;
-            } else if self.consume(ExprToken::Slash) {
-                let divisor = self.parse_unary()?;
-                if divisor == 0.0 {
-                    bail!("division by zero in SIMPLIS numeric expression");
-                }
-                value /= divisor;
-            } else {
-                return Ok(value);
-            }
-        }
-    }
-
-    fn parse_unary(&mut self) -> Result<f64> {
-        if self.consume(ExprToken::Plus) {
-            self.parse_unary()
-        } else if self.consume(ExprToken::Minus) {
-            Ok(-self.parse_unary()?)
-        } else {
-            self.parse_primary()
-        }
-    }
-
-    fn parse_primary(&mut self) -> Result<f64> {
-        if self.consume(ExprToken::LeftParen) {
-            let value = self.parse_sum()?;
-            if !self.consume(ExprToken::RightParen) {
-                bail!("unterminated parenthesis in SIMPLIS numeric expression");
-            }
-            return Ok(value);
-        }
-        self.parse_number()
-    }
-
-    fn parse_number(&mut self) -> Result<f64> {
-        self.skip_space();
-        let start = self.offset;
-        let mut saw_digit = false;
-        while self.input.get(self.offset).is_some_and(u8::is_ascii_digit) {
-            saw_digit = true;
-            self.offset += 1;
-        }
-        if self.input.get(self.offset) == Some(&b'.') {
-            self.offset += 1;
-            while self.input.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                saw_digit = true;
-                self.offset += 1;
-            }
-        }
-        if !saw_digit {
-            bail!("expected number in SIMPLIS numeric expression");
-        }
-        if self
-            .input
-            .get(self.offset)
-            .is_some_and(|byte| matches!(byte, b'e' | b'E'))
-        {
-            self.offset += 1;
-            if self
-                .input
-                .get(self.offset)
-                .is_some_and(|byte| matches!(byte, b'+' | b'-'))
-            {
-                self.offset += 1;
-            }
-            let exponent_start = self.offset;
-            while self.input.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                self.offset += 1;
-            }
-            if exponent_start == self.offset {
-                bail!("invalid exponent in SIMPLIS numeric expression");
-            }
-        }
-        let number_end = self.offset;
-        while self
-            .input
-            .get(self.offset)
-            .is_some_and(u8::is_ascii_alphabetic)
-        {
-            self.offset += 1;
-        }
-        let number = std::str::from_utf8(&self.input[start..number_end])?.parse::<f64>()?;
-        let suffix = self.input[number_end..self.offset].to_ascii_lowercase();
-        let multiplier = if suffix.starts_with(b"meg") {
-            1.0e6
-        } else if suffix.starts_with(b"mil") {
-            25.4e-6
-        } else {
-            match suffix.first().copied() {
-                Some(b't') => 1.0e12,
-                Some(b'g') => 1.0e9,
-                Some(b'k') => 1.0e3,
-                Some(b'm') => 1.0e-3,
-                Some(b'u') => 1.0e-6,
-                Some(b'n') => 1.0e-9,
-                Some(b'p') => 1.0e-12,
-                Some(b'f') => 1.0e-15,
-                None | Some(_) => 1.0,
-            }
-        };
-        Ok(number * multiplier)
-    }
-}
-
-fn parse_numeric(input: &str) -> Result<f64> {
-    let trimmed = input.trim();
-    let expression = trimmed
-        .strip_prefix('{')
-        .and_then(|value| value.strip_suffix('}'))
-        .unwrap_or(trimmed);
-    ExprParser::new(expression.as_bytes()).parse()
-}
-
-fn statement_tokens(input: &str) -> Result<Vec<String>> {
-    if input.trim_start().starts_with('*') {
-        return Ok(Vec::new());
-    }
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    let mut brace_depth = 0usize;
-    let mut quote = false;
-    for character in input.chars() {
-        match character {
-            '\'' => {
-                quote = !quote;
-                token.push(character);
-            }
-            '{' if !quote => {
-                brace_depth = brace_depth
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("SIMPLIS brace nesting overflow"))?;
-                token.push(character);
-            }
-            '}' if !quote => {
-                brace_depth = brace_depth
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow::anyhow!("unmatched SIMPLIS closing brace"))?;
-                token.push(character);
-            }
-            ';' if !quote && brace_depth == 0 => break,
-            character if character.is_whitespace() && !quote && brace_depth == 0 => {
-                if !token.is_empty() {
-                    tokens.push(std::mem::take(&mut token));
-                }
-            }
-            _ => token.push(character),
-        }
-    }
-    if quote || brace_depth != 0 {
-        bail!("unterminated quote or brace in SIMPLIS statement");
-    }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-    Ok(tokens)
-}
-
-fn normalized_statement(input: &str) -> String {
-    input
-        .lines()
-        .map(str::trim)
-        .map(|line| line.strip_prefix('+').map_or(line, str::trim_start))
-        .collect::<Vec<_>>()
-        .join(" ")
+    output.push('\n');
+    Ok(Translation {
+        bytes: output.into_bytes(),
+        kind: TranslationKind::FluxInductor,
+    })
 }
 
 fn parse_assignments(tokens: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
@@ -664,7 +610,7 @@ fn sanitized_name(input: &str) -> String {
         .collect()
 }
 
-fn indexed_points(
+fn read_indexed_points(
     parameters: &std::collections::BTreeMap<String, String>,
     count: usize,
     voltage_prefix: &str,
@@ -677,6 +623,16 @@ fn indexed_points(
             value: numeric_parameter(parameters, &format!("{value_prefix}{index}"))?,
         });
     }
+    Ok(points)
+}
+
+fn indexed_points(
+    parameters: &std::collections::BTreeMap<String, String>,
+    count: usize,
+    voltage_prefix: &str,
+    value_prefix: &str,
+) -> Result<Vec<Point>> {
+    let points = read_indexed_points(parameters, count, voltage_prefix, value_prefix)?;
     validate_points(&points)?;
     Ok(points)
 }
@@ -709,15 +665,7 @@ struct DigitalBufferSpec {
 fn emit_digital_buffer(spec: &DigitalBufferSpec) -> Result<Translation> {
     let diff = format!("__{}_DIFF", spec.stem);
     let state = format!("__{}_STATE", spec.stem);
-    let delayed = if spec.delay == 0.0 {
-        state.clone()
-    } else {
-        format!("__{}_DELAYED", spec.stem)
-    };
-    let out_int = format!("__{}_OUT_INT", spec.stem);
-    let out_bar_int = format!("__{}_OUTB_INT", spec.stem);
     let hyst_model = format!("__{}_HYST_M", spec.stem);
-    let delay_model = format!("__{}_DELAY_M", spec.stem);
     let mut output = String::new();
     write!(
         output,
@@ -766,40 +714,25 @@ fn emit_digital_buffer(spec: &DigitalBufferSpec) -> Result<Translation> {
     output.push_str(" hyst=");
     write_number(&mut output, spec.hystwd / 2.0)?;
     output.push_str(" out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)\n");
-    if spec.delay != 0.0 {
-        writeln!(
-            output,
-            "A__{}_DELAY {state} {delayed} 0 {delay_model}",
-            spec.stem
-        )?;
-        write!(output, ".model {delay_model} delay(delay=")?;
-        write_number(&mut output, spec.delay)?;
-        output.push_str(" buffer_size=2048)\n");
+    OutputStage {
+        stem: &spec.stem,
+        rtn: &spec.rtn,
+        pins: OutputPins {
+            primary: &spec.out,
+            complement: Some(&spec.out_bar),
+        },
+        drive: OutputDrive {
+            low: spec.vol,
+            high: spec.voh,
+            resistance: spec.rout,
+        },
+        polarity: LogicPolarity::Positive,
+        signal: OutputSignal::Analog {
+            state: &state,
+            delay: spec.delay,
+        },
     }
-    write!(output, "B__{}_OUTV {out_int} {} V='", spec.stem, spec.rtn)?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*v({delayed})'")?;
-    write!(output, "R__{}_OUT {out_int} {} ", spec.stem, spec.out)?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
-    write!(
-        output,
-        "B__{}_OUTBV {out_bar_int} {} V='",
-        spec.stem, spec.rtn
-    )?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*(1-v({delayed}))'")?;
-    write!(
-        output,
-        "R__{}_OUTB {out_bar_int} {} ",
-        spec.stem, spec.out_bar
-    )?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
+    .emit(&mut output)?;
     Ok(Translation {
         bytes: output.into_bytes(),
         kind: match spec.kind {
@@ -813,16 +746,42 @@ fn emit_digital_buffer(spec: &DigitalBufferSpec) -> Result<Translation> {
 enum LogicGateKind {
     And,
     Or,
+    Nand,
+    Nor,
 }
 
-#[derive(Debug)]
-struct AndSpec {
-    kind: LogicGateKind,
-    stem: String,
-    out: String,
-    out_bar: String,
-    rtn: String,
-    inputs: Vec<String>,
+impl LogicGateKind {
+    const fn inverted(self) -> bool {
+        matches!(self, Self::Nand | Self::Nor)
+    }
+
+    const fn conjunction(self) -> bool {
+        matches!(self, Self::And | Self::Nand)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicPolarity {
+    Positive,
+    Negative,
+}
+
+impl LogicPolarity {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "POS" => Ok(Self::Positive),
+            "NEG" => Ok(Self::Negative),
+            _ => bail!("invalid SIMPLIS LOGIC={value}"),
+        }
+    }
+
+    const fn negative(self) -> bool {
+        matches!(self, Self::Negative)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicIo {
     rin: f64,
     rout: f64,
     hystwd: f64,
@@ -832,123 +791,240 @@ struct AndSpec {
     threshold: f64,
 }
 
-fn emit_logic_and(spec: &AndSpec) -> Result<Translation> {
-    let mut output = String::new();
-    let mut states = Vec::with_capacity(spec.inputs.len());
-    for (index, input) in spec.inputs.iter().enumerate() {
-        let number = index + 1;
-        let state = format!("__{}_S{number}", spec.stem);
-        let diff = format!("__{}_D{number}", spec.stem);
-        let model = format!("__{}_H{number}", spec.stem);
-        write!(output, "R__{}_RIN{number} {input} {} ", spec.stem, spec.rtn)?;
-        write_number(&mut output, spec.rin)?;
-        output.push('\n');
-        writeln!(
-            output,
-            "E__{}_D{number} {diff} 0 {input} {} 1",
-            spec.stem, spec.rtn
-        )?;
-        writeln!(output, "A__{}_H{number} {diff} {state} {model}", spec.stem)?;
-        write!(output, ".model {model} hyst(in_low=")?;
-        write_number(&mut output, spec.threshold)?;
-        output.push_str(" in_high=");
-        write_number(&mut output, spec.threshold)?;
-        output.push_str(" hyst=");
-        write_number(&mut output, spec.hystwd / 2.0)?;
-        output.push_str(" out_lower_limit=0 out_upper_limit=1 input_domain=0 fraction=false)\n");
-        states.push(state);
-    }
-    let raw = format!("__{}_RAW", spec.stem);
-    write!(output, "B__{}_LOGIC {raw} 0 V='", spec.stem)?;
-    match spec.kind {
-        LogicGateKind::And => {
-            for (index, state) in states.iter().enumerate() {
-                if index != 0 {
-                    output.push('*');
-                }
-                write!(output, "v({state})")?;
-            }
-        }
-        LogicGateKind::Or => {
-            output.push_str("1-(");
-            for (index, state) in states.iter().enumerate() {
-                if index != 0 {
-                    output.push('*');
-                }
-                write!(output, "(1-v({state}))")?;
-            }
-            output.push(')');
-        }
-    }
-    output.push_str("'\n");
-    let logic = if spec.delay == 0.0 {
-        raw
-    } else {
-        let delayed = format!("__{}_DELAYED", spec.stem);
-        let model = format!("__{}_DELAY_M", spec.stem);
-        writeln!(output, "A__{}_DELAY {raw} {delayed} 0 {model}", spec.stem)?;
-        write!(output, ".model {model} delay(delay=")?;
-        write_number(&mut output, spec.delay)?;
-        output.push_str(" buffer_size=2048)\n");
-        delayed
-    };
-    let out_int = format!("__{}_OUT_INT", spec.stem);
-    let out_bar_int = format!("__{}_OUTB_INT", spec.stem);
-    write!(output, "B__{}_OUTV {out_int} {} V='", spec.stem, spec.rtn)?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*v({logic})'")?;
-    write!(output, "R__{}_OUT {out_int} {} ", spec.stem, spec.out)?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
-    write!(
-        output,
-        "B__{}_OUTBV {out_bar_int} {} V='",
-        spec.stem, spec.rtn
-    )?;
-    write_number(&mut output, spec.vol)?;
-    output.push_str("+(");
-    write_number(&mut output, spec.voh - spec.vol)?;
-    writeln!(output, ")*(1-v({logic}))'")?;
-    write!(
-        output,
-        "R__{}_OUTB {out_bar_int} {} ",
-        spec.stem, spec.out_bar
-    )?;
-    write_number(&mut output, spec.rout)?;
-    output.push('\n');
-    Ok(Translation {
-        bytes: output.into_bytes(),
-        kind: match spec.kind {
-            LogicGateKind::And => TranslationKind::AndGate,
-            LogicGateKind::Or => TranslationKind::OrGate,
-        },
-    })
+#[derive(Clone, Copy, Debug)]
+struct LogicReceiver {
+    polarity: LogicPolarity,
+    initial: bool,
 }
 
-/// Experimental isolated ALB-to-XSPICE subcircuit compiler.
-///
-/// This does not enable normal `SIMetrix` `D_LOGIC_BLOCK` translation. Callers
-/// explicitly supply the timing environment and electrical test parameters;
-/// digital-family/UNKNOWN semantics remain outside this model.
-///
-/// # Errors
-/// Fails on unsupported ALB body, timing, initial state or native LUT limits.
-pub fn compile_alb_xspice_subcircuit(
-    body: &str,
-    subcircuit: &str,
-    timing: TimingEnvironment<'_>,
-    electrical: XspiceElectrical,
+impl LogicReceiver {
+    const fn digital1(polarity: LogicPolarity) -> Self {
+        Self {
+            polarity,
+            initial: polarity.negative(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LogicGateMode {
+    Classic {
+        polarity: LogicPolarity,
+        initial: bool,
+    },
+    Digital1 {
+        inverted_inputs: usize,
+    },
+}
+
+impl LogicGateMode {
+    const fn receiver(self, kind: LogicGateKind, index: usize, arity: usize) -> LogicReceiver {
+        match self {
+            // Every undecided input takes the state satisfying the suggested
+            // classic output whenever possible.
+            Self::Classic { polarity, initial } => LogicReceiver {
+                polarity,
+                initial: initial ^ kind.inverted(),
+            },
+            // DIGITAL1 receivers start physically low, independent of IC.
+            Self::Digital1 { inverted_inputs } => {
+                let inverted = index >= arity - inverted_inputs;
+                let polarity = if inverted {
+                    LogicPolarity::Negative
+                } else {
+                    LogicPolarity::Positive
+                };
+                LogicReceiver::digital1(polarity)
+            }
+        }
+    }
+
+    const fn output_polarity(self) -> LogicPolarity {
+        match self {
+            Self::Classic { polarity, .. } => polarity,
+            Self::Digital1 { .. } => LogicPolarity::Positive,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LogicGateSpec {
+    kind: LogicGateKind,
+    stem: String,
+    out: String,
+    out_bar: Option<String>,
+    rtn: String,
+    inputs: Vec<String>,
+    io: LogicIo,
+    mode: LogicGateMode,
+}
+
+// The numeric discriminants are the interface of preprocess_logic_event,
+// shared with the independent native reference code model.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+enum LogicOperation {
+    And = 0,
+    Or = 1,
+    Nand = 2,
+    Nor = 3,
+    ResetDominant = 4,
+    SetDominant = 5,
+    HoldWhenEqual = 6,
+    ClockedSrRising = 7,
+    ClockedSrFalling = 8,
+    ClockedJkRising = 9,
+    ClockedJkFalling = 10,
+    ClockedDRising = 11,
+    ClockedDFalling = 12,
+    ClockedTRising = 13,
+    ClockedTFalling = 14,
+    LatchHigh = 15,
+    LatchLow = 16,
+}
+
+impl From<LogicGateKind> for LogicOperation {
+    fn from(kind: LogicGateKind) -> Self {
+        match kind {
+            LogicGateKind::And => Self::And,
+            LogicGateKind::Or => Self::Or,
+            LogicGateKind::Nand => Self::Nand,
+            LogicGateKind::Nor => Self::Nor,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicTiming {
+    operation: LogicOperation,
+    delay: f64,
+    inertial: bool,
+    initial: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogicThresholds {
+    center: f64,
+    width: f64,
+}
+
+impl LogicIo {
+    const fn thresholds(self) -> LogicThresholds {
+        LogicThresholds {
+            center: self.threshold,
+            width: self.hystwd,
+        }
+    }
+}
+
+fn emit_logic_input_loads(
+    output: &mut String,
+    stem: &str,
+    rtn: &str,
+    inputs: &[String],
+    resistance: f64,
+) -> Result<()> {
+    for (index, input) in inputs.iter().enumerate() {
+        write!(output, "R__{stem}_RIN_I{} {input} {rtn} ", index + 1)?;
+        write_number(output, resistance)?;
+        output.push('\n');
+    }
+    Ok(())
+}
+
+fn emit_logic_event(
+    output: &mut String,
+    stem: &str,
+    rtn: &str,
+    inputs: &[String],
+    receivers: &[LogicReceiver],
+    thresholds: LogicThresholds,
+    timing: LogicTiming,
 ) -> Result<String> {
-    let (_, program) = alb::analyze_body(body)?.into_parts();
-    let graph = program
-        .context("SIMetrix ALB body is not a timed COMB program")?
-        .timed_combinational_graph(timing)?
-        .context("SIMetrix ALB timed graph needs acyclic BITWISE COMB semantics")?;
-    graph
-        .xspice_timed_plan()?
-        .render_subcircuit(subcircuit, electrical)
+    let upper = thresholds.center + thresholds.width / 2.0;
+    let lower = thresholds.center - thresholds.width / 2.0;
+    if !upper.is_finite() || !lower.is_finite() {
+        bail!("SIMPLIS logic thresholds overflow");
+    }
+    if inputs.is_empty() || inputs.len() != receivers.len() {
+        bail!("inconsistent logic receiver count");
+    }
+    let state = format!("__{stem}_Q_STATE");
+    let model = format!("__{stem}_EVENT_M");
+    write!(output, "A__{stem}_EVENT %vd [")?;
+    for input in inputs {
+        write!(output, " {input} {rtn}")?;
+    }
+    writeln!(output, " ] {state} {model}")?;
+    write!(
+        output,
+        ".model {model} preprocess_logic_event(operation={} delay=",
+        timing.operation as u8
+    )?;
+    write_number(output, timing.delay)?;
+    write!(
+        output,
+        " inertial={} ic={} low={lower:.17e} high={upper:.17e} inverted=[",
+        timing.inertial,
+        u8::from(timing.initial)
+    )?;
+    for receiver in receivers {
+        write!(output, " {}", receiver.polarity.negative())?;
+    }
+    output.push_str(" ] rx_ic=[");
+    for receiver in receivers {
+        write!(output, " {}", u8::from(receiver.initial))?;
+    }
+    output.push_str(" ])\n");
+    Ok(state)
+}
+
+fn emit_logic_gate(spec: &LogicGateSpec) -> Result<Translation> {
+    let mut output = String::new();
+    let receivers = (0..spec.inputs.len())
+        .map(|index| spec.mode.receiver(spec.kind, index, spec.inputs.len()))
+        .collect::<Vec<_>>();
+    emit_logic_input_loads(
+        &mut output,
+        &spec.stem,
+        &spec.rtn,
+        &spec.inputs,
+        spec.io.rin,
+    )?;
+    let state = emit_logic_event(
+        &mut output,
+        &spec.stem,
+        &spec.rtn,
+        &spec.inputs,
+        &receivers,
+        spec.io.thresholds(),
+        LogicTiming {
+            operation: spec.kind.into(),
+            delay: spec.io.delay,
+            inertial: matches!(spec.mode, LogicGateMode::Digital1 { .. }),
+            initial: false,
+        },
+    )?;
+    OutputStage {
+        stem: &spec.stem,
+        rtn: &spec.rtn,
+        pins: OutputPins {
+            primary: &spec.out,
+            complement: spec.out_bar.as_deref(),
+        },
+        drive: spec.io.into(),
+        polarity: spec.mode.output_polarity(),
+        signal: OutputSignal::Event(&state),
+    }
+    .emit(&mut output)?;
+    Ok(Translation {
+        bytes: output.into_bytes(),
+        kind: if spec.kind.conjunction() {
+            TranslationKind::AndGate
+        } else {
+            TranslationKind::OrGate
+        },
+    })
 }
 
 #[cfg(test)]
@@ -1140,6 +1216,7 @@ mod tests {
                     value: 30.0e-9,
                 },
             ],
+            None,
         )?;
         assert_eq!(translated.kind, TranslationKind::ChargeCapacitor);
         ngspice_accepts(&translated.bytes, ".tran 100p 1n\n.print tran v(in)")
@@ -1165,6 +1242,7 @@ mod tests {
                     value: 0.0,
                 },
             ],
+            None,
         )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("CCDS in 0 Q='pwl(v(in,0)"));
@@ -1192,6 +1270,7 @@ mod tests {
                     value: 8.0e-9,
                 },
             ],
+            None,
         )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("B__CGD_PWLC_V in 0 V='pwl(v(__CGD_PWLC_Q), 0.00000000000000000e0, 0.00000000000000000e0"));
@@ -1215,6 +1294,7 @@ mod tests {
                     value: 30.0e-12,
                 },
             ],
+            None,
         )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("CCGS in 0 Q='pwl(v(in,0)"));
@@ -1242,6 +1322,7 @@ mod tests {
                     value: 5.0e-12,
                 },
             ],
+            None,
         )?;
         let text = std::str::from_utf8(&translated.bytes)?;
         assert!(text.contains("CCGD in 0 Q='pwl(v(in,0)"));

@@ -1,0 +1,19 @@
+* A real_delay C model observes logic STATE, not just drive strength
+0n 0s
+9n 1s
+14n 0r
+21n 1r
+29n Uz
+33n 1z
+39n 0s
+46n 1u
+51n 0z
+60n 1s
+64n 0s
+70n Uu
+75n 1s
+80n 1r
+86n 0u
+93n 1s
+99n 0s
+107n 1r

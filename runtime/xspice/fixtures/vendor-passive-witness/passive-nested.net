@@ -1,0 +1,16 @@
+* Analog contact via passive-only lexical wrapper
+Vinput d 0 PULSE(0 3.3 5n 1n 1n 20n 50n)
+Aproducer [d] [p] M
+Asense [p] [q] M
+Xload p LOAD
+Rout q 0 100k
+.model M d_logic_block family="HC" vsupply=3.3 input_load=2p sink_current=-1m source_current=2m out_res=40 out_delay=1n def="out[0]=in[0];"
+.subckt LOAD p
+Xlower p LOAD_INNER
+.ends LOAD
+.subckt LOAD_INNER p
+Rload p 0 100
+.ends LOAD_INNER
+.tran 5p 45n 0 5p
+.PRINT TRAN V(q) I(Vinput)
+.end

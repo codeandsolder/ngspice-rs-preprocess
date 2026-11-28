@@ -1,0 +1,142 @@
+{
+  "simulator": "SIMetrix Elements 9.40d",
+  "sampling_note": "Native and vendor source match at 2 ps maximum transient timestep. Observe initial and final samples and 0.25+0.5*N ns samples, away from exact source-event endpoints. Earlier 10 ps-grid raw source and hashes retained per case.",
+  "cases": [
+    {
+      "sidecar": {
+        "sha256": "73789D4C03BF068D413DCAFFF521937F5B6C0F6F4385F4AB95CD562F8E777E03",
+        "name": "source.txt",
+        "normalized_sha256": "70b496c9a6375895668f9fee0d7315000aefb4ff541053a1905042355027d9ea"
+      },
+      "pins": [
+        "i(vforce)"
+      ],
+      "csv_sha256": "4E7AD4EAE8C1D38E5D2366229B3BEC783AF4E5EE7C33B73D01E8FDF2FAAC1BD7",
+      "listing_sha256": "98D61E64CDBD9F43715C3492B59C79BE3A105655C29AB795833B062B12E90448",
+      "name": "equal",
+      "rows": 90001,
+      "source_sha256": "A0C0017681C03EFA5D3C522509F007BB4133FD6FCD91F5026E0D14053030B654",
+      "retained_rows": 362,
+      "normalized_source_sha256": "41831e66c1760b9a59b4d8b7134224d631c914354bac3438b10ed0cf954b0f53",
+      "coarse_reference": {
+        "source_sha256": "0F10CEFBA31E1139B3EBB53370FB398C4882428C8F5157BB8D24EDCF9C1154F6",
+        "normalized_source_sha256": "473803620416df2dd84cf41be0b22fa78b7ccfb2dcca49eda811894d36dd2bd2",
+        "listing_sha256": "3B042B6930C08A95F766329E8579AA94F1F8198AA7B707027EE33A3E0A0E75EA",
+        "csv_sha256": "C25269593DA9AD756FC180E2D0791A7FBC1A997CB053BECBED7D1487D152CFDA",
+        "rows": 18001,
+        "retained_rows": 362,
+        "source_file": "equal-coarse.net"
+      },
+      "current_time_tolerance_ns": 0.0025
+    },
+    {
+      "sidecar": {
+        "sha256": "73789D4C03BF068D413DCAFFF521937F5B6C0F6F4385F4AB95CD562F8E777E03",
+        "name": "source.txt",
+        "normalized_sha256": "70b496c9a6375895668f9fee0d7315000aefb4ff541053a1905042355027d9ea"
+      },
+      "pins": [
+        "i(vforce)"
+      ],
+      "csv_sha256": "15E6BCD4E222197FD1F5AD07E6BA158BFED927F69B5FE54BF38E92805BC21021",
+      "listing_sha256": "576DA3A76525E5B05F8ECCCF60817E761EF2DF6BAD59199CD65123B5E8C073EE",
+      "name": "normal",
+      "rows": 90001,
+      "source_sha256": "0DC35F9C1F0AE55C3A3356CD9C3A063CF7DE4D6AEA2469F8CE5C95BC2182E964",
+      "retained_rows": 362,
+      "normalized_source_sha256": "fa187b9e6e6b07b84f43da4388c90bf5aa32caafb7906d4af61e4a2ee83a6d1a",
+      "coarse_reference": {
+        "source_sha256": "DCB4A3F575FA81FEB4A1CA9CED3D97F6F85A65B776D60D9460696249999F0467",
+        "normalized_source_sha256": "23c6c31c71a6a02e7ce58efe1b0867e85c3f6f9009b9ff9f852d7aa26c1ccead",
+        "listing_sha256": "6C2DB1BB53D07E8B4C8D389311A7527E5E2B559F06D84C5305C192082362BCF4",
+        "csv_sha256": "BFF79445E39FC6D6CD12F61C2568488DDE52D663032ECC53DE174AF94BB57620",
+        "rows": 18001,
+        "retained_rows": 362,
+        "source_file": "normal-coarse.net"
+      },
+      "current_time_tolerance_ns": 0.0025
+    },
+    {
+      "sidecar": {
+        "sha256": "73789D4C03BF068D413DCAFFF521937F5B6C0F6F4385F4AB95CD562F8E777E03",
+        "name": "source.txt",
+        "normalized_sha256": "70b496c9a6375895668f9fee0d7315000aefb4ff541053a1905042355027d9ea"
+      },
+      "pins": [
+        "i(vforce)"
+      ],
+      "csv_sha256": "85571B59DA290BA021FE5152FE93E3FA17B225B7EC6EB89EF7A0D6767957E1D5",
+      "listing_sha256": "5AC0699B2AFBE637306782378933D00E147B34A233E3F1027C6349963CCDC8BF",
+      "name": "reversed-fixed",
+      "rows": 90001,
+      "source_sha256": "4E235707BAA21C6E03D9F98D8054ABD24645B0028F5D9E0EF8566838CDF3AE8F",
+      "retained_rows": 362,
+      "normalized_source_sha256": "62b6a08a2c45985e618636c74b6277284c9223b9ae9b424578b4bde8c484a023",
+      "coarse_reference": {
+        "source_sha256": "7344AFC84C76FC70B4D618EDE6573637EB9BC8ED96C768CE4CAA801AB1E40A9C",
+        "normalized_source_sha256": "ff654fb2edf8d79df0efc36829df239f459ec29a1b9a990385bf5da4921c99a6",
+        "listing_sha256": "1ABEC0D4777597E768BC06F08CA5631AB4328D797CC5313C1B31A33E3DE42952",
+        "csv_sha256": "57674217EEF0CE5F9132376F9597CAB62878A6B0C5393A71B75464AE40BF5F38",
+        "rows": 18001,
+        "retained_rows": 362,
+        "source_file": "reversed-fixed-coarse.net"
+      },
+      "current_time_tolerance_ns": 0.0025
+    },
+    {
+      "sidecar": {
+        "sha256": "73789D4C03BF068D413DCAFFF521937F5B6C0F6F4385F4AB95CD562F8E777E03",
+        "name": "source.txt",
+        "normalized_sha256": "70b496c9a6375895668f9fee0d7315000aefb4ff541053a1905042355027d9ea"
+      },
+      "pins": [
+        "i(vforce)"
+      ],
+      "csv_sha256": "68B494DD800B5A4F39C0EEB1F72983DB4636A14457F5975DD318EED2A5A70CA9",
+      "listing_sha256": "304CD391654FF249B6412CF6355C741724B93D8C5D295FF205AA94327D2F857C",
+      "name": "reversed-natural",
+      "rows": 90001,
+      "source_sha256": "BF95F3F35829C6C2AFD21FB578F6AB1B3DE12090135BF8D0CB4E6166A82CDC4A",
+      "retained_rows": 362,
+      "normalized_source_sha256": "f7903e83c0103795eac1763a66e9104274e5311a3d89a9a692c8324a2a9e65da",
+      "coarse_reference": {
+        "source_sha256": "965806E4B3F9353954D80DD9603A63D1FF6F162A113A156C7FA2F6BD3A71D634",
+        "normalized_source_sha256": "ac91817963e603c3d1123cad1ba1651f624235763168204371f86f1829f99c30",
+        "listing_sha256": "E988DF62B967EBC71A5A0915AD3ECBEA9B9ECE76C37CE71B3F7B72FE37107CF9",
+        "csv_sha256": "D422E70BEFC22F6FC3DC9B99B5E6367302B24CF99EFD9E38BFD92B8F1EDA7A7C",
+        "rows": 18001,
+        "retained_rows": 362,
+        "source_file": "reversed-natural-coarse.net"
+      },
+      "current_time_tolerance_ns": 0.0025
+    },
+    {
+      "sidecar": {
+        "sha256": "73789D4C03BF068D413DCAFFF521937F5B6C0F6F4385F4AB95CD562F8E777E03",
+        "name": "source.txt",
+        "normalized_sha256": "70b496c9a6375895668f9fee0d7315000aefb4ff541053a1905042355027d9ea"
+      },
+      "pins": [
+        "i(vforce)"
+      ],
+      "csv_sha256": "B91D1C33485DF0EE88F3D58C1B8921B4BAE077BE08E4EB2DA61F7489165DE837",
+      "listing_sha256": "5B279DD91E663B8A7C6DB50B37B53688E675CE5B57573A8A4C6D8BD02DD2C828",
+      "name": "reversed-negative",
+      "rows": 90001,
+      "source_sha256": "498ADEC776187017572E7875E7B05C08D4AE0629EE29DDC59E478ED41984C8F7",
+      "retained_rows": 362,
+      "normalized_source_sha256": "69632fde756afa2dc3c49fcfbceea67c58ba6dc9db96bc27063b237d63e93974",
+      "coarse_reference": {
+        "source_sha256": "B7ED5205BB442C015152653B37B7F8BC3A3D6EDA97AB793E70260C6D73D9BC21",
+        "normalized_source_sha256": "6a826b8f6f6046de3281203019681c966974c9a78f6248cc45ee1a9b390e33b2",
+        "listing_sha256": "927099230176AC97B13484BBC15A4EE9DFD66E1A99DC35D9DB089E590A24B94A",
+        "csv_sha256": "DD20A7DFA4106F84C70937FF2ACC6D9A0627F3E54ED4D8CDA305AF9C33CAADCD",
+        "rows": 18001,
+        "retained_rows": 362,
+        "source_file": "reversed-negative-coarse.net"
+      },
+      "current_time_tolerance_ns": 0.0025
+    }
+  ],
+  "time_oracle": "Source-identical vendor and native 2ps transient runs. Each current sample must agree to 1uA at a time within 2.5ps, and a 30ps corrupted DAC slew is independently rejected."
+}

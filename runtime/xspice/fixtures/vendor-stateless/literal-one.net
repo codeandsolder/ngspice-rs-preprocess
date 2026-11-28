@@ -1,0 +1,13 @@
+* SIMetrix stateless ALB execution parameter baseline
+.model MLITERAL_ONE d_logic_block file=FLITERAL_ONE family="UNIV"
+.file FLITERAL_ONE
+PORT D in[0] ;
+PORT Q out[0] ;
+Q=1 ? D : 0 ;
+.endf
+Vdata d 0 PWL(0 0 5n 0 5.1n 5 5.4n 5 5.5n 0 10n 0 10.1n 5 14n 5 14.1n 0 24n 0)
+Aalb [d] [q] MLITERAL_ONE
+Rout q 0 100k
+.tran 20p 24n 0 20p
+.PRINT TRAN V(d) V(q)
+.end

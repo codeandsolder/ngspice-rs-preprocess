@@ -5,19 +5,56 @@
 //! distinction avoids silently evaluating vendor symbols with wrong defaults.
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use std::ops::Range;
 
 /// A model parameter in original source order; duplicates are deliberately
 /// retained for source-dialect resolution rather than guessed here.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelParameter {
     /// Case-preserved identifier.
     pub name: String,
     /// Original expression, or `None` for a bare model flag.
     pub expression: Option<String>,
+    /// Offsets relative to the logical source supplied to this parser.
+    pub span: FieldSpan,
+}
+
+impl ModelParameter {
+    fn from_span(statement: &str, span: FieldSpan) -> Self {
+        Self {
+            name: statement[span.name.clone()].to_owned(),
+            expression: span
+                .value
+                .as_ref()
+                .map(|value| statement[value.clone()].to_owned()),
+            span,
+        }
+    }
+}
+
+/// Lexical field spans in the original logical statement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FieldSpan {
+    /// Case-preserved field identifier or bare positional token.
+    pub name: Range<usize>,
+    /// Exact value, including quotes or nested delimiters.
+    pub value: Option<Range<usize>>,
+    /// Whether the source explicitly separates name and value with an equals sign.
+    pub explicit_equals: bool,
+}
+
+/// How a model parameter list terminates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelTermination {
+    /// Require the closing model wrapper, if present.
+    Complete,
+    /// The caller has identified a dialect-specific terminator and supplies only its prefix.
+    DialectPrefix,
 }
 
 /// One lexed `.model` statement. This is deliberately model-family agnostic.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelCard {
     /// Declared model identifier.
     pub name: String,
@@ -25,7 +62,8 @@ pub struct ModelCard {
     pub family: String,
     /// Named parameter tokens, preserving expression text and ordering.
     pub parameters: Vec<ModelParameter>,
-    /// 1-based physical source line where the `.model` begins.
+    /// 1-based physical source line where the `.model` begins, or zero
+    /// when only a projected logical statement is available.
     pub source_line: usize,
 }
 
@@ -58,38 +96,20 @@ pub fn parse_model_cards(input: &[u8]) -> Result<Vec<ModelCard>> {
 /// Combine `+` continuation lines and preserve physical source locations.
 /// Never interpret opaque non-model source statements while lexing.
 pub(crate) fn logical_statements(input: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
-    let mut complete = Vec::new();
-    for (index, physical_line) in input.split(|byte| *byte == b'\n').enumerate() {
-        let line = physical_line
-            .strip_suffix(b"\r")
-            .unwrap_or(physical_line)
-            .trim_ascii();
-        if line.is_empty() || line.first() == Some(&b'*') {
-            continue;
-        }
-        let line = strip_comment(line).trim_ascii();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(continuation) = line.strip_prefix(b"+") {
-            let Some((_, statement)): Option<&mut (usize, Vec<u8>)> = complete.last_mut() else {
-                bail!(
-                    "line {}: continuation without a preceding source line",
-                    index + 1
-                );
-            };
-            statement.push(b' ');
-            statement.extend_from_slice(continuation.trim_ascii());
-        } else {
-            complete.push((index + 1, line.to_vec()));
-        }
-    }
-    Ok(complete)
+    let normalized = crate::lexical::normalize_nbsp(input);
+    let bytes = normalized.as_deref().unwrap_or(input);
+    Ok(crate::lexical::statements(bytes)?
+        .into_iter()
+        .map(|statement| (statement.line, statement.text))
+        .collect())
 }
 
 /// Decode named source parameters shared by `.param` and `.subckt` syntax.
 /// Values may contain nested expressions/quoted strings, and names require `=`.
-pub(crate) fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
+///
+/// # Errors
+/// Invalid names, missing assignments or malformed expression values.
+pub fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
     let mut source = Source {
         text: input,
         offset: 0,
@@ -100,24 +120,253 @@ pub(crate) fn parse_assignments(input: &str) -> Result<Vec<ModelParameter>> {
         if source.offset == input.len() {
             break;
         }
-        let name = source.name();
-        ensure!(!name.is_empty(), "invalid parameter identifier in {input}");
-        source.skip_space();
+        let field = source.field(&[])?;
         ensure!(
-            input.as_bytes().get(source.offset) == Some(&b'='),
-            "parameter {name} requires name=value"
+            field.explicit_equals,
+            "parameter {} requires name=value",
+            &input[field.name]
         );
-        source.offset += 1;
-        source.skip_space();
-        let expression = source
-            .value()
-            .with_context(|| format!("parameter {name}"))?;
-        parsed.push(ModelParameter {
-            name: name.to_owned(),
-            expression: Some(expression.to_owned()),
-        });
+        parsed.push(ModelParameter::from_span(input, field));
     }
     Ok(parsed)
+}
+
+/// A function declaration's identifier and ordered formal arguments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionSignature {
+    /// Case-preserved source name.
+    pub name: String,
+    /// Case-preserved formals, unique under ASCII case folding.
+    pub formals: Vec<String>,
+}
+
+/// A scalar or function-valued parameter declaration, in source order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterDeclaration {
+    /// Exact field text and source spans, including a formal list if present.
+    pub field: ModelParameter,
+    /// A function signature, absent for scalar assignments.
+    pub function: Option<FunctionSignature>,
+}
+
+fn valid_formal(name: &str) -> bool {
+    name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Parse a source function signature, returning the remaining declaration body.
+///
+/// # Errors
+/// Missing/malformed formal list, invalid identifiers, or repeated formals.
+pub fn parse_function_signature(source: &str) -> Result<(FunctionSignature, &str)> {
+    let open = source
+        .find('(')
+        .context("user-defined function requires formal argument list")?;
+    let close = source[open + 1..]
+        .find(')')
+        .map(|position| position + open + 1)
+        .context("user-defined function missing closing parenthesis")?;
+    let name = source[..open].trim();
+    ensure!(
+        name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && name.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'#' | b'$' | b'[' | b']')),
+        "invalid function identifier {name}"
+    );
+    let mut formals = Vec::new();
+    let raw = source[open + 1..close].trim();
+    if !raw.is_empty() {
+        let mut seen = std::collections::BTreeSet::new();
+        for item in raw.split(',') {
+            let formal = item.trim();
+            ensure!(valid_formal(formal), "invalid formal parameter {formal}");
+            ensure!(
+                seen.insert(formal.to_ascii_lowercase()),
+                "repeated function formal {formal}"
+            );
+            formals.push(formal.to_owned());
+        }
+    }
+    Ok((
+        FunctionSignature {
+            name: name.to_owned(),
+            formals,
+        },
+        &source[close + 1..],
+    ))
+}
+
+/// Parse mixed scalar and user-defined function assignments.
+///
+/// Uses the shared named-field tokenizer. Whitespace between a function name and its formal
+/// list is allowed; expression values retain their original delimiters.
+///
+/// # Errors
+/// Malformed fields, formal lists, or missing assignment values.
+pub fn parse_parameter_declarations(input: &str) -> Result<Vec<ParameterDeclaration>> {
+    let mut source = Source {
+        text: input,
+        offset: 0,
+    };
+    let mut result = Vec::new();
+    loop {
+        source.skip_separators();
+        if source.offset == input.len() {
+            return Ok(result);
+        }
+        let start = source.offset;
+        source.token(true)?;
+        let mut end = source.offset;
+        source.skip_space();
+        if source.text.as_bytes().get(source.offset) == Some(&b'(') {
+            source.token(true)?;
+            end = source.offset;
+        }
+        let function = if input[start..end].contains('(') {
+            let (signature, rest) = parse_function_signature(&input[start..end])?;
+            ensure!(
+                rest.trim().is_empty(),
+                "unexpected function signature suffix"
+            );
+            Some(signature)
+        } else {
+            None
+        };
+        let field = source.field_after_name(start..end, &[])?;
+        ensure!(
+            field.explicit_equals,
+            "parameter {} requires name=value",
+            &input[field.name]
+        );
+        result.push(ParameterDeclaration {
+            field: ModelParameter::from_span(input, field),
+            function,
+        });
+    }
+}
+
+/// Read positional tokens up to the first named parameter or PARAMS: marker.
+///
+/// Parenthesized terminal lists and commas use the same token boundaries as
+/// native ngspice. Return the unconsumed assignment text.
+#[must_use = "the returned prefix and remainder identify the positional and assignment fields"]
+pub fn positional_prefix(input: &str) -> (Vec<(&str, usize)>, &str) {
+    let mut source = Source {
+        text: input,
+        offset: 0,
+    };
+    let mut tokens = Vec::new();
+    loop {
+        while input
+            .as_bytes()
+            .get(source.offset)
+            .is_some_and(|b| b.is_ascii_whitespace() || matches!(*b, b',' | b'(' | b')'))
+        {
+            source.offset += 1;
+        }
+        let start = source.offset;
+        let token = source.name();
+        if token.is_empty() {
+            return (tokens, &input[start..]);
+        }
+        if token
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("params:"))
+        {
+            return (tokens, &input[start + 7..]);
+        }
+        source.skip_space();
+        if input.as_bytes().get(source.offset) == Some(&b'=') {
+            return (tokens, &input[start..]);
+        }
+        tokens.push((token, start + token.len()));
+    }
+}
+
+/// Named scalar/flag parameters of an already identified MOS instance.
+/// The caller provides the maximum arity of an unparenthesized IC vector.
+///
+/// # Errors
+/// Malformed assignments or unbalanced expressions.
+pub fn instance_fields(input: &str, ic_arity: usize) -> Result<Vec<ModelParameter>> {
+    let mut source = Source {
+        text: input,
+        offset: 0,
+    };
+    let mut parsed = Vec::new();
+    loop {
+        source.skip_separators();
+        if source.offset == input.len() {
+            return Ok(parsed);
+        }
+        let mut field = source.field(&[])?;
+        // Keep a family-sized IC vector; a multi-component
+        // parenthesized value already contains the whole vector.
+        if input[field.name.clone()].eq_ignore_ascii_case("ic")
+            && let Some(value) = &mut field.value
+            && instance_vector_fields(&input[value.clone()])?.len() == 1
+        {
+            for _ in 1..ic_arity {
+                let end = value.end;
+                source.skip_space();
+                let first = input.as_bytes().get(source.offset).copied();
+                if first == Some(b',') {
+                    source.offset += 1;
+                    source.skip_space();
+                    source.value()?;
+                } else if first.is_some_and(|b| {
+                    b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'{' | b'\'' | b'(')
+                }) {
+                    source.value()?;
+                } else {
+                    source.offset = end;
+                    break;
+                }
+                value.end = source.offset;
+            }
+        }
+        parsed.push(ModelParameter::from_span(input, field));
+    }
+}
+
+/// Split an instance vector into balanced scalar expressions.
+///
+/// Delimiters and quoted expressions are preserved. Commas and whitespace separate
+/// components; an optional outer parenthesis groups the entire vector.
+///
+/// # Errors
+/// Unbalanced expressions, empty components or an assignment inside a vector.
+pub fn instance_vector_fields(input: &str) -> Result<Vec<&str>> {
+    let mut input = input.trim();
+    let mut spans = crate::lexical::comma_tokens(input.as_bytes())?;
+    if spans.len() == 1
+        && let Some(group) = input
+            .strip_prefix('(')
+            .and_then(|tail| tail.strip_suffix(')'))
+    {
+        input = group;
+        spans = crate::lexical::comma_tokens(input.as_bytes())?;
+    }
+    let mut fields = Vec::new();
+    let mut comma_allowed = false;
+    for span in spans {
+        let field = &input[span];
+        match field {
+            "," => {
+                ensure!(comma_allowed, "empty instance vector component");
+                comma_allowed = false;
+            }
+            "=" => bail!("assignment inside an instance vector"),
+            _ => {
+                fields.push(field);
+                comma_allowed = true;
+            }
+        }
+    }
+    ensure!(comma_allowed, "empty instance vector component");
+    Ok(fields)
 }
 
 fn is_model_start(line: &[u8]) -> bool {
@@ -125,32 +374,6 @@ fn is_model_start(line: &[u8]) -> bool {
         return false;
     };
     prefix.eq_ignore_ascii_case(b".model") && line.get(6).is_some_and(u8::is_ascii_whitespace)
-}
-
-fn strip_comment(line: &[u8]) -> &[u8] {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut nested_braces = 0;
-    for (index, &byte) in line.iter().enumerate() {
-        if let Some(delimiter) = quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == delimiter {
-                quote = None;
-            }
-        } else {
-            match byte {
-                b'\'' | b'"' => quote = Some(byte),
-                b'{' => nested_braces += 1,
-                b'}' if nested_braces > 0 => nested_braces -= 1,
-                b'$' | b';' if nested_braces == 0 => return &line[..index],
-                _ => {}
-            }
-        }
-    }
-    line
 }
 
 struct Source<'a> {
@@ -192,12 +415,14 @@ impl<'a> Source<'a> {
     }
 
     fn value(&mut self) -> Result<&'a str> {
+        self.token(false)
+    }
+
+    fn token(&mut self, stop_at_equals: bool) -> Result<&'a str> {
         let start = self.offset;
         let mut quote = None;
         let mut escaped = false;
-        let mut round = 0_usize;
-        let mut curly = 0_usize;
-        let mut square = 0_usize;
+        let mut stack = Vec::new();
         while let Some(&byte) = self.text.as_bytes().get(self.offset) {
             if let Some(delimiter) = quote {
                 if escaped {
@@ -208,18 +433,26 @@ impl<'a> Source<'a> {
                     quote = None;
                 }
             } else {
+                if stack.is_empty()
+                    && (byte.is_ascii_whitespace()
+                        || matches!(byte, b',' | b')' | b';')
+                        || stop_at_equals && byte == b'=')
+                {
+                    break;
+                }
                 match byte {
                     b'\'' | b'"' => quote = Some(byte),
-                    b'(' => round += 1,
-                    b')' if round > 0 => round -= 1,
-                    b')' if curly == 0 && square == 0 => break,
-                    b'{' => curly += 1,
-                    b'}' if curly > 0 => curly -= 1,
-                    b'[' => square += 1,
-                    b']' if square > 0 => square -= 1,
-                    b',' if round == 0 && curly == 0 && square == 0 => break,
-                    b if b.is_ascii_whitespace() && round == 0 && curly == 0 && square == 0 => {
-                        break;
+                    b'(' | b'{' | b'[' => stack.push(byte),
+                    b')' | b'}' | b']' => {
+                        let expected = match byte {
+                            b')' => b'(',
+                            b'}' => b'{',
+                            _ => b'[',
+                        };
+                        ensure!(
+                            stack.pop() == Some(expected),
+                            "mismatched parameter delimiters"
+                        );
                     }
                     _ => {}
                 }
@@ -227,89 +460,189 @@ impl<'a> Source<'a> {
             self.offset += 1;
         }
         ensure!(
-            quote.is_none() && round == 0 && curly == 0 && square == 0,
-            "unterminated quote or nested model parameter expression"
+            quote.is_none() && stack.is_empty(),
+            "unterminated quote or nested parameter expression"
         );
-        ensure!(start != self.offset, "empty .model parameter value");
+        ensure!(start != self.offset, "empty parameter token");
         Ok(&self.text[start..self.offset])
+    }
+
+    fn field(&mut self, positional: &[&str]) -> Result<FieldSpan> {
+        let name_start = self.offset;
+        self.token(true)?;
+        self.field_after_name(name_start..self.offset, positional)
+    }
+
+    fn field_after_name(
+        &mut self,
+        name_span: Range<usize>,
+        positional: &[&str],
+    ) -> Result<FieldSpan> {
+        let name = &self.text[name_span.clone()];
+        self.skip_space();
+        let explicit_equals = self.text.as_bytes().get(self.offset) == Some(&b'=');
+        let value =
+            if explicit_equals || positional.iter().any(|key| name.eq_ignore_ascii_case(key)) {
+                if explicit_equals {
+                    self.offset += 1;
+                    self.skip_space();
+                }
+                let start = self.offset;
+                self.token(true)
+                    .with_context(|| format!("parameter {name}"))?;
+                let end = self.offset;
+                self.skip_space();
+                ensure!(
+                    self.text.as_bytes().get(self.offset) != Some(&b'='),
+                    "parameter {name} is missing a value before the next assignment"
+                );
+                Some(start..end)
+            } else {
+                None
+            };
+        Ok(FieldSpan {
+            name: name_span,
+            value,
+            explicit_equals,
+        })
     }
 }
 
-fn parse_one(statement: &str, source_line: usize) -> Result<ModelCard> {
-    let mut source = Source {
-        text: statement,
-        offset: 6,
-    };
-    source.skip_space();
-    let name = source.name();
-    ensure!(
-        !name.is_empty(),
-        "line {source_line}: .model requires a name"
-    );
-    source.skip_space();
-    let family = source.name();
-    ensure!(
-        !family.is_empty(),
-        "line {source_line}: .model {name} requires a family"
-    );
-    source.skip_space();
-    let wrapper = statement.as_bytes().get(source.offset) == Some(&b'(');
-    if wrapper {
-        source.offset += 1;
-    }
-    let mut parameters = Vec::new();
-    loop {
-        source.skip_separators();
-        let next = statement.as_bytes().get(source.offset).copied();
-        if wrapper && next == Some(b')') {
-            source.offset += 1;
-            source.skip_space();
-            ensure!(
-                source.offset == statement.len(),
-                "line {source_line}: trailing tokens after .model parameters"
-            );
-            break;
-        }
-        if next.is_none() {
-            ensure!(
-                !wrapper,
-                "line {source_line}: missing closing .model parenthesis"
-            );
-            break;
-        }
-        ensure!(
-            next != Some(b')'),
-            "line {source_line}: unexpected closing parenthesis"
-        );
-        let name = source.name();
-        ensure!(
-            !name.is_empty(),
-            "line {source_line}: invalid model parameter identifier"
-        );
-        source.skip_space();
-        let expression = if statement.as_bytes().get(source.offset) == Some(&b'=') {
-            source.offset += 1;
-            source.skip_space();
-            Some(
-                source
-                    .value()
-                    .with_context(|| format!("line {source_line}: {name}"))?
-                    .to_owned(),
-            )
-        } else {
-            None
-        };
-        parameters.push(ModelParameter {
-            name: name.to_owned(),
-            expression,
-        });
-    }
+pub(crate) fn parse_one(statement: &str, source_line: usize) -> Result<ModelCard> {
+    parse_model_card(statement, source_line, &[])
+}
+
+/// Parse one already joined model statement.
+///
+/// Allow explicitly selected
+/// parameter names to use the source dialect's positional value syntax.
+/// All other bare tokens remain flags; native parsing uses no positional names.
+///
+/// # Errors
+/// Rejects malformed headers, missing selected values and unbalanced expressions.
+pub fn parse_model_card(
+    statement: &str,
+    source_line: usize,
+    positional: &[&str],
+) -> Result<ModelCard> {
+    let (name, family, mut source) =
+        model_header_source(statement).with_context(|| format!("line {source_line}"))?;
+    let parameters = field_spans(&mut source, positional, ModelTermination::Complete)
+        .with_context(|| format!("line {source_line}: model {name}"))?
+        .into_iter()
+        .map(|field| ModelParameter::from_span(statement, field))
+        .collect();
     Ok(ModelCard {
         name: name.to_owned(),
         family: family.to_owned(),
         parameters,
         source_line,
     })
+}
+
+/// Parse a joined SPICE assignment/flag list with the model-card grammar.
+///
+/// Positional value names are explicit at the call site. Source ranges are
+/// relative to the supplied assignment list.
+///
+/// # Errors
+/// Invalid fields, missing values or unbalanced delimiters.
+pub fn parse_parameter_fields(input: &str, positional: &[&str]) -> Result<Vec<ModelParameter>> {
+    let mut source = Source {
+        text: input,
+        offset: 0,
+    };
+    source.skip_space();
+    Ok(
+        field_spans(&mut source, positional, ModelTermination::Complete)?
+            .into_iter()
+            .map(|span| ModelParameter::from_span(input, span))
+            .collect(),
+    )
+}
+
+fn model_header_source(statement: &str) -> Result<(&str, &str, Source<'_>)> {
+    let mut source = Source {
+        text: statement,
+        offset: 0,
+    };
+    source.skip_space();
+    ensure!(
+        is_model_start(&statement.as_bytes()[source.offset..]),
+        "expected .model statement"
+    );
+    source.offset += 6;
+    source.skip_space();
+    let name = source.name();
+    ensure!(!name.is_empty(), ".model requires a name");
+    source.skip_space();
+    let family = source.name();
+    ensure!(!family.is_empty(), ".model {name} requires a family");
+    source.skip_space();
+    Ok((name, family, source))
+}
+
+fn field_spans(
+    source: &mut Source<'_>,
+    positional: &[&str],
+    termination: ModelTermination,
+) -> Result<Vec<FieldSpan>> {
+    let wrapper = source.text.as_bytes().get(source.offset) == Some(&b'(');
+    if wrapper {
+        source.offset += 1;
+    }
+    let mut fields = Vec::new();
+    loop {
+        source.skip_separators();
+        let next = source.text.as_bytes().get(source.offset).copied();
+        if wrapper && next == Some(b')') {
+            source.offset += 1;
+            source.skip_space();
+            ensure!(
+                matches!(source.text.as_bytes().get(source.offset), None | Some(b';')),
+                "trailing tokens after model parameter list"
+            );
+            return Ok(fields);
+        }
+        if matches!(next, None | Some(b';')) {
+            ensure!(
+                !wrapper || termination == ModelTermination::DialectPrefix,
+                "missing closing model parenthesis"
+            );
+            return Ok(fields);
+        }
+        ensure!(next != Some(b')'), "unexpected closing parenthesis");
+        fields.push(source.field(positional)?);
+    }
+}
+
+/// Parse model fields from a joined logical statement, retaining exact source spans.
+///
+/// For non-model statements, skip the optional model wrapper and scan top-level
+/// fields and positional tokens with the same lexical grammar.
+///
+/// # Errors
+/// Malformed assignments, missing selected positional values, and unbalanced
+/// delimiters are errors, rather than indistinguishable from absent parameters.
+pub fn statement_field_spans(
+    statement: &str,
+    positional: &[&str],
+    termination: ModelTermination,
+) -> Result<Vec<FieldSpan>> {
+    let trimmed = statement.trim_start();
+    if trimmed.starts_with('*') {
+        return Ok(Vec::new());
+    }
+    let mut source = if is_model_start(trimmed.as_bytes()) {
+        model_header_source(statement)?.2
+    } else {
+        Source {
+            text: statement,
+            offset: 0,
+        }
+    };
+    source.skip_space();
+    field_spans(&mut source, positional, termination)
 }
 
 /// Decode a single scalar SPICE numeric constant and its engineering suffix.
@@ -339,7 +672,11 @@ pub fn parse_spice_constant(raw: &str) -> Result<f64> {
         }
     }
     ensure!(digits > 0, "not a scalar SPICE number: {raw}");
-    if matches!(bytes.get(offset), Some(b'e' | b'E' | b'd' | b'D')) {
+    if matches!(bytes.get(offset), Some(b'e' | b'E' | b'd' | b'D'))
+        && !["db", "deg"]
+            .iter()
+            .any(|unit| raw[offset..].eq_ignore_ascii_case(unit))
+    {
         offset += 1;
         if matches!(bytes.get(offset), Some(b'+' | b'-')) {
             offset += 1;
@@ -359,7 +696,12 @@ pub fn parse_spice_constant(raw: &str) -> Result<f64> {
         suffix.bytes().all(|byte| byte.is_ascii_alphabetic()),
         "invalid SPICE unit suffix in {raw}"
     );
-    let scale = if suffix.starts_with("meg") {
+    let scale = if matches!(
+        suffix.as_str(),
+        "hz" | "v" | "ohm" | "s" | "rad" | "db" | "deg"
+    ) {
+        1.0
+    } else if suffix.starts_with("meg") {
         1e6
     } else if suffix.starts_with("mil") {
         25.4e-6
@@ -386,6 +728,60 @@ pub fn parse_spice_constant(raw: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_parameter_declarations_preserve_signatures_and_value_spans() -> Result<()> {
+        let source = "gain=2 CentToFar (c) = '(((c*9)/5)+32)' f(x, Y)={max(x, Y)} base=f(1,2)";
+        let declarations = parse_parameter_declarations(source)?;
+        assert_eq!(declarations.len(), 4);
+        assert!(declarations[0].function.is_none());
+        assert_eq!(
+            declarations[1].function.as_ref().context("signature")?.name,
+            "CentToFar"
+        );
+        assert_eq!(
+            declarations[1]
+                .function
+                .as_ref()
+                .context("signature")?
+                .formals,
+            ["c"]
+        );
+        assert_eq!(
+            declarations[2]
+                .function
+                .as_ref()
+                .context("signature")?
+                .formals,
+            ["x", "Y"]
+        );
+        assert!(declarations[3].function.is_none());
+        for declaration in declarations {
+            let field = declaration.field;
+            assert_eq!(&source[field.span.name], field.name);
+            assert_eq!(
+                &source[field.span.value.context("value span")?],
+                field.expression.context("expression")?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_parameter_function_declarations_are_rejected() {
+        for source in [
+            "f(a,A)=1",
+            "f(a,)=2",
+            "f(1)=2",
+            "f(a+b)=1",
+            "f(a) junk=2",
+            "f(a)=",
+            "f(a=1",
+            "f(a)(b)=2",
+        ] {
+            assert!(parse_parameter_declarations(source).is_err(), "{source}");
+        }
+    }
 
     #[test]
     fn multiline_cards_preserve_expressions_flags_and_order() -> Result<()> {
@@ -437,6 +833,109 @@ mod tests {
     }
 
     #[test]
+    fn model_fields_keep_exact_spans_order_and_dialect_forms() -> Result<()> {
+        let source = r#".model LEVEL NMOS (level=7 LEVEL = 17
+            text="RG=99, a b" q={max(a, f(b[2], 'RG=4'))} VLEVEL=3
+            LIMIT(VDS) = (*, 400) USER [1, 2] flag)"#;
+        let card = parse_model_card(source, 2, &["USER"])?;
+        let names = card
+            .parameters
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "level",
+                "LEVEL",
+                "text",
+                "q",
+                "VLEVEL",
+                "LIMIT(VDS)",
+                "USER",
+                "flag"
+            ]
+        );
+        for field in &card.parameters {
+            assert_eq!(&source[field.span.name.clone()], field.name);
+            assert_eq!(
+                field.span.value.as_ref().map(|span| &source[span.clone()]),
+                field.expression.as_deref()
+            );
+        }
+        assert_eq!(card.parameters[1].expression.as_deref(), Some("17"));
+        assert_eq!(
+            card.parameters[2].expression.as_deref(),
+            Some(r#""RG=99, a b""#)
+        );
+        assert_eq!(card.parameters[5].expression.as_deref(), Some("(*, 400)"));
+        assert_eq!(card.parameters[6].expression.as_deref(), Some("[1, 2]"));
+        assert!(!card.parameters[6].span.explicit_equals);
+        assert!(card.parameters[7].expression.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mapping_fields_use_the_model_grammar() -> Result<()> {
+        let source = r#"   (DEVICE="mos 1", LIMIT(VDS, VGS) = (*, 400), FLAG, USER [1, {x + y}])"#;
+        let fields = parse_parameter_fields(source, &["USER"])?;
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[1].name, "LIMIT(VDS, VGS)");
+        assert_eq!(fields[1].expression.as_deref(), Some("(*, 400)"));
+        assert_eq!(fields[2].expression, None);
+        assert_eq!(fields[3].expression.as_deref(), Some("[1, {x + y}]"));
+        for field in fields {
+            assert_eq!(&source[field.span.name], field.name);
+            assert_eq!(
+                field.span.value.map(|span| &source[span]),
+                field.expression.as_deref()
+            );
+        }
+        assert!(parse_parameter_fields("DEVICE= LEVEL=2", &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_fields_are_not_missing_fields() {
+        for source in [
+            ".model m D (IS= RS=2)",
+            ".model m D (IS= RS = 2)",
+            ".model m D (IS={max(1,2}) )",
+            ".model m D (IS=[1,2})",
+            ".model m D (IS=)",
+            ".model m D (USER)",
+        ] {
+            assert!(parse_model_card(source, 1, &["USER"]).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn instance_vectors_preserve_balanced_scalar_fields() -> Result<()> {
+        for input in [
+            "(1, {max(a, b)}, 'c + d')",
+            "1 {max(a, b)} 'c + d'",
+            "1, {max(a, b)} 'c + d'",
+        ] {
+            assert_eq!(
+                instance_vector_fields(input)?,
+                ["1", "{max(a, b)}", "'c + d'"]
+            );
+        }
+        assert_eq!(
+            instance_vector_fields("(a),(b),(c)")?,
+            ["(a)", "(b)", "(c)"]
+        );
+        let fields = instance_fields("ic=(a),(b),(c) w=1u", 3)?;
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].expression.as_deref(), Some("(a),(b),(c)"));
+        assert_eq!(fields[1].name, "w");
+        for input in ["", "()", ",1", "1,", "1,,2", "1, ,2", "1, a=2", "(1,{2)"] {
+            assert!(instance_vector_fields(input).is_err(), "{input}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn spice_scales_are_not_si_prefix_guesses() -> Result<()> {
         for (raw, expected) in [
             ("100nF", 1e-7),
@@ -449,6 +948,12 @@ mod tests {
             (".5pF", 5e-13),
             ("+6", 6.0),
             ("1a", 1e-18),
+            ("1.0e7Hz", 1e7),
+            ("100V", 100.0),
+            ("45deg", 45.0),
+            ("3dB", 3.0),
+            ("20rad", 20.0),
+            ("10Ohm", 10.0),
         ] {
             let actual = parse_spice_constant(raw)?;
             assert!(

@@ -7,7 +7,7 @@ Xinner public_in public_out INNER
 .ends OUTER
 .subckt INNER pin_in pin_out
 A1 [pin_in] [pin_out] DL
-.model DL d_logic_block def="out[0] = in[0];" input_load=2p out_res=40 out_delay=2n family="HC"
+.model DL d_logic_block input_load=2p out_res=40 out_delay=2n family="HC" def="out[0] = in[0];"
 .ends INNER
 .tran 20p 15n
 .control

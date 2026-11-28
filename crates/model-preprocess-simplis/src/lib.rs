@@ -5,18 +5,30 @@
 //! fail closed instead of being approximated.
 
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 mod hierarchy;
+pub mod source_dialect;
 pub use hierarchy::{
-    LibrarySimulator, LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats,
-    ParsedLibrary, PreprocessedNetlist, SubcircuitCatalog, linked_library_filename,
-    parse_init_target_path, parse_library, parse_library_for_simulator, preprocess_netlist,
-    preprocess_netlist_linked,
+    BoundExpression, FunctionAlias, LibrarySimulator, LinkedGeneratedLibrary,
+    LinkedPreprocessedNetlist, NetlistPreprocessStats, ParsedLibrary, PreprocessedNetlist,
+    SubcircuitCatalog, active_statement_prefix, capacitor_charge_assignments,
+    linked_library_filename, lower_scoped_statements, lower_simetrix_source_view,
+    lower_simetrix_source_view_with_budget, lower_spice_expression, parse_init_statement,
+    parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,
+    parse_library_with_budget, parse_scoped_library, parse_standalone_library, preprocess_netlist,
+    preprocess_netlist_file, preprocess_netlist_linked, preprocess_netlist_linked_file,
+    project_resource, project_simetrix_source, project_source, project_spice_resource,
+    render_projection, rewrite_bound_symbols, rewrite_parameter_symbols, source_include_target,
 };
 
 fn decode_simplis_text(input: &[u8]) -> Result<String> {
+    anyhow::ensure!(!input.contains(&0), "SIMPLIS source contains a NUL byte");
     if let Ok(text) = std::str::from_utf8(input) {
         return Ok(text.to_owned());
     }
@@ -53,19 +65,53 @@ pub enum Value {
     Vector(Vec<Self>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarType {
+    Number,
+    Text,
+}
+
 impl Value {
-    fn number(&self) -> Result<f64> {
+    fn charge_copy(&self, budget: &WorkBudget) -> Result<()> {
+        let _depth = budget.enter()?;
+        budget.charge(Resource::EvaluationSteps, 1)?;
         match self {
-            Self::Number(value) => Ok(*value),
-            Self::Text(_) | Self::Vector(_) => bail!("numeric value required"),
+            Self::Number(_) => Ok(()),
+            Self::Text(text) => budget.charge(Resource::EmittedBytes, text.len()),
+            Self::Vector(values) => {
+                budget.charge(Resource::GeneratedNodes, values.len())?;
+                for value in values {
+                    value.charge_copy(budget)?;
+                }
+                Ok(())
+            }
         }
     }
 
-    fn truthy(&self) -> Result<bool> {
+    fn charged_render(&self, budget: &WorkBudget) -> Result<String> {
+        self.charge_copy(budget)?;
+        self.render()
+    }
+
+    // In the reference expression language, scalar and vector are shapes,
+    // not distinct element types. Empty vectors have no inspectable type.
+    fn scalar_type(&self) -> Result<Option<ScalarType>> {
         match self {
-            Self::Number(value) => Ok(*value != 0.0),
-            Self::Text(value) => Ok(!value.is_empty()),
-            Self::Vector(_) => bail!("vector cannot be used as a boolean"),
+            Self::Number(_) => Ok(Some(ScalarType::Number)),
+            Self::Text(_) => Ok(Some(ScalarType::Text)),
+            Self::Vector(values) => {
+                let mut kind = None;
+                for value in values {
+                    if let Some(next) = value.scalar_type()? {
+                        anyhow::ensure!(
+                            kind.is_none_or(|prior| prior == next),
+                            "SIMPLIS vector elements must have the same type"
+                        );
+                        kind = Some(next);
+                    }
+                }
+                Ok(kind)
+            }
         }
     }
 
@@ -87,16 +133,44 @@ impl Value {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+type GlobalBindings = Arc<BTreeMap<String, Value>>;
+
+#[derive(Clone, Debug, Default)]
 pub struct Environment {
     values: BTreeMap<String, Value>,
+    globals: GlobalBindings,
     options: BTreeMap<String, Value>,
+    budget: WorkBudget,
+}
+
+impl PartialEq for Environment {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+            && self.globals == other.globals
+            && self.options == other.options
+    }
 }
 
 impl Environment {
-    #[must_use]
+    #[must_use = "the returned environment owns parameter and option bindings"]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create bindings that participate in a caller's cumulative budget.
+    #[must_use = "the returned environment shares the caller’s cumulative work budget"]
+    pub fn with_budget(budget: WorkBudget) -> Self {
+        Self {
+            budget,
+            ..Self::default()
+        }
+    }
+
+    fn charged_clone(&self) -> Result<Self> {
+        for value in self.values.values().chain(self.options.values()) {
+            value.charge_copy(&self.budget)?;
+        }
+        Ok(self.clone())
     }
 
     pub fn set(&mut self, name: impl AsRef<str>, value: Value) {
@@ -104,14 +178,44 @@ impl Environment {
             .insert(name.as_ref().to_ascii_uppercase(), value);
     }
 
-    #[must_use]
+    #[must_use = "the returned value is the requested parameter binding"]
     pub fn get(&self, name: &str) -> Option<&Value> {
-        self.values.get(&name.to_ascii_uppercase())
+        let name = name.to_ascii_uppercase();
+        self.values.get(&name).or_else(|| self.globals.get(&name))
     }
 
-    #[must_use]
+    #[must_use = "the result reports whether the parameter is bound"]
     pub fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
+    }
+
+    fn ensure_local_name(&self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.globals.contains_key(&name.to_ascii_uppercase()),
+            "SIMPLIS parameter {name} is reserved by a global binding"
+        );
+        Ok(())
+    }
+
+    fn set_global(&mut self, name: &str, value: Value) -> Result<()> {
+        self.ensure_local_name(name)?;
+        let name = name.to_ascii_uppercase();
+        self.values.remove(&name);
+        if Arc::strong_count(&self.globals) > 1 {
+            for existing in self.globals.values() {
+                existing.charge_copy(&self.budget)?;
+            }
+        }
+        Arc::make_mut(&mut self.globals).insert(name, value);
+        Ok(())
+    }
+
+    fn inherited(globals: GlobalBindings, budget: WorkBudget) -> Self {
+        Self {
+            globals,
+            budget,
+            ..Self::default()
+        }
     }
 
     pub fn set_option(&mut self, name: impl AsRef<str>, value: Value) {
@@ -119,14 +223,14 @@ impl Environment {
             .insert(name.as_ref().to_ascii_uppercase(), value);
     }
 
-    #[must_use]
+    #[must_use = "the returned value is the requested option binding"]
     pub fn get_option(&self, name: &str) -> Option<&Value> {
         self.options.get(&name.to_ascii_uppercase())
     }
 
-    #[must_use]
+    #[must_use = "the result reports whether any bindings exist"]
     pub(crate) fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.options.is_empty()
+        self.values.is_empty() && self.globals.is_empty() && self.options.is_empty()
     }
 }
 
@@ -172,25 +276,31 @@ enum Token {
     End,
 }
 
-fn engineering_multiplier(suffix: &str) -> Option<f64> {
-    match suffix.to_ascii_uppercase().as_str() {
-        "" => Some(1.0),
-        "T" => Some(1e12),
-        "G" => Some(1e9),
-        "MEG" => Some(1e6),
-        "K" => Some(1e3),
-        "M" => Some(1e-3),
-        "U" => Some(1e-6),
-        "N" => Some(1e-9),
-        "P" => Some(1e-12),
-        "F" => Some(1e-15),
-        "A" => Some(1e-18),
-        _ => None,
+/// A numeric token may carry a unit label after its engineering multiplier.
+fn engineering_multiplier(suffix: &str) -> (f64, usize) {
+    let upper = suffix.to_ascii_uppercase();
+    if upper.starts_with("MEG") {
+        return (1e6, 3);
     }
+    if upper.starts_with("MIL") {
+        return (25.4e-6, 3);
+    }
+    let multiplier = match upper.as_bytes().first() {
+        Some(b'T') => 1e12,
+        Some(b'G') => 1e9,
+        Some(b'K') => 1e3,
+        Some(b'M') => 1e-3,
+        Some(b'U') => 1e-6,
+        Some(b'N') => 1e-9,
+        Some(b'P') => 1e-12,
+        Some(b'F') => 1e-15,
+        Some(b'A') => 1e-18,
+        _ => 1.0,
+    };
+    (multiplier, usize::from(!suffix.is_empty()))
 }
 
-fn parse_number_literal(input: &str) -> Result<f64> {
-    let bytes = input.as_bytes();
+fn decimal_end(bytes: &[u8]) -> usize {
     let mut offset = 0usize;
     while bytes
         .get(offset)
@@ -218,16 +328,39 @@ fn parse_number_literal(input: &str) -> Result<f64> {
             offset = exponent_marker;
         }
     }
-    let (number, suffix) = input.split_at(offset);
+    offset
+}
+
+fn parse_number_literal(input: &str) -> Result<f64> {
+    let (number, suffix) = input.split_at(decimal_end(input.as_bytes()));
     let base: f64 = number
         .parse()
         .with_context(|| format!("invalid SIMPLIS number {input:?}"))?;
-    let multiplier = engineering_multiplier(suffix)
-        .with_context(|| format!("unsupported SIMPLIS numeric suffix {suffix:?}"))?;
-    let value = base * multiplier;
-    if !value.is_finite() {
-        bail!("non-finite SIMPLIS number {input:?}");
-    }
+    anyhow::ensure!(
+        suffix.is_empty() || suffix.starts_with(|c: char| c.is_ascii_alphabetic()),
+        "invalid SIMPLIS numeric suffix {suffix:?}"
+    );
+    anyhow::ensure!(
+        suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "invalid SIMPLIS numeric suffix {suffix:?}"
+    );
+    let (multiplier, prefix) = engineering_multiplier(suffix);
+    // SIMetrix accepts engineering decimal notation (4k7, 2R2)
+    // and ignores trailing unit text (2kOhm, 3V, 1xx). Only digits
+    // immediately following the scale marker extend the mantissa.
+    let fractional = suffix[prefix..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    // The vendor's engineering-decimal expansion leaves an exactly zero
+    // leading value unchanged, including 0k2 and 0.0x2.
+    let value = if fractional == 0 || base == 0.0 {
+        base
+    } else {
+        let digits = &suffix[prefix..prefix + fractional];
+        base + format!("0.{digits}").parse::<f64>()?
+    } * multiplier;
+    anyhow::ensure!(value.is_finite(), "non-finite SIMPLIS number {input:?}");
     Ok(value)
 }
 
@@ -286,17 +419,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
             _ if b.is_ascii_digit() || b == b'.' => {
                 let start = i;
-                i += 1;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_digit()
-                        || bytes[i].is_ascii_alphabetic()
-                        || matches!(bytes[i], b'.' | b'+' | b'-'))
-                {
-                    if matches!(bytes[i], b'+' | b'-')
-                        && !matches!(bytes.get(i.wrapping_sub(1)), Some(b'e' | b'E'))
-                    {
-                        break;
-                    }
+                i += decimal_end(&bytes[i..]);
+                while bytes.get(i).is_some_and(u8::is_ascii_alphanumeric) {
                     i += 1;
                 }
                 let literal = &input[start..i];
@@ -322,18 +446,71 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
+struct Evaluation<'a> {
+    env: &'a Environment,
+    conversion_depth: usize,
+}
+
+impl<'a> Evaluation<'a> {
+    const fn new(env: &'a Environment) -> Self {
+        Self {
+            env,
+            conversion_depth: 0,
+        }
+    }
+
+    fn expression(self, input: &str) -> Result<Value> {
+        self.env
+            .budget
+            .charge(Resource::EvaluationSteps, input.len().max(1))?;
+        let trimmed = input.trim();
+        let inner = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            &trimmed[1..trimmed.len().saturating_sub(1)]
+        } else {
+            trimmed
+        };
+        Parser::new(inner, self)?.parse()
+    }
+
+    fn number(self, value: &Value) -> Result<f64> {
+        match value {
+            Value::Number(number) => Ok(*number),
+            Value::Text(text) => {
+                anyhow::ensure!(
+                    self.conversion_depth < 32,
+                    "SIMPLIS numeric string conversion depth exceeded"
+                );
+                let nested = Self {
+                    conversion_depth: self.conversion_depth + 1,
+                    ..self
+                };
+                let evaluated = nested
+                    .expression(text)
+                    .with_context(|| format!("SIMPLIS numeric conversion of {text:?}"))?;
+                nested.number(&evaluated)
+            }
+            Value::Vector(_) => bail!("numeric value required"),
+        }
+    }
+
+    fn truthy(self, value: &Value) -> Result<bool> {
+        Ok(self.number(value)? != 0.0)
+    }
+}
+
 struct Parser<'a> {
     tokens: Vec<Token>,
     offset: usize,
-    env: &'a Environment,
+    eval: Evaluation<'a>,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &str, env: &'a Environment) -> Result<Self> {
+    fn new(input: &str, eval: Evaluation<'a>) -> Result<Self> {
         Ok(Self {
             tokens: tokenize(input)?,
             offset: 0,
-            env,
+            eval,
         })
     }
 
@@ -360,7 +537,9 @@ impl<'a> Parser<'a> {
         while self.current() == &Token::OrOr {
             self.bump();
             let right = self.parse_and()?;
-            left = Value::Number(f64::from(left.truthy()? || right.truthy()?));
+            left = Value::Number(f64::from(
+                self.eval.truthy(&left)? | self.eval.truthy(&right)?,
+            ));
         }
         Ok(left)
     }
@@ -370,7 +549,9 @@ impl<'a> Parser<'a> {
         while self.current() == &Token::AndAnd {
             self.bump();
             let right = self.parse_compare()?;
-            left = Value::Number(f64::from(left.truthy()? && right.truthy()?));
+            left = Value::Number(f64::from(
+                self.eval.truthy(&left)? & self.eval.truthy(&right)?,
+            ));
         }
         Ok(left)
     }
@@ -416,7 +597,13 @@ impl<'a> Parser<'a> {
         while self.current() == &Token::Amp {
             self.bump();
             let right = self.parse_add()?;
-            left = Value::Text(format!("{}{}", left.render()?, right.render()?));
+            let left_text = left.charged_render(&self.eval.env.budget)?;
+            let right_text = right.charged_render(&self.eval.env.budget)?;
+            self.eval.env.budget.charge(
+                Resource::EmittedBytes,
+                left_text.len().saturating_add(right_text.len()),
+            )?;
+            left = Value::Text(left_text + &right_text);
         }
         Ok(left)
     }
@@ -431,7 +618,7 @@ impl<'a> Parser<'a> {
             }
             self.bump();
             let right = self.parse_mul()?;
-            left = vector_add_sub(left, right, add)?;
+            left = vector_add_sub(left, right, add, self.eval)?;
         }
     }
 
@@ -446,9 +633,9 @@ impl<'a> Parser<'a> {
             self.bump();
             let right = self.parse_unary()?;
             let value = if mul {
-                left.number()? * right.number()?
+                self.eval.number(&left)? * self.eval.number(&right)?
             } else {
-                left.number()? / right.number()?
+                self.eval.number(&left)? / self.eval.number(&right)?
             };
             if !value.is_finite() {
                 bail!("non-finite SIMPLIS arithmetic result");
@@ -458,18 +645,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Value> {
+        let _depth = self.eval.env.budget.enter()?;
         match self.current() {
             Token::Plus => {
                 self.bump();
-                Ok(Value::Number(self.parse_unary()?.number()?))
+                let operand = self.parse_unary()?;
+                Ok(Value::Number(self.eval.number(&operand)?))
             }
             Token::Minus => {
                 self.bump();
-                Ok(Value::Number(-self.parse_unary()?.number()?))
+                let operand = self.parse_unary()?;
+                Ok(Value::Number(-self.eval.number(&operand)?))
             }
             Token::Bang => {
                 self.bump();
-                Ok(Value::Number(f64::from(!self.parse_unary()?.truthy()?)))
+                let operand = self.parse_unary()?;
+                Ok(Value::Number(f64::from(!self.eval.truthy(&operand)?)))
             }
             _ => self.parse_power(),
         }
@@ -481,8 +672,9 @@ impl<'a> Parser<'a> {
             return Ok(left);
         }
         self.bump();
-        let exponent = self.parse_unary()?.number()?;
-        let value = left.number()?.powf(exponent);
+        let operand = self.parse_unary()?;
+        let exponent = self.eval.number(&operand)?;
+        let value = self.eval.number(&left)?.powf(exponent);
         if !value.is_finite() {
             bail!("non-finite SIMPLIS exponentiation result");
         }
@@ -493,7 +685,8 @@ impl<'a> Parser<'a> {
         let mut value = self.parse_primary()?;
         while self.current() == &Token::LBracket {
             self.bump();
-            let index = self.parse_or()?.number()?;
+            let operand = self.parse_or()?;
+            let index = self.eval.number(&operand)?;
             if self.current() != &Token::RBracket {
                 bail!("missing ] after SIMPLIS vector index");
             }
@@ -526,10 +719,13 @@ impl<'a> Parser<'a> {
                 } else if name.eq_ignore_ascii_case("PI") {
                     Ok(Value::Number(std::f64::consts::PI))
                 } else {
-                    self.env
+                    let value = self
+                        .eval
+                        .env
                         .get(&name)
-                        .cloned()
-                        .with_context(|| format!("undefined SIMPLIS variable {name}"))
+                        .with_context(|| format!("undefined SIMPLIS variable {name}"))?;
+                    value.charge_copy(&self.eval.env.budget)?;
+                    Ok(value.clone())
                 }
             }
             Token::LParen => {
@@ -544,6 +740,7 @@ impl<'a> Parser<'a> {
                 let mut values = Vec::new();
                 if self.current() != &Token::RBracket {
                     loop {
+                        self.eval.env.budget.charge(Resource::GeneratedNodes, 1)?;
                         values.push(self.parse_or()?);
                         if self.current() != &Token::Comma {
                             break;
@@ -555,7 +752,9 @@ impl<'a> Parser<'a> {
                     bail!("missing ] in SIMPLIS vector literal");
                 }
                 self.bump();
-                Ok(Value::Vector(values))
+                let vector = Value::Vector(values);
+                vector.scalar_type()?;
+                Ok(vector)
             }
             other => bail!("unexpected SIMPLIS expression token {other:?}"),
         }
@@ -589,7 +788,7 @@ impl<'a> Parser<'a> {
                 bail!("ExistVec accepts exactly one argument");
             }
             self.bump();
-            return Ok(Value::Number(f64::from(self.env.contains(&ident))));
+            return Ok(Value::Number(f64::from(self.eval.env.contains(&ident))));
         }
         let args = self.parse_arguments()?;
         match name.to_ascii_uppercase().as_str() {
@@ -597,24 +796,32 @@ impl<'a> Parser<'a> {
                 if args.len() != 3 {
                     bail!("IFF requires exactly three arguments");
                 }
-                if args[0].truthy()? {
+                let left_type = args[1].scalar_type()?;
+                let right_type = args[2].scalar_type()?;
+                anyhow::ensure!(
+                    left_type.is_none() || right_type.is_none() || left_type == right_type,
+                    "IFF arguments 2 and 3 must be of the same type"
+                );
+                if self.eval.truthy(&args[0])? {
+                    args[1].charge_copy(&self.eval.env.budget)?;
                     Ok(args[1].clone())
                 } else {
+                    args[2].charge_copy(&self.eval.env.budget)?;
                     Ok(args[2].clone())
                 }
             }
-            "ABS" => unary_numeric(name, &args, f64::abs),
-            "SQRT" => unary_numeric(name, &args, f64::sqrt),
-            "SIN" => unary_numeric(name, &args, f64::sin),
-            "LN" => unary_numeric(name, &args, f64::ln),
-            "LOG10" => unary_numeric(name, &args, f64::log10),
-            "FLOOR" => unary_numeric(name, &args, f64::floor),
-            "SIGN" => unary_numeric(name, &args, f64::signum),
-            "VECTOR" => vector_function(name, &args),
+            "ABS" => unary_numeric(name, &args, f64::abs, self.eval),
+            "SQRT" => unary_numeric(name, &args, f64::sqrt, self.eval),
+            "SIN" => unary_numeric(name, &args, f64::sin, self.eval),
+            "LN" => unary_numeric(name, &args, f64::ln, self.eval),
+            "LOG10" => unary_numeric(name, &args, f64::log10, self.eval),
+            "FLOOR" => unary_numeric(name, &args, f64::floor, self.eval),
+            "SIGN" => unary_numeric(name, &args, f64::signum, self.eval),
+            "VECTOR" => vector_function(name, &args, self.eval),
             "SEARCH" => search_function(name, &args),
-            "GETOPTION" => get_option_function(name, &args, self.env),
-            "FORMATNUMBER" => format_number_function(name, &args),
-            "SUBSTSTRING" => subst_string_function(name, &args),
+            "GETOPTION" => get_option_function(name, &args, self.eval.env),
+            "FORMATNUMBER" => format_number_function(name, &args, self.eval),
+            "SUBSTSTRING" => subst_string_function(name, &args, &self.eval.env.budget),
             _ => bail!("unsupported SIMPLIS function {name}"),
         }
     }
@@ -679,7 +886,7 @@ fn format_engineering(value: f64, significant_digits: u32) -> Result<String> {
     Ok(format!("{rendered}{suffix}"))
 }
 
-fn subst_string_function(name: &str, args: &[Value]) -> Result<Value> {
+fn subst_string_function(name: &str, args: &[Value], budget: &WorkBudget) -> Result<Value> {
     if args.len() != 4 {
         bail!("{name} requires exactly four arguments");
     }
@@ -698,15 +905,21 @@ fn subst_string_function(name: &str, args: &[Value]) -> Result<Value> {
     if !mode.eq_ignore_ascii_case("all") {
         bail!("{name} currently supports only mode 'all'");
     }
+    let matches = input.matches(needle).count();
+    let length = input
+        .len()
+        .saturating_sub(matches.saturating_mul(needle.len()))
+        .saturating_add(matches.saturating_mul(replacement.len()));
+    budget.charge(Resource::EmittedBytes, length)?;
     Ok(Value::Text(input.replace(needle, replacement)))
 }
 
-fn format_number_function(name: &str, args: &[Value]) -> Result<Value> {
+fn format_number_function(name: &str, args: &[Value], eval: Evaluation<'_>) -> Result<Value> {
     if args.len() != 2 {
         bail!("{name} currently supports exactly two arguments");
     }
-    let value = args[0].number()?;
-    let significant_digits = args[1].number()?;
+    let value = eval.number(&args[0])?;
+    let significant_digits = eval.number(&args[1])?;
     if significant_digits < 1.0 || significant_digits > 17.0 || significant_digits.fract() != 0.0 {
         bail!("{name} significant digits must be an integer from 1 through 17");
     }
@@ -723,13 +936,15 @@ fn get_option_function(name: &str, args: &[Value], env: &Environment) -> Result<
     let Value::Text(option_name) = &args[0] else {
         bail!("{name} option name must be a string");
     };
-    Ok(env
-        .get_option(option_name)
-        .cloned()
-        .unwrap_or_else(|| Value::Text("FALSE".to_owned())))
+    if let Some(value) = env.get_option(option_name) {
+        value.charge_copy(&env.budget)?;
+        Ok(value.clone())
+    } else {
+        Ok(Value::Text("FALSE".to_owned()))
+    }
 }
 
-fn vector_add_sub(left: Value, right: Value, add: bool) -> Result<Value> {
+fn vector_add_sub(left: Value, right: Value, add: bool, eval: Evaluation<'_>) -> Result<Value> {
     fn apply(left: f64, right: f64, add: bool) -> Result<f64> {
         let value = if add { left + right } else { left - right };
         if !value.is_finite() {
@@ -738,18 +953,27 @@ fn vector_add_sub(left: Value, right: Value, add: bool) -> Result<Value> {
         Ok(value)
     }
 
+    let elements = match (&left, &right) {
+        (Value::Vector(values), _) | (_, Value::Vector(values)) => values.len(),
+        _ => 0,
+    };
+    eval.env.budget.charge(Resource::GeneratedNodes, elements)?;
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => Ok(Value::Number(apply(left, right, add)?)),
-        (Value::Vector(left), Value::Number(right)) => left
-            .into_iter()
-            .map(|value| Ok(Value::Number(apply(value.number()?, right, add)?)))
-            .collect::<Result<Vec<_>>>()
-            .map(Value::Vector),
-        (Value::Number(left), Value::Vector(right)) => right
-            .into_iter()
-            .map(|value| Ok(Value::Number(apply(left, value.number()?, add)?)))
-            .collect::<Result<Vec<_>>>()
-            .map(Value::Vector),
+        (Value::Vector(left), right @ (Value::Number(_) | Value::Text(_))) => {
+            let right = eval.number(&right)?;
+            left.into_iter()
+                .map(|value| Ok(Value::Number(apply(eval.number(&value)?, right, add)?)))
+                .collect::<Result<Vec<_>>>()
+                .map(Value::Vector)
+        }
+        (left @ (Value::Number(_) | Value::Text(_)), Value::Vector(right)) => {
+            let left = eval.number(&left)?;
+            right
+                .into_iter()
+                .map(|value| Ok(Value::Number(apply(left, eval.number(&value)?, add)?)))
+                .collect::<Result<Vec<_>>>()
+                .map(Value::Vector)
+        }
         (Value::Vector(left), Value::Vector(right)) => {
             if left.len() != right.len() {
                 bail!("SIMPLIS vector arithmetic requires equal lengths");
@@ -757,26 +981,37 @@ fn vector_add_sub(left: Value, right: Value, add: bool) -> Result<Value> {
             left.into_iter()
                 .zip(right)
                 .map(|(left, right)| {
-                    Ok(Value::Number(apply(left.number()?, right.number()?, add)?))
+                    Ok(Value::Number(apply(
+                        eval.number(&left)?,
+                        eval.number(&right)?,
+                        add,
+                    )?))
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(Value::Vector)
         }
-        _ => bail!("SIMPLIS addition/subtraction type mismatch"),
+        (left, right) => Ok(Value::Number(apply(
+            eval.number(&left)?,
+            eval.number(&right)?,
+            add,
+        )?)),
     }
 }
 
-fn vector_function(name: &str, args: &[Value]) -> Result<Value> {
+fn vector_function(name: &str, args: &[Value], eval: Evaluation<'_>) -> Result<Value> {
     if args.len() != 1 {
         bail!("{name} requires exactly one argument");
     }
-    let length = args[0].number()?;
+    let length = eval.number(&args[0])?;
     if length < 0.0 || length.fract() != 0.0 {
         bail!("{name} length must be a non-negative integer");
     }
     let length: u32 = format!("{length:.0}")
         .parse()
         .context("SIMPLIS Vector length does not fit u32")?;
+    eval.env
+        .budget
+        .charge(Resource::GeneratedNodes, usize::try_from(length)?)?;
     let values = (0..length)
         .map(|index| Value::Number(f64::from(index)))
         .collect();
@@ -805,11 +1040,16 @@ fn search_function(name: &str, args: &[Value]) -> Result<Value> {
     Ok(Value::Number(index.map_or(-1.0, f64::from)))
 }
 
-fn unary_numeric(name: &str, args: &[Value], function: fn(f64) -> f64) -> Result<Value> {
+fn unary_numeric(
+    name: &str,
+    args: &[Value],
+    function: fn(f64) -> f64,
+    eval: Evaluation<'_>,
+) -> Result<Value> {
     if args.len() != 1 {
         bail!("{name} requires exactly one argument");
     }
-    let value = function(args[0].number()?);
+    let value = function(eval.number(&args[0])?);
     if !value.is_finite() {
         bail!("{name} produced a non-finite result");
     }
@@ -823,13 +1063,9 @@ fn unary_numeric(name: &str, args: &[Value], function: fn(f64) -> f64) -> Result
 /// Returns an error for unsupported syntax/functions, undefined variables, type
 /// mismatches, non-finite arithmetic, or invalid vector access.
 pub fn eval_expression(input: &str, env: &Environment) -> Result<Value> {
-    let trimmed = input.trim();
-    let inner = if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        &trimmed[1..trimmed.len().saturating_sub(1)]
-    } else {
-        trimmed
-    };
-    Parser::new(inner, env)?.parse()
+    let result = Evaluation::new(env).expression(input);
+    env.budget.check()?;
+    result
 }
 
 fn directive<'a>(line: &'a str, name: &str) -> Option<&'a str> {
@@ -910,7 +1146,17 @@ fn brace_belongs_to_runtime_annotation(line: &str, start: usize) -> bool {
     )
 }
 
-fn substitute_line(line: &str, env: &Environment) -> Result<(String, usize)> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Substitution {
+    None,
+    Known,
+    All,
+}
+
+fn substitute_line(line: &str, env: &Environment, mode: Substitution) -> Result<(String, usize)> {
+    if mode == Substitution::None {
+        return Ok((line.to_owned(), 0));
+    }
     let mut output = String::new();
     let mut offset = 0usize;
     let mut substitutions = 0usize;
@@ -921,9 +1167,23 @@ fn substitute_line(line: &str, env: &Environment) -> Result<(String, usize)> {
         if brace_belongs_to_runtime_annotation(line, start) {
             output.push_str(&line[start..=end]);
         } else {
-            let value = eval_expression(&line[start..=end], env)?;
-            output.push_str(&value.render()?);
-            substitutions = substitutions.saturating_add(1);
+            match eval_expression(&line[start..=end], env) {
+                Ok(value) => {
+                    let value = value.charged_render(&env.budget)?;
+                    env.budget.charge(Resource::EmittedBytes, value.len())?;
+                    output.push_str(&value);
+                    substitutions = substitutions.saturating_add(1);
+                }
+                // A plain definition may carry runtime electrical
+                // expressions. The source preprocessor expands its
+                // known compile-time expressions while preserving
+                // expressions outside that environment.
+                Err(_) if mode == Substitution::Known => {
+                    env.budget.check()?;
+                    output.push_str(&line[start..=end]);
+                }
+                Err(error) => return Err(error),
+            }
         }
         offset = end.saturating_add(1);
     }
@@ -931,9 +1191,70 @@ fn substitute_line(line: &str, env: &Environment) -> Result<(String, usize)> {
     Ok((output.replace("%%", "%"), substitutions))
 }
 
+// Elements 9.40d uses 1000, despite the reference manual listing 100.
+// The source cap and the independent implementation resource ceiling are
+// different contracts. A source cap is fixed when entering its loop.
+const DEFAULT_WHILE_ITERATIONS: usize = 1_000;
 const MAX_WHILE_ITERATIONS: usize = 100_000;
 
-fn find_if_bounds(lines: &[&str], start: usize, end: usize) -> Result<(Option<usize>, usize)> {
+fn while_header(header: &str) -> Result<(&str, Option<&str>)> {
+    let header = active_statement_prefix(header).trim();
+    anyhow::ensure!(!header.is_empty(), "SIMPLIS .WHILE requires a condition");
+    let end = if header.starts_with('{') {
+        find_closing_brace(header, 0)? + 1
+    } else {
+        // The vendor also accepts an unbraced, whitespace-delimited
+        // condition. Expressions containing spaces belong in braces.
+        header.find(char::is_whitespace).unwrap_or(header.len())
+    };
+    let condition = &header[..end];
+    let remaining = header[end..].trim();
+    if remaining.is_empty() {
+        return Ok((condition, None));
+    }
+    let limit_end = if remaining.starts_with('{') {
+        find_closing_brace(remaining, 0)? + 1
+    } else {
+        remaining
+            .find(char::is_whitespace)
+            .unwrap_or(remaining.len())
+    };
+    Ok((condition, Some(&remaining[..limit_end])))
+}
+
+fn while_limit(expression: Option<&str>, env: &Environment) -> Result<usize> {
+    let Some(expression) = expression else {
+        return Ok(DEFAULT_WHILE_ITERATIONS);
+    };
+    // Unlike truth testing, the limit requires a numeric value rather
+    // than numeric conversion of a string. Invalid expressions must not
+    // accidentally disable the independent execution ceiling.
+    let Ok(Value::Number(value)) = eval_expression(expression, env) else {
+        // The source tool falls back to its default for unresolved
+        // names, invalid expressions and nonnumeric values (including
+        // quoted numeric strings).
+        env.budget.check()?;
+        return Ok(DEFAULT_WHILE_ITERATIONS);
+    };
+    anyhow::ensure!(
+        value.is_finite() && value <= f64::from(i32::MAX),
+        "SIMPLIS .WHILE limit exceeds signed 32-bit range"
+    );
+    if value < 1.0 {
+        return Ok(0);
+    }
+    let count: usize = format!("{:.0}", value.trunc())
+        .parse()
+        .context("SIMPLIS .WHILE limit does not fit usize")?;
+    Ok(count)
+}
+
+fn find_if_bounds(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    budget: &WorkBudget,
+) -> Result<(Option<usize>, usize)> {
     let mut depth = 1usize;
     let mut else_index = None;
     for (index, line) in lines
@@ -942,6 +1263,8 @@ fn find_if_bounds(lines: &[&str], start: usize, end: usize) -> Result<(Option<us
         .take(end)
         .skip(start.saturating_add(1))
     {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, line.len())?;
         if directive(line, "IF").is_some() {
             depth = depth.saturating_add(1);
         } else if directive(line, "ENDIF").is_some() {
@@ -961,7 +1284,7 @@ fn find_if_bounds(lines: &[&str], start: usize, end: usize) -> Result<(Option<us
     bail!("unterminated SIMPLIS .IF at line {}", start + 1)
 }
 
-fn find_while_end(lines: &[&str], start: usize, end: usize) -> Result<usize> {
+fn find_while_end(lines: &[&str], start: usize, end: usize, budget: &WorkBudget) -> Result<usize> {
     let mut depth = 1usize;
     for (index, line) in lines
         .iter()
@@ -969,6 +1292,8 @@ fn find_while_end(lines: &[&str], start: usize, end: usize) -> Result<usize> {
         .take(end)
         .skip(start.saturating_add(1))
     {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, line.len())?;
         if directive(line, "WHILE").is_some() {
             depth = depth.saturating_add(1);
         } else if directive(line, "ENDWHILE").is_some() {
@@ -990,8 +1315,55 @@ struct PreprocessState<'a> {
     evaluated_conditionals: &'a mut usize,
     substituted_expressions: &'a mut usize,
     parameter_names: &'a mut BTreeSet<String>,
-    substitute_active_lines: bool,
+    substitution: Substitution,
     evaluate_parameters: bool,
+}
+
+fn process_while(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    header: &str,
+    state: &mut PreprocessState<'_>,
+) -> Result<()> {
+    let line = start + 1;
+    let (condition, source_limit) =
+        while_header(header).with_context(|| format!("SIMPLIS .WHILE at line {line}"))?;
+    let mut limit = None;
+    let mut iterations = 0usize;
+    loop {
+        state.env.budget.charge(Resource::Statements, 1)?;
+        let active = eval_expression(condition, state.env)
+            .and_then(|value| Evaluation::new(state.env).truthy(&value))
+            .with_context(|| format!("SIMPLIS .WHILE condition at line {line}"))?;
+        *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
+        if !active {
+            return Ok(());
+        }
+        // An inactive loop never evaluates its count. An entered loop
+        // computes it only once, before executing the first body.
+        let limit = if let Some(limit) = limit {
+            limit
+        } else {
+            let value = while_limit(source_limit, state.env)
+                .with_context(|| format!("SIMPLIS .WHILE limit at line {line}"))?;
+            limit = Some(value);
+            value
+        };
+        // The vendor emits a partial deck after an overrun, but reports
+        // an error. Our API is transactional: never execute or return the
+        // extra iteration once the condition remains true at the cap.
+        anyhow::ensure!(
+            iterations < limit,
+            "SIMPLIS .WHILE at line {line} exceeded source limit {limit} iterations"
+        );
+        anyhow::ensure!(
+            iterations < MAX_WHILE_ITERATIONS,
+            "SIMPLIS .WHILE at line {line} exceeded implementation ceiling {MAX_WHILE_ITERATIONS} iterations"
+        );
+        process_range(lines, start + 1, end, state)?;
+        iterations += 1;
+    }
 }
 
 fn process_range(
@@ -1000,12 +1372,19 @@ fn process_range(
     end: usize,
     state: &mut PreprocessState<'_>,
 ) -> Result<()> {
+    let _depth = state.env.budget.enter()?;
     let mut index = start;
     while index < end {
         let line = lines[index];
+        state.env.budget.charge(Resource::Statements, 1)?;
+        state
+            .env
+            .budget
+            .charge(Resource::ScannedBytes, line.len())?;
         if let Some(condition) = directive(line, "IF") {
-            let (else_index, endif_index) = find_if_bounds(lines, index, end)?;
-            let active = eval_expression(unwrap_then(condition), state.env)?.truthy()?;
+            let (else_index, endif_index) = find_if_bounds(lines, index, end, &state.env.budget)?;
+            let active = Evaluation::new(state.env)
+                .truthy(&eval_expression(unwrap_then(condition), state.env)?)?;
             *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
             if active {
                 process_range(
@@ -1023,24 +1402,9 @@ fn process_range(
         if directive(line, "ELSE").is_some() || directive(line, "ENDIF").is_some() {
             bail!("unexpected SIMPLIS IF terminator at line {}", index + 1);
         }
-        if let Some(condition) = directive(line, "WHILE") {
-            let endwhile_index = find_while_end(lines, index, end)?;
-            let mut iterations = 0usize;
-            loop {
-                let active = eval_expression(condition, state.env)?.truthy()?;
-                *state.evaluated_conditionals = state.evaluated_conditionals.saturating_add(1);
-                if !active {
-                    break;
-                }
-                iterations = iterations.saturating_add(1);
-                if iterations > MAX_WHILE_ITERATIONS {
-                    let line_number = index + 1;
-                    bail!(
-                        "SIMPLIS .WHILE at line {line_number} exceeded {MAX_WHILE_ITERATIONS} iterations"
-                    );
-                }
-                process_range(lines, index.saturating_add(1), endwhile_index, state)?;
-            }
+        if let Some(header) = directive(line, "WHILE") {
+            let endwhile_index = find_while_end(lines, index, end, &state.env.budget)?;
+            process_while(lines, index, endwhile_index, header, state)?;
             index = endwhile_index.saturating_add(1);
             continue;
         }
@@ -1048,6 +1412,10 @@ fn process_range(
             bail!("unexpected SIMPLIS .ENDWHILE at line {}", index + 1);
         }
         if line.trim_start().starts_with('*') {
+            state
+                .env
+                .budget
+                .charge(Resource::EmittedBytes, line.len().saturating_add(1))?;
             state.output.push_str(line);
             state.output.push('\n');
             index = index.saturating_add(1);
@@ -1056,7 +1424,12 @@ fn process_range(
         if let Some(assignment) = directive(line, "VAR").or_else(|| directive(line, "GLOBALVAR")) {
             let (name, value) = parse_assignment(assignment, state.env)
                 .with_context(|| format!("SIMPLIS assignment at line {}", index + 1))?;
-            state.env.set(name, value);
+            if directive(line, "GLOBALVAR").is_some() {
+                state.env.set_global(&name, value)?;
+            } else {
+                state.env.ensure_local_name(&name)?;
+                state.env.set(name, value);
+            }
             *state.assigned_variables = state.assigned_variables.saturating_add(1);
             index = index.saturating_add(1);
             continue;
@@ -1073,7 +1446,7 @@ fn process_range(
             continue;
         }
         if let Some(message) = directive(line, "ERROR") {
-            let (message, _) = substitute_line(message, state.env)?;
+            let (message, _) = substitute_line(message, state.env, Substitution::All)?;
             bail!("SIMPLIS .ERROR at line {}: {}", index + 1, message.trim());
         }
         for unsupported in ["FOR", "ENDFOR"] {
@@ -1081,14 +1454,21 @@ fn process_range(
                 bail!("unsupported SIMPLIS .{unsupported} at line {}", index + 1);
             }
         }
-        if state.substitute_active_lines {
-            let (rendered, count) = substitute_line(line, state.env)
-                .with_context(|| format!("SIMPLIS substitution at line {}", index + 1))?;
-            *state.substituted_expressions = state.substituted_expressions.saturating_add(count);
-            state.output.push_str(&rendered);
+        // A runtime parameter declaration must retain its expression and
+        // binding; control-flow expansion does not evaluate runtime parameters.
+        let mode = if !state.evaluate_parameters && directive(line, "PARAM").is_some() {
+            Substitution::None
         } else {
-            state.output.push_str(line);
-        }
+            state.substitution
+        };
+        let (rendered, count) = substitute_line(line, state.env, mode)
+            .with_context(|| format!("SIMPLIS substitution at line {}", index + 1))?;
+        *state.substituted_expressions = state.substituted_expressions.saturating_add(count);
+        state
+            .env
+            .budget
+            .charge(Resource::EmittedBytes, rendered.len().saturating_add(1))?;
+        state.output.push_str(&rendered);
         state.output.push('\n');
         index = index.saturating_add(1);
     }
@@ -1099,7 +1479,9 @@ fn process_range(
 /// model-library bodies. The caller provides the subcircuit parameter environment.
 ///
 /// Supported today: `.VAR`, `.GLOBALVAR`, `.IF/.ELSE/.ENDIF`, bounded
-/// `.WHILE/.ENDWHILE`, arithmetic, strings, vectors/indexing, `IFF`, `ExistVec`,
+/// `.WHILE/.ENDWHILE` (numeric source count, default 1000 as observed in
+/// Elements 9.40d, independent implementation ceiling), arithmetic, strings,
+/// vectors/indexing, `IFF`, `ExistVec`,
 /// and selected functions. `.FOR`, library lookup, and unsupported expressions fail closed.
 ///
 /// # Errors
@@ -1113,13 +1495,14 @@ pub fn preprocess_body(input: &[u8], initial: &Environment) -> Result<Preprocess
 fn run_preprocess_body(
     input: &[u8],
     initial: &Environment,
-    substitute_active_lines: bool,
+    substitution: Substitution,
     evaluate_parameters: bool,
     parameter_names: &mut BTreeSet<String>,
 ) -> Result<Preprocessed> {
+    initial.budget.charge(Resource::ScannedBytes, input.len())?;
     let text = decode_simplis_text(input)?;
     let lines = text.lines().collect::<Vec<_>>();
-    let mut env = initial.clone();
+    let mut env = initial.charged_clone()?;
     let mut output = String::new();
     let mut assigned_variables = 0usize;
     let mut evaluated_conditionals = 0usize;
@@ -1135,7 +1518,7 @@ fn run_preprocess_body(
             evaluated_conditionals: &mut evaluated_conditionals,
             substituted_expressions: &mut substituted_expressions,
             parameter_names,
-            substitute_active_lines,
+            substitution,
             evaluate_parameters,
         },
     )?;
@@ -1150,18 +1533,37 @@ fn run_preprocess_body(
     })
 }
 
+// Execute source controls and substitute known compile-time expressions
+// without consuming native runtime .PARAM declarations or electrical
+// expressions. Used for root statements and plain subcircuits.
+fn preprocess_control_flow(input: &[u8], initial: &Environment) -> Result<Preprocessed> {
+    run_preprocess_body(
+        input,
+        initial,
+        Substitution::Known,
+        false,
+        &mut BTreeSet::new(),
+    )
+}
+
 fn preprocess_body_with_mode(
     input: &[u8],
     initial: &Environment,
     substitute_active_lines: bool,
 ) -> Result<Preprocessed> {
     if !substitute_active_lines {
-        return run_preprocess_body(input, initial, false, false, &mut BTreeSet::new());
+        return preprocess_control_flow(input, initial);
     }
 
     let mut discovered_names = BTreeSet::new();
-    let discovery = run_preprocess_body(input, initial, false, true, &mut discovered_names)?;
-    let mut seeded = initial.clone();
+    let discovery = run_preprocess_body(
+        input,
+        initial,
+        Substitution::None,
+        true,
+        &mut discovered_names,
+    )?;
+    let mut seeded = initial.charged_clone()?;
     for name in discovered_names {
         let value = discovery
             .environment
@@ -1170,7 +1572,13 @@ fn preprocess_body_with_mode(
             .clone();
         seeded.set(name, value);
     }
-    run_preprocess_body(input, &seeded, true, true, &mut BTreeSet::new())
+    run_preprocess_body(
+        input,
+        &seeded,
+        Substitution::All,
+        true,
+        &mut BTreeSet::new(),
+    )
 }
 
 #[cfg(test)]
@@ -1179,6 +1587,164 @@ mod tests {
 
     fn n(value: f64) -> Value {
         Value::Number(value)
+    }
+
+    #[test]
+    fn numeric_choice_and_engineering_unit_notation_matches_reference() -> Result<()> {
+        let env = Environment::new();
+        for count in 1..=10 {
+            assert_eq!(
+                eval_expression(&format!("{count}x"), &env)?,
+                n(f64::from(count))
+            );
+        }
+        for (expression, expected) in [
+            ("3X", 3.0),
+            ("1xx", 1.0),
+            ("2.5x", 2.5),
+            ("1.5e2x", 150.0),
+            ("4foo", 4e-15),
+            ("2kOhm", 2000.0),
+            ("6megOhm", 6e6),
+            ("3V", 3.0),
+            ("4x2", 4.2),
+            ("4k7", 4700.0),
+            ("2R2", 2.2),
+            ("1meg5", 1.5e6),
+            ("1u25", 1.25e-6),
+            ("2k7Ohm", 2700.0),
+            ("2xyz", 2.0),
+            ("1foo2", 1e-15),
+            ("1.5k2", 1700.0),
+            ("1x2x3", 1.2),
+            ("1abc", 1e-18),
+            ("1abc2", 1e-18),
+            ("3mV", 0.003),
+            ("1mil", 25.4e-6),
+            ("2e", 2.0),
+            ("3efoo", 3.0),
+            ("1e3k", 1e6),
+            ("1e-3k", 1.0),
+            ("2e3x", 2000.0),
+            ("1e+3V", 1000.0),
+            ("3e-2V", 0.03),
+            ("4e2x3", 400.3),
+            ("1e2e3", 100.3),
+            ("1.2e2k3", 120_300.0),
+            ("0.5x1", 0.6),
+            ("0.01k2", 210.0),
+            ("0.0001k2", 200.1),
+            ("0.1e-2k3", 301.0),
+            ("0k2", 0.0),
+            ("0.0x2", 0.0),
+            ("0e2x3", 0.0),
+            ("4k7+1", 4701.0),
+            ("3e-2V-1", -0.97),
+        ] {
+            let actual = Evaluation::new(&env).number(&eval_expression(expression, &env)?)?;
+            assert!(
+                (actual - expected).abs() <= expected.abs() * 4.0 * f64::EPSILON,
+                "{expression}: {actual} != {expected}"
+            );
+        }
+        for invalid in [".", "1.2.3", "1e999", "1k.2", "1x+unknown"] {
+            assert!(eval_expression(invalid, &env).is_err(), "{invalid}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_string_conversion_uses_the_current_environment() -> Result<()> {
+        let mut env = Environment::new();
+        env.set("X", n(5.0));
+        for (expression, expected) in [
+            ("'2x'+1", 3.0),
+            ("'2+3'*4", 20.0),
+            ("'2k'+1", 2001.0),
+            ("'X+2'*3", 21.0),
+            ("'2+3'+1", 6.0),
+            ("'2'+'3'", 5.0),
+            ("ABS('-2')", 2.0),
+            ("IFF('0',2,3)", 3.0),
+            ("IFF('1',2,3)", 2.0),
+            ("!'0'", 1.0),
+        ] {
+            assert_eq!(
+                eval_expression(expression, &env)?,
+                n(expected),
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            eval_expression("'2' & 3", &env)?,
+            Value::Text("23".to_owned())
+        );
+        assert_eq!(eval_expression("'01' == '1'", &env)?, n(0.0));
+        for invalid in ["'2' == 2", "'2' < 3", "2 == '2'", "!'foo'"] {
+            assert!(eval_expression(invalid, &env).is_err(), "{invalid}");
+        }
+        env.set("A", Value::Text("2".to_owned()));
+        env.set("B", Value::Text("A".to_owned()));
+        env.set("C", Value::Text("B+1".to_owned()));
+        assert_eq!(eval_expression("'A'+1", &env)?, n(3.0));
+        assert_eq!(eval_expression("'B'+1", &env)?, n(3.0));
+        assert_eq!(eval_expression("'C'+1", &env)?, n(4.0));
+        env.set("LOOP", Value::Text("LOOP+1".to_owned()));
+        assert!(eval_expression("LOOP+1", &env).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn preprocessing_branches_are_lazy_but_operators_and_iff_are_eager() -> Result<()> {
+        let env = Environment::new();
+        for invalid in [
+            "IFF(1,2,UNDEFINED)",
+            "IFF(0,UNDEFINED,3)",
+            "IFF(0,1/0,3)",
+            "IFF(1,2,'abc')",
+            "0 && UNDEFINED",
+            "1 || UNDEFINED",
+            "0 && 'undefined'",
+            "1 || 'undefined'",
+        ] {
+            assert!(eval_expression(invalid, &env).is_err(), "{invalid}");
+        }
+        assert_eq!(eval_expression("IFF(1,2,[3,4])", &env)?, n(2.0));
+        assert_eq!(eval_expression("IFF(0,[2,3],4)", &env)?, n(4.0));
+        assert_eq!(
+            eval_expression("IFF(1,'hi',['a','b'])", &env)?,
+            Value::Text("hi".to_owned())
+        );
+        assert_eq!(
+            eval_expression("IFF(0,['a','b'],'hi')", &env)?,
+            Value::Text("hi".to_owned())
+        );
+        assert!(eval_expression("IFF(1,2,['a','b'])", &env).is_err());
+        assert!(eval_expression("IFF(1,[2,'a'],[3,4])", &env).is_err());
+        let source = b".IF {0}\nR1 1 0 {UNDEFINED}\n.ELSE\nR2 1 0 3\n.ENDIF\n";
+        assert_eq!(preprocess_body(source, &env)?.bytes, b"R2 1 0 3\n");
+        let source = b".IF {'0'}\nR1 1 0 {UNDEFINED}\n.ELSE\nR2 1 0 3\n.ENDIF\n";
+        assert_eq!(preprocess_body(source, &env)?.bytes, b"R2 1 0 3\n");
+        Ok(())
+    }
+
+    #[test]
+    fn quantity_defaults_overrides_and_inactive_branches_specialize() -> Result<()> {
+        let source = b".SUBCKT CTEST A B VARS: USE_QUANTITY=0 QUANTITY=1x\nC1 A B 1u\n.IF {USE_QUANTITY}\nF1 A B V1 {QUANTITY}\n.ELSE\nR1 A B 1k\n.ENDIF\n.ENDS\n";
+        let mut overrides = Environment::new();
+        assert_eq!(
+            specialize_subcircuit(source, &overrides)?
+                .environment
+                .get("QUANTITY"),
+            Some(&n(1.0))
+        );
+        overrides.set("USE_QUANTITY", n(1.0));
+        overrides.set("QUANTITY", eval_expression("3x", &Environment::new())?);
+        let specialized = specialize_subcircuit(source, &overrides)?;
+        let output = std::str::from_utf8(&specialized.bytes)?;
+        assert!(output.contains("F1 A B V1 3"));
+        assert!(!output.contains("R1 A B 1k"));
+        Ok(())
     }
 
     #[test]
@@ -1239,7 +1805,7 @@ R1 1 0 {RUNTIME}
         assert_eq!(eval_expression("2^3^2", &env)?, n(512.0));
         assert_eq!(eval_expression("-2^2", &env)?, n(-4.0));
         assert_eq!(eval_expression("2^-2", &env)?, n(0.25));
-        let sine = eval_expression("SIN(PI/2)", &env)?.number()?;
+        let sine = Evaluation::new(&env).number(&eval_expression("SIN(PI/2)", &env)?)?;
         assert!((sine - 1.0).abs() < f64::EPSILON);
         Ok(())
     }
@@ -1269,6 +1835,7 @@ R1 1 0 {RUNTIME}
         let (line, count) = substitute_line(
             "C1 P N {C} BRANCH={IF(ANALYSIS=2,1,0)} ICMODE={RUNTIME_MODE}",
             &env,
+            Substitution::All,
         )?;
         assert_eq!(count, 1);
         assert!(line.contains("C1 P N 1e-6"));
@@ -1513,6 +2080,112 @@ R1 1 0 1k
     }
 
     #[test]
+    fn source_while_count_matches_vendor_boundaries() -> Result<()> {
+        for (limit, bound) in [
+            ("", 1000),
+            ("garbage", 1000),
+            ("{UNKNOWN}", 1000),
+            ("'2'", 1000),
+            ("{'2'}", 1000),
+            (r#""2""#, 1000),
+            ("3", 3),
+            ("1002", 1002),
+            ("2.9", 2),
+            ("2e+0", 2),
+            ("2x", 2),
+            ("LIMIT", 2),
+            ("{LIMIT}", 2),
+            ("2+1", 3),
+            ("{LIMIT + 1}", 3),
+            ("3 4", 3),
+            ("0", 0),
+            ("-1", 0),
+            ("-0.5", 0),
+            ("0.5", 0),
+        ] {
+            for count in [bound, bound + 1] {
+                let input = format!(
+                    ".VAR I=0\n.VAR LIMIT=2\n.WHILE {{I<{count}}} {limit}\n.VAR I={{I+1}}\n.ENDWHILE\nR1 1 0 {{I+1}}\n"
+                );
+                let result = preprocess_body(input.as_bytes(), &Environment::new());
+                if count == bound {
+                    let result = result?;
+                    assert_eq!(result.environment.get("I"), Some(&n(f64::from(count))));
+                    assert_eq!(
+                        result.stats.evaluated_conditionals,
+                        usize::try_from(count + 1)?
+                    );
+                } else {
+                    let error = result.err().context("expected source count error")?;
+                    assert!(
+                        format!("{error:#}").contains(&format!("source limit {bound} iterations")),
+                        "{error:#}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn while_source_limit_does_not_disable_the_implementation_ceiling() -> Result<()> {
+        let overflow = preprocess_body(b".WHILE {1} 2147483648\n.ENDWHILE\n", &Environment::new())
+            .err()
+            .context("expected out-of-range limit error")?;
+        assert!(format!("{overflow:#}").contains("signed 32-bit range"));
+        let ceiling = preprocess_body(b".WHILE {1} 100001\n.ENDWHILE\n", &Environment::new())
+            .err()
+            .context("expected implementation ceiling error")?;
+        assert!(format!("{ceiling:#}").contains("implementation ceiling 100000"));
+        Ok(())
+    }
+
+    #[test]
+    fn while_counts_are_entry_local_and_inactive_bodies_are_lazy() -> Result<()> {
+        let source = br".VAR I=0
+.VAR SUM=0
+.WHILE {I<3} 3
+.VAR J=0
+.WHILE {J<2} {2}
+.IF {I==1}
+.VAR SUM={SUM+10}
+.ELSE
+.VAR SUM={SUM+1}
+.ENDIF
+.VAR J={J+1}
+.ENDWHILE
+.VAR I={I+1}
+.ENDWHILE
+.IF {0}
+.WHILE {UNDEFINED} UNKNOWN
+.ERROR 'unreachable'
+.ENDWHILE
+.ENDIF
+.WHILE {0} UNKNOWN
+.ERROR 'unreachable'
+.ENDWHILE
+R1 1 0 {SUM}
+";
+        let result = preprocess_body(source, &Environment::new())?;
+        assert_eq!(std::str::from_utf8(&result.bytes)?.trim(), "R1 1 0 24");
+        for (limit, next) in [(2, 10), (3, 0)] {
+            let input = format!(
+                ".VAR I=0\n.VAR LIMIT={limit}\n.WHILE {{I<5}} {{LIMIT}}\n.VAR I={{I+1}}\n.VAR LIMIT={next}\n.ENDWHILE\n"
+            );
+            let error = preprocess_body(input.as_bytes(), &Environment::new())
+                .err()
+                .context("entry count must not change")?;
+            assert!(format!("{error:#}").contains(&format!("source limit {limit} iterations")));
+        }
+        let naked = preprocess_body(
+            b".VAR I=0\n.WHILE I<3 3\n.VAR I={I+1}\n.ENDWHILE\nR1 1 0 {I+1}\n",
+            &Environment::new(),
+        )?;
+        assert_eq!(std::str::from_utf8(&naked.bytes)?.trim(), "R1 1 0 4");
+        Ok(())
+    }
+
+    #[test]
     fn for_remains_fail_closed() {
         let error = preprocess_body(b".for I=0 to 1\n.enfor\n", &Environment::new())
             .err()
@@ -1529,10 +2202,42 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
+/// Historical fixed nominal `SIMetrix` constants, as decimal source literals.
+#[must_use = "the result determines whether the source symbol is a fixed constant"]
+pub fn simetrix_constant(name: &str) -> Option<&'static str> {
+    match name.to_ascii_uppercase().as_str() {
+        "PI" => Some("3.141592653589793"),
+        "E" => Some("2.718281828459045"),
+        "BOLTZ" => Some("1.3806226e-23"),
+        "ECHARGE" => Some("1.6021918e-19"),
+        _ => None,
+    }
+}
+
+/// Reject attempts to bind a predefined nominal parameter as an ordinary one.
+///
+/// # Errors
+/// The name is reserved by the source simulator.
+pub fn validate_simetrix_parameter_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        simetrix_constant(name).is_none() && !name.eq_ignore_ascii_case("TEMP"),
+        "SIMetrix predefined parameter {name} has already been defined"
+    );
+    Ok(())
+}
+
+/// Parse ordered parameter assignments without evaluating their expressions.
+///
+/// # Errors
+/// Rejects malformed names, missing values and unbalanced expression delimiters.
+pub fn parameter_assignments(input: &str) -> Result<Vec<(&str, &str)>> {
+    named_assignments(input, false)
+}
+
+fn named_assignments(input: &str, init: bool) -> Result<Vec<(&str, &str)>> {
     let bytes = input.as_bytes();
     let mut offset = 0usize;
-    let mut count = 0usize;
+    let mut assignments = Vec::new();
     while offset < bytes.len() {
         while bytes
             .get(offset)
@@ -1544,10 +2249,11 @@ fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
             break;
         }
         let name_start = offset;
-        while bytes
-            .get(offset)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$' | b'.'))
-        {
+        while bytes.get(offset).is_some_and(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(*byte, b'_' | b'$' | b'.')
+                || init && matches!(*byte, b'!' | b':' | b'(' | b')')
+        }) {
             offset += 1;
         }
         if offset == name_start {
@@ -1615,12 +2321,30 @@ fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
         if expression.is_empty() {
             bail!("SIMPLIS parameter {name} has an empty value");
         }
+        assignments.push((name, expression));
+    }
+    Ok(assignments)
+}
+
+fn parse_parameter_list(input: &str, env: &mut Environment) -> Result<usize> {
+    env.budget.charge(Resource::ScannedBytes, input.len())?;
+    let assignments = parameter_assignments(input)?;
+    for (name, expression) in &assignments {
+        env.ensure_local_name(name)?;
+        // A VARS header is evaluated directly, not as a substitution line.
+        // In Elements 9.40d even a constant braced default is invalid.
+        anyhow::ensure!(
+            !expression
+                .split('\'')
+                .step_by(2)
+                .any(|part| part.contains(['{', '}'])),
+            "braced SIMPLIS default for {name} is not a direct expression"
+        );
         let value = eval_expression(expression, env)
             .with_context(|| format!("evaluating default for SIMPLIS parameter {name}"))?;
         env.set(name, value);
-        count = count.saturating_add(1);
     }
-    Ok(count)
+    Ok(assignments.len())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1652,7 +2376,11 @@ pub fn specialize_subcircuit(
     input: &[u8],
     overrides: &Environment,
 ) -> Result<SpecializedSubcircuit> {
-    specialize_subcircuit_with_base(input, &Environment::new(), overrides)
+    specialize_subcircuit_with_base(
+        input,
+        &Environment::with_budget(overrides.budget.clone()),
+        overrides,
+    )
 }
 
 fn specialize_subcircuit_with_base(
@@ -1671,14 +2399,7 @@ fn specialize_subcircuit_control_flow_with_base(
     specialize_subcircuit_with_base_mode(input, inherited, overrides, false)
 }
 
-fn specialize_subcircuit_with_base_mode(
-    input: &[u8],
-    inherited: &Environment,
-    overrides: &Environment,
-    substitute_active_lines: bool,
-) -> Result<SpecializedSubcircuit> {
-    let text = decode_simplis_text(input)?;
-    let lines: Vec<&str> = text.lines().collect();
+fn read_subcircuit_header(lines: &[&str]) -> Result<(String, usize)> {
     let first = lines
         .iter()
         .position(|line| directive(line, "SUBCKT").is_some())
@@ -1699,6 +2420,38 @@ fn specialize_subcircuit_with_base_mode(
                 .trim(),
         );
     }
+    Ok((header, header_end))
+}
+
+fn subcircuit_parameters(header: &str) -> &str {
+    find_ascii_case_insensitive(header, "vars:")
+        .map_or("", |index| &header[index + "vars:".len()..])
+}
+
+fn call_defaults(input: &[u8], inherited: &Environment) -> Result<Environment> {
+    inherited
+        .budget
+        .charge(Resource::ScannedBytes, input.len())?;
+    let text = decode_simplis_text(input)?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let (header, _) = read_subcircuit_header(&lines)?;
+    let mut defaults = inherited.charged_clone()?;
+    parse_parameter_list(subcircuit_parameters(&header), &mut defaults)?;
+    Ok(defaults)
+}
+
+fn specialize_subcircuit_with_base_mode(
+    input: &[u8],
+    inherited: &Environment,
+    overrides: &Environment,
+    substitute_active_lines: bool,
+) -> Result<SpecializedSubcircuit> {
+    inherited
+        .budget
+        .charge(Resource::ScannedBytes, input.len())?;
+    let text = decode_simplis_text(input)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let (header, header_end) = read_subcircuit_header(&lines)?;
     let subckt_rest = directive(&header, "SUBCKT").context("invalid .SUBCKT header")?;
     let vars_offset = find_ascii_case_insensitive(subckt_rest, "vars:");
     let (identity, parameter_text) = vars_offset.map_or((subckt_rest, ""), |index| {
@@ -1714,11 +2467,16 @@ fn specialize_subcircuit_with_base_mode(
         bail!("SIMPLIS .SUBCKT {name} has no external nodes");
     }
 
-    let mut env = inherited.clone();
+    let mut env = inherited.charged_clone()?;
+    for value in overrides.options.values() {
+        value.charge_copy(&env.budget)?;
+    }
     env.options.extend(overrides.options.clone());
     let default_parameters = parse_parameter_list(parameter_text, &mut env)?;
     let mut overridden_parameters = 0usize;
     for (name, value) in &overrides.values {
+        env.ensure_local_name(name)?;
+        value.charge_copy(&env.budget)?;
         env.values.insert(name.clone(), value.clone());
         overridden_parameters = overridden_parameters.saturating_add(1);
     }

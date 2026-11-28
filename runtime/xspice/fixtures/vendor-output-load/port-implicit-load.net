@@ -1,0 +1,57 @@
+* Original clocked output port-delay versus load compensation
+Vdata d 0 PWL(0 0 4n 0 4.1n 5 24n 5 24.1n 0 50n 0)
+Vclock ck 0 PWL(0 0 9.9n 0 10n 5 13n 5 13.1n 0 29.9n 0 30n 5 33n 5 33.1n 0 50n 0)
+.file LOGIC0
+PORT D in[0] ;
+PORT CK in[1] ;
+PORT (DELAY=0n) Q out[0] ;
+EDGE (WIDTH=1, DELAY=1n, CLOCK=in[1]) FF=0 ;
+FF = D ;
+Q = FF ;
+.endf
+.file LOGIC1
+PORT D in[0] ;
+PORT CK in[1] ;
+PORT (DELAY=1n) Q out[0] ;
+EDGE (WIDTH=1, DELAY=1n, CLOCK=in[1]) FF=0 ;
+FF = D ;
+Q = FF ;
+.endf
+.file LOGIC2
+PORT D in[0] ;
+PORT CK in[1] ;
+PORT (DELAY=4n) Q out[0] ;
+EDGE (WIDTH=1, DELAY=1n, CLOCK=in[1]) FF=0 ;
+FF = D ;
+Q = FF ;
+.endf
+.model M00 d_logic_block file=LOGIC0 family="HC" input_load=0 out_res=0 out_delay=1n
+Aseq00 [d ck] [q00] M00
+Rout00 q00 0 100k
+.model M01 d_logic_block file=LOGIC1 family="HC" input_load=0 out_res=0 out_delay=1n
+Aseq01 [d ck] [q01] M01
+Rout01 q01 0 100k
+.model M02 d_logic_block file=LOGIC2 family="HC" input_load=0 out_res=0 out_delay=1n
+Aseq02 [d ck] [q02] M02
+Rout02 q02 0 100k
+.model M10 d_logic_block file=LOGIC0 family="HC" input_load=0 out_res=100 out_delay=1n
+Aseq10 [d ck] [q10] M10
+Rout10 q10 0 100k
+.model M11 d_logic_block file=LOGIC1 family="HC" input_load=0 out_res=100 out_delay=1n
+Aseq11 [d ck] [q11] M11
+Rout11 q11 0 100k
+.model M12 d_logic_block file=LOGIC2 family="HC" input_load=0 out_res=100 out_delay=1n
+Aseq12 [d ck] [q12] M12
+Rout12 q12 0 100k
+.model M20 d_logic_block file=LOGIC0 family="HC" input_load=0 out_res=1000 out_delay=1n
+Aseq20 [d ck] [q20] M20
+Rout20 q20 0 100k
+.model M21 d_logic_block file=LOGIC1 family="HC" input_load=0 out_res=1000 out_delay=1n
+Aseq21 [d ck] [q21] M21
+Rout21 q21 0 100k
+.model M22 d_logic_block file=LOGIC2 family="HC" input_load=0 out_res=1000 out_delay=1n
+Aseq22 [d ck] [q22] M22
+Rout22 q22 0 100k
+.tran 10p 50n 0 10p
+.PRINT TRAN V(q00) V(q01) V(q02) V(q10) V(q11) V(q12) V(q20) V(q21) V(q22)
+.end

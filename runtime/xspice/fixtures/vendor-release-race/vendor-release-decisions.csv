@@ -1,0 +1,10 @@
+case,offset_ps,q_at_16ns_v,first_clock_captured
+release-offset-m20ps,-20,4.9979175344,1
+release-offset-m10ps,-10,4.9979175344,1
+release-offset-m5ps,-5,4.9979175344,1
+release-offset-m2ps,-2,4.9979175344,1
+release-offset-z0ps,0,4.9979175344,1
+release-offset-p2ps,2,0,0
+release-offset-p5ps,5,0,0
+release-offset-p10ps,10,0,0
+release-offset-p20ps,20,0,0

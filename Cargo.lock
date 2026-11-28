@@ -101,6 +101,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -134,9 +140,65 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "model-alb-experimental"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "model-normalize-ngspice",
+ "model-translate-simplis",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "model-alb-xspice-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "model-alb-experimental",
+]
+
+[[package]]
+name = "model-compact-intrinsic"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
+name = "model-kernel-api"
+version = "0.1.0"
+
+[[package]]
+name = "model-kernel-bipolar"
+version = "0.1.0"
+dependencies = [
+ "model-kernel-api",
+ "sha2",
+]
+
+[[package]]
+name = "model-kernel-bsim"
+version = "0.1.0"
+dependencies = [
+ "model-compact-intrinsic",
+ "model-kernel-api",
+]
+
+[[package]]
+name = "model-kernel-diode"
+version = "0.1.0"
+dependencies = [
+ "model-kernel-api",
+]
+
+[[package]]
 name = "model-kernel-vdmos"
 version = "0.1.0"
 dependencies = [
+ "model-kernel-api",
  "model-normalize-ngspice",
 ]
 
@@ -145,10 +207,32 @@ name = "model-normalize-ngspice"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-preprocess-command",
  "regex",
  "serde",
  "tempfile",
- "wait-timeout",
+]
+
+[[package]]
+name = "model-prepare-osdi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "model-preprocess-command",
+ "object",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "model-preprocess-command"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rustix",
+ "subprocess",
+ "tempfile",
 ]
 
 [[package]]
@@ -156,20 +240,66 @@ name = "model-preprocess-simplis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-kernel-diode",
+ "model-normalize-ngspice",
+ "model-preprocess-command",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
+
+[[package]]
+name = "model-statistics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "sha2",
+]
+
+[[package]]
+name = "model-touchstone"
+version = "0.1.0"
 
 [[package]]
 name = "model-translate-simplis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-normalize-ngspice",
+ "model-preprocess-command",
  "model-preprocess-simplis",
+ "model-statistics",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "ngspice-rs-preprocess"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "model-kernel-diode",
+ "model-normalize-ngspice",
+ "model-preprocess-command",
+ "model-preprocess-simplis",
+ "model-statistics",
+ "model-translate-simplis",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "object"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11dbdb66876026054e4ffc8d757d862bdf5df5aebd5c0b95a41f17832a94f7d2"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -299,6 +429,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "subprocess"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357bfac1d7af31600c3d45744ac453a4a25fc0f8b2ebe22db07d147745711cff"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "syn"
 version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -333,15 +473,6 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "windows-link"

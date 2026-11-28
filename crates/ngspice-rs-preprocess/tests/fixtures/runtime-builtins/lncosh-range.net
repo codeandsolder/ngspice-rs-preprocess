@@ -1,0 +1,9 @@
+* Robust smooth limiter near zero, both signs and large magnitude
+B1 x 0 V=lncosh(1e-4)
+B2 y 0 V=lncosh(1e-6)
+B3 z 0 V=lncosh(100)
+B4 a 0 V=lncosh(-100)
+B5 b 0 V=lncosh(0)
+B6 c 0 V=lncosh(1e6)
+.op
+.end

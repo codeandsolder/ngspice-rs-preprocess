@@ -1,0 +1,37 @@
+* UNKNOWN must not create false HOLD, MINCLOCK, SETUP or reset events
+Vdata d 0 PWL(0 5 10.2n 5 10.3n 2.15 15n 2.15 15.1n 5 25n 5 25.1n 0 35n 0 35.1n 5 48n 5 48.1n 0 55n 0)
+Vclock ck 0 PWL(0 0 9.9n 0 10n 5 10.2n 5 10.3n 2.15 12n 2.15 12.1n 5 14n 5 14.1n 0 29.9n 0 30n 5 33n 5 33.1n 0 39.9n 0 40n 5 43n 5 43.1n 0 49.9n 0 50n 5 53n 5 53.1n 0 55n 0)
+Vreset rst 0 PWL(0 5 18n 5 18.1n 2.15 22n 2.15 22.1n 0 28n 0 28.1n 2.15 36n 2.15 36.1n 5 55n 5)
+Venable en 0 PWL(0 0 6n 0 6.1n 5 10.5n 5 10.6n 0 20n 0 20.1n 5 24n 5 24.1n 0 37n 0 37.1n 5 46n 5 46.1n 0 55n 0)
+.model M d_logic_block file=LOGIC family="HC" input_load=0 out_res=100
+.file LOGIC
+PORT D in[0] ;
+PORT CK in[1] ;
+PORT RST in[2] ;
+PORT EN in[3] ;
+PORT Qhold out[0] ;
+PORT Qmin out[1] ;
+PORT Qreset out[2] ;
+PORT Qsetup out[3] ;
+EDGE (WIDTH=1, DELAY=2n, HOLD=1n, CLOCK=in[1]) Rhold=0 ;
+EDGE (WIDTH=1, DELAY=2n, MINCLOCK=1n, CLOCK=in[1]) Rmin=0 ;
+EDGE (WIDTH=1, DELAY=2n, ASYNCDELAY=200p, CLOCK=in[1]) Rreset=0 ;
+LEVEL (WIDTH=1, DELAY=2n, SETUP=1n, CLOCK=in[3]) Rsetup=0 ;
+Rhold = D ;
+Rmin = D ;
+Rreset := !RST ? 0 ;
+Rreset = D ;
+Rsetup = D ;
+Qhold = Rhold ;
+Qmin = Rmin ;
+Qreset = Rreset ;
+Qsetup = Rsetup ;
+.endf
+Aseq [d ck rst en] [qh qm qr qs] M
+Rh qh 0 100k
+Rm qm 0 100k
+Rr qr 0 100k
+Rs qs 0 100k
+.tran 10p 55n 0 10p
+.PRINT TRAN V(d) V(ck) V(rst) V(en) V(qh) V(qm) V(qr) V(qs)
+.end

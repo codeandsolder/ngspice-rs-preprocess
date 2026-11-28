@@ -1,0 +1,23 @@
+* Original SIMetrix Elements 9.40d indexed EDGE array HOLD oracle, BITWISE=1
+.model MARRAY_HOLD_1 d_logic_block file=FARRAY_HOLD_1 family="UNIV"
+.file FARRAY_HOLD_1
+PORT Data in[0:1] ;
+PORT Clock in[2] ;
+PORT Q out[0:3] ;
+EDGE (WIDTH=2, DELAY=1n, HOLD=800p, BITWISE=1, CLOCK=in[2]) R[2]=0,3 ;
+R[0]=Data ;
+R[1]=Data^3 ;
+OUT[0:1]=R[0] ;
+OUT[2:3]=R[1] ;
+.endf
+Vd0 d0 0 PWL(0 0 5n 0 5.1n 5 10.35n 5 10.45n 0 38n 0)
+Vd1 d1 0 PWL(0 0 5n 0 5.1n 5 19.95n 5 20.05n 0 38n 0)
+Vclock ck 0 PWL(0 0 9.95n 0 10.05n 5 14.95n 5 15.05n 0 23.95n 0 24.05n 5 28.95n 5 29.05n 0 38n 0)
+Aseq [d0 d1 ck] [q0 q1 q2 q3] MARRAY_HOLD_1
+Rout0 q0 0 100k
+Rout1 q1 0 100k
+Rout2 q2 0 100k
+Rout3 q3 0 100k
+.tran 20p 38n 0 20p
+.PRINT TRAN V(d0) V(d1) V(ck) V(q0) V(q1) V(q2) V(q3)
+.end

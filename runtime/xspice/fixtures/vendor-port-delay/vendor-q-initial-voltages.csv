@@ -1,0 +1,14 @@
+scenario,pin,initial_v
+edge-port-0,q,0.0000000000
+edge-port-2n,q,0.0000000000
+comb-port-0,q1,0.0000000000
+comb-port-0,q0,0.0000000000
+comb-port-2n,q1,0.0000000000
+comb-port-2n,q0,0.0000000000
+edge-default-1p,q,0.0000000000
+edge-default-2n,q,0.0000000000
+comb-default-1p,q1,0.0000000000
+comb-default-1p,q0,0.0000000000
+comb-default-2n,q1,0.0000000000
+comb-default-2n,q0,0.0000000000
+edge-reg-3n,q,0.0000000000

@@ -1,0 +1,47 @@
+* Directional output resistance, signed capacitive load
+Vd d 0 PWL(0 0 5n 0 5.1n 5 25n 5 25.1n 0 45n 0 45.1n 5 65n 5 65.1n 0 100n 0)
+Vck ck 0 PWL(0 0 9.9n 0 10n 5 13n 5 13.1n 0 29.9n 0 30n 5 33n 5 33.1n 0 49.9n 0 50n 5 53n 5 53.1n 0 69.9n 0 70n 5 73n 5 73.1n 0 100n 0)
+.file LOGIC
+PORT D in[0] ;
+PORT CK in[1] ;
+PORT (DELAY=4n) Q out[0] ;
+EDGE (WIDTH=1, DELAY=1n, CLOCK=in[1]) REG=0 ;
+REG=D ;
+Q=REG ;
+.endf
+.model M0 d_logic_block file=LOGIC family="HC" input_load=0 out_res=1000
+.model M1 d_logic_block file=LOGIC family="HC" input_load=0 out_res_pos=1000 out_res_neg=2000
+.model M2 d_logic_block file=LOGIC family="HC" input_load=0 out_res_pos=2000 out_res_neg=1000
+.model DAC0 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0p t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5)
+.model DAC1 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5)
+.model DAC2 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=8p t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5)
+Aseq00 [d ck] [dig00] M0
+Adac00 dig00 q00 DAC0
+Rout00 q00 0 100k
+Aseq01 [d ck] [dig01] M0
+Adac01 dig01 q01 DAC1
+Rout01 q01 0 100k
+Aseq02 [d ck] [dig02] M0
+Adac02 dig02 q02 DAC2
+Rout02 q02 0 100k
+Aseq10 [d ck] [dig10] M1
+Adac10 dig10 q10 DAC0
+Rout10 q10 0 100k
+Aseq11 [d ck] [dig11] M1
+Adac11 dig11 q11 DAC1
+Rout11 q11 0 100k
+Aseq12 [d ck] [dig12] M1
+Adac12 dig12 q12 DAC2
+Rout12 q12 0 100k
+Aseq20 [d ck] [dig20] M2
+Adac20 dig20 q20 DAC0
+Rout20 q20 0 100k
+Aseq21 [d ck] [dig21] M2
+Adac21 dig21 q21 DAC1
+Rout21 q21 0 100k
+Aseq22 [d ck] [dig22] M2
+Adac22 dig22 q22 DAC2
+Rout22 q22 0 100k
+.tran 5p 100n 0 5p
+.PRINT TRAN V(q00) V(q01) V(q02) V(q10) V(q11) V(q12) V(q20) V(q21) V(q22)
+.end

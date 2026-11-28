@@ -1,0 +1,13 @@
+[package]
+name = "model-touchstone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "BSD-3-Clause"
+repository.workspace = true
+readme = "../../README.md"
+publish.workspace = true
+description = "Bounded standalone Touchstone 1.x and 2.x network-data codec"
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+* .options temperature
+.options temp=85
+.param tt={TEMP}
+V1 x 0 {tt}
+B1 y 0 V=TEMP
+.op
+.end

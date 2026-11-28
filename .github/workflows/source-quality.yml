@@ -2,16 +2,17 @@ name: Source quality
 
 on:
   pull_request:
+  merge_group:
   push:
-    branches: [main]
+    branches: [main, refactor/architecture-campaign]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   source-quality:
-    uses: codeandsolder/ci-workflows/.github/workflows/source-quality.yml@bf0a56b897a722e474561d94dcb12485f1e14e41 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/source-quality.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main

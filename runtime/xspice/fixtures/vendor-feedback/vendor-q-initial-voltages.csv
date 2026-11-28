@@ -1,0 +1,5 @@
+scenario,pin,initial_v
+comb-feedback-positive-delay,q,4.9979175344
+comb-two-stage,q,4.9979175344
+comb-feedback-input,q,4.9979175344
+comb-feedback-two-register,q,4.9979175344

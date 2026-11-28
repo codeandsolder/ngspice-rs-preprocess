@@ -1,0 +1,32 @@
+* Independent original 2016 Tim Edwards d_genlut multi-output, fanned out
+* through original 1991 Georgia Tech d_and and d_xor code models.
+Vi0 ai0 0 PWL(0 0 10n 0 10.1n 3.3 30n 3.3 30.1n 0 50n 0 50.1n 3.3 70n 3.3 70.1n 0 90n 0 90.1n 3.3 110n 3.3 110.1n 0 125n 0)
+Vi1 ai1 0 PWL(0 0 20n 0 20.1n 3.3 40n 3.3 40.1n 0 60n 0 60.1n 3.3 80n 3.3 80.1n 0 100n 0 100.1n 3.3 120n 3.3 120.1n 0 125n 0)
+Ainputs [ai0 ai1] [i0 i1] ORIG_ADC
+.model ORIG_ADC adc_bridge(in_low=1.386 in_high=1.452 rise_delay=1p fall_delay=1p)
+AGEN [i0 i1] [q0 q1 q2] ORIG_GEN
+.model ORIG_GEN d_genlut(table_values="01100001z01z" rise_delay=[550p 750p 900p] fall_delay=[650p 850p 1100p] input_load=[0 0] input_delay=[150p 250p])
+AAND [q0 q2] f0 ORIG_AND
+.model ORIG_AND d_and(rise_delay=450p fall_delay=500p input_load=0 inertial_delay=false)
+AXOR [q0 q1 q2] f1 ORIG_XOR
+.model ORIG_XOR d_xor(rise_delay=700p fall_delay=600p input_load=0 inertial_delay=false)
+Aout0 q0 q0_sink q0_source %gd(analog_q0 0) PHYSICAL_DAC
+Aout1 q1 q1_sink q1_source %gd(analog_q1 0) PHYSICAL_DAC
+Aout2 q2 q2_sink q2_source %gd(analog_q2 0) PHYSICAL_DAC
+Aout3 f0 f0_sink f0_source %gd(analog_f0 0) PHYSICAL_DAC
+Aout4 f1 f1_sink f1_source %gd(analog_f1 0) PHYSICAL_DAC
+.model PHYSICAL_DAC sr_family_dac(out_low=0 out_high=3.3 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-8 knee_low=2 knee_high=2.75 v_smooth=.5 input_load=0 t_rise=50p t_fall=50p)
+Rpull0 vpull analog_q0 1k
+Rpull1 vpull analog_q1 1k
+Rpull2 vpull analog_q2 1k
+Rpull3 vpull analog_f0 1k
+Rpull4 vpull analog_f1 1k
+Vpull vpull 0 1.2
+.tran 20p 125n 0 20p
+.control
+run
+eprint q0 q1 q2 f0 f1 > result.events
+wrdata result.dat i(Vpull) v(analog_q0) v(analog_q1) v(analog_q2) v(analog_f0) v(analog_f1)
+quit
+.endc
+.end

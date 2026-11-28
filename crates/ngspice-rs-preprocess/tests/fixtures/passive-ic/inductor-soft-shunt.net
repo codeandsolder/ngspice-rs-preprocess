@@ -1,0 +1,8 @@
+* resolve whether soft inductor shunt contributes to stored flux
+.options initCondMode=2 icres=2
+Vs s 0 10
+R1 s lp 100Meg
+L1 lp 0 1Meg IC=1u
+.tran 1u 5u 0 100n
+.PRINT TRAN V(lp)
+.end

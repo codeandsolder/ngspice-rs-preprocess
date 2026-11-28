@@ -1,0 +1,15 @@
+{
+  "supply_v": 3.3,
+  "bridge_models": [
+    {"name":"HC_ADC","kind":"adc","family":"HC","nominal_supply_v":5},
+    {"name":"HC_DAC","kind":"dac","family":"HC","nominal_supply_v":5}
+  ],
+  "opaque_x_interfaces": [
+    {
+      "model":"TI_TPS22986_COMP_HYS",
+      "pins":["analog","analog","analog"],
+      "native_model":"SR_TI_COMP_HYS",
+      "native_formals":["OUT","INP","INN"]
+    }
+  ]
+}

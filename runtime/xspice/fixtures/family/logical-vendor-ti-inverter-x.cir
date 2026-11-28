@@ -1,0 +1,22 @@
+* A genuine vendor PSpice inverter subcircuit supplied as an opaque external X.
+* The independently authored ngspice-native replacement preserves its analog
+* port order and forwards two different per-instance vendor timing parameters.
+Vin analog_input 0 PWL(0 0 2n 0 2.001n 1 6n 1 6.001n 0 10n 0 10.001n .52 14n .52 14.001n .49 18n .49 18.001n 1 22n 1 22.001n 0 27n 0)
+Xvendor_fast vendor_out analog_input TI_TPS22986_BASIC_INVERTER PARAMS: td=0 tt=2n
+Xvendor_slow vendor_slow analog_input TI_TPS22986_BASIC_INVERTER PARAMS: td=1n tt=4n
+Rload_fast vendor_out 0 10k
+Rload_slow vendor_slow 0 10k
+* Buffer the vendor analog output for the ALB monitor, without altering the
+* independently measured 10k-loaded vendor inverter reference.
+Elevel monitor_in 0 vendor_out 0 3.3
+Amonitor [monitor_in] [monitor_out] DL
+Rmonitor monitor_out 0 100k
+.model DL d_logic_block family="HC" out_delay=1n def="out[0]=in[0];"
+.include "native-ti-inverter.lib"
+.tran 10p 27n 0 10p
+.control
+run
+wrdata result.dat v(vendor_out) v(vendor_slow) v(monitor_out)
+quit
+.endc
+.end

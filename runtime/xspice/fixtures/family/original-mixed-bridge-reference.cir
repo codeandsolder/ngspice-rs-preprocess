@@ -1,0 +1,23 @@
+* Georgia Tech 1991 original ADC-logic-DAC hybrid with differential input.
+* Both source analog channels are independently driven at different common modes.
+Vcm vcm 0 DC 1.0
+Va aplus vcm PWL(0 0 10n 0 10.1n 3.3 30n 3.3 30.1n 0 50n 0 50.1n 3.3 70n 3.3 70.1n 0 90n 0 90.1n 3.3 110n 3.3 110.1n 0 125n 0)
+Vd ad 0 PWL(0 0 20n 0 20.1n 3.3 40n 3.3 40.1n 0 60n 0 60.1n 3.3 80n 3.3 80.1n 0 100n 0 100.1n 3.3 120n 3.3 120.1n 0 125n 0)
+Aadc [%vd(aplus vcm)] [a_bit] GT_ADC
+Ainputd [ad] [d_bit] GT_ADC
+.model GT_ADC adc_bridge(in_low=1.386 in_high=1.452 rise_delay=1p fall_delay=1p)
+Aand [a_bit d_bit] out_bit GT_AND
+.model GT_AND d_and(rise_delay=450p fall_delay=500p input_load=0 inertial_delay=false)
+Adac [a_bit out_bit] [analog_probe analog_out] GT_DAC
+.model GT_DAC dac_bridge(out_low=0 out_high=3.3 out_undef=1.65 input_load=0 t_rise=50p t_fall=50p)
+Rload_probe analog_probe 0 1k
+Rload_out analog_out 0 1k
+Cload_probe analog_probe 0 2p
+Cload_out analog_out 0 2p
+.tran 20p 125n 0 20p
+.control
+run
+wrdata result.dat v(analog_probe) v(analog_out) v(aplus) v(vcm) v(ad)
+quit
+.endc
+.end

@@ -1,0 +1,17 @@
+* Independent strength and logic signed slew sequence
+0n 0z
+2n 0s
+4n 0r
+6n 0u
+8n 1s
+10n 1r
+12n 1z
+14n 1r
+16n Ur
+18n Us
+20n Uz
+22n 0s
+24n 1s
+26n 0r
+28n 1z
+30n 0u

@@ -1,0 +1,17 @@
+* Original Georgia Tech public-domain d_ram code model in a strict native X wrapper.
+* External digital signals use complete ALB state/sink/source triples.
+* Original RAM has vector data_in/data_out/address/select and scalar write_en.
+.subckt SR_GT_RAM D0 D0_SINK D0_SOURCE D1 D1_SINK D1_SOURCE A0 A0_SINK A0_SOURCE A1 A1_SINK A1_SOURCE WE WE_SINK WE_SOURCE S0 S0_SINK S0_SOURCE S1 S1_SINK S1_SOURCE OUT0 OUT1
+Aload_d0 D0 D0_SINK D0_SOURCE INPUT_LOAD
+Aload_d1 D1 D1_SINK D1_SOURCE INPUT_LOAD
+Aload_a0 A0 A0_SINK A0_SOURCE INPUT_LOAD
+Aload_a1 A1 A1_SINK A1_SOURCE INPUT_LOAD
+Aload_we WE WE_SINK WE_SOURCE INPUT_LOAD
+Aload_s0 S0 S0_SINK S0_SOURCE INPUT_LOAD
+Aload_s1 S1 S1_SINK S1_SOURCE INPUT_LOAD
+.model INPUT_LOAD sr_bundle_load(capacitance=2p sink_current=0 source_current=0)
+Aram [D0 D1] [Q0 Q1] [A0 A1] WE [S0 S1] GT_ORIGINAL_RAM
+.model GT_ORIGINAL_RAM d_ram(select_value=1 ic=2 read_delay=600p data_load=0 address_load=0 select_load=0 enable_load=0)
+Aout [Q0 Q1] [OUT0 OUT1] GT_ORIGINAL_DAC
+.model GT_ORIGINAL_DAC dac_bridge(out_low=0 out_high=3.3 out_undef=1.65 input_load=0 t_rise=50p t_fall=50p)
+.ends SR_GT_RAM

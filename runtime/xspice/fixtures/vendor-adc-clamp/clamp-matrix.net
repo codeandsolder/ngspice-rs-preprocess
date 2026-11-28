@@ -1,0 +1,59 @@
+* Explicit ADC clamping and reflected load matrix
+.model ADC0 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1p fall_delay=1p time_tol=10p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=0.5 out_family="HC")
+.model ADC1 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1p fall_delay=1p time_tol=10p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=1 out_family="HC")
+.model ADC2 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1p fall_delay=1p time_tol=10p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=20 clamp_bias=0.5 out_family="HC")
+.model ADC3 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1p fall_delay=1p time_tol=10p out_low=0 out_high=5 clamp_low=-1 clamp_high=6 clamp_res=10 clamp_bias=0.5 out_family="HC")
+.model DAC0 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0 t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=0m source_current=0m)
+.model DAC1 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0 t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-10m source_current=20m)
+.model DAC2 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0 t_rise=2n t_fall=2n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-10m source_current=0m)
+Vforce0 p0 0 PWL(0 -3 130n 10)
+Aadc0 p0 din0 ADC0
+Adac0 din0 q0 DAC0
+Rout0 q0 0 100k
+Vforce1 p1 0 PWL(0 -3 130n 10)
+Aadc1 p1 din1 ADC0
+Adac1 din1 q1 DAC1
+Rout1 q1 0 100k
+Vforce2 p2 0 PWL(0 -3 130n 10)
+Aadc2 p2 din2 ADC0
+Adac2 din2 q2 DAC2
+Rout2 q2 0 100k
+Vforce3 p3 0 PWL(0 -3 130n 10)
+Aadc3 p3 din3 ADC1
+Adac3 din3 q3 DAC0
+Rout3 q3 0 100k
+Vforce4 p4 0 PWL(0 -3 130n 10)
+Aadc4 p4 din4 ADC1
+Adac4 din4 q4 DAC1
+Rout4 q4 0 100k
+Vforce5 p5 0 PWL(0 -3 130n 10)
+Aadc5 p5 din5 ADC1
+Adac5 din5 q5 DAC2
+Rout5 q5 0 100k
+Vforce6 p6 0 PWL(0 -3 130n 10)
+Aadc6 p6 din6 ADC2
+Adac6 din6 q6 DAC0
+Rout6 q6 0 100k
+Vforce7 p7 0 PWL(0 -3 130n 10)
+Aadc7 p7 din7 ADC2
+Adac7 din7 q7 DAC1
+Rout7 q7 0 100k
+Vforce8 p8 0 PWL(0 -3 130n 10)
+Aadc8 p8 din8 ADC2
+Adac8 din8 q8 DAC2
+Rout8 q8 0 100k
+Vforce9 p9 0 PWL(0 -3 130n 10)
+Aadc9 p9 din9 ADC3
+Adac9 din9 q9 DAC0
+Rout9 q9 0 100k
+Vforce10 p10 0 PWL(0 -3 130n 10)
+Aadc10 p10 din10 ADC3
+Adac10 din10 q10 DAC1
+Rout10 q10 0 100k
+Vforce11 p11 0 PWL(0 -3 130n 10)
+Aadc11 p11 din11 ADC3
+Adac11 din11 q11 DAC2
+Rout11 q11 0 100k
+.tran 50p 130n 0 50p
+.PRINT TRAN I(Vforce0) I(Vforce1) I(Vforce2) I(Vforce3) I(Vforce4) I(Vforce5) I(Vforce6) I(Vforce7) I(Vforce8) I(Vforce9) I(Vforce10) I(Vforce11)
+.end

@@ -1,0 +1,42 @@
+* Stateful ALB UNKNOWN data, clock, enable and async input history
+Vdata d 0 PWL(0 2.15 4n 2.15 4.1n 5 14n 5 14.1n 2.15 34n 2.15 34.1n 0 44n 0 44.1n 2.15 64n 2.15 64.1n 5 90n 5)
+Vclock ck 0 PWL(0 0 7n 0 7.1n 5 10n 5 10.1n 0 18n 0 18.1n 5 21n 5 21.1n 0 28n 0 28.1n 5 31n 5 31.1n 0 38n 0 38.1n 5 41n 5 41.1n 0 48n 0 48.1n 5 51n 5 51.1n 0 58n 0 58.1n 5 61n 5 61.1n 0 68n 0 68.1n 5 71n 5 71.1n 0 90n 0)
+Vambiguity ca 0 PWL(0 0 6n 0 6.1n 2.15 12n 2.15 12.1n 5 18n 5 18.1n 2.15 26n 2.15 26.1n 5 34n 5 34.1n 0 42n 0 42.1n 2.15 48n 2.15 48.1n 0 56n 0 56.1n 5 60n 5 60.1n 2.15 70n 2.15 70.1n 0 78n 0 78.1n 5 90n 5)
+.model M d_logic_block file=LOGIC family="HC" input_load=0 out_res=100
+.file LOGIC
+PORT D in[0] ;
+PORT CK in[1] ;
+PORT CA in[2] ;
+PORT Direct out[0] ;
+PORT Qedge out[1] ;
+PORT Qlevel out[2] ;
+PORT Qcomb out[3] ;
+PORT Toggle out[4] ;
+PORT Transparent out[5] ;
+COMB (WIDTH=1, DELAY=1n) Rcomb=0 ;
+EDGE (WIDTH=1, DELAY=1n, CLOCK=in[1]) Redge=0 ;
+LEVEL (WIDTH=1, DELAY=1n, CLOCK=in[1]) Rlevel=0 ;
+EDGE (WIDTH=1, DELAY=1n, CLOCK=in[2]) Rtoggle=0 ;
+LEVEL (WIDTH=1, DELAY=1n, CLOCK=in[2]) Rtrans=0 ;
+Direct = D ;
+Rcomb = D ;
+Redge = D ;
+Rlevel = D ;
+Rtoggle = !Rtoggle ;
+Rtrans = D ;
+Qedge = Redge ;
+Qlevel = Rlevel ;
+Qcomb = Rcomb ;
+Toggle = Rtoggle ;
+Transparent = Rtrans ;
+.endf
+Aseq [d ck ca] [qd qe ql qc qt qtr] M
+Rd qd 0 100k
+Re qe 0 100k
+Rl ql 0 100k
+Rc qc 0 100k
+Rt qt 0 100k
+Rtr qtr 0 100k
+.tran 10p 90n 0 10p
+.PRINT TRAN V(d) V(ck) V(ca) V(qd) V(qe) V(ql) V(qc) V(qt) V(qtr)
+.end

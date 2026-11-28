@@ -1,0 +1,28 @@
+* Three full strength-code sweeps through original 1991 d_source and original real_gain cascade.
+* The enable edges exactly coincide with original digital data changes (144ns and 288ns).
+Venable aenable 0 PWL(0 3.3 144n 3.3 144.1n 0 288n 0 288.1n 3.3 435n 3.3)
+AINEN [aenable] [len] SOURCE_LOGIC
+.model SOURCE_LOGIC d_logic_block family="HC" out_delay=1p def="out[0]=in[0];"
+Xexternal len ANALOG_RAW ANALOG_GATED ANALOG_POS ANALOG_NEG ANALOG_CHAIN ANALOG_PROBE ORIGINAL_FULL_STRENGTH
+.include "native-original-full-strength-cascade.lib"
+Rraw ANALOG_RAW 0 1k
+Rgated ANALOG_GATED 0 1k
+Rpos ANALOG_POS 0 1k
+Rneg ANALOG_NEG 0 1k
+Rchain ANALOG_CHAIN 0 1k
+Craw ANALOG_RAW 0 2p
+Cgated ANALOG_GATED 0 2p
+Cpos ANALOG_POS 0 2p
+Cneg ANALOG_NEG 0 2p
+Cchain ANALOG_CHAIN 0 2p
+Vpull vpull 0 1.2
+Rprobe vpull ANALOG_PROBE 1k
+Cprobe ANALOG_PROBE 0 2p
+.tran 20p 434n 0 20p
+.control
+run
+eprint xexternal.qev xexternal.rraw xexternal.rgated xexternal.rpos xexternal.rneg xexternal.rchain > original-events.txt
+wrdata result.dat v(ANALOG_RAW) v(ANALOG_GATED) v(ANALOG_POS) v(ANALOG_NEG) v(ANALOG_CHAIN) v(ANALOG_PROBE) i(Vpull) v(aenable)
+quit
+.endc
+.end

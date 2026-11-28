@@ -1,0 +1,57 @@
+* Directional resistance during output enable/disable transitions
+Vd d 0 PWL(0 0 39.9n 0 40n 5 65.9n 5 66n 0 87.9n 0 88n 5 119.9n 5 120n 0 143.9n 0 144n 5 167.9n 5 168n 0 200n 0)
+Ve en 0 PWL(0 5 19.9n 5 20n 0 59.9n 0 60n 5 71.9n 5 72n 0 79.9n 0 80n 5 97.9n 5 98n 0 105.9n 0 106n 5 127.9n 5 128n 0 135.9n 0 136n 5 151.9n 5 152n 0 159.9n 0 160n 5 200n 5)
+Vbias bias 0 2.5
+.file LOGIC
+PORT D in[0] ;
+PORT EN in[1] ;
+PORT (DELAY=4n) Q out[0] ;
+COMB (WIDTH=1, DELAY=1n) REG=0 ;
+REG=D ;
+Q=REG ;
+Q.En=EN ;
+.endf
+.model M d_logic_block file=LOGIC family="HC" input_load=0 out_res_pos=1000 out_res_neg=2000 min_sink=-10m max_source=10m
+.model DAC0 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=8n t_fall=16n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-5m source_current=5m)
+.model DAC1 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=8n t_fall=16n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-15m source_current=5m)
+.model DAC2 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=8n t_fall=16n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-5m source_current=15m)
+.model DAC3 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=4p t_rise=8n t_fall=16n knee_low=2 knee_high=2.75 v_smooth=.5 sink_current=-15m source_current=15m)
+Aseq0 [d en] [dig0] M
+Adac0 dig0 q0 DAC0
+Vforce0 q0 0 0
+Aseq1 [d en] [dig1] M
+Adac1 dig1 q1 DAC0
+Vforce1 q1 0 2.5
+Aseq2 [d en] [dig2] M
+Adac2 dig2 q2 DAC0
+Vforce2 q2 0 5
+Aseq3 [d en] [dig3] M
+Adac3 dig3 q3 DAC1
+Vforce3 q3 0 0
+Aseq4 [d en] [dig4] M
+Adac4 dig4 q4 DAC1
+Vforce4 q4 0 2.5
+Aseq5 [d en] [dig5] M
+Adac5 dig5 q5 DAC1
+Vforce5 q5 0 5
+Aseq6 [d en] [dig6] M
+Adac6 dig6 q6 DAC2
+Vforce6 q6 0 0
+Aseq7 [d en] [dig7] M
+Adac7 dig7 q7 DAC2
+Vforce7 q7 0 2.5
+Aseq8 [d en] [dig8] M
+Adac8 dig8 q8 DAC2
+Vforce8 q8 0 5
+Aseq9 [d en] [dig9] M
+Adac9 dig9 q9 DAC3
+Vforce9 q9 0 0
+Aseq10 [d en] [dig10] M
+Adac10 dig10 q10 DAC3
+Vforce10 q10 0 2.5
+Aseq11 [d en] [dig11] M
+Adac11 dig11 q11 DAC3
+Vforce11 q11 0 5
+.tran 5p 200n 0 5p
+.PRINT TRAN I(Vforce0) I(Vforce1) I(Vforce2) I(Vforce3) I(Vforce4) I(Vforce5) I(Vforce6) I(Vforce7) I(Vforce8) I(Vforce9) I(Vforce10) I(Vforce11)
+.end

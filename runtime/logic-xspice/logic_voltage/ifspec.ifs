@@ -1,0 +1,24 @@
+NAME_TABLE:
+Spice_Model_Name:      preprocess_logic_voltage
+C_Function_Name:       cm_preprocess_logic_voltage
+Description:           "Ideal normalized digital-to-analog voltage"
+
+PORT_TABLE:
+Port_Name:             in               out
+Description:           "logic input"    "voltage output"
+Direction:             in               out
+Default_Type:          d                v
+Allowed_Types:         [d]              [v,vd]
+Vector:                no               no
+Vector_Bounds:         -                -
+Null_Allowed:          no               no
+
+PARAMETER_TABLE:
+Parameter_Name:        out_low             out_high
+Description:           "voltage at zero"   "voltage at one"
+Data_Type:             real                real
+Default_Value:         0                   1
+Limits:                -                   -
+Vector:                no                  no
+Vector_Bounds:         -                   -
+Null_Allowed:          yes                 yes
