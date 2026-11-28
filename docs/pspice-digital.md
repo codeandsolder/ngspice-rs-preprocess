@@ -17,7 +17,7 @@ PSpice dollar-prefixed nodes while native/HSPICE dollar comments retain
 their ordinary meaning.
 
 `model_normalize_ngspice::pspice::digital_source::capture_linked`
-captures both digital and delayed-threshold switch declarations in the
+captures both digital and short-transition switch declarations in the
 admitted source graph. The declaration, its include visit, lexical
 subcircuit scope, and every base-to-derived model layer have individual
 source identities, including complete physical statement spans. Special
@@ -67,8 +67,8 @@ See [solver #255](https://github.com/codeandsolder/ngspice-rs-fast/issues/255).
 
 ## Delayed short-transition switches
 
-The same capture pass preserves short-transition switches with nonzero
-or expression-valued TD. Voltage control retains positive and negative
+The same capture pass preserves all short-transition switches, including
+zero, nonzero and expression-valued TD. Voltage control retains positive and negative
 control nodes and requires the source GMIN shunt; current control
 retains the signed voltage-source branch reference. RON/ROFF,
 VT/VH or IT/IH and TD bind from their effective lexical setters with
@@ -79,7 +79,9 @@ The October 2012 PSpice Reference Guide, version 16.6, pp. 309–311
 and 325–328, distinguishes a short transition shifted by TD from
 continuous log-resistance interpolation. The documented off-to-on
 comparison is inclusive at threshold plus hysteresis; the on-to-off
-comparison is strict below threshold minus hysteresis. TD is not
+comparison is strict below threshold minus hysteresis. BoundThreshold
+provides these named boundaries, checked for overflow, without choosing
+a pending-event cancellation policy. TD is not
 the duration of an analog ramp. The engine must bind the native
 instantaneous delayed law with transactional state and qualified
 pending-event behavior. The reference does not establish cancellation
@@ -88,7 +90,7 @@ See [solver #254](https://github.com/codeandsolder/ngspice-rs-fast/issues/254).
 
 Source normalization rejects unbound digital devices and delayed
 switches explicitly. It neither drops these declarations nor emits
-a nominally similar native primitive. The existing zero-delay switch lowering still requires review against
+a nominally similar native primitive. The existing zero-delay switch lowering still requires integration against
 the documented asymmetric equality rule; continuous switch lowering
 is independent of this extension.
 

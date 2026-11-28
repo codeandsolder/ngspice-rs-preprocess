@@ -8,7 +8,7 @@ use super::{
     digital_timing::{TimingModel, TimingPath},
     optional_ports::OptionalPorts,
     scope::{Scopes, charge_card, charge_scope},
-    switch_source::DelayedSwitchDeclaration,
+    switch_source::ThresholdSwitchDeclaration,
 };
 use crate::{
     SourceDialects, lexical,
@@ -291,8 +291,8 @@ impl Capture<'_> {
 pub struct SourceDeclarations {
     /// Digital primitive declarations with lexical model layers.
     pub digital: Vec<DigitalDeclaration>,
-    /// Short-transition switch declarations with nonzero or symbolic delay.
-    pub delayed_switches: Vec<DelayedSwitchDeclaration>,
+    /// Short-transition switch declarations, including explicit or default zero delay.
+    pub threshold_switches: Vec<ThresholdSwitchDeclaration>,
     /// Node-valued optional subcircuit signatures used by library devices.
     pub optional_ports: Vec<Located<OptionalPorts>>,
 }
@@ -374,20 +374,20 @@ pub(super) fn capture(
         {
             let text = std::str::from_utf8(&statement.text)?;
             if let Some(declaration) =
-                capture.delayed_switch(text, statement.line, statement.last_line)?
+                capture.threshold_switch(text, statement.line, statement.last_line)?
             {
                 ensure!(
                     conditional_depth == 0,
-                    "conditional PSpice delayed switch requires topology binding"
+                    "conditional PSpice threshold switch requires topology binding"
                 );
-                declarations.delayed_switches.push(declaration);
+                declarations.threshold_switches.push(declaration);
             }
         }
     }
     Ok(declarations)
 }
 
-/// Bind source digital and delayed-switch declarations in an admitted graph.
+/// Capture source digital and short-transition switch declarations in an admitted graph.
 ///
 /// Model references use lexical visibility and preserve original include visits.
 /// Numerical parameters, I/O interfaces and native event scheduling are not bound here.
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_thresholds_preserve_control_orientation_and_scope() -> Result<()> {
+    fn threshold_switches_preserve_control_orientation_scope_and_boundaries() -> Result<()> {
         use super::super::switch_source::ControlConnection;
         let input = b".model base VSWITCH(VT={global_threshold} RON=2 TD={global_delay})\n.subckt cell p n cp cn\n.model local AKO:base VSWITCH(VH={local_hysteresis} TD={local_delay})\nS1 p n cp cn local\n.ends\n.model current ISWITCH(IT=-1m IH=0 TD=2n)\nW1 p n Vsense current\n.model immediate VSWITCH(VT=0 TD=0)\nS2 p n cp cn immediate\n";
         let budget = WorkBudget::default();
@@ -509,9 +509,12 @@ mod tests {
         let dialects = SourceDialects::Uniform(SourceDialect::Pspice);
         let scopes = Scopes::collect(&statements, &origins, dialects, &budget)?;
         let declarations = capture(&statements, &scopes, &origins, dialects)?;
-        let [voltage, current] = declarations.delayed_switches.as_slice() else {
-            anyhow::bail!("expected exactly two delayed switches")
+        let [voltage, current, immediate] = declarations.threshold_switches.as_slice() else {
+            anyhow::bail!("expected exactly three threshold switches")
         };
+        assert!(voltage.requires_delayed_kernel());
+        assert!(current.requires_delayed_kernel());
+        assert!(!immediate.requires_delayed_kernel());
         assert_eq!(voltage.location.scope, ["cell"]);
         assert_eq!(voltage.terminals, ["p", "n"]);
         assert_eq!(
@@ -536,6 +539,12 @@ mod tests {
         assert_eq!(bound.delay.to_bits(), 5e-9_f64.to_bits());
         assert_eq!(bound.ron.to_bits(), 2_f64.to_bits());
         assert_eq!(bound.roff.to_bits(), 1e12_f64.to_bits());
+        let boundaries = bound.boundaries()?;
+        assert_eq!(
+            boundaries.turn_on_at_or_above.to_bits(),
+            (-0.75_f64).to_bits()
+        );
+        assert_eq!(boundaries.turn_off_below.to_bits(), (-1.25_f64).to_bits());
         assert_eq!(
             current.control,
             ControlConnection::Current {
@@ -552,6 +561,24 @@ mod tests {
         )?;
         assert_eq!(bound.threshold.to_bits(), (-1e-3_f64).to_bits());
         assert_eq!(bound.delay.to_bits(), 2e-9_f64.to_bits());
+        let boundaries = bound.boundaries()?;
+        assert_eq!(
+            boundaries.turn_on_at_or_above.to_bits(),
+            (-1e-3_f64).to_bits()
+        );
+        assert_eq!(boundaries.turn_off_below.to_bits(), (-1e-3_f64).to_bits());
+        let immediate = immediate.bind(
+            |_, field| {
+                crate::model_card::parse_spice_constant(
+                    field.expression.as_deref().context("missing expression")?,
+                )
+            },
+            &budget,
+        )?;
+        assert_eq!(immediate.delay.to_bits(), 0_f64.to_bits());
+        let boundaries = immediate.boundaries()?;
+        assert_eq!(boundaries.turn_on_at_or_above.to_bits(), 0_f64.to_bits());
+        assert_eq!(boundaries.turn_off_below.to_bits(), 0_f64.to_bits());
         Ok(())
     }
 

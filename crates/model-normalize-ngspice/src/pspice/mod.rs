@@ -728,7 +728,11 @@ fn lower_body(
     })?;
     let scopes = Scopes::collect(&statements, origins, dialects, budget)?;
     let declarations = digital_source::capture(&statements, &scopes, origins, dialects)?;
-    if let Some(declaration) = declarations.delayed_switches.first() {
+    if let Some(declaration) = declarations
+        .threshold_switches
+        .iter()
+        .find(|switch| switch.requires_delayed_kernel())
+    {
         bail!(
             "PSpice nonzero threshold-switch delay requires a timed switch kernel: {} at {:?}",
             declaration.name,

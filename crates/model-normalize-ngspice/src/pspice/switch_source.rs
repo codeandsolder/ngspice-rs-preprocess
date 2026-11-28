@@ -1,4 +1,4 @@
-//! Source switch classification and delayed threshold declaration binding.
+//! Source switch classification and short-transition declaration binding.
 //!
 //! The `PSpice` Reference Guide 16.6, pp. 309–311 and 325–328, distinguishes
 //! continuous log-resistance interpolation from short-transition switches.
@@ -76,21 +76,27 @@ impl SwitchLaw {
         let law = Self::classify(&card.family, card.parameters.iter())?;
         if law.is_some() {
             ensure!(
-                card.parameters
-                    .iter()
-                    .rev()
-                    .find(|field| field.name.eq_ignore_ascii_case("td"))
-                    .is_none_or(|field| field.expression.as_deref().is_some_and(|value| {
-                        matches!(
-                            parse_spice_constant(temperature::expression(value)),
-                            Ok(0.0)
-                        )
-                    })),
+                !needs_delayed_kernel(card.parameters.iter()),
                 "PSpice nonzero threshold-switch delay requires a timed switch kernel"
             );
         }
         Ok(law)
     }
+}
+
+/// A symbolic delay must be bound per candidate; it cannot be assumed zero.
+fn needs_delayed_kernel<'a>(fields: impl DoubleEndedIterator<Item = &'a ModelParameter>) -> bool {
+    fields
+        .rev()
+        .find(|field| field.name.eq_ignore_ascii_case("td"))
+        .is_some_and(|field| {
+            field.expression.as_deref().is_none_or(|value| {
+                !matches!(
+                    parse_spice_constant(temperature::expression(value)),
+                    Ok(0.0)
+                )
+            })
+        })
 }
 
 /// A differential voltage control or signed controlling branch current.
@@ -111,10 +117,10 @@ pub enum ControlConnection {
     },
 }
 
-/// A short-transition switch occurrence and all its lexical model layers.
+/// A short-transition switch declaration, including zero delay, and all its lexical model layers.
 /// No pending event cancellation policy is assumed from the source spelling.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct DelayedSwitchDeclaration {
+pub struct ThresholdSwitchDeclaration {
     /// Original source device identifier.
     pub name: String,
     /// Instance declaration address.
@@ -127,7 +133,7 @@ pub struct DelayedSwitchDeclaration {
     pub models: Vec<Located<ModelCard>>,
 }
 
-/// Resolved physical parameters for the instantaneous delayed law.
+/// Resolved physical parameters for the instantaneous transition law.
 /// The native event kernel owns accepted state, deadlines and cancellation.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct BoundThreshold {
@@ -143,7 +149,48 @@ pub struct BoundThreshold {
     pub delay: f64,
 }
 
-impl DelayedSwitchDeclaration {
+/// State-specific thresholds in the original differential-control units.
+/// The comparison operators are part of the source contract.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ThresholdBoundaries {
+    /// An off switch requests turn-on when the control reaches this value.
+    pub turn_on_at_or_above: f64,
+    /// An on switch requests turn-off only below this value.
+    pub turn_off_below: f64,
+}
+
+impl BoundThreshold {
+    /// Compute the two documented transition boundaries without changing
+    /// the order of the source addition/subtraction or clamping hysteresis.
+    ///
+    /// # Errors
+    /// Nonfinite or overflowing threshold coordinates.
+    pub fn boundaries(self) -> Result<ThresholdBoundaries> {
+        let boundaries = ThresholdBoundaries {
+            turn_on_at_or_above: self.threshold + self.hysteresis,
+            turn_off_below: self.threshold - self.hysteresis,
+        };
+        ensure!(
+            boundaries.turn_on_at_or_above.is_finite() && boundaries.turn_off_below.is_finite(),
+            "nonfinite PSpice transition boundary"
+        );
+        Ok(boundaries)
+    }
+}
+
+impl ThresholdSwitchDeclaration {
+    /// Whether a nonzero or candidate-dependent propagation delay requires
+    /// an explicit timed kernel. Zero-delay declarations still carry the
+    /// source-specific transition boundaries.
+    #[must_use = "a nonzero or unresolved delay cannot be lowered as a static switch"]
+    pub fn requires_delayed_kernel(&self) -> bool {
+        needs_delayed_kernel(
+            self.models
+                .iter()
+                .flat_map(|model| model.declaration.parameters.iter()),
+        )
+    }
+
     /// Resolve effective parameters in the scopes of their declarations.
     ///
     /// The 16.6 reference specifies inclusive turn-on at threshold plus
@@ -202,17 +249,18 @@ impl DelayedSwitchDeclaration {
             "nonpositive PSpice switch resistance"
         );
         ensure!(bound.delay >= 0., "negative PSpice switch delay");
+        let _ = bound.boundaries()?;
         Ok(bound)
     }
 }
 
 impl Capture<'_> {
-    pub(super) fn delayed_switch(
+    pub(super) fn threshold_switch(
         &self,
         text: &str,
         line: usize,
         last_line: usize,
-    ) -> Result<Option<DelayedSwitchDeclaration>> {
+    ) -> Result<Option<ThresholdSwitchDeclaration>> {
         let (positions, tail) = positional_prefix(text);
         let fields = positions
             .iter()
@@ -247,26 +295,18 @@ impl Capture<'_> {
             "PSpice switch inheritance changes model family"
         );
         let fields_iter = chain.iter().flat_map(|model| model.card.parameters.iter());
-        let Some(law) = SwitchLaw::classify(family, fields_iter.clone())? else {
+        let Some(law) = SwitchLaw::classify(family, fields_iter)? else {
             return Ok(None);
         };
-        let delayed = fields_iter
-            .rev()
-            .find(|field| field.name.eq_ignore_ascii_case("td"))
-            .is_some_and(|field| {
-                field.expression.as_deref().is_none_or(|value| {
-                    !matches!(
-                        parse_spice_constant(temperature::expression(value)),
-                        Ok(0.0)
-                    )
-                })
-            });
-        if !delayed {
+        if !matches!(
+            law,
+            SwitchLaw::ThresholdVoltage | SwitchLaw::ThresholdCurrent
+        ) {
             return Ok(None);
         }
         ensure!(
             chain.iter().all(|model| !model.conditional),
-            "conditional PSpice delayed switch model requires topology binding"
+            "conditional PSpice threshold switch model requires topology binding"
         );
         let control = match (law, voltage_instance, fields.as_slice()) {
             (SwitchLaw::ThresholdVoltage, true, [_, _, _, positive, negative, _]) => {
@@ -280,11 +320,11 @@ impl Capture<'_> {
                     branch: (*branch).to_owned(),
                 }
             }
-            _ => anyhow::bail!("invalid PSpice delayed threshold switch instance"),
+            _ => anyhow::bail!("invalid PSpice short-transition switch instance"),
         };
         ensure!(
             tail.trim().is_empty(),
-            "unsupported delayed switch instance assignment"
+            "unsupported short-transition switch instance assignment"
         );
         self.scopes.budget().charge(Resource::GeneratedNodes, 1)?;
         self.scopes
@@ -304,7 +344,7 @@ impl Capture<'_> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Some(DelayedSwitchDeclaration {
+        Ok(Some(ThresholdSwitchDeclaration {
             name: (*name).to_owned(),
             location: self.location(line, last_line, scope)?,
             terminals: [fields[1].to_owned(), fields[2].to_owned()],
