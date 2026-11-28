@@ -66,17 +66,22 @@ impl ExponentialJunction {
             return Slope::zero();
         }
         let x = voltage.scale(self.inverse_vt);
-        let exponential = x.exp();
-        let raw = x.exp_m1().scale(self.saturation);
+        let exponential = x.value().exp();
+        let raw_value = self.saturation * x.value().exp_m1();
         if x.value() <= 0.0
-            || (self.saturation > 0.0 && raw.value().is_finite() && exponential.value().is_finite())
+            || (self.saturation > 0.0 && raw_value.is_finite() && exponential.is_finite())
         {
-            let scaled_exponential = exponential.scale(self.saturation);
+            // Seed the scaled series directly. Computing unscaled high-order
+            // exp coefficients first can overflow even with finite F and G.
+            let scaled_exponential = x.exp_with_value(self.saturation * exponential);
+            let raw = scaled_exponential
+                .offset(-self.saturation)
+                .with_value(raw_value);
             if let Some(knee) = knee
                 && raw.compare(0.) == Some(Ordering::Greater)
             {
                 let ratio = raw / S::constant(knee);
-                if ratio.value().is_finite() {
+                if ratio.is_finite() {
                     let denominator = ratio.offset(1.0);
                     let root = denominator.sqrt();
                     return Slope {
@@ -96,8 +101,8 @@ impl ExponentialJunction {
         // but a large forward bias makes the physical current representable.
         if x.value() <= 0.0 {
             return Slope {
-                value: raw,
-                derivative: exponential.scale(self.saturation).scale(self.inverse_vt),
+                value: S::constant(raw_value),
+                derivative: S::constant(f64::NAN),
             };
         }
         let one_minus_exp = -(-x).exp_m1();

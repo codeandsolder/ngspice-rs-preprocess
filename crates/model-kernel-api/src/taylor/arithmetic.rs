@@ -48,6 +48,10 @@ pub trait Scalar:
     fn tanh(self) -> Self;
     #[must_use = "scalar operations return a new value"]
     fn atan(self) -> Self;
+    /// Lift an exponential whose scaled constant term is already evaluated.
+    /// Useful when the unscaled exp(x) would overflow in higher coefficients.
+    #[must_use = "scalar operations return a new value"]
+    fn exp_with_value(self, value: f64) -> Self;
     /// Regular continuation of expm1(x)/x through zero.
     #[must_use = "scalar operations return a new value"]
     fn exprel(self) -> Self;
@@ -145,6 +149,9 @@ impl Scalar for f64 {
     }
     fn atan(self) -> Self {
         self.atan()
+    }
+    fn exp_with_value(self, value: f64) -> Self {
+        value
     }
     fn exprel(self) -> Self {
         if self == 0. { 1. } else { self.exp_m1() / self }
@@ -483,6 +490,20 @@ impl Scalar for Series {
     fn mul_add(self, multiplier: Self, addend: Self) -> Self {
         let order = self.order.max(multiplier.order).max(addend.order);
         let mut result = Self::zero(order);
+        if self.order == 0 || multiplier.order == 0 {
+            let (constant, series) = if self.order == 0 {
+                (self.value(), multiplier)
+            } else {
+                (multiplier.value(), self)
+            };
+            for (dst, (&value, &offset)) in result.coefficients[..=order]
+                .iter_mut()
+                .zip(series.coefficients.iter().zip(&addend.coefficients))
+            {
+                *dst = constant.mul_add(value, offset);
+            }
+            return result;
+        }
         for n in 0..=order {
             result.coefficients[n] = self.coefficients[..=n]
                 .iter()
@@ -523,6 +544,9 @@ impl Scalar for Series {
             (self * self).offset(1.).recip()
         };
         self.compose_derivative(self.value().atan(), slope)
+    }
+    fn exp_with_value(self, value: f64) -> Self {
+        self.exponential(value)
     }
     fn exprel(self) -> Self {
         if self.is_constant() {

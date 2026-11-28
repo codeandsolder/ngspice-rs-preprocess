@@ -215,15 +215,12 @@ fn fowler_nordheim_artifact_reuses_terminal_law_and_candidate_slots() -> Result<
             assert_eq!(point.capacitance, [c, -c, -c, c]);
             let mut noise = Noise::default();
             let result = compiled.evaluate_noise(&prepared, &coordinates, 1e3, &mut noise);
-            match local.shot_noise(expected.current) {
-                Ok(density) => {
-                    result?;
-                    assert_eq!(noise.0, [("shot".into(), [0, 1], density)]);
-                }
-                Err(_) => {
-                    assert!(result.is_err());
-                    assert!(noise.0.is_empty());
-                }
+            if let Ok(density) = local.shot_noise(expected.current) {
+                result?;
+                assert_eq!(noise.0, [("shot".into(), [0, 1], density)]);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(noise.0, []);
             }
         }
     }
@@ -235,7 +232,7 @@ fn fowler_nordheim_artifact_reuses_terminal_law_and_candidate_slots() -> Result<
 fn physical_taylor_diode_reconstructs_full_model() -> Result<()> {
     use model_kernel_api::taylor::{TaylorBuffer, TaylorInput};
     const ORDER: usize = 12;
-    for m in [0.4, 1., 1.2] {
+    for grading in [0.4, 1., 1.2] {
         for rs in [0., 3.] {
             let model = compile_simetrix([
                 ("IS", 1e-12),
@@ -250,50 +247,61 @@ fn physical_taylor_diode_reconstructs_full_model() -> Result<()> {
                 ("NBVL", 2.2),
                 ("CJO", 1e-9),
                 ("VJ", 0.7),
-                ("M", m),
+                ("M", grading),
                 ("FC", 0.5),
                 ("TT", 20e-9),
                 ("RS", rs),
             ])?;
-            let a = artifact(model, Instance::default(), [6; 16])?;
-            let prepared = a.prepare(&[1., 1., 1e-12, 0.], 300.15)?;
-            let width = a.descriptor().equations.len();
+            let compiled = artifact(model, Instance::default(), [6; 16])?;
+            let prepared = compiled.prepare(&[1., 1., 1e-12, 0.], 300.15)?;
+            let width = compiled.descriptor().equations.len();
             let anode = if width == 3 { 2 } else { 0 };
-            for v in [-4.1, -1., 0., 0.35, 0.6, 0.8] {
+            for bias in [-4.1, -1., 0., 0.35, 0.6, 0.8] {
                 for slope in [-0.01, 0.01] {
-                    let mut x = vec![0.; width * (ORDER + 1)];
-                    x[anode] = v;
-                    x[width + anode] = slope;
-                    x[2 * width + anode] = 0.001;
-                    let mut t = TaylorBuffer::new(width, ORDER)?;
-                    a.evaluate_taylor(
+                    let mut coefficients = vec![0.; width * (ORDER + 1)];
+                    coefficients[anode] = bias;
+                    coefficients[width + anode] = slope;
+                    coefficients[2 * width + anode] = 0.001;
+                    let mut series_buffer = TaylorBuffer::new(width, ORDER)?;
+                    compiled.evaluate_taylor(
                         &prepared,
                         TaylorInput {
                             order: ORDER,
-                            coefficients: &x,
+                            coefficients: &coefficients,
                         },
-                        &mut t.point(),
+                        &mut series_buffer.point(),
                     )?;
-                    let p = t.point();
+                    let series_point = series_buffer.point();
                     let mut scalar = PointBuffer::new(width)?;
                     for tau in [0., 0.125, 0.5] {
                         let reconstruct = |coeff: &[f64], stride: usize, i: usize| -> f64 {
                             (0..=ORDER)
                                 .rev()
-                                .fold(0., |v: f64, k| v.mul_add(tau, coeff[k * stride + i]))
+                                .fold(0., |bias: f64, k| bias.mul_add(tau, coeff[k * stride + i]))
                         };
-                        let coords: Vec<_> =
-                            (0..width).map(|i| reconstruct(&x, width, i)).collect();
-                        a.evaluate(&prepared, &coords, &mut scalar.point())?;
-                        let s = scalar.point();
+                        let coords: Vec<_> = (0..width)
+                            .map(|i| reconstruct(&coefficients, width, i))
+                            .collect();
+                        compiled.evaluate(&prepared, &coords, &mut scalar.point())?;
+                        let scalar_point = scalar.point();
                         for (series, expected, stride, atol) in [
-                            (&*p.current, &*s.current, width, 1e-13),
-                            (&*p.charge, &*s.charge, width, 1e-21),
-                            (&*p.conductance, &*s.conductance, width * width, 1e-13),
-                            (&*p.capacitance, &*s.capacitance, width * width, 1e-21),
+                            (&*series_point.current, &*scalar_point.current, width, 1e-13),
+                            (&*series_point.charge, &*scalar_point.charge, width, 1e-21),
+                            (
+                                &*series_point.conductance,
+                                &*scalar_point.conductance,
+                                width * width,
+                                1e-13,
+                            ),
+                            (
+                                &*series_point.capacitance,
+                                &*scalar_point.capacitance,
+                                width * width,
+                                1e-21,
+                            ),
                         ] {
                             for (i, expected) in expected.iter().enumerate() {
-                                close(reconstruct(series,stride,i), *expected, atol, 1e-8).map_err(|e| format!("M={m} RS={rs} v={v} slope={slope} tau={tau} entry={i}: {e}"))?;
+                                close(reconstruct(series,stride,i), *expected, atol, 1e-8).map_err(|e| format!("M={grading} RS={rs} bias={bias} slope={slope} tau={tau} entry={i}: {e}"))?;
                             }
                         }
                     }
@@ -402,6 +410,37 @@ fn exact_diode_join_and_full_order_exponential() -> Result<()> {
             0.,
             1e-13,
         )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn scaled_exponential_series_avoids_unscaled_overflow() -> Result<()> {
+    use model_kernel_api::taylor::{MAX_ORDER, TaylorBuffer, TaylorInput};
+    let model = compile_simetrix([("IS", 1e-300)])?;
+    let a = artifact(model, Instance::default(), [12; 16])?;
+    let p = a.prepare(&[1., 1., 0., 0.], 300.15)?;
+    let vt = model_kernel_diode::K_OVER_Q * 300.15;
+    let mut x = vec![0.; 2 * (MAX_ORDER + 1)];
+    x[0] = 700. * vt;
+    x[2] = 100. * vt;
+    let mut output = TaylorBuffer::new(2, MAX_ORDER)?;
+    a.evaluate_taylor(
+        &p,
+        TaylorInput {
+            order: MAX_ORDER,
+            coefficients: &x,
+        },
+        &mut output.point(),
+    )?;
+    let out = output.point();
+    let mut expected = 1e-300 * 700_f64.exp();
+    for (degree, k) in (0..=MAX_ORDER).zip(0_u32..) {
+        if k != 0 {
+            expected *= 100. / f64::from(k);
+        }
+        close(out.current[2 * degree], expected, 0., 2e-12)?;
+        close(out.conductance[4 * degree], expected / vt, 0., 2e-12)?;
     }
     Ok(())
 }

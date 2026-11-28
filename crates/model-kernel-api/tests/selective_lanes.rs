@@ -146,7 +146,7 @@ fn snapshot(tile: &PreparedTile<CountingKernel>, x: &[f64]) -> Result<Vec<Vec<u6
         .collect()
 }
 
-fn update(lane: usize, values: &[f64], ambient_kelvin: f64) -> LaneUpdate<'_> {
+const fn update(lane: usize, values: &[f64], ambient_kelvin: f64) -> LaneUpdate<'_> {
     LaneUpdate {
         lane,
         values,
