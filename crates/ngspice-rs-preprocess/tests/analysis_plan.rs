@@ -341,3 +341,85 @@ fn named_analysis_coordinates_are_not_mistaken_for_native_devices() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn linked_ltspice_analysis_is_extracted_with_occurrence_and_bound_axes() -> Result<()> {
+    use ngspice_rs_preprocess::{
+        WorkBudget,
+        analysis_plan::sweep::{SweepExecution, SweepTarget},
+    };
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let settings = dir.path().join("settings.inc");
+    fs::write(
+        &root,
+        b"Native root\n.include settings.inc\nV1 in 0 1\nR1 in out {r}\nC1 out 0 1u\n.op\n.end\n",
+    )?;
+    fs::write(&settings, b"*#LTSPICE\n.param r=1k\n.step param r list 2k\n+ 1k 3k\n.step temp list 40 20\n.tran 0 {r*1u} 0 0 startup\n.meas tran vmax MAX V(out)\n.meas tran scaled PARAM vmax*2\n.dc V1 1 0 -.5\n")?;
+    let prepared = prepare_path(&root, InputFormat::NativeDeck)?;
+    let plan = prepared
+        .analysis_plan
+        .as_ref()
+        .context("missing mixed analysis plan")?;
+    assert_eq!(plan.dialect, AnalysisDialect::Native);
+    assert_eq!(
+        plan.entries
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect::<Vec<_>>(),
+        [".STEP", ".STEP", ".TRAN", ".MEAS", ".MEAS", ".DC", ".OP"]
+    );
+    assert_eq!(
+        plan.entries[0].origin,
+        DirectiveOrigin::SourceOccurrence {
+            path: settings.canonicalize()?,
+            first_line: 3,
+            last_line: 4,
+            visit: 1,
+            scope: 0,
+        }
+    );
+    assert_eq!(plan.entries[6].dialect, AnalysisDialect::Native);
+    assert!(
+        matches!(&plan.entries[0].directive, Directive::Sweep { axis } if axis.target == SweepTarget::Parameter { name: "r".into() })
+    );
+    let Directive::DcSweep { axes } = &plan.entries[5].directive else {
+        anyhow::bail!("missing continuation sweep");
+    };
+    assert_eq!(axes[0].execution, SweepExecution::Continuation);
+    assert_eq!(plan.entries[4].statement, ".meas tran scaled PARAM vmax*2");
+    let budget = WorkBudget::default();
+    let sweeps = plan.bind_independent_sweeps(
+        |_, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+        &budget,
+    )?;
+    assert_eq!(sweeps.count(), 6);
+    let coordinates = |ordinal| -> Result<Vec<u64>> {
+        sweeps
+            .candidate(ordinal)?
+            .map(|result| result.map(|(_, value)| value.to_bits()))
+            .collect()
+    };
+    assert_eq!(coordinates(0)?, [1000_f64, 40.].map(f64::to_bits));
+    assert_eq!(coordinates(3)?, [1000_f64, 20.].map(f64::to_bits));
+    assert!(plan.validate_unbound_execution().is_err());
+    let electrical = std::str::from_utf8(&prepared.primary.bytes)?;
+    assert!(electrical.contains("R1 in out {r}"));
+    assert!(!electrical.lines().any(|line| matches!(
+        line.split_whitespace().next(),
+        Some(".step" | ".tran" | ".dc" | ".meas" | ".op")
+    )));
+    Ok(())
+}
+
+#[test]
+fn native_deck_without_source_analysis_preserves_native_execution() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let source = b"title\nV1 a 0 1\nR1 a 0 1k\n.tran 1u 2m\n.print tran v(a)\n.end\n";
+    fs::write(&root, source)?;
+    let bundle = prepare_path(&root, InputFormat::NativeDeck)?;
+    assert!(bundle.analysis_plan.is_none());
+    assert_eq!(bundle.primary.bytes, source);
+    Ok(())
+}

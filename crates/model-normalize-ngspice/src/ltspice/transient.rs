@@ -156,6 +156,16 @@ impl TransientIntent {
         let stop = resolve(&self.stop)?;
         let output_start = self.output_start.as_deref().map_or(Ok(0.), &mut resolve)?;
         let max_step = self.max_step.as_deref().map_or(Ok(0.), &mut resolve)?;
+        self.bind_values(interval, stop, output_start, max_step)
+    }
+
+    fn bind_values(
+        &self,
+        interval: f64,
+        stop: f64,
+        output_start: f64,
+        max_step: f64,
+    ) -> Result<BoundTransient> {
         ensure!(
             [interval, stop, output_start, max_step]
                 .iter()
@@ -186,23 +196,61 @@ impl TransientIntent {
         })
     }
 
-    /// Bind an entirely closed source declaration using the source's scalar
-    /// expression parser, not the native parser's arithmetic conventions.
+    /// Validate every closed field in the source expression language.
+    /// Return a bound timing only when no field needs lexical binding.
     ///
     /// # Errors
-    /// Symbolic timing requiring occurrence binding, invalid scalar or timing.
-    pub fn bind_closed(&self, budget: &WorkBudget) -> Result<BoundTransient> {
-        self.bind(|raw| {
+    /// Malformed scalar syntax, nonfinite or invalid closed timing, or work
+    /// exhaustion. An unresolved name is not replaced with a nominal value.
+    pub fn try_bind_closed(&self, budget: &WorkBudget) -> Result<Option<BoundTransient>> {
+        let scalar = |raw: &str| {
             budget.charge(Resource::ScannedBytes, raw.len())?;
             let text = raw.trim();
             let grouped = text
                 .strip_prefix('{')
                 .and_then(|text| text.strip_suffix('}'));
             let expression = grouped.unwrap_or(text);
-            crate::model_card::parse_spice_constant(expression)
-                .or_else(|_| super::constants::evaluate(expression, grouped.is_none(), budget))
-                .context("LTspice transient timing requires occurrence-specific scalar binding")
-        })
+            if let Ok(value) = crate::model_card::parse_spice_constant(expression) {
+                Ok(Some(value))
+            } else {
+                super::constants::try_evaluate(expression, grouped.is_none(), budget)
+            }
+        };
+        let interval = self.interval.as_deref().map_or(Ok(Some(0.)), scalar)?;
+        let stop = scalar(&self.stop)?;
+        let output_start = self.output_start.as_deref().map_or(Ok(Some(0.)), scalar)?;
+        let max_step = self.max_step.as_deref().map_or(Ok(Some(0.)), scalar)?;
+        ensure!(
+            stop.is_none_or(|value| value > 0.),
+            "LTspice transient needs positive duration"
+        );
+        ensure!(
+            max_step.is_none_or(|value| value >= 0.),
+            "LTspice transient needs nonnegative maximum step"
+        );
+        if let (Some(stop), Some(start)) = (stop, output_start) {
+            ensure!(
+                stop > start.max(0.),
+                "LTspice transient output window starts after final time"
+            );
+        }
+        let (Some(interval), Some(stop), Some(output_start), Some(max_step)) =
+            (interval, stop, output_start, max_step)
+        else {
+            return Ok(None);
+        };
+        self.bind_values(interval, stop, output_start, max_step)
+            .map(Some)
+    }
+
+    /// Bind an entirely closed source declaration using the source's scalar
+    /// expression parser, not the native parser's arithmetic conventions.
+    ///
+    /// # Errors
+    /// Symbolic timing requiring occurrence binding, invalid scalar or timing.
+    pub fn bind_closed(&self, budget: &WorkBudget) -> Result<BoundTransient> {
+        self.try_bind_closed(budget)?
+            .context("LTspice transient timing requires occurrence-specific scalar binding")
     }
 }
 

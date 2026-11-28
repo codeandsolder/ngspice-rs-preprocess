@@ -593,13 +593,13 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
     match (dialect, name) {
         (
             AnalysisDialect::Ltspice,
-            "RELTOL" | "ABSTOL" | "VNTOL" | "CHGTOL" | "TRTOL" | "GMIN" | "METHOD" | "TNOM"
-            | "MAXORD" | "ITL1" | "ITL2" | "ITL4",
+            "RELTOL" | "ABSTOL" | "VNTOL" | "CHGTOL" | "TRTOL" | "GMIN" | "TNOM" | "MAXORD"
+            | "ITL1" | "ITL2" | "ITL4",
         ) => Circuit,
         (
             AnalysisDialect::Ltspice,
-            "MAXSTEP" | "TEMP" | "SSTOL" | "STSTDELAY" | "STSTCLOCKS" | "PLOTRELTOL" | "PLOTVNTOL"
-            | "PLOTABSTOL" | "PLOTWINSIZE",
+            "MAXSTEP" | "TEMP" | "METHOD" | "SSTOL" | "STSTDELAY" | "STSTCLOCKS" | "PLOTRELTOL"
+            | "PLOTVNTOL" | "PLOTABSTOL" | "PLOTWINSIZE",
         ) => RequiresBinding,
         (
             AnalysisDialect::Ltspice,
