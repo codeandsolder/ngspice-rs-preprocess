@@ -1,0 +1,5 @@
+R1 left 0 1k
+R2 left 0 2k
+.op
+.backanno
+.end

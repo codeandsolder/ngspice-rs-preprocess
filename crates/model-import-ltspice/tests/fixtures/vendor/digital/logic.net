@@ -1,0 +1,6 @@
+A1 in ref ref ref ref inv ref ref BUF
+A2 a b ref ref ref ref q ref AND
+A3 inp 0 0 0 0 0 outp 0 SCHMITT
+.op
+.backanno
+.end

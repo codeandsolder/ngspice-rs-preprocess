@@ -1067,6 +1067,7 @@ pub fn prepare(
         | InputFormat::TinaDeck
         | InputFormat::TinaLibrary
         | InputFormat::LtspiceDeck
+        | InputFormat::LtspiceSchematic
         | InputFormat::LtspiceLibrary
         | InputFormat::PspiceDeck
         | InputFormat::PspiceLibrary

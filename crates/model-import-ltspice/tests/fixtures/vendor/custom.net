@@ -1,0 +1,6 @@
+XX1 a b ext
+XX2 b 0 ext
+.op
+.lib ext.lib
+.backanno
+.end

@@ -1,0 +1,5 @@
+A1 in ref ref ref ref N001 ref ref BUF
+R1 NC_06 NC_07 1k
+.op
+.backanno
+.end
