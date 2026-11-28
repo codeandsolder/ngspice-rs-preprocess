@@ -510,7 +510,7 @@ impl<'a> Capture<'a> {
         self.capture_device(scope, statement, &fields, None)
     }
 
-    /// Capture only the device IC property of a PSpice storage instance.
+    /// Capture device IC and omitted-coordinate policy of a `PSpice` storage instance.
     /// Source NOICTRANSLATE selects whether to generate a finite bias equation;
     /// the explicit storage coordinate remains available for skipped bias.
     ///
@@ -583,12 +583,10 @@ impl<'a> Capture<'a> {
         if !has_override && pspice_translate.is_none() {
             return Ok(statement.to_owned());
         }
-        let missing_storage = if let Some(translate) = pspice_translate {
+        let missing_storage = pspice_translate.map_or(MissingStorage::NodeHints, |translate| {
             mode = Some(if translate { "2" } else { "0" }.to_owned());
             MissingStorage::Zero
-        } else {
-            MissingStorage::NodeHints
-        };
+        });
         ensure!(fields.len() >= 4, "incomplete passive declaration {first}");
         // All ICs are bound by the typed policy, including analysis-dependent
         // explicit storage values. Do not leave an unbound ANALYSIS expression

@@ -176,7 +176,8 @@ fn capture_devices(
     Ok(())
 }
 
-/// Extract PSpice device initialization from a normalized, linked artifact.
+/// Extract `PSpice` device initialization from a normalized, linked artifact.
+///
 /// Unlike textual replacement with a permanent source, the resulting policy
 /// is selected separately for each elaborated device and enclosing analysis.
 /// The number and order of physical lines are unchanged.
