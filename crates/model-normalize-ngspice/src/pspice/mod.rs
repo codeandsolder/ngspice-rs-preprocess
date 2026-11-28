@@ -26,6 +26,7 @@ mod nodes;
 mod options;
 mod passive;
 mod scope;
+pub mod switch_source;
 mod temperature;
 use scope::Scopes;
 
@@ -308,66 +309,9 @@ fn rename_parameter(card: &mut ModelCard, from: &str, to: &str) {
     }
 }
 
-#[derive(Clone, Copy)]
-enum SwitchLaw {
-    ThresholdVoltage,
-    ThresholdCurrent,
-    ContinuousVoltage,
-    ContinuousCurrent,
-}
+use switch_source::SwitchLaw;
 
 impl SwitchLaw {
-    fn from_model(card: &ModelCard) -> Result<Option<Self>> {
-        let voltage = card.family.eq_ignore_ascii_case("vswitch");
-        if !voltage && !card.family.eq_ignore_ascii_case("iswitch") {
-            return Ok(None);
-        }
-        let (threshold, hysteresis, on, off) = if voltage {
-            ("vt", "vh", "von", "voff")
-        } else {
-            ("it", "ih", "ion", "ioff")
-        };
-        let discrete = parameter(card, threshold).is_some()
-            || parameter(card, hysteresis).is_some()
-            || parameter(card, "td").is_some();
-        let continuous = parameter(card, on).is_some() || parameter(card, off).is_some();
-        ensure!(
-            !(discrete && continuous),
-            "PSpice switch cannot mix threshold and continuous laws"
-        );
-        let allowed = if discrete {
-            [threshold, hysteresis, "ron", "roff"]
-        } else {
-            [on, off, "ron", "roff"]
-        };
-        for field in &card.parameters {
-            if discrete && field.name.eq_ignore_ascii_case("td") {
-                ensure!(
-                    field.expression.as_deref().is_some_and(|value| matches!(
-                        parse_spice_constant(temperature::expression(value)),
-                        Ok(0.0)
-                    )),
-                    "PSpice nonzero threshold-switch delay requires a timed switch kernel"
-                );
-                continue;
-            }
-            ensure!(
-                allowed
-                    .iter()
-                    .any(|name| field.name.eq_ignore_ascii_case(name))
-                    && field.expression.is_some(),
-                "unsupported PSpice switch parameter {}",
-                field.name
-            );
-        }
-        Ok(Some(match (voltage, discrete) {
-            (true, true) => Self::ThresholdVoltage,
-            (false, true) => Self::ThresholdCurrent,
-            (true, false) => Self::ContinuousVoltage,
-            (false, false) => Self::ContinuousCurrent,
-        }))
-    }
-
     fn lower_model(self, card: &mut ModelCard, control_conductance: f64) -> Result<()> {
         match self {
             Self::ThresholdVoltage | Self::ThresholdCurrent => {
@@ -496,7 +440,7 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
         return Ok(text.to_owned());
     }
     let model = functions.scopes.model(model_line)?;
-    let Some(law) = SwitchLaw::from_model(&model)? else {
+    let Some(law) = SwitchLaw::from_static_model(&model)? else {
         return Ok(text.to_owned());
     };
     if matches!(law, SwitchLaw::ThresholdVoltage) {
@@ -603,7 +547,7 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
         set_parameter(&mut card, "level", "1")?;
         set_parameter(&mut card, "subs", "-1")?;
     }
-    if let Some(switch) = SwitchLaw::from_model(&card)? {
+    if let Some(switch) = SwitchLaw::from_static_model(&card)? {
         switch.lower_model(&mut card, functions.options.gmin)?;
     }
     let multiplier = functions.passives.lower_model(line, &mut card);
@@ -779,8 +723,15 @@ fn lower_body(
         ))
     })?;
     let scopes = Scopes::collect(&statements, origins, dialects, budget)?;
-    let digital = digital_source::capture(&statements, &scopes, origins, dialects)?;
-    if let Some(declaration) = digital.first() {
+    let declarations = digital_source::capture(&statements, &scopes, origins, dialects)?;
+    if let Some(declaration) = declarations.delayed_switches.first() {
+        bail!(
+            "PSpice nonzero threshold-switch delay requires a timed switch kernel: {} at {:?}",
+            declaration.name,
+            declaration.location
+        );
+    }
+    if let Some(declaration) = declarations.digital.first() {
         bail!(
             "PSpice digital primitive {} at {:?} requires occurrence-bound native digital execution",
             declaration.instance.declaration.name,

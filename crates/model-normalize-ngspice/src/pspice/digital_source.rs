@@ -5,6 +5,7 @@ use super::{
     digital_io::IoModel,
     digital_timing::TimingModel,
     scope::{Scopes, charge_card, charge_scope},
+    switch_source::DelayedSwitchDeclaration,
 };
 use crate::{
     SourceDialects, lexical,
@@ -71,14 +72,14 @@ impl DigitalDeclaration {
     }
 }
 
-struct Capture<'a> {
-    scopes: &'a Scopes,
+pub(super) struct Capture<'a> {
+    pub(super) scopes: &'a Scopes,
     origins: &'a [usize],
     dialects: SourceDialects<'a>,
 }
 
 impl Capture<'_> {
-    fn location(&self, line: usize, scope: usize) -> Result<Location> {
+    pub(super) fn location(&self, line: usize, scope: usize) -> Result<Location> {
         let input_line = *self
             .origins
             .get(line.checked_sub(1).context("invalid digital source line")?)
@@ -167,18 +168,27 @@ impl Capture<'_> {
     }
 }
 
+/// Source declarations requiring occurrence-bound event or delayed physical execution.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SourceDeclarations {
+    /// Digital primitive declarations with lexical model layers.
+    pub digital: Vec<DigitalDeclaration>,
+    /// Short-transition switch declarations with nonzero or symbolic delay.
+    pub delayed_switches: Vec<DelayedSwitchDeclaration>,
+}
+
 pub(super) fn capture(
     statements: &[lexical::Statement],
     scopes: &Scopes,
     origins: &[usize],
     dialects: SourceDialects<'_>,
-) -> Result<Vec<DigitalDeclaration>> {
+) -> Result<SourceDeclarations> {
     let capture = Capture {
         scopes,
         origins,
         dialects,
     };
-    let mut declarations = Vec::new();
+    let mut declarations = SourceDeclarations::default();
     let mut control = false;
     let mut conditional_depth = 0usize;
     for statement in statements {
@@ -216,13 +226,26 @@ pub(super) fn capture(
                     dialects.describe_mapped(origins, statement.line)
                 )
             })?;
-            declarations.push(declaration);
+            declarations.digital.push(declaration);
+        } else if first
+            .first()
+            .is_some_and(|byte| matches!(byte, b's' | b'S' | b'w' | b'W'))
+            && dialects.at_mapped(origins, statement.line)?.is_pspice()
+        {
+            let text = std::str::from_utf8(&statement.text)?;
+            if let Some(declaration) = capture.delayed_switch(text, statement.line)? {
+                ensure!(
+                    conditional_depth == 0,
+                    "conditional PSpice delayed switch requires topology binding"
+                );
+                declarations.delayed_switches.push(declaration);
+            }
         }
     }
     Ok(declarations)
 }
 
-/// Bind digital declarations in an admitted graph without executing devices.
+/// Bind source digital and delayed-switch declarations in an admitted graph.
 ///
 /// Model references use lexical visibility and preserve original include visits.
 /// Numerical parameters, I/O interfaces and native event scheduling are not bound here.
@@ -233,7 +256,10 @@ pub fn capture_linked(
     linked: &LinkedSource,
     kind: RootKind,
     budget: &WorkBudget,
-) -> Result<Vec<DigitalDeclaration>> {
+) -> Result<SourceDeclarations> {
+    if !linked.visits.iter().any(|visit| visit.dialect.is_pspice()) {
+        return Ok(SourceDeclarations::default());
+    }
     let bytes = &linked.bytes;
     budget.charge(Resource::ScannedBytes, bytes.len())?;
     let skip = usize::from(kind == RootKind::Deck);
@@ -275,6 +301,7 @@ mod tests {
         let scopes = Scopes::collect(&statements, &origins, dialects, &budget)?;
         let declarations = capture(&statements, &scopes, &origins, dialects)?;
         let declaration = declarations
+            .digital
             .first()
             .context("missing U-device declaration")?;
         assert_eq!(declaration.instance.location.scope, ["cell"]);
@@ -320,6 +347,62 @@ mod tests {
     }
 
     #[test]
+    fn delayed_thresholds_preserve_control_orientation_and_scope() -> Result<()> {
+        use super::super::switch_source::ControlConnection;
+        let input = b".model base VSWITCH(VT={global_threshold} RON=2 TD={global_delay})\n.subckt cell p n cp cn\n.model local AKO:base VSWITCH(VH={local_hysteresis} TD={local_delay})\nS1 p n cp cn local\n.ends\n.model current ISWITCH(IT=-1m IH=0 TD=2n)\nW1 p n Vsense current\n.model immediate VSWITCH(VT=0 TD=0)\nS2 p n cp cn immediate\n";
+        let budget = WorkBudget::default();
+        let statements = lexical::statements(input)?;
+        let origins = (1..=9).collect::<Vec<_>>();
+        let dialects = SourceDialects::Uniform(SourceDialect::Pspice);
+        let scopes = Scopes::collect(&statements, &origins, dialects, &budget)?;
+        let declarations = capture(&statements, &scopes, &origins, dialects)?;
+        let [voltage, current] = declarations.delayed_switches.as_slice() else {
+            anyhow::bail!("expected exactly two delayed switches")
+        };
+        assert_eq!(voltage.location.scope, ["cell"]);
+        assert_eq!(voltage.terminals, ["p", "n"]);
+        assert_eq!(
+            voltage.control,
+            ControlConnection::Voltage {
+                positive: "cp".to_owned(),
+                negative: "cn".to_owned()
+            }
+        );
+        let bound = voltage.bind(
+            |location, field| match (location.scope.as_slice(), field.expression.as_deref()) {
+                ([], Some("{global_threshold}")) => Ok(-1.),
+                ([], Some("2")) => Ok(2.),
+                ([cell], Some("{local_hysteresis}")) if cell == "cell" => Ok(0.25),
+                ([cell], Some("{local_delay}")) if cell == "cell" => Ok(5e-9),
+                _ => anyhow::bail!("unexpected effective switch field"),
+            },
+            &budget,
+        )?;
+        assert_eq!(bound.threshold.to_bits(), (-1_f64).to_bits());
+        assert_eq!(bound.hysteresis.to_bits(), 0.25_f64.to_bits());
+        assert_eq!(bound.delay.to_bits(), 5e-9_f64.to_bits());
+        assert_eq!(bound.ron.to_bits(), 2_f64.to_bits());
+        assert_eq!(bound.roff.to_bits(), 1e12_f64.to_bits());
+        assert_eq!(
+            current.control,
+            ControlConnection::Current {
+                branch: "Vsense".to_owned()
+            }
+        );
+        let bound = current.bind(
+            |_, field| {
+                crate::model_card::parse_spice_constant(
+                    field.expression.as_deref().context("missing expression")?,
+                )
+            },
+            &budget,
+        )?;
+        assert_eq!(bound.threshold.to_bits(), (-1e-3_f64).to_bits());
+        assert_eq!(bound.delay.to_bits(), 2e-9_f64.to_bits());
+        Ok(())
+    }
+
+    #[test]
     fn bind_io_defaults_overrides_and_selected_interface() -> Result<()> {
         use super::super::digital_io::{InterfaceLevel, PulseRejection};
         let input = b".model base UIO(DRVH={ignored} DRVL=70 AtoD2=rx AtoD4={unused})
@@ -335,7 +418,7 @@ U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
         let dialects = SourceDialects::Uniform(SourceDialect::Pspice);
         let scopes = Scopes::collect(&statements, &origins, dialects, &budget)?;
         let declarations = capture(&statements, &scopes, &origins, dialects)?;
-        let declaration = declarations.first().context("missing U-device")?;
+        let declaration = declarations.digital.first().context("missing U-device")?;
         let selector = declaration.resolve_selector(
             "IO_LEVEL",
             |location, field| {
@@ -421,7 +504,7 @@ U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
         )?;
         let budget = WorkBudget::default();
         let declarations = capture_linked(&linked, RootKind::Deck, &budget)?;
-        let [one, two] = declarations.as_slice() else {
+        let [one, two] = declarations.digital.as_slice() else {
             anyhow::bail!("expected two lexical declarations")
         };
         let left = one
