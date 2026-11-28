@@ -7,6 +7,7 @@
 //! channel only; source-specific parasitics and parameter derivation are separate.
 #![forbid(unsafe_code)]
 
+pub mod artifact;
 mod channel;
 mod parameters;
 
@@ -32,6 +33,7 @@ pub struct Linearization {
     pub point: Intrinsic,
     pub conductance: [[f64; 4]; 4],
     pub capacitance: [[f64; 4]; 4],
+    pub channel_transconductance: f64,
 }
 
 impl Prepared {
@@ -65,12 +67,16 @@ impl Prepared {
         let point = self.evaluate(voltage)?;
         let mut conductance = [[0.; 4]; 4];
         let mut capacitance = [[0.; 4]; 4];
+        let mut channel_transconductance = 0.;
         for column in 0..4 {
             let mut input = [Series::default(); 4];
             for (row, value) in voltage.into_iter().enumerate() {
                 input[row] = Series::from_coefficients([value, f64::from(row == column)])?;
             }
             let derivative = self.evaluate(input)?;
+            if column == 1 {
+                channel_transconductance = derivative.channel_current.coefficient(1);
+            }
             for row in 0..4 {
                 conductance[row][column] = derivative.current[row].coefficient(1);
                 capacitance[row][column] = derivative.charge[row].coefficient(1);
@@ -80,6 +86,7 @@ impl Prepared {
             point,
             conductance,
             capacitance,
+            channel_transconductance,
         })
     }
 }

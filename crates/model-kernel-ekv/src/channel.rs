@@ -78,6 +78,14 @@ struct Transport<S> {
     equivalent_length: S,
 }
 
+// Rationalize the difference of the two smoothed saturation roots. In
+// particular, equal drain and source voltages give exactly zero difference
+// without rounding away the small-signal derivative.
+fn saturation_difference<S: Scalar>(sat: S, half_vds: S, smooth: S) -> S {
+    half_vds * (sat.scale(2.) - half_vds)
+        / ((square(sat) + smooth).sqrt() + (square(half_vds - sat) + smooth).sqrt())
+}
+
 fn transport<S: Scalar>(p: &Prepared, vp: S, vd: S, vs: S) -> Transport<S> {
     let forward = normalized_current((vp - vs).scale(p.vt.recip()));
     let root = forward.sqrt();
@@ -93,8 +101,7 @@ fn transport<S: Scalar>(p: &Prepared, vp: S, vd: S, vs: S) -> Transport<S> {
         .scale(p.lambda)
         .offset(0.015_625)
         .scale(16. * p.vt * p.vt);
-    let effective =
-        (square(saturation) + smooth).sqrt() - (square(half_vds - saturation) + smooth).sqrt();
+    let effective = saturation_difference(saturation, half_vds, smooth);
     let reverse_saturation = (root - forward.ln().scale(0.75))
         .scale(p.vt / vc)
         .offset(0.25)
@@ -103,9 +110,8 @@ fn transport<S: Scalar>(p: &Prepared, vp: S, vd: S, vs: S) -> Transport<S> {
         .scale(vc)
         .offset(p.vt * ((0.5 * vc / p.vt).ln() - 0.6));
     let reverse_saturated = normalized_current(
-        (vp - half_vds - vs - (square(reverse_saturation) + smooth).sqrt()
-            + (square(half_vds - reverse_saturation) + smooth).sqrt())
-        .scale(p.vt.recip()),
+        (vp - vs - half_vds - saturation_difference(reverse_saturation, half_vds, smooth))
+            .scale(p.vt.recip()),
     );
     let shortening = (half_vds - effective)
         .scale((p.characteristic_length * p.critical_field).recip())

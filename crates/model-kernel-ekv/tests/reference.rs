@@ -73,3 +73,93 @@ fn conservation_and_derivatives() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+#[test]
+fn reference_linearization() -> Result<(), Box<dyn std::error::Error>> {
+    for line in include_str!("fixtures/reference-linearization.tsv")
+        .lines()
+        .skip(1)
+    {
+        let row: Vec<&str> = line.split_whitespace().collect();
+        let value = |i: usize| row[i].parse::<f64>();
+        let polarity = if row[0] == "1" {
+            Polarity::N
+        } else {
+            Polarity::P
+        };
+        let mut model = Model::reference_defaults(polarity);
+        model.mobility_field = value(6)?;
+        model.theta = value(7)?;
+        let geometry = Geometry {
+            length: value(2)?,
+            width: value(3)?,
+            parallel: value(4)?,
+            series: value(5)?,
+        };
+        let prepared = model.prepare(geometry, value(1)? + 273.15)?;
+        let v = [value(8)?, value(9)?, value(10)?, value(11)?];
+        let col: usize = row[12].parse()?;
+        let linear = prepared.linearize(v)?;
+        for r in 0..4 {
+            let actual = linear.point.current[r];
+            let expected = value(13 + r)?;
+            assert!(
+                (actual - expected).abs() <= expected.abs().mul_add(2e-7, 1e-24),
+                "I {r}: {actual:.12e} != {expected:.12e}, {line}"
+            );
+            let actual = linear.conductance[r][col];
+            let expected = value(17 + 2 * r)?;
+            assert!(
+                (actual - expected).abs() <= expected.abs().mul_add(2e-7, 1e-18),
+                "G {r} {col}: {actual:.12e} != {expected:.12e}, {line}"
+            );
+            let actual = linear.capacitance[r][col];
+            let expected = value(18 + 2 * r)?;
+            assert!(
+                (actual - expected).abs() <= expected.abs().mul_add(2e-7, 1e-26),
+                "C {r} {col}: {actual:.12e} != {expected:.12e}, {line}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn reference_transient_charge() -> Result<(), Box<dyn std::error::Error>> {
+    let model = Model::reference_defaults(Polarity::N).prepare(GEOMETRY, 300.15)?;
+    let mut previous: Option<(f64, [f64; 4])> = None;
+    let mut first_charge = [0.; 4];
+    let mut final_charge = [0.; 4];
+    let mut integral = [0.; 4];
+    // Skip the initial operating point, which has no ramp displacement.
+    for line in include_str!("fixtures/reference-transient.tsv")
+        .lines()
+        .skip(2)
+    {
+        let row: Vec<f64> = line
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?;
+        let p = model.evaluate([1., row[1], 0., 0.])?;
+        let displacement = std::array::from_fn(|r| -row[2 + r] - p.current[r]);
+        if let Some((time, last)) = previous {
+            for r in 0..4 {
+                integral[r] =
+                    (row[0] - time).mul_add(f64::midpoint(last[r], displacement[r]), integral[r]);
+            }
+        } else {
+            first_charge = p.charge;
+        }
+        final_charge = p.charge;
+        previous = Some((row[0], displacement));
+    }
+    for r in 0..4 {
+        let expected = final_charge[r] - first_charge[r];
+        assert!(
+            (integral[r] - expected).abs() <= expected.abs().mul_add(3e-3, 5e-18),
+            "terminal {r}: integrated {:+.12e} != charge change {expected:+.12e}",
+            integral[r]
+        );
+    }
+    Ok(())
+}
