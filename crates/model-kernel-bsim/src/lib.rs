@@ -11,8 +11,8 @@
 
 mod junction;
 mod noise;
-mod trial;
 pub mod soi;
+mod trial;
 
 use std::sync::Arc;
 

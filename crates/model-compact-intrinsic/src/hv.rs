@@ -10,6 +10,7 @@ mod channel_correction;
 mod channel_electrostatics;
 mod channel_mobility;
 mod channel_modulation;
+mod depletion_surface;
 mod drain_smoothing;
 mod drift;
 mod edge_tunneling;
@@ -69,6 +70,10 @@ pub use channel_modulation::{
     HiSimHvChannelModulationInputs, HiSimHvChannelModulationPoint, HiSimHvChannelTerminalCharges,
     PreparedHiSimHvChannelChargeArea, PreparedHiSimHvChannelModulation,
     prepare_hisim_hv_channel_modulation,
+};
+pub use depletion_surface::{
+    HiSimHvDepletionSurfaceInputs, HiSimHvDepletionSurfacePoint,
+    evaluate_hisim_hv_depletion_surface,
 };
 pub use drain_smoothing::{
     HiSimHvDrainSmoothingInputs, HiSimHvDrainSmoothingPoint, evaluate_hisim_hv_drain_smoothing,
