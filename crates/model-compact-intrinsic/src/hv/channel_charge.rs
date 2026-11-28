@@ -48,6 +48,8 @@ pub struct HiSimHvChannelChargePoint {
     pub bulk_density: Jet,
     pub inversion_density: Jet,
     pub drain_fraction: Jet,
+    /// Native unblended channel charge ratio used by noise.
+    pub alpha: Jet,
     pub transition_weight: Jet,
     /// Native endpoint depletion-integral shape for impact-induced bulk-potential feedback.
     pub bulk_feedback_shape: Jet,
@@ -147,6 +149,7 @@ impl HiSimHvChannelChargePoint {
             self.bulk_density,
             self.inversion_density,
             self.drain_fraction,
+            self.alpha,
             self.transition_weight,
             self.bulk_feedback_shape,
         ] {
@@ -182,6 +185,7 @@ fn integrate(
     let achi = pds + 2. * coefficient / cox * factors.f10_delta;
     let clamped = super::smoothing::unit_ceiling_power4(achi / point.inversion_voltage);
     let alpha = 1. - clamped;
+    point.alpha = alpha;
     let qinm = 1. + alpha * (1. + alpha);
     let denominator = 1. + alpha;
     let denominator = if denominator.value < EPS {
@@ -271,6 +275,7 @@ pub fn evaluate_hisim_hv_channel_charge(
         bulk_density: bulk,
         inversion_density: inversion,
         drain_fraction: Jet::constant(0.5),
+        alpha: Jet::constant(0.),
         transition_weight: transition_weight(source.chi),
         bulk_feedback_shape: Jet::constant(0.),
     };

@@ -832,6 +832,27 @@ and 10 GHz across both model variants, polarities, orientations, temperatures,
 geometries and delay cards: 11,520 cases. Independent off-equilibrium trial
 rows are tested by fourth-order finite differences and conservation checks.
 
+### HiSIM-HV enhancement-mode channel noise
+
+The prepared channel noise evaluator uses the native one-sided, source-referred
+thermal, flicker and induced-gate drain/source current spectra. The physical
+noise input is the same solved channel, access, overlap and local temperature
+state used by the current and charge evaluations. The native unblended Alpha,
+channel-length modulation, source inversion density and drift/diffusion integral
+feed the thermal and induced-gate shape factors. Flicker uses a stable log1p
+divided difference at equal endpoint carrier densities. Multiplicity and the
+native trap-density, interface-capacitance and mobility-correlation units are
+applied exactly once. CONQS excludes equilibrium channel gate charge from the
+induced noise capacitance, as in the original evaluator.
+
+The native source-resolved noise oracle measures 6,144 combinations with a
+unit drain transresistance, including 1 kHz, 1 MHz and 1 GHz, both families,
+polarities, directions, temperatures and geometries, and mechanism-selective
+cards. Near depletion the original endpoint subtraction loses significant
+relative accuracy in Pds; the comparison propagates the endpoint ULP bound
+through the squared-current law while retaining the ordinary relative and
+absolute criteria. The Rust difference solve does not lose that precision.
+
 ### Physical HiSIM-HV1/HV2 external fringing capacitance
 
 `prepare_hisim_hv_fringing(model, instance)` now prepares a real, original

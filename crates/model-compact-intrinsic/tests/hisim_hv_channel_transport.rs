@@ -50,6 +50,7 @@ fn values(fields: &[f64; 72]) -> Result<[Jet; 8], ModelError> {
         bulk_density: j(5),
         inversion_density: j(6),
         drain_fraction: zero,
+        alpha: zero,
         transition_weight: j(10),
         bulk_feedback_shape: zero,
     };

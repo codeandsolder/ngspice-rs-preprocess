@@ -146,6 +146,7 @@ pub struct PreparedHiSimHvNormalChannel {
     overlap: PreparedHiSimHvOverlap,
     fringing: PreparedHiSimHvFringing,
     nqs: super::nqs::Nqs,
+    noise: super::noise::Noise,
     identity: Arc<()>,
 }
 
@@ -229,6 +230,7 @@ pub fn prepare_hisim_hv_normal_channel(
         overlap: prepare_hisim_hv_overlap(model, instance)?,
         fringing: prepare_hisim_hv_fringing(model, instance)?,
         nqs: super::nqs::Nqs::prepare(model)?,
+        noise: super::noise::Noise::prepare(model, instance)?,
         identity: Arc::clone(&instance.identity),
     })
 }
@@ -256,6 +258,24 @@ impl HiSimHvNormalChannelWithParasiticsPoint {
 }
 
 impl PreparedHiSimHvNormalChannel {
+    /// Evaluate native channel noise at the same physical trial point.
+    /// # Errors
+    /// Invalid frequency or local constitutive state.
+    pub fn evaluate_noise(
+        &self,
+        bias: HiSimHvIntrinsicBias,
+        external: HiSimHvExternalBias,
+        drift_voltage: f64,
+        reversed: bool,
+        transport: &PreparedHiSimHvTransport,
+        frequency: f64,
+    ) -> Result<super::HiSimHvChannelNoise, ModelError> {
+        let state =
+            self.evaluate_with_parasitics(bias, external, drift_voltage, reversed, transport)?;
+        self.noise
+            .evaluate(bias, &state, &transport.temperature, frequency)
+    }
+
     /// Evaluate normal channel, access, impact and leakage with an independent
     /// normalized HV2 drain drift-region voltage drop (unused for HV1).
     /// Overlap orientation explicitly selects the physical source/drain sides.

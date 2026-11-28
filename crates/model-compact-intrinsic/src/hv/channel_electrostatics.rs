@@ -206,6 +206,7 @@ impl PreparedHiSimHvChannelElectrostatics {
                     bulk_density: acc.bulk_charge_density,
                     inversion_density: zero,
                     drain_fraction: zero,
+                    alpha: zero,
                     transition_weight: zero,
                     bulk_feedback_shape: zero,
                 },
