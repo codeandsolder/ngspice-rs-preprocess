@@ -287,3 +287,96 @@ impl TablePhases {
         }
     }
 }
+
+/// Annotate source electrical current reads after scalar/operator lowering
+/// and macro specialization. Native elaboration resolves each occurrence's
+/// actual branch or sampled port; display directives are not electrical reads.
+pub(super) fn project_current_reads(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+    budget.charge(Resource::ScannedBytes, body.len())?;
+    let mut edits = Vec::new();
+    let mut control = false;
+    for statement in lexical::statements(body)? {
+        budget.charge(Resource::Statements, 1)?;
+        let text = &statement.text;
+        let first = text
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .unwrap_or_default();
+        if first.eq_ignore_ascii_case(b".control") {
+            control = true;
+        } else if first.eq_ignore_ascii_case(b".endc") {
+            control = false;
+            continue;
+        }
+        if control
+            || !(first.eq_ignore_ascii_case(b".func")
+                || first.first().is_some_and(|byte| {
+                    matches!(
+                        byte.to_ascii_lowercase(),
+                        b'b' | b'r' | b'c' | b'l' | b'e' | b'g' | b'f' | b'h' | b'v' | b'i'
+                    )
+                }))
+        {
+            continue;
+        }
+        let Some(start) = expression_start(text, first)? else {
+            continue;
+        };
+        for call in lexical::function_names(text, b"i", start) {
+            let tail = &text[call.end..];
+            let after_space = tail.trim_ascii_start();
+            let Some(argument) = after_space.strip_prefix(b"(") else {
+                continue;
+            };
+            let Some(close) = argument.iter().position(|byte| *byte == b')') else {
+                continue;
+            };
+            let target = argument[..close].trim_ascii();
+            // The current grammar names a single device, possibly supplied
+            // through a function formal; don't reinterpret a malformed call.
+            if target.is_empty()
+                || target
+                    .iter()
+                    .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b',' | b'('))
+            {
+                continue;
+            }
+            let end = text.len() - argument.len() + close;
+            lexical::replace_span(&statement, call, b"branch_or_sampled_current(i", &mut edits);
+            lexical::replace_span(&statement, end..end + 1, b"))", &mut edits);
+        }
+    }
+    lexical::apply_budgeted_edits(body, edits, budget)
+}
+
+#[cfg(test)]
+mod current_read_tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn current_reads_preserve_runtime_roles_and_macro_formals() -> Result<()> {
+        let input = b".func read(x) {I(x)}\n.func fixed() {0*I(V1)}\nB1 b 0 V=read(C1)+fixed()+I( x1::vdrive )\nB2 c 0 I=I(R1)\nB3 d 0 V=I(\n+ C2)\nF1 e 0 V1 1\n.save I(C1) I(V1)\n.meas tran test FIND I(C1) AT=1m\n.control\nprint I(V1)\n.endc\n";
+        let output = project_current_reads(input, &WorkBudget::default())?
+            .context("missing current policy")?;
+        let text = std::str::from_utf8(&output)?;
+        for expected in [
+            ".func read(x) {branch_or_sampled_current(i(x))}",
+            ".func fixed() {0*branch_or_sampled_current(i(V1))}",
+            "branch_or_sampled_current(i( x1::vdrive ))",
+            "I=branch_or_sampled_current(i(R1))",
+            "V=branch_or_sampled_current(i(\n+ C2))",
+            "F1 e 0 V1 1",
+            ".save I(C1) I(V1)",
+            ".meas tran test FIND I(C1) AT=1m",
+            "print I(V1)",
+        ] {
+            ensure!(text.contains(expected), "{text}: missing {expected}");
+        }
+        ensure!(
+            input.split_inclusive(|byte| *byte == b'\n').count()
+                == output.split_inclusive(|byte| *byte == b'\n').count()
+        );
+        Ok(())
+    }
+}
