@@ -458,9 +458,7 @@ D1 a 0 dm
 
 #[test]
 fn classic_bjt_selector_preserves_source_models_and_native_input() -> Result<()> {
-    use model_preprocess_simplis::source_dialect::model_mapping::{
-        GUMMEL_POON_LEGACY_NPN, GUMMEL_POON_LEGACY_PNP,
-    };
+    use model_normalize_ngspice::bjt_card::{GUMMEL_POON_LEGACY_NPN, GUMMEL_POON_LEGACY_PNP};
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.net");
     let content = "* source BJT selection\n.temp 85\n.param sat=3p\n.model outer NPN(IS={sat} BF=110 TNOM=27)\nQ1 c b 0 outer TEMP=50\nQ2 c b 0 bipolar\n.model bipolar NPN(LEVEL=4 IS=1e-16)\nX1 c b 0 cell\n.subckt cell c b e\n.model outer PNP(LEVEL=1 IS=4p BF=120 T_MEASURED=29 T_ABS={TEMP-20})\nQ3 c b e outer\n.ends\n.end\n";
@@ -508,7 +506,7 @@ fn classic_bjt_selector_preserves_source_models_and_native_input() -> Result<()>
         bundle
             .model_selections
             .iter()
-            .filter(|s| s.mapping.device == Device::GummelPoon)
+            .filter(|s| s.mapping.device == Device::GummelPoonLegacy)
             .count(),
         2
     );
@@ -516,7 +514,7 @@ fn classic_bjt_selector_preserves_source_models_and_native_input() -> Result<()>
         bundle
             .model_selections
             .iter()
-            .any(|s| s.mapping.device == Device::GummelPoon
+            .any(|s| s.mapping.device == Device::GummelPoonLegacy
                 && s.scope == ["cell"]
                 && s.original.contains("T_MEASURED=29"))
     );
@@ -539,7 +537,7 @@ fn classic_bjt_selector_preserves_source_models_and_native_input() -> Result<()>
 
 #[test]
 fn classic_bjt_alias_retains_declared_polarity_in_raw_and_parsed_libraries() -> Result<()> {
-    use model_preprocess_simplis::source_dialect::model_mapping::GUMMEL_POON_LEGACY_PNP;
+    use model_normalize_ngspice::bjt_card::GUMMEL_POON_LEGACY_PNP;
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.net");
     let lib = dir.path().join("parts.lib");
@@ -586,7 +584,7 @@ fn classic_bjt_alias_retains_declared_polarity_in_raw_and_parsed_libraries() -> 
                 .model_selections
                 .iter()
                 .any(|s| s.card.name.eq_ignore_ascii_case("base")
-                    && s.mapping.device == Device::GummelPoon
+                    && s.mapping.device == Device::GummelPoonLegacy
                     && s.scope.is_empty()
                     && s.source.ends_with("parts.lib"))
         );
@@ -611,5 +609,172 @@ fn classic_bjt_alias_retains_declared_polarity_in_raw_and_parsed_libraries() -> 
     req.libraries
         .push(LibraryInput::Source(SourceInput::File(lib)));
     assert!(prepare(&req, &Options::default(), &Cancellation::default()).is_err());
+    Ok(())
+}
+
+#[test]
+fn classic_bjt_mapping_survives_raw_and_parsed_libraries_and_native_selection() -> Result<()> {
+    use model_normalize_ngspice::bjt_card::{BjtPolarity, BjtThermalConvention, ClassicBjtFamily};
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.net");
+    let library = dir.path().join("bjt.lib");
+    fs::write(
+        &library,
+        "*#HSPICE\n.subckt cell c b e params: is_local=3p\nQ1 c b e same M=2 TEMP=45\nQ2 c b e same\n.model same PNP(LEVEL=1 IS={is_local} BF=70 TNOM=35 T_ABS=50)\n.ends\n",
+    )?;
+    fs::write(
+        &root,
+        "* mixed BJT physical selection\n.temp 85\nVbias c 0 2\nVbase b 0 0.65\nQouter c b 0 same TEMP=60\n.model same NPN(IS=2p BF=100 TNOM=27)\nQexplicit c b 0 native_model DTEMP=5\n.model native_model NPN(LEVEL=70 IS=5p BF=200 TNOM=40)\n.map ModelName=NPN Level=70 Device=NGSPICE_BJT Letter=Q\nX1 c b 0 cell params: is_local=7p\n.op\n.end\n",
+    )?;
+    let mut raw = request(&root, InputFormat::SimetrixDeck);
+    raw.libraries
+        .push(LibraryInput::Source(SourceInput::File(library.clone())));
+    let admitted = prepare(&raw, &Options::default(), &Cancellation::default())?;
+    let compiled = prepare(
+        &request(&library, InputFormat::SimetrixLibrary),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let mut cached = request(&root, InputFormat::SimetrixDeck);
+    cached
+        .libraries
+        .push(LibraryInput::Parsed(ParsedLibrary::from_json(
+            &compiled.primary.bytes,
+        )?));
+    let restored = prepare(&cached, &Options::default(), &Cancellation::default())?;
+    let selected = |bundle: &PreparedBundle| {
+        bundle
+            .model_selections
+            .iter()
+            .map(|selection| {
+                (
+                    &selection.card.name,
+                    selection.mapping.device,
+                    selection.declared_level,
+                )
+            })
+            .map(|(name, device, level)| (name.clone(), device, level))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(selected(&admitted), selected(&restored));
+    assert_eq!(
+        serde_json::to_value(&admitted.model_selections)?,
+        serde_json::to_value(&restored.model_selections)?
+    );
+    assert_eq!(
+        admitted
+            .artifacts()
+            .map(|a| (&a.filename, &a.bytes))
+            .collect::<Vec<_>>(),
+        restored
+            .artifacts()
+            .map(|a| (&a.filename, &a.bytes))
+            .collect::<Vec<_>>()
+    );
+    for bundle in [&admitted, &restored] {
+        let source = prepared_diode::linked_library(bundle)?;
+        let top = source
+            .instantiate(model_normalize_ngspice::parameter_scope::topology::Limits::default())?;
+        assert_eq!(top.frames.len(), 2);
+        let mut families = source
+            .models
+            .iter()
+            .map(|model| {
+                (
+                    model.scope,
+                    model.card.name.to_ascii_lowercase(),
+                    ClassicBjtFamily::parse(&model.card.family),
+                )
+            })
+            .collect::<Vec<_>>();
+        families.sort_by_key(|(scope, name, _)| (*scope, name.clone()));
+        use BjtPolarity::{Npn, Pnp};
+        use BjtThermalConvention::{Legacy, Ngspice};
+        assert_eq!(
+            families,
+            [
+                (
+                    0,
+                    "native_model".into(),
+                    Some(ClassicBjtFamily {
+                        polarity: Npn,
+                        thermal: Ngspice
+                    })
+                ),
+                (
+                    0,
+                    "same".into(),
+                    Some(ClassicBjtFamily {
+                        polarity: Npn,
+                        thermal: Legacy
+                    })
+                ),
+                (
+                    1,
+                    "same".into(),
+                    Some(ClassicBjtFamily {
+                        polarity: Pnp,
+                        thermal: Legacy
+                    })
+                )
+            ]
+        );
+        let local = source
+            .models
+            .iter()
+            .find(|model| model.scope == 1)
+            .context("local BJT model")?;
+        let current = local
+            .card
+            .parameters
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("IS"))
+            .and_then(|p| p.expression.as_deref())
+            .context("local IS")?;
+        let overrides = top.frames[1]
+            .overrides
+            .iter()
+            .map(|(name, value)| (1, name.as_str(), *value))
+            .collect::<Vec<_>>();
+        assert!((source.evaluate_scalar(1, current, &overrides)? - 7e-12).abs() < 1e-25);
+        assert!(
+            local
+                .card
+                .parameters
+                .iter()
+                .all(|p| !p.name.eq_ignore_ascii_case("T_ABS"))
+        );
+        let deck = bundle
+            .artifacts()
+            .map(|a| String::from_utf8_lossy(&a.bytes))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_uppercase();
+        assert!(deck.contains("TEMP=45"), "{deck}");
+        assert!(deck.contains("TEMP=50"), "{deck}");
+        assert!(deck.contains("TEMP=60"), "{deck}");
+        assert!(deck.contains("DTEMP=5"), "{deck}");
+    }
+    // Native source bypasses SIMetrix mapping entirely, even when its model
+    // is the classic level and its instance temperature is explicit.
+    let native = dir.path().join("native.cir");
+    fs::write(
+        &native,
+        "* native\nV1 c 0 2\nQ1 c b 0 same TEMP=60\n.model same NPN(LEVEL=1 IS=2p BF=100 TNOM=27)\n.op\n.end\n",
+    )?;
+    let bundle = prepare(
+        &request(&native, InputFormat::NativeDeck),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    assert!(bundle.model_selections.is_empty());
+    let cards = model_normalize_ngspice::model_card::parse_model_cards(&bundle.primary.bytes)?;
+    assert_eq!(
+        ClassicBjtFamily::parse(&cards[0].family),
+        Some(ClassicBjtFamily {
+            polarity: BjtPolarity::Npn,
+            thermal: BjtThermalConvention::Ngspice
+        })
+    );
     Ok(())
 }

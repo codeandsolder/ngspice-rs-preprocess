@@ -19,3 +19,12 @@ TEMP resolution applies to the selected family. The solver #266 handles the
 historical junction thermal-voltage convention per model. The selector does
 not imply qualification of distinct quasi-saturation, noise or unported
 source parameter semantics.
+
+The explicit producer extension `.MAP Device=NGSPICE_BJT` selects native
+thermal physics in a mixed SIMetrix deck. The source-neutral `ClassicBjtFamily`
+type records polarity and thermal convention. Unqualified classic `VERSION`
+values and lateral PNP substrate semantics are rejected. The independent
+temperature-precedence fixtures evaluate the historical fixed-bias transport
+equation with the emitted scoped model, source voltages, and instance
+temperature; they compare directly against measured SIMetrix currents rather
+than changing the selected family for execution in stock ngspice.
