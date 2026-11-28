@@ -455,3 +455,161 @@ D1 a 0 dm
     }
     Ok(())
 }
+
+#[test]
+fn classic_bjt_selector_preserves_source_models_and_native_input() -> Result<()> {
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        GUMMEL_POON_LEGACY_NPN, GUMMEL_POON_LEGACY_PNP,
+    };
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.net");
+    let content = "* source BJT selection\n.temp 85\n.param sat=3p\n.model outer NPN(IS={sat} BF=110 TNOM=27)\nQ1 c b 0 outer TEMP=50\nQ2 c b 0 bipolar\n.model bipolar NPN(LEVEL=4 IS=1e-16)\nX1 c b 0 cell\n.subckt cell c b e\n.model outer PNP(LEVEL=1 IS=4p BF=120 T_MEASURED=29 T_ABS={TEMP-20})\nQ3 c b e outer\n.ends\n.end\n";
+    fs::write(&root, content)?;
+    let bundle = prepare(
+        &request(&root, InputFormat::SimetrixDeck),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let models = prepared_diode::linked_library(&bundle)?;
+    let root_model = models
+        .models
+        .iter()
+        .find(|m| m.scope == 0 && m.card.family.eq_ignore_ascii_case(GUMMEL_POON_LEGACY_NPN))
+        .context("missing root legacy NPN")?;
+    let local_model = models
+        .models
+        .iter()
+        .find(|m| m.scope != 0 && m.card.family.eq_ignore_ascii_case(GUMMEL_POON_LEGACY_PNP))
+        .context("missing local legacy PNP")?;
+    assert!(
+        root_model
+            .card
+            .parameters
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case("TNOM") && p.expression.as_deref() == Some("27"))
+    );
+    assert!(
+        local_model
+            .card
+            .parameters
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case("TNOM") && p.expression.as_deref() == Some("29"))
+    );
+    assert!(models.models.iter().any(|m| {
+        m.card.family.eq_ignore_ascii_case("NPN")
+            && m.card.parameters.iter().any(|p| {
+                p.name.eq_ignore_ascii_case("LEVEL") && p.expression.as_deref() == Some("4")
+            })
+    }));
+    assert!(text.contains("TEMP=50"), "{text}");
+    assert!(!text.to_ascii_uppercase().contains("T_ABS"), "{text}");
+    assert_eq!(
+        bundle
+            .model_selections
+            .iter()
+            .filter(|s| s.mapping.device == Device::GummelPoon)
+            .count(),
+        2
+    );
+    assert!(
+        bundle
+            .model_selections
+            .iter()
+            .any(|s| s.mapping.device == Device::GummelPoon
+                && s.scope == ["cell"]
+                && s.original.contains("T_MEASURED=29"))
+    );
+    let repeated = prepare(
+        &request(&root, InputFormat::SimetrixDeck),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    assert_eq!(bundle.primary.bytes, repeated.primary.bytes);
+    assert_eq!(bundle.model_selections, repeated.model_selections);
+    let native = prepare(
+        &request(&root, InputFormat::NativeDeck),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    assert!(native.model_selections.is_empty());
+    assert!(!std::str::from_utf8(&native.primary.bytes)?.contains("gummel_poon_legacy"));
+    Ok(())
+}
+
+#[test]
+fn classic_bjt_alias_retains_declared_polarity_in_raw_and_parsed_libraries() -> Result<()> {
+    use model_preprocess_simplis::source_dialect::model_mapping::GUMMEL_POON_LEGACY_PNP;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.net");
+    let lib = dir.path().join("parts.lib");
+    fs::write(
+        &lib,
+        "*#HSPICE\n.model base PNP(LEVEL=1 IS=2p TNOM=28)\n.alias selected base PNP\n.subckt unused c b e\n.model base NPN(IS=3p)\nQ1 c b e base\n.ends\n",
+    )?;
+    fs::write(&root, "* BJT alias\nQ1 c b 0 selected\n.end\n")?;
+    let parsed = prepare(
+        &request(&lib, InputFormat::SimetrixLibrary),
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let mut bundles = Vec::new();
+    for input in [
+        LibraryInput::Source(SourceInput::File(lib.clone())),
+        LibraryInput::Parsed(ParsedLibrary::from_json(&parsed.primary.bytes)?),
+    ] {
+        let mut req = request(&root, InputFormat::SimetrixDeck);
+        req.libraries.push(input);
+        let bundle = prepare(&req, &Options::default(), &Cancellation::default())?;
+        let linked = prepared_diode::linked_library(&bundle)?;
+        let alias = linked
+            .models
+            .iter()
+            .find(|m| m.card.name.eq_ignore_ascii_case("selected"))
+            .context("missing materialized alias")?;
+        assert!(
+            alias
+                .card
+                .family
+                .eq_ignore_ascii_case(GUMMEL_POON_LEGACY_PNP)
+        );
+        assert!(
+            alias
+                .card
+                .parameters
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case("TNOM")
+                    && p.expression.as_deref() == Some("28"))
+        );
+        assert!(
+            bundle
+                .model_selections
+                .iter()
+                .any(|s| s.card.name.eq_ignore_ascii_case("base")
+                    && s.mapping.device == Device::GummelPoon
+                    && s.scope.is_empty()
+                    && s.source.ends_with("parts.lib"))
+        );
+        bundles.push(bundle);
+    }
+    assert_eq!(bundles[0].primary.bytes, bundles[1].primary.bytes);
+    assert_eq!(bundles[0].model_selections, bundles[1].model_selections);
+    assert_eq!(
+        bundles[0]
+            .companions
+            .iter()
+            .map(|a| (&a.filename, &a.bytes))
+            .collect::<Vec<_>>(),
+        bundles[1]
+            .companions
+            .iter()
+            .map(|a| (&a.filename, &a.bytes))
+            .collect::<Vec<_>>()
+    );
+    fs::write(&lib, ".model base PNP(IS=2p)\n.alias selected base NPN\n")?;
+    let mut req = request(&root, InputFormat::SimetrixDeck);
+    req.libraries
+        .push(LibraryInput::Source(SourceInput::File(lib)));
+    assert!(prepare(&req, &Options::default(), &Cancellation::default()).is_err());
+    Ok(())
+}

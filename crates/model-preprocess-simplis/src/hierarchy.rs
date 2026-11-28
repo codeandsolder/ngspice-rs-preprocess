@@ -239,6 +239,8 @@ struct SourceMetadata {
     source_name: String,
     source_positions: BTreeMap<String, Vec<usize>>,
     support_lines: Vec<String>,
+    /// Original root model families, distinct from emitted kernel selectors.
+    source_model_families: BTreeMap<String, BTreeSet<String>>,
     aliases: Vec<Alias>,
     /// Ordered source retained separately from indexed declarations.
     explicit_source: String,
@@ -261,6 +263,47 @@ pub struct SubcircuitCatalog {
     explicit_sources: BTreeSet<String>,
     active_aliases: BTreeMap<String, Alias>,
     budget: WorkBudget,
+}
+
+/// Index source (not emitted) root model types for library alias validation.
+/// The same name can occur in a nested scope without changing a root alias.
+fn root_model_families(
+    statements: &[crate::source_dialect::ScopedStatement],
+    budget: &WorkBudget,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut families = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut depth = 0usize;
+    let mut opaque = crate::source_dialect::OpaqueSource::default();
+    for statement in statements {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
+        if opaque.consume(&statement.text) {
+            continue;
+        }
+        if is_subcircuit_header(&statement.text) {
+            depth = depth.saturating_add(1);
+        } else if is_directive(&statement.text, "ENDS") {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 && is_directive(&statement.text, "MODEL") {
+            let mut fields = statement.text.split_whitespace().skip(1);
+            let Some(name) = fields.next() else { continue };
+            let Some(family) = fields.next() else {
+                continue;
+            };
+            let family = family.split('(').next().unwrap_or_default();
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(
+                Resource::EmittedBytes,
+                name.len().saturating_add(family.len()),
+            )?;
+            families
+                .entry(name.to_ascii_uppercase())
+                .or_default()
+                .insert(family.to_ascii_uppercase());
+        }
+    }
+    opaque.finish()?;
+    Ok(families)
 }
 
 /// Parse a static dialect include path, with literal Windows separators.
@@ -526,6 +569,10 @@ impl SubcircuitCatalog {
                     source_name: source_name.clone(),
                     source_positions: BTreeMap::new(),
                     support_lines: parsed.support_lines.clone(),
+                    source_model_families: root_model_families(
+                        &parsed.scoped_statements,
+                        &self.budget,
+                    )?,
                     aliases: parsed.aliases.clone(),
                     explicit_source,
                 },
@@ -678,37 +725,59 @@ impl SubcircuitCatalog {
         .then_some(fields)
     }
 
-    fn resolve_model_statement(&self, target: &str, preferred_source: &str) -> Result<String> {
-        let same_source = self
-            .sources
-            .get(preferred_source)
-            .into_iter()
-            .flat_map(|metadata| metadata.support_lines.iter())
-            .filter(|statement| Self::model_statement(statement, target).is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        let candidates = if same_source.is_empty() {
-            self.sources
-                .values()
-                .flat_map(|metadata| metadata.support_lines.iter())
-                .filter(|statement| Self::model_statement(statement, target).is_some())
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            same_source
+    fn resolve_model_statement(
+        &self,
+        target: &str,
+        preferred_source: &str,
+    ) -> Result<(String, String)> {
+        let local = self.sources.get(preferred_source).into_iter();
+        let global = self.sources.values();
+        let collect = |metadata: &SourceMetadata| -> Result<Vec<(String, String)>> {
+            let mut candidates = Vec::new();
+            for statement in &metadata.support_lines {
+                let Some(fields) = Self::model_statement(statement, target) else {
+                    continue;
+                };
+                let emitted = fields[2].split('(').next().unwrap_or_default();
+                let source_family = match metadata
+                    .source_model_families
+                    .get(&target.to_ascii_uppercase())
+                {
+                    Some(families) => {
+                        ensure!(
+                            families.len() == 1,
+                            "ambiguous source model family for {target}"
+                        );
+                        families
+                            .first()
+                            .context("missing source model family")?
+                            .clone()
+                    }
+                    None => emitted.to_ascii_uppercase(),
+                };
+                candidates.push((statement.clone(), source_family));
+            }
+            Ok(candidates)
         };
-        let Some(first) = candidates.first() else {
+        let mut candidates = Vec::new();
+        for metadata in local {
+            candidates.extend(collect(metadata)?);
+        }
+        if candidates.is_empty() {
+            for metadata in global {
+                candidates.extend(collect(metadata)?);
+            }
+        }
+        let Some((first, family)) = candidates.first() else {
             bail!("SIMPLIS model alias target {target} was not found");
         };
         let normalized = first.replace('\r', "");
-        if candidates
-            .iter()
-            .skip(1)
-            .any(|candidate| candidate.replace('\r', "") != normalized)
-        {
+        if candidates.iter().skip(1).any(|(candidate, source_family)| {
+            candidate.replace('\r', "") != normalized || source_family != family
+        }) {
             bail!("ambiguous SIMPLIS model alias target {target}");
         }
-        Ok(first.clone())
+        Ok((first.clone(), family.clone()))
     }
 
     fn source_for_model(&self, target: &str) -> Result<Option<String>> {
@@ -750,12 +819,9 @@ impl SubcircuitCatalog {
             if alias.kind.eq_ignore_ascii_case("subckt") {
                 continue;
             }
-            let target = self.resolve_model_statement(&alias.target, source_id)?;
+            let (target, model_type) = self.resolve_model_statement(&alias.target, source_id)?;
             let mut fields = Self::model_statement(&target, &alias.target)
                 .context("resolved SIMPLIS model alias target is not a .MODEL statement")?;
-            let model_type = fields[2]
-                .split_once('(')
-                .map_or(fields[2], |(head, _)| head);
             if !model_type.eq_ignore_ascii_case(&alias.kind) {
                 bail!(
                     "SIMPLIS alias {} expects {} but target {} is model type {model_type}",

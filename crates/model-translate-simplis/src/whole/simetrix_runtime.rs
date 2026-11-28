@@ -490,6 +490,14 @@ struct ModelTemperature {
 type Temperatures = BTreeMap<String, ModelTemperature>;
 
 fn temperature_device(kind: &str) -> Option<u8> {
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        GUMMEL_POON_LEGACY_NPN, GUMMEL_POON_LEGACY_PNP,
+    };
+    if kind.eq_ignore_ascii_case(GUMMEL_POON_LEGACY_NPN)
+        || kind.eq_ignore_ascii_case(GUMMEL_POON_LEGACY_PNP)
+    {
+        return Some(b'Q');
+    }
     match kind {
         "NPN" | "PNP" => Some(b'Q'),
         "D" => Some(b'D'),
