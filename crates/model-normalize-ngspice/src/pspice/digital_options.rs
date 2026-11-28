@@ -1,6 +1,6 @@
 //! Circuit-wide digital option values, resolved before instance binding.
 //!
-//! Reference: `PSpice` A/D Reference Guide 10.5, pp. 70 and 352.
+//! Reference: `PSpice` A/D Reference Guide 9.0, pp. 61 and 264.
 
 use super::{
     digital_corners::{DelaySelection, TimingScales},
@@ -104,14 +104,8 @@ impl DigitalOptions {
         );
         let get = |option, default| values.get(&option).copied().unwrap_or(default);
         let options = Self {
-            delay_selection: DelaySelection::resolve(
-                None,
-                values.get(&O::DelaySelection).copied(),
-            )?,
-            interface_level: InterfaceLevel::resolve(
-                None,
-                values.get(&O::InterfaceLevel).copied(),
-            )?,
+            delay_selection: DelaySelection::from_global(values.get(&O::DelaySelection).copied())?,
+            interface_level: InterfaceLevel::from_global(values.get(&O::InterfaceLevel).copied())?,
             timing_scales: TimingScales::new(get(O::MinimumScale, 0.4), get(O::MaximumScale, 1.6))?,
             initial_state: match get(O::InitialState, 2.) {
                 0. => InitialState::Clear,

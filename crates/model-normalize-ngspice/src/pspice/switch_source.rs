@@ -1,6 +1,6 @@
 //! Source switch classification and delayed threshold declaration binding.
 //!
-//! The `PSpice` Reference Guide 10.5, pp. 295–299 and 311–316, distinguishes
+//! The `PSpice` Reference Guide 16.6, pp. 309–311 and 325–328, distinguishes
 //! continuous log-resistance interpolation from short-transition switches.
 //! TD shifts the transition; it is not a finite transition duration.
 
@@ -146,9 +146,9 @@ pub struct BoundThreshold {
 impl DelayedSwitchDeclaration {
     /// Resolve effective parameters in the scopes of their declarations.
     ///
-    /// The reference guide specifies strict comparisons at threshold plus
-    /// or minus hysteresis. Equality retains the existing state. This API
-    /// does not decide when a scheduled transition is cancelled.
+    /// The 16.6 reference specifies inclusive turn-on at threshold plus
+    /// hysteresis and strict turn-off below threshold minus hysteresis.
+    /// This API does not decide when a scheduled transition is cancelled.
     ///
     /// # Errors
     /// Missing model, invalid/nonfinite parameters or exhausted budget.

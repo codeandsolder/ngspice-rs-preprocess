@@ -1,6 +1,6 @@
 //! Source timing-corner completion and selection, independent of event execution.
 //!
-//! Reference: `PSpice` A/D Reference Guide 10.5, pp. 338–340. Propagation
+//! Reference: `PSpice` A/D Reference Guide 9.0, pp. 252–253. Propagation
 //! delays and timing checks have different omitted-corner completion rules.
 
 use super::{
@@ -28,24 +28,31 @@ pub enum DelaySelection {
 }
 
 impl DelaySelection {
-    /// Resolve an occurrence's selector against the circuit-wide option.
-    ///
-    /// An absent or zero instance selector delegates to the global option.
-    /// An absent global option is typical.
+    /// Parse the circuit-wide numeric selector.
     ///
     /// # Errors
     /// Invalid or nonintegral selector.
-    pub fn resolve(instance: Option<f64>, global: Option<f64>) -> Result<Self> {
-        let value = match instance {
-            None | Some(0.) => global.unwrap_or(2.),
-            Some(value) => value,
-        };
-        Ok(match value {
-            1. => Self::Minimum,
-            2. => Self::Typical,
-            3. => Self::Maximum,
-            4. => Self::WorstCase,
-            _ => anyhow::bail!("invalid PSpice delay selector {value}"),
+    pub fn from_global(global: Option<f64>) -> Result<Self> {
+        ensure!(
+            global != Some(0.),
+            "invalid global PSpice delay selector zero"
+        );
+        Self::Typical.override_with(global)
+    }
+
+    /// An omitted or zero instance selector delegates to the already
+    /// validated circuit-wide value.
+    ///
+    /// # Errors
+    /// Invalid or nonintegral selector.
+    pub fn override_with(self, instance: Option<f64>) -> Result<Self> {
+        Ok(match instance {
+            None | Some(0.) => self,
+            Some(1.) => Self::Minimum,
+            Some(2.) => Self::Typical,
+            Some(3.) => Self::Maximum,
+            Some(4.) => Self::WorstCase,
+            Some(value) => anyhow::bail!("invalid PSpice delay selector {value}"),
         })
     }
 }
@@ -250,7 +257,7 @@ impl DigitalDeclaration {
     ///
     /// # Errors
     /// Unresolvable expressions, invalid timings, or exhausted work budget.
-    pub fn bind_timing(
+    pub(super) fn bind_timing(
         &self,
         scales: TimingScales,
         mut resolve: impl FnMut(&Location, &ModelParameter) -> Result<f64>,
@@ -405,19 +412,16 @@ mod tests {
 
     #[test]
     fn delay_selection_keeps_worst_case_intervals() -> Result<()> {
+        assert_eq!(DelaySelection::from_global(None)?, DelaySelection::Typical);
         assert_eq!(
-            DelaySelection::resolve(None, None)?,
-            DelaySelection::Typical
-        );
-        assert_eq!(
-            DelaySelection::resolve(Some(0.), Some(4.))?,
+            DelaySelection::WorstCase.override_with(Some(0.))?,
             DelaySelection::WorstCase
         );
         assert_eq!(
-            DelaySelection::resolve(Some(1.), Some(4.))?,
+            DelaySelection::WorstCase.override_with(Some(1.))?,
             DelaySelection::Minimum
         );
-        assert!(DelaySelection::resolve(Some(2.5), None).is_err());
+        assert!(DelaySelection::Typical.override_with(Some(2.5)).is_err());
         let corners = CornerValues {
             minimum: 1.,
             typical: 2.,

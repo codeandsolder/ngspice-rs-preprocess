@@ -1,6 +1,6 @@
 //! Optional source subcircuit ports, independent of numerical parameters.
 //!
-//! The `PSpice` A/D Reference Guide 10.5, pp. 84–86, specifies that
+//! The `PSpice` A/D Reference Guide 9.0, pp. 84–86, specifies that
 //! callers may supply a prefix of optional nodes; remaining ports use
 //! their declaration defaults. Defaults are not scalar parameter values.
 

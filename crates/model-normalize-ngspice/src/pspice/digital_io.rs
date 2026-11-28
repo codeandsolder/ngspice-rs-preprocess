@@ -25,22 +25,31 @@ pub enum InterfaceLevel {
 }
 
 impl InterfaceLevel {
-    /// Select the interface level, using the global option for an absent or zero
-    /// instance selector. The default global level is one.
+    /// Parse the global numeric interface selector.
     ///
     /// # Errors
     /// Invalid or nonintegral level.
-    pub fn resolve(instance: Option<f64>, global: Option<f64>) -> Result<Self> {
-        let value = match instance {
-            None | Some(0.) => global.unwrap_or(1.),
-            Some(value) => value,
-        };
-        Ok(match value {
-            1. => Self::One,
-            2. => Self::Two,
-            3. => Self::Three,
-            4. => Self::Four,
-            _ => anyhow::bail!("invalid PSpice interface level {value}"),
+    pub fn from_global(global: Option<f64>) -> Result<Self> {
+        ensure!(
+            global != Some(0.),
+            "invalid global PSpice interface level zero"
+        );
+        Self::One.override_with(global)
+    }
+
+    /// Select the interface level, using the validated global option for
+    /// an absent or zero instance selector.
+    ///
+    /// # Errors
+    /// Invalid or nonintegral level.
+    pub fn override_with(self, instance: Option<f64>) -> Result<Self> {
+        Ok(match instance {
+            None | Some(0.) => self,
+            Some(1.) => Self::One,
+            Some(2.) => Self::Two,
+            Some(3.) => Self::Three,
+            Some(4.) => Self::Four,
+            Some(value) => anyhow::bail!("invalid PSpice interface level {value}"),
         })
     }
 
@@ -283,14 +292,14 @@ fn reference(
 impl DigitalDeclaration {
     /// Resolve an occurrence's effective I/O fields in their declaration scopes.
     ///
-    /// Defaults follow the `PSpice` Reference Guide 10.5, pp. 417–419. Interface
+    /// Defaults follow the `PSpice` Reference Guide 9.0, pp. 322–323. Interface
     /// references are not instantiated; omitted pulse rejection remains dependent
     /// on the actual propagation path. Unselected interface fields are not
     /// evaluated.
     ///
     /// # Errors
     /// Unresolvable or invalid values, missing model, or exceeded work budget.
-    pub fn bind_io(
+    pub(super) fn bind_io(
         &self,
         level: InterfaceLevel,
         mut resolve_number: impl FnMut(&Location, &ModelParameter) -> Result<f64>,

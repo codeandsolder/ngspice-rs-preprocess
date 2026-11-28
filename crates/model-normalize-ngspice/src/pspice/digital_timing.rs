@@ -1,6 +1,6 @@
 //! Source timing declarations for `PSpice` digital primitives.
 //!
-//! The reference guide (10.5, digital devices, pp. 345–365) distinguishes
+//! The reference guide (9.0, digital devices, pp. 254–274) distinguishes
 //! directional propagation paths, timing checks and min/typ/max corners.
 //! Keep these distinctions before resolving the model in an instance scope.
 

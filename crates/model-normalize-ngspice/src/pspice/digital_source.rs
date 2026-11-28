@@ -1,9 +1,11 @@
 //! Lexical digital model binding, before physical occurrence elaboration.
 
 use super::{
-    digital_instance::DigitalInstance,
-    digital_io::IoModel,
-    digital_timing::TimingModel,
+    digital_corners::{BoundPath, DelaySelection, SelectedTiming},
+    digital_instance::{DigitalInstance, Primitive},
+    digital_io::{BoundIo, IoModel},
+    digital_options::{DigitalOptions, InitialState},
+    digital_timing::{TimingModel, TimingPath},
     optional_ports::OptionalPorts,
     scope::{Scopes, charge_card, charge_scope},
     switch_source::DelayedSwitchDeclaration,
@@ -57,12 +59,89 @@ pub struct DigitalDeclaration {
     pub io: Vec<Located<IoModel>>,
 }
 
+/// Numeric settings for one actual occurrence. The declaration is borrowed
+/// so repeated calls can share its immutable source identity and pin layout.
+#[derive(Debug)]
+pub struct BoundDigital<'a> {
+    /// Source topology and model declarations.
+    pub declaration: &'a DigitalDeclaration,
+    /// Effective timing mode, absent for untimed pulls.
+    pub selection: Option<DelaySelection>,
+    /// Complete path corners before applying topology-dependent loading.
+    pub timing: Vec<BoundPath>,
+    /// Bound I/O characteristics and interface references.
+    pub io: BoundIo,
+    /// Requested sequential startup state, not the evaluated output state.
+    pub initialization: Option<InitialState>,
+}
+
+impl BoundDigital<'_> {
+    /// Iterate effective timing paths with the requested corner selection.
+    /// No delay is synthesized for untimed primitives.
+    ///
+    /// # Errors
+    /// An inverted worst-case interval or inconsistent binding.
+    pub fn selected_timing(
+        &self,
+    ) -> impl Iterator<Item = Result<(TimingPath, SelectedTiming)>> + '_ {
+        self.timing.iter().map(|path| {
+            let mode = self
+                .selection
+                .context("timed path on an untimed PSpice primitive")?;
+            Ok((path.path, path.corners.select(mode)?))
+        })
+    }
+}
+
 impl DigitalDeclaration {
+    /// Bind one occurrence using validated circuit-wide options and the
+    /// occurrence resolver. Effective timing and I/O setters are evaluated
+    /// in their own declaration contexts; instance selectors use the actual
+    /// occurrence context.
+    ///
+    /// # Errors
+    /// Unsupported or invalid effective fields, failed resolution, or budget.
+    pub fn bind(
+        &self,
+        options: DigitalOptions,
+        mut resolve_number: impl FnMut(&Location, &crate::model_card::ModelParameter) -> Result<f64>,
+        resolve_name: impl FnMut(&Location, &crate::model_card::ModelParameter) -> Result<String>,
+        budget: &WorkBudget,
+    ) -> Result<BoundDigital<'_>> {
+        let primitive = self.instance.declaration.primitive;
+        let selection = primitive
+            .timing_family()
+            .map(|_| {
+                let instance = self.resolve_selector("MNTYMXDLY", &mut resolve_number, budget)?;
+                options.delay_selection.override_with(instance)
+            })
+            .transpose()?;
+        let instance_level = self.resolve_selector("IO_LEVEL", &mut resolve_number, budget)?;
+        let level = options.interface_level.override_with(instance_level)?;
+        let timing = self.bind_timing(options.timing_scales, &mut resolve_number, budget)?;
+        let io = self.bind_io(level, resolve_number, resolve_name, budget)?;
+        let initialization =
+            matches!(primitive, Primitive::Sequential { .. }).then_some(options.initial_state);
+        let bound = BoundDigital {
+            declaration: self,
+            selection,
+            timing,
+            io,
+            initialization,
+        };
+        // Validate the selected intervals before crossing the execution boundary.
+        for path in bound.selected_timing() {
+            budget.charge(Resource::EvaluationSteps, 1)?;
+            let _ = path?;
+        }
+        Ok(bound)
+    }
+
     /// Resolve the last instance selector in its own occurrence context.
     ///
     /// # Errors
     /// Unresolvable selector or exhausted budget.
-    pub fn resolve_selector(
+    fn resolve_selector(
         &self,
         name: &str,
         mut resolve: impl FnMut(&Location, &crate::model_card::ModelParameter) -> Result<f64>,
@@ -502,7 +581,7 @@ U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
             },
             &budget,
         )?;
-        let level = InterfaceLevel::resolve(selector, Some(4.))?;
+        let level = InterfaceLevel::Four.override_with(selector)?;
         let io = declaration.bind_io(
             level,
             |location, field| match field.name.to_ascii_uppercase().as_str() {
@@ -538,6 +617,55 @@ U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
         assert_eq!(io.digital_to_analog.name, "tx");
         assert_eq!(io.power_supply.name, "DIGIFPWR");
         assert!(io.power_supply.declaration.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn one_occurrence_binder_keeps_interface_and_timing_overrides_together() -> Result<()> {
+        use super::super::{
+            digital_corners::SelectedTiming, digital_io::InterfaceLevel,
+            digital_options::DigitalOption,
+        };
+        use crate::model_card::parse_spice_constant;
+        use std::collections::BTreeMap;
+
+        let input = b".model t UEFF(TPCLKQLHTY=10n)\n.model io UIO(DRVL=25)\nU1 DFF(1) p g pre clr clk d q qb t io MNTYMXDLY=4 IO_LEVEL=2\n";
+        let budget = WorkBudget::default();
+        let statements = lexical::statements(input)?;
+        let origins = (1..=3).collect::<Vec<_>>();
+        let dialects = SourceDialects::Uniform(SourceDialect::Pspice);
+        let scopes = Scopes::collect(&statements, &origins, dialects, &budget)?;
+        let declarations = capture(&statements, &scopes, &origins, dialects)?;
+        let declaration = declarations
+            .digital
+            .first()
+            .context("missing digital instance")?;
+        let options = DigitalOptions::from_effective(&BTreeMap::from([
+            (DigitalOption::InitialState, 1.),
+            (DigitalOption::DelaySelection, 1.),
+            (DigitalOption::InterfaceLevel, 3.),
+        ]))?;
+        let bound = declaration.bind(
+            options,
+            |_, field| {
+                parse_spice_constant(field.expression.as_deref().context("missing expression")?)
+            },
+            |_, _| anyhow::bail!("no explicit interface names expected"),
+            &budget,
+        )?;
+        assert_eq!(bound.selection, Some(DelaySelection::WorstCase));
+        assert_eq!(bound.io.level, InterfaceLevel::Two);
+        assert_eq!(bound.initialization, Some(InitialState::Set));
+        let paths = bound.selected_timing().collect::<Result<Vec<_>>>()?;
+        let (_, selected) = paths
+            .iter()
+            .find(|(path, _)| *path == TimingPath::ClockRise)
+            .context("missing clock propagation path")?;
+        let SelectedTiming::Window { minimum, maximum } = *selected else {
+            anyhow::bail!("worst-case timing collapsed");
+        };
+        assert_eq!(minimum.to_bits(), (10e-9_f64 * 0.4).to_bits());
+        assert_eq!(maximum.to_bits(), (10e-9_f64 * 1.6).to_bits());
         Ok(())
     }
 
