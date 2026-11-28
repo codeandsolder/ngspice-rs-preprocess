@@ -507,7 +507,24 @@ pub(crate) fn normalize(
             .passes
             .push(NormalizationPass::LtspiceIntrinsics);
     }
-    apply_plan(input, title, title_lines, &static_macros, dialects, budget)
+    let mut input = apply_plan(input, title, title_lines, &static_macros, dialects, budget)?;
+    if let Some(lowered) = operators::project_current_reads(
+        &input.model.bytes[title..],
+        &input.input_lines[title_lines..],
+        dialects,
+        budget,
+    )? {
+        input.model.bytes.truncate(title);
+        input.model.bytes.extend_from_slice(&lowered);
+        if !input
+            .model
+            .passes
+            .contains(&NormalizationPass::LtspiceOperators)
+        {
+            input.model.passes.push(NormalizationPass::LtspiceOperators);
+        }
+    }
+    Ok(input)
 }
 
 fn apply_plan(

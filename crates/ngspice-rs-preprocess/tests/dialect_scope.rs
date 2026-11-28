@@ -351,7 +351,7 @@ fn native_and_ltspice_statements_keep_separate_laws_in_one_deck() -> Result<()> 
     assert!(text.contains(".param vendor_result={__lt_intrinsic_limit("));
     assert!(text.contains("Lnative p n 1m"));
     assert!(!text.contains("R__Lnative_RSER"));
-    assert!(text.contains("R__Lvendor_RSER"));
+    assert!(text.contains("Lvendor p n 1m pn_rseries_uncoupled=1m"));
     let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing native line map");
     };
@@ -359,8 +359,8 @@ fn native_and_ltspice_statements_keep_separate_laws_in_one_deck() -> Result<()> 
     let origin = text
         .lines()
         .zip(lines)
-        .find_map(|(line, origin)| line.starts_with("R__Lvendor_RSER").then_some(origin))
-        .context("missing generated series resistor")?;
+        .find_map(|(line, origin)| line.starts_with("Lvendor p n ").then_some(origin))
+        .context("missing prepared inductor")?;
     assert_eq!(origin.source, vendor.canonicalize()?);
     assert_eq!(origin.line, 5);
     run_prepared(&bundle, "v(a) v(b) v(c) v(d)", &[8.0, 2.0, 1.5, 1.5])
@@ -386,7 +386,7 @@ fn ltspice_root_does_not_apply_its_default_inductor_loss_to_native_include() -> 
     assert!(text.contains(".param native_result={(-2)^3}"));
     assert!(text.contains("Lnative p n 1m"));
     assert!(!text.contains("R__Lnative_RSER"));
-    assert!(text.contains("R__Lvendor_RSER"));
+    assert!(text.contains("Lvendor p n 1m pn_rseries_uncoupled=1m"));
     run_prepared(&bundle, "v(x)", &[1.0])
 }
 

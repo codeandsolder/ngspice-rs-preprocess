@@ -7,8 +7,8 @@
 use crate::{
     linked_source::{LinkedSource, RootKind, SourceOrigin},
     model_card::{
-        ModelCard, logical_statements, parse_assignments, parse_function_signature, parse_one,
-        positional_prefix,
+        ModelCard, identifier_start, logical_statements, parse_assignments,
+        parse_function_signature, parse_one, positional_prefix,
     },
     param_expression::{SpiceExpression, SpiceExpressionContext},
     vdmos_card::{VdmosLiterals, vdmos_resolved},
@@ -225,8 +225,9 @@ fn assignments(
                 .name
                 .as_bytes()
                 .first()
-                .is_some_and(u8::is_ascii_alphabetic),
-            "line {line}: SPICE parameter {name} must begin with a letter"
+                .copied()
+                .is_some_and(identifier_start),
+            "line {line}: SPICE parameter {name} must begin with a letter or underscore"
         );
         definitions.insert(
             name,
@@ -760,6 +761,16 @@ mod tests {
         assert_eq!(p(&nested, "KP")?, 12.0);
         let global = lib.resolve_vdmos(2, &[])?.context("global VDMOS")?;
         assert_eq!(p(&global, "KP")?, 4.0);
+        Ok(())
+    }
+
+    #[test]
+    fn leading_underscore_identifiers_share_the_native_scalar_grammar() -> Result<()> {
+        // Independent ngspice-47: a 14 V source using this function and
+        // formal name parses and evaluates without compatibility settings.
+        let source = b"* title\n.param _a=2\n.func __helper(_x) {3*_x+_a}\n";
+        let lib = ModelLibrary::parse(source)?;
+        assert_eq!(lib.evaluate_scalar(0, "{__helper(4)}", &[])?, 14.);
         Ok(())
     }
 
