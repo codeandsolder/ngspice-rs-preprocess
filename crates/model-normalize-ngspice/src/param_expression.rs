@@ -73,7 +73,7 @@ impl ParsedBinaryOp {
         }
     }
 
-    fn binding(self) -> (u8, u8) {
+    const fn binding(self) -> (u8, u8) {
         let left = match self {
             Self::Native(op) => op.precedence(),
             Self::Source(op) => op.precedence(),
