@@ -1,4 +1,5 @@
 //! Source analysis intent, independent of the prepared electrical circuit.
+pub mod source_capture;
 pub mod sweep;
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::ltspice::transient::TransientIntent;
@@ -43,6 +44,19 @@ pub enum DirectiveOrigin {
         first_line: usize,
         /// Last physical line, inclusive.
         last_line: usize,
+    },
+    /// Exact declaration in a directly admitted source occurrence.
+    SourceOccurrence {
+        /// Original resource path.
+        path: PathBuf,
+        /// First physical line, one-based.
+        first_line: usize,
+        /// Last physical line, inclusive.
+        last_line: usize,
+        /// Admitted source visit index.
+        visit: usize,
+        /// Electrical lexical scope index.
+        scope: usize,
     },
     /// Location in a linked artifact before primitive lowering.
     Generated {
@@ -125,6 +139,11 @@ pub enum Directive {
     Sweep {
         /// Typed, unresolved axis with source coordinate ordering.
         axis: SweepAxis,
+    },
+    /// Ordered continuation axes of one DC analysis.
+    DcSweep {
+        /// Inner axis first; do not treat these as independent STEP candidates.
+        axes: Vec<SweepAxis>,
     },
     /// Source-specific transient timing and execution policy.
     Transient {
@@ -459,6 +478,33 @@ impl<'a> BoundIndependentSweeps<'a> {
         self.count
     }
 
+    /// Coordinates of a candidate in first-axis-innermost order.
+    /// The returned iterator borrows the compact axis sequences.
+    ///
+    /// # Errors
+    /// Candidate ordinal or bound coordinate outside the reserved product.
+    pub fn candidate(
+        &self,
+        ordinal: usize,
+    ) -> Result<impl Iterator<Item = Result<(&'a PlanEntry, f64)>> + '_> {
+        ensure!(
+            ordinal < self.count,
+            "candidate ordinal outside reserved sweep"
+        );
+        Ok(self.entries.iter().copied().zip(&self.axes).scan(
+            ordinal,
+            |remaining, (entry, axis)| {
+                let index = *remaining % axis.len();
+                *remaining /= axis.len();
+                Some(
+                    axis.value(index)
+                        .map(|value| (entry, value))
+                        .context("missing reserved sweep coordinate"),
+                )
+            },
+        ))
+    }
+
     /// The source-order axes, with declaration identity and coordinate law.
     pub fn axes(&self) -> impl ExactSizeIterator<Item = (&'a PlanEntry, &BoundAxis)> {
         self.entries.iter().copied().zip(&self.axes)
@@ -545,6 +591,20 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
         Circuit, Initialization, Metadata, ModelSelection, RequiresBinding, Unsupported,
     };
     match (dialect, name) {
+        (
+            AnalysisDialect::Ltspice,
+            "RELTOL" | "ABSTOL" | "VNTOL" | "CHGTOL" | "TRTOL" | "GMIN" | "METHOD" | "TNOM"
+            | "MAXORD" | "ITL1" | "ITL2" | "ITL4",
+        ) => Circuit,
+        (
+            AnalysisDialect::Ltspice,
+            "MAXSTEP" | "TEMP" | "SSTOL" | "STSTDELAY" | "STSTCLOCKS" | "PLOTRELTOL" | "PLOTVNTOL"
+            | "PLOTABSTOL" | "PLOTWINSIZE",
+        ) => RequiresBinding,
+        (
+            AnalysisDialect::Ltspice,
+            "NUMDGT" | "MEASDGT" | "LOGPARAMS" | "LOGOPINFO" | "DEBUGTRAN",
+        ) => Metadata,
         (AnalysisDialect::Simetrix, "HSPICEMODELS" | "HSPICECOMPATIBILITY") => ModelSelection,
         (AnalysisDialect::Simetrix, "INITCONDMODE" | "ICRES") => Initialization,
         (
@@ -708,6 +768,44 @@ fn transient_arguments(args: &[String]) -> Option<Vec<String>> {
     ])
 }
 
+fn ltspice_directive(
+    name: &str,
+    statement: &str,
+    scoped: bool,
+) -> Result<Option<(Directive, Disposition)>> {
+    let disposition = if scoped {
+        Disposition::Unsupported
+    } else {
+        Disposition::RequiresBinding
+    };
+    let directive = match name {
+        ".STEP" => Directive::Sweep {
+            axis: SweepAxis::ltspice_step(&arguments(statement)?)?,
+        },
+        ".TEMP" => {
+            let args = arguments(statement)?;
+            if args.len() <= 1 {
+                return Ok(None);
+            }
+            Directive::Sweep {
+                axis: SweepAxis::ltspice_temperature(&args)?,
+            }
+        }
+        ".TRAN" => {
+            let args = arguments(statement)?;
+            let fields = args.iter().map(String::as_str).collect::<Vec<_>>();
+            Directive::Transient {
+                intent: TransientIntent::parse(&fields)?,
+            }
+        }
+        ".DC" => Directive::DcSweep {
+            axes: SweepAxis::ltspice_dc(&arguments(statement)?)?,
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some((directive, disposition)))
+}
+
 fn classify(
     name: &str,
     statement: &str,
@@ -717,13 +815,10 @@ fn classify(
     use Disposition::{
         Circuit, Initialization, Metadata, NativeRequest, RequiresBinding, Unsupported,
     };
-    if dialect == AnalysisDialect::Ltspice && name == ".STEP" {
-        return Ok((
-            Directive::Sweep {
-                axis: SweepAxis::ltspice_step(&arguments(statement)?)?,
-            },
-            if scoped { Unsupported } else { RequiresBinding },
-        ));
+    if dialect == AnalysisDialect::Ltspice
+        && let Some(directive) = ltspice_directive(name, statement, scoped)?
+    {
+        return Ok(directive);
     }
     if matches!(
         name,
@@ -742,25 +837,6 @@ fn classify(
         return Ok((Directive::Metadata, Metadata));
     }
     let args = arguments(statement)?;
-    if dialect == AnalysisDialect::Ltspice {
-        if name == ".TEMP" && args.len() > 1 {
-            return Ok((
-                Directive::Sweep {
-                    axis: SweepAxis::ltspice_temperature(&args)?,
-                },
-                if scoped { Unsupported } else { RequiresBinding },
-            ));
-        }
-        if name == ".TRAN" {
-            let fields = args.iter().map(String::as_str).collect::<Vec<_>>();
-            return Ok((
-                Directive::Transient {
-                    intent: TransientIntent::parse(&fields)?,
-                },
-                if scoped { Unsupported } else { RequiresBinding },
-            ));
-        }
-    }
     if matches!(name, ".OPTIONS" | ".OPTION" | ".OPT") {
         return Ok((
             Directive::Options {
@@ -792,7 +868,7 @@ fn classify(
     }
     let analysis = analysis_kind(name);
     let mut args = args;
-    let uic = dialect == AnalysisDialect::Simetrix
+    let uic = matches!(dialect, AnalysisDialect::Simetrix | AnalysisDialect::Native)
         && analysis == AnalysisKind::Transient
         && args
             .last()
@@ -812,16 +888,9 @@ fn classify(
                     NativeRequest
                 })
             }
-            (
-                AnalysisDialect::Native
-                | AnalysisDialect::Ltspice
-                | AnalysisDialect::Pspice
-                | AnalysisDialect::Tina
-                | AnalysisDialect::Qspice
-                | AnalysisDialect::Hspice
-                | AnalysisDialect::Simetrix,
-                _,
-            ) if native_analysis_shape(analysis, &args) => {
+            (AnalysisDialect::Native | AnalysisDialect::Ltspice | AnalysisDialect::Simetrix, _)
+                if native_analysis_shape(analysis, &args) =>
+            {
                 if matches!(
                     analysis,
                     AnalysisKind::DcSweep | AnalysisKind::Noise | AnalysisKind::TransferFunction
@@ -833,6 +902,20 @@ fn classify(
                 } else {
                     NativeRequest
                 }
+            }
+            (
+                AnalysisDialect::Pspice
+                | AnalysisDialect::Tina
+                | AnalysisDialect::Qspice
+                | AnalysisDialect::Hspice,
+                _,
+            ) if analysis != AnalysisKind::Other => RequiresBinding,
+            (AnalysisDialect::Ltspice, AnalysisKind::Ac)
+                if args.first().is_some_and(|arg| {
+                    arg.eq_ignore_ascii_case("LIST") || arg.eq_ignore_ascii_case("FILE")
+                }) =>
+            {
+                RequiresBinding
             }
             (AnalysisDialect::Simplis, AnalysisKind::Transient) if args.len() == 2 => {
                 RequiresBinding
@@ -947,7 +1030,8 @@ impl Capture<'_> {
 
     fn clone_origin(&self, origin: &DirectiveOrigin) -> Result<DirectiveOrigin> {
         let bytes = match origin {
-            DirectiveOrigin::Source { path, .. } => path.as_os_str().len(),
+            DirectiveOrigin::Source { path, .. }
+            | DirectiveOrigin::SourceOccurrence { path, .. } => path.as_os_str().len(),
             DirectiveOrigin::Generated { artifact, .. } => artifact.len(),
         };
         self.budget.charge(Resource::EmittedBytes, bytes)?;

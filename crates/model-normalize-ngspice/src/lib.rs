@@ -12,6 +12,52 @@ mod series;
 pub fn statement_token_spans(text: &str) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
     lexical::tokens(text.as_bytes())
 }
+/// A logical source statement and its inclusive original physical line span.
+#[derive(Debug)]
+pub struct SourceStatement {
+    /// One-based first physical line, counting a deck title.
+    pub first_line: usize,
+    /// One-based last physical line, including continuations.
+    pub last_line: usize,
+    /// Logical text without continuation separators or inline comments.
+    pub text: Vec<u8>,
+}
+
+/// Scan logical source statements with the same lexical rules used by the
+/// normalization passes. A complete deck's first physical line is its title,
+/// never a statement. No source-specific expression is interpreted here.
+///
+/// # Errors
+/// Malformed source, missing deck title, or exhausted request budget.
+pub fn source_statements(
+    input: &[u8],
+    kind: linked_source::RootKind,
+    budget: &WorkBudget,
+) -> Result<Vec<SourceStatement>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    let (body, title_lines) = if kind == linked_source::RootKind::Deck {
+        let title = input
+            .split_inclusive(|byte| *byte == b'\n')
+            .next()
+            .context("source deck has no title")?;
+        (&input[title.len()..], 1)
+    } else {
+        (input, 0)
+    };
+    let normalized = lexical::normalize_nbsp(body);
+    let statements = lexical::statements(normalized.as_deref().unwrap_or(body))?;
+    budget.charge(Resource::Statements, statements.len())?;
+    budget.charge(Resource::GeneratedNodes, statements.len())?;
+    Ok(statements
+        .into_iter()
+        .map(|statement| SourceStatement {
+            first_line: statement.line + title_lines,
+            last_line: statement.last_line + title_lines,
+            text: statement.text,
+        })
+        .collect())
+}
+
 pub mod linked_source;
 pub mod ltspice;
 pub mod model_card;

@@ -247,6 +247,50 @@ impl SweepAxis {
         })
     }
 
+    /// The ordered axes of one LTspice DC continuation analysis.
+    /// The first axis is the innermost; each outer coordinate starts a
+    /// separate continuation of the inner analysis.
+    ///
+    /// # Errors
+    /// Missing fields, unsupported target types, or source syntax outside
+    /// the documented independent-source/temperature DC form.
+    pub fn ltspice_dc(args: &[String]) -> Result<Vec<Self>> {
+        let (groups, remainder) = args.as_chunks::<4>();
+        ensure!(
+            !groups.is_empty() && remainder.is_empty(),
+            "LTspice DC needs source/temperature, start, stop and increment per axis"
+        );
+        groups
+            .iter()
+            .map(|[target, start, stop, increment]| {
+                let target = if target.eq_ignore_ascii_case("temp") {
+                    SweepTarget::Temperature
+                } else {
+                    ensure!(
+                        target
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|byte| matches!(byte.to_ascii_lowercase(), b'v' | b'i')),
+                        "LTspice DC target must be an independent source or temperature"
+                    );
+                    SweepTarget::Source {
+                        name: name(target)?,
+                    }
+                };
+                Ok(Self {
+                    target,
+                    law: CoordinateLaw::Linear {
+                        start: start.clone(),
+                        stop: stop.clone(),
+                        increment: increment.clone(),
+                    },
+                    execution: SweepExecution::Continuation,
+                    order: CoordinateOrder::Declared,
+                })
+            })
+            .collect()
+    }
+
     /// The multi-temperature directive uses the same independent list law.
     ///
     /// # Errors
