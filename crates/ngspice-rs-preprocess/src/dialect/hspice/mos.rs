@@ -202,7 +202,10 @@ fn instance_parameters(
         consumed = span.end;
     }
     for parameter in instance_fields(&tail[consumed..], 3)? {
-        let name = parameter.name.to_ascii_uppercase();
+        let mut name = parameter.name.to_ascii_uppercase();
+        if name == "DELVT0" {
+            "DELVTO".clone_into(&mut name);
+        }
         ensure!(
             fields.insert(name.clone(), parameter.expression).is_none(),
             "duplicate HSPICE MOS instance parameter {name}"
@@ -369,6 +372,30 @@ fn scale_dimension(
     Ok(())
 }
 
+// The source mobility modifier resets negative values to unity (zero is
+// retained). Preserve symbolic occurrence expressions, rather than evaluating
+// them at deck preparation and freezing parameter sweeps.
+fn normalize_mobility_multiplier(fields: &mut Fields, budget: &WorkBudget) -> Result<()> {
+    let Some(raw) = field(fields, "MULU0") else {
+        return Ok(());
+    };
+    let factor = super::hierarchy::inner(raw);
+    let normalized = if let Ok(value) = parse_spice_constant(factor) {
+        if value >= 0. {
+            return Ok(());
+        }
+        "1".to_owned()
+    } else {
+        budget.charge(
+            Resource::EmittedBytes,
+            factor.len().saturating_mul(2).saturating_add(32),
+        )?;
+        format!("{{ternary_fcn(({factor})<0,1,({factor}))}}")
+    };
+    fields.insert("MULU0".to_owned(), Some(normalized));
+    Ok(())
+}
+
 fn bind_instance(
     text: &str,
     model_end: usize,
@@ -383,6 +410,7 @@ fn bind_instance(
     let model = model_fields(card, budget)?;
     let mask = version_mask(field(&model, "VERSION").context("missing bound BSIM4 version")?)?;
     fields.remove("WNFLAG");
+    normalize_mobility_multiplier(&mut fields, budget)?;
     scale_dimension(&mut fields, &model, "L", "LMLT", budget)?;
     scale_dimension(&mut fields, &model, "W", "WMLT", budget)?;
     let spans = statement_token_spans(text)?;
