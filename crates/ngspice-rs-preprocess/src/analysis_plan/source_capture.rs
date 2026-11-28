@@ -4,7 +4,7 @@
 
 use super::{
     AnalysisDialect, AnalysisPlan, Directive, DirectiveOrigin, Disposition, PlanKind, arguments,
-    command, push_entry, source_title, tracked,
+    command, options, push_entry, source_title, tracked,
 };
 use crate::OriginLine;
 use anyhow::{Context, Result, ensure};
@@ -173,7 +173,12 @@ impl Candidate {
         }
         let name = command(&self.text);
         Ok(match name.as_str() {
-            ".OPTIONS" | ".OPTION" | ".OPT" | ".IC" | ".INIT" | ".NODESET" | ".CONTROL" => false,
+            ".OPTIONS" | ".OPTION" | ".OPT" => {
+                options(&arguments(&self.text)?, self.location.dialect)?
+                    .iter()
+                    .any(|setting| setting.disposition != Disposition::Circuit)
+            }
+            ".IC" | ".NODESET" => false,
             ".TEMP" => arguments(&self.text)?.len() > 1,
             _ => true,
         })

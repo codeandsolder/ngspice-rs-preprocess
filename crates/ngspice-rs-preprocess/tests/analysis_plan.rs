@@ -347,7 +347,7 @@ fn linked_ltspice_analysis_is_extracted_with_occurrence_and_bound_axes() -> Resu
     use ngspice_rs_preprocess::{
         WorkBudget,
         analysis_plan::{
-            MeasurementOperation,
+            measurement::MeasurementOperation,
             sweep::{SweepExecution, SweepTarget},
         },
     };

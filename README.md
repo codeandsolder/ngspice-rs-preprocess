@@ -288,7 +288,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 11 records the explicit `power_target` capability and
+counts, dependencies and provenance. Manifest version 12 records the explicit `power_target` capability and
 includes typed PWL resistor declarations as well as
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
@@ -311,6 +311,21 @@ electrical lexical scope, including generated lines. The graph records the
 parent include, selected library section, effective dialect and declaration
 line. Specialized HSPICE output currently retains physical spans without a
 linked graph; full cross-dialect occurrence-model binding is tracked in #70.
+
+Directly linked LTspice analysis declarations are captured in the typed
+analysis plan before electrical normalization. Each declaration retains
+its admitted source occurrence and lexical scope, including schematic
+directive origins. Independent parameter, source, temperature and model
+parameter steps are distinct from DC continuation axes. Transient timing
+is evaluated for the candidate, with output start and maximum integration
+step kept separate; source startup and steady-state policies are not UIC.
+Measurement operations preserve source waveform expressions, event
+qualifiers and previous-result dependencies in declaration order. The
+consumer must bind this analysis plan; an electrical artifact alone is
+not a complete analysis request. Native-only decks retain native analysis
+cards. Unqualified conditional and mixed-dialect analysis is diagnosed
+rather than executed with guessed semantics.
+
 
 The combined artifact/intermediate-link byte limit defaults to 128 MiB and
 is configurable with `--max-output-bytes`. Per-source and command limits are

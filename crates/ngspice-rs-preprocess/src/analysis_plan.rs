@@ -1,7 +1,9 @@
 //! Source analysis intent, independent of the prepared electrical circuit.
+pub mod measurement;
 pub mod source_capture;
 pub mod sweep;
 use anyhow::{Context, Result, ensure};
+use measurement::MeasurementIntent;
 use model_normalize_ngspice::ltspice::transient::TransientIntent;
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
@@ -109,117 +111,6 @@ pub enum AnalysisKind {
     TransferFunction,
     /// Other analysis, with its original command retained.
     Other,
-}
-
-/// Source post-processing operation, distinct from circuit parameter evaluation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MeasurementOperation {
-    /// Value at an axis position or threshold event.
-    Find,
-    /// Local waveform derivative.
-    Derivative,
-    /// Coordinate of a threshold event.
-    When,
-    /// Scalar expression, potentially depending on preceding measurements.
-    Parameter,
-    /// Interval average.
-    Average,
-    /// Interval maximum.
-    Maximum,
-    /// Interval minimum.
-    Minimum,
-    /// Peak-to-peak.
-    PeakToPeak,
-    /// Root mean square.
-    RootMeanSquare,
-    /// Interval integral.
-    Integral,
-    /// Distance between trigger and target events.
-    TriggerTarget,
-}
-
-impl MeasurementOperation {
-    fn parse(name: &str) -> Option<Self> {
-        Some(match name.to_ascii_uppercase().as_str() {
-            "FIND" => Self::Find,
-            "DERIV" => Self::Derivative,
-            "WHEN" => Self::When,
-            "PARAM" => Self::Parameter,
-            "AVG" => Self::Average,
-            "MAX" => Self::Maximum,
-            "MIN" => Self::Minimum,
-            "PP" => Self::PeakToPeak,
-            "RMS" => Self::RootMeanSquare,
-            "INTEG" => Self::Integral,
-            "TRIG" => Self::TriggerTarget,
-            _ => return None,
-        })
-    }
-}
-
-/// A source measurement prior to waveform and result-name binding.
-/// Keep the remaining source grammar verbatim: complex AC expressions,
-/// event predicates and previous measurement names are not numparam.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MeasurementIntent {
-    /// Explicit selector or current analysis when omitted.
-    pub analysis: Option<AnalysisKind>,
-    /// Original candidate-local result identity.
-    pub name: String,
-    /// Requested operation.
-    pub operation: MeasurementOperation,
-    /// Operation operands and qualifiers in the original source syntax.
-    pub expression: String,
-}
-
-impl MeasurementIntent {
-    fn parse_ltspice(statement: &str) -> Result<Self> {
-        let spans = model_normalize_ngspice::statement_token_spans(statement)?;
-        let (_, operands) = spans
-            .split_first()
-            .context("missing measurement declaration")?;
-        let first = operands
-            .first()
-            .context("missing measurement result name")?;
-        let analysis = match statement[first.clone()].to_ascii_uppercase().as_str() {
-            "OP" => Some(AnalysisKind::OperatingPoint),
-            "DC" => Some(AnalysisKind::DcSweep),
-            "AC" => Some(AnalysisKind::Ac),
-            "TRAN" => Some(AnalysisKind::Transient),
-            "NOISE" => Some(AnalysisKind::Noise),
-            "TF" => Some(AnalysisKind::TransferFunction),
-            _ => None,
-        };
-        let fields = if analysis.is_some() {
-            &operands[1..]
-        } else {
-            operands
-        };
-        let [name, operation, ..] = fields else {
-            anyhow::bail!("missing measurement result name or operation");
-        };
-        let name = &statement[name.clone()];
-        ensure!(
-            !name.is_empty()
-                && !name
-                    .chars()
-                    .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '{' | '}' | '=' | ',')),
-            "invalid measurement result name {name:?}"
-        );
-        let operation_name = &statement[operation.clone()];
-        let kind = MeasurementOperation::parse(operation_name).with_context(|| {
-            format!("unqualified LTspice measurement operation {operation_name}")
-        })?;
-        let expression = statement[operation.end..].trim();
-        ensure!(!expression.is_empty(), "missing measurement expression");
-        Ok(Self {
-            analysis,
-            name: name.to_owned(),
-            operation: kind,
-            expression: expression.to_owned(),
-        })
-    }
 }
 
 /// Individual option, retaining repeats and order.
@@ -970,6 +861,7 @@ fn classify(
     }
     if matches!(name, ".TEMP" | ".NODESET" | ".IC" | ".INIT") {
         let disposition = match (name, dialect) {
+            (".INIT", AnalysisDialect::Ltspice) => Unsupported,
             (".INIT", _) | (".IC", AnalysisDialect::Simetrix) => Initialization,
             _ => Circuit,
         };
@@ -1373,29 +1265,6 @@ mod typed_analysis_tests {
             budget,
             AnalysisDialect::Ltspice,
         )
-    }
-
-    #[test]
-    fn measurement_source_expressions_and_result_dependencies_are_preserved() -> Result<()> {
-        let result = MeasurementIntent::parse_ltspice(
-            ".meas AC fc WHEN mag(V(out)) = tmp / sqrt(2) FALL=LAST",
-        )?;
-        assert_eq!(result.analysis, Some(AnalysisKind::Ac));
-        assert_eq!(result.operation, MeasurementOperation::When);
-        assert_eq!(result.expression, "mag(V(out)) = tmp / sqrt(2) FALL=LAST");
-        let delta = MeasurementIntent::parse_ltspice(
-            ".measure delay TRIG V(a)=0.5 RISE=1 TARG V(b)=0.5 RISE=2",
-        )?;
-        assert_eq!(delta.analysis, None);
-        assert_eq!(delta.operation, MeasurementOperation::TriggerTarget);
-        assert_eq!(delta.expression, "V(a)=0.5 RISE=1 TARG V(b)=0.5 RISE=2");
-        assert_eq!(delta.name, "delay");
-        let scalar = MeasurementIntent::parse_ltspice(".meas tran scaled PARAM delay*2")?;
-        assert_eq!(scalar.operation, MeasurementOperation::Parameter);
-        assert_eq!(scalar.expression, "delay*2");
-        assert!(MeasurementIntent::parse_ltspice(".meas tran").is_err());
-        assert!(MeasurementIntent::parse_ltspice(".meas tran p AVG").is_err());
-        Ok(())
     }
 
     #[test]
