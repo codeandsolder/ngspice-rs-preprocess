@@ -43,7 +43,7 @@ pub use legacy_bsim::{
 pub use hv::{
     HiSimHvAccumulationInputs, HiSimHvAccumulationPoint, HiSimHvBiasConditioningInputs,
     HiSimHvBiasConditioningPoint, HiSimHvBinningGeometry, HiSimHvChannelChargeInputs,
-    HiSimHvChannelChargePoint, HiSimHvChannelElectrostaticPoint,
+    HiSimHvChannelChargePoint, HiSimHvChannelCorrectionPoint, HiSimHvChannelElectrostaticPoint,
     HiSimHvChannelMobilityCoefficients, HiSimHvChannelMobilityInputs, HiSimHvChannelMobilityPoint,
     HiSimHvChannelModulationInputs, HiSimHvChannelModulationPoint, HiSimHvChannelRegion,
     HiSimHvChannelTerminalCharges, HiSimHvDepletionMaterialPoint, HiSimHvDepletionTransport,

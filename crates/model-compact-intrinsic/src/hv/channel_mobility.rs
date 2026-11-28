@@ -1,10 +1,10 @@
 //! Normal-channel HiSIM-HV universal mobility, velocity saturation and Ids0.
 use super::{
-    HiSimHvChannelChargePoint, HiSimHvChannelElectrostaticPoint, HiSimHvChannelModulationPoint,
-    HiSimHvChannelRegion, HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar as Jet,
-    PreparedHiSimHvChannelElectrostatics, PreparedHiSimHvInstance, PreparedHiSimHvModel,
-    PreparedHiSimHvTransport, instance::model_real, instance_real_at, lookup_slot,
-    prepare_hisim_hv_channel_electrostatics,
+    HiSimHvChannelChargePoint, HiSimHvChannelCorrectionPoint, HiSimHvChannelElectrostaticPoint,
+    HiSimHvChannelModulationPoint, HiSimHvChannelRegion, HiSimHvIntrinsicBias,
+    HiSimHvIntrinsicScalar as Jet, PreparedHiSimHvChannelElectrostatics, PreparedHiSimHvInstance,
+    PreparedHiSimHvModel, PreparedHiSimHvTransport, channel_correction::ChannelCorrection,
+    instance::model_real, instance_real_at, lookup_slot, prepare_hisim_hv_channel_electrostatics,
 };
 use crate::{ModelError, ParameterScope};
 use std::sync::Arc;
@@ -137,14 +137,18 @@ impl HiSimHvChannelMobilityCoefficients {
 pub struct PreparedHiSimHvNormalChannel {
     electrostatics: PreparedHiSimHvChannelElectrostatics,
     mobility: HiSimHvChannelMobilityCoefficients,
+    correction: ChannelCorrection,
     identity: Arc<()>,
 }
 
-/// Coupled intrinsic charge and core channel current, excluding parasitics.
+/// Coupled intrinsic charge and channel current, excluding access and junction branches.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HiSimHvNormalChannelPoint {
     pub electrostatics: HiSimHvChannelElectrostaticPoint,
     pub mobility: HiSimHvChannelMobilityPoint,
+    pub correction: HiSimHvChannelCorrectionPoint,
+    /// Total intrinsic channel current before external access correction.
+    pub drain_current_a: Jet,
 }
 
 /// Prepare the native enhancement-mode channel for repeated local evaluation.
@@ -184,6 +188,7 @@ pub fn prepare_hisim_hv_normal_channel(
     Ok(PreparedHiSimHvNormalChannel {
         electrostatics,
         mobility,
+        correction: ChannelCorrection::prepare(model, instance, mobility.multiplicity)?,
         identity: Arc::clone(&instance.identity),
     })
 }
@@ -227,9 +232,16 @@ impl PreparedHiSimHvNormalChannel {
         let mobility =
             self.mobility
                 .evaluate(&inputs, &electrostatics.charge, &electrostatics.modulation)?;
+        let correction = self.correction.evaluate(bias, &electrostatics, &mobility)?;
+        let drain_current_a = (mobility.drain_current_a
+            + correction.parasitic_channel_current_a
+            + correction.ohmic_leakage_a)
+            .checked("HiSIM-HV intrinsic channel current")?;
         Ok(HiSimHvNormalChannelPoint {
             electrostatics,
             mobility,
+            correction,
+            drain_current_a,
         })
     }
 }

@@ -1050,10 +1050,14 @@ symmetry factor are retained. The independent source-extracted reference
 fixtures cover 1,536 endpoint/integral cases (binary128 bisection and finite
 differences) and 864 channel-length/mobility cases. Composed-device tests
 check both variants and polarities, charge conservation, zero drain current
-and context ownership. These are intrinsic normal-channel results, not yet
-the complete native device: HV2 depletion-mode transport, additional channel
-corrections, parasitic assembly, noise and full circuit-level qualification
-remain separate work.
+and context ownership. Full ngspice 47 isolated-channel operating-point fixtures
+cover 1,344 default-card points and 4,032 HV2 PTL/GDL/GDSLEAK points,
+including separate and combined corrections, two polarities, three
+temperatures and multiple geometries including multifinger instances.
+The core current, optional parasitic channel term and ohmic leakage remain
+separate so native access correction can be applied in its original order.
+HV2 depletion-mode transport, access/drift and STI corrections, parasitic
+assembly, noise and full circuit-level qualification remain separate work.
 
 ## Reference test coverage
 

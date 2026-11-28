@@ -5,6 +5,7 @@
 mod accumulation;
 mod bias_conditioning;
 mod channel_charge;
+mod channel_correction;
 mod channel_electrostatics;
 mod channel_mobility;
 mod channel_modulation;
@@ -40,6 +41,7 @@ pub use channel_charge::{
     HiSimHvChannelChargeInputs, HiSimHvChannelChargePoint, HiSimHvChannelRegion,
     evaluate_hisim_hv_channel_charge,
 };
+pub use channel_correction::HiSimHvChannelCorrectionPoint;
 pub use channel_electrostatics::{
     HiSimHvChannelElectrostaticPoint, PreparedHiSimHvChannelElectrostatics,
     prepare_hisim_hv_channel_electrostatics,
