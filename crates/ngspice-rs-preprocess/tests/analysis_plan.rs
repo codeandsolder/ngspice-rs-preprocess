@@ -397,14 +397,15 @@ fn linked_ltspice_analysis_is_extracted_with_occurrence_and_bound_axes() -> Resu
     assert_eq!(intent.expression, "vmax*2");
     let budget = WorkBudget::default();
     let sweeps = plan.bind_independent_sweeps(
-        |_, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+        2,
+        |_, _, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
         &budget,
     )?;
     assert_eq!(sweeps.count(), 6);
     let coordinates = |ordinal| -> Result<Vec<u64>> {
         sweeps
             .candidate(ordinal)?
-            .map(|result| result.map(|(_, value)| value.to_bits()))
+            .map(|result| result.map(|coordinate| coordinate.value.to_bits()))
             .collect()
     };
     assert_eq!(coordinates(0)?, [1000_f64, 40.].map(f64::to_bits));

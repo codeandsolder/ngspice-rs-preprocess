@@ -547,7 +547,8 @@ mod tests {
                 .all(|axis| axis.execution == SweepExecution::Continuation)
         );
         let independent = result.plan.bind_independent_sweeps(
-            |_, value| model_normalize_ngspice::model_card::parse_spice_constant(value),
+            1,
+            |_, _, value| model_normalize_ngspice::model_card::parse_spice_constant(value),
             &budget,
         )?;
         assert_eq!(independent.count(), 2);

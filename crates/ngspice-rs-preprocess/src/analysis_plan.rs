@@ -1,5 +1,6 @@
 //! Source analysis intent, independent of the prepared electrical circuit.
 pub mod measurement;
+mod simetrix;
 pub mod source_capture;
 pub mod sweep;
 use anyhow::{Context, Result, ensure};
@@ -190,8 +191,24 @@ pub struct PlanEntry {
     pub statement: String,
     /// Typed declaration.
     pub directive: Directive,
+    /// Analysis-local independent axes, in innermost-first order. Deck-wide
+    /// STEP declarations are separate entries and do not belong to this list.
+    pub independent_axes: Vec<SweepAxis>,
+    /// Original scheduling hint, not a physical or numerical policy.
+    pub parallelism_hint: Option<u32>,
     /// Execution policy.
     pub disposition: Disposition,
+}
+
+impl PlanEntry {
+    /// Whether this entry requests an analysis rather than a setting or observation.
+    #[must_use = "independent axes attach only to an actual analysis"]
+    pub const fn is_analysis(&self) -> bool {
+        matches!(
+            self.directive,
+            Directive::Analysis { .. } | Directive::Transient { .. } | Directive::DcSweep { .. }
+        )
+    }
 }
 
 /// Whether the plan describes a complete deck or an include-only artifact.
@@ -258,6 +275,33 @@ impl AnalysisPlan {
                 }
             }
         }
+        let steps = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.dialect == AnalysisDialect::Simetrix
+                    && matches!(entry.directive, Directive::Sweep { .. })
+            })
+            .count();
+        if steps > 0 {
+            ensure!(
+                steps == 1,
+                "SIMetrix STEP supports one compatibility axis; nested sweeps belong to an analysis"
+            );
+            let mut analyses = self.entries.iter().filter(|entry| entry.is_analysis());
+            let request = analyses
+                .next()
+                .context("SIMetrix STEP requires a companion analysis")?;
+            ensure!(
+                analyses.next().is_none()
+                    && request.independent_axes.is_empty()
+                    && matches!(
+                        request.command.as_str(),
+                        ".DC" | ".AC" | ".TF" | ".NOISE" | ".TRAN"
+                    ),
+                "SIMetrix STEP requires one compatible analysis without inline sweeps"
+            );
+        }
         Ok(())
     }
 
@@ -291,16 +335,18 @@ impl AnalysisPlan {
             || matches!(&entry.directive, Directive::Options { settings } if settings.iter().any(|setting| setting.disposition == Disposition::RequiresBinding)))
     }
 
-    /// Bind all independent axes in source order using a caller-provided
-    /// lexical scalar resolver, then reserve their Cartesian product.
-    /// No candidate deck or tuple table is allocated.
+    /// Bind the independent axes of a specific analysis in innermost-first
+    /// order, using the declaration's lexical scalar resolver. Analysis-local
+    /// axes do not leak into unrelated requests. Reserve the complete product
+    /// before executing any candidate.
     ///
     /// # Errors
-    /// Invalid or unbound coordinate, scoped/unsupported declaration,
-    /// cardinality overflow, or exhausted request budget.
+    /// Invalid analysis index, scoped/unsupported declaration, invalid or
+    /// unbound coordinate, cardinality overflow, or exhausted request budget.
     pub fn bind_independent_sweeps(
         &self,
-        mut resolve: impl FnMut(&PlanEntry, &str) -> Result<f64>,
+        analysis: usize,
+        mut resolve: impl FnMut(&PlanEntry, &SweepAxis, &str) -> Result<f64>,
         budget: &WorkBudget,
     ) -> Result<BoundIndependentSweeps<'_>> {
         self.validate_supported()?;
@@ -308,26 +354,37 @@ impl AnalysisPlan {
             self.kind == PlanKind::Deck,
             "library analysis plan is not executable"
         );
-        let mut entries = Vec::new();
-        let mut axes = Vec::new();
-        for entry in &self.entries {
-            if let Directive::Sweep { axis } = &entry.directive
-                && axis.execution == SweepExecution::Independent
-            {
-                budget.charge(Resource::GeneratedNodes, 1)?;
-                axes.push(
-                    axis.bind(|scalar| resolve(entry, scalar), budget)
-                        .with_context(|| format!("sweep declaration at {:?}", entry.origin))?,
-                );
-                entries.push(entry);
+        let request = self
+            .entries
+            .get(analysis)
+            .filter(|entry| entry.is_analysis())
+            .context("independent sweep must select an actual analysis entry")?;
+        let local = request.independent_axes.iter().map(|axis| (request, axis));
+        let global = self.entries.iter().filter_map(|entry| {
+            if let Directive::Sweep { axis } = &entry.directive {
+                Some((entry, axis))
+            } else {
+                None
             }
+        });
+        let mut axes = Vec::new();
+        for (entry, axis) in local.chain(global) {
+            ensure!(
+                axis.execution == SweepExecution::Independent,
+                "non-independent axis in candidate product"
+            );
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            let coordinates = axis
+                .bind(|scalar| resolve(entry, axis, scalar), budget)
+                .with_context(|| format!("sweep declaration at {:?}", entry.origin))?;
+            axes.push(BoundSweep {
+                entry,
+                axis,
+                coordinates,
+            });
         }
-        let count = sweep::reserve_product(&axes, budget)?;
-        Ok(BoundIndependentSweeps {
-            entries,
-            axes,
-            count,
-        })
+        let count = sweep::reserve_product(axes.iter().map(|axis| &axis.coordinates), budget)?;
+        Ok(BoundIndependentSweeps { axes, count })
     }
 
     // Select an actual member of a Monte Carlo sweep, not a nominal
@@ -472,13 +529,35 @@ impl AnalysisPlan {
     }
 }
 
+/// A bound axis retains both declaration identity and the precise typed
+/// target. Several independent axes may come from the same statement.
+#[derive(Debug)]
+pub struct BoundSweep<'a> {
+    /// Original declaration and lexical context.
+    pub entry: &'a PlanEntry,
+    /// Source target and coordinate policy.
+    pub axis: &'a SweepAxis,
+    /// Compact validated coordinate sequence.
+    pub coordinates: BoundAxis,
+}
+
+/// One candidate's override for a particular bound axis.
+#[derive(Debug)]
+pub struct BoundCoordinate<'a> {
+    /// Original declaration.
+    pub entry: &'a PlanEntry,
+    /// Source target; resolution and invalidation belong to the consumer.
+    pub axis: &'a SweepAxis,
+    /// Physical candidate value.
+    pub value: f64,
+}
+
 /// Independent sweep axes bound to source declarations. Coordinates are
 /// represented by compact sequences; the execution layer owns candidate
 /// invalidation, analysis scheduling and state reset.
 #[derive(Debug)]
 pub struct BoundIndependentSweeps<'a> {
-    entries: Vec<&'a PlanEntry>,
-    axes: Vec<BoundAxis>,
+    axes: Vec<BoundSweep<'a>>,
     count: usize,
 }
 
@@ -497,28 +576,31 @@ impl<'a> BoundIndependentSweeps<'a> {
     pub fn candidate(
         &self,
         ordinal: usize,
-    ) -> Result<impl Iterator<Item = Result<(&'a PlanEntry, f64)>> + '_> {
+    ) -> Result<impl Iterator<Item = Result<BoundCoordinate<'a>>> + '_> {
         ensure!(
             ordinal < self.count,
             "candidate ordinal outside reserved sweep"
         );
-        Ok(self.entries.iter().copied().zip(&self.axes).scan(
-            ordinal,
-            |remaining, (entry, axis)| {
-                let index = *remaining % axis.len();
-                *remaining /= axis.len();
-                Some(
-                    axis.value(index)
-                        .map(|value| (entry, value))
-                        .context("missing reserved sweep coordinate"),
-                )
-            },
-        ))
+        Ok(self.axes.iter().scan(ordinal, |remaining, bound| {
+            let index = *remaining % bound.coordinates.len();
+            *remaining /= bound.coordinates.len();
+            Some(
+                bound
+                    .coordinates
+                    .value(index)
+                    .map(|value| BoundCoordinate {
+                        entry: bound.entry,
+                        axis: bound.axis,
+                        value,
+                    })
+                    .context("missing reserved sweep coordinate"),
+            )
+        }))
     }
 
     /// The source-order axes, with declaration identity and coordinate law.
-    pub fn axes(&self) -> impl ExactSizeIterator<Item = (&'a PlanEntry, &BoundAxis)> {
-        self.entries.iter().copied().zip(&self.axes)
+    pub fn axes(&self) -> impl ExactSizeIterator<Item = &BoundSweep<'a>> {
+        self.axes.iter()
     }
 }
 
@@ -829,6 +911,33 @@ fn classify(
     use Disposition::{
         Circuit, Initialization, Metadata, NativeRequest, RequiresBinding, Unsupported,
     };
+    if dialect == AnalysisDialect::Simetrix {
+        let directive = match name {
+            ".STEP" => Some(Directive::Sweep {
+                axis: SweepAxis::simetrix_step(&arguments(statement)?)?,
+            }),
+            ".DC" => {
+                let args = arguments(statement)?;
+                // Statistical selection owns the original unbound MONTE form.
+                if args.windows(2).any(|pair| {
+                    pair[0].eq_ignore_ascii_case("SWEEP") && pair[1].eq_ignore_ascii_case("MONTE")
+                }) {
+                    None
+                } else {
+                    Some(Directive::DcSweep {
+                        axes: simetrix::dc_axes(&args)?,
+                    })
+                }
+            }
+            _ => None,
+        };
+        if let Some(directive) = directive {
+            return Ok((
+                directive,
+                if scoped { Unsupported } else { RequiresBinding },
+            ));
+        }
+    }
     if dialect == AnalysisDialect::Ltspice
         && let Some(directive) = ltspice_directive(name, statement, scoped)?
     {
@@ -970,8 +1079,36 @@ fn push_entry(
         Resource::EmittedBytes,
         text.len().saturating_add(name.len()),
     )?;
-    let (mut directive, disposition) = classify(&name, text, dialect, library || !scope.is_empty())
-        .with_context(|| format!("analysis declaration at {origin:?}"))?;
+    let inline = if dialect == AnalysisDialect::Simetrix
+        && matches!(
+            analysis_kind(&name),
+            AnalysisKind::DcSweep
+                | AnalysisKind::Ac
+                | AnalysisKind::Transient
+                | AnalysisKind::Noise
+                | AnalysisKind::TransferFunction
+                | AnalysisKind::OperatingPoint
+        ) {
+        simetrix::inline_sweeps(analysis_kind(&name), &arguments(text)?)
+            .with_context(|| format!("analysis sweep at {origin:?}"))?
+    } else {
+        None
+    };
+    let (mut directive, mut disposition) = if let Some(inline) = &inline {
+        budget.charge(Resource::GeneratedNodes, inline.axes.len())?;
+        let base = format!("{name} {}", inline.arguments.join(" "));
+        classify(&name, &base, dialect, library || !scope.is_empty())
+    } else {
+        classify(&name, text, dialect, library || !scope.is_empty())
+    }
+    .with_context(|| format!("analysis declaration at {origin:?}"))?;
+    let (independent_axes, parallelism_hint) = inline.map_or_else(
+        || (Vec::new(), None),
+        |inline| (inline.axes, inline.parallelism_hint),
+    );
+    if !independent_axes.is_empty() && disposition != Disposition::Unsupported {
+        disposition = Disposition::RequiresBinding;
+    }
     if let Directive::Sweep { axis } = &mut directive
         && axis.execution == SweepExecution::Independent
         && dialect == AnalysisDialect::Ltspice
@@ -986,6 +1123,8 @@ fn push_entry(
         command: name,
         statement: text.to_owned(),
         directive,
+        independent_axes,
+        parallelism_hint,
         disposition,
     });
     Ok(())
@@ -1282,16 +1421,26 @@ mod typed_analysis_tests {
         assert_eq!(plan.entries.len(), 4);
         assert!(plan.requires_binding());
         assert!(plan.validate_unbound_execution().is_err());
-        let sweeps = plan.bind_independent_sweeps(|_, text| parse_spice_constant(text), &budget)?;
+        let sweeps =
+            plan.bind_independent_sweeps(2, |_, _, text| parse_spice_constant(text), &budget)?;
         assert_eq!(sweeps.count(), 9);
         let mut axes = sweeps.axes();
-        let (entry, axis) = axes.next().context("missing duration sweep")?;
-        assert_eq!(entry.command, ".STEP");
-        assert_eq!(axis.value(0).map(f64::to_bits), Some(1e-3_f64.to_bits()));
-        let (entry, axis) = axes.next().context("missing temperature sweep")?;
-        assert_eq!(entry.command, ".TEMP");
-        assert_eq!(axis.value(0).map(f64::to_bits), Some(25_f64.to_bits()));
-        assert_eq!(axis.value(1).map(f64::to_bits), Some((-40_f64).to_bits()));
+        let axis = axes.next().context("missing duration sweep")?;
+        assert_eq!(axis.entry.command, ".STEP");
+        assert_eq!(
+            axis.coordinates.value(0).map(f64::to_bits),
+            Some(1e-3_f64.to_bits())
+        );
+        let axis = axes.next().context("missing temperature sweep")?;
+        assert_eq!(axis.entry.command, ".TEMP");
+        assert_eq!(
+            axis.coordinates.value(0).map(f64::to_bits),
+            Some(25_f64.to_bits())
+        );
+        assert_eq!(
+            axis.coordinates.value(1).map(f64::to_bits),
+            Some((-40_f64).to_bits())
+        );
         let Directive::Transient { intent } = &plan.entries[2].directive else {
             anyhow::bail!("missing typed transient");
         };

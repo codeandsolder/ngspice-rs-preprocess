@@ -21,13 +21,20 @@ pub enum SweepTarget {
         /// Original source identity; the consumer verifies its device type.
         name: String,
     },
+    /// Device's source-language default instance parameter (not necessarily V/I).
+    Device {
+        /// Original device identity.
+        name: String,
+    },
+    /// Excitation frequency in hertz.
+    Frequency,
     /// Actual circuit temperature in Celsius, not the model's nominal temperature.
     Temperature,
     /// Source-selected model parameter; resolution may require model binning
     /// or occurrence-specific physical preparation.
     ModelParameter {
-        /// Source model family.
-        family: String,
+        /// Explicit source model family, when the syntax specifies it.
+        family: Option<String>,
         /// Source model name.
         model: String,
         /// Source parameter name.
@@ -53,6 +60,15 @@ pub enum CoordinateLaw {
         stop: String,
         /// Signed increment.
         increment: String,
+    },
+    /// Uniform arithmetic grid including both endpoints, with a total point count.
+    LinearCount {
+        /// First coordinate.
+        start: String,
+        /// Last coordinate.
+        stop: String,
+        /// Total number of coordinates, not an increment.
+        count: String,
     },
     /// Logarithmic coordinates, with the density specified per interval.
     Logarithmic {
@@ -107,6 +123,17 @@ pub enum CoordinateOrder {
     Ascending,
 }
 
+/// Source-specific minimum coordinate policy. A one-coordinate independent
+/// run is meaningful in some dialects, but LTspice STEP requires variation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cardinality {
+    /// At least one coordinate.
+    Nonempty,
+    /// At least two distinct coordinates.
+    Distinct,
+}
+
 /// One source sweep axis, prior to occurrence binding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SweepAxis {
@@ -118,9 +145,11 @@ pub struct SweepAxis {
     pub execution: SweepExecution,
     /// Per-axis ordering policy, selected by the source plan.
     pub order: CoordinateOrder,
+    /// Minimum coordinate requirement of the original source directive.
+    pub cardinality: Cardinality,
 }
 
-fn name(raw: &str) -> Result<String> {
+pub(super) fn name(raw: &str) -> Result<String> {
     ensure!(
         !raw.is_empty()
             && raw
@@ -131,7 +160,7 @@ fn name(raw: &str) -> Result<String> {
     Ok(raw.to_owned())
 }
 
-fn target(args: &[String]) -> Result<(SweepTarget, &[String])> {
+fn target(args: &[String], allow_display_name: bool) -> Result<(SweepTarget, &[String])> {
     let (first, rest) = args.split_first().context("missing sweep target")?;
     if first.eq_ignore_ascii_case("param") {
         let (parameter, rest) = rest.split_first().context("missing swept parameter name")?;
@@ -155,7 +184,7 @@ fn target(args: &[String]) -> Result<(SweepTarget, &[String])> {
             .context("unterminated model-parameter target")?;
         return Ok((
             SweepTarget::ModelParameter {
-                family: name(first)?,
+                family: Some(name(first)?),
                 model: name(model_name)?,
                 parameter: name(parameter)?,
             },
@@ -163,11 +192,12 @@ fn target(args: &[String]) -> Result<(SweepTarget, &[String])> {
         ));
     }
     ensure!(
-        first
-            .as_bytes()
-            .first()
-            .is_some_and(|c| matches!(c.to_ascii_lowercase(), b'v' | b'i')),
-        "unsupported LTspice sweep target {first:?}"
+        allow_display_name
+            || first
+                .as_bytes()
+                .first()
+                .is_some_and(|c| matches!(c.to_ascii_lowercase(), b'v' | b'i')),
+        "unsupported independent-source sweep target {first:?}"
     );
     Ok((SweepTarget::Source { name: name(first)? }, rest))
 }
@@ -231,6 +261,19 @@ impl SweepAxis {
     /// Missing or ambiguous target, malformed grid, invalid numeric list,
     /// or file-backed coordinates that have not been admitted.
     pub fn ltspice_step(args: &[String]) -> Result<Self> {
+        Self::compatibility_step(args, false)
+    }
+
+    /// Parse the SIMetrix single-level compatibility STEP form.
+    ///
+    /// # Errors
+    /// Malformed target or range; nested or file-backed forms require the
+    /// separately typed multi-step analysis grammar.
+    pub fn simetrix_step(args: &[String]) -> Result<Self> {
+        Self::compatibility_step(args, true)
+    }
+
+    fn compatibility_step(args: &[String], simetrix: bool) -> Result<Self> {
         let (first, rest) = args.split_first().context("missing STEP operands")?;
         let mode = match first.to_ascii_lowercase().as_str() {
             "lin" => Some(RangeMode::Linear),
@@ -238,12 +281,24 @@ impl SweepAxis {
             "dec" => Some(RangeMode::Logarithmic(LogInterval::Decade)),
             _ => None,
         };
-        let (target, fields) = target(if mode.is_some() { rest } else { args })?;
+        let (target, fields) = target(if mode.is_some() { rest } else { args }, simetrix)?;
+        ensure!(
+            !simetrix
+                || !fields
+                    .first()
+                    .is_some_and(|field| field.eq_ignore_ascii_case("LIST")),
+            "SIMetrix STEP list requires an explicit analysis SWEEP LIST declaration"
+        );
         Ok(Self {
             target,
             law: law(fields, mode)?,
             execution: SweepExecution::Independent,
             order: CoordinateOrder::Declared,
+            cardinality: if simetrix {
+                Cardinality::Nonempty
+            } else {
+                Cardinality::Distinct
+            },
         })
     }
 
@@ -286,6 +341,7 @@ impl SweepAxis {
                     },
                     execution: SweepExecution::Continuation,
                     order: CoordinateOrder::Declared,
+                    cardinality: Cardinality::Nonempty,
                 })
             })
             .collect()
@@ -301,6 +357,7 @@ impl SweepAxis {
             law: list(values)?,
             execution: SweepExecution::Independent,
             order: CoordinateOrder::Declared,
+            cardinality: Cardinality::Distinct,
         })
     }
 
@@ -340,6 +397,10 @@ impl SweepAxis {
                     (resolve(start)?, resolve(stop)?, resolve(increment)?);
                 Coordinates::Range(Range::linear(start, stop, increment, self.order)?)
             }
+            CoordinateLaw::LinearCount { start, stop, count } => {
+                let (start, stop, count) = (resolve(start)?, resolve(stop)?, resolve(count)?);
+                Coordinates::Range(Range::linear_count(start, stop, count, self.order)?)
+            }
             CoordinateLaw::Logarithmic {
                 start,
                 stop,
@@ -366,6 +427,9 @@ impl SweepAxis {
                 .value(index)
                 .context("invalid sweep coordinate")?;
             ensure!(value.is_finite(), "nonfinite sweep coordinate");
+            if self.target == SweepTarget::Frequency {
+                ensure!(value >= 0., "swept frequency cannot be negative");
+            }
             if self.target == SweepTarget::Temperature {
                 ensure!(
                     value > -273.15,
@@ -383,8 +447,8 @@ impl SweepAxis {
             previous = Some(value);
         }
         ensure!(
-            self.execution != SweepExecution::Independent || distinct,
-            "independent sweep requires at least two distinct coordinates"
+            self.cardinality == Cardinality::Nonempty || distinct,
+            "source sweep requires at least two distinct coordinates"
         );
         Ok(BoundAxis { coordinates })
     }
@@ -442,11 +506,17 @@ impl Coordinates {
 struct Range {
     start: f64,
     stop: f64,
-    increment: f64,
+    spacing: RangeSpacing,
     count: u32,
     snap_stop: bool,
     reverse: bool,
-    logarithmic: bool,
+}
+
+#[derive(Debug)]
+enum RangeSpacing {
+    Increment(f64),
+    Logarithmic(f64),
+    Interpolated,
 }
 
 // Count arithmetic is performed before allocation. u32 is more than the
@@ -490,17 +560,51 @@ impl Range {
         Ok(Self {
             start,
             stop,
-            increment,
+            spacing: if logarithmic {
+                RangeSpacing::Logarithmic(increment)
+            } else {
+                RangeSpacing::Increment(increment)
+            },
             count: checked_count(intervals)?,
             snap_stop: intervals > 0. && (ratio - intervals).abs() <= slack,
             reverse: order == CoordinateOrder::Ascending && stop < start,
-            logarithmic,
         })
     }
 
     fn linear(start: f64, stop: f64, increment: f64, order: CoordinateOrder) -> Result<Self> {
-        let ratio = (stop - start) / increment;
+        let difference = stop - start;
+        let ratio = if difference.is_finite() {
+            difference / increment
+        } else {
+            // Opposite-sign finite endpoints can have an overflowing
+            // difference even when the number of increments is small.
+            stop / increment - start / increment
+        };
         Self::new(start, stop, increment, ratio, order, false)
+    }
+
+    fn linear_count(start: f64, stop: f64, count: f64, order: CoordinateOrder) -> Result<Self> {
+        ensure!(
+            start.is_finite()
+                && stop.is_finite()
+                && count.is_finite()
+                && count >= 1.
+                && count.fract() == 0.,
+            "linear point-count sweep requires finite endpoints and positive integral count"
+        );
+        let count = checked_count(count - 1.)?;
+        ensure!(
+            count > 1 || start.partial_cmp(&stop) == Some(std::cmp::Ordering::Equal),
+            "single-point linear sweep must identify one coordinate"
+        );
+        Ok(Self {
+            start,
+            stop,
+            spacing: RangeSpacing::Interpolated,
+            count,
+            snap_stop: true,
+            reverse: order == CoordinateOrder::Ascending && stop < start,
+        })
     }
 
     fn logarithmic(
@@ -534,12 +638,19 @@ impl Range {
             self.start
         } else if self.snap_stop && index == self.count - 1 {
             self.stop
-        } else if self.logarithmic {
-            self.increment
-                .mul_add(f64::from(index), self.start.ln())
-                .exp()
         } else {
-            self.increment.mul_add(f64::from(index), self.start)
+            match self.spacing {
+                RangeSpacing::Logarithmic(increment) => {
+                    increment.mul_add(f64::from(index), self.start.ln()).exp()
+                }
+                RangeSpacing::Increment(increment) => {
+                    increment.mul_add(f64::from(index), self.start)
+                }
+                RangeSpacing::Interpolated => {
+                    let fraction = f64::from(index) / f64::from(self.count - 1);
+                    self.start.mul_add(1. - fraction, self.stop * fraction)
+                }
+            }
         })
     }
 }
@@ -549,8 +660,11 @@ impl Range {
 ///
 /// # Errors
 /// Integer overflow or cumulative request budget exhaustion.
-pub fn reserve_product(axes: &[BoundAxis], budget: &WorkBudget) -> Result<usize> {
-    let count = axes.iter().try_fold(1usize, |count, axis| {
+pub fn reserve_product<'a>(
+    axes: impl IntoIterator<Item = &'a BoundAxis>,
+    budget: &WorkBudget,
+) -> Result<usize> {
+    let count = axes.into_iter().try_fold(1usize, |count, axis| {
         count
             .checked_mul(axis.len())
             .context("Cartesian sweep cardinality overflow")
@@ -573,7 +687,7 @@ mod tests {
         assert_eq!(
             parse(".step NPN Q2N3904(BF) 50 200 50")?.target,
             SweepTarget::ModelParameter {
-                family: "NPN".into(),
+                family: Some("NPN".into()),
                 model: "Q2N3904".into(),
                 parameter: "BF".into()
             }
