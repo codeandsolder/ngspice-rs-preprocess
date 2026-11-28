@@ -330,12 +330,12 @@ fn extract_pspice_options(
     if entry.disposition != Disposition::Unsupported {
         entry.disposition = Disposition::RequiresBinding;
     }
-    return Ok(Some(Rewrite {
+    Ok(Some(Rewrite {
         first,
         last,
         removed_fields: (digital.len() != fields.len())
             .then(|| digital.into_iter().map(|(_, span)| span.clone()).collect()),
-    }));
+    }))
 }
 
 fn extract_entry(
