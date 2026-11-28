@@ -22,8 +22,8 @@ export PATH="$temporary/reference/bin:$PATH"
 cd "$temporary/source"
 cargo metadata --locked --format-version 1 >/dev/null
 bash .github/scripts/verify-packages.sh --metadata-only
-cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
+# Formatting and Clippy use the canonical strict CI job, including its
+# explicit per-target lint policy. Do not run a second, incompatible gate.
 cargo test --locked --workspace --all-targets
 # These tests deliberately require an independent native simulator; running
 # ordinary cargo test alone skips all of them.
