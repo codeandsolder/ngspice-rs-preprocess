@@ -5,6 +5,7 @@
 use super::{parameter, scope::Scopes, temperature::expression};
 use crate::{
     IdentifierAllocator, lexical,
+    linked_source::SourceDialect,
     model_card::{ModelCard, parse_spice_constant},
     passive_storage::{PSPICE_CAPACITOR, PSPICE_INDUCTOR},
 };
@@ -155,6 +156,7 @@ impl PassiveModels {
         text: &str,
         scope: usize,
         scopes: &Scopes,
+        source: SourceDialect,
     ) -> Result<String> {
         let Some(first) = text.as_bytes().first().map(u8::to_ascii_lowercase) else {
             return Ok(text.to_owned());
@@ -163,14 +165,29 @@ impl PassiveModels {
             return Ok(text.to_owned());
         }
         let spans = lexical::tokens(text.as_bytes())?;
-        let Some(model_span) = spans.get(3) else {
-            return Ok(text.to_owned());
-        };
-        let model_name = &text[model_span.clone()];
-        let Some(model_line) = scopes.find_model(scope, &model_name.to_ascii_lowercase())? else {
-            return Ok(text.to_owned());
-        };
-        let Some(model) = self.models.get(&model_line) else {
+        // A PSpice model owns its multiplier even when a native card
+        // references it. Native positional syntax accepts value/model in
+        // either order; PSpice requires the model before its value.
+        let mut candidate = None;
+        for (model_index, value_index) in [(3, 4), (4, 3)] {
+            if source.is_pspice() && model_index == 4 {
+                break;
+            }
+            let Some(model_span) = spans.get(model_index) else {
+                continue;
+            };
+            let model_name = &text[model_span.clone()];
+            let Some(model_line) = scopes.find_model(scope, &model_name.to_ascii_lowercase())?
+            else {
+                continue;
+            };
+            let Some(model) = self.models.get(&model_line) else {
+                continue;
+            };
+            ensure!(candidate.is_none(), "ambiguous modeled passive {text}");
+            candidate = Some((model, model_name, value_index));
+        }
+        let Some((model, model_name, value_index)) = candidate else {
             return Ok(text.to_owned());
         };
         ensure!(
@@ -178,11 +195,14 @@ impl PassiveModels {
             "PSpice passive instance uses incompatible model {model_name}"
         );
         let value_span = spans
-            .get(4)
+            .get(value_index)
             .context("PSpice modeled passive requires an instance value")?;
         let value = &text[value_span.clone()];
         ensure!(
-            value != "=" && spans.get(5).is_none_or(|next| &text[next.clone()] != "="),
+            value != "="
+                && spans
+                    .get(value_index + 1)
+                    .is_none_or(|next| &text[next.clone()] != "="),
             "PSpice modeled passive requires a positional instance value"
         );
         let Some(multiplier) = &model.multiplier else {

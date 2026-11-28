@@ -31,20 +31,13 @@ pub enum PowerTarget {
     PreparedSolverV1,
 }
 
-/// Parameter expression and inline-comment language.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SourceLanguage {
-    #[default]
-    Simetrix,
-    Hspice,
-    Pspice,
-}
+use model_normalize_ngspice::linked_source::source_declaration;
+pub use model_normalize_ngspice::linked_source::{RootKind, SourceDialect};
 
 /// Effective language of a source resource, inherited by its children.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DialectContext {
-    pub language: SourceLanguage,
+    pub language: SourceDialect,
     /// Device type/name separator; absent in compatibility languages.
     pub separator: Option<char>,
 }
@@ -52,41 +45,33 @@ pub struct DialectContext {
 impl Default for DialectContext {
     fn default() -> Self {
         Self {
-            language: SourceLanguage::Simetrix,
+            language: SourceDialect::Simetrix,
             separator: Some('$'),
         }
     }
 }
 
-/// Placement rules differ between a complete deck and an included resource.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SourceKind {
-    Deck,
-    Include,
-}
-
 impl DialectContext {
-    /// Resolve the legal header declaration; declarations later in the
-    /// resource are comments and cannot change the active language.
-    #[must_use = "the resolved context must be applied to this resource"]
-    pub fn resolve(input: &str, inherited: Self, kind: SourceKind) -> Self {
-        let mut lines = input.lines();
-        let first = lines.next().unwrap_or_default();
-        let second = lines.next().unwrap_or_default();
-        let declaration = match kind {
-            SourceKind::Deck => parse_declaration(second),
-            SourceKind::Include => {
-                let first_declaration = parse_declaration(first);
-                if first_declaration.is_some() {
-                    first_declaration
-                } else if first.trim_start().starts_with('*') || first.trim().is_empty() {
-                    parse_declaration(second)
-                } else {
-                    None
-                }
-            }
-        };
-        declaration.unwrap_or(inherited)
+    /// Resolve the same legal source declaration as the native linker.
+    ///
+    /// # Errors
+    /// The catalog/standalone expression projector does not yet compose
+    /// the other dialects' physical preparation policies.
+    pub fn resolve(input: &str, inherited: Self, kind: RootKind) -> Result<Self> {
+        let context =
+            source_declaration(input.as_bytes(), kind)?.map_or(inherited, |declaration| Self {
+                language: declaration.dialect,
+                separator: declaration.separator,
+            });
+        ensure!(
+            matches!(
+                context.language,
+                SourceDialect::Simetrix | SourceDialect::Hspice | SourceDialect::Pspice
+            ),
+            "foreign source dialect {:?} requires occurrence model binding",
+            context.language
+        );
+        Ok(context)
     }
 
     /// Split the physical device token into its type and displayed identity.
@@ -113,47 +98,13 @@ impl DialectContext {
     /// Remove an inline comment outside quoted strings and expression groups.
     #[must_use = "the active text is the source to be interpreted"]
     pub fn active_prefix(self, line: &str) -> &str {
-        let marker = if self.language == SourceLanguage::Hspice {
+        let marker = if self.language == SourceDialect::Hspice {
             '$'
         } else {
             ';'
         };
         active_prefix(line, marker)
     }
-}
-
-fn parse_declaration(line: &str) -> Option<DialectContext> {
-    let mut fields = line.split_ascii_whitespace();
-    let header = fields.next()?;
-    let language = match header.to_ascii_uppercase().as_str() {
-        "*#SIMETRIX" => SourceLanguage::Simetrix,
-        "*#HSPICE" => SourceLanguage::Hspice,
-        "*#PSPICE" => SourceLanguage::Pspice,
-        _ => return None,
-    };
-    let mut context = DialectContext {
-        language,
-        separator: (language == SourceLanguage::Simetrix).then_some('$'),
-    };
-    for field in fields {
-        let Some((name, value)) = field.split_once('=') else {
-            continue;
-        };
-        if language == SourceLanguage::Simetrix && name.eq_ignore_ascii_case("sep") {
-            if value.eq_ignore_ascii_case("none") {
-                context.separator = None;
-            } else {
-                let mut chars = value.chars();
-                if let Some(character) = chars.next()
-                    && chars.next().is_none()
-                {
-                    context.separator = Some(character);
-                }
-                // The reference ignores multi-character separator options.
-            }
-        }
-    }
-    Some(context)
 }
 
 #[derive(Default)]
@@ -254,7 +205,7 @@ pub(super) fn logical_source(
     let mut active = None;
     let mut state = CommentState::default();
     let mut opaque = OpaqueSource::default();
-    let marker = if context.language == SourceLanguage::Hspice {
+    let marker = if context.language == SourceDialect::Hspice {
         '$'
     } else {
         ';'
@@ -373,13 +324,13 @@ pub(super) fn split_arguments<'a>(input: &'a str, budget: &WorkBudget) -> Result
 
 #[derive(Clone, Copy)]
 struct ExpressionProjection {
-    language: SourceLanguage,
+    language: SourceDialect,
     target: PowerTarget,
     numeric_suffixes: bool,
 }
 
 impl ExpressionProjection {
-    const fn native(language: SourceLanguage, numeric_suffixes: bool) -> Self {
+    const fn native(language: SourceDialect, numeric_suffixes: bool) -> Self {
         Self {
             language,
             target: PowerTarget::NativeNgspice,
@@ -388,7 +339,7 @@ impl ExpressionProjection {
     }
 
     const fn prepared(self) -> bool {
-        matches!(self.language, SourceLanguage::Simetrix)
+        matches!(self.language, SourceDialect::Simetrix)
             && matches!(self.target, PowerTarget::PreparedSolverV1)
     }
 }
@@ -407,7 +358,7 @@ fn lower_call(
             args.len() == 1 && !args[0].is_empty(),
             "LOG requires one argument"
         );
-        let target = if language == SourceLanguage::Simetrix {
+        let target = if language == SourceDialect::Simetrix {
             "log10"
         } else {
             "ln"
@@ -450,14 +401,14 @@ fn lower_call(
         budget.charge(Resource::EmittedBytes, len)?;
         return Ok(format!("{operation}({base},{exponent})"));
     }
-    if language == SourceLanguage::Simetrix {
+    if language == SourceDialect::Simetrix {
         return power::guarded(&base, &exponent, limit, budget);
     }
     // ngspice's behavioral PWR is signed, but its static PWR is unsigned.
     // Use the same explicit mathematical operators in both contexts.
     let expansion = base
         .len()
-        .saturating_mul(if language == SourceLanguage::Hspice {
+        .saturating_mul(if language == SourceDialect::Hspice {
             2
         } else {
             1
@@ -470,7 +421,7 @@ fn lower_call(
     );
     budget.charge(Resource::EmittedBytes, expansion)?;
     let power = format!("pow(abs({base}),{exponent})");
-    if language == SourceLanguage::Hspice {
+    if language == SourceDialect::Hspice {
         Ok(format!("(sgn({base})*{power})"))
     } else {
         Ok(power)
@@ -530,7 +481,7 @@ fn append_hspice_number(
 /// Lower one expression region of a standalone SPICE dialect.
 pub(super) fn lower_expression(
     input: &str,
-    language: SourceLanguage,
+    language: SourceDialect,
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<String> {
@@ -661,7 +612,7 @@ fn rewrite_expression(
             output.push(if grouped { ')' } else { '}' });
             offset = end + 1;
         } else if projection.numeric_suffixes
-            && language == SourceLanguage::Hspice
+            && language == SourceDialect::Hspice
             && (offset == 0 || !symbol_byte(bytes[offset - 1]))
             && (ch.is_ascii_digit()
                 || (ch == '.' && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit)))
@@ -687,7 +638,7 @@ fn rewrite_expression(
             "source expression expansion byte budget exceeded"
         );
     }
-    if grouped && language == SourceLanguage::Simetrix {
+    if grouped && language == SourceDialect::Simetrix {
         power::lower_with_budget(&output, limit, budget)
     } else {
         Ok(output)
@@ -777,9 +728,9 @@ pub(super) fn lower_statement_targeted(
             .next()
             .unwrap_or_default();
         let language = match (device, assignment.to_ascii_uppercase().as_str()) {
-            (b'B', _) => SourceLanguage::Simetrix,
-            (b'E'..=b'H', "VALUE") => SourceLanguage::Pspice,
-            (b'E' | b'G', "VOL" | "CUR") => SourceLanguage::Hspice,
+            (b'B', _) => SourceDialect::Simetrix,
+            (b'E'..=b'H', "VALUE") => SourceDialect::Pspice,
+            (b'E' | b'G', "VOL" | "CUR") => SourceDialect::Hspice,
             _ => context.language,
         };
         (prefix, language)
@@ -803,7 +754,7 @@ pub(super) fn lower_statement_targeted(
         limit.saturating_sub(prefix_end),
         budget,
     )?);
-    if language == SourceLanguage::Simetrix && output.contains("**") {
+    if language == SourceDialect::Simetrix && output.contains("**") {
         let start = match upper.as_str() {
             ".PARAM" | ".MODEL" | ".FUNC" => prefix_end,
             _ if matches!(upper.as_bytes()[0], b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => {
@@ -983,7 +934,7 @@ fn prepared_expression(input: &str, limit: usize, budget: &WorkBudget) -> Result
     let lowered = power::lower_runtime(body, limit, budget)?;
     let lowered = rewrite_expression(
         &lowered,
-        ExpressionProjection::native(SourceLanguage::Simetrix, false),
+        ExpressionProjection::native(SourceDialect::Simetrix, false),
         true,
         limit,
         budget,
@@ -1044,19 +995,19 @@ mod tests {
         let root = DialectContext::resolve(
             "* title\n*#SIMETRIX sep=:\nR:A a 0 1k\n",
             DialectContext::default(),
-            SourceKind::Deck,
-        );
+            RootKind::Deck,
+        )?;
         assert_eq!(root.separator, Some(':'));
-        let child = DialectContext::resolve("*#HSPICE\n.param x=1\n", root, SourceKind::Include);
-        assert_eq!(child.language, SourceLanguage::Hspice);
+        let child = DialectContext::resolve("*#HSPICE\n.param x=1\n", root, RootKind::Include)?;
+        assert_eq!(child.language, SourceDialect::Hspice);
         assert_eq!(child.separator, None);
         assert_eq!(
-            DialectContext::resolve(".param y=2\n*#PSPICE\n", child, SourceKind::Include),
+            DialectContext::resolve(".param y=2\n*#PSPICE\n", child, RootKind::Include)?,
             child
         );
         assert_eq!(
-            DialectContext::resolve("*#PSPICE\n", root, SourceKind::Include).language,
-            SourceLanguage::Pspice
+            DialectContext::resolve("*#PSPICE\n", root, RootKind::Include)?.language,
+            SourceDialect::Pspice
         );
         assert_eq!(root.device_identity("R:A")?, "A");
         assert_eq!(child.device_identity("R:A")?, "R:A");
@@ -1068,11 +1019,11 @@ mod tests {
     fn absolute_power_is_lowered_only_in_its_source_language() -> Result<()> {
         let native = DialectContext::default();
         let hspice = DialectContext {
-            language: SourceLanguage::Hspice,
+            language: SourceDialect::Hspice,
             separator: None,
         };
         let pspice = DialectContext {
-            language: SourceLanguage::Pspice,
+            language: SourceDialect::Pspice,
             separator: None,
         };
         for source in [
@@ -1108,7 +1059,7 @@ mod tests {
     fn intermediate_power_expansion_consumes_the_request_ledger() -> Result<()> {
         use model_preprocess_command::{Cancellation, WorkLimits};
         let hspice = DialectContext {
-            language: SourceLanguage::Hspice,
+            language: SourceDialect::Hspice,
             separator: None,
         };
         let mut nested = "2".to_owned();
@@ -1143,9 +1094,8 @@ mod tests {
     }
 
     #[test]
-    fn comments_respect_dialect_and_quoted_paths() {
-        let hs =
-            DialectContext::resolve("*#HSPICE", DialectContext::default(), SourceKind::Include);
+    fn comments_respect_dialect_and_quoted_paths() -> Result<()> {
+        let hs = DialectContext::resolve("*#HSPICE", DialectContext::default(), RootKind::Include)?;
         assert_eq!(
             hs.active_prefix(".include \"a$b.lib\" $ comment"),
             ".include \"a$b.lib\" "
@@ -1162,5 +1112,6 @@ mod tests {
             DialectContext::default().active_prefix(".inc \"a;b.lib\" ; comment"),
             ".inc \"a;b.lib\" "
         );
+        Ok(())
     }
 }

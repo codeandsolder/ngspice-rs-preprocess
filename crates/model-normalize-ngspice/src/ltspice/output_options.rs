@@ -6,7 +6,11 @@
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 
-use crate::lexical::{self, Edit, Statement};
+use crate::{
+    SourceDialects,
+    lexical::{self, Edit, Statement},
+    linked_source::SourceDialect,
+};
 
 const NAMES: &[&str] = &[
     "plotwinsize",
@@ -80,7 +84,12 @@ fn project_card(statement: &Statement, edits: &mut Vec<Edit>) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+pub(super) fn rewrite(
+    body: &[u8],
+    origins: &[usize],
+    dialects: SourceDialects<'_>,
+    budget: &WorkBudget,
+) -> Result<Option<Vec<u8>>> {
     budget.charge(Resource::ScannedBytes, body.len())?;
     let mut edits = Vec::new();
     let mut control = false;
@@ -96,11 +105,13 @@ pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>
         } else if first.eq_ignore_ascii_case(b".endc") {
             control = false;
         } else if !control
+            && dialects.at_mapped(origins, statement.line)? == SourceDialect::Ltspice
             && [b".options".as_slice(), b".option", b".opt"]
                 .iter()
                 .any(|keyword| first.eq_ignore_ascii_case(keyword))
         {
-            project_card(&statement, &mut edits)?;
+            project_card(&statement, &mut edits)
+                .with_context(|| dialects.describe_mapped(origins, statement.line))?;
         }
     }
     lexical::apply_budgeted_edits(body, edits, budget)
@@ -109,9 +120,7 @@ pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        NormalizationDialect, NormalizationPass, linked_source::RootKind, normalize_mapped,
-    };
+    use crate::{NormalizationPass, linked_source::RootKind, normalize_mapped};
 
     #[test]
     fn projection_keeps_order_scope_and_physical_lines() -> Result<()> {
@@ -119,7 +128,7 @@ mod tests {
         let result = normalize_mapped(
             input,
             RootKind::Deck,
-            NormalizationDialect::Ltspice,
+            SourceDialect::Ltspice,
             &WorkBudget::default(),
         )?;
         let actual = std::str::from_utf8(&result.model.bytes)?;
@@ -140,7 +149,7 @@ mod tests {
         let native = normalize_mapped(
             input,
             RootKind::Deck,
-            NormalizationDialect::Native,
+            SourceDialect::Native,
             &WorkBudget::default(),
         )?;
         assert!(
@@ -161,11 +170,25 @@ mod tests {
             b".options plotwinsize=,numdgt=15",
             b".options plotwinsize reltol=1m",
         ] {
-            assert!(rewrite(input, &WorkBudget::default()).is_err());
+            assert!(
+                rewrite(
+                    input,
+                    &[1],
+                    SourceDialects::Uniform(SourceDialect::Ltspice),
+                    &WorkBudget::default()
+                )
+                .is_err()
+            );
         }
         let input = b".options method=plotwinsize unknown=1 plotwinsize=0\n";
         assert_eq!(
-            rewrite(input, &WorkBudget::default())?.context("expected projection")?,
+            rewrite(
+                input,
+                &[1],
+                SourceDialects::Uniform(SourceDialect::Ltspice),
+                &WorkBudget::default()
+            )?
+            .context("expected projection")?,
             b".options method=plotwinsize unknown=1 ltspice_output_plotwinsize=0\n"
         );
         Ok(())

@@ -1,7 +1,8 @@
 //! Lexical model and function visibility before physical model lowering.
 
 use crate::{
-    lexical,
+    SourceDialects, lexical,
+    linked_source::SourceDialect,
     model_card::{ModelCard, parse_model_card},
 };
 use anyhow::{Context, Result, ensure};
@@ -21,6 +22,7 @@ struct Declaration {
     scope: usize,
     card: ModelCard,
     base: Option<String>,
+    dialect: SourceDialect,
 }
 
 pub(super) struct Scopes {
@@ -56,7 +58,12 @@ fn parse_model(text: &str, line: usize) -> Result<(ModelCard, Option<String>)> {
 }
 
 impl Scopes {
-    pub(super) fn collect(statements: &[lexical::Statement], budget: &WorkBudget) -> Result<Self> {
+    pub(super) fn collect(
+        statements: &[lexical::Statement],
+        origins: &[usize],
+        dialects: SourceDialects<'_>,
+        budget: &WorkBudget,
+    ) -> Result<Self> {
         let mut result = Self {
             budget: budget.clone(),
             entries: vec![Scope::default()],
@@ -112,16 +119,7 @@ impl Scopes {
                     .parent
                     .context("unmatched PSpice .ENDS")?;
             } else if first == ".model" {
-                let (card, base) = parse_model(text, statement.line)?;
-                charge_card(&card, budget)?;
-                result.entries[scope]
-                    .models
-                    .entry(card.name.to_ascii_lowercase())
-                    .or_default()
-                    .push(statement.line);
-                result
-                    .models
-                    .insert(statement.line, Declaration { scope, card, base });
+                result.collect_model(scope, statement.line, text, origins, dialects)?;
             } else if first == ".global" {
                 result.global_ground |= text
                     .split_ascii_whitespace()
@@ -143,6 +141,42 @@ impl Scopes {
         }
         ensure!(scope == 0, "unterminated PSpice subcircuit");
         Ok(result)
+    }
+
+    fn collect_model(
+        &mut self,
+        scope: usize,
+        line: usize,
+        text: &str,
+        origins: &[usize],
+        dialects: SourceDialects<'_>,
+    ) -> Result<()> {
+        let dialect = dialects.at_mapped(origins, line)?;
+        let location = || dialects.describe_mapped(origins, line);
+        let (card, base) = if dialect.is_pspice() {
+            parse_model(text, line).with_context(location)?
+        } else {
+            (
+                parse_model_card(text, line, &[]).with_context(location)?,
+                None,
+            )
+        };
+        charge_card(&card, &self.budget)?;
+        self.entries[scope]
+            .models
+            .entry(card.name.to_ascii_lowercase())
+            .or_default()
+            .push(line);
+        self.models.insert(
+            line,
+            Declaration {
+                scope,
+                card,
+                base,
+                dialect,
+            },
+        );
+        Ok(())
     }
 
     pub(super) const fn budget(&self) -> &WorkBudget {
@@ -209,7 +243,14 @@ impl Scopes {
     pub(super) fn model_declarations(&self) -> impl Iterator<Item = (usize, &str)> {
         self.models
             .iter()
+            .filter(|(_, declaration)| declaration.dialect.is_pspice())
             .map(|(&line, declaration)| (line, declaration.card.family.as_str()))
+    }
+
+    pub(super) fn is_pspice_model(&self, line: usize) -> bool {
+        self.models
+            .get(&line)
+            .is_some_and(|model| model.dialect.is_pspice())
     }
 
     pub(super) fn model(&self, line: usize) -> Result<ModelCard> {
@@ -235,6 +276,10 @@ impl Scopes {
             current = self
                 .find_model(declaration.scope, base)?
                 .with_context(|| format!("missing PSpice AKO base model {base}"))?;
+            ensure!(
+                self.is_pspice_model(current),
+                "PSpice AKO model inheritance across source dialects needs a qualified physical model contract"
+            );
         }
         let base = stack.pop().context("empty PSpice model chain")?;
         charge_card(&base.card, &self.budget)?;

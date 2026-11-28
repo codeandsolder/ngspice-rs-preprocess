@@ -15,8 +15,8 @@ pub enum ParameterError {
 impl std::fmt::Display for ParameterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unknown(name) => write!(f, "unknown SIMetrix diode parameter: {name}"),
-            Self::Unsupported(name) => write!(f, "unsupported SIMetrix diode parameter: {name}"),
+            Self::Unknown(name) => write!(f, "unknown diode parameter: {name}"),
+            Self::Unsupported(name) => write!(f, "unsupported diode parameter: {name}"),
             Self::Invalid(error) => error.fmt(f),
         }
     }
@@ -194,4 +194,47 @@ pub fn compile_simetrix<'a>(
     }
     grouped.finish(&mut model);
     Ok(model.prepare()?)
+}
+
+/// Compile the already-resolved `LTspice` semiconductor model. Ordered
+/// duplicate assignments retain last-value precedence.
+///
+/// The source dispatcher must select the semiconductor family before
+/// calling this function. LEVEL and ideal-only smoothing/limiting fields
+/// are not electrical parameters of this family.
+///
+/// # Errors
+/// Unknown or unqualified fields, or nonfinite numeric values.
+pub fn compile_ltspice<'a>(
+    parameters: impl IntoIterator<Item = (&'a str, f64)>,
+) -> Result<super::ltspice_semiconductor::SourceModel, ParameterError> {
+    let mut model = super::ltspice_semiconductor::SourceModel::default();
+    let mut grouped = Grouped::default();
+    for (original, value) in parameters {
+        if !value.is_finite() {
+            return Err(ModelError::Invalid("source parameter").into());
+        }
+        let name = original.to_ascii_lowercase();
+        match name.as_str() {
+            "level" | "ilimit" | "revilimit" | "epsilon" | "revepsilon" | "area" | "vpk"
+            | "ipk" | "iave" | "irms" | "diss" => {}
+            "perim" => model.sidewall.perimeter = value,
+            "isw" => model.sidewall.transport.saturation_current = value,
+            "ns" => model.sidewall.transport.emission = value,
+            "rsw" => model.sidewall.resistance = value,
+            "cjsw" => model.sidewall.capacitance = value,
+            "vjsw" => model.sidewall.potential = Some(value),
+            "mjsw" => model.sidewall.grading = value,
+            "fcs" => model.sidewall.forward_coefficient = Some(value),
+            "vp" => model.recovery = value,
+            "t_measured" | "t_abs" | "t_rel_global" => {
+                return Err(ParameterError::Unknown(original.to_owned()));
+            }
+            _ => SourceParameter::parse(original)
+                .ok_or_else(|| ParameterError::Unknown(original.to_owned()))?
+                .apply(&mut model.bulk, &mut grouped, value)?,
+        }
+    }
+    grouped.finish(&mut model.bulk);
+    Ok(model)
 }

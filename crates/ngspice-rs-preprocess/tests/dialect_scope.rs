@@ -321,3 +321,254 @@ fn prepared_power_target_survives_nested_source_and_catalog_roundtrip() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn native_and_ltspice_statements_keep_separate_laws_in_one_deck() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let vendor = dir.path().join("vendor.lib");
+    fs::write(
+        &root,
+        b"mixed source laws\n.func limit(x,a,b) {x+a+b}\n.param native_result={limit(5,2,1)}\n.include vendor.lib\n.func bridge(x) {tbl(x)+1}\n.param table_result={bridge(0.25)}\nVnative a 0 {native_result}\nVvendor b 0 {vendor_result}\nVtable c 0 {table_result}\nVin input 0 0.25\nBtable d 0 V=bridge(v(input))\n.subckt native_cell p n\nLnative p n 1m\n.ends\n.end\n",
+    )?;
+    fs::write(
+        &vendor,
+        b"*#LTSPICE\n.param vendor_result={limit(5,2,1)}\n.func tbl(x) {table(x,0,0,1,2)}\n.subckt vendor_cell p n\nLvendor p n 1m\n.ends\n",
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root.clone()),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".func limit(x,a,b) {x+a+b}"));
+    assert!(text.contains(".param native_result={limit(5,2,1)}"));
+    assert!(text.contains(".param vendor_result={__lt_intrinsic_limit("));
+    assert!(text.contains("Lnative p n 1m"));
+    assert!(!text.contains("R__Lnative_RSER"));
+    assert!(text.contains("R__Lvendor_RSER"));
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native line map");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    let origin = text
+        .lines()
+        .zip(lines)
+        .find_map(|(line, origin)| line.starts_with("R__Lvendor_RSER").then_some(origin))
+        .context("missing generated series resistor")?;
+    assert_eq!(origin.source, vendor.canonicalize()?);
+    assert_eq!(origin.line, 5);
+    run_prepared(&bundle, "v(a) v(b) v(c) v(d)", &[8.0, 2.0, 1.5, 1.5])
+}
+
+#[test]
+fn ltspice_root_does_not_apply_its_default_inductor_loss_to_native_include() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"LTspice with native subcircuit\n.include native.inc\n.func f(x) {limit(x,0,1)}\nV1 x 0 {f(2)}\n.subckt vendor p n\nLvendor p n 1m\n.ends\n.end\n")?;
+    fs::write(dir.path().join("native.inc"), b"*#NATIVE\n.subckt native_cell p n\nLnative p n 1m\n.ends\n.param native_result={(-2)^3}\n")?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::LtspiceDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".param native_result={(-2)^3}"));
+    assert!(text.contains("Lnative p n 1m"));
+    assert!(!text.contains("R__Lnative_RSER"));
+    assert!(text.contains("R__Lvendor_RSER"));
+    run_prepared(&bundle, "v(x)", &[1.0])
+}
+
+#[test]
+fn nested_pspice_qspice_and_tina_resources_keep_their_own_scalar_laws() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"Mixed source resource laws\n.param temp=7 native_power={pwr(-2,3)}\n.include ps.inc\nVnative a 0 {native_power+temp}\nVps b 0 {ps_power}\nVdrive d 0 1\nRnative d 0 multiplier 1k\nVq qin 0 4.4\nRq qout 0 1k\nX1 qin qout qdivider\nX2 t 0 tina_cell\n.temp 40\n.end\n")?;
+    fs::write(dir.path().join("ps.inc"), b"*#PSPICE\n.param ps_power={pwr(-2,3)}\n.model multiplier RES(R=2)\nEtemp temp_out 0 VALUE={TEMP}\n.include q.inc\n.include tina.inc\n")?;
+    fs::write(
+        dir.path().join("q.inc"),
+        b"*#QSPICE\n.subckt qdivider a b\nR1 a b 3k4\n.ends\n",
+    )?;
+    fs::write(
+        dir.path().join("tina.inc"),
+        b"*#TINA\n.subckt tina_cell o n .param local=3\nE1 o n VALUE={local}\n.ends\n",
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    ensure!(text.contains("native_power={pwr(-2,3)}"), "{text}");
+    ensure!(text.contains(".param temp=7"), "{text}");
+    ensure!(!text.contains("3k4"), "{text}");
+    ensure!(!text.contains("tina_cell o n .param"), "{text}");
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native line map");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    let source = dir.path().join("ps.inc").canonicalize()?;
+    for (prefix, expected) in [(".func __ps_pwr", 2), (".param __ps_temperature", 4)] {
+        let origin = text
+            .lines()
+            .zip(lines)
+            .find_map(|(line, origin)| line.starts_with(prefix).then_some(origin))
+            .context("missing generated PSpice helper")?;
+        assert_eq!(origin.source, source);
+        assert_eq!(origin.line, expected);
+    }
+    run_prepared(
+        &bundle,
+        "v(a) v(b) v(temp_out) i(vdrive) v(qout) v(t)",
+        &[15.0, -8.0, 40.0, -0.0005, 1.0, 3.0],
+    )
+}
+
+#[test]
+fn emitted_line_map_keeps_repeated_resource_occurrences_and_scope() -> Result<()> {
+    use model_normalize_ngspice::linked_source::SourceDialect;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let shared = dir.path().join("shared.inc");
+    fs::write(&root, b"Repeated resources\n.include ps.inc\n.subckt native_cell out rtn\n.include shared.inc\n.ends\nX1 p 0 ps_cell\nX2 n 0 native_cell\n.end\n")?;
+    fs::write(
+        dir.path().join("ps.inc"),
+        b"*#PSPICE\n.subckt ps_cell out rtn\n.include shared.inc\n.ends\n",
+    )?;
+    fs::write(&shared, b".param gain={pwr(-2,3)}\nV1 out rtn {gain}\n")?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let Provenance::Native {
+        lines,
+        source_graph: Some(graph),
+    } = &bundle.primary.provenance
+    else {
+        anyhow::bail!("missing linked source graph");
+    };
+    let path = shared.canonicalize()?;
+    let occurrences = lines
+        .iter()
+        .filter(|line| line.source == path && line.line == 2)
+        .map(|line| line.linked.context("missing linked occurrence"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(occurrences.len(), 2);
+    assert_ne!(occurrences[0], occurrences[1]);
+    assert_eq!(
+        graph.visits[occurrences[0].visit].dialect,
+        SourceDialect::Pspice
+    );
+    assert_eq!(
+        graph.visits[occurrences[1].visit].dialect,
+        SourceDialect::Native
+    );
+    assert_eq!(
+        graph.scopes[occurrences[0].scope].name.as_deref(),
+        Some("ps_cell")
+    );
+    assert_eq!(
+        graph.scopes[occurrences[1].scope].name.as_deref(),
+        Some("native_cell")
+    );
+    run_prepared(&bundle, "v(p) v(n)", &[-8.0, 8.0])
+}
+
+#[test]
+fn mixed_dialect_error_identifies_physical_source_occurrence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let vendor = dir.path().join("vendor.lib");
+    fs::write(
+        &root,
+        b"Mixed source diagnostics\n.include vendor.lib\n.end\n",
+    )?;
+    fs::write(&vendor, b"*#LTSPICE\n.backanno invalid\n")?;
+    let error = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )
+    .err()
+    .context("invalid .backanno accepted")?;
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains(&format!(
+            "{}:2 (source occurrence 1)",
+            vendor.canonicalize()?.display()
+        )),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("unexpected .backanno operands"),
+        "{diagnostic}"
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_file_options_are_projected_only_in_their_source_language() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let vendor = dir.path().join("vendor.lib");
+    fs::write(&root, b"Mixed source presentation\n.options numdgt=8\n.include vendor.lib\nV1 x 0 1\nR1 x 0 1k\n.end\n")?;
+    fs::write(
+        &vendor,
+        b"*#LTSPICE\n.param pw=0\n.options plotwinsize={pw}\n+ numdgt={7+8}\n",
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".options numdgt=8"));
+    assert!(text.contains(".options ltspice_output_plotwinsize={pw}"));
+    assert!(text.contains("+ ltspice_output_numdgt={7+8}"));
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native line map");
+    };
+    let origin = text
+        .lines()
+        .zip(lines)
+        .find_map(|(line, origin)| {
+            line.starts_with("+ ltspice_output_numdgt=")
+                .then_some(origin)
+        })
+        .context("missing projected output option")?;
+    assert_eq!(origin.source, vendor.canonicalize()?);
+    assert_eq!(origin.line, 4);
+    Ok(())
+}

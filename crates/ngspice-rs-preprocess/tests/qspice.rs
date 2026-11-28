@@ -43,7 +43,7 @@ fn whole_file_nested_section_and_physical_provenance() -> Result<()> {
     assert!(!text.contains("Rser"));
     assert!(text.contains("ideal winding"));
     assert!(text.contains("L1 a b 1m"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         bail!("missing source map");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -144,7 +144,7 @@ fn root_search_order_and_legacy_encoding() -> Result<()> {
     assert!(text.contains("D1 a 0 d•x"));
     assert!(!text.contains(".model wrong"));
     assert!(!text.lines().any(|line| line.starts_with(".libpath")));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         bail!("missing source map");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -328,7 +328,7 @@ fn relative_pwl_is_cumulative_and_preserves_value_signs() -> Result<()> {
     let output = std::str::from_utf8(&bundle.primary.bytes)?;
     assert!(output.contains("V1 a 0 PWL("));
     assert!(output.contains("+1"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         bail!("missing source map");
     };
     assert_eq!(lines.len(), source.lines().count());
@@ -432,7 +432,7 @@ fn bjt_assertions_use_visible_model_and_preserve_terminals() -> Result<()> {
     assert!(!text.contains("polarity PNP\n.model"));
     assert!(!text.contains("Qfour c b 0 0 polarity NPN"));
     assert!(text.contains("assert NPN"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         bail!("missing source map");
     };
     assert_eq!(lines.len(), source.lines().count());
@@ -487,7 +487,7 @@ fn transient_window_defaults_and_symbolic_options() -> Result<()> {
         !output.to_ascii_lowercase().contains("maxstep="),
         "{output}"
     );
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         bail!("missing source map");
     };
     assert_eq!(lines.len(), source.lines().count());
@@ -586,7 +586,7 @@ fn symbolic_waveforms_bind_per_instance_and_preserve_bias() -> Result<()> {
     assert!(text.contains("source law"));
     assert!(!text.contains("PWL("));
     assert!(!text.contains("PULSE("));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         bail!("missing source map");
     };
     assert_eq!(lines.len(), source.lines().count());

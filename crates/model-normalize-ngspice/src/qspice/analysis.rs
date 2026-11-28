@@ -4,7 +4,7 @@
 use super::{Feature, literal, reject};
 use crate::{
     lexical::{Edit, Statement, remove_spans, replace_spans, tokens},
-    linked_source::{LinkedSource, SourceOrigin},
+    linked_source::{LinkedSource, SourceDialect, SourceOrigin},
     model_card::{ModelParameter, parse_parameter_fields},
     param_expression::SpiceExpression,
     parameter_scope::declarations::Declarations,
@@ -390,6 +390,10 @@ pub(super) fn collect<'a>(
         settings
             .budget
             .charge(Resource::ScannedBytes, statement.text.len())?;
+        let line = statement.line + usize::from(has_title);
+        if linked.dialect_at(line) != Some(SourceDialect::Qspice) {
+            continue;
+        }
         let fields = tokens(&statement.text)?;
         let Some(first) = fields.first() else {
             continue;

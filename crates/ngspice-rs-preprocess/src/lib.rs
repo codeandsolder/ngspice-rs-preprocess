@@ -6,8 +6,11 @@ mod dialect;
 
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
-    MappedNormalization, NormalizationDialect, NormalizationPass,
-    linked_source::{LibrarySyntax, LinkLimits, LinkedSource, RootKind, SourceLinker},
+    MappedNormalization, NormalizationPass,
+    linked_source::{
+        LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker, SourceOrigin, SourceScope,
+        SourceVisit,
+    },
     normalize_mapped,
 };
 pub use model_normalize_ngspice::{passive_ic, passive_storage, pwl_resistor, waveform};
@@ -207,6 +210,26 @@ pub struct OriginLine {
     pub line: usize,
     /// Inclusive end of the admitted physical source span, or zero for a generated dialect default.
     pub last_line: usize,
+    /// Admitted source occurrence and lexical scope, when linked directly.
+    pub linked: Option<LinkedLocation>,
+}
+
+/// Stable indices into the artifact's admitted source graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct LinkedLocation {
+    /// Zero-based index of the resource occurrence.
+    pub visit: usize,
+    /// Zero-based index of the lexical subcircuit scope.
+    pub scope: usize,
+}
+
+/// Admitted source occurrences and electrical lexical scopes.
+#[derive(Clone, Debug, Serialize)]
+pub struct SourceGraph {
+    /// Include occurrences in traversal order, including repeated resources.
+    pub visits: Vec<SourceVisit>,
+    /// Lexical scopes in declaration order, starting with the root scope.
+    pub scopes: Vec<SourceScope>,
 }
 
 /// Provenance of an artifact. Generated dialect output is not falsely given
@@ -218,6 +241,8 @@ pub enum Provenance {
     Native {
         /// Exact ordered line mapping.
         lines: Vec<OriginLine>,
+        /// Graph underlying the line map for directly linked artifacts.
+        source_graph: Option<SourceGraph>,
     },
     /// Generated source or parsed library.
     Generated {
@@ -322,7 +347,7 @@ struct NativeProjection {
 impl NativeProjection {
     fn plain(bytes: &[u8], kind: RootKind, budget: &WorkBudget) -> Result<Self> {
         Ok(Self {
-            normalized: normalize_mapped(bytes, kind, NormalizationDialect::Native, budget)?,
+            normalized: normalize_mapped(bytes, kind, SourceDialect::Native, budget)?,
             device_identities: Vec::new(),
             waveforms: Vec::new(),
         })
@@ -332,97 +357,46 @@ impl NativeProjection {
 fn project_native(
     linked: &LinkedSource,
     kind: RootKind,
-    format: InputFormat,
     budget: &WorkBudget,
 ) -> Result<NativeProjection> {
-    match format {
-        InputFormat::PspiceDeck
-        | InputFormat::PspiceLibrary
-        | InputFormat::TinaDeck
-        | InputFormat::TinaLibrary => {
-            let normalized = if matches!(format, InputFormat::TinaDeck | InputFormat::TinaLibrary) {
-                model_normalize_ngspice::tina::normalize_mapped(&linked.bytes, kind, budget)?
-            } else {
-                model_normalize_ngspice::pspice::normalize_mapped(&linked.bytes, kind, budget)?
-            };
-            let identities = normalized
-                .renamed
-                .into_iter()
-                .map(|device| {
-                    let origin = linked
-                        .origin(device.input_line)
-                        .context("missing renamed device origin")?;
-                    budget.charge(Resource::GeneratedNodes, 1)?;
-                    budget.charge(
-                        Resource::EmittedBytes,
-                        origin
-                            .path
-                            .as_os_str()
-                            .len()
-                            .saturating_add(device.declared.len())
-                            .saturating_add(device.declared.len())
-                            .saturating_add(device.linked.len()),
-                    )?;
-                    for part in &device.scope {
-                        budget.charge(Resource::EmittedBytes, part.len())?;
-                    }
-                    Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
-                        source: display_path(&origin.path),
-                        scope: device.scope,
-                        displayed: device.declared.clone(),
-                        declared: device.declared,
-                        linked: device.linked,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut mapped = normalized.mapped;
-            let waveforms = std::mem::take(&mut mapped.waveforms);
-            Ok(NativeProjection {
-                normalized: mapped,
-                device_identities: identities,
-                waveforms,
-            })
-        }
-        InputFormat::QspiceDeck | InputFormat::QspiceLibrary => {
-            let lowered = model_normalize_ngspice::qspice::lower_linked(linked, kind, budget)?;
-            let mut normalized = normalize_mapped(
-                lowered.bytes.as_deref().unwrap_or(&linked.bytes),
-                kind,
-                NormalizationDialect::Native,
-                budget,
+    let normalized = model_normalize_ngspice::normalize_linked(linked, kind, budget)?;
+    let identities = normalized
+        .renamed
+        .into_iter()
+        .map(|device| {
+            let origin = linked
+                .origin(device.input_line)
+                .context("missing renamed device origin")?;
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(
+                Resource::EmittedBytes,
+                origin
+                    .path
+                    .as_os_str()
+                    .len()
+                    .saturating_add(device.declared.len())
+                    .saturating_add(device.declared.len())
+                    .saturating_add(device.linked.len()),
             )?;
-            if lowered.bytes.is_some() {
-                normalized
-                    .model
-                    .passes
-                    .insert(0, NormalizationPass::QspiceSource);
+            for part in &device.scope {
+                budget.charge(Resource::EmittedBytes, part.len())?;
             }
-            Ok(NativeProjection {
-                normalized,
-                device_identities: Vec::new(),
-                waveforms: lowered.waveforms,
+            Ok(model_preprocess_simplis::source_dialect::DeviceIdentity {
+                source: display_path(&origin.path),
+                scope: device.scope,
+                displayed: device.declared.clone(),
+                declared: device.declared,
+                linked: device.linked,
             })
-        }
-        _ => {
-            let dialect = if matches!(
-                format,
-                InputFormat::LtspiceDeck
-                    | InputFormat::LtspiceLibrary
-                    | InputFormat::LtspiceSchematic
-            ) {
-                NormalizationDialect::Ltspice
-            } else {
-                NormalizationDialect::Native
-            };
-            let mut normalized = normalize_mapped(&linked.bytes, kind, dialect, budget)?;
-            let waveforms = std::mem::take(&mut normalized.waveforms);
-            Ok(NativeProjection {
-                normalized,
-                device_identities: Vec::new(),
-                waveforms,
-            })
-        }
-    }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut mapped = normalized.mapped;
+    let waveforms = std::mem::take(&mut mapped.waveforms);
+    Ok(NativeProjection {
+        normalized: mapped,
+        device_identities: identities,
+        waveforms,
+    })
 }
 
 fn native(
@@ -471,18 +445,16 @@ fn native(
     }
     let syntax = match request.format {
         InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary | InputFormat::LtspiceSchematic => {
-            LibrarySyntax::Ltspice
+            SourceDialect::Ltspice
         }
-        InputFormat::PspiceDeck
-        | InputFormat::PspiceLibrary
-        | InputFormat::TinaDeck
-        | InputFormat::TinaLibrary => LibrarySyntax::Pspice,
-        InputFormat::QspiceDeck | InputFormat::QspiceLibrary => LibrarySyntax::Qspice,
-        _ => LibrarySyntax::NamedSections,
+        InputFormat::PspiceDeck | InputFormat::PspiceLibrary => SourceDialect::Pspice,
+        InputFormat::TinaDeck | InputFormat::TinaLibrary => SourceDialect::Tina,
+        InputFormat::QspiceDeck | InputFormat::QspiceLibrary => SourceDialect::Qspice,
+        _ => SourceDialect::Native,
     };
     let linked = SourceLinker {
         search_paths: request.search_paths.clone(),
-        library_syntax: syntax,
+        dialect: syntax,
     }
     .link_admitted(
         root,
@@ -492,34 +464,16 @@ fn native(
         },
         session,
     )?;
-    let projected = project_native(&linked, kind, request.format, session.budget())?;
+    let projected = project_native(&linked, kind, session.budget())?;
     let origins = linked
         .origins
         .into_iter()
         .map(|mapped| {
-            if let Some((_, origins)) = &imported
-                && mapped.path == origin
-            {
-                let original = origins
-                    .get(
-                        mapped
-                            .line
-                            .checked_sub(1)
-                            .context("invalid schematic source line")?,
-                    )
-                    .context("missing schematic source origin")?;
-                Ok(OriginLine {
-                    source: original.path.clone(),
-                    line: original.line,
-                    last_line: original.line,
-                })
-            } else {
-                Ok(OriginLine {
-                    source: mapped.path,
-                    line: mapped.line,
-                    last_line: mapped.line,
-                })
-            }
+            linked_origin(
+                mapped,
+                &origin,
+                imported.as_ref().map(|(_, origins)| origins.as_slice()),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     native_bundle(
@@ -528,8 +482,43 @@ fn native(
         kind,
         projected,
         &origins,
+        Some(SourceGraph {
+            visits: linked.visits,
+            scopes: linked.scopes,
+        }),
         session.budget(),
     )
+}
+
+fn linked_origin(
+    mapped: SourceOrigin,
+    root: &Path,
+    schematic: Option<&[model_import_ltspice::Origin]>,
+) -> Result<OriginLine> {
+    let (source, line) = if let Some(origins) = schematic
+        && mapped.path == root
+    {
+        let original = origins
+            .get(
+                mapped
+                    .line
+                    .checked_sub(1)
+                    .context("invalid schematic source line")?,
+            )
+            .context("missing schematic source origin")?;
+        (original.path.clone(), original.line)
+    } else {
+        (mapped.path, mapped.line)
+    };
+    Ok(OriginLine {
+        source,
+        line,
+        last_line: line,
+        linked: Some(LinkedLocation {
+            visit: mapped.visit,
+            scope: mapped.scope,
+        }),
+    })
 }
 
 fn native_bundle(
@@ -538,6 +527,7 @@ fn native_bundle(
     kind: RootKind,
     projection: NativeProjection,
     origins: &[OriginLine],
+    source_graph: Option<SourceGraph>,
     budget: &WorkBudget,
 ) -> Result<PreparedBundle> {
     let NativeProjection {
@@ -572,7 +562,10 @@ fn native_bundle(
             }
             .to_owned(),
             bytes: normalized.model.bytes,
-            provenance: Provenance::Native { lines },
+            provenance: Provenance::Native {
+                lines,
+                source_graph,
+            },
             dependencies: Vec::new(),
             required_code_models: Vec::new(),
             current_scalings: Vec::new(),

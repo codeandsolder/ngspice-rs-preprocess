@@ -1,0 +1,47 @@
+* standard diode intrinsic laws and recombination/high injection
+Vx x 0 DC .6 AC 1
+V0 x a0 0
+V1 x a1 0
+V2 x a2 0
+V3 x a3 0
+V4 x a4 0
+V5 x a5 0
+V6 x a6 0
+V7 x a7 0
+V8 x a8 0
+V9 x a9 0
+V10 x a10 0
+V11 x a11 0
+V12 x a12 0
+V13 x a13 0
+V14 x a14 0
+D0 a0 0 d0
+D1 a1 0 d1
+D2 a2 0 d2
+D3 a3 0 d3
+D4 a4 0 d4
+D5 a5 0 d5
+D6 a6 0 d6
+D7 a7 0 d7
+D8 a8 0 d8
+D9 a9 0 d9
+D10 a10 0 d10
+D11 a11 0 d0 temp=100
+D12 a12 0 d0 temp=-40
+D13 a13 0 d0 m=2 n=2
+D14 a14 0 d3 2
+.model d0 D(Is=1e-12 N=1.5)
+.model d1 D(Is=1e-12 N=1.5 Isr=1e-10 Nr=2)
+.model d2 D(Is=1e-12 N=1.5 Ikf=.01)
+.model d3 D(Is=1e-12 N=1.5 Isr=1e-10 Nr=2 Ikf=.01)
+.model d4 D(Is=1e-12 N=1.5 Isr=1e-10 Nr=2 Vj=.7 M=.4)
+.model d5 D(Is=1e-12 N=1.5 Isr=1e-10 Nr=2 Vj=2 M=.2)
+.model d6 D(Is=1e-12 N=1.5 BV=3 Ibv=1m Nbv=2)
+.model d7 D(Is=1e-12 N=1.5 BV=3 Ibv=1m Nbv=2 Ibvl=1e-7 Nbvl=3)
+.model d8 D(Is=0 N=1.5)
+.model d9 D(Is=1e-12 N=1.5 Isr=1e-10 Nr=2 Fc=.1)
+.model d10 D(Is=1e-12 N=1.5 Isr=1e-10 Nr=2 Vj=.7 M=0)
+.options gmin=1e-12 reltol=1e-10 abstol=1e-14 vntol=1e-12 plotwinsize=0 numdgt=15
+.save I(V0) I(V1) I(V2) I(V3) I(V4) I(V5) I(V6) I(V7) I(V8) I(V9) I(V10) I(V11) I(V12) I(V13) I(V14)
+.dc Vx -3.2 1.5 .02
+.end

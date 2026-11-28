@@ -41,9 +41,16 @@ fn expression_calls(text: &[u8], start: usize) -> Vec<Range<usize>> {
 /// Build the reverse dependency graph across declarations, conservatively
 /// marking every declaration of a shadowed name as phase-sensitive. Generated
 /// names are shared across lexical scopes, so native scope rules remain intact.
-fn specialized_names(input: &[u8], body: &[u8], budget: &WorkBudget) -> Result<Names> {
+fn specialized_names(
+    input: &[u8],
+    body: &[u8],
+    origins: &[usize],
+    dialects: crate::SourceDialects<'_>,
+    budget: &WorkBudget,
+) -> Result<Names> {
     budget.charge(Resource::ScannedBytes, body.len())?;
     let mut reverse = BTreeMap::<Vec<u8>, BTreeSet<Vec<u8>>>::new();
+    let mut seeds = BTreeSet::new();
     for statement in lexical::statements(body)? {
         budget.charge(Resource::Statements, 1)?;
         let text = &statement.text;
@@ -56,15 +63,29 @@ fn specialized_names(input: &[u8], body: &[u8], budget: &WorkBudget) -> Result<N
         };
         for call in expression_calls(text, start) {
             budget.charge(Resource::GeneratedNodes, 1)?;
+            let called = text[call].to_ascii_uppercase();
+            if called == b"TABLE"
+                && dialects.at_mapped(origins, statement.line)?
+                    == crate::linked_source::SourceDialect::Ltspice
+            {
+                seeds.insert(identifier.clone());
+            }
             reverse
-                .entry(text[call].to_ascii_uppercase())
+                .entry(called)
                 .or_default()
                 .insert(identifier.clone());
         }
     }
     let mut used = IdentifierAllocator::new(input, budget)?;
-    let mut pending = vec![b"TABLE".to_vec()];
+    let mut pending = Vec::new();
     let mut names = Names::new();
+    for seed in seeds {
+        let mut base = b"__lt_param_".to_vec();
+        base.extend_from_slice(&seed);
+        let alias = used.fresh(&base)?;
+        pending.push(seed.clone());
+        names.insert(seed, alias);
+    }
     while let Some(dependency) = pending.pop() {
         let Some(dependents) = reverse.get(&dependency) else {
             continue;
@@ -113,9 +134,10 @@ pub(super) fn specialize(
     input: &[u8],
     body: &[u8],
     origins: &[usize],
+    dialects: crate::SourceDialects<'_>,
     budget: &WorkBudget,
 ) -> Result<Option<Specialization>> {
-    let names = specialized_names(input, body, budget)?;
+    let names = specialized_names(input, body, origins, dialects, budget)?;
     if names.is_empty() {
         return Ok(None);
     }

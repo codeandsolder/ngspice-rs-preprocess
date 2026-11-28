@@ -1,0 +1,17 @@
+base|is=1e-12 n=1.5|
+reverse|is=1e-12 n=1.5|
+gmin|is=0.0 n=1.5|
+m2|is=1e-12 n=1.5|m=2.0
+area2|is=1e-12 n=1.5|area=2.0
+n2|is=1e-12 n=1.5|n=2.0
+mn|is=1e-12 n=1.5|m=2.0 n=2.0
+kf|is=1e-12 n=1.5 kf=1e-12 af=1.5|
+kf_m|is=1e-12 n=1.5 kf=1e-12 af=1.5|m=2.0
+kf_area|is=1e-12 n=1.5 kf=1e-12 af=1.5|area=2.0
+kf_n|is=1e-12 n=1.5 kf=1e-12 af=1.5|n=2.0
+kf_mn|is=1e-12 n=1.5 kf=1e-12 af=1.5|m=2.0 n=2.0
+rs|is=1e-12 n=1.5 rs=20.0|
+rs_n|is=1e-12 n=1.5 rs=20.0|n=2.0
+side|is=1e-12 n=1.5 isw=1e-10 ns=2.0 perim=2.0|
+side_rs|is=1e-12 n=1.5 isw=1e-10 ns=2.0 perim=2.0 rsw=4.0|
+hot|is=1e-12 n=1.5 rs=20.0|temp=100.0

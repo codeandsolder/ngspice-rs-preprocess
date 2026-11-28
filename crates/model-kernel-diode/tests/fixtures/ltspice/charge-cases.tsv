@@ -1,0 +1,25 @@
+base|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|
+depletion|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4|
+diffusion|is=1e-12 n=1.5 tt=5e-09|
+rec|is=1e-12 n=1.5 isr=1e-10 nr=2.0 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|
+rec_dep|is=1e-12 n=1.5 isr=1e-10 nr=2.0 cjo=1e-09 vj=0.7 m=0.4|
+ikf|is=1e-12 n=1.5 ikf=0.01 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|
+ikf_dep|is=1e-12 n=1.5 ikf=0.01 cjo=1e-09 vj=0.7 m=0.4|
+bv|is=1e-12 n=1.5 bv=3.0 ibv=0.001 nbv=2.0 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|
+bv_dep|is=1e-12 n=1.5 bv=3.0 ibv=0.001 nbv=2.0 cjo=1e-09 vj=0.7 m=0.4|
+area|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|area=2.0
+m|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|m=2.0
+n|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|n=2.0
+mn|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|m=2.0 n=2.0
+hot|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|temp=100.0
+hot_dep|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4|temp=100.0
+cold|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|temp=-40.0
+cold_dep|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4|temp=-40.0
+side|is=1e-12 n=1.5 isw=1e-10 ns=2.0 cjsw=2e-09 perim=2.0|
+side_pj|is=1e-12 n=1.5 isw=1e-10 ns=2.0 cjsw=2e-09|pj=2.0
+side_perim|is=1e-12 n=1.5 isw=1e-10 ns=2.0 cjsw=2e-09|perim=2.0
+side_both|is=1e-12 n=1.5 isw=1e-10 ns=2.0 cjsw=2e-09 perim=2.0|area=2.0 m=2.0 n=2.0
+side_rsw|is=1e-12 n=1.5 isw=1e-10 ns=2.0 cjsw=2e-09 perim=2.0 rsw=4.0|
+zeroarea|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|area=0.0
+negm|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|m=-2.0
+negn|is=1e-12 n=1.5 cjo=1e-09 vj=0.7 m=0.4 tt=5e-09|n=-2.0

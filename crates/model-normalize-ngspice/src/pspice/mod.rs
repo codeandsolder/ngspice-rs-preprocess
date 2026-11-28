@@ -7,17 +7,14 @@
 //! physical model families and stochastic declarations fail explicitly.
 
 use crate::{
-    MappedNormalization, NormalizationPass,
+    MappedNormalization, NativeNormalization, NormalizationPass, RenamedDevice, SourceDialects,
     lexical::{self, Edit},
-    linked_source::RootKind,
+    linked_source::{RootKind, SourceDialect},
     model_card::{ModelCard, parse_parameter_fields, parse_spice_constant},
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-};
+use std::{collections::BTreeMap, fmt::Write as _};
 
 mod instances;
 mod nodes;
@@ -26,8 +23,6 @@ mod passive;
 mod scope;
 mod temperature;
 use scope::Scopes;
-
-const TEMPERATURE_PARAMS: &str = ".param temp='temper'\n.param vt='(temper+273.15)*8.6173303e-5'";
 
 const FUNCTIONS: &[(&str, &str)] = &[
     (
@@ -47,14 +42,18 @@ const fn identifier(byte: u8) -> bool {
 
 struct Functions {
     names: BTreeMap<String, String>,
-    used: BTreeSet<String>,
+    used: BTreeMap<String, usize>,
+    line: usize,
     scopes: Scopes,
     scope: usize,
     ground: String,
     identifiers: crate::IdentifierAllocator,
     passives: passive::PassiveModels,
-    temperature: bool,
-    uses_gmin: bool,
+    temperature: Option<usize>,
+    uses_gmin: Option<usize>,
+    temperature_name: String,
+    thermal_voltage_name: String,
+    gmin_name: String,
     options: options::GlobalOptions,
     renamed: Vec<RenamedDevice>,
 }
@@ -70,16 +69,23 @@ impl Functions {
         }
         let ground = String::from_utf8(identifiers.fresh(b"__ps_gnd")?)?;
         let passives = passive::PassiveModels::collect(&scopes, &mut identifiers)?;
+        let temperature_name = String::from_utf8(identifiers.fresh(b"__ps_temperature")?)?;
+        let thermal_voltage_name = String::from_utf8(identifiers.fresh(b"__ps_thermal_voltage")?)?;
+        let gmin_name = String::from_utf8(identifiers.fresh(b"__ps_gmin")?)?;
         Ok(Self {
             names,
-            used: BTreeSet::new(),
+            used: BTreeMap::new(),
+            line: 0,
             scopes,
             scope: 0,
             ground,
             identifiers,
             passives,
-            temperature: false,
-            uses_gmin: false,
+            temperature: None,
+            uses_gmin: None,
+            temperature_name,
+            thermal_voltage_name,
+            gmin_name,
             options,
             renamed: Vec::new(),
         })
@@ -89,22 +95,33 @@ impl Functions {
         Ok(String::from_utf8(self.identifiers.fresh(base.as_bytes())?)?)
     }
 
-    fn definitions(&self) -> Result<String> {
+    fn temperature_parameters(&self) -> String {
+        format!(
+            ".param {}='temper'\n.param {}='(temper+273.15)*8.6173303e-5'",
+            self.temperature_name, self.thermal_voltage_name
+        )
+    }
+
+    fn definitions(&self) -> Result<(String, Vec<usize>)> {
         let mut result = String::new();
+        let mut origins = Vec::new();
         for (name, body) in FUNCTIONS {
-            if self.used.contains(*name) {
+            if let Some(&line) = self.used.get(*name) {
                 let generated = self.names.get(*name).context("missing PSpice helper")?;
                 writeln!(result, ".func {generated}{body}")?;
+                origins.push(line);
             }
         }
-        if self.temperature {
-            result.push_str(TEMPERATURE_PARAMS);
+        if let Some(line) = self.temperature {
+            result.push_str(&self.temperature_parameters());
             result.push('\n');
+            origins.extend([line, line]);
         }
-        if self.uses_gmin {
-            writeln!(result, ".param gmin={:e}", self.options.gmin)?;
+        if let Some(line) = self.uses_gmin {
+            writeln!(result, ".param {}={:e}", self.gmin_name, self.options.gmin)?;
+            origins.push(line);
         }
-        Ok(result)
+        Ok((result, origins))
     }
 
     // Keep electrical probe operands opaque while rewriting actual function
@@ -143,7 +160,7 @@ impl Functions {
                         .budget()
                         .charge(Resource::EmittedBytes, generated.len())?;
                     output.extend_from_slice(generated.as_bytes());
-                    self.used.insert(lower);
+                    self.used.entry(lower).or_insert(self.line);
                     return Ok(end);
                 }
                 if lower == "table" {
@@ -155,10 +172,28 @@ impl Functions {
                     return Ok(end);
                 }
             }
-        } else {
-            self.temperature |=
-                name.eq_ignore_ascii_case("temp") || name.eq_ignore_ascii_case("vt");
-            self.uses_gmin |= name.eq_ignore_ascii_case("gmin");
+        } else if bytes.get(after) != Some(&b'=') || bytes.get(after + 1) == Some(&b'=') {
+            // Generated names keep PSpice's implicit scalar parameters from
+            // replacing same-spelled native parameters or instance setters.
+            let generated = if name.eq_ignore_ascii_case("temp") {
+                self.temperature.get_or_insert(self.line);
+                Some(&self.temperature_name)
+            } else if name.eq_ignore_ascii_case("vt") {
+                self.temperature.get_or_insert(self.line);
+                Some(&self.thermal_voltage_name)
+            } else if name.eq_ignore_ascii_case("gmin") {
+                self.uses_gmin.get_or_insert(self.line);
+                Some(&self.gmin_name)
+            } else {
+                None
+            };
+            if let Some(generated) = generated {
+                self.scopes
+                    .budget()
+                    .charge(Resource::EmittedBytes, generated.len())?;
+                output.extend_from_slice(generated.as_bytes());
+                return Ok(end);
+            }
         }
         output.extend_from_slice(name.as_bytes());
         Ok(end)
@@ -452,6 +487,9 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
     else {
         return Ok(text.to_owned());
     };
+    if !functions.scopes.is_pspice_model(model_line) {
+        return Ok(text.to_owned());
+    }
     let model = functions.scopes.model(model_line)?;
     let Some(law) = SwitchLaw::from_model(&model)? else {
         return Ok(text.to_owned());
@@ -618,17 +656,20 @@ fn rewrite(text: &str, line: usize, functions: &mut Functions) -> Result<String>
 struct LoweredBody {
     bytes: Vec<u8>,
     lines: Vec<usize>,
-    definitions: String,
+    definitions: (String, Vec<usize>),
     renamed: Vec<RenamedDevice>,
 }
 
 fn rewrite_statements(
     statements: &[lexical::Statement],
     functions: &mut Functions,
+    origins: &[usize],
+    dialects: SourceDialects<'_>,
 ) -> Result<Vec<String>> {
     let mut rewritten_statements = Vec::with_capacity(statements.len());
     let mut in_control = false;
     for statement in statements {
+        functions.line = statement.line;
         functions.scopes.budget().charge(Resource::Statements, 1)?;
         functions
             .scopes
@@ -644,7 +685,21 @@ fn rewrite_statements(
             rewritten_statements.push(text.to_owned());
             continue;
         }
-        let rewritten = if in_control {
+        let source = dialects.at_mapped(origins, statement.line)?;
+        let rewritten = if !source.is_pspice() {
+            if in_control {
+                text.to_owned()
+            } else {
+                functions.scope = functions.scopes.scope(statement.line)?;
+                let text = functions.passives.rewrite_instance(
+                    text,
+                    functions.scope,
+                    &functions.scopes,
+                    source,
+                )?;
+                switch_instance(&text, statement.line, functions)?
+            }
+        } else if in_control {
             nodes::rewrite(text, false, &functions.ground, true, |node| {
                 functions.scopes.hierarchical_ground(0, node)
             })?
@@ -655,12 +710,18 @@ fn rewrite_statements(
                 functions.scopes.local_ground(functions.scope),
                 &functions.ground,
             )?;
-            let text =
-                functions
-                    .passives
-                    .rewrite_instance(&text, functions.scope, &functions.scopes)?;
-            let rewritten = rewrite(&text, statement.line, functions)
-                .with_context(|| format!("PSpice source line {}", statement.line))?;
+            let text = functions.passives.rewrite_instance(
+                &text,
+                functions.scope,
+                &functions.scopes,
+                source,
+            )?;
+            let rewritten = rewrite(&text, statement.line, functions).with_context(|| {
+                format!(
+                    "{}: PSpice source statement",
+                    dialects.describe_mapped(origins, statement.line)
+                )
+            })?;
             if first.eq_ignore_ascii_case(".model") {
                 functions
                     .scopes
@@ -687,17 +748,22 @@ fn rewrite_statements(
     Ok(rewritten_statements)
 }
 
-fn lower_body(body: &[u8], budget: &WorkBudget) -> Result<LoweredBody> {
+fn lower_body(
+    body: &[u8],
+    origins: &[usize],
+    dialects: SourceDialects<'_>,
+    budget: &WorkBudget,
+) -> Result<LoweredBody> {
     budget.charge(Resource::ScannedBytes, body.len())?;
     let statements = lexical::statements(body)?;
-    let scopes = Scopes::collect(&statements, budget)?;
+    let scopes = Scopes::collect(&statements, origins, dialects, budget)?;
     let options = options::GlobalOptions::collect(&statements)?;
     let mut functions = Functions::new(body, scopes, options)?;
-    let rewritten_statements = rewrite_statements(&statements, &mut functions)?;
+    let rewritten_statements = rewrite_statements(&statements, &mut functions, origins, dialects)?;
     let mut edits: Vec<Edit> = Vec::new();
     let mut inserted = BTreeMap::<usize, usize>::new();
     for (statement, mut rewritten) in statements.iter().zip(rewritten_statements) {
-        if functions.temperature
+        if functions.temperature.is_some()
             && statement
                 .text
                 .split(u8::is_ascii_whitespace)
@@ -705,7 +771,7 @@ fn lower_body(body: &[u8], budget: &WorkBudget) -> Result<LoweredBody> {
                 .is_some_and(|first| first.eq_ignore_ascii_case(b".subckt"))
         {
             rewritten.push('\n');
-            rewritten.push_str(TEMPERATURE_PARAMS);
+            rewritten.push_str(&functions.temperature_parameters());
         }
         if rewritten.as_bytes() == statement.text {
             continue;
@@ -733,9 +799,9 @@ fn lower_body(body: &[u8], budget: &WorkBudget) -> Result<LoweredBody> {
     }
     // PSpice treats *# directives as comments, not native simulator commands.
     let mut offset = 0;
-    for line in body.split_inclusive(|byte| *byte == b'\n') {
+    for (index, line) in body.split_inclusive(|byte| *byte == b'\n').enumerate() {
         let trimmed = line.trim_ascii_start();
-        if trimmed.starts_with(b"*#") {
+        if trimmed.starts_with(b"*#") && dialects.at_mapped(origins, index + 1)?.is_pspice() {
             let position = offset + line.len() - trimmed.len() + 1;
             edits.push((position..position, vec![b' ']));
         }
@@ -756,28 +822,6 @@ fn lower_body(body: &[u8], budget: &WorkBudget) -> Result<LoweredBody> {
     })
 }
 
-/// A declaration whose designator changed during native lowering.
-#[derive(Debug)]
-pub struct RenamedDevice {
-    /// One-based input physical line, including the deck title.
-    pub input_line: usize,
-    /// Enclosing source subcircuit declarations.
-    pub scope: Vec<String>,
-    /// Original source device identifier.
-    pub declared: String,
-    /// Native emitted device identifier.
-    pub linked: String,
-}
-
-/// Native normalization plus identity changes for downstream occurrence binding.
-#[derive(Debug)]
-pub struct PspiceNormalization {
-    /// Emitted artifact and ordered physical source mapping.
-    pub mapped: MappedNormalization,
-    /// Renamed electrical declarations.
-    pub renamed: Vec<RenamedDevice>,
-}
-
 /// Lower a linked `PSpice` artifact and retain physical source provenance.
 /// The ordinary native normalizer is applied first for existing shared syntax.
 ///
@@ -787,9 +831,23 @@ pub fn normalize_mapped(
     input: &[u8],
     kind: RootKind,
     budget: &WorkBudget,
-) -> Result<PspiceNormalization> {
+) -> Result<NativeNormalization> {
     budget.charge(Resource::ScannedBytes, input.len())?;
-    let shared = super::normalize_mapped(input, kind, super::NormalizationDialect::Native, budget)?;
+    let shared = super::normalize_mapped(input, kind, SourceDialect::Pspice, budget)?;
+    lower_mapped(
+        shared,
+        kind,
+        SourceDialects::Uniform(SourceDialect::Pspice),
+        budget,
+    )
+}
+
+pub(crate) fn lower_mapped(
+    shared: MappedNormalization,
+    kind: RootKind,
+    dialects: SourceDialects<'_>,
+    budget: &WorkBudget,
+) -> Result<NativeNormalization> {
     budget.charge(Resource::EmittedBytes, shared.model.bytes.len())?;
     let first = usize::from(kind == RootKind::Deck);
     let title_end = if first != 0 {
@@ -805,9 +863,14 @@ pub fn normalize_mapped(
     let LoweredBody {
         bytes: body,
         lines,
-        definitions,
+        definitions: (definitions, definition_lines),
         mut renamed,
-    } = lower_body(&shared.model.bytes[title_end..], budget)?;
+    } = lower_body(
+        &shared.model.bytes[title_end..],
+        &shared.input_lines[first..],
+        dialects,
+        budget,
+    )?;
     for device in &mut renamed {
         device.input_line = *shared
             .input_lines
@@ -822,9 +885,15 @@ pub fn normalize_mapped(
     )?;
     let mut bytes = shared.model.bytes[..title_end].to_vec();
     let mut input_lines = shared.input_lines[..first].to_vec();
-    let origin = shared.input_lines.get(first).copied().unwrap_or(1);
     bytes.extend_from_slice(definitions.as_bytes());
-    input_lines.extend(std::iter::repeat_n(origin, definitions.lines().count()));
+    for line in definition_lines {
+        input_lines.push(
+            *shared
+                .input_lines
+                .get(first + line - 1)
+                .context("missing PSpice helper origin")?,
+        );
+    }
     bytes.extend_from_slice(&body);
     for line in lines {
         input_lines.push(
@@ -842,7 +911,7 @@ pub fn normalize_mapped(
         input_lines.len() == bytes.split_inclusive(|b| *b == b'\n').count(),
         "PSpice source mapping is inconsistent"
     );
-    Ok(PspiceNormalization {
+    Ok(NativeNormalization {
         mapped: MappedNormalization {
             model: crate::NormalizedModel { bytes, passes },
             waveforms: shared.waveforms,

@@ -108,7 +108,7 @@ fn lowering_keeps_scope_branch_names_source_lines_and_collision_free_ids() -> Re
     let result = normalize_mapped(
         input,
         RootKind::Deck,
-        crate::NormalizationDialect::Native,
+        crate::linked_source::SourceDialect::Native,
         &WorkBudget::default(),
     )?;
     let text = std::str::from_utf8(&result.model.bytes)?;
@@ -126,14 +126,14 @@ fn lowering_keeps_scope_branch_names_source_lines_and_collision_free_ids() -> Re
     let repeated = normalize_mapped(
         &result.model.bytes,
         RootKind::Deck,
-        crate::NormalizationDialect::Native,
+        crate::linked_source::SourceDialect::Native,
         &WorkBudget::default(),
     )?;
     assert_eq!(repeated.model.bytes, result.model.bytes);
     let bad = normalize_mapped(
         b"title\nL1 a 0 1m Rser=1\nE1 b 0 a 0 Laplace={exp(-s)}\n.end\n",
         RootKind::Deck,
-        crate::NormalizationDialect::Native,
+        crate::linked_source::SourceDialect::Native,
         &WorkBudget::default(),
     );
     assert!(format!("{:#}", bad.err().context("expected positioned failure")?).contains("line 3"));
@@ -164,7 +164,7 @@ fn native_rational_reference_ac_transient_scope_and_current_polarity() -> Result
     let normalized = normalize_mapped(
         source,
         RootKind::Deck,
-        crate::NormalizationDialect::Native,
+        crate::linked_source::SourceDialect::Native,
         &WorkBudget::default(),
     )?;
     fs::write(

@@ -239,7 +239,7 @@ fn library_imports_are_mapped_and_native_mode_does_not_change() -> Result<()> {
     assert!(text.contains("* #PSPICE"));
     assert!(text.contains("X1 out 0 CELL PARAMS: a=2  b=4"));
     assert!(text.ends_with(".end\n"));
-    let Provenance::Native { lines } = &prepared.primary.provenance else {
+    let Provenance::Native { lines, .. } = &prepared.primary.provenance else {
         anyhow::bail!("missing PSpice source map");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -605,7 +605,7 @@ quit
             close(current, -1. / (1000. * factor));
         }
     }
-    let Provenance::Native { lines } = &prepared.primary.provenance else {
+    let Provenance::Native { lines, .. } = &prepared.primary.provenance else {
         anyhow::bail!("missing passive multiplier provenance");
     };
     let emitted = std::str::from_utf8(&prepared.primary.bytes)?;

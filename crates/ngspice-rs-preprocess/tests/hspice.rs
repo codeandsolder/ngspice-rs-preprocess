@@ -52,7 +52,7 @@ fn linked_hspice_resource_spans_and_language_overrides() -> Result<()> {
         !text.contains("999") && !text.contains("discarded"),
         "{text}"
     );
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("expected mapped artifact");
     };
     let span = lines
@@ -145,7 +145,7 @@ fn standalone_library_keeps_neutral_source_and_binds_in_consuming_deck() -> Resu
         (actual - 2. * 100_f64.ln()).abs() < 1e-10,
         "{actual} {text}"
     );
-    let Provenance::Native { lines } = &cached.primary.provenance else {
+    let Provenance::Native { lines, .. } = &cached.primary.provenance else {
         anyhow::bail!("missing native spans");
     };
     assert!(
@@ -944,7 +944,7 @@ B1 b 0 V='twice(V(a))'
     )?;
     let bundle = compile(&root, InputFormat::HspiceDeck)?;
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing native source map")
     };
     assert_eq!(lines.len(), text.lines().count());
