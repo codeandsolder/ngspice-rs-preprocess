@@ -209,6 +209,24 @@ fn bandgap(temperature: f64) -> f64 {
     1.16 - 7.02e-4 * temperature * temperature / (temperature + 1108.0)
 }
 
+fn adjusted_potential(potential: f64, nominal: f64, temperature: f64, vt: f64) -> f64 {
+    let ratio = temperature / nominal;
+    // Algebraically cancel the arbitrary bandgap reference temperature.
+    (3.0 * vt).mul_add(
+        -ratio.ln(),
+        ratio.mul_add(potential - bandgap(nominal), bandgap(temperature)),
+    )
+}
+
+fn saturation_exponent(model: &Model, temperature: f64, k_over_q: f64) -> f64 {
+    let nominal = model.temperature.nominal;
+    let delta = temperature - nominal;
+    model.temperature.exponent.mul_add(
+        (temperature / nominal).ln(),
+        model.temperature.energy_gap / k_over_q * (delta / nominal / temperature),
+    )
+}
+
 const fn temperature_factor(linear: f64, quadratic: f64, delta: f64) -> f64 {
     quadratic.mul_add(delta, linear).mul_add(delta, 1.0)
 }
@@ -227,17 +245,118 @@ fn effective_temperature(model: &Model, instance: Instance) -> Result<f64, Model
     Ok(temperature)
 }
 
+/// Shared intrinsic current and depletion law. Source-specific binding
+/// determines geometry, historical constants and temperature corrections.
+#[derive(Clone, Copy, Debug)]
+struct JunctionLaw {
+    transport: ExponentialJunction,
+    recombination: ExponentialJunction,
+    high_injection: Option<f64>,
+    depletion: Depletion,
+    avalanche: Option<[Avalanche; 2]>,
+}
+
+#[derive(Clone, Copy)]
+struct JunctionEnvironment {
+    factor: f64,
+    thermal_voltage: f64,
+    saturation_exponent: f64,
+    temperature_delta: f64,
+    potential: f64,
+    capacitance_factor: f64,
+}
+
+impl JunctionLaw {
+    fn new(model: &Model, env: JunctionEnvironment) -> Result<Self, ModelError> {
+        let transport = ExponentialJunction::new(
+            model.transport,
+            env.factor,
+            env.thermal_voltage,
+            env.saturation_exponent,
+        )?;
+        let recombination = ExponentialJunction::new(
+            model.recombination,
+            env.factor,
+            env.thermal_voltage,
+            env.saturation_exponent,
+        )?;
+        let high_injection = model.high_injection.map(|knee| {
+            env.factor
+                * knee.current
+                * knee
+                    .temperature_coefficient
+                    .mul_add(env.temperature_delta, 1.)
+        });
+        if let Some(value) = high_injection {
+            positive("temperature-adjusted IKF", value)?;
+        }
+        let avalanche = prepare_avalanche(
+            model,
+            env.factor,
+            env.thermal_voltage,
+            env.temperature_delta,
+        )?;
+        let depletion = Depletion::new(
+            model.depletion,
+            env.potential,
+            env.factor * env.capacitance_factor,
+        )?;
+        Ok(Self {
+            transport,
+            recombination,
+            high_injection,
+            depletion,
+            avalanche,
+        })
+    }
+
+    fn trial_limits(self) -> trial::TrialLimits {
+        trial::TrialLimits::new(self.transport, self.recombination, self.avalanche)
+    }
+
+    fn evaluate_recombination(&self, voltage: f64) -> Slope {
+        if self.recombination.log_saturation == f64::NEG_INFINITY {
+            return Slope::default();
+        }
+        let rec = self.recombination.evaluate(voltage, None);
+        let x = 1.0 - voltage / self.depletion.potential;
+        let base = x.mul_add(x, 0.005);
+        let generation = base.powf(self.depletion.grading * 0.5);
+        let generation_derivative =
+            -self.depletion.grading * x / self.depletion.potential / base * generation;
+        Slope {
+            value: rec.value * generation,
+            derivative: rec
+                .derivative
+                .mul_add(generation, rec.value * generation_derivative),
+        }
+    }
+
+    fn conduction(&self, voltage: f64) -> Slope {
+        let transport = self.transport.evaluate(voltage, self.high_injection);
+        let recombination = self.evaluate_recombination(voltage);
+        let mut physical = Slope {
+            value: transport.value + recombination.value,
+            derivative: transport.derivative + recombination.derivative,
+        };
+        if let Some(terms) = self.avalanche {
+            for term in terms {
+                let term = term.evaluate(voltage);
+                physical.value += term.value;
+                physical.derivative += term.derivative;
+            }
+        }
+        physical
+    }
+}
+
 /// An immutable, temperature- and geometry-bound physical instance.
 ///
 /// Intrinsic bias is anode minus cathode. The solver binds an external
 /// resistor node only if the prepared series resistance is nonzero.
 #[derive(Clone, Copy, Debug)]
 pub struct PreparedInstance {
-    transport: ExponentialJunction,
-    recombination: ExponentialJunction,
-    high_injection: Option<f64>,
-    depletion: Depletion,
-    avalanche: Option<[Avalanche; 2]>,
+    law: JunctionLaw,
     gmin: f64,
     transit_time: f64,
     series_resistance: f64,
@@ -285,32 +404,22 @@ impl PreparedInstance {
         let temperature = effective_temperature(model, instance)?;
         let nominal = model.temperature.nominal;
         let delta = temperature - nominal;
-        let ratio = temperature / nominal;
         let vt = K_OVER_Q * temperature;
         positive("thermal voltage", vt)?;
-        // Algebraically cancel the arbitrary bandgap reference temperature.
-        let potential = (3.0 * vt).mul_add(
-            -ratio.ln(),
-            ratio.mul_add(
-                model.depletion.potential - bandgap(nominal),
-                bandgap(temperature),
-            ),
-        );
+        let potential = adjusted_potential(model.depletion.potential, nominal, temperature, vt);
         positive("temperature-adjusted VJ", potential)?;
-        let exponent = model.temperature.exponent.mul_add(
-            ratio.ln(),
-            model.temperature.energy_gap / K_OVER_Q * (delta / nominal / temperature),
-        );
-        let transport = ExponentialJunction::new(model.transport, factor, vt, exponent)?;
-        let recombination = ExponentialJunction::new(model.recombination, factor, vt, exponent)?;
-        let high_injection = model
-            .high_injection
-            .map(|knee| factor * knee.current * knee.temperature_coefficient.mul_add(delta, 1.0));
-        if let Some(value) = high_injection {
-            positive("temperature-adjusted IKF", value)?;
-        }
-        let avalanche = prepare_avalanche(model, factor, vt, delta)?;
-        let depletion = Depletion::new(model.depletion, potential, factor)?;
+        let exponent = saturation_exponent(model, temperature, K_OVER_Q);
+        let law = JunctionLaw::new(
+            model,
+            JunctionEnvironment {
+                factor,
+                thermal_voltage: vt,
+                saturation_exponent: exponent,
+                temperature_delta: delta,
+                potential,
+                capacitance_factor: 1.,
+            },
+        )?;
         let series_resistance = model.series.resistance
             * temperature_factor(
                 model.series.linear_temperature,
@@ -322,18 +431,14 @@ impl PreparedInstance {
         let gmin = instance.multiplier * instance.gmin;
         nonnegative("scaled gmin", gmin)?;
         Ok(Self {
-            transport,
-            recombination,
-            high_injection,
-            depletion,
-            avalanche,
+            law,
             gmin,
             transit_time: model.transit_time,
             series_resistance,
             temperature,
             multiplier: instance.multiplier,
             noise: model.noise,
-            trial_limits: trial::TrialLimits::new(transport, recombination, avalanche),
+            trial_limits: law.trial_limits(),
         })
     }
 
@@ -382,24 +487,6 @@ impl PreparedInstance {
         })
     }
 
-    fn evaluate_recombination(&self, voltage: f64) -> Slope {
-        if self.recombination.log_saturation == f64::NEG_INFINITY {
-            return Slope::default();
-        }
-        let rec = self.recombination.evaluate(voltage, None);
-        let x = 1.0 - voltage / self.depletion.potential;
-        let base = x.mul_add(x, 0.005);
-        let generation = base.powf(self.depletion.grading * 0.5);
-        let generation_derivative =
-            -self.depletion.grading * x / self.depletion.potential / base * generation;
-        Slope {
-            value: rec.value * generation,
-            derivative: rec
-                .derivative
-                .mul_add(generation, rec.value * generation_derivative),
-        }
-    }
-
     /// Evaluate the physical junction and both exact voltage derivatives.
     ///
     /// No allocations, parameter lookups or accepted-state mutation occur.
@@ -409,20 +496,8 @@ impl PreparedInstance {
     /// A nonfinite voltage or nonrepresentable result is rejected.
     pub fn evaluate(&self, voltage: f64) -> Result<Evaluation, ModelError> {
         finite("junction voltage", &[voltage])?;
-        let transport = self.transport.evaluate(voltage, self.high_injection);
-        let recombination = self.evaluate_recombination(voltage);
-        let mut physical = Slope {
-            value: transport.value + recombination.value,
-            derivative: transport.derivative + recombination.derivative,
-        };
-        if let Some(terms) = self.avalanche {
-            for term in terms {
-                let term = term.evaluate(voltage);
-                physical.value += term.value;
-                physical.derivative += term.derivative;
-            }
-        }
-        let depletion = self.depletion.evaluate(voltage);
+        let physical = self.law.conduction(voltage);
+        let depletion = self.law.depletion.evaluate(voltage);
         let result = Evaluation {
             current: self.gmin.mul_add(voltage, physical.value),
             conductance: physical.derivative + self.gmin,
