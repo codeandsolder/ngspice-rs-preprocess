@@ -595,34 +595,76 @@ fn vendor_transient_timing_is_explicit_in_native_decks() -> Result<()> {
             format!("title\nV1 a 0 1\nR1 a 0 1k\n{source}\n.print tran v(a)\n.end\n"),
         )?;
         let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
-        let output = std::str::from_utf8(&bundle.primary.bytes)?;
-        let tran = output
-            .lines()
-            .find(|line| line.starts_with(".tran"))
-            .context("missing transient analysis")?;
-        let actual = tran
-            .split_whitespace()
-            .skip(1)
-            .take(4)
-            .map(str::parse::<f64>)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        assert_eq!(actual.len(), 4);
+        let plan = bundle
+            .analysis_plan
+            .as_ref()
+            .context("missing typed transient plan")?;
+        let ngspice_rs_preprocess::analysis_plan::Directive::Transient { intent } =
+            &plan.entries[0].directive
+        else {
+            anyhow::bail!("missing typed transient analysis");
+        };
+        let bound = intent.bind_closed(&ngspice_rs_preprocess::WorkBudget::default())?;
+        let actual = bound.native_timing()?;
         for (&actual, expected) in actual.iter().zip(expected) {
             near(actual, expected)?;
         }
-        assert_eq!(source.ends_with("uic"), tran.ends_with("uic"));
-        native(dir.path(), &bundle.primary.bytes)?;
+        assert_eq!(
+            source.ends_with("uic"),
+            bound
+                .modes
+                .contains(model_normalize_ngspice::ltspice::transient::TransientModifier::Uic)
+        );
+        let mut deck = bundle.primary.bytes.clone();
+        let card = format!(
+            ".tran {} {} {} {}{}\n.print tran v(a)\n.end\n",
+            actual[0],
+            actual[1],
+            actual[2],
+            actual[3],
+            if bound
+                .modes
+                .contains(model_normalize_ngspice::ltspice::transient::TransientModifier::Uic)
+            {
+                " UIC"
+            } else {
+                ""
+            }
+        );
+        let end = deck
+            .len()
+            .checked_sub(b".end\n".len())
+            .context("missing end")?;
+        ensure!(&deck[end..] == b".end\n", "missing end");
+        deck.truncate(end);
+        deck.extend_from_slice(card.as_bytes());
+        native(dir.path(), &deck)?;
     }
-    for source in [
-        ".tran 0 1 startup",
-        ".tran 0 1 steady",
-        ".tran 0 1 1",
-        ".tran 0 1 0 -1",
-    ] {
+    for source in [".tran 0 1 1", ".tran 0 1 0 -1"] {
         fs::write(&root, format!("title\n{source}\n.end\n"))?;
         assert!(
             prepared(&root, InputFormat::LtspiceDeck).is_err(),
             "{source}"
+        );
+    }
+    for source in [".tran 0 1 startup", ".tran 0 1 steady"] {
+        fs::write(&root, format!("title\n{source}\n.end\n"))?;
+        let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
+        let plan = bundle
+            .analysis_plan
+            .as_ref()
+            .context("missing typed source mode")?;
+        assert!(plan.validate_unbound_execution().is_err());
+        let ngspice_rs_preprocess::analysis_plan::Directive::Transient { intent } =
+            &plan.entries[0].directive
+        else {
+            anyhow::bail!("missing typed source mode");
+        };
+        assert!(
+            intent
+                .bind_closed(&ngspice_rs_preprocess::WorkBudget::default())?
+                .native_timing()
+                .is_err()
         );
     }
     Ok(())

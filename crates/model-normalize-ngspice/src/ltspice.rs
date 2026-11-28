@@ -9,6 +9,7 @@ mod operators;
 pub mod output_options;
 mod sources;
 mod table;
+pub mod transient;
 
 use crate::{
     IdentifierAllocator, MappedNormalization, NormalizationPass, SourceDialects, expression_start,

@@ -129,6 +129,7 @@ pub(super) fn try_evaluate(
     }
 }
 
+#[cfg(test)]
 pub(super) fn evaluate(raw: &str, runtime_literal: bool, budget: &WorkBudget) -> Result<f64> {
     try_evaluate(raw, runtime_literal, budget)?
         .context("LTspice expression requires occurrence-specific binding")

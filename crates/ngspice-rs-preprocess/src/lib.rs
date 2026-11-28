@@ -297,7 +297,8 @@ pub struct PreparedBundle {
     /// Source-specific initialization policy; absent for native decks.
     /// Consumers must bind it per instance and enclosing analysis.
     pub initial_conditions: Option<passive_ic::InitialConditions>,
-    /// Original dialect analysis declarations; native decks retain executable cards.
+    /// Original dialect analysis declarations. Pure native decks retain executable cards;
+    /// mixed source decks with extracted analysis require consumer binding.
     pub analysis_plan: Option<analysis_plan::AnalysisPlan>,
     /// Mandatory named independent-source forcing, bound once per
     /// elaborated occurrence and parameter candidate. Electrical cards
@@ -452,7 +453,7 @@ fn native(
         InputFormat::QspiceDeck | InputFormat::QspiceLibrary => SourceDialect::Qspice,
         _ => SourceDialect::Native,
     };
-    let linked = SourceLinker {
+    let mut linked = SourceLinker {
         search_paths: request.search_paths.clone(),
         dialect: syntax,
     }
@@ -464,10 +465,10 @@ fn native(
         },
         session,
     )?;
-    let projected = project_native(&linked, kind, session.budget())?;
     let origins = linked
         .origins
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|mapped| {
             linked_origin(
                 mapped,
@@ -476,7 +477,14 @@ fn native(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    native_bundle(
+    let analysis_plan = analysis_plan::source_capture::capture_linked(
+        &mut linked,
+        kind,
+        &origins,
+        session.budget(),
+    )?;
+    let projected = project_native(&linked, kind, session.budget())?;
+    let mut bundle = native_bundle(
         origin,
         request.format,
         kind,
@@ -487,7 +495,9 @@ fn native(
             scopes: linked.scopes,
         }),
         session.budget(),
-    )
+    )?;
+    bundle.analysis_plan = analysis_plan;
+    Ok(bundle)
 }
 
 fn linked_origin(
