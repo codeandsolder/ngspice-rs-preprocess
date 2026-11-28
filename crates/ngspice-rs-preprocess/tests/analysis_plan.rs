@@ -341,3 +341,470 @@ fn named_analysis_coordinates_are_not_mistaken_for_native_devices() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn linked_ltspice_analysis_is_extracted_with_occurrence_and_bound_axes() -> Result<()> {
+    use ngspice_rs_preprocess::{
+        WorkBudget,
+        analysis_plan::{
+            measurement::MeasurementOperation,
+            sweep::{SweepExecution, SweepTarget},
+        },
+    };
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let settings = dir.path().join("settings.inc");
+    fs::write(
+        &root,
+        b"Native root\n.include settings.inc\nV1 in 0 1\nR1 in out {r}\nC1 out 0 1u\n.op\n.end\n",
+    )?;
+    fs::write(&settings, b"*#LTSPICE\n.param r=1k\n.step param r list 2k\n+ 1k 3k\n.step temp list 40 20\n.tran 0 {r*1u} 0 0 startup\n.meas tran vmax MAX V(out)\n.meas tran scaled PARAM vmax*2\n.dc V1 1 0 -.5\n")?;
+    let prepared = prepare_path(&root, InputFormat::NativeDeck)?;
+    let plan = prepared
+        .analysis_plan
+        .as_ref()
+        .context("missing mixed analysis plan")?;
+    assert_eq!(plan.dialect, AnalysisDialect::Native);
+    assert_eq!(
+        plan.entries
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect::<Vec<_>>(),
+        [".STEP", ".STEP", ".TRAN", ".MEAS", ".MEAS", ".DC", ".OP"]
+    );
+    assert_eq!(
+        plan.entries[0].origin,
+        DirectiveOrigin::SourceOccurrence {
+            path: settings.canonicalize()?,
+            first_line: 3,
+            last_line: 4,
+            visit: 1,
+            scope: 0,
+        }
+    );
+    assert_eq!(plan.entries[6].dialect, AnalysisDialect::Native);
+    assert!(
+        matches!(&plan.entries[0].directive, Directive::Sweep { axis } if axis.target == SweepTarget::Parameter { name: "r".into() })
+    );
+    let Directive::DcSweep { axes } = &plan.entries[5].directive else {
+        anyhow::bail!("missing continuation sweep");
+    };
+    assert_eq!(axes[0].execution, SweepExecution::Continuation);
+    let Directive::Measurement { intent } = &plan.entries[4].directive else {
+        anyhow::bail!("missing source measurement");
+    };
+    assert_eq!(intent.operation, MeasurementOperation::Parameter);
+    assert_eq!(intent.expression, "vmax*2");
+    let budget = WorkBudget::default();
+    let sweeps = plan.bind_independent_sweeps(
+        2,
+        |_, _, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+        &budget,
+    )?;
+    assert_eq!(sweeps.count(), 6);
+    let coordinates = |ordinal| -> Result<Vec<u64>> {
+        sweeps
+            .candidate(ordinal)?
+            .map(|result| result.map(|coordinate| coordinate.value.to_bits()))
+            .collect()
+    };
+    assert_eq!(coordinates(0)?, [1000_f64, 40.].map(f64::to_bits));
+    assert_eq!(coordinates(3)?, [1000_f64, 20.].map(f64::to_bits));
+    assert!(plan.validate_unbound_execution().is_err());
+    let electrical = std::str::from_utf8(&prepared.primary.bytes)?;
+    assert!(electrical.contains("R1 in out {r}"));
+    assert!(!electrical.lines().any(|line| matches!(
+        line.split_whitespace().next(),
+        Some(".step" | ".tran" | ".dc" | ".meas" | ".op")
+    )));
+    Ok(())
+}
+
+#[test]
+fn native_deck_without_source_analysis_preserves_native_execution() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let source = b"title\nV1 a 0 1\nR1 a 0 1k\n.tran 1u 2m\n.print tran v(a)\n.end\n";
+    fs::write(&root, source)?;
+    let bundle = prepare_path(&root, InputFormat::NativeDeck)?;
+    assert!(bundle.analysis_plan.is_none());
+    assert_eq!(bundle.primary.bytes, source);
+    Ok(())
+}
+
+fn native_rc_candidate(
+    directory: &Path,
+    name: &str,
+    electrical: &[u8],
+    resistance: f64,
+    temperature: f64,
+    timing: &[String],
+    uic: bool,
+    alter_parameter: bool,
+) -> Result<f64> {
+    let mut deck = std::str::from_utf8(electrical)?
+        .strip_suffix(".end\n")
+        .context("missing electrical deck terminator")?
+        .to_owned();
+    deck.push_str(".control\nset numdgt=17\nset wr_singlescale\n");
+    if alter_parameter {
+        writeln!(deck, "alterparam rbase={resistance}")?;
+        deck.push_str("reset\n");
+    }
+    writeln!(deck, "option temp={temperature}")?;
+    writeln!(
+        deck,
+        "tran {}{}",
+        timing.join(" "),
+        if uic { " UIC" } else { "" }
+    )?;
+    writeln!(deck, "wrdata {name}.dat v(out)\nquit\n.endc\n.end")?;
+    let filename = format!("{name}.cir");
+    fs::write(directory.join(&filename), deck)?;
+    let result = Command::new("ngspice")
+        .current_dir(directory)
+        .args(["-n", "-b", &filename])
+        .output()?;
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    ensure!(
+        result.status.success() && !log.to_ascii_lowercase().contains("error"),
+        "{log}"
+    );
+    let trace = fs::read_to_string(directory.join(format!("{name}.dat")))?;
+    let mut last = None;
+    for line in trace.lines() {
+        let values = line
+            .split_whitespace()
+            .map(str::parse::<f64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let [time, voltage] = values.as_slice() else {
+            anyhow::bail!("invalid RC trace")
+        };
+        let expected = -(-time / (resistance * 1e-6)).exp_m1();
+        ensure!(
+            (voltage - expected).abs() < 3e-6,
+            "RC at {time}: {voltage} vs {expected}"
+        );
+        last = Some(*voltage);
+    }
+    last.context("empty RC trace")
+}
+
+#[test]
+fn simetrix_nested_sweeps_bind_only_the_selected_analysis_and_match_native_cases() -> Result<()> {
+    use ngspice_rs_preprocess::{WorkBudget, analysis_plan::sweep::SweepTarget};
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("sweep.net");
+    fs::write(&root, b"nested RC sweeps\n.param rbase=1k\nV1 in 0 1\nR1 in out {rbase}\nC1 out 0 1u\n.options RELTOL=1e-8 ABSTOL=1e-12\n.tran 1u 4m 0 5u UIC SWEEP PARAM rbase LIN 3 1k 3k\n+ SWEEP TEMP LIST 10 40 NUMCORES=2\n.ac lin 2 100 200\n.end\n")?;
+    let bundle = prepare_path(&root, InputFormat::SimetrixDeck)?;
+    let plan = bundle
+        .analysis_plan
+        .as_ref()
+        .context("missing analysis plan")?;
+    plan.validate_supported()?;
+    let (transient_index, transient) = plan
+        .entries
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.command == ".TRAN")
+        .context("missing transient")?;
+    let ac_index = plan
+        .entries
+        .iter()
+        .position(|entry| entry.command == ".AC")
+        .context("missing AC")?;
+    assert_eq!(transient.independent_axes.len(), 2);
+    assert_eq!(transient.parallelism_hint, Some(2));
+    assert_eq!(transient.disposition, Disposition::RequiresBinding);
+    let Directive::Analysis { arguments, uic, .. } = &transient.directive else {
+        anyhow::bail!("missing base transient")
+    };
+    assert!(*uic);
+    let budget = WorkBudget::default();
+    let resolve =
+        |_: &ngspice_rs_preprocess::analysis_plan::PlanEntry,
+         _: &ngspice_rs_preprocess::analysis_plan::sweep::SweepAxis,
+         raw: &str| model_normalize_ngspice::model_card::parse_spice_constant(raw);
+    let candidates = plan.bind_independent_sweeps(transient_index, resolve, &budget)?;
+    assert_eq!(candidates.count(), 6);
+    assert_eq!(
+        plan.bind_independent_sweeps(ac_index, resolve, &budget)?
+            .count(),
+        1
+    );
+    for ordinal in 0..candidates.count() {
+        let coordinates = candidates.candidate(ordinal)?.collect::<Result<Vec<_>>>()?;
+        let [resistance, temperature] = coordinates.as_slice() else {
+            anyhow::bail!("wrong axes")
+        };
+        assert_eq!(
+            resistance.axis.target,
+            SweepTarget::Parameter {
+                name: "rbase".into()
+            }
+        );
+        assert_eq!(temperature.axis.target, SweepTarget::Temperature);
+        let r = resistance.value;
+        let temp = temperature.value;
+        let expected_r = [1000_f64, 2000., 3000.][ordinal % 3];
+        let expected_temp = [10_f64, 40.][ordinal / 3];
+        assert_eq!(r.to_bits(), expected_r.to_bits());
+        assert_eq!(temp.to_bits(), expected_temp.to_bits());
+        let actual = native_rc_candidate(
+            directory.path(),
+            &format!("prepared-{ordinal}"),
+            &bundle.primary.bytes,
+            r,
+            temp,
+            arguments,
+            *uic,
+            true,
+        )?;
+        let reference = format!(
+            "reference\nV1 in 0 1\nR1 in out {r}\nC1 out 0 1u\n.options RELTOL=1e-8 ABSTOL=1e-12\n.end\n"
+        );
+        let expected = native_rc_candidate(
+            directory.path(),
+            &format!("reference-{ordinal}"),
+            reference.as_bytes(),
+            r,
+            temp,
+            arguments,
+            *uic,
+            false,
+        )?;
+        ensure!(
+            (actual - expected).abs() < 3e-6,
+            "candidate {ordinal}: {actual} vs {expected}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn simetrix_compatibility_step_and_continuation_are_not_interchangeable() -> Result<()> {
+    use ngspice_rs_preprocess::{
+        WorkBudget,
+        analysis_plan::sweep::{SweepExecution, SweepTarget},
+    };
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("sweep.net");
+    fs::write(&root, b"sweep continuation\nV1 in 0 1\nR1 in 0 1k\n.dc DEVICE R1 STP 1k 3k 1k\n+ SWEEP TEMP LIST 10 30\n.end\n")?;
+    let bundle = prepare_path(&root, InputFormat::SimetrixDeck)?;
+    let plan = bundle.analysis_plan.as_ref().context("missing DC plan")?;
+    let Directive::DcSweep { axes } = &plan.entries[0].directive else {
+        anyhow::bail!("missing continuation")
+    };
+    assert_eq!(axes[0].target, SweepTarget::Device { name: "R1".into() });
+    assert_eq!(axes[0].execution, SweepExecution::Continuation);
+    let budget = WorkBudget::default();
+    assert_eq!(
+        plan.bind_independent_sweeps(
+            0,
+            |_, _, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+            &budget
+        )?
+        .count(),
+        2
+    );
+    for (analysis, expected) in [
+        (".tran 1m", true),
+        (".op", false),
+        (".tran 1m\n.ac lin 1 1k 1k", false),
+        (".tran 1m SWEEP TEMP LIST 20 40", false),
+    ] {
+        fs::write(
+            &root,
+            format!(
+                "step companion\n.param rbase=1k\nV1 in 0 1\nR1 in 0 {{rbase}}\n.step param rbase 1k 3k 1k\n{analysis}\n.end\n"
+            ),
+        )?;
+        let bundle = prepare_path(&root, InputFormat::SimetrixDeck)?;
+        let plan = bundle
+            .analysis_plan
+            .as_ref()
+            .context("missing compatibility plan")?;
+        assert_eq!(plan.validate_supported().is_ok(), expected, "{analysis}");
+    }
+    Ok(())
+}
+
+#[test]
+fn raw_file_options_share_source_fields_with_analysis_options() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"Option ownership\n.param pw=0\nV1 x 0 1\nR1 x 0 1k\n.options MAXSTEP=1u,RELTOL=1e-5\n+ plotwinsize pw\n+ SSTOL=1m,\n+ numdgt={7+8}\n.tran 1m\n.end\n")?;
+    let bundle = prepare_path(&root, InputFormat::LtspiceDeck)?;
+    let plan = bundle
+        .analysis_plan
+        .as_ref()
+        .context("missing analysis plan")?;
+    let Directive::Options { settings } = &plan.entries[0].directive else {
+        anyhow::bail!("missing option settings");
+    };
+    assert_eq!(
+        settings
+            .iter()
+            .map(|setting| (&*setting.name, setting.disposition))
+            .collect::<Vec<_>>(),
+        [
+            ("MAXSTEP", Disposition::RequiresBinding),
+            ("RELTOL", Disposition::Circuit),
+            ("PLOTWINSIZE", Disposition::Circuit),
+            ("SSTOL", Disposition::RequiresBinding),
+            ("NUMDGT", Disposition::Circuit),
+        ]
+    );
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let ngspice_rs_preprocess::Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing source provenance");
+    };
+    for (marker, line) in [
+        ("ltspice_output_plotwinsize=", 6),
+        ("ltspice_output_numdgt=", 8),
+    ] {
+        let origin = text
+            .lines()
+            .zip(lines)
+            .find_map(|(card, origin)| card.contains(marker).then_some(origin))
+            .context("missing output projection")?;
+        assert_eq!(origin.line, line);
+        assert_eq!(origin.source, root.canonicalize()?);
+    }
+    assert!(text.contains(".options RELTOL=1e-5"), "{text}");
+    assert!(
+        !text
+            .lines()
+            .filter(|line| !line.starts_with('*'))
+            .any(|line| line.contains("MAXSTEP") || line.contains("SSTOL")),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn pspice_capture_binds_independent_and_continuation_axes_separately() -> Result<()> {
+    use ngspice_rs_preprocess::{
+        WorkBudget,
+        analysis_plan::sweep::{SweepExecution, SweepTarget},
+    };
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"PSpice numerical analysis\n.param rbase=1k other=1\nV1 in 0 1\nR1 in 0 {rbase}\n.temp 65\n.step PARAM rbase 3k,1k,1k\n.dc V1 LIST .1,.2 PARAM other 1,3,1\n.tran/OP 1u 4m 0 {SCHEDULE(0,5u,1m,10u)} SKIPBP\n.probe/CSDF V(in)\n.end\n")?;
+    let bundle = prepare_path(&root, InputFormat::PspiceDeck)?;
+    let plan = bundle
+        .analysis_plan
+        .as_ref()
+        .context("missing PSpice plan")?;
+    plan.validate_supported()?;
+    assert!(plan.requires_binding());
+    assert_eq!(plan.dialect, AnalysisDialect::Pspice);
+    assert_eq!(
+        plan.entries
+            .iter()
+            .map(|entry| entry.command.as_str())
+            .collect::<Vec<_>>(),
+        [".TEMP", ".STEP", ".DC", ".TRAN/OP", ".PROBE/CSDF"]
+    );
+    let Directive::DcSweep { axes } = &plan.entries[2].directive else {
+        anyhow::bail!("missing DC continuation axes")
+    };
+    assert_eq!(axes.len(), 2);
+    assert!(
+        axes.iter()
+            .all(|axis| axis.execution == SweepExecution::Continuation)
+    );
+    assert_eq!(axes[0].target, SweepTarget::Source { name: "V1".into() });
+    assert_eq!(
+        axes[1].target,
+        SweepTarget::Parameter {
+            name: "other".into()
+        }
+    );
+    let Directive::Analysis { arguments, uic, .. } = &plan.entries[3].directive else {
+        anyhow::bail!("missing transient request")
+    };
+    assert!(*uic);
+    assert_eq!(arguments, &["1u", "4m", "0", "{SCHEDULE(0,5u,1m,10u)}"]);
+    assert!(plan.entries[3].statement.ends_with("SKIPBP"));
+    let budget = WorkBudget::default();
+    for index in [2, 3] {
+        let bound = plan.bind_independent_sweeps(
+            index,
+            |_, _, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+            &budget,
+        )?;
+        assert_eq!(bound.count(), 3);
+        for (ordinal, expected) in [3000_f64, 2000., 1000.].into_iter().enumerate() {
+            let coordinates = bound.candidate(ordinal)?.collect::<Result<Vec<_>>>()?;
+            assert_eq!(coordinates.len(), 1);
+            assert_eq!(coordinates[0].value.to_bits(), expected.to_bits());
+        }
+    }
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".temp 65"), "{text}");
+    assert!(
+        !text.lines().any(|line| [".step", ".dc", ".tran", ".probe"]
+            .iter()
+            .any(|prefix| line.to_ascii_lowercase().starts_with(prefix))),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn pspice_temperature_and_statistical_policies_are_not_interchangeable() -> Result<()> {
+    use ngspice_rs_preprocess::WorkBudget;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    for (directives, supported) in [
+        (".temp 65,-40,25\n.op", true),
+        (".temp 65,-40\n.step param r 1 2 1\n.op", false),
+        (".temp 65\n.step temp 25 50 25\n.op", false),
+        (".step param r 1 2 1\n.dc PARAM R 1 2 1", false),
+        (".dc V1 1 2 1 v1 2 3 1", false),
+    ] {
+        fs::write(
+            &root,
+            format!("PSpice policy\n.param r=1\nV1 in 0 1\nR1 in 0 1k\n{directives}\n.end\n"),
+        )?;
+        let bundle = prepare_path(&root, InputFormat::PspiceDeck)?;
+        let plan = bundle
+            .analysis_plan
+            .as_ref()
+            .context("missing analysis plan")?;
+        assert_eq!(plan.validate_supported().is_ok(), supported, "{directives}");
+        if supported {
+            let budget = WorkBudget::default();
+            let bound = plan.bind_independent_sweeps(
+                1,
+                |_, _, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+                &budget,
+            )?;
+            assert_eq!(bound.count(), 3);
+            let coordinates = bound.candidate(1)?.collect::<Result<Vec<_>>>()?;
+            assert_eq!(coordinates[0].value.to_bits(), (-40_f64).to_bits());
+        }
+    }
+    for statistical in [
+        ".mc 10 dc V(in) YMAX",
+        ".WCASE DC V(in) YMAX",
+        ".distribution test 1 2",
+    ] {
+        fs::write(
+            &root,
+            format!("PSpice statistical\nV1 in 0 1\nR1 in 0 1k\n{statistical}\n.end\n"),
+        )?;
+        let error = prepare_path(&root, InputFormat::PspiceDeck)
+            .expect_err("statistical request must not be reduced to nominal execution");
+        assert!(
+            format!("{error:#}").contains("realization policy"),
+            "{error:#}"
+        );
+    }
+    Ok(())
+}

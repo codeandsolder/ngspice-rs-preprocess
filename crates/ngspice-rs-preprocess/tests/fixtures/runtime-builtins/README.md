@@ -3,3 +3,7 @@ Synthetic independent operating-point witnesses measured in SIMetrix Elements
 relative tolerance (reference listing precision); semiconductor current
 comparisons use 1 pA plus 0.1% relative tolerance for the native kernel.
 The wrong-arity case must fail during preparation. No vendor models are included.
+
+The three classic BJT temperature cases are measured against the historical
+thermal-voltage transport equation using the emitted scoped model, voltage
+bias, and temperature, without converting to native ngspice physics.

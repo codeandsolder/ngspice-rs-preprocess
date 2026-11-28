@@ -1,0 +1,5 @@
+# Independent ngspice 47 reference and native model tooling
+codeandsolder-ngspice47 sha256:d8673acd463eb147370d53f78612526adb5d77e2991c4492115997928c24e31d https://github.com/codeandsolder/ngspice/releases/download/ci-ngspice47-debian13-x86_64-r1/codeandsolder-ngspice47_47-1_amd64.deb
+flex
+bison
+ripgrep

@@ -1,6 +1,8 @@
 //! Source-scoped QSPICE plaintext normalization. No compiled device execution.
 mod analysis;
 mod bindings;
+/// Source-only declarations and unresolved module dependency metadata.
+pub mod external_module;
 mod numeric;
 mod sources;
 use crate::{
@@ -36,6 +38,8 @@ pub enum Feature {
     Binding,
     /// Digital, specialized or compiled device class.
     SpecialDevice,
+    /// External module declaration without qualified execution.
+    ExternalModule,
     /// Simulator-specific command, search path or execution directive.
     Directive,
     /// Implicit or explicit parasitics requiring a physical device contract.
@@ -58,6 +62,7 @@ impl fmt::Display for Feature {
             Self::ExpressionLaw => "expression law",
             Self::ConditionalTopology => "conditional topology",
             Self::SpecialDevice => "specialized device class",
+            Self::ExternalModule => "external module",
             Self::Directive => "simulator-specific directive",
             Self::PassiveParasitics => "passive parasitics",
             Self::TransientTiming => "transient timing",
@@ -591,6 +596,7 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind, budget: &WorkBudget) 
         let origin = linked
             .origin(line)
             .context("missing QSPICE source location")?;
+        external_module::reject_unqualified(&statement, origin, budget)?;
         numeric::rewrite(&statement, origin, &declarations, &mut numeric_edits)?;
     }
     let lowered = apply_budgeted_edits(body, numeric_edits, budget)?;

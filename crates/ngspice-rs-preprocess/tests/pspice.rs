@@ -730,9 +730,28 @@ X2 l 0 cell a=0 base=4
     ] {
         assert!(text.contains(field), "{field}: {text}");
     }
-    assert!(text.contains("c1 c 0 cm 1n ic=-2"), "{text}");
-    assert!(text.contains("l1 l 0 lm 1m ic=-0.5"), "{text}");
-    assert!(text.contains("c2 p n cm {base*1n} ic={-a}"), "{text}");
+    assert!(text.contains("c1 c 0 cm 1n"), "{text}");
+    assert!(text.contains("l1 l 0 lm 1m"), "{text}");
+    assert!(text.contains("c2 p n cm {base*1n}"), "{text}");
+    assert!(!text.contains("ic="), "{text}");
+    let policy = prepared
+        .initial_conditions
+        .context("missing passive IC policy")?;
+    let devices = policy.devices;
+    assert_eq!(devices.len(), 3);
+    for (device, target, scope) in [
+        ("C1", "-2", None),
+        ("L1", "-0.5", None),
+        ("C2", "{-a}", Some("cell")),
+    ] {
+        let declaration = devices
+            .iter()
+            .find(|d| d.device.eq_ignore_ascii_case(device))
+            .context("missing IC declaration")?;
+        assert_eq!(declaration.target.as_deref(), Some(target));
+        assert_eq!(declaration.scope.first().map(String::as_str), scope);
+        assert_eq!(declaration.mode.as_deref(), Some("2"));
+    }
     assert!(!text.contains("__ps_passive_"), "{text}");
     Ok(())
 }

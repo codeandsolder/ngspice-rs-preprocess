@@ -5,8 +5,11 @@ use super::{
     BOLTZMANN, ELEMENTARY_CHARGE, Instance, Junction, K_OVER_Q, Model, ModelError, Noise, finite,
     nonnegative, positive,
 };
-use model_kernel_api::taylor::arithmetic::Scalar;
+use model_kernel_api::taylor::{GuardPredicate, GuardRecorder, arithmetic::Scalar};
 use std::cmp::Ordering;
+
+const HIGH_INJECTION: u16 = 0;
+const DEPLETION_CONTINUATION: u16 = 1;
 
 #[derive(Clone, Copy, Debug)]
 struct Slope<S> {
@@ -78,9 +81,7 @@ impl ExponentialJunction {
             let raw = scaled_exponential
                 .offset(-self.saturation)
                 .with_value(raw_value);
-            if let Some(knee) = knee
-                && raw.compare(0.) == Some(Ordering::Greater)
-            {
+            if let Some(knee) = knee {
                 let ratio = raw / S::constant(knee);
                 if ratio.is_finite() {
                     let denominator = ratio.offset(1.0);
@@ -221,11 +222,17 @@ impl Depletion {
         }
     }
 
-    fn evaluate<S: Scalar>(self, voltage: S) -> Slope<S> {
+    fn evaluate<S: Scalar>(self, voltage: S, guards: &mut GuardRecorder<'_>) -> Slope<S> {
         if self.capacitance == 0.0 {
             return Slope::zero();
         }
-        if voltage.compare(self.threshold) == Some(Ordering::Less) {
+        if guards.select(
+            DEPLETION_CONTINUATION,
+            GuardPredicate::Less,
+            voltage,
+            S::constant(self.threshold),
+            self.grading != 0.,
+        ) {
             return self.below_threshold(voltage);
         }
         let delta = voltage.offset(-self.threshold);
@@ -369,8 +376,19 @@ impl JunctionLaw {
         }
     }
 
-    fn forward<S: Scalar>(&self, voltage: S) -> Slope<S> {
-        let transport = self.transport.evaluate(voltage, self.high_injection);
+    fn forward<S: Scalar>(&self, voltage: S, guards: &mut GuardRecorder<'_>) -> Slope<S> {
+        // Select the positive-current law using physical voltage, even if the
+        // scaled current has underflowed during preparation.
+        let knee = self.high_injection.filter(|_| {
+            guards.select(
+                HIGH_INJECTION,
+                GuardPredicate::Greater,
+                voltage,
+                S::constant(0.),
+                self.transport.log_saturation != f64::NEG_INFINITY,
+            )
+        });
+        let transport = self.transport.evaluate(voltage, knee);
         let recombination = self.evaluate_recombination(voltage);
         Slope {
             value: transport.value + recombination.value,
@@ -390,8 +408,8 @@ impl JunctionLaw {
         result
     }
 
-    fn conduction<S: Scalar>(&self, voltage: S) -> Slope<S> {
-        let mut physical = self.forward(voltage);
+    fn conduction<S: Scalar>(&self, voltage: S, guards: &mut GuardRecorder<'_>) -> Slope<S> {
+        let mut physical = self.forward(voltage, guards);
         if let Some(terms) = self.avalanche {
             for term in terms {
                 let term = term.evaluate(voltage);
@@ -544,12 +562,13 @@ impl PreparedInstance {
     pub(crate) fn evaluate_physical<S: Scalar>(
         &self,
         voltage: S,
+        guards: &mut GuardRecorder<'_>,
     ) -> Result<JunctionEvaluation<S>, ModelError> {
         if !voltage.is_finite() {
             return Err(ModelError::Invalid("junction voltage"));
         }
-        let physical = self.law.conduction(voltage);
-        let depletion = self.law.depletion.evaluate(voltage);
+        let physical = self.law.conduction(voltage, guards);
+        let depletion = self.law.depletion.evaluate(voltage, guards);
         let result = JunctionEvaluation {
             current: S::constant(self.gmin).mul_add(voltage, physical.value),
             conductance: physical.derivative.offset(self.gmin),
@@ -581,7 +600,7 @@ impl PreparedInstance {
     /// # Errors
     /// A nonfinite voltage or nonrepresentable result is rejected.
     pub fn evaluate(&self, voltage: f64) -> Result<Evaluation, ModelError> {
-        let value = self.evaluate_physical(voltage)?;
+        let value = self.evaluate_physical(voltage, &mut GuardRecorder::disabled())?;
         Ok(Evaluation {
             current: value.current,
             conductance: value.conductance,

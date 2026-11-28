@@ -583,6 +583,14 @@ fn taylor_selects_vgd_join_from_right_germ() -> std::result::Result<(), Box<dyn 
                 &mut out.point(),
             )?;
             let p = out.point();
+            let guard = p
+                .guards
+                .records()
+                .iter()
+                .find(|guard| guard.site == 4)
+                .unwrap();
+            assert_eq!(guard.selected, direction < 0.);
+            close(guard.surface.coefficient(1), gate.a * direction, 0., 1e-14);
             let expected =
                 scale * gate.a.powi(5) * if direction > 0. { 2. / 15. } else { -1. / 5. };
             // Gate-row, drain-column entry equals minus Cgd.
@@ -593,6 +601,224 @@ fn taylor_selects_vgd_join_from_right_germ() -> std::result::Result<(), Box<dyn 
                 1e-22,
                 1e-12,
             );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn executed_channel_and_junction_guards_follow_thermal_and_electrical_germs()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use model_kernel_api::taylor::{GuardPredicate, TaylorBuffer, TaylorInput};
+    const VT: f64 = 8.617_333_262_145e-5 * 300.15;
+    for polarity in [Polarity::N, Polarity::P] {
+        let sign = polarity.sign();
+        let mut m = Model::defaults(polarity);
+        m.channel.theta = 0.1;
+        m.channel.ksubthres = 0.;
+        m.channel.subshift = 0.25;
+        m.channel.tcvth = -0.003 * sign;
+        m.diode.tt = 50e-9;
+        m.diode.vp = 0.2;
+        m.diode.breakdown = Some(model_kernel_vdmos::Breakdown {
+            bv: 5.,
+            ibv: 0.,
+            nbv: 1.,
+        });
+        let a = artifact(Arc::new(m.prepare()?), true, [15; 16])?;
+        let p = a.prepare(&[1.], 300.15)?;
+        let tile = PreparedTile::new(&a, &[(&[1.], 300.15)])?;
+        let width = a.descriptor().equations.len();
+        assert_eq!(width, 6);
+        let mut buffer = TaylorBuffer::new(width, 2)?;
+        for direction in [-1., 1.] {
+            // Normalized drain, gate, thermal slope; independent expected
+            // signed surface slope. Each case lands on a distinct join.
+            for (site, drain, gate, drain_rate, gate_rate, thermal_rate, expected) in [
+                (0, 0., 4.5, 0.04 * direction, 0., 0., 0.04 * direction),
+                (
+                    1,
+                    1.,
+                    3.,
+                    0.,
+                    0.04 * direction,
+                    2.,
+                    0.04_f64.mul_add(direction, 0.006),
+                ),
+                (
+                    2,
+                    1.,
+                    3.25,
+                    0.,
+                    0.04 * direction,
+                    2.,
+                    0.04_f64.mul_add(direction, 0.006),
+                ),
+                (3, 1., 4.25, 0.04 * direction, 0., 0., -0.04 * direction),
+                (4, 4.5, 4.5, 0., 0.04 * direction, 0., 0.04 * direction),
+                (
+                    5,
+                    3. * VT,
+                    4.5,
+                    0.04 * direction,
+                    0.,
+                    2.,
+                    (-0.04_f64).mul_add(direction, 6. * 8.617_333_262_145e-5),
+                ),
+                (6, 5., 4.5, 0.04 * direction, 0., 0., -0.04 * direction),
+                (8, -0.4, 4.5, 0.04 * direction, 0., 0., -0.04 * direction),
+            ] {
+                let x = [
+                    drain * sign,
+                    gate * sign,
+                    0.,
+                    300.15,
+                    300.15,
+                    1e-12,
+                    drain_rate * sign,
+                    gate_rate * sign,
+                    0.,
+                    thermal_rate,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                ];
+                let input = TaylorInput {
+                    order: 2,
+                    coefficients: &x,
+                };
+                let verify = |out: &mut TaylorBuffer| {
+                    let point = out.point();
+                    let guards = point.guards.records();
+                    let guard = guards.iter().find(|guard| guard.site == site).unwrap();
+                    let predicate = if matches!(site, 1..=3) {
+                        GuardPredicate::Greater
+                    } else {
+                        GuardPredicate::Less
+                    };
+                    assert_eq!(guard.predicate, predicate, "site {site}");
+                    close(guard.surface.coefficient(0), 0., 1e-15, 0.);
+                    close(guard.surface.coefficient(1), expected, 1e-14, 1e-12);
+                    assert_eq!(
+                        guard.selected,
+                        if predicate == GuardPredicate::Less {
+                            expected < 0.
+                        } else {
+                            expected > 0.
+                        },
+                        "site {site}, direction {direction}"
+                    );
+                    // Matching is irrelevant with IBV=0. Avalanche is lazy:
+                    // it must not appear on the forward continuation side.
+                    assert!(!guards.iter().any(|guard| guard.site == 9));
+                    if site == 5 {
+                        assert_eq!(guards.iter().any(|guard| guard.site == 6), guard.selected);
+                    }
+                };
+                a.evaluate_taylor(&p, input, &mut buffer.point())?;
+                verify(&mut buffer);
+                tile.evaluate_lane_taylor(0, input, &mut buffer.point())?;
+                verify(&mut buffer);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn temperature_guards_select_depletion_and_avalanche_matching_germs()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use model_kernel_api::taylor::{GuardPredicate, TaylorBuffer, TaylorInput};
+    const T: f64 = 300.15;
+    const KQ: f64 = 8.617_333_262_145e-5;
+    for polarity in [Polarity::N, Polarity::P] {
+        let sign = polarity.sign();
+        for site in [7, 9] {
+            let mut m = Model::defaults(polarity);
+            m.diode.vj = 5.;
+            m.diode.fc = 0.5;
+            m.diode.tt = 50e-9;
+            m.diode.vp = 0.2;
+            let reverse = m.diode.is.ln().exp() * 5. / (KQ * T);
+            m.diode.breakdown = Some(model_kernel_vdmos::Breakdown {
+                bv: 5.,
+                ibv: reverse,
+                nbv: 0.5,
+            });
+            // Independent analytic derivative of Is*BV/Vt at nominal T.
+            let expected_matching =
+                reverse * (m.diode.eg / (m.diode.n * KQ * T) + m.diode.xti / m.diode.n - 1.) / T;
+            // Differentiate the temperature-adjusted depletion potential.
+            let bandgap_slope = -7.02e-4 * T * (T + 2216.) / (T + 1108.).powi(2);
+            let expected_clamp = 0.5
+                * (5. / T - 3. * KQ
+                    + (bandgap_slope - (1.16 - 7.02e-4 * T * T / (T + 1108.)) / T)
+                        * KQ
+                        * 1.602_176_634e-19
+                        / 1.380_649e-23);
+            let a = artifact(Arc::new(m.prepare()?), true, [16; 16])?;
+            let p = a.prepare(&[1.], T)?;
+            let tile = PreparedTile::new(&a, &[(&[1.], T)])?;
+            let width = a.descriptor().equations.len();
+            assert_eq!(width, 6);
+            let mut buffer = TaylorBuffer::new(width, 2)?;
+            for direction in [-1., 1.] {
+                let drain = if site == 7 { -0.5 } else { 6. };
+                let x = [
+                    drain * sign,
+                    4.5 * sign,
+                    0.,
+                    T,
+                    T,
+                    1e-12,
+                    0.,
+                    0.,
+                    0.,
+                    direction,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                    0.,
+                ];
+                let input = TaylorInput {
+                    order: 2,
+                    coefficients: &x,
+                };
+                let verify = |out: &mut TaylorBuffer| {
+                    let point = out.point();
+                    let guard = point
+                        .guards
+                        .records()
+                        .iter()
+                        .find(|guard| guard.site == site)
+                        .unwrap();
+                    let (predicate, slope) = if site == 7 {
+                        (GuardPredicate::Greater, expected_clamp * direction)
+                    } else {
+                        (GuardPredicate::Less, expected_matching * direction)
+                    };
+                    assert_eq!(guard.predicate, predicate);
+                    close(guard.surface.coefficient(0), 0., 1e-15, 0.);
+                    close(guard.surface.coefficient(1), slope, 1e-20, 1e-10);
+                    assert_eq!(
+                        guard.selected,
+                        if site == 7 { slope > 0. } else { slope < 0. }
+                    );
+                };
+                a.evaluate_taylor(&p, input, &mut buffer.point())?;
+                verify(&mut buffer);
+                tile.evaluate_lane_taylor(0, input, &mut buffer.point())?;
+                verify(&mut buffer);
+            }
         }
     }
     Ok(())

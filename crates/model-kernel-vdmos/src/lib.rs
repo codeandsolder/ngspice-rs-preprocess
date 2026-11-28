@@ -20,9 +20,20 @@ mod parameters;
 
 pub use parameters::{ParameterError, compile_ngspice};
 
-use model_kernel_api::taylor::arithmetic::Scalar;
+use model_kernel_api::taylor::{GuardPredicate, GuardRecorder, arithmetic::Scalar};
 use std::cmp::Ordering;
 use std::ops::{Add, Div, Mul, Neg, Sub};
+
+const CHANNEL_DIRECTION: u16 = 0;
+const MOBILITY_THRESHOLD: u16 = 1;
+const HARD_CHANNEL_CUTOFF: u16 = 2;
+const CHANNEL_SATURATION: u16 = 3;
+const GATE_DRAIN_JOIN: u16 = 4;
+const DIODE_REVERSE_CONTINUATION: u16 = 5;
+const DIODE_BREAKDOWN: u16 = 6;
+const DEPLETION_POTENTIAL_CLAMP: u16 = 7;
+const DEPLETION_CONTINUATION: u16 = 8;
+const AVALANCHE_MATCH: u16 = 9;
 
 /// Physical MOS channel polarity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -804,12 +815,13 @@ impl PreparedInstance<'_> {
     ///
     /// Fails on invalid temperature/bias or a singular/nonfinite model state.
     pub fn evaluate(&self, bias: Bias) -> Result<Evaluation, ModelError> {
-        self.evaluate_physical(bias)
+        self.evaluate_physical(bias, &mut GuardRecorder::disabled())
     }
 
     pub(crate) fn evaluate_physical<S: Scalar>(
         &self,
         bias: Bias<S>,
+        guards: &mut GuardRecorder<'_>,
     ) -> Result<Evaluation<S>, ModelError> {
         if ![
             bias.vgs,
@@ -831,14 +843,14 @@ impl PreparedInstance<'_> {
         let dt = t - m.tnom;
         let relative = t / m.tnom;
 
-        let ids = channel_at(m, self.multiplier, bias, t)?;
+        let ids = channel_at(m, self.multiplier, bias, t, guards)?;
         let qgs = Charge {
             value: bias.vgs.scale(m.gate.cgs * self.multiplier),
             d_voltage: S::constant(m.gate.cgs * self.multiplier),
             d_temperature: S::constant(0.0),
         };
         let normalized_vgd = (bias.vgs - bias.vds).scale(polarity);
-        let (qgd_normal, cgd) = gate_charge(normalized_vgd, m.gate, self.multiplier);
+        let (qgd_normal, cgd) = gate_charge(normalized_vgd, m.gate, self.multiplier, guards);
         let qgd = Charge {
             value: qgd_normal.scale(polarity),
             d_voltage: cgd,
@@ -846,7 +858,14 @@ impl PreparedInstance<'_> {
         };
 
         let vd = Jet::voltage(bias.vdiode) * polarity;
-        let diode = diode_at(self.model, self.multiplier, t, vd, bias.recovery_node)?;
+        let diode = diode_at(
+            self.model,
+            self.multiplier,
+            t,
+            vd,
+            bias.recovery_node,
+            guards,
+        )?;
 
         let series = series_at(
             m,
@@ -931,6 +950,7 @@ fn channel_at<S: Scalar>(
     multiplier: f64,
     bias: Bias<S>,
     t: Jet<S>,
+    guards: &mut GuardRecorder<'_>,
 ) -> Result<Jet<S>, ModelError> {
     let dt = t - m.tnom;
     let relative = t / m.tnom;
@@ -944,17 +964,56 @@ fn channel_at<S: Scalar>(
     }
     let vgs = Jet::gate(bias.vgs) * polarity;
     let vds = Jet::drain(bias.vds) * polarity;
-    let mode = if vds.v.compare(0.) == Some(Ordering::Less) {
+    let channel_active = m.channel.kp != 0.;
+    let quasi_active = m.series.quasi_saturation.is_some_and(|q| q.rq != 0.);
+    let mode = if guards.select(
+        CHANNEL_DIRECTION,
+        GuardPredicate::Less,
+        vds.v,
+        S::constant(0.),
+        channel_active || quasi_active,
+    ) {
         -1.0
     } else {
         1.0
     };
     let overdrive = if mode > 0.0 { vgs } else { vgs - vds } - threshold * polarity;
-    let vdsat = overdrive.max_zero();
-    let gate_drive = (overdrive - m.channel.subshift).scaled_softplus(slope);
+    let vdsat = if guards.select(
+        MOBILITY_THRESHOLD,
+        GuardPredicate::Greater,
+        overdrive.v,
+        S::constant(0.),
+        channel_active && m.channel.theta != 0.,
+    ) {
+        overdrive
+    } else {
+        Jet::constant(0.)
+    };
+    let shifted = overdrive - m.channel.subshift;
+    let gate_drive = if slope.v.is_zero() {
+        if guards.select(
+            HARD_CHANNEL_CUTOFF,
+            GuardPredicate::Greater,
+            shifted.v,
+            S::constant(0.),
+            channel_active,
+        ) {
+            shifted
+        } else {
+            Jet::constant(0.)
+        }
+    } else {
+        shifted.scaled_softplus(slope)
+    };
     let beta_effective = beta * (1.0 + m.channel.lambda * vds) / (1.0 + m.channel.theta * vdsat);
     let vdss = vds * (mode * m.channel.mtriode);
-    let channel_normal = if gate_drive.v.compare_to(vdss.v) == Some(Ordering::Greater) {
+    let channel_normal = if guards.select(
+        CHANNEL_SATURATION,
+        GuardPredicate::Greater,
+        gate_drive.v,
+        vdss.v,
+        channel_active,
+    ) {
         beta_effective * vdss * (gate_drive - 0.5 * vdss)
     } else {
         beta_effective * gate_drive * gate_drive * 0.5
@@ -1215,11 +1274,22 @@ fn log_cosh<S: Scalar>(v: S) -> S {
     v.abs() + v.abs().scale(-2.).exp().ln_1p() - S::constant(std::f64::consts::LN_2)
 }
 
-fn gate_charge<S: Scalar>(v: S, params: GateCharge, mult: f64) -> (S, S) {
+fn gate_charge<S: Scalar>(
+    v: S,
+    params: GateCharge,
+    mult: f64,
+    guards: &mut GuardRecorder<'_>,
+) -> (S, S) {
     let s = (params.cgdmax - params.cgdmin) / (1.0 + std::f64::consts::FRAC_PI_2);
     let y = params.cgdmax - s;
     let av = v.scale(params.a);
-    let positive = av.compare(0.) != Some(Ordering::Less);
+    let positive = !guards.select(
+        GATE_DRAIN_JOIN,
+        GuardPredicate::Less,
+        av,
+        S::constant(0.),
+        params.a != 0. && s != 0.,
+    );
     let base = if positive { av.tanh() } else { av.atan() };
     let antiderivative = if params.a == 0.0 {
         S::constant(0.)
@@ -1270,12 +1340,19 @@ fn depletion_charge<S: Scalar>(
     cap_zero: Jet<S>,
     grading: Jet<S>,
     fc: f64,
+    guards: &mut GuardRecorder<'_>,
 ) -> Jet<S> {
     let fc_v = potential * fc;
     let arg_fc = 1.0 - fc;
     let z = 1.0 - grading;
     let q_fc = potential * cap_zero * depletion_primitive(Jet::constant(arg_fc), z);
-    if v.v.compare_to(fc_v.v) == Some(Ordering::Less) {
+    if guards.select(
+        DEPLETION_CONTINUATION,
+        GuardPredicate::Less,
+        v.v,
+        fc_v.v,
+        !cap_zero.v.is_zero() && !grading.v.is_zero(),
+    ) {
         let x = 1.0 - v / potential;
         potential * cap_zero * depletion_primitive(x, z)
     } else {
@@ -1318,6 +1395,7 @@ fn diode_current<S: Scalar>(
     mult: f64,
     d: BodyDiode,
     tnom: f64,
+    guards: &mut GuardRecorder<'_>,
 ) -> Result<Jet<S>, ModelError> {
     let terms = DiodeActivation::new(temperature, mult, d, tnom);
     let saturation_current = terms.saturation_log().exp();
@@ -1327,7 +1405,13 @@ fn diode_current<S: Scalar>(
         activation,
         log_prefactor,
     } = terms;
-    if vd.v.compare_to(vte.v.scale(-3.)) != Some(Ordering::Less) {
+    if !guards.select(
+        DIODE_REVERSE_CONTINUATION,
+        GuardPredicate::Less,
+        vd.v,
+        vte.v.scale(-3.),
+        d.is != 0.,
+    ) {
         let exponent = vd / vte;
         // Combine activation and bias before division to avoid cancellation
         // between independently expanded thermal and forward exponentials.
@@ -1338,8 +1422,15 @@ fn diode_current<S: Scalar>(
         });
     }
     if let Some(parameters) = d.breakdown {
-        let xbv = breakdown::effective_voltage(parameters, saturation_current, thermal_voltage)?;
-        if vd.v.compare_to(-xbv.v) == Some(Ordering::Less) {
+        let xbv =
+            breakdown::effective_voltage(parameters, saturation_current, thermal_voltage, guards)?;
+        if guards.select(
+            DIODE_BREAKDOWN,
+            GuardPredicate::Less,
+            vd.v,
+            -xbv.v,
+            d.is != 0.,
+        ) {
             return Ok(-(log_prefactor
                 + (activation / d.n - (xbv + vd) / parameters.nbv) / thermal_voltage)
                 .exp());
@@ -1362,6 +1453,7 @@ fn diode_at<S: Scalar>(
     temp: Jet<S>,
     vd: Jet<S>,
     qp: S,
+    guards: &mut GuardRecorder<'_>,
 ) -> Result<DiodeAt<S>, ModelError> {
     let model = &prepared.model;
     let d = model.diode;
@@ -1377,7 +1469,7 @@ fn diode_at<S: Scalar>(
     let cap = mult * d.cjo
         / (1.0 + grading * (400e-6f64.mul_add(model.tnom - REFERENCE_T, -gmaold)))
         * (1.0 + grading * (400e-6 * (temp - REFERENCE_T) - gmanew));
-    let current = diode_current(vd, temp, mult, d, model.tnom)?;
+    let current = diode_current(vd, temp, mult, d, model.tnom, guards)?;
     // ngspice 47 vdmostemp.c limits the *temperature-adjusted* junction
     // potential when FC*VJ exceeds 2.5 V. The zero-bias capacitance is
     // computed using the original potential, before applying this limit.
@@ -1387,12 +1479,18 @@ fn diode_at<S: Scalar>(
     // a consistent continuation at that cutoff, bounded by ngspice's own
     // maximum admissible FC. This reproduces the C law below the cutoff
     // while keeping charge and dQ/dV continuous and real above it.
-    let (potential, fc) = if potential.v.scale(d.fc).compare(2.5) == Some(Ordering::Greater) {
+    let (potential, fc) = if guards.select(
+        DEPLETION_POTENTIAL_CLAMP,
+        GuardPredicate::Greater,
+        potential.v.scale(d.fc),
+        S::constant(2.5),
+        d.cjo != 0. && d.fc != 0.,
+    ) {
         (Jet::constant(2.5 / d.n), d.n.min(0.95))
     } else {
         (potential, d.fc)
     };
-    let qdep = depletion_charge(vd, potential, cap, grading, fc);
+    let qdep = depletion_charge(vd, potential, cap, grading, fc, guards);
     // Fitted catalog grading exponents can be negative. Admit the real,
     // passive charge law where it is valid, but reject a negative
     // temperature-adjusted capacitance or extrapolated differential C.

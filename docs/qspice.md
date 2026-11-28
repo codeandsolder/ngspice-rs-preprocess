@@ -85,3 +85,28 @@ Shared integration work:
 [idealized diode laws](https://github.com/codeandsolder/ngspice-rs-fast/issues/226),
 [switch laws](https://github.com/codeandsolder/ngspice-rs-fast/issues/229),
 [soft-recovery charge state](https://github.com/codeandsolder/ngspice-rs-fast/issues/238).
+
+### External module declarations
+
+The `Ø` device is a source-level dependency, not a native behavioral source.
+The source linker retains its selected declarations, including original
+physical origin, lexical scope and source visit. `qspice::external_module::external_modules`
+inspects those declarations without loading module files. It retains each of
+three ordered terminal groups, explicit pin conversion suffixes, the module
+reference (including quoting), and the ordered typed and ordinary instance
+parameter assignments, including repeated names. Parameter expressions are not
+evaluated during inspection. The reference is unresolved: the existence of a
+file with the corresponding name neither qualifies the implementation nor
+establishes executable semantics. Unselected sections remain uninspected.
+
+Native preparation rejects these devices with a physical-source external-module
+diagnostic. There is no executable prepared artifact for this device class.
+Any future qualified runtime must specify terminal conversion, source-dependent
+parameter conversion and ordering, output electrical behavior, engine-owned
+instance state, trial/accept/reject semantics and event scheduling before an
+explicit implementation may be bound. No implicit module loading occurs.
+
+Grammar and interface references: [device declaration](https://spicelib.readthedocs.io/en/stable/readme.html),
+[typed parameter ordering](https://forum.qorvo.com/t/how-to-use-netlist-passed-parameter-in-c-code/14892),
+[output electrical behavior](https://forum.qorvo.com/t/dll-block-not-working-when-co-simulated-with-spice-element/19033),
+[instance state and edge scheduling](https://forum.qorvo.com/t/beginner-tutorial-for-qspice-community-sharing/25421/3).

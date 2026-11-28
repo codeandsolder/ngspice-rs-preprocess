@@ -297,7 +297,8 @@ pub struct PreparedBundle {
     /// Source-specific initialization policy; absent for native decks.
     /// Consumers must bind it per instance and enclosing analysis.
     pub initial_conditions: Option<passive_ic::InitialConditions>,
-    /// Original dialect analysis declarations; native decks retain executable cards.
+    /// Original dialect analysis declarations. Pure native decks retain executable cards;
+    /// mixed source decks with extracted analysis require consumer binding.
     pub analysis_plan: Option<analysis_plan::AnalysisPlan>,
     /// Mandatory named independent-source forcing, bound once per
     /// elaborated occurrence and parameter candidate. Electrical cards
@@ -342,6 +343,7 @@ struct NativeProjection {
     normalized: MappedNormalization,
     device_identities: Vec<model_preprocess_simplis::source_dialect::DeviceIdentity>,
     waveforms: Vec<waveform::PreparedWaveform>,
+    initial_conditions: Option<passive_ic::InitialConditions>,
 }
 
 impl NativeProjection {
@@ -350,6 +352,7 @@ impl NativeProjection {
             normalized: normalize_mapped(bytes, kind, SourceDialect::Native, budget)?,
             device_identities: Vec::new(),
             waveforms: Vec::new(),
+            initial_conditions: None,
         })
     }
 }
@@ -392,10 +395,13 @@ fn project_native(
         .collect::<Result<Vec<_>>>()?;
     let mut mapped = normalized.mapped;
     let waveforms = std::mem::take(&mut mapped.waveforms);
+    let initial_conditions =
+        model_normalize_ngspice::pspice::capture_initialization(&mut mapped, linked, kind, budget)?;
     Ok(NativeProjection {
         normalized: mapped,
         device_identities: identities,
         waveforms,
+        initial_conditions,
     })
 }
 
@@ -452,7 +458,7 @@ fn native(
         InputFormat::QspiceDeck | InputFormat::QspiceLibrary => SourceDialect::Qspice,
         _ => SourceDialect::Native,
     };
-    let linked = SourceLinker {
+    let mut linked = SourceLinker {
         search_paths: request.search_paths.clone(),
         dialect: syntax,
     }
@@ -464,10 +470,10 @@ fn native(
         },
         session,
     )?;
-    let projected = project_native(&linked, kind, session.budget())?;
     let origins = linked
         .origins
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|mapped| {
             linked_origin(
                 mapped,
@@ -476,7 +482,14 @@ fn native(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    native_bundle(
+    let analysis_plan = analysis_plan::source_capture::capture_linked(
+        &mut linked,
+        kind,
+        &origins,
+        session.budget(),
+    )?;
+    let projected = project_native(&linked, kind, session.budget())?;
+    let mut bundle = native_bundle(
         origin,
         request.format,
         kind,
@@ -487,7 +500,9 @@ fn native(
             scopes: linked.scopes,
         }),
         session.budget(),
-    )
+    )?;
+    bundle.analysis_plan = analysis_plan;
+    Ok(bundle)
 }
 
 fn linked_origin(
@@ -534,6 +549,7 @@ fn native_bundle(
         normalized,
         device_identities,
         waveforms,
+        initial_conditions,
     } = projection;
     let lines = normalized
         .input_lines
@@ -574,7 +590,7 @@ fn native_bundle(
         normalization: normalized.model.passes,
         device_identities,
         model_selections: Vec::new(),
-        initial_conditions: None,
+        initial_conditions,
         analysis_plan: None,
         waveforms,
         pwl_resistors: Vec::new(),

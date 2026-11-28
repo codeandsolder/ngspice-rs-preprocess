@@ -239,3 +239,203 @@ fn diode_alias_uses_the_selected_kernel_parameter_grammar() -> Result<()> {
     assert!(card.contains("T_ABS={local_temp}"), "{card}");
     Ok(())
 }
+
+#[test]
+fn classic_bjt_implementation_selection_is_not_the_lexical_dialect() -> Result<()> {
+    let mut source = statements(
+        ".map ModelName=PNP Level=69 Device=BJT Letter=Q\n.model n NPN(IS=3p)\n.model p PNP(LEVEL=69 IS=4p TNOM=29)\n.model v NPN(LEVEL=4 IS=1p)\n",
+    );
+    source[2].context.language = SourceDialect::Hspice;
+    let mapped = MappingTable::resolve(
+        &DeviceConfiguration::default(),
+        &source,
+        &WorkBudget::default(),
+    )?
+    .apply(&source, &WorkBudget::default())?;
+    assert_eq!(
+        mapped
+            .selections
+            .iter()
+            .map(|s| s.mapping.device)
+            .collect::<Vec<_>>(),
+        [
+            Device::GummelPoonLegacy,
+            Device::GummelPoonLegacy,
+            Device::Vbic
+        ]
+    );
+    assert_eq!(
+        mapped.selections[1].mapping.origin,
+        SelectionOrigin::NetlistMap
+    );
+    assert!(
+        mapped.statements[1]
+            .text
+            .contains("gummel_poon_legacy_npn (LEVEL=1")
+    );
+    assert!(
+        mapped.statements[2]
+            .text
+            .contains("gummel_poon_legacy_pnp (LEVEL=1")
+    );
+    assert!(mapped.statements[3].text.contains("NPN (LEVEL=4"));
+    assert!(
+        table("")?
+            .apply(&statements(".model l LPNP(IS=3p)"), &WorkBudget::default())
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn classic_bjt_thermal_law_follows_the_selected_implementation() -> Result<()> {
+    use model_normalize_ngspice::bjt_card::{BjtPolarity, BjtThermalConvention, ClassicBjtFamily};
+    use model_normalize_ngspice::model_card::parse_model_cards;
+    let source = statements(
+        ".model omitted NPN(IS={local_is} BF=100 TNOM=27)\n\
+         .model level1 PNP(LEVEL=1 IS=3p TNOM=50)\n\
+         .map ModelName=NPN Level=69 Device=BJT Letter=Q\n\
+         .model remapped NPN(LEVEL=69 IS=5p)\n\
+         .map ModelName=PNP Level=70 Device=NGSPICE_BJT Letter=Q\n\
+         .model explicit_native PNP(LEVEL=70 IS=7p)\n\
+         .model vbic NPN(LEVEL=4 IS=9p)",
+    );
+    let budget = WorkBudget::default();
+    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source, &budget)?
+        .apply(&source, &budget)?;
+    let identities = mapped
+        .selections
+        .iter()
+        .map(|selection| selection.mapping.device)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        [
+            Device::GummelPoonLegacy,
+            Device::GummelPoonLegacy,
+            Device::GummelPoonLegacy,
+            Device::GummelPoonNative,
+            Device::Vbic
+        ]
+    );
+    assert_eq!(
+        mapped.selections[2].mapping.origin,
+        SelectionOrigin::NetlistMap
+    );
+    assert_eq!(
+        mapped.selections[3].mapping.origin,
+        SelectionOrigin::NetlistMap
+    );
+    let text = mapped
+        .statements
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cards = parse_model_cards(text.as_bytes())?;
+    use BjtPolarity::{Npn, Pnp};
+    use BjtThermalConvention::{Legacy, Ngspice};
+    for (card, polarity, thermal) in [
+        (&cards[0], Npn, Legacy),
+        (&cards[1], Pnp, Legacy),
+        (&cards[2], Npn, Legacy),
+        (&cards[3], Pnp, Ngspice),
+    ] {
+        assert_eq!(
+            ClassicBjtFamily::parse(&card.family),
+            Some(ClassicBjtFamily { polarity, thermal })
+        );
+        assert_eq!(
+            card.parameters
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case("LEVEL"))
+                .and_then(|p| p.expression.as_deref()),
+            Some("1")
+        );
+    }
+    assert_eq!(
+        cards[0]
+            .parameters
+            .iter()
+            .find(|p| p.name == "IS")
+            .and_then(|p| p.expression.as_deref()),
+        Some("{local_is}")
+    );
+    assert_eq!(
+        cards[1]
+            .parameters
+            .iter()
+            .find(|p| p.name == "TNOM")
+            .and_then(|p| p.expression.as_deref()),
+        Some("50")
+    );
+    assert!(cards[4].family.eq_ignore_ascii_case("NPN"));
+    assert_eq!(cards[4].parameters[0].expression.as_deref(), Some("4"));
+    Ok(())
+}
+
+#[test]
+fn classic_bjt_selection_is_not_a_lexical_dialect_or_lateral_pnp_guess() -> Result<()> {
+    let mut source = statements(
+        ".subckt part c b e\n.model same PNP(IS={local_is} T_ABS={TEMP} TNOM=27)\n.ends\n.model same NPN(IS=2p)\n",
+    );
+    source[1].context.language = SourceDialect::Hspice;
+    source[1].source = "part.lib".into();
+    source[3].context.language = SourceDialect::Pspice;
+    let budget = WorkBudget::default();
+    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source, &budget)?
+        .apply(&source, &budget)?;
+    assert_eq!(mapped.selections[0].scope, ["part"]);
+    assert_eq!(mapped.selections[0].source, "part.lib");
+    assert_eq!(mapped.selections[0].context.language, SourceDialect::Hspice);
+    assert_eq!(mapped.selections[1].context.language, SourceDialect::Pspice);
+    assert!(mapped.statements[1].text.contains("gummel_poon_legacy_pnp"));
+    assert!(mapped.statements[3].text.contains("gummel_poon_legacy_npn"));
+    for declaration in [
+        ".model lateral LPNP(IS=1p)",
+        ".model versioned NPN(LEVEL=1 VERSION=2 IS=1p)",
+        ".model hicum PNP(LEVEL=8)",
+    ] {
+        assert!(
+            table("")?
+                .apply(&statements(declaration), &WorkBudget::default())
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn classic_bjt_selector_preserves_binned_model_names_and_physical_fields() -> Result<()> {
+    use model_normalize_ngspice::model_card::parse_model_cards;
+    let source = statements(
+        ".model q.1 NPN(LEVEL=1 IS=2p BF={beta} TNOM=40)\n.model q.2 NPN(IS=5p BF=150 TNOM=55)\n.model q.3 PNP(LEVEL=1 IS=7p BF=80 TNOM=65)",
+    );
+    let budget = WorkBudget::default();
+    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source, &budget)?
+        .apply(&source, &budget)?;
+    let text = mapped
+        .statements
+        .iter()
+        .map(|statement| statement.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cards = parse_model_cards(text.as_bytes())?;
+    assert_eq!(cards.len(), 3);
+    for (card, selection) in cards.iter().zip(&mapped.selections) {
+        assert_eq!(card.name, selection.card.name);
+        assert!(card.family.starts_with("gummel_poon_legacy_"));
+        let fields = |card: &model_normalize_ngspice::model_card::ModelCard| {
+            card.parameters
+                .iter()
+                .filter(|parameter| !parameter.name.eq_ignore_ascii_case("LEVEL"))
+                .map(|parameter| (parameter.name.clone(), parameter.expression.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields(card), fields(&selection.card));
+    }
+    assert_eq!(cards[0].name, "q.1");
+    assert_eq!(cards[1].name, "q.2");
+    assert_eq!(cards[2].name, "q.3");
+    Ok(())
+}

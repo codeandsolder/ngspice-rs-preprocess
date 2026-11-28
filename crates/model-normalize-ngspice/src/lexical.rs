@@ -68,6 +68,7 @@ pub fn split_line_ending(line: &[u8]) -> (&[u8], &[u8]) {
 /// Synthetic continuation separators do not map to source bytes.
 pub struct Statement {
     pub line: usize,
+    pub last_line: usize,
     pub start: usize,
     pub text: Vec<u8>,
     segments: Vec<(Range<usize>, usize)>,
@@ -132,6 +133,7 @@ pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
         if !continuation {
             statements.push(Statement {
                 line: index + 1,
+                last_line: index + 1,
                 start,
                 text: Vec::new(),
                 segments: Vec::new(),
@@ -144,6 +146,7 @@ pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
                 index + 1
             );
         };
+        statement.last_line = index + 1;
         if continuation {
             statement.text.push(b' ');
             statement
@@ -411,6 +414,9 @@ pub fn replace_spans(
         let ranges = statement.source_ranges(span.clone());
         for (index, range) in ranges.into_iter().enumerate() {
             if index == 0 && !replacement.is_empty() {
+                if replacement.iter().all(u8::is_ascii_whitespace) {
+                    removed.push(range.clone());
+                }
                 edits.push((range, replacement.clone()));
             } else {
                 removed.push(range.clone());

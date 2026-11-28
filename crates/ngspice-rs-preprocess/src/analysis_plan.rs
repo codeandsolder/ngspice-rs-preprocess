@@ -1,13 +1,33 @@
 //! Source analysis intent, independent of the prepared electrical circuit.
+pub mod measurement;
+mod pspice;
+mod simetrix;
+pub mod source_capture;
+pub mod sweep;
 use anyhow::{Context, Result, ensure};
+use measurement::MeasurementIntent;
+use model_normalize_ngspice::ltspice::transient::TransientIntent;
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Write as _, path::PathBuf};
+use sweep::{BoundAxis, CoordinateOrder, SweepAxis, SweepExecution};
 
 /// Analysis semantics (not the syntax of individual model expressions).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalysisDialect {
+    /// Native ngspice analysis semantics.
+    Native,
+    /// `LTspice` analysis and independent parameter stepping.
+    Ltspice,
+    /// `PSpice` source analysis declarations.
+    Pspice,
+    /// TINA source analysis declarations.
+    Tina,
+    /// QSPICE source analysis declarations.
+    Qspice,
+    /// HSPICE source analysis declarations.
+    Hspice,
     /// Ordinary SPICE analyses with `SIMetrix` extensions.
     Simetrix,
     /// SIMPLIS transient and periodic analyses.
@@ -29,6 +49,19 @@ pub enum DirectiveOrigin {
         /// Last physical line, inclusive.
         last_line: usize,
     },
+    /// Exact declaration in a directly admitted source occurrence.
+    SourceOccurrence {
+        /// Original resource path.
+        path: PathBuf,
+        /// First physical line, one-based.
+        first_line: usize,
+        /// Last physical line, inclusive.
+        last_line: usize,
+        /// Admitted source visit index.
+        visit: usize,
+        /// Electrical lexical scope index.
+        scope: usize,
+    },
     /// Location in a linked artifact before primitive lowering.
     Generated {
         /// Artifact name.
@@ -46,7 +79,7 @@ pub enum DirectiveOrigin {
 pub enum Disposition {
     /// Equivalent native analysis request; not embedded in the circuit.
     NativeRequest,
-    /// Numerical setting materialized in the circuit.
+    /// Setting materialized in the artifact, including qualified output options.
     Circuit,
     /// Already applied by source model selection; never emitted as a native option.
     ModelSelection,
@@ -103,13 +136,33 @@ pub enum Directive {
         analysis: AnalysisKind,
         /// Canonical native arguments for native requests; otherwise source operands.
         arguments: Vec<String>,
-        /// Native transient UIC flag, removed from arguments.
+        /// Skip transient bias; native UIC or PSpice SKIPBP, removed from arguments.
         uic: bool,
+    },
+    /// Independent analysis repetitions or continuation coordinates.
+    Sweep {
+        /// Typed, unresolved axis with source coordinate ordering.
+        axis: SweepAxis,
+    },
+    /// Ordered continuation axes of one DC analysis.
+    DcSweep {
+        /// Inner axis first; do not treat these as independent STEP candidates.
+        axes: Vec<SweepAxis>,
+    },
+    /// Source-specific transient timing and execution policy.
+    Transient {
+        /// Timing fields and initialization/termination modes.
+        intent: TransientIntent,
     },
     /// Ordered option settings.
     Options {
         /// Individual settings.
         settings: Vec<OptionSetting>,
+    },
+    /// Source-specific waveform and previous-result measurement.
+    Measurement {
+        /// Ordered measurement operation and its source expression.
+        intent: MeasurementIntent,
     },
     /// Output selection, measurement, or node mapping.
     Observation {
@@ -129,6 +182,8 @@ pub enum Directive {
 pub struct PlanEntry {
     /// Source or generated location.
     pub origin: DirectiveOrigin,
+    /// Effective analysis language at this declaration, independent of the root.
+    pub dialect: AnalysisDialect,
     /// Lexical definition scope.
     pub scope: Vec<String>,
     /// Uppercase directive including leading period.
@@ -137,8 +192,24 @@ pub struct PlanEntry {
     pub statement: String,
     /// Typed declaration.
     pub directive: Directive,
+    /// Analysis-local independent axes, in innermost-first order. Deck-wide
+    /// STEP declarations are separate entries and do not belong to this list.
+    pub independent_axes: Vec<SweepAxis>,
+    /// Original scheduling hint, not a physical or numerical policy.
+    pub parallelism_hint: Option<u32>,
     /// Execution policy.
     pub disposition: Disposition,
+}
+
+impl PlanEntry {
+    /// Whether this entry requests an analysis rather than a setting or observation.
+    #[must_use = "independent axes attach only to an actual analysis"]
+    pub const fn is_analysis(&self) -> bool {
+        matches!(
+            self.directive,
+            Directive::Analysis { .. } | Directive::Transient { .. } | Directive::DcSweep { .. }
+        )
+    }
 }
 
 /// Whether the plan describes a complete deck or an include-only artifact.
@@ -205,6 +276,34 @@ impl AnalysisPlan {
                 }
             }
         }
+        let steps = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.dialect == AnalysisDialect::Simetrix
+                    && matches!(entry.directive, Directive::Sweep { .. })
+            })
+            .count();
+        if steps > 0 {
+            ensure!(
+                steps == 1,
+                "SIMetrix STEP supports one compatibility axis; nested sweeps belong to an analysis"
+            );
+            let mut analyses = self.entries.iter().filter(|entry| entry.is_analysis());
+            let request = analyses
+                .next()
+                .context("SIMetrix STEP requires a companion analysis")?;
+            ensure!(
+                analyses.next().is_none()
+                    && request.independent_axes.is_empty()
+                    && matches!(
+                        request.command.as_str(),
+                        ".DC" | ".AC" | ".TF" | ".NOISE" | ".TRAN"
+                    ),
+                "SIMetrix STEP requires one compatible analysis without inline sweeps"
+            );
+        }
+        pspice::validate(self)?;
         Ok(())
     }
 
@@ -236,6 +335,58 @@ impl AnalysisPlan {
     pub fn requires_binding(&self) -> bool {
         self.statistical_sample.is_some() || self.entries.iter().any(|entry| entry.disposition == Disposition::RequiresBinding
             || matches!(&entry.directive, Directive::Options { settings } if settings.iter().any(|setting| setting.disposition == Disposition::RequiresBinding)))
+    }
+
+    /// Bind the independent axes of a specific analysis in innermost-first
+    /// order, using the declaration's lexical scalar resolver. Analysis-local
+    /// axes do not leak into unrelated requests. Reserve the complete product
+    /// before executing any candidate.
+    ///
+    /// # Errors
+    /// Invalid analysis index, scoped/unsupported declaration, invalid or
+    /// unbound coordinate, cardinality overflow, or exhausted request budget.
+    pub fn bind_independent_sweeps(
+        &self,
+        analysis: usize,
+        mut resolve: impl FnMut(&PlanEntry, &SweepAxis, &str) -> Result<f64>,
+        budget: &WorkBudget,
+    ) -> Result<BoundIndependentSweeps<'_>> {
+        self.validate_supported()?;
+        ensure!(
+            self.kind == PlanKind::Deck,
+            "library analysis plan is not executable"
+        );
+        let request = self
+            .entries
+            .get(analysis)
+            .filter(|entry| entry.is_analysis())
+            .context("independent sweep must select an actual analysis entry")?;
+        let local = request.independent_axes.iter().map(|axis| (request, axis));
+        let global = self.entries.iter().filter_map(|entry| {
+            if let Directive::Sweep { axis } = &entry.directive {
+                Some((entry, axis))
+            } else {
+                None
+            }
+        });
+        let mut axes = Vec::new();
+        for (entry, axis) in local.chain(global) {
+            ensure!(
+                axis.execution == SweepExecution::Independent,
+                "non-independent axis in candidate product"
+            );
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            let coordinates = axis
+                .bind(|scalar| resolve(entry, axis, scalar), budget)
+                .with_context(|| format!("sweep declaration at {:?}", entry.origin))?;
+            axes.push(BoundSweep {
+                entry,
+                axis,
+                coordinates,
+            });
+        }
+        let count = sweep::reserve_product(axes.iter().map(|axis| &axis.coordinates), budget)?;
+        Ok(BoundIndependentSweeps { axes, count })
     }
 
     // Select an actual member of a Monte Carlo sweep, not a nominal
@@ -322,7 +473,7 @@ impl AnalysisPlan {
             if *uic {
                 single.push_str(" UIC");
             }
-            let (directive, disposition) = classify(&entry.command, &single, self.dialect, false)?;
+            let (directive, disposition) = classify(&entry.command, &single, entry.dialect, false)?;
             ensure!(
                 disposition != Disposition::Unsupported,
                 "unsupported selected Monte Carlo analysis: {single}"
@@ -380,6 +531,81 @@ impl AnalysisPlan {
     }
 }
 
+/// A bound axis retains both declaration identity and the precise typed
+/// target. Several independent axes may come from the same statement.
+#[derive(Debug)]
+pub struct BoundSweep<'a> {
+    /// Original declaration and lexical context.
+    pub entry: &'a PlanEntry,
+    /// Source target and coordinate policy.
+    pub axis: &'a SweepAxis,
+    /// Compact validated coordinate sequence.
+    pub coordinates: BoundAxis,
+}
+
+/// One candidate's override for a particular bound axis.
+#[derive(Debug)]
+pub struct BoundCoordinate<'a> {
+    /// Original declaration.
+    pub entry: &'a PlanEntry,
+    /// Source target; resolution and invalidation belong to the consumer.
+    pub axis: &'a SweepAxis,
+    /// Physical candidate value.
+    pub value: f64,
+}
+
+/// Independent sweep axes bound to source declarations. Coordinates are
+/// represented by compact sequences; the execution layer owns candidate
+/// invalidation, analysis scheduling and state reset.
+#[derive(Debug)]
+pub struct BoundIndependentSweeps<'a> {
+    axes: Vec<BoundSweep<'a>>,
+    count: usize,
+}
+
+impl<'a> BoundIndependentSweeps<'a> {
+    /// Count of combinations, including the nominal case with no axes.
+    #[must_use = "the count is the reserved candidate work"]
+    pub const fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Coordinates of a candidate in first-axis-innermost order.
+    /// The returned iterator borrows the compact axis sequences.
+    ///
+    /// # Errors
+    /// Candidate ordinal or bound coordinate outside the reserved product.
+    pub fn candidate(
+        &self,
+        ordinal: usize,
+    ) -> Result<impl Iterator<Item = Result<BoundCoordinate<'a>>> + '_> {
+        ensure!(
+            ordinal < self.count,
+            "candidate ordinal outside reserved sweep"
+        );
+        Ok(self.axes.iter().scan(ordinal, |remaining, bound| {
+            let index = *remaining % bound.coordinates.len();
+            *remaining /= bound.coordinates.len();
+            Some(
+                bound
+                    .coordinates
+                    .value(index)
+                    .map(|value| BoundCoordinate {
+                        entry: bound.entry,
+                        axis: bound.axis,
+                        value,
+                    })
+                    .context("missing reserved sweep coordinate"),
+            )
+        }))
+    }
+
+    /// The source-order axes, with declaration identity and coordinate law.
+    pub fn axes(&self) -> impl ExactSizeIterator<Item = &BoundSweep<'a>> {
+        self.axes.iter()
+    }
+}
+
 pub(crate) const TAG_PREFIX: &str = "*#ngspice-rs-preprocess-plan:";
 
 #[derive(Clone, Debug)]
@@ -414,6 +640,7 @@ pub(crate) fn tracked(command: &str) -> bool {
             | ".DC"
             | ".AC"
             | ".TRAN"
+            | ".TRAN/OP"
             | ".POP"
             | ".NOISE"
             | ".TF"
@@ -429,6 +656,8 @@ pub(crate) fn tracked(command: &str) -> bool {
             | ".MONTE"
             | ".MC"
             | ".WCASE"
+            | ".WORSTCASE"
+            | ".DISTRIBUTION"
             | ".SAVEBIAS"
             | ".LOADBIAS"
             | ".OPTIONS"
@@ -442,6 +671,8 @@ pub(crate) fn tracked(command: &str) -> bool {
             | ".KEEP"
             | ".SAVE"
             | ".PROBE"
+            | ".PROBE/CSDF"
+            | ".WATCH"
             | ".MEAS"
             | ".MEASURE"
             | ".FOUR"
@@ -459,15 +690,25 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
     use Disposition::{
         Circuit, Initialization, Metadata, ModelSelection, RequiresBinding, Unsupported,
     };
+    if dialect == AnalysisDialect::Ltspice
+        && model_normalize_ngspice::ltspice::output_options::SOURCE_NAMES
+            .iter()
+            .any(|source| name.eq_ignore_ascii_case(source))
+    {
+        return Circuit;
+    }
     match (dialect, name) {
-        (AnalysisDialect::Simetrix, "HSPICEMODELS" | "HSPICECOMPATIBILITY") => ModelSelection,
-        (AnalysisDialect::Simetrix, "INITCONDMODE" | "ICRES") => Initialization,
         (
-            AnalysisDialect::Simetrix,
-            "TEMP" | "TNOM" | "RELTOL" | "ABSTOL" | "VNTOL" | "CHGTOL" | "TRTOL" | "GMIN"
-            | "RSHUNT" | "CSHUNT" | "METHOD" | "MAXORD" | "ITL1" | "ITL2" | "ITL4",
-        ) => Circuit,
+            AnalysisDialect::Ltspice | AnalysisDialect::Simetrix,
+            "RELTOL" | "ABSTOL" | "VNTOL" | "CHGTOL" | "TRTOL" | "GMIN" | "TNOM" | "MAXORD"
+            | "ITL1" | "ITL2" | "ITL4",
+        )
+        | (AnalysisDialect::Simetrix, "TEMP" | "RSHUNT" | "CSHUNT" | "METHOD") => Circuit,
         (
+            AnalysisDialect::Ltspice,
+            "MAXSTEP" | "TEMP" | "METHOD" | "SSTOL" | "STSTDELAY" | "STSTCLOCKS",
+        )
+        | (
             AnalysisDialect::Simplis,
             "PSP_START"
             | "PSP_END"
@@ -483,6 +724,9 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
             | "MIN_AVG_TOPOLOGY_DUR"
             | "AVG_TOPOLOGY_DUR_MEASUREMENT_WINDOW",
         ) => RequiresBinding,
+        (AnalysisDialect::Ltspice, "MEASDGT" | "LOGPARAMS" | "LOGOPINFO" | "DEBUGTRAN") => Metadata,
+        (AnalysisDialect::Simetrix, "HSPICEMODELS" | "HSPICECOMPATIBILITY") => ModelSelection,
+        (AnalysisDialect::Simetrix, "INITCONDMODE" | "ICRES") => Initialization,
         (_, "EMSG_MAX" | "EXPAND" | "POP_SHOWDATA" | "LIST" | "NODE" | "NOMOD" | "NOPAGE") => {
             Metadata
         }
@@ -490,43 +734,67 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
     }
 }
 
-fn options(fields: &[String], dialect: AnalysisDialect) -> Result<Vec<OptionSetting>> {
-    let mut result = Vec::new();
-    let mut index = 0;
-    while let Some(name) = fields.get(index) {
-        ensure!(
-            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-            "invalid option name {name:?}"
-        );
-        index += 1;
-        let value = if fields.get(index).is_some_and(|field| field == "=") {
-            let value = fields
-                .get(index + 1)
-                .filter(|value| *value != "=")
-                .context("missing option value")?
-                .clone();
-            index += 2;
-            Some(value)
-        } else {
-            None
-        };
-        let name = name.to_ascii_uppercase();
-        let disposition = option_disposition(&name, dialect);
-        ensure!(
-            !matches!(
-                disposition,
-                Disposition::Circuit | Disposition::Initialization
-            ) || value.is_some(),
-            "{name} requires an assignment"
-        );
-        result.push(OptionSetting {
-            name,
-            value,
-            disposition,
-        });
-    }
-    ensure!(!result.is_empty(), "empty options statement");
-    Ok(result)
+fn option_fields(
+    statement: &str,
+    dialect: AnalysisDialect,
+) -> Result<Vec<(OptionSetting, std::ops::Range<usize>)>> {
+    use model_normalize_ngspice::{model_card::parse_parameter_fields, statement_token_spans};
+    let fields = if dialect == AnalysisDialect::Ltspice {
+        model_normalize_ngspice::ltspice::output_options::source_fields(statement)?
+    } else {
+        let offset = statement_token_spans(statement)?
+            .into_iter()
+            .next()
+            .context("missing options directive")?
+            .end;
+        let mut fields = parse_parameter_fields(&statement[offset..], &[])?;
+        for field in &mut fields {
+            field.span.name = field.span.name.start + offset..field.span.name.end + offset;
+            if let Some(span) = &mut field.span.value {
+                *span = span.start + offset..span.end + offset;
+            }
+        }
+        fields
+    };
+    ensure!(!fields.is_empty(), "empty options statement");
+    fields
+        .into_iter()
+        .map(|field| {
+            let name = field.name.to_ascii_uppercase();
+            ensure!(
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                "invalid option name {name:?}"
+            );
+            let disposition = option_disposition(&name, dialect);
+            ensure!(
+                !matches!(
+                    disposition,
+                    Disposition::Circuit | Disposition::Initialization
+                ) || field.expression.is_some(),
+                "{name} requires an assignment"
+            );
+            let span = field.span.name.start
+                ..field
+                    .span
+                    .value
+                    .map_or(field.span.name.end, |span| span.end);
+            Ok((
+                OptionSetting {
+                    name,
+                    value: field.expression,
+                    disposition,
+                },
+                span,
+            ))
+        })
+        .collect()
+}
+
+fn options(statement: &str, dialect: AnalysisDialect) -> Result<Vec<OptionSetting>> {
+    Ok(option_fields(statement, dialect)?
+        .into_iter()
+        .map(|(setting, _)| setting)
+        .collect())
 }
 
 pub(crate) fn arguments(statement: &str) -> Result<Vec<String>> {
@@ -623,15 +891,140 @@ fn transient_arguments(args: &[String]) -> Option<Vec<String>> {
     ])
 }
 
+fn ltspice_directive(
+    name: &str,
+    statement: &str,
+    scoped: bool,
+) -> Result<Option<(Directive, Disposition)>> {
+    let disposition = if scoped {
+        Disposition::Unsupported
+    } else {
+        Disposition::RequiresBinding
+    };
+    let directive = match name {
+        ".STEP" => Directive::Sweep {
+            axis: SweepAxis::ltspice_step(&arguments(statement)?)?,
+        },
+        ".TEMP" => {
+            let args = arguments(statement)?;
+            if args.len() <= 1 {
+                return Ok(None);
+            }
+            Directive::Sweep {
+                axis: SweepAxis::ltspice_temperature(&args)?,
+            }
+        }
+        ".TRAN" => {
+            let args = arguments(statement)?;
+            let fields = args.iter().map(String::as_str).collect::<Vec<_>>();
+            Directive::Transient {
+                intent: TransientIntent::parse(&fields)?,
+            }
+        }
+        ".DC" => Directive::DcSweep {
+            axes: SweepAxis::ltspice_dc(&arguments(statement)?)?,
+        },
+        ".MEAS" | ".MEASURE" => Directive::Measurement {
+            intent: MeasurementIntent::parse_ltspice(statement)?,
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some((directive, disposition)))
+}
+
+fn pspice_directive(
+    name: &str,
+    statement: &str,
+    scoped: bool,
+) -> Result<Option<(Directive, Disposition)>> {
+    let disposition = if scoped {
+        Disposition::Unsupported
+    } else {
+        Disposition::RequiresBinding
+    };
+    let directive = match name {
+        ".STEP" => Directive::Sweep {
+            axis: pspice::step(&pspice::arguments(statement)?)?,
+        },
+        ".DC" => Directive::DcSweep {
+            axes: pspice::dc_axes(&pspice::arguments(statement)?)?,
+        },
+        ".TEMP" => {
+            let args = pspice::arguments(statement)?;
+            let axis = pspice::temperature(&args)?;
+            if args.len() == 1 {
+                return Ok(None);
+            }
+            Directive::Sweep { axis }
+        }
+        ".TRAN" | ".TRAN/OP" => {
+            let (arguments, uic) = pspice::transient(pspice::arguments(statement)?)?;
+            Directive::Analysis {
+                analysis: AnalysisKind::Transient,
+                arguments,
+                uic,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some((directive, disposition)))
+}
+
+fn dialect_directive(
+    name: &str,
+    statement: &str,
+    dialect: AnalysisDialect,
+    scoped: bool,
+) -> Result<Option<(Directive, Disposition)>> {
+    match dialect {
+        AnalysisDialect::Simetrix => {
+            let directive = match name {
+                ".STEP" => Some(Directive::Sweep {
+                    axis: SweepAxis::simetrix_step(&arguments(statement)?)?,
+                }),
+                ".DC" => {
+                    let args = arguments(statement)?;
+                    // Statistical selection owns the original unbound MONTE form.
+                    if simetrix::sweep_start(AnalysisKind::DcSweep, &args)
+                        .and_then(|index| args.get(index + 1))
+                        .is_some_and(|field| field.eq_ignore_ascii_case("MONTE"))
+                    {
+                        None
+                    } else {
+                        Some(Directive::DcSweep {
+                            axes: simetrix::dc_axes(&args)?,
+                        })
+                    }
+                }
+                _ => None,
+            };
+            Ok(directive.map(|directive| {
+                (
+                    directive,
+                    if scoped {
+                        Disposition::Unsupported
+                    } else {
+                        Disposition::RequiresBinding
+                    },
+                )
+            }))
+        }
+        AnalysisDialect::Ltspice => ltspice_directive(name, statement, scoped),
+        AnalysisDialect::Pspice => pspice_directive(name, statement, scoped),
+        _ => Ok(None),
+    }
+}
+
 fn classify(
     name: &str,
     statement: &str,
     dialect: AnalysisDialect,
     scoped: bool,
 ) -> Result<(Directive, Disposition)> {
-    use Disposition::{
-        Circuit, Initialization, Metadata, NativeRequest, RequiresBinding, Unsupported,
-    };
+    use Disposition::{Circuit, Initialization, Metadata, RequiresBinding, Unsupported};
+    if let Some(directive) = dialect_directive(name, statement, dialect, scoped)? {
+        return Ok(directive);
+    }
     if matches!(
         name,
         ".CONTROL"
@@ -640,6 +1033,8 @@ fn classify(
             | ".MONTE"
             | ".MC"
             | ".WCASE"
+            | ".WORSTCASE"
+            | ".DISTRIBUTION"
             | ".SAVEBIAS"
             | ".LOADBIAS"
     ) {
@@ -648,17 +1043,22 @@ fn classify(
     if matches!(name, ".GRAPH" | ".LICENSE_FEATURE" | ".REQUIRED_VERSION") {
         return Ok((Directive::Metadata, Metadata));
     }
-    let args = arguments(statement)?;
+    let args = if dialect == AnalysisDialect::Pspice {
+        pspice::arguments(statement)?
+    } else {
+        arguments(statement)?
+    };
     if matches!(name, ".OPTIONS" | ".OPTION" | ".OPT") {
         return Ok((
             Directive::Options {
-                settings: options(&args, dialect)?,
+                settings: options(statement, dialect)?,
             },
             if scoped { Unsupported } else { Circuit },
         ));
     }
     if matches!(name, ".TEMP" | ".NODESET" | ".IC" | ".INIT") {
         let disposition = match (name, dialect) {
+            (".INIT", AnalysisDialect::Ltspice | AnalysisDialect::Pspice) => Unsupported,
             (".INIT", _) | (".IC", AnalysisDialect::Simetrix) => Initialization,
             _ => Circuit,
         };
@@ -670,6 +1070,8 @@ fn classify(
             | ".KEEP"
             | ".SAVE"
             | ".PROBE"
+            | ".PROBE/CSDF"
+            | ".WATCH"
             | ".MEAS"
             | ".MEASURE"
             | ".FOUR"
@@ -678,9 +1080,19 @@ fn classify(
     ) {
         return Ok((Directive::Observation { arguments: args }, RequiresBinding));
     }
+    Ok(classify_request(name, args, dialect, scoped))
+}
+
+fn classify_request(
+    name: &str,
+    args: Vec<String>,
+    dialect: AnalysisDialect,
+    scoped: bool,
+) -> (Directive, Disposition) {
+    use Disposition::{NativeRequest, RequiresBinding, Unsupported};
     let analysis = analysis_kind(name);
     let mut args = args;
-    let uic = dialect == AnalysisDialect::Simetrix
+    let uic = matches!(dialect, AnalysisDialect::Simetrix | AnalysisDialect::Native)
         && analysis == AnalysisKind::Transient
         && args
             .last()
@@ -700,7 +1112,9 @@ fn classify(
                     NativeRequest
                 })
             }
-            (AnalysisDialect::Simetrix, _) if native_analysis_shape(analysis, &args) => {
+            (AnalysisDialect::Native | AnalysisDialect::Ltspice | AnalysisDialect::Simetrix, _)
+                if native_analysis_shape(analysis, &args) =>
+            {
                 if matches!(
                     analysis,
                     AnalysisKind::DcSweep | AnalysisKind::Noise | AnalysisKind::TransferFunction
@@ -713,6 +1127,20 @@ fn classify(
                     NativeRequest
                 }
             }
+            (
+                AnalysisDialect::Pspice
+                | AnalysisDialect::Tina
+                | AnalysisDialect::Qspice
+                | AnalysisDialect::Hspice,
+                _,
+            ) if analysis != AnalysisKind::Other => RequiresBinding,
+            (AnalysisDialect::Ltspice, AnalysisKind::Ac)
+                if args.first().is_some_and(|arg| {
+                    arg.eq_ignore_ascii_case("LIST") || arg.eq_ignore_ascii_case("FILE")
+                }) =>
+            {
+                RequiresBinding
+            }
             (AnalysisDialect::Simplis, AnalysisKind::Transient) if args.len() == 2 => {
                 RequiresBinding
             }
@@ -720,14 +1148,14 @@ fn classify(
             _ => Unsupported,
         }
     };
-    Ok((
+    (
         Directive::Analysis {
             analysis,
             arguments: args,
             uic,
         },
         disposition,
-    ))
+    )
 }
 
 fn push_entry(
@@ -737,6 +1165,7 @@ fn push_entry(
     text: &str,
     library: bool,
     budget: &WorkBudget,
+    dialect: AnalysisDialect,
 ) -> Result<()> {
     budget.charge(Resource::GeneratedNodes, 1)?;
     budget.charge(Resource::EmittedBytes, text.len())?;
@@ -750,15 +1179,52 @@ fn push_entry(
         Resource::EmittedBytes,
         text.len().saturating_add(name.len()),
     )?;
-    let (directive, disposition) =
-        classify(&name, text, plan.dialect, library || !scope.is_empty())
-            .with_context(|| format!("analysis declaration at {origin:?}"))?;
+    let inline = if dialect == AnalysisDialect::Simetrix
+        && matches!(
+            analysis_kind(&name),
+            AnalysisKind::DcSweep
+                | AnalysisKind::Ac
+                | AnalysisKind::Transient
+                | AnalysisKind::Noise
+                | AnalysisKind::TransferFunction
+                | AnalysisKind::OperatingPoint
+        ) {
+        simetrix::inline_sweeps(analysis_kind(&name), &arguments(text)?)
+            .with_context(|| format!("analysis sweep at {origin:?}"))?
+    } else {
+        None
+    };
+    let (mut directive, mut disposition) = if let Some(inline) = &inline {
+        budget.charge(Resource::GeneratedNodes, inline.axes.len())?;
+        let base = format!("{name} {}", inline.arguments.join(" "));
+        classify(&name, &base, dialect, library || !scope.is_empty())
+    } else {
+        classify(&name, text, dialect, library || !scope.is_empty())
+    }
+    .with_context(|| format!("analysis declaration at {origin:?}"))?;
+    let (independent_axes, parallelism_hint) = inline.map_or_else(
+        || (Vec::new(), None),
+        |inline| (inline.axes, inline.parallelism_hint),
+    );
+    if !independent_axes.is_empty() && disposition != Disposition::Unsupported {
+        disposition = Disposition::RequiresBinding;
+    }
+    if let Directive::Sweep { axis } = &mut directive
+        && axis.execution == SweepExecution::Independent
+        && dialect == AnalysisDialect::Ltspice
+        && !plan.entries.iter().any(|entry| matches!(&entry.directive, Directive::Sweep { axis } if axis.execution == SweepExecution::Independent))
+    {
+        axis.order = CoordinateOrder::Ascending;
+    }
     plan.entries.push(PlanEntry {
         origin,
+        dialect,
         scope: scope.to_vec(),
         command: name,
         statement: text.to_owned(),
         directive,
+        independent_axes,
+        parallelism_hint,
         disposition,
     });
     Ok(())
@@ -805,12 +1271,21 @@ impl Capture<'_> {
 
     fn entry(&mut self, origin: DirectiveOrigin, text: &str) -> Result<()> {
         let library = self.library();
-        push_entry(self.plan, origin, &self.scope, text, library, self.budget)
+        push_entry(
+            self.plan,
+            origin,
+            &self.scope,
+            text,
+            library,
+            self.budget,
+            self.plan.dialect,
+        )
     }
 
     fn clone_origin(&self, origin: &DirectiveOrigin) -> Result<DirectiveOrigin> {
         let bytes = match origin {
-            DirectiveOrigin::Source { path, .. } => path.as_os_str().len(),
+            DirectiveOrigin::Source { path, .. }
+            | DirectiveOrigin::SourceOccurrence { path, .. } => path.as_os_str().len(),
             DirectiveOrigin::Generated { artifact, .. } => artifact.len(),
         };
         self.budget.charge(Resource::EmittedBytes, bytes)?;
@@ -1003,4 +1478,122 @@ pub(crate) fn capture(
     }
     *bytes = capture.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod typed_analysis_tests {
+    use super::*;
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+
+    fn add(
+        plan: &mut AnalysisPlan,
+        statement: &str,
+        line: usize,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        push_entry(
+            plan,
+            DirectiveOrigin::Generated {
+                artifact: "deck.cir".into(),
+                first_line: line,
+                last_line: line,
+            },
+            &[],
+            statement,
+            false,
+            budget,
+            AnalysisDialect::Ltspice,
+        )
+    }
+
+    #[test]
+    fn pspice_transient_operating_point_is_dialect_specific() -> Result<()> {
+        let statement = ".TRAN/OP 1u 1m";
+        let (directive, disposition) =
+            classify(".TRAN/OP", statement, AnalysisDialect::Pspice, false)?;
+        assert_eq!(disposition, Disposition::RequiresBinding);
+        assert!(matches!(
+            directive,
+            Directive::Analysis {
+                analysis: AnalysisKind::Transient,
+                ..
+            }
+        ));
+        for dialect in [
+            AnalysisDialect::Native,
+            AnalysisDialect::Ltspice,
+            AnalysisDialect::Hspice,
+            AnalysisDialect::Simetrix,
+            AnalysisDialect::Simplis,
+            AnalysisDialect::Tina,
+            AnalysisDialect::Qspice,
+            AnalysisDialect::Expanded,
+        ] {
+            let (_, disposition) = classify(".TRAN/OP", statement, dialect, false)?;
+            assert_eq!(disposition, Disposition::Unsupported, "{dialect:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_steps_and_timing_preserve_declaration_order() -> Result<()> {
+        let budget = WorkBudget::default();
+        let mut plan = AnalysisPlan::new(
+            AnalysisDialect::Ltspice,
+            PlanKind::Deck,
+            Some("test".into()),
+        );
+        add(&mut plan, ".step param duration list 5m 1m 2m", 2, &budget)?;
+        add(&mut plan, ".temp 25 -40 85", 3, &budget)?;
+        add(&mut plan, ".tran 0 {duration} -1m 0 startup", 4, &budget)?;
+        add(&mut plan, ".meas tran vmax MAX V(out)", 5, &budget)?;
+        assert_eq!(plan.entries.len(), 4);
+        assert!(plan.requires_binding());
+        assert!(plan.validate_unbound_execution().is_err());
+        let sweeps =
+            plan.bind_independent_sweeps(2, |_, _, text| parse_spice_constant(text), &budget)?;
+        assert_eq!(sweeps.count(), 9);
+        let mut axes = sweeps.axes();
+        let axis = axes.next().context("missing duration sweep")?;
+        assert_eq!(axis.entry.command, ".STEP");
+        assert_eq!(
+            axis.coordinates.value(0).map(f64::to_bits),
+            Some(1e-3_f64.to_bits())
+        );
+        let axis = axes.next().context("missing temperature sweep")?;
+        assert_eq!(axis.entry.command, ".TEMP");
+        assert_eq!(
+            axis.coordinates.value(0).map(f64::to_bits),
+            Some(25_f64.to_bits())
+        );
+        assert_eq!(
+            axis.coordinates.value(1).map(f64::to_bits),
+            Some((-40_f64).to_bits())
+        );
+        let Directive::Transient { intent } = &plan.entries[2].directive else {
+            anyhow::bail!("missing typed transient");
+        };
+        let timing = intent.bind(|text| {
+            if text == "{duration}" {
+                Ok(5e-3)
+            } else {
+                parse_spice_constant(text)
+            }
+        })?;
+        assert_eq!(timing.max_step.to_bits(), (5e-3_f64 / 1024.).to_bits());
+        assert!(
+            timing
+                .modes
+                .contains(model_normalize_ngspice::ltspice::transient::TransientModifier::Startup)
+                && !timing
+                    .modes
+                    .contains(model_normalize_ngspice::ltspice::transient::TransientModifier::Uic)
+        );
+        assert!(timing.native_timing().is_err());
+        assert!(matches!(
+            plan.entries[3].directive,
+            Directive::Measurement { .. }
+        ));
+        Ok(())
+    }
 }

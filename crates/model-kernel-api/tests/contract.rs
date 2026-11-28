@@ -384,6 +384,13 @@ enum TaylorWitness {
     Unbalanced,
     Gauge,
     Storage,
+    GuardValid,
+    GuardDuplicate,
+    GuardInvalid,
+    GuardOrder,
+    GuardLimit,
+    GuardUnbalanced,
+    GuardKernelError,
 }
 
 impl Kernel for TaylorWitness {
@@ -397,7 +404,7 @@ impl Kernel for TaylorWitness {
     fn evaluate_taylor(
         &self,
         _: &f64,
-        _: model_kernel_api::taylor::TaylorInput<'_>,
+        input: model_kernel_api::taylor::TaylorInput<'_>,
         out: &mut model_kernel_api::taylor::TaylorPoint<'_>,
     ) -> Result<()> {
         // A separate degree-one witness; point zero is always valid, and
@@ -414,6 +421,56 @@ impl Kernel for TaylorWitness {
             Self::Storage => {
                 out.charge[3] = 1.;
                 out.charge[4] = -1.;
+            }
+            Self::GuardValid
+            | Self::GuardDuplicate
+            | Self::GuardUnbalanced
+            | Self::GuardKernelError => {
+                use model_kernel_api::taylor::{GuardPredicate, GuardRecorder};
+                let mut recorder = GuardRecorder::new(out.guards);
+                let lhs = input.coordinate(3, 0)?;
+                let rhs = input.coordinate(3, 1)?;
+                recorder.select(7, GuardPredicate::Less, lhs, rhs, true);
+                recorder.select(8, GuardPredicate::Greater, lhs, rhs, false);
+                if matches!(self, Self::GuardDuplicate) {
+                    recorder.select(7, GuardPredicate::Greater, lhs, rhs, true);
+                }
+                if matches!(self, Self::GuardUnbalanced) {
+                    out.current[3] = 1.;
+                }
+                if matches!(self, Self::GuardKernelError) {
+                    return Err(Error::Domain("witness kernel failure".into()));
+                }
+            }
+            Self::GuardInvalid => {
+                use model_kernel_api::taylor::{GuardPredicate, GuardRecorder};
+                GuardRecorder::new(out.guards).select(
+                    1,
+                    GuardPredicate::Less,
+                    f64::INFINITY,
+                    0.,
+                    true,
+                );
+            }
+            Self::GuardOrder => {
+                use model_kernel_api::taylor::{
+                    GuardPredicate, GuardRecorder,
+                    arithmetic::{Scalar, Series},
+                };
+                GuardRecorder::new(out.guards).select(
+                    1,
+                    GuardPredicate::Greater,
+                    Series::from_coefficients([0., 0., 1.])?,
+                    Series::constant(0.),
+                    true,
+                );
+            }
+            Self::GuardLimit => {
+                use model_kernel_api::taylor::{GuardPredicate, GuardRecorder};
+                let mut recorder = GuardRecorder::new(out.guards);
+                for site in 0..=256 {
+                    recorder.select(site, GuardPredicate::Greater, 1., 0., true);
+                }
             }
         }
         Ok(())
@@ -434,14 +491,29 @@ fn physical_taylor_checks_every_degree_and_known_zero_charge() -> Result<()> {
         TaylorWitness::Unbalanced,
         TaylorWitness::Gauge,
         TaylorWitness::Storage,
+        TaylorWitness::GuardValid,
+        TaylorWitness::GuardDuplicate,
+        TaylorWitness::GuardInvalid,
+        TaylorWitness::GuardOrder,
+        TaylorWitness::GuardLimit,
+        TaylorWitness::GuardUnbalanced,
+        TaylorWitness::GuardKernelError,
     ] {
         let expected = match witness {
-            TaylorWitness::Valid => Ok(()),
+            TaylorWitness::Valid | TaylorWitness::GuardValid => Ok(()),
             TaylorWitness::Incomplete => Err(Error::Domain(
                 "incomplete static residual or Jacobian".into(),
             )),
-            TaylorWitness::Unbalanced | TaylorWitness::Gauge => Err(Error::Conservation),
+            TaylorWitness::Unbalanced | TaylorWitness::Gauge | TaylorWitness::GuardUnbalanced => {
+                Err(Error::Conservation)
+            }
+            TaylorWitness::GuardKernelError => Err(Error::Domain("witness kernel failure".into())),
             TaylorWitness::Storage => Err(Error::Domain("nonzero declared-zero storage".into())),
+            TaylorWitness::GuardDuplicate => Err(Error::Schema("duplicate physical guard site")),
+            TaylorWitness::GuardInvalid | TaylorWitness::GuardOrder => {
+                Err(Error::Domain("inconsistent physical guard germ".into()))
+            }
+            TaylorWitness::GuardLimit => Err(Error::Shape("physical guard site limit")),
         };
         let mut d = descriptor();
         d.charge = Capability::Zero;
@@ -449,6 +521,59 @@ fn physical_taylor_checks_every_degree_and_known_zero_charge() -> Result<()> {
         let a = Artifact::new(d, witness)?;
         let p = a.prepare(&[2.], 300.)?;
         assert_eq!(a.evaluate_taylor(&p, input, &mut buffer.point()), expected);
+        if expected.is_err() {
+            assert!(buffer.point().guards.records().is_empty());
+        }
     }
+    Ok(())
+}
+
+#[test]
+fn executed_guard_trace_is_one_sided_and_reusable_across_tiles() -> Result<()> {
+    use model_kernel_api::taylor::{GuardPredicate, TaylorBuffer, TaylorCapability, TaylorInput};
+    let mut descriptor = descriptor();
+    descriptor.taylor = TaylorCapability::Computed { max_order: 1 };
+    descriptor.charge = Capability::Zero;
+    let a = Artifact::new(descriptor.clone(), TaylorWitness::GuardValid)?;
+    let p = a.prepare(&[2.], 300.)?;
+    let tile = PreparedTile::new(&a, &[(&[2.], 300.), (&[3.], 300.)])?;
+    let mut buffer = TaylorBuffer::new(3, 1)?;
+    for slope in [-1., 0., 1.] {
+        let input = TaylorInput {
+            order: 1,
+            coefficients: &[2., 2., 300., slope, 0., 0.],
+        };
+        a.evaluate_taylor(&p, input, &mut buffer.point())?;
+        let verify = |out: &mut TaylorBuffer| {
+            let point = out.point();
+            let guards = point.guards.records();
+            assert_eq!(guards.len(), 1);
+            let guard = &guards[0];
+            assert_eq!(guard.site, 7);
+            assert_eq!(guard.predicate, GuardPredicate::Less);
+            assert_eq!(guard.selected, slope < 0.);
+            assert_eq!(guard.surface.coefficient(0).to_bits(), 0_f64.to_bits());
+            assert_eq!(guard.surface.coefficient(1).to_bits(), slope.to_bits());
+        };
+        verify(&mut buffer);
+        tile.evaluate_lane_taylor(1, input, &mut buffer.point())?;
+        verify(&mut buffer);
+        assert!(
+            tile.evaluate_lane_taylor(2, input, &mut buffer.point())
+                .is_err()
+        );
+        assert!(buffer.point().guards.records().is_empty());
+    }
+    let empty = Artifact::new(descriptor, TaylorWitness::Valid)?;
+    let p = empty.prepare(&[2.], 300.)?;
+    empty.evaluate_taylor(
+        &p,
+        TaylorInput {
+            order: 1,
+            coefficients: &[2., 2., 300., 0., 0., 0.],
+        },
+        &mut buffer.point(),
+    )?;
+    assert!(buffer.point().guards.records().is_empty());
     Ok(())
 }
