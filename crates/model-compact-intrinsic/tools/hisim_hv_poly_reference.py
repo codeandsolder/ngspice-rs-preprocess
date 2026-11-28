@@ -11,13 +11,11 @@ def program(root,version):
     macros=[]
     for name in ('Fn_SU','Fn_SZ','Fn_SL','Fn_DclPoly4','Fn_SUPoly4','Fn_ExpLim'):
         start=src.index('#define '+name+'(');end=re.search(r'(?m)^\s*}[^\S\n]*$',src[start:]).end()+start;macros.append(src[start:end].replace('sqrt (','sqrtl ('))
-    symmetry=''
-    if version==1:
-        start=src.index('T1 = here->HSMHV_qnsub_esi * Cox0_inv',src.index('* Factor of modification for symmetry.'));end=src.index('* Quantum effect',start);symmetry=src[start:src.rfind('/*',start,end)]
+    start=src.index(f'T1 = here->{prefix}_qnsub_esi * Cox0_inv',src.index('* Factor of modification for symmetry.'));end=src.index('* Quantum effect',start);symmetry=src[start:src.rfind('/*',start,end)]
     start=src.rindex('* Poly-Depletion Effect');start=src.index('*/',start)+2;end=src.index('Vgs_fb =',start);end=src.index(';',end)+1;section=symmetry+src[start:end]
     section=re.sub(r'/\*.*?\*/','',section,flags=re.S)
     names=set(re.findall(r'\b\w+_d(?:V\w+|T)\b',section));decl=';'.join(f'long double {n}=0.' for n in sorted(names))+';'
-    inputs={'Vgs','Vds','Vbscl','Vgsz','Vbsz','Vfb','Vthq','Cox0_inv','Pb2c','dVth','dmpacc','FMDVDS','pol_b','pol_dlt','TMF0','TMF1','TMF2','TMF3','TMF4','T9','T6'}
+    inputs={'Vgs','Vds','Vbscl','Vgsz','Vbsz','Vfb','Vthq','Cox0_inv','Pb2c','dVth','dmpacc','FMDVDS','pol_b','pol_dlt','TMF0','TMF1','TMF2','TMF3','TMF4','T9','T6','T5','small'}
     lhs=set(re.findall(r'\b([A-Za-z_]\w*)\s*(?:=|\*=|/=|\+=|-=)\s*[^=]',section));lhs-=inputs|names
     lhs.update(re.findall(r'Fn_\w+\(\s*(\w+)\s*,',section));lhs-=inputs|names
     maps={'here':{'qnsub_esi':'density','betatnom':'x[10]','flg_pgd':'x[6]!=0','cnstpgd':'x[6]*powl(1.L+1e-6L/x[9],0.7L)'},'model':{'pgd2':'x[7]'},'pParam':{'pgd3':'x[8]'}}
@@ -31,7 +29,7 @@ def program(root,version):
 int main(void){{long double x[11];while(1){{for(int i=0;i<11;i++)if(scanf("%Lf",&x[i])!=1)return 0;
 long double Vgs=x[0],Vds=x[1],Vbscl=x[2],Vgsz=x[3],Vbsz=x[4],dVth=x[5],Vfb=-0.7L,qe=1.6021918e-19L,esi=1.034943e-10L,density=qe*esi*1e23L;
 long double Pb2c=2.L/38.68283L*logl(1e23L/1.04e16L),Cox0_inv=10e-9L/(8.8541878e-12L*3.9L),Vthq=Pb2c+Vfb+sqrtl(2*density*Pb2c)*Cox0_inv;
-long double pol_b=1.L,pol_dlt=.05L,dmpacc=0,FMDVDS=0,TMF0=0,TMF1=0,TMF2=0,TMF3=0,TMF4=0,T9=0,T6=0;
+long double pol_b=1.L,pol_dlt=.05L,dmpacc=0,FMDVDS=0,TMF0=0,TMF1=0,TMF2=0,TMF3=0,TMF4=0,T9=0,T6=0,T5=0,small=1e-25L;
 {chr(10).join(structs)}
 {decl}
 long double {','.join(n+'=0' for n in sorted(lhs))};

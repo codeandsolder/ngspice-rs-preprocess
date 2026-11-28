@@ -117,6 +117,12 @@ impl PreparedHiSimHvPolyDepletion {
             1. + 2. / scale * (drive - 1. / temperature.nominal_inverse_thermal_voltage - body),
             0.001,
         );
+        let radicand = radicand
+            + if self.variant == ModelVariant::HiSimHv2 {
+                1e-25
+            } else {
+                0.
+            };
         let saturation = lower(
             drive + scale * (1. - radicand.sqrt()) - self.reference_bulk,
             Jet::constant(0.1),
@@ -146,11 +152,7 @@ impl PreparedHiSimHvPolyDepletion {
         let gate = Jet::coordinate(bias.vgs, 0, 1.);
         let drain = Jet::coordinate(bias.vds, 1, 1.);
         let hv1 = self.variant == ModelVariant::HiSimHv1;
-        let symmetry = if hv1 {
-            self.symmetry(gate, drain, conditioned.confined_body, temperature)
-        } else {
-            Jet::constant(0.)
-        };
+        let symmetry = self.symmetry(gate, drain, conditioned.confined_body, temperature);
         let mut damping = Jet::constant(0.);
         let depletion = if self.coefficient == 0. {
             Jet::constant(0.)
