@@ -75,6 +75,7 @@ fn descriptor() -> Descriptor {
         family: "linear".into(),
         fingerprint: [1; 16],
         abi: ABI_VERSION,
+        taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
         equations: [
             ("positive", EquationKind::Electrical),
             ("negative", EquationKind::Electrical),

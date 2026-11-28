@@ -149,6 +149,7 @@ pub fn artifact(
             family: "hicum2".into(),
             fingerprint,
             abi: ABI_VERSION,
+            taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
             equations: equations(layout)?,
             parameters,
             charge: Capability::Computed,

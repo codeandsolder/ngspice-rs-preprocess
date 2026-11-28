@@ -264,6 +264,7 @@ pub fn legacy_bsim_artifact(
             .into(),
             fingerprint,
             abi: ABI_VERSION,
+            taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
             equations: layout.equations(),
             parameters,
             charge: Capability::Computed,

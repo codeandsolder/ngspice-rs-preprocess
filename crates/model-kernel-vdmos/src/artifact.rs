@@ -117,6 +117,7 @@ pub fn artifact(
             family: "vdmos".into(),
             fingerprint,
             abi: ABI_VERSION,
+            taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
             equations,
             parameters: vec![Parameter {
                 name: "multiplier".into(),
