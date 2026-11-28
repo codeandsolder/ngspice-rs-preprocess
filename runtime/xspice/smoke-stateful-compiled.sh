@@ -2,14 +2,15 @@
 # Compile original clocked ALB source with its original electrical
 # parameters and compare to independent source-identical vendor oracles.
 set -euo pipefail
-if (( $# != 3 )); then
-    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT\n' "$0" >&2
+if (( $# != 4 )); then
+    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT EXTERNAL_MODEL_JSON\n' "$0" >&2
     exit 2
 fi
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 cm="$(realpath -- "$1")"
 bins="$(realpath -- "$2")"
 scratch="$(realpath -- "$3")"
+models="$(realpath -e -- "$4")"
 work="$(mktemp -d "$scratch/ngspice_preprocess_stateful_compiled_XXXXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 printf 'codemodel %s\n' "$cm" > "$work/.spiceinit"
@@ -22,7 +23,7 @@ for name in edge-basic level-basic edge-hold-minclock level-setup edge-async-res
         { print }
     ' "$vendor/$name.net" > "$work/original.cir"
     "$bins/alb-boundary-discover" "$work/original.cir" "$family/auto-discovery-univ-5v.json" "$work/boundaries.json"
-    "$bins/alb-family-compile" "$work/original.cir" "$work/boundaries.json" "$family/vendor-univ-models.json" "$work/circuit.cir" "$work/generated.inc"
+    "$bins/alb-family-compile" "$work/original.cir" "$work/boundaries.json" "$models" "$work/circuit.cir" "$work/generated.inc"
     rg -q '^Asr_stateful \[sr_in0.*\] \[sr_out0\] 0 \[sr_out0_sink\] \[sr_out0_source\] Msr_stateful$' "$work/generated.inc"
     (cd "$work" && ngspice -b circuit.cir > sim.log 2>&1) || {
         tail -n 70 "$work/sim.log" >&2

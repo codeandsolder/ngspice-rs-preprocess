@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Original source vendor netlist -> automatically compiled native waveform.
 set -euo pipefail
-if (( $# != 5 )); then
-    printf 'usage: %s SOURCE.net PINS CODEMODEL_CM RUST_BIN_DIR WORK_DIR\n' "$0" >&2
+if (( $# != 6 )); then
+    printf 'usage: %s SOURCE.net PINS CODEMODEL_CM RUST_BIN_DIR WORK_DIR EXTERNAL_MODEL_JSON\n' "$0" >&2
     exit 2
 fi
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
@@ -58,7 +58,7 @@ jq -s --rawfile models "$work/models.txt" '
         {model:.,pins:["digital","analog"],native_model:("SR_EXPLICIT_"+.),
          native_formals:["D","D_SINK","D_SOURCE","Q"]}))}
 ' "$family/auto-discovery-5v.json" "$family/auto-discovery-univ-5v.json" > "$work/electrical.json"
-jq -s '{models: (map(.models) | add)}' "$family/auto-models.json" "$family/vendor-univ-models.json" > "$work/native-models.json"
+jq -s '{models: (map(.models) | add)}' "$family/auto-models.json" "$(realpath -e -- "$6")" > "$work/native-models.json"
 "$bins/alb-boundary-discover" "$work/original.cir" "$work/electrical.json" "$work/boundaries.json"
 "$bins/alb-family-compile" "$work/original.cir" "$work/boundaries.json" "$work/native-models.json" "$work/circuit.cir" "$work/generated.inc"
 (cd "$work" && ngspice -b circuit.cir > sim.log 2>&1) || {

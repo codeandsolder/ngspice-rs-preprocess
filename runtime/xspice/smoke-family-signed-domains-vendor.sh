@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Independent signed current limits, receiver capacitance and physical bridges.
 set -euo pipefail
-if (( $# != 3 )); then
-    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT\n' "$0" >&2
+if (( $# != 4 )); then
+    printf 'usage: %s CODEMODEL_CM RUST_BIN_DIR SCRATCH_ROOT EXTERNAL_MODEL_JSON\n' "$0" >&2
     exit 2
 fi
 here="$(cd -- "$(dirname -- "$0")" && pwd)"
 cm="$(realpath -- "$1")"
 bins="$(realpath -- "$2")"
 scratch="$(realpath -- "$3")"
+models="$(realpath -e -- "$4")"
 fixture="$here/fixtures/vendor-signed-domains"
 work="$(mktemp -d "$scratch/ngspice_preprocess_signed_domains_XXXXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
@@ -19,7 +20,7 @@ while IFS= read -r case_json; do
     source="$fixture/$name.net"
     [[ $(sha256sum -- "$source" | cut -d' ' -f1) == "$hash" ]]
     runner_pins="$(printf '%s\n' "$pins" | sed -E 's/v\(([a-z0-9_]+)\)/\1/g')"
-    "$here/run-compiled-vendor-physical.sh" "$source" "$runner_pins" "$cm" "$bins" "$work"
+    "$here/run-compiled-vendor-physical.sh" "$source" "$runner_pins" "$cm" "$bins" "$work" "$models"
     jq -e --argjson oracle "$case_json" '
         ([.connections[] | select(.direction == "input") | .analog_net] | sort) == $oracle.input_nets and
         ([.connections[] | select(.direction == "output") | .analog_net] | sort) == $oracle.output_nets and

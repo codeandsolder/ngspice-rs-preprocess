@@ -2,6 +2,7 @@
 //! ordinary lexical numparam expressions; neither parameters nor device
 //! voltages are sampled during polynomial extraction.
 use super::{Expr, SpiceExpression, parse_spice_constant};
+use crate::native_scalar::{BinaryOp, UnaryOp};
 use anyhow::{Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 
@@ -117,7 +118,9 @@ fn contains_s(expr: &Expr, budget: &WorkBudget) -> Result<bool> {
         Expr::Number(_) | Expr::SourceAtom(_) => false,
         Expr::Symbol(name) => name == "s",
         Expr::Unary(_, value) | Expr::ParameterGroup(value) => contains_s(value, budget)?,
-        Expr::Binary(_, left, right) => contains_s(left, budget)? || contains_s(right, budget)?,
+        Expr::Binary(_, left, right) | Expr::SourceBinary(_, left, right) => {
+            contains_s(left, budget)? || contains_s(right, budget)?
+        }
         Expr::Conditional(condition, yes, no) => {
             contains_s(condition, budget)? || contains_s(yes, budget)? || contains_s(no, budget)?
         }
@@ -150,19 +153,19 @@ fn scalar_text(expr: &Expr, text: &mut String, budget: &WorkBudget) -> Result<()
             append_scalar(text, &scalar.0, budget)?;
         }
         Expr::Symbol(name) => append_scalar(text, name, budget)?,
-        Expr::SourceAtom(_) | Expr::ParameterGroup(_) => {
+        Expr::SourceAtom(_) | Expr::ParameterGroup(_) | Expr::SourceBinary(_, _, _) => {
             bail!("source-only expression cannot be a native Laplace coefficient")
         }
         Expr::Unary(op, value) => {
             append_scalar(text, "(", budget)?;
-            append_scalar(text, op, budget)?;
+            append_scalar(text, op.symbol(), budget)?;
             scalar_text(value, text, budget)?;
             append_scalar(text, ")", budget)?;
         }
         Expr::Binary(op, left, right) => {
             append_scalar(text, "(", budget)?;
             scalar_text(left, text, budget)?;
-            append_scalar(text, op, budget)?;
+            append_scalar(text, op.symbol(), budget)?;
             scalar_text(right, text, budget)?;
             append_scalar(text, ")", budget)?;
         }
@@ -375,19 +378,17 @@ impl Rational {
                     denominator: Polynomial::one(budget)?,
                 })
             }
-            Expr::Unary("+", value) => Self::compile(value, budget),
-            Expr::Unary("-", value) => Self::constant(Scalar::zero(budget)?, budget)?.add(
-                "-",
-                &Self::compile(value, budget)?,
-                budget,
-            ),
-            Expr::Binary(op @ ("+" | "-"), left, right) => {
-                Self::compile(left, budget)?.add(op, &Self::compile(right, budget)?, budget)
-            }
-            Expr::Binary("*", left, right) => {
+            Expr::Unary(UnaryOp::Plus, value) => Self::compile(value, budget),
+            Expr::Unary(UnaryOp::Minus, value) => Self::constant(Scalar::zero(budget)?, budget)?
+                .add("-", &Self::compile(value, budget)?, budget),
+            Expr::Binary(op @ (BinaryOp::Add | BinaryOp::Sub), left, right) => Self::compile(
+                left, budget,
+            )?
+            .add(op.symbol(), &Self::compile(right, budget)?, budget),
+            Expr::Binary(BinaryOp::Mul, left, right) => {
                 Self::compile(left, budget)?.multiply(&Self::compile(right, budget)?, budget)
             }
-            Expr::Binary("/", left, right) if !contains_s(right, budget)? => {
+            Expr::Binary(BinaryOp::Div, left, right) if !contains_s(right, budget)? => {
                 // Keep scalar division in the coefficient domain. Clearing a
                 // parameter-valued scalar divisor could otherwise make an
                 // undefined instance (e.g. p=0 in s/p) appear valid.
@@ -395,9 +396,9 @@ impl Rational {
                 let reciprocal = Scalar::one(budget)?.binary("/", &divisor, budget)?;
                 Self::compile(left, budget)?.multiply(&Self::constant(reciprocal, budget)?, budget)
             }
-            Expr::Binary("/", left, right) => Self::compile(left, budget)?
+            Expr::Binary(BinaryOp::Div, left, right) => Self::compile(left, budget)?
                 .multiply(&Self::compile(right, budget)?.reciprocal()?, budget),
-            Expr::Binary("**", base, exponent) => {
+            Expr::Binary(BinaryOp::Pow, base, exponent) => {
                 Self::compile(base, budget)?.power(exponent, budget)
             }
             _ => bail!("nonrational Laplace expression (unsupported operation on s)"),

@@ -384,6 +384,8 @@ timeout per attempt. It no longer waits on a child before draining its pipes.
 See per-crate documentation and upstream notices for model-specific
 provenance, supported formats and reproducible reference validation.
 
+See [third-party notices](THIRD_PARTY_NOTICES.md) for upstream licensing and
+reference-fixture provenance.
 ## Validation
 
 Use the repository's dated nightly from `rust-toolchain.toml`, the managed

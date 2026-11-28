@@ -99,7 +99,7 @@ of physical simulation support.
 From this repository's root, using a checkout of the pinned reference:
 
 ```sh
-uv run --no-project python crates/model-compact-intrinsic/tools/generate_legacy_bsim_catalog.py /path/to/ngspice | diff - crates/model-compact-intrinsic/src/catalog/legacy_bsim.rs
+uv run --no-project python .github/scripts/generate_legacy_bsim_catalog.py /path/to/ngspice | diff - crates/model-compact-intrinsic/src/catalog/legacy_bsim.rs
 ```
 
 The generator copies only interface facts (name, type, access and alias
