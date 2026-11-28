@@ -37,8 +37,11 @@ Do not run the placeholder deck as a stand-alone reference.
   implicit inductor shunt, and nonlinear passive laws require the corresponding
   native physical contracts. Explicit root `.option LFT=0` disables the
   omitted inductor shunt (equivalent to explicit `Rpar=0` only when no
-  shunt was written). Positive or symbolic LFT remains diagnosed until
-  frequency-derived damping is qualified. Do not equate LFT=0 with a
+  shunt was written). Constant zero expressions are equivalent. Positive LFT
+  is admissible only when every inductor has an explicit supported shunt
+  setting; otherwise frequency-derived damping requires qualification.
+  Symbolic LFT, conflicting values, Q/Qser/Frequency-derived losses, and
+  deck-wide LFT in standalone libraries are diagnosed. Do not equate LFT=0 with a
   zero-ohm shunt. In particular, `R=`, `C=`, `Q=` and `Flux=` are not
   interchangeable with static positional values.
 - Idealized diode and smooth switch laws require their own model binding.

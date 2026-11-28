@@ -319,6 +319,17 @@ fn lower_passive(
     let mut index = 4;
     while index < fields.len() {
         let key = &text[fields[index].clone()];
+        if designator == b'l'
+            && [b"q".as_slice(), b"qser", b"frequency"]
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+        {
+            return Err(reject(
+                origin,
+                Feature::PassiveParasitics,
+                "frequency-derived inductor losses require a qualified physical law",
+            ));
+        }
         if let Some(span) = assignment(text, fields, index) {
             let value = &text[fields[index + 2].clone()];
             let is_parallel = key.eq_ignore_ascii_case(b"rpar");
@@ -563,6 +574,29 @@ pub struct Lowered {
     pub waveforms: Vec<PreparedWaveform>,
 }
 
+fn lower_numeric(
+    linked: &LinkedSource,
+    title_len: usize,
+    source_statements: Vec<Statement>,
+    declarations: &Declarations,
+    budget: &WorkBudget,
+) -> Result<Option<Vec<u8>>> {
+    let mut numeric_edits = Vec::new();
+    for statement in source_statements {
+        budget.charge(Resource::Statements, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
+        let line = statement.line + usize::from(title_len != 0);
+        if linked.dialect_at(line) != Some(SourceDialect::Qspice) {
+            continue;
+        }
+        let origin = linked
+            .origin(line)
+            .context("missing QSPICE source location")?;
+        numeric::rewrite(&statement, origin, declarations, &mut numeric_edits)?;
+    }
+    apply_budgeted_edits(&linked.bytes[title_len..], numeric_edits, budget)
+}
+
 /// Apply the source-specific pass to a linked graph. Rewrites preserve the
 /// physical line count, so every subsequent native pass retains provenance.
 /// # Errors
@@ -589,20 +623,7 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind, budget: &WorkBudget) 
                 |origin| reject(origin, Feature::Binding, &format!("{:#}", failure.error)),
             )
     })?;
-    let mut numeric_edits = Vec::new();
-    for statement in source_statements {
-        budget.charge(Resource::Statements, 1)?;
-        budget.charge(Resource::ScannedBytes, statement.text.len())?;
-        let line = statement.line + usize::from(title_len != 0);
-        if linked.dialect_at(line) != Some(SourceDialect::Qspice) {
-            continue;
-        }
-        let origin = linked
-            .origin(line)
-            .context("missing QSPICE source location")?;
-        numeric::rewrite(&statement, origin, &declarations, &mut numeric_edits)?;
-    }
-    let lowered = apply_budgeted_edits(body, numeric_edits, budget)?;
+    let lowered = lower_numeric(linked, title_len, source_statements, &declarations, budget)?;
     let body = lowered.as_deref().unwrap_or(body);
     let mut edits = Vec::new();
     let mut waveforms = Vec::new();

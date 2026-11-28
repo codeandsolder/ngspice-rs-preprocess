@@ -279,6 +279,57 @@ fn damping_option_does_not_override_written_shunt_or_timing_scope() -> Result<()
 }
 
 #[test]
+fn damping_options_preserve_precedence_and_reject_unbound_losses() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("source.cir");
+    for (device, option) in [
+        ("L1 a 0 1m", ".option LFT={1-1}"),
+        ("L1 a 0 1m Rpar=0", ".option LFT=1k"),
+        ("L1 a 0 1m", ".option LFT=0\n.option LFT=-0"),
+    ] {
+        fs::write(&root, format!("Title\n{device}\n{option}\n.end\n"))?;
+        let bundle = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())?;
+        let text = std::str::from_utf8(&bundle.primary.bytes)?;
+        ensure!(text.contains("L1 a 0 1m"), "{text}");
+        ensure!(!text.to_ascii_lowercase().contains("lft="), "{text}");
+    }
+    for (device, option) in [
+        ("L1 a 0 1m", ".option LFT=0\n.option LFT=1k"),
+        ("L1 a 0 1m Q=10", ".option LFT=0"),
+        ("L1 a 0 1m Qser=10", ".option LFT=0"),
+        ("L1 a 0 1m Rpar=0 Frequency=1k", ".option LFT=0"),
+    ] {
+        fs::write(&root, format!("Title\n{device}\n{option}\n.end\n"))?;
+        let error = prepare_file(&root, InputFormat::QspiceDeck, Vec::new())
+            .err()
+            .context("unqualified loss law accepted")?;
+        assert_eq!(
+            error
+                .downcast_ref::<Unsupported>()
+                .context("missing diagnostic")?
+                .feature,
+            Feature::PassiveParasitics
+        );
+    }
+    let lib = dir.path().join("source.lib");
+    fs::write(
+        &lib,
+        ".option LFT=0\n.subckt coil a b\nL1 a b 1m\n.ends coil\n",
+    )?;
+    let error = prepare_file(&lib, InputFormat::QspiceLibrary, Vec::new())
+        .err()
+        .context("deck-wide option discarded from standalone library")?;
+    assert_eq!(
+        error
+            .downcast_ref::<Unsupported>()
+            .context("missing diagnostic")?
+            .feature,
+        Feature::PassiveParasitics
+    );
+    Ok(())
+}
+
+#[test]
 fn native_reference_matches_dc_ac_and_transient_laws() -> Result<()> {
     let dir = tempfile::tempdir()?;
     fs::write(

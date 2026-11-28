@@ -125,7 +125,7 @@ pub(super) struct Settings<'a> {
     budget: &'a WorkBudget,
     maximum: Option<Scalar>,
     absolute: Option<bool>,
-    inductor_damping_disabled: bool,
+    lft: Option<f64>,
 }
 
 pub(super) fn is_options(name: &[u8]) -> bool {
@@ -165,27 +165,47 @@ fn positive(value: &Scalar, origin: &SourceOrigin, message: &str) -> Result<()> 
 }
 
 impl Settings<'_> {
-    pub(super) const fn inductor_damping_disabled(&self) -> bool {
-        self.inductor_damping_disabled
+    pub(super) fn inductor_damping_disabled(&self) -> bool {
+        self.lft == Some(0.0)
+    }
+
+    fn add_damping(&mut self, parameter: &ModelParameter, origin: &SourceOrigin) -> Result<()> {
+        let invalid = || {
+            reject(
+                origin,
+                Feature::PassiveParasitics,
+                "LFT requires a finite nonnegative constant",
+            )
+        };
+        let raw = parameter.expression.as_deref().ok_or_else(invalid)?;
+        let value = if let Some(value) = literal(raw.as_bytes()) {
+            value
+        } else {
+            SpiceExpression::parse_with_budget(raw, self.budget)?
+                .known_value(self.budget)?
+                .ok_or_else(invalid)?
+        };
+        if !value.is_finite() || value < 0.0 {
+            return Err(invalid());
+        }
+        let value = if value == 0.0 { 0.0 } else { value };
+        if self
+            .lft
+            .is_some_and(|previous| previous.to_bits() != value.to_bits())
+        {
+            return Err(reject(
+                origin,
+                Feature::PassiveParasitics,
+                "conflicting LFT options",
+            ));
+        }
+        self.lft = Some(value);
+        Ok(())
     }
 
     fn add(&mut self, parameter: &ModelParameter, origin: &SourceOrigin) -> Result<()> {
         if damping_option(&parameter.name) {
-            let value = parameter
-                .expression
-                .as_deref()
-                .and_then(|raw| literal(raw.as_bytes()));
-            // QSPICE defines zero LFT as disabling the implicit shunt, not
-            // as a short circuit. Positive/symbolic LFT needs the physical
-            // frequency-derived conductance contract, not native .option.
-            if value != Some(0.0) {
-                return Err(reject(
-                    origin,
-                    Feature::PassiveParasitics,
-                    "LFT must be explicitly zero until frequency-derived inductor damping is qualified",
-                ));
-            }
-            self.inductor_damping_disabled = true;
+            self.add_damping(parameter, origin)?;
         } else if parameter.name.eq_ignore_ascii_case("maxstep") {
             let raw = parameter.expression.as_deref().ok_or_else(|| {
                 reject(
@@ -411,7 +431,7 @@ pub(super) fn collect<'a>(
         budget: declarations.budget(),
         maximum: None,
         absolute: None,
-        inductor_damping_disabled: false,
+        lft: None,
     };
     let mut first_option = None;
     let mut transient = false;
@@ -450,6 +470,14 @@ pub(super) fn collect<'a>(
                     continue;
                 }
                 let timing = timing_option(&parameter.name);
+                if !timing && !has_title {
+                    return Err(reject(
+                        origin,
+                        Feature::PassiveParasitics,
+                        "LFT requires a linked deck context",
+                    ));
+                }
+
                 if !declarations.unconditional_root(statement.line) {
                     return Err(reject(
                         origin,
