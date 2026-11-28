@@ -10,7 +10,7 @@ use model_normalize_ngspice::{
     linked_source::{
         LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker, SourceOrigin,
     },
-    normalize_mapped,
+    normalize_bound_mapped,
 };
 pub use model_normalize_ngspice::{
     linked_source::{LinkedLocation, SourceGraph},
@@ -330,9 +330,14 @@ struct NativeProjection {
 }
 
 impl NativeProjection {
-    fn plain(bytes: &[u8], kind: RootKind, budget: &WorkBudget) -> Result<Self> {
+    fn bound(
+        bytes: &[u8],
+        kind: RootKind,
+        dialects: &[SourceDialect],
+        budget: &WorkBudget,
+    ) -> Result<Self> {
         Ok(Self {
-            normalized: normalize_mapped(bytes, kind, SourceDialect::Native, budget)?,
+            normalized: normalize_bound_mapped(bytes, kind, dialects, budget)?,
             device_identities: Vec::new(),
             waveforms: Vec::new(),
         })

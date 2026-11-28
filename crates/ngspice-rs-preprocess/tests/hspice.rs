@@ -1079,6 +1079,25 @@ M1 d g 0 0 shared L=1u W=2u
     assert_eq!(mos.mapping.device, Device::Bsim4);
     assert_eq!(mos.effective_version.as_deref(), Some("4.70"));
     assert_ne!(diode.scope, mos.scope);
+    let diode_location = diode.linked.context("missing diode declaration identity")?;
+    let mos_location = mos.linked.context("missing MOS declaration identity")?;
+    assert_eq!(diode_location.visit, mos_location.visit);
+    assert_ne!(diode_location.scope, mos_location.scope);
+    let Provenance::Native {
+        source_graph: Some(graph),
+        ..
+    } = &bundle.primary.provenance
+    else {
+        anyhow::bail!("missing combined source graph");
+    };
+    assert_eq!(
+        graph.scopes[diode_location.scope].name.as_deref(),
+        Some("dcell")
+    );
+    assert_eq!(
+        graph.scopes[mos_location.scope].name.as_deref(),
+        Some("mcell")
+    );
     let native = std::str::from_utf8(&bundle.primary.bytes)?;
     measure_native(dir.path(), native, "op\nwrdata actual.dat i(vd) i(vm)")?;
     let reference = tempfile::tempdir()?;
@@ -1257,6 +1276,118 @@ R1 p n 'gain*1k'
         for (a, e) in observed[0][1..].iter().zip([-1. / 12000., hs_current]) {
             ensure!((*a - e).abs() < 1e-12, "{policy}: {a} != {e}\n{text}");
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_laplace_coefficients_preserve_scope_gain_and_polarity() -> Result<()> {
+    // HSPICE's positional coefficients ascend in powers of s, whereas
+    // native s_xfer vectors descend. "s" here is also a legal scalar
+    // parameter, not the physical transform variable.
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("root.sp");
+    fs::write(
+        &root,
+        "Scoped differential filters\n.option parhier=local reltol=1e-7\n.subckt filter p n out gout s=2 tau=1m\nE1 out 0 LAPLACE p n s,0 / 1,'tau' SCALE=2\nG1 gout 0 LAPLACE p n s/1,tau SCALE=2 M=3\n.ends filter\nV1 in ref DC 0 AC 1 PWL(0 0 1u 1 5m 1)\nVref ref 0 2\nX1 in ref out1 gout1 filter s=2 tau=1m\nX2 in ref out2 gout2 filter s=3 tau=2m\nR1 out1 0 1k\nR2 out2 0 1k\nRg1 gout1 0 1\nRg2 gout2 0 1\n.end\n",
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native source provenance");
+    };
+    assert_eq!(text.lines().count(), lines.len());
+    assert_eq!(text.matches("s_xfer").count(), 4);
+    for line in [4, 5] {
+        assert!(lines.iter().filter(|origin| origin.line == line).count() >= 6);
+    }
+    measure_native(
+        directory.path(),
+        text,
+        "ac lin 5 100 500\nwrdata ac.dat v(out1) v(gout1) v(out2) v(gout2)\ntran 0.1u 5m 0 0.1u\nwrdata tran.dat v(out1) v(gout1) v(out2) v(gout2)",
+    )?;
+    let ac = values(directory.path(), "ac.dat")?;
+    assert_eq!(ac.len(), 5);
+    for row in ac {
+        let [frequency, re1, im1, gre1, gim1, re2, im2, gre2, gim2] = row.as_slice() else {
+            anyhow::bail!("unexpected AC row {row:?}");
+        };
+        for (tau, gain, re, im, gre, gim) in [
+            (0.001, 4., *re1, *im1, *gre1, *gim1),
+            (0.002, 6., *re2, *im2, *gre2, *gim2),
+        ] {
+            let omega = std::f64::consts::TAU * frequency * tau;
+            let expected = gain / omega.mul_add(omega, 1.);
+            assert!((re - expected).abs() < 1e-8, "{row:?}");
+            assert!((im + expected * omega).abs() < 1e-8, "{row:?}");
+            assert!((gre + 3. * re).abs() < 1e-8, "{row:?}");
+            assert!((gim + 3. * im).abs() < 1e-8, "{row:?}");
+        }
+    }
+    let transient = values(directory.path(), "tran.dat")?;
+    for row in &transient {
+        let [time, out1, gout1, out2, gout2] = row.as_slice() else {
+            anyhow::bail!("unexpected transient row {row:?}");
+        };
+        if *time >= 1e-6 {
+            for (tau, gain, voltage, current) in [
+                (0.001_f64, 4., *out1, *gout1),
+                (0.002_f64, 6., *out2, *gout2),
+            ] {
+                let ramp = 1e-6;
+                let fraction = -(-ramp / tau).exp_m1() * tau / ramp;
+                let expected = gain * (fraction.mul_add(-(-(time - ramp) / tau).exp(), 1.));
+                assert!((voltage - expected).abs() < 2e-4, "{row:?}");
+                assert!((current + 3. * voltage).abs() < 1e-6, "{row:?}");
+            }
+        }
+    }
+    assert!(transient.last().context("missing transient samples")?[0] >= 0.004999);
+    Ok(())
+}
+
+#[test]
+fn foreign_resources_cannot_override_root_analysis_policy() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("child.lib");
+    fs::write(
+        &root,
+        "Root policy\n.include child.lib\nV1 a 0 1\nR1 a 0 1k\n.op\n.end\n",
+    )?;
+    for directive in [".temp 100", ".op", ".tran 1n 10n", ".option reltol=1e-3"] {
+        fs::write(&child, format!("*#PSPICE\n{directive}\n"))?;
+        let err = compile(&root, InputFormat::HspiceDeck).expect_err("foreign global policy");
+        let text = format!("{err:#}");
+        assert!(text.contains("circuit-wide policy belongs"), "{text}");
+        assert!(text.contains("child.lib:2"), "{text}");
+    }
+
+    // Ordinary same-language include files remain part of the root deck.
+    fs::write(&child, ".temp 50\n.option reltol=1e-5\n")?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(native.contains(".temp 50"), "{native}");
+    assert!(!native.contains(".temp 25"), "{native}");
+
+    // Independent catalogs have no authority over the receiving analysis,
+    // whether admitted directly or deserialized.
+    fs::write(&root, "Catalog policy\nV1 a 0 1\nR1 a 0 1k\n.op\n.end\n")?;
+    let library = compile(&child, InputFormat::HspiceLibrary)?;
+    let cached = ParsedLibrary::from_json(&library.primary.bytes)?;
+    for library in [
+        LibraryInput::Source(SourceInput::File(child.clone())),
+        LibraryInput::Parsed(cached),
+    ] {
+        let request = Request {
+            format: InputFormat::HspiceDeck,
+            input: SourceInput::File(root.clone()),
+            libraries: vec![library],
+            search_paths: Vec::new(),
+        };
+        let err = prepare(&request, &Options::default(), &Cancellation::default())
+            .expect_err("catalog global policy");
+        assert!(format!("{err:#}").contains("catalog resource"), "{err:#}");
     }
     Ok(())
 }

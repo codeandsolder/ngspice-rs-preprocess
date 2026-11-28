@@ -331,6 +331,7 @@ fn controlled_value_start(
     text: &str,
     ranges: &[std::ops::Range<usize>],
     kind: u8,
+    language: SourceDialect,
 ) -> Result<usize> {
     let token = |index: usize| ranges.get(index).map_or("", |range| &text[range.clone()]);
     let mode = token(3).to_ascii_uppercase();
@@ -364,6 +365,12 @@ fn controlled_value_start(
             .context("missing HSPICE controlled expression")?
             .start);
     }
+    if mode == "LAPLACE" && language == SourceDialect::Hspice && matches!(kind, b'E' | b'G') {
+        return Ok(ranges
+            .get(6)
+            .context("missing HSPICE Laplace coefficients")?
+            .start);
+    }
     ensure!(
         ![
             "TABLE", "LAPLACE", "FREQ", "VCR", "VCCAP", "CCCR", "CCCAP", "DELAY"
@@ -385,6 +392,7 @@ fn controlled_value_start(
 /// named 1x is legal and is not a one-mega engineering literal.
 fn map_values(
     text: &str,
+    language: SourceDialect,
     limit: usize,
     budget: &WorkBudget,
     mut map: impl FnMut(&str, usize) -> Result<String>,
@@ -438,7 +446,7 @@ fn map_values(
             Some(b'X') => assignment_start(),
             Some(b'M') => start(6),
             Some(b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => start(3),
-            Some(kind @ (b'E'..=b'H')) => controlled_value_start(text, &ranges, *kind)?,
+            Some(kind @ (b'E'..=b'H')) => controlled_value_start(text, &ranges, *kind, language)?,
             Some(b'D') => start(4),
             _ => text.len(),
         },
@@ -637,9 +645,13 @@ fn lower_card(
         _ if hspice => lower_source(text)?,
         _ => text.to_owned(),
     };
-    source = map_values(&source, limit, budget, |value, remaining| {
-        lower_spice_expression(value, context, remaining, budget)
-    })?;
+    source = map_values(
+        &source,
+        context.language,
+        limit,
+        budget,
+        |value, remaining| lower_spice_expression(value, context, remaining, budget),
+    )?;
     if matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN") {
         source = analysis::lower(&source)?;
     }
@@ -715,12 +727,44 @@ fn append_lowered_line(
     Ok(())
 }
 
+// These commands select circuit-wide policies, not electrical declarations
+// local to a resource. A foreign language override or an independent catalog
+// cannot silently acquire authority over the receiving deck's analysis.
+fn root_policy(text: &str) -> bool {
+    matches!(
+        analysis_plan::command(text).as_str(),
+        ".OPTION" | ".OPTIONS" | ".OPT" | ".TEMP" | ".OP" | ".DC" | ".AC" | ".TRAN"
+    )
+}
+
+fn validate_policy(statement: &ScopedStatement, independent_catalog: bool) -> Result<()> {
+    ensure!(
+        !root_policy(&statement.text)
+            || (!independent_catalog && statement.context.language == SourceDialect::Hspice),
+        "{}:{}: circuit-wide policy belongs to the HSPICE root deck, not {:?} {}",
+        statement.source,
+        statement.first_line,
+        statement.context.language,
+        if independent_catalog {
+            "catalog resource"
+        } else {
+            "resource"
+        }
+    );
+    Ok(())
+}
+
 fn lower_expansion(
     statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
     input_origins: Vec<crate::OriginLine>,
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<LoweredExpansion> {
+    for statement in statements.iter().skip(1) {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
+        validate_policy(statement, false)?;
+    }
     let dcap = depletion_mode(
         statements.get(1..).context("missing HSPICE deck title")?,
         budget,
@@ -772,7 +816,7 @@ fn lower_expansion(
                 statement.text.clone()
             }
         } else if analysis_plan::command(&statement.text) == ".MODEL" {
-            let (text, selection) = models::lower(
+            let (text, mut selection) = models::lower(
                 statement,
                 &scope,
                 dcap,
@@ -780,6 +824,7 @@ fn lower_expansion(
                 budget,
             )
             .with_context(|| format!("{}:{}", statement.source, statement.first_line))?;
+            selection.linked = origin.linked;
             selections.insert(origins.len(), selection);
             text
         } else {
@@ -851,6 +896,7 @@ fn add_catalog(
             .transpose()?;
         for (index, statement) in member.scoped_statements().iter().enumerate() {
             budget.charge(Resource::Statements, 1)?;
+            validate_policy(statement, true)?;
             budget.charge(Resource::ScannedBytes, statement.text.len())?;
             size = size.saturating_add(statement.text.len()).saturating_add(1);
             ensure!(
@@ -921,7 +967,11 @@ pub(super) fn prepare(
         budget,
     )?;
     let lowered = lower_expansion(&statements, origins, options.output_bytes, budget)?;
-    let (mut bytes, mut origins) = hierarchy::bind(&lowered, options.output_bytes, budget)?;
+    let hierarchy::BoundExpansion {
+        mut bytes,
+        mut origins,
+        mut dialects,
+    } = hierarchy::bind(&lowered, options.output_bytes, budget)?;
     let LoweredExpansion {
         selections, state, ..
     } = lowered;
@@ -959,12 +1009,16 @@ pub(super) fn prepare(
         )?;
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
+        dialects.splice(
+            1..1,
+            std::iter::repeat_n(SourceDialect::Native, defaults.len()),
+        );
     }
     let mut bundle = native_bundle(
         root.path.clone(),
         request.format,
         RootKind::Deck,
-        NativeProjection::plain(&bytes, RootKind::Deck, budget)?,
+        NativeProjection::bound(&bytes, RootKind::Deck, &dialects, budget)?,
         &origins,
         Some(graph),
         budget,

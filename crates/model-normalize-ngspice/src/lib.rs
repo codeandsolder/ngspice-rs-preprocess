@@ -648,12 +648,17 @@ pub struct MappedNormalization {
 pub(crate) enum SourceDialects<'a> {
     Uniform(linked_source::SourceDialect),
     Linked(&'a linked_source::LinkedSource),
+    Rows(&'a [SourceDialect]),
 }
 
 impl SourceDialects<'_> {
     pub(crate) fn at(self, line: usize) -> Result<linked_source::SourceDialect> {
         match self {
             Self::Uniform(dialect) => Ok(dialect),
+            Self::Rows(rows) => rows
+                .get(line.checked_sub(1).context("invalid source line")?)
+                .copied()
+                .context("missing row source dialect"),
             Self::Linked(linked) => linked
                 .dialect_at(line)
                 .context("missing linked source dialect"),
@@ -663,6 +668,7 @@ impl SourceDialects<'_> {
     fn includes(self, dialect: linked_source::SourceDialect) -> bool {
         match self {
             Self::Uniform(source) => source == dialect,
+            Self::Rows(rows) => rows.contains(&dialect),
             Self::Linked(linked) => linked.visits.iter().any(|visit| visit.dialect == dialect),
         }
     }
@@ -680,7 +686,7 @@ impl SourceDialects<'_> {
                     )
                 },
             ),
-            Self::Uniform(_) => format!("line {line}"),
+            Self::Uniform(_) | Self::Rows(_) => format!("line {line}"),
         }
     }
 
@@ -718,6 +724,36 @@ pub fn normalize_mapped(
     budget: &WorkBudget,
 ) -> Result<MappedNormalization> {
     normalize_selected(input, kind, SourceDialects::Uniform(dialect), None, budget)
+}
+
+/// Normalize occurrence-bound rows while retaining their source transfer
+/// syntax. Expressions and model declarations have already been bound and
+/// lowered by the producer. Do not rerun dialect-specific physical passes.
+///
+/// # Errors
+/// Invalid or unsupported bound dialect map, malformed transfer or source,
+/// or exceeded preparation budget.
+pub fn normalize_bound_mapped(
+    input: &[u8],
+    kind: linked_source::RootKind,
+    dialects: &[SourceDialect],
+    budget: &WorkBudget,
+) -> Result<MappedNormalization> {
+    anyhow::ensure!(
+        input.split_inclusive(|byte| *byte == b'\n').count() == dialects.len(),
+        "bound source dialect map is inconsistent"
+    );
+    anyhow::ensure!(
+        dialects.iter().all(|dialect| matches!(
+            dialect,
+            SourceDialect::Native
+                | SourceDialect::Hspice
+                | SourceDialect::Pspice
+                | SourceDialect::Simetrix
+        )),
+        "unqualified bound source dialect"
+    );
+    normalize_selected(input, kind, SourceDialects::Rows(dialects), None, budget)
 }
 
 /// Native emitted source and identity changes from all selected lowerers.
@@ -944,6 +980,7 @@ fn normalize_body(
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
+    let prior_origins = origins;
     let origins = if inserted_lines.is_empty() {
         None
     } else {
@@ -975,7 +1012,16 @@ fn normalize_body(
     };
     if let Some(lowered) = controlled_transfer::lower_sources(
         &bytes,
-        |line| Ok(original_line(line)? + title_lines),
+        |line| {
+            let line = original_line(line)? + title_lines;
+            let source = prior_origins.map_or(Ok(line), |mapping| {
+                mapping
+                    .get(line - 1)
+                    .copied()
+                    .context("missing prior transfer source line")
+            })?;
+            Ok((source, dialects.at(source)?))
+        },
         budget,
     )? {
         for line in lowered.inserted_lines {

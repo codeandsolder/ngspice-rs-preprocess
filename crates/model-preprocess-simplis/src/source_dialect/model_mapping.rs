@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, fmt::Write as _};
 
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::bjt_card::{BjtThermalConvention, ClassicBjtFamily};
+use model_normalize_ngspice::linked_source::LinkedLocation;
 use model_normalize_ngspice::model_card::{
     ModelCard, ModelParameter, parse_model_card, parse_parameter_fields, parse_spice_constant,
 };
@@ -163,6 +164,8 @@ pub struct Mapping {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelSelection {
     pub source: String,
+    /// Declaration identity in the combined source graph, when available.
+    pub linked: Option<LinkedLocation>,
     pub scope: Vec<String>,
     pub context: DialectContext,
     pub original: String,
@@ -693,6 +696,7 @@ impl MappingTable {
         )?;
         Ok(Some(ModelSelection {
             source: line.source.clone(),
+            linked: None,
             scope: scope.to_vec(),
             context: line.context,
             original: line.text.clone(),

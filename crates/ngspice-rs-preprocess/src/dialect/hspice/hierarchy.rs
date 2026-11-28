@@ -146,8 +146,14 @@ fn inner(expression: &str) -> &str {
         .unwrap_or_else(|| expression.trim())
 }
 
-fn bind_values(text: &str, scope: &Scope, limit: usize, budget: &WorkBudget) -> Result<String> {
-    map_values(text, limit, budget, |value, remaining| {
+fn bind_values(
+    text: &str,
+    language: SourceDialect,
+    scope: &Scope,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<String> {
+    map_values(text, language, limit, budget, |value, remaining| {
         // Explicit braces make standalone positional parameters native values;
         // the common expression scanner handles expressions without renaming
         // node/current probes, function names or assignment destinations.
@@ -638,7 +644,13 @@ impl<'a> Binder<'a> {
         if command == ".PARAM" {
             return names.calls(text);
         }
-        let bound = bind_values(text, names, self.limit, self.budget)?;
+        let bound = bind_values(
+            text,
+            self.contexts[line].language,
+            names,
+            self.limit,
+            self.budget,
+        )?;
         let bound = if command.starts_with(['D', 'M']) {
             self.model_reference(owner, &bound, command.starts_with('M'))?
         } else {
@@ -704,11 +716,17 @@ fn bound_model_library(rows: &Rows, budget: &WorkBudget) -> Result<ModelLibrary>
     ModelLibrary::parse_source_with_budget(linked.as_bytes(), RootKind::Deck, budget.clone())
 }
 
+pub(super) struct BoundExpansion {
+    pub bytes: Vec<u8>,
+    pub origins: Vec<OriginLine>,
+    pub dialects: Vec<SourceDialect>,
+}
+
 pub(super) fn bind(
     lowered: &LoweredExpansion,
     limit: usize,
     budget: &WorkBudget,
-) -> Result<(Vec<u8>, Vec<OriginLine>)> {
+) -> Result<BoundExpansion> {
     let LoweredExpansion {
         bytes,
         origins,
@@ -770,6 +788,7 @@ pub(super) fn bind(
     let rows = binder.finish(&state.mos)?;
     let mut output = Vec::new();
     let mut mapped = Vec::new();
+    let mut dialects = Vec::new();
     for (text, line) in rows {
         ensure!(
             output.len().saturating_add(text.len()).saturating_add(1) <= limit,
@@ -788,6 +807,12 @@ pub(super) fn bind(
         )?;
         output.extend_from_slice(text.as_bytes());
         output.push(b'\n');
+        dialects.push(
+            contexts
+                .get(line)
+                .context("missing bound row dialect")?
+                .language,
+        );
         mapped.push(
             origins
                 .get(line)
@@ -795,5 +820,9 @@ pub(super) fn bind(
                 .clone(),
         );
     }
-    Ok((output, mapped))
+    Ok(BoundExpansion {
+        bytes: output,
+        origins: mapped,
+        dialects,
+    })
 }

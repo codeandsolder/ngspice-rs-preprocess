@@ -301,3 +301,37 @@ fn rational_coefficients_consume_cumulative_intermediate_work() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn hspice_positional_coefficients_use_shared_rational_binding() -> Result<()> {
+    let budget = WorkBudget::default();
+    let source = super::hspice_laplace("G1 p n LAPLACE a b g, 2,0 / 1, p, 3 SCALE=2 M=4", &budget)?
+        .context("missing HSPICE transfer")?;
+    assert_eq!(source.output, OutputKind::Current);
+    assert_eq!(
+        source.control,
+        Control::Differential {
+            positive: "a".into(),
+            negative: "b".into()
+        }
+    );
+    assert_eq!(
+        resolve(&source, 5., 7.)?,
+        (vec![16., 56.], vec![3., 5., 1.])
+    );
+    for malformed in [
+        "E1 p n LAPLACE a b 1 / 0",
+        "E1 p n LAPLACE a b 1 2 / 1",
+        "E1 p n LAPLACE a b 1 / 1 / 2",
+        "E1 p n LAPLACE a b / 1",
+        "E1 p n LAPLACE a b 1 / 1 TC1=0.1",
+        "E1 p n LAPLACE a b 1 / 1 M=2",
+        "G1 p n LAPLACE a b 1 / 1 SCALE=1 SCALE=2",
+    ] {
+        assert!(
+            super::hspice_laplace(malformed, &budget).is_err(),
+            "{malformed}"
+        );
+    }
+    Ok(())
+}

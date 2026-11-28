@@ -2,7 +2,8 @@
 //! rational dynamic LAPLACE in the physical s-domain.
 use crate::{
     lexical,
-    param_expression::{SpiceExpression, rational_coefficients},
+    linked_source::SourceDialect,
+    param_expression::{MAX_RATIONAL_DEGREE, SpiceExpression, rational_coefficients},
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
@@ -333,6 +334,158 @@ fn laplace(
             denominator,
         },
     ))
+}
+
+/// HSPICE B-2008.09, chapter 9: differential LAPLACE coefficients are
+/// supplied in ascending powers of physical s. Keep them in the coefficient
+/// domain; constructing a symbolic polynomial would reinterpret a lexical
+/// coefficient named "s" as the Laplace variable.
+fn hspice_laplace(statement: &str, budget: &WorkBudget) -> Result<Option<ControlledTransfer>> {
+    let spans = lexical::tokens(statement.as_bytes())?;
+    let token = |index: usize| spans.get(index).map_or("", |span| &statement[span.clone()]);
+    if !eq(token(3), "LAPLACE") {
+        return Ok(None);
+    }
+    let output = match token(0).as_bytes().first().map(u8::to_ascii_uppercase) {
+        Some(b'E') => OutputKind::Voltage,
+        Some(b'G') => OutputKind::Current,
+        _ => return Ok(None),
+    };
+    budget.charge(Resource::ScannedBytes, statement.len())?;
+    budget.charge(Resource::EmittedBytes, statement.len())?;
+    let start = spans
+        .get(6)
+        .context("missing HSPICE Laplace coefficients")?
+        .start;
+    let tail = &statement[start..];
+    let mut balanced = lexical::Balanced::default();
+    let mut slash = None;
+    for (index, byte) in tail.bytes().enumerate() {
+        if balanced.top_level() && byte == b'/' {
+            ensure!(
+                slash.replace(index).is_none(),
+                "multiple HSPICE Laplace coefficient separators"
+            );
+        }
+        balanced.advance(byte)?;
+    }
+    balanced.finish()?;
+    let slash = slash.context("missing HSPICE Laplace coefficient separator")?;
+    let (numerator, denominator) = tail.split_at(slash);
+    let mut numerator = coefficient_list(numerator, budget)?;
+    let fields = lexical::waveform_tokens(&denominator.as_bytes()[1..])?;
+    let denominator = &denominator[1..];
+    let fields = fields
+        .iter()
+        .map(|span| &denominator[span.clone()])
+        .collect::<Vec<_>>();
+    let options = fields
+        .iter()
+        .position(|field| *field == "=")
+        .map_or(fields.len(), |index| index.saturating_sub(1));
+    let mut denominator = coefficient_values(&fields[..options], budget)?;
+    trim_leading_coefficients(&mut numerator, budget)?;
+    trim_leading_coefficients(&mut denominator, budget)?;
+    ensure!(
+        numerator.len() <= denominator.len(),
+        "improper HSPICE Laplace transfer requires explicit derivative operators"
+    );
+    scale_hspice_numerator(&mut numerator, &fields[options..], output, budget)?;
+    let transfer = Transfer::Rational {
+        numerator,
+        denominator,
+    };
+    validate_known(&transfer, budget)?;
+    Ok(Some(ControlledTransfer {
+        name: token(0).to_owned(),
+        output,
+        positive: token(1).to_owned(),
+        negative: token(2).to_owned(),
+        control: Control::Differential {
+            positive: token(4).to_owned(),
+            negative: token(5).to_owned(),
+        },
+        transfer,
+    }))
+}
+
+fn scale_hspice_numerator(
+    numerator: &mut [String],
+    options: &[&str],
+    output: OutputKind,
+    budget: &WorkBudget,
+) -> Result<()> {
+    let mut scale = None;
+    let mut multiplier = None;
+    let mut remaining = options;
+    while let [name, "=", value, rest @ ..] = remaining {
+        let target = if eq(name, "SCALE") {
+            &mut scale
+        } else if eq(name, "M") && output == OutputKind::Current {
+            &mut multiplier
+        } else {
+            bail!("unqualified HSPICE Laplace option {name}");
+        };
+        ensure!(
+            target.replace(scalar(value, budget)?).is_none(),
+            "duplicate HSPICE Laplace option {name}"
+        );
+        remaining = rest;
+    }
+    ensure!(remaining.is_empty(), "invalid HSPICE Laplace options");
+    let factors = [scale.as_deref(), multiplier.as_deref()];
+    for factor in factors.into_iter().flatten() {
+        for value in &mut *numerator {
+            // Form the product as a scalar parameter expression, never as
+            // algebra over the transform variable.
+            budget.charge(
+                Resource::EmittedBytes,
+                value.len().saturating_add(factor.len()).saturating_add(5),
+            )?;
+            *value = format!("({})*({})", scalar_body(value), scalar_body(factor));
+        }
+    }
+    Ok(())
+}
+
+fn scalar_body(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .strip_prefix('{')
+        .and_then(|v| v.strip_suffix('}'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
+}
+
+fn coefficient_list(text: &str, budget: &WorkBudget) -> Result<Vec<String>> {
+    let spans = lexical::waveform_tokens(text.as_bytes())?;
+    let fields = spans
+        .iter()
+        .map(|span| &text[span.clone()])
+        .collect::<Vec<_>>();
+    coefficient_values(&fields, budget)
+}
+
+fn coefficient_values(fields: &[&str], budget: &WorkBudget) -> Result<Vec<String>> {
+    ensure!(!fields.is_empty(), "empty HSPICE Laplace coefficient list");
+    ensure!(
+        fields.len() <= MAX_RATIONAL_DEGREE + 1,
+        "Laplace polynomial degree exceeds resource limit"
+    );
+    fields
+        .iter()
+        .rev()
+        .map(|value| scalar(value, budget))
+        .collect()
+}
+
+fn trim_leading_coefficients(values: &mut Vec<String>, budget: &WorkBudget) -> Result<()> {
+    let mut first = 0;
+    while first + 1 < values.len() && known_scalar(&values[first], budget)? == Some(0.) {
+        first += 1;
+    }
+    values.drain(..first);
+    Ok(())
 }
 
 /// Recognize an E/G transfer card without interpreting ordinary node names as
@@ -847,11 +1000,13 @@ pub struct LoweredSources {
 /// and explicitly lower FREQ and rational LAPLACE to native transfer models.
 ///
 /// Control commands, ordinary E/G cards and comments are not transformed.
+/// The callback supplies the original source line and the lexical dialect for
+/// each input statement, including after occurrence expansion.
 /// # Errors
 /// Malformed transfer cards, invalid text, or identifier allocation failure.
 pub fn lower_sources(
     input: &[u8],
-    source_line: impl Fn(usize) -> Result<usize>,
+    source_line: impl Fn(usize) -> Result<(usize, SourceDialect)>,
     budget: &model_preprocess_command::WorkBudget,
 ) -> Result<Option<LoweredSources>> {
     budget.charge(Resource::ScannedBytes, input.len())?;
@@ -888,9 +1043,14 @@ pub fn lower_sources(
         }
         let source =
             std::str::from_utf8(text).context("controlled transfer source is not UTF-8")?;
-        let line = source_line(statement.line)?;
-        let Some((transfer, wrapped)) = parse_with_layout(source, budget)
-            .with_context(|| format!("line {line}: controlled transfer"))?
+        let (line, dialect) = source_line(statement.line)?;
+        let parsed = if dialect == SourceDialect::Hspice {
+            hspice_laplace(source, budget).map(|transfer| transfer.map(|value| (value, false)))
+        } else {
+            parse_with_layout(source, budget)
+        };
+        let Some((transfer, wrapped)) =
+            parsed.with_context(|| format!("line {line}: controlled transfer"))?
         else {
             continue;
         };

@@ -210,11 +210,15 @@ ACM=12 junction mode. Geometry bins use source-order, lexical model-family
 resolution and half-open length/width intervals, with XLREF/XWREF and
 WNFLAG, rather than native fuzzy bin matching. Version-specific parameter
 inventories reject unknown fields instead of allowing a native parser to
-ignore them.
+ignore them. Differential E/G LAPLACE coefficient lists are lowered to the
+shared rational-transfer implementation in descending coefficient order,
+preserving lexical coefficient parameters, SCALE and G-source M. Foreign
+resource overrides and independently admitted catalogs cannot set the root
+deck's global analysis, temperature or option policies.
 
 This is not blanket HSPICE equivalence. Other physical variants,
 non-HSPICE model cards inside an overridden resource,
-controlled transfer extensions, statistical or multi-interval analyses
+other controlled transfer extensions, statistical or multi-interval analyses
 and unqualified output directives are diagnosed rather than guessed.
 See issues [#68](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/68),
 [#69](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/69),
