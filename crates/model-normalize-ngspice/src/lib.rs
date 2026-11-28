@@ -13,6 +13,125 @@ mod series;
 pub fn statement_token_spans(text: &str) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
     lexical::tokens(text.as_bytes())
 }
+/// Token spans for a directive with comma or whitespace field separators.
+/// Nested expressions retain their original spelling.
+/// # Errors
+/// Unbalanced expression groups or quotes.
+pub fn statement_comma_field_spans(text: &str) -> Result<Vec<std::ops::Range<usize>>> {
+    lexical::waveform_tokens(text.as_bytes())
+}
+
+/// A logical source statement and its inclusive original physical line span.
+#[derive(Debug)]
+pub struct SourceStatement {
+    /// One-based first physical line, counting a deck title.
+    pub first_line: usize,
+    /// One-based last physical line, including continuations.
+    pub last_line: usize,
+    /// Logical text without continuation separators or inline comments.
+    pub text: Vec<u8>,
+}
+
+/// Scan logical source statements with the same lexical rules used by the
+/// normalization passes.
+///
+/// A complete deck's first physical line is its title,
+/// never a statement. No source-specific expression is interpreted here.
+///
+/// # Errors
+/// Malformed source, missing deck title, or exhausted request budget.
+pub fn source_statements(
+    input: &[u8],
+    kind: linked_source::RootKind,
+    budget: &WorkBudget,
+) -> Result<Vec<SourceStatement>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    let (body, title_lines) = if kind == linked_source::RootKind::Deck {
+        let title = input
+            .split_inclusive(|byte| *byte == b'\n')
+            .next()
+            .context("source deck has no title")?;
+        (&input[title.len()..], 1)
+    } else {
+        (input, 0)
+    };
+    let normalized = lexical::normalize_nbsp(body);
+    let statements = lexical::statements(normalized.as_deref().unwrap_or(body))?;
+    budget.charge(Resource::Statements, statements.len())?;
+    budget.charge(Resource::GeneratedNodes, statements.len())?;
+    Ok(statements
+        .into_iter()
+        .map(|statement| SourceStatement {
+            first_line: statement.line + title_lines,
+            last_line: statement.last_line + title_lines,
+            text: statement.text,
+        })
+        .collect())
+}
+
+/// Remove selected fields of one logical source statement while preserving
+/// its physical lines, including wholly consumed continuation lines.
+///
+/// Spans refer to the text returned by the shared logical statement scanner.
+///
+/// # Errors
+/// Invalid physical statement or field spans, or exhausted work budget.
+pub fn remove_statement_fields(
+    input: &[u8],
+    fields: &[std::ops::Range<usize>],
+    budget: &WorkBudget,
+) -> Result<Vec<u8>> {
+    budget.charge(Resource::ScannedBytes, input.len())?;
+    let normalized = lexical::normalize_nbsp(input);
+    let input = normalized.as_deref().unwrap_or(input);
+    let mut statements = lexical::statements(input)?;
+    ensure!(
+        statements.len() == 1,
+        "field removal needs exactly one logical statement"
+    );
+    let statement = statements.pop().context("missing logical statement")?;
+    ensure!(
+        fields
+            .iter()
+            .all(|span| span.start < span.end && span.end <= statement.text.len())
+            && fields.windows(2).all(|pair| pair[0].end <= pair[1].start),
+        "invalid logical field removal spans"
+    );
+    let mut edits = Vec::new();
+    let separator = |byte: u8| byte.is_ascii_whitespace() || byte == b',';
+    let mut regions: Vec<std::ops::Range<usize>> = Vec::new();
+    for span in fields {
+        let mut start = span.start;
+        let mut end = span.end;
+        while start > 0 && separator(statement.text[start - 1]) {
+            start -= 1;
+        }
+        while end < statement.text.len() && separator(statement.text[end]) {
+            end += 1;
+        }
+        if let Some(previous) = regions.last_mut()
+            && previous.end >= start
+        {
+            previous.end = previous.end.max(end);
+        } else {
+            regions.push(start..end);
+        }
+    }
+    let replacements = regions
+        .into_iter()
+        .map(|span| {
+            let replacement = if span.end < statement.text.len() {
+                vec![b' ']
+            } else {
+                Vec::new()
+            };
+            (span, replacement)
+        })
+        .collect::<Vec<_>>();
+    lexical::replace_spans(&statement, input, &replacements, &mut edits);
+    Ok(lexical::apply_budgeted_edits(input, edits, budget)?.unwrap_or_else(|| input.to_vec()))
+}
+
 pub mod linked_source;
 pub mod ltspice;
 pub mod model_card;
@@ -29,7 +148,7 @@ pub mod vdmos_card;
 pub mod vdmos_ltspice;
 pub mod waveform;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use linked_source::SourceDialect;
 use model_preprocess_command::{Cancellation, ProcessLimits, Resource, WorkBudget, capture};
 use regex::bytes::Regex;

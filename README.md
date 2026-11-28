@@ -288,7 +288,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 11 records the explicit `power_target` capability and
+counts, dependencies and provenance. Manifest version 12 records the explicit `power_target` capability and
 includes typed PWL resistor declarations as well as
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
@@ -311,6 +311,8 @@ electrical lexical scope, including generated lines. The graph records the
 parent include, selected library section, effective dialect and declaration
 line. Specialized HSPICE output currently retains physical spans without a
 linked graph; full cross-dialect occurrence-model binding is tracked in #70.
+
+See [original analysis intent](#original-analysis-intent) for the binding contract.
 
 The combined artifact/intermediate-link byte limit defaults to 128 MiB and
 is configurable with `--max-output-bytes`. Per-source and command limits are
@@ -479,7 +481,7 @@ or capacitances, or requires unchanged internal current observations, select
 ### Original analysis intent
 
 A translated dialect deck is an electrical artifact, not an implicitly
-executable replica of the original netlist. Manifest v6 and
+executable replica of the original netlist. Manifest v12 and
 `PreparedBundle::analysis_plan` carry an ordered analysis plan alongside
 the circuit, with explicit source dialect, title, lexical scope and
 declaration locations. Complete SIMetrix decks reserve their first
@@ -496,6 +498,43 @@ operations, including periodic SIMPLIS analyses, remain visible in the
 plan. SIMPLIS transient and snapshot/output sampling semantics are
 not substituted with ordinary SPICE transient arguments.
 
+Directly linked LTspice and PSpice analysis declarations are captured in the typed
+analysis plan before electrical normalization. Each declaration retains
+its admitted source occurrence and lexical scope, including schematic
+directive origins. Independent parameter, source, temperature and model
+parameter steps are distinct from DC continuation axes. Transient timing
+is evaluated for the candidate, with output start and maximum integration
+step kept separate; source startup and steady-state policies are not UIC.
+Measurement operations preserve source waveform expressions, event
+qualifiers and previous-result dependencies in declaration order. The
+consumer must bind this analysis plan; an electrical artifact alone is
+not a complete analysis request. Native-only decks retain native analysis
+cards. Unqualified conditional and mixed-dialect analysis is diagnosed
+rather than executed with guessed semantics.
+
+PSpice STEP uses positive linear increment magnitudes even for descending
+endpoints, and explicit sweep lists preserve monotonic source order. A
+nested DC request retains its continuation axes independently of STEP
+and multi-temperature repetition. Conflicting sweep declarations are
+rejected rather than multiplied indiscriminately. PSpice transient
+operands (including SKIPBP and scheduled ceilings) retain their original
+dialect for consumer binding. Statistical Monte Carlo, distribution and
+worst-case directives require a separate realization policy; they are
+not treated as ordinary numerical sweeps.
+
+SIMetrix compatibility STEP is a single independent axis around one
+eligible analysis. Explicit general SWEEP clauses belong to their
+individual request, and distinguish an arithmetic increment (STP) from
+a total point count (LIN), logarithmic density and explicit lists.
+NUMCORES is scheduling metadata rather than a numerical setting.
+The consumer selects an analysis index and calls
+`AnalysisPlan::bind_independent_sweeps` with its lexical scalar resolver
+and shared work budget. The returned axes preserve source targets and
+declaration identities; candidate enumeration uses bounded mixed-radix
+indices, not materialized circuit copies. DC continuation axes are
+separate. Circuit/model invalidation and occurrence binding belong to
+the consuming solver, not the source grid generator.
+
 Named sweep stimuli, noise and transfer-function probes, output selectors
 and measurements retain source coordinates for binding against device
 identities and prepared current scalings. Control scripts
@@ -510,7 +549,7 @@ plan without dialect-specific bindings. Consumers implementing additional
 bindings must inspect every declaration and option disposition and resolve
 source coordinates, initialization and sampling semantics before execution.
 `native_requests()` is a filtered view, not a validation or execution API.
-Native ngspice input retains its own native executable directives.
+Native-only ngspice input retains its own executable directives.
 
 ### Analysis-scoped passive initialization
 
