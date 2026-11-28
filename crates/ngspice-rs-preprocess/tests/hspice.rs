@@ -533,7 +533,7 @@ fn segmented_transient_preserves_continuation_origins_and_candidate_axes() -> Re
     assert!(
         !native
             .lines()
-            .any(|line| line.starts_with(".tran") || line.starts_with(".op"))
+            .any(|line| matches!(line.split_whitespace().next(), Some(".tran" | ".op")))
     );
     Ok(())
 }
