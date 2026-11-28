@@ -1,4 +1,5 @@
 //! Version-specific HiSIM-HV quantum oxide-thickness correction.
+use super::smoothing::{positive, upper};
 use super::{
     HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar as Jet, PreparedHiSimHvInstance,
     PreparedHiSimHvModel, instance::model_real, lookup_slot,
@@ -28,30 +29,6 @@ pub struct HiSimHvQuantumOxidePoint {
     pub capacitance: Jet,
     pub inverse_capacitance: Jet,
     pub poisson_capacitance_factor: Jet,
-}
-fn positive(x: Jet, delta: f64) -> Jet {
-    let root = (x * x + 4. * delta * delta).sqrt();
-    if x.value >= 0. {
-        0.5 * (x + root)
-    } else {
-        2. * delta * delta / (root - x)
-    }
-}
-fn upper(x: Jet, limit: Jet, delta: f64) -> Jet {
-    let argument = limit - x - delta;
-    let product = 4. * delta * limit;
-    let product = if product.value < 0. {
-        -product
-    } else {
-        product
-    };
-    let root = (argument * argument + product).sqrt();
-    let correction = if argument.value >= 0. {
-        0.5 * (argument + root)
-    } else {
-        0.5 * product / (root - argument)
-    };
-    limit - correction
 }
 /// Prepare the original HV1/HV2 QME selector and reference threshold.
 /// # Errors

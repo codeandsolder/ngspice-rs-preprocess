@@ -1,5 +1,6 @@
 //! Native HiSIM-HV effective drain voltage and saturation smoothing.
 use super::HiSimHvIntrinsicScalar as Jet;
+use super::smoothing::positive as smooth_positive;
 use crate::{ModelError, ModelVariant};
 
 /// Inputs to the normal-mode `Vdseff` section. Derivatives use intrinsic
@@ -21,15 +22,6 @@ pub struct HiSimHvDrainSmoothingInputs {
 pub struct HiSimHvDrainSmoothingPoint {
     pub effective_drain: Jet,
     pub saturation_limit: Jet,
-}
-fn smooth_positive(value: Jet, delta: f64) -> Jet {
-    let root = value.value.hypot(2. * delta);
-    let positive = if value.value >= 0. {
-        f64::midpoint(value.value, root)
-    } else {
-        2. * delta * delta / (root - value.value)
-    };
-    value.map(positive, positive / root)
 }
 /// Evaluate the original effective channel drain bias, including the small
 /// HV2-only offset before the depletion square root.

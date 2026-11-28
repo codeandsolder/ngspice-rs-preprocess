@@ -504,7 +504,7 @@ input expressed in microns. Source `modelMKS` conversion matters:
   C rejects nonpositive **Leff/Weff** as fatal; Rust returns an error and
   rejects nonfinite dependent geometry instead of emitting NaN.
 - The short-device `WL1/WL1P`, `WL2/WL2P`, `WSTI/WSTIL/WSTIW` and `CLM5/CLM6`
-  expressions are calculated using the source **centimeter-scale LG/WG** values.
+  expressions are calculated using the source **micrometre-scale LG/WG** values.
   This geometry stage is temperature-independent despite living in `*temp.c`.
 
 `prepare_hisim_hv_temperature(model, instance, circuit_temperature_kelvin,
@@ -1017,6 +1017,22 @@ including the positive square-root smoothing and drain saturation. The
 intrinsic gradients. Zero-drain limits and depletion-mode material selection
 are tested separately. The laws accept actual intrinsic model states rather
 than inventing replacement terminal potentials.
+
+### HiSIM-HV quantum oxide, threshold shifts and poly depletion
+
+The quantum correction evaluates both native oxide-capacitance laws, including
+HV2's bias-dependent limit and its complete derivative. The prepared threshold
+law computes pocket, short-channel, narrow-channel and small-device shifts,
+including HV1 punchthrough and HV2 depletion-mode contributions. Poly depletion
+uses the native variant-specific voltage and limiting laws. The shared smooth
+clipping primitives preserve the original values and differentiate moving
+limits, using cancellation-resistant expressions.
+
+The native-reference fixtures cover 5,120 quantum oxide, 3,456 threshold and
+4,320 poly-depletion cases, with independent finite-difference gradients.
+Effective geometry uses micrometres and square micrometres for the native
+size-dependent STI and short-device expressions, not centimetres. The final
+coupled intrinsic I/Q evaluation and topology integration remain separate work.
 
 ## Reference test coverage
 

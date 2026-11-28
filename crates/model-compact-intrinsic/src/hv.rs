@@ -16,10 +16,13 @@ mod instance;
 mod junction;
 mod junction_current;
 mod lateral_field;
+mod poly_depletion;
 mod quantum_oxide;
 mod rules;
+mod smoothing;
 mod surface;
 mod temperature;
+mod threshold;
 mod transport;
 
 pub use accumulation::{
@@ -67,11 +70,15 @@ pub use lateral_field::{
     HiSimHvLateralFieldCharge, PreparedHiSimHvLateralFieldCharge,
     prepare_hisim_hv_lateral_field_charge,
 };
+pub use poly_depletion::{
+    HiSimHvPolyDepletionPoint, PreparedHiSimHvPolyDepletion, prepare_hisim_hv_poly_depletion,
+};
 pub use quantum_oxide::{
     HiSimHvQuantumOxidePoint, PreparedHiSimHvQuantumOxide, prepare_hisim_hv_quantum_oxide,
 };
 pub use surface::{HiSimHvSurfaceInputs, HiSimHvSurfacePoint, evaluate_hisim_hv_surface};
 pub use temperature::{PreparedHiSimHvTemperature, prepare_hisim_hv_temperature};
+pub use threshold::{HiSimHvThresholdPoint, PreparedHiSimHvThreshold, prepare_hisim_hv_threshold};
 pub use transport::{
     HiSimHvDepletionTransport, HiSimHvThermalBranch, HiSimHvTransportGeometry,
     PreparedHiSimHvTransport, prepare_hisim_hv_transport,
