@@ -24,7 +24,7 @@ impl<S: Scalar> Slope<S> {
 
 // Shared scalar and Taylor evaluation. All constitutive laws, including the
 // exact incremental voltage slopes, are instantiated from these equations.
-pub(crate) struct Physical<S> {
+pub struct JunctionEvaluation<S> {
     pub(crate) current: S,
     pub(crate) conductance: S,
     pub(crate) physical_current: S,
@@ -102,22 +102,25 @@ impl ExponentialJunction {
         }
         let one_minus_exp = -(-x).exp_m1();
         let log_raw = S::constant(self.log_saturation) + x + one_minus_exp.ln();
-        let (log_current, slope_factor) = knee.map_or((log_raw, S::constant(1.0)), |knee| {
-            let log_ratio = log_raw.offset(-knee.ln());
-            // log(1+exp(r)) and its sigmoid without overflow.
-            let tail = (-log_ratio.abs()).exp();
-            let positive = log_ratio.compare(0.) != Some(Ordering::Less);
-            let softplus = if positive { log_ratio } else { S::constant(0.) } + tail.ln_1p();
-            let fraction = if positive {
-                tail.offset(1.0).recip()
-            } else {
-                tail / tail.offset(1.0)
-            };
-            (
-                S::constant(0.5).mul_add(-softplus, log_raw),
-                S::constant(0.5).mul_add(-fraction, S::constant(1.0)),
-            )
-        });
+        let (log_current, slope_factor) = knee.map_or_else(
+            || (log_raw, S::constant(1.0)),
+            |knee| {
+                let log_ratio = log_raw.offset(-knee.ln());
+                // log(1+exp(r)) and its sigmoid without overflow.
+                let tail = (-log_ratio.abs()).exp();
+                let positive = log_ratio.compare(0.) != Some(Ordering::Less);
+                let softplus = if positive { log_ratio } else { S::constant(0.) } + tail.ln_1p();
+                let fraction = if positive {
+                    tail.offset(1.0).recip()
+                } else {
+                    tail / tail.offset(1.0)
+                };
+                (
+                    S::constant(0.5).mul_add(-softplus, log_raw),
+                    S::constant(0.5).mul_add(-fraction, S::constant(1.0)),
+                )
+            },
+        );
         let value = log_current.exp();
         let derivative = (log_current.offset(self.inverse_vt.ln()) + slope_factor.ln()
             - one_minus_exp.ln())
@@ -428,7 +431,7 @@ impl PreparedInstance {
     pub(crate) fn evaluate_physical<S: Scalar>(
         &self,
         voltage: S,
-    ) -> Result<Physical<S>, ModelError> {
+    ) -> Result<JunctionEvaluation<S>, ModelError> {
         if !voltage.is_finite() {
             return Err(ModelError::Invalid("junction voltage"));
         }
@@ -446,7 +449,7 @@ impl PreparedInstance {
             }
         }
         let depletion = self.depletion.evaluate(voltage);
-        let result = Physical {
+        let result = JunctionEvaluation {
             current: S::constant(self.gmin).mul_add(voltage, physical.value),
             conductance: physical.derivative.offset(self.gmin),
             physical_current: physical.value,

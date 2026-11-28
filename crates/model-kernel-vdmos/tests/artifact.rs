@@ -504,3 +504,48 @@ fn physical_taylor_reconstructs_electrothermal_laws()
     }
     Ok(())
 }
+
+#[test]
+fn taylor_selects_vgd_join_from_right_germ() -> std::result::Result<(), Box<dyn std::error::Error>>
+{
+    use model_kernel_api::taylor::{TaylorBuffer, TaylorInput};
+    for polarity in [Polarity::N, Polarity::P] {
+        let m = Model::defaults(polarity);
+        let gate = m.gate;
+        let a = artifact(Arc::new(m.prepare()?), false, [11; 16])?;
+        let prepared = a.prepare(&[1.], 300.15)?;
+        let width = a.descriptor().equations.len();
+        assert_eq!(width, 3);
+        // Both tanh and atan have the same first and third coefficients;
+        // they diverge at degree five. Q is their physical antiderivative.
+        let scale = (gate.cgdmax - gate.cgdmin) / (1. + std::f64::consts::FRAC_PI_2);
+        let mut out = TaylorBuffer::new(width, 6)?;
+        let sign = polarity.sign();
+        for direction in [-1., 1.] {
+            let mut x = [0.; 21];
+            x[0] = 4. * sign;
+            x[1] = x[0];
+            x[4] = direction * sign;
+            a.evaluate_taylor(
+                &prepared,
+                TaylorInput {
+                    order: 6,
+                    coefficients: &x,
+                },
+                &mut out.point(),
+            )?;
+            let p = out.point();
+            let expected =
+                scale * gate.a.powi(5) * if direction > 0. { 2. / 15. } else { -1. / 5. };
+            // Gate-row, drain-column entry equals minus Cgd.
+            close(p.capacitance[5 * 9 + 3], -expected, 1e-22, 1e-12);
+            close(
+                p.charge[6 * 3 + 1],
+                sign * expected * direction / 6.,
+                1e-22,
+                1e-12,
+            );
+        }
+    }
+    Ok(())
+}

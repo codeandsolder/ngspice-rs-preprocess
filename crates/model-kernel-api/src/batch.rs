@@ -258,6 +258,20 @@ impl<K: Kernel> PreparedTile<K> {
         self.artifact.evaluate_data(data, coordinates, out)
     }
 
+    /// Evaluate the exact physical Taylor germ from an existing prepared lane.
+    ///
+    /// # Errors
+    /// Invalid lane, unsupported capability/order, shape or physical domain.
+    pub fn evaluate_lane_taylor(
+        &self,
+        lane: usize,
+        input: crate::taylor::TaylorInput<'_>,
+        out: &mut crate::taylor::TaylorPoint<'_>,
+    ) -> Result<()> {
+        let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
+        self.artifact.evaluate_taylor_data(data, input, out)
+    }
+
     /// Evaluate source noise directly from the existing prepared lane.
     ///
     /// # Errors

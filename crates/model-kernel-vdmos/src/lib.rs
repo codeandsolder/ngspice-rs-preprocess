@@ -954,10 +954,10 @@ fn channel_at<S: Scalar>(
     let gate_drive = (overdrive - m.channel.subshift).scaled_softplus(slope);
     let beta_effective = beta * (1.0 + m.channel.lambda * vds) / (1.0 + m.channel.theta * vdsat);
     let vdss = vds * (mode * m.channel.mtriode);
-    let channel_normal = if gate_drive.v.compare_to(vdss.v) != Some(Ordering::Greater) {
-        beta_effective * gate_drive * gate_drive * 0.5
-    } else {
+    let channel_normal = if gate_drive.v.compare_to(vdss.v) == Some(Ordering::Greater) {
         beta_effective * vdss * (gate_drive - 0.5 * vdss)
+    } else {
+        beta_effective * gate_drive * gate_drive * 0.5
     };
     let ids = channel_normal * (polarity * mode);
 
@@ -1052,6 +1052,9 @@ impl<S: Scalar> Jet<S> {
             self.v.powf(exponent),
             self.v.powf(exponent - 1.).scale(exponent),
         )
+    }
+    fn exprel(self) -> Self {
+        self.compose(self.v.exprel(), self.v.exprel_slope())
     }
     fn max_zero(self) -> Self {
         if self.v.compare(0.) == Some(Ordering::Greater) {
@@ -1255,15 +1258,7 @@ fn pbfact<S: Scalar>(t: Jet<S>) -> Jet<S> {
 // m=1 logarithmic limit AND its temperature derivative through dm/dT.
 fn depletion_primitive<S: Scalar>(x: Jet<S>, one_minus_m: Jet<S>) -> Jet<S> {
     let logarithm = x.ln();
-    if one_minus_m.v.abs().compare(1e-4) == Some(Ordering::Less) {
-        let z = one_minus_m;
-        -logarithm
-            - 0.5 * z * logarithm * logarithm
-            - (z * z * logarithm * logarithm * logarithm) / 6.0
-            - (z * z * z * logarithm * logarithm * logarithm * logarithm) / 24.0
-    } else {
-        (1.0 - (one_minus_m * logarithm).exp()) / one_minus_m
-    }
+    -logarithm * (one_minus_m * logarithm).exprel()
 }
 
 fn depletion_charge<S: Scalar>(

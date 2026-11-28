@@ -303,3 +303,105 @@ fn physical_taylor_diode_reconstructs_full_model() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn exact_diode_join_and_full_order_exponential() -> Result<()> {
+    use model_kernel_api::{
+        batch::{LaneUpdate, PreparedTile},
+        taylor::{MAX_ORDER, TaylorBuffer, TaylorInput},
+    };
+    // At nominal temperature with no extra transport terms the exact current
+    // is Is*expm1(v/Vt), and the storage is TT*I plus depletion charge.
+    let model = compile_simetrix([("IS", 1e-12), ("TT", 3e-9)])?;
+    let a = artifact(model, Instance::default(), [9; 16])?;
+    let mut tile = PreparedTile::new(
+        &a,
+        &[(&[1., 1., 0., 0.], 300.15), (&[2., 1., 0., 0.], 300.15)],
+    )?;
+    let vt = model_kernel_diode::K_OVER_Q * 300.15;
+    let mut x = vec![0.; 2 * (MAX_ORDER + 1)];
+    x[0] = vt;
+    x[2] = vt;
+    let input = TaylorInput {
+        order: MAX_ORDER,
+        coefficients: &x,
+    };
+    let mut buffer = TaylorBuffer::new(2, MAX_ORDER)?;
+    for (lane, area) in [(0, 1.), (1, 2.)] {
+        tile.evaluate_lane_taylor(lane, input, &mut buffer.point())?;
+        let p = buffer.point();
+        let mut i = area * 1e-12 * std::f64::consts::E;
+        close(p.current[0], area * 1e-12 * 1_f64.exp_m1(), 0., 1e-13)?;
+        for k in 0..=MAX_ORDER {
+            if k > 0 {
+                i /= f64::from(u32::try_from(k)?);
+                close(p.current[2 * k], i, 0., 2e-13)?;
+                close(p.charge[2 * k], 3e-9 * i, 0., 2e-13)?;
+            }
+            close(p.conductance[4 * k], i / vt, 0., 2e-13)?;
+            close(p.capacitance[4 * k], 3e-9 * i / vt, 0., 2e-13)?;
+        }
+    }
+    let replacement = [LaneUpdate {
+        lane: 1,
+        values: &[3., 1., 0., 0.],
+        ambient_kelvin: 300.15,
+    }];
+    tile.stage_replacements(&a, &replacement)?.commit();
+    tile.evaluate_lane_taylor(1, input, &mut buffer.point())?;
+    close(
+        buffer.point().current[2],
+        3e-12 * std::f64::consts::E,
+        0.,
+        1e-13,
+    )?;
+    assert!(
+        tile.evaluate_lane_taylor(2, input, &mut buffer.point())
+            .is_err()
+    );
+
+    // FC=0 is an exact depletion join, independent of rounded temperature
+    // adjustment of VJ. Q is quadratic on the positive side and has nonzero
+    // cubic derivative on the negative side. No perturbation of v0 is used.
+    let model = compile_simetrix([
+        ("IS", 0.),
+        ("CJO", 2e-9),
+        ("VJ", 1.),
+        ("M", 0.5),
+        ("FC", 0.),
+    ])?;
+    let a = artifact(model, Instance::default(), [10; 16])?;
+    let prepared = a.prepare(&[1., 1., 0., 0.], 300.15)?;
+    let mut buffer = TaylorBuffer::new(2, 4)?;
+    for slope in [-0.1, 0.1] {
+        let coefficients = [0., 0., slope, 0., 0., 0., 0., 0., 0., 0.];
+        a.evaluate_taylor(
+            &prepared,
+            TaylorInput {
+                order: 4,
+                coefficients: &coefficients,
+            },
+            &mut buffer.point(),
+        )?;
+        let p = buffer.point();
+        close(p.charge[2], 2e-9 * slope, 0., 1e-13)?;
+        close(p.charge[4], 0.5e-9 * slope * slope, 0., 1e-13)?;
+        let cubic = if slope < 0. {
+            0.25e-9 * slope * slope * slope
+        } else {
+            0.
+        };
+        close(p.charge[6], cubic, 0., 1e-13)?;
+        close(
+            p.capacitance[8],
+            if slope < 0. {
+                0.75e-9 * slope * slope
+            } else {
+                0.
+            },
+            0.,
+            1e-13,
+        )?;
+    }
+    Ok(())
+}

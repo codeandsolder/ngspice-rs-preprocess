@@ -67,6 +67,7 @@ impl Shape {
 }
 
 /// Borrowed normalized state germ, coefficient-major then coordinate order.
+///
 /// Coefficient k is the k-th time derivative times scale^k / k!.
 /// At a join use the right-hand germ, with the exact coefficient-zero point.
 #[derive(Clone, Copy, Debug)]
@@ -100,7 +101,7 @@ pub struct TaylorPoint<'a> {
 }
 
 impl TaylorPoint<'_> {
-    fn check(&self, shape: Shape) -> Result<()> {
+    const fn check(&self, shape: Shape) -> Result<()> {
         if self.current.len() != shape.rows
             || self.charge.len() != shape.rows
             || self.conductance.len() != shape.matrices
@@ -168,6 +169,15 @@ impl<K: Kernel> Artifact<K> {
         out: &mut TaylorPoint<'_>,
     ) -> Result<()> {
         self.check(instance)?;
+        self.evaluate_taylor_data(&instance.data, input, out)
+    }
+
+    pub(super) fn evaluate_taylor_data(
+        &self,
+        data: &K::Prepared,
+        input: TaylorInput<'_>,
+        out: &mut TaylorPoint<'_>,
+    ) -> Result<()> {
         let descriptor = self.descriptor();
         let TaylorCapability::Computed { max_order } = descriptor.taylor else {
             return Err(Error::Unsupported("physical Taylor evaluation"));
@@ -192,7 +202,7 @@ impl<K: Kernel> Artifact<K> {
         for degree in 0..=input.order {
             out.point(shape, degree).reset(descriptor.charge);
         }
-        self.kernel.evaluate_taylor(&instance.data, input, out)?;
+        self.kernel.evaluate_taylor(data, input, out)?;
         for degree in 0..=input.order {
             out.point(shape, degree).validate(descriptor)?;
         }

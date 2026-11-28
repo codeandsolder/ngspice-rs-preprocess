@@ -1,5 +1,7 @@
 //! Fixed-capacity normalized Taylor arithmetic and the scalar constitutive
-//! abstraction. Constant operands broadcast without allocating or carrying
+//! abstraction.
+//!
+//! Constant operands broadcast without allocating or carrying
 //! a separate order context. Nonregular operations propagate nonfinite values
 //! that the physical output contract rejects.
 use super::MAX_ORDER;
@@ -26,17 +28,34 @@ pub trait Scalar:
     fn compare(self, boundary: f64) -> Option<Ordering>;
     fn is_zero(self) -> bool;
     fn is_finite(self) -> bool;
+    #[must_use = "scalar operations return a new value"]
     fn exp(self) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn exp_m1(self) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn ln(self) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn ln_1p(self) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn sqrt(self) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn powf(self, exponent: f64) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn mul_add(self, multiplier: Self, addend: Self) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn abs(self) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn tanh(self) -> Self;
+    #[must_use = "scalar operations return a new value"]
     fn atan(self) -> Self;
+    /// Regular continuation of expm1(x)/x through zero.
+    #[must_use = "scalar operations return a new value"]
+    fn exprel(self) -> Self;
+    /// Derivative of the same regular exponential quotient.
+    #[must_use = "scalar operations return a new value"]
+    fn exprel_slope(self) -> Self;
     fn degree(self) -> usize;
+    #[must_use = "scalar operations return a new value"]
     fn with_value(self, value: f64) -> Self;
 
     fn compare_to(self, rhs: Self) -> Option<Ordering> {
@@ -48,15 +67,37 @@ pub trait Scalar:
         }
     }
 
+    #[must_use = "scalar operations return a new value"]
     fn scale(self, factor: f64) -> Self {
         self * Self::constant(factor)
     }
+    #[must_use = "scalar operations return a new value"]
     fn offset(self, value: f64) -> Self {
         self + Self::constant(value)
     }
+    #[must_use = "scalar operations return a new value"]
     fn recip(self) -> Self {
         Self::constant(1.) / self
     }
+}
+
+// Integral of exp(value*t)*t^(moment-1) on [0,1] near zero.
+// |value| <= 1/8: 12 terms bound the omitted tail below binary64 rounding
+// even at the largest requested moment. No subtraction of nearly equal
+// exponentials and no division by a vanishing germ are needed.
+const MOMENT_LIMIT: f64 = 0.125;
+fn small_exp_moment(value: f64, moment: u32) -> f64 {
+    let mut term = 1.;
+    let mut sum = f64::from(moment).recip();
+    for n in 1..=12_u32 {
+        term *= value / f64::from(n);
+        let addition = term / f64::from(n + moment);
+        sum += addition;
+        if addition.abs() <= f64::EPSILON * sum.abs() {
+            break;
+        }
+    }
+    sum
 }
 
 impl Scalar for f64 {
@@ -105,6 +146,16 @@ impl Scalar for f64 {
     fn atan(self) -> Self {
         self.atan()
     }
+    fn exprel(self) -> Self {
+        if self == 0. { 1. } else { self.exp_m1() / self }
+    }
+    fn exprel_slope(self) -> Self {
+        if self.abs() <= MOMENT_LIMIT {
+            small_exp_moment(self, 2)
+        } else {
+            (self.exp() - self.exprel()) / self
+        }
+    }
     fn degree(self) -> usize {
         0
     }
@@ -127,7 +178,7 @@ impl Default for Series {
 }
 
 impl Series {
-    fn zero(order: usize) -> Self {
+    const fn zero(order: usize) -> Self {
         Self {
             coefficients: [0.; MAX_ORDER + 1],
             order,
@@ -171,13 +222,13 @@ impl Series {
         &self.coefficients[..=self.order]
     }
 
-    fn constant_value(value: f64) -> Self {
+    const fn constant_value(value: f64) -> Self {
         let mut series = Self::zero(0);
         series.coefficients[0] = value;
         series
     }
 
-    fn invalid(order: usize) -> Self {
+    const fn invalid(order: usize) -> Self {
         let mut result = Self::zero(order);
         result.coefficients[0] = f64::NAN;
         result
@@ -219,6 +270,26 @@ impl Series {
             result.coefficients[n] = sum / k;
         }
         result
+    }
+    fn small_exp_moment(self, moment: u32) -> Self {
+        // Coefficient k of the shifted entire function equals the integral
+        // of exp(x0*t)*t^(k+moment-1) / k!. Compose with a zero-constant
+        // germ; retaining exactly the requested polynomial order is enough.
+        let mut coefficients = [0.; MAX_ORDER + 1];
+        let mut reciprocal_factorial = 1.;
+        for (k, coefficient) in (0_u32..).zip(&mut coefficients[..=self.order]) {
+            if k != 0 {
+                reciprocal_factorial /= f64::from(k);
+            }
+            *coefficient = small_exp_moment(self.value(), moment + k) * reciprocal_factorial;
+        }
+        let delta = self.with_value(0.);
+        coefficients[..=self.order]
+            .iter()
+            .rev()
+            .fold(Self::constant(0.), |sum, &coefficient| {
+                sum * delta + Self::constant(coefficient)
+            })
     }
 }
 
@@ -377,23 +448,33 @@ impl Scalar for Series {
         if exponent.fract() != 0. || !exponent.is_finite() {
             return Self::invalid(self.order);
         }
-        // For zero base any integer exponent above the retained order gives
-        // an identically zero retained polynomial. Negative powers are poles.
-        if self.value() == 0. && exponent > 64. {
-            return Self::zero(self.order);
+        if self.value() < 0. {
+            let magnitude = (-self).powf(exponent);
+            return if exponent.rem_euclid(2.) == 0. {
+                magnitude
+            } else {
+                -magnitude
+            };
         }
-        if exponent.abs() > f64::from(u32::MAX) {
+        // A nonconstant germ at zero has valuation at least one. Integer
+        // powers above the retained order vanish; negative powers are poles.
+        if exponent < 0. {
             return Self::invalid(self.order);
         }
-        let mut remaining = exponent.abs();
-        let mut base = if exponent < 0. { self.recip() } else { self };
+        let Some(mut remaining) = (1_u32..)
+            .take(self.order)
+            .find(|&n| f64::from(n).to_bits() == exponent.to_bits())
+        else {
+            return Self::zero(self.order);
+        };
+        let mut base = self;
         let mut result = Self::constant(1.);
-        while remaining >= 1. {
-            if remaining % 2. == 1. {
+        while remaining != 0 {
+            if remaining & 1 != 0 {
                 result = result * base;
             }
-            remaining = (remaining * 0.5).floor();
-            if remaining >= 1. {
+            remaining >>= 1;
+            if remaining != 0 {
                 base = base * base;
             }
         }
@@ -443,6 +524,26 @@ impl Scalar for Series {
         };
         self.compose_derivative(self.value().atan(), slope)
     }
+    fn exprel(self) -> Self {
+        if self.is_constant() {
+            return Self::constant(self.value().exprel());
+        }
+        if self.value().abs() <= MOMENT_LIMIT {
+            self.small_exp_moment(1).with_value(self.value().exprel())
+        } else {
+            self.exp_m1() / self
+        }
+    }
+    fn exprel_slope(self) -> Self {
+        if self.is_constant() {
+            return Self::constant(self.value().exprel_slope());
+        }
+        if self.value().abs() <= MOMENT_LIMIT {
+            self.small_exp_moment(2)
+        } else {
+            (self.exp() - self.exprel()) / self
+        }
+    }
     fn degree(self) -> usize {
         self.order
     }
@@ -474,6 +575,28 @@ mod tests {
             }
             assert!((e.coefficient(k) / expected - 1.).abs() < 3e-14);
             assert_eq!(geometric.coefficient(k).to_bits(), 1_f64.to_bits());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn regular_exponential_quotient_retains_all_orders() -> Result<()> {
+        let x = Series::from_coefficients(
+            [0., 1.]
+                .into_iter()
+                .chain(std::iter::repeat_n(0., MAX_ORDER - 1)),
+        )?;
+        let y = x.exprel();
+        let slope = x.exprel_slope();
+        let mut reciprocal_factorial = 1.;
+        for (k, degree) in (0..=MAX_ORDER).zip(0_u32..) {
+            if degree != 0 {
+                reciprocal_factorial /= f64::from(degree);
+            }
+            let expected = reciprocal_factorial / f64::from(degree + 1);
+            let expected_slope = reciprocal_factorial / f64::from(degree + 2);
+            assert!((y.coefficient(k) / expected - 1.).abs() < 3e-14);
+            assert!((slope.coefficient(k) / expected_slope - 1.).abs() < 3e-14);
         }
         Ok(())
     }

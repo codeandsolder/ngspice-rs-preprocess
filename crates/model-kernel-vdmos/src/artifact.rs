@@ -138,8 +138,43 @@ pub fn artifact(
     )
 }
 
-// Analytic local derivatives, propagated through the coordinate conversion
-// and elementary branch assembly. No independent physical model is copied.
+// The local bias coordinates are affine functions of the terminal and
+// hidden state. Their incidence derivatives are scalar constants, not series.
+// Keep that mapping compact and lift only the nonlinear partial derivatives.
+#[derive(Clone, Copy)]
+struct Coordinate<S> {
+    value: S,
+    incidence: [f64; MAX_ROWS],
+}
+
+impl<S: Scalar> Coordinate<S> {
+    const fn constant(value: S) -> Self {
+        Self {
+            value,
+            incidence: [0.; MAX_ROWS],
+        }
+    }
+    const fn bound(value: S, row: usize) -> Self {
+        let mut result = Self::constant(value);
+        result.incidence[row] = 1.;
+        result
+    }
+    fn minus(self, other: Self) -> Self {
+        let mut incidence = self.incidence;
+        for (dst, src) in incidence.iter_mut().zip(other.incidence) {
+            *dst -= src;
+        }
+        Self {
+            value: self.value - other.value,
+            incidence,
+        }
+    }
+    fn scale(self, factor: S) -> Differential<S> {
+        Differential::compose(self.value * factor, [(self, factor)])
+    }
+}
+
+// Analytic local derivatives through the nonlinear branch assembly.
 #[derive(Clone, Copy)]
 struct Differential<S = f64> {
     value: S,
@@ -147,46 +182,42 @@ struct Differential<S = f64> {
 }
 
 impl<S: Scalar> Differential<S> {
-    fn constant(value: S) -> Self {
-        Self {
-            value,
-            derivative: [S::constant(0.); MAX_ROWS],
-        }
-    }
-    fn coordinate(value: S, row: usize) -> Self {
-        let mut result = Self::constant(value);
-        result.derivative[row] = S::constant(1.);
-        result
-    }
-    fn compose<const N: usize>(value: S, terms: [(Self, S); N]) -> Self {
-        let mut result = Self::constant(value);
+    fn compose<const N: usize>(value: S, terms: [(Coordinate<S>, S); N]) -> Self {
+        let mut derivative = [S::constant(0.); MAX_ROWS];
         for (input, slope) in terms {
-            for (dst, dx) in result.derivative.iter_mut().zip(input.derivative) {
-                *dst = slope.mul_add(dx, *dst);
+            for (dst, dx) in derivative.iter_mut().zip(input.incidence) {
+                *dst = slope.mul_add(S::constant(dx), *dst);
             }
         }
-        result
+        Self { value, derivative }
     }
-    fn minus(self, other: Self) -> Self {
-        Self::compose(
-            self.value - other.value,
-            [(self, S::constant(1.)), (other, S::constant(-1.))],
-        )
+    fn minus(mut self, other: Self) -> Self {
+        self.value = self.value - other.value;
+        for (dst, src) in self.derivative.iter_mut().zip(other.derivative) {
+            *dst = *dst - src;
+        }
+        self
     }
-    fn plus(self, other: Self) -> Self {
-        Self::compose(
-            self.value + other.value,
-            [(self, S::constant(1.)), (other, S::constant(1.))],
-        )
+    fn plus(mut self, other: Self) -> Self {
+        self.value = self.value + other.value;
+        for (dst, src) in self.derivative.iter_mut().zip(other.derivative) {
+            *dst = *dst + src;
+        }
+        self
     }
-    fn times(self, other: Self) -> Self {
-        Self::compose(
-            self.value * other.value,
-            [(self, other.value), (other, self.value)],
-        )
+    fn times(mut self, other: Self) -> Self {
+        for (dst, src) in self.derivative.iter_mut().zip(other.derivative) {
+            *dst = self.value.mul_add(src, *dst * other.value);
+        }
+        self.value = self.value * other.value;
+        self
     }
-    fn scale(self, factor: S) -> Self {
-        Self::compose(self.value * factor, [(self, factor)])
+    fn scale(mut self, factor: S) -> Self {
+        self.value = self.value * factor;
+        for dst in &mut self.derivative {
+            *dst = *dst * factor;
+        }
+        self
     }
 }
 
@@ -252,13 +283,13 @@ impl Stamp<Series> for TaylorAssembly<'_, '_> {
 
 struct OperatingPoint<S = f64> {
     bias: Bias<S>,
-    vgs: Differential<S>,
-    vds: Differential<S>,
-    external_vds: Differential<S>,
-    diode: Differential<S>,
-    recovery: Differential<S>,
-    temperature: Differential<S>,
-    coordinates: [Differential<S>; MAX_ROWS],
+    vgs: Coordinate<S>,
+    vds: Coordinate<S>,
+    external_vds: Coordinate<S>,
+    diode: Coordinate<S>,
+    recovery: Coordinate<S>,
+    temperature: Coordinate<S>,
+    coordinates: [Coordinate<S>; MAX_ROWS],
 }
 
 impl VdmosKernel {
@@ -270,9 +301,9 @@ impl VdmosKernel {
         if x.len() != self.layout.width {
             return Err(Error::Shape("VDMOS coordinate count"));
         }
-        let mut coordinates = [Differential::constant(S::constant(0.)); MAX_ROWS];
+        let mut coordinates = [Coordinate::constant(S::constant(0.)); MAX_ROWS];
         for (index, (slot, &value)) in coordinates.iter_mut().zip(x).enumerate() {
-            *slot = Differential::coordinate(value, index);
+            *slot = Coordinate::bound(value, index);
         }
         let [d, g, s] = self.layout.intrinsic.map(|index| coordinates[index]);
         let [de, _, se] = self.layout.external.map(|index| coordinates[index]);
@@ -283,9 +314,9 @@ impl VdmosKernel {
         let recovery = self
             .layout
             .recovery
-            .map_or(Differential::constant(S::constant(0.)), |i| coordinates[i]);
+            .map_or_else(|| Coordinate::constant(S::constant(0.)), |i| coordinates[i]);
         let temperature = self.layout.thermal.map_or_else(
-            || Differential::constant(S::constant(prepared.ambient_kelvin)),
+            || Coordinate::constant(S::constant(prepared.ambient_kelvin)),
             |[j, _]| coordinates[j],
         );
         if let Some([_, case]) = self.layout.thermal
@@ -446,7 +477,9 @@ impl VdmosKernel {
             let value = conductance
                 .value
                 .ok_or_else(|| Error::Domain("series branch collapsed at bias".into()))?;
-            let drop = point.coordinates[external].minus(point.coordinates[internal]);
+            let drop = point.coordinates[external]
+                .minus(point.coordinates[internal])
+                .scale(S::constant(1.));
             let differential_g = Differential::compose(
                 value,
                 [
@@ -482,7 +515,7 @@ impl VdmosKernel {
             out.add(
                 case,
                 tcase
-                    .minus(Differential::constant(S::constant(ambient)))
+                    .minus(Coordinate::constant(S::constant(ambient)))
                     .scale(evaluation.heat.case_to_ambient),
                 false,
             );
