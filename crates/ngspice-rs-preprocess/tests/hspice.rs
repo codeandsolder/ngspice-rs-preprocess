@@ -1501,3 +1501,88 @@ M2 pm g 0 0 pmos L=1u W=2u
     }
     Ok(())
 }
+
+#[test]
+fn pspice_transfers_bind_coefficients_without_rebinding_laplace_or_electrical_names() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("filters.lib");
+    fs::write(
+        &child,
+        r#"*#PSPICE
+.subckt filter s gnd out gout tab freq params: gain=2 tau=1m
+.param s=99
+E1 out gnd LAPLACE {V(s,gnd)} = {gain/(1+s*tau)}
+G1 gout gnd LAPLACE {V(s,gnd)} = {gain/(1+s*tau)}
+E2 tab gnd TABLE {V(s,gnd)} = (0,0) (2,{2*gain})
+E3 freq gnd FREQ {V(s,gnd)} R_I (100,{gain},0) (500,0,{gain})
+.ends filter
+"#,
+    )?;
+    fs::write(
+        &root,
+        r#"Mixed scoped transfer functions
+.option parhier=local
+.inc filters.lib
+V1 input ref DC 1 AC 1
+Vref ref 0 2
+X1 input ref o1 g1 t1 f1 filter gain=2 tau=1m
+X2 input ref o2 g2 t2 f2 filter gain=3 tau=2m
+R1 o1 ref 1k
+R2 o2 ref 1k
+Rg1 g1 ref 1
+Rg2 g2 ref 1
+Rt1 t1 ref 1k
+Rt2 t2 ref 1k
+Rf1 f1 ref 1k
+Rf2 f2 ref 1k
+.end
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing transfer provenance");
+    };
+    assert_eq!(native.lines().count(), lines.len());
+    assert_eq!(native.matches("s_xfer").count(), 4);
+    let path = child.canonicalize()?;
+    for (line, origin) in native.lines().zip(lines) {
+        if line.contains("s_xfer") || line.contains(" xfer ") {
+            assert_eq!(origin.source, path);
+            assert!((4..=7).contains(&origin.line));
+        }
+    }
+    measure_native(
+        dir.path(),
+        native,
+        "op\nwrdata op.dat v(o1,ref) v(g1,ref) v(t1,ref) v(o2,ref) v(g2,ref) v(t2,ref)\nac lin 2 100 500\nwrdata ac.dat v(o1,ref) v(g1,ref) v(f1,ref) v(o2,ref) v(g2,ref) v(f2,ref)",
+    )?;
+    let op = values(dir.path(), "op.dat")?;
+    for (&actual, expected) in op[0][1..].iter().zip([2., -2., 2., 3., -3., 3.]) {
+        ensure!((actual - expected).abs() <= 1e-8, "{op:?}\n{native}");
+    }
+    let ac = values(dir.path(), "ac.dat")?;
+    assert_eq!(ac.len(), 2);
+    for row in ac {
+        let frequency = row[0];
+        for (index, gain, tau) in [(1, 2., 0.001), (7, 3., 0.002)] {
+            let omega = std::f64::consts::TAU * frequency * tau;
+            let re = gain / omega.mul_add(omega, 1.);
+            let im = -re * omega;
+            let (freq_re, freq_im) = if frequency < 300. {
+                (gain, 0.)
+            } else {
+                (0., gain)
+            };
+            for (&actual, expected) in row[index..index + 6]
+                .iter()
+                .zip([re, im, -re, -im, freq_re, freq_im])
+            {
+                ensure!((actual - expected).abs() <= 1e-8, "{row:?}\n{native}");
+            }
+        }
+    }
+    Ok(())
+}

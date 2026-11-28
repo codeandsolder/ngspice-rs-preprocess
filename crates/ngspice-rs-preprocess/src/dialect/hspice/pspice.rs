@@ -43,6 +43,7 @@ pub(super) fn project(
         origins,
         contexts,
         mut selections,
+        transfers,
         state,
     } = input;
     budget.charge(Resource::GeneratedNodes, contexts.len())?;
@@ -64,6 +65,7 @@ pub(super) fn project(
         origins: Vec::new(),
         contexts: Vec::new(),
         selections: SelectedModels::new(),
+        transfers,
         state,
     };
     for (text, line) in std::str::from_utf8(&projected.mapped.model.bytes)?
@@ -112,6 +114,11 @@ pub(super) fn project(
             };
             output.selections.insert(output.origins.len(), selection);
         }
+        if analysis_plan::command(&text).starts_with(['E', 'G'])
+            && let Some(transfer) = projected.pspice_transfers.remove(&line)
+        {
+            output.transfers.insert(output.origins.len(), transfer);
+        }
         budget.charge(Resource::EmittedBytes, origin.source.as_os_str().len())?;
         super::append_lowered_line(
             &mut output.bytes,
@@ -124,7 +131,9 @@ pub(super) fn project(
         output.contexts.push(context);
     }
     ensure!(
-        selections.is_empty() && projected.pspice_junctions.is_empty(),
+        selections.is_empty()
+            && projected.pspice_junctions.is_empty()
+            && projected.pspice_transfers.is_empty(),
         "unconsumed projected model selections"
     );
     Ok(output)

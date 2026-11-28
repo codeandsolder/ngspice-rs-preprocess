@@ -8,6 +8,7 @@
 
 use crate::{
     MappedNormalization, NativeNormalization, NormalizationPass, RenamedDevice, SourceDialects,
+    controlled_transfer::{self, ControlledTransfer},
     lexical::{self, Edit},
     linked_source::{RootKind, SourceDialect},
     model_card::{ModelCard, parse_parameter_fields, parse_spice_constant},
@@ -59,10 +60,16 @@ struct Functions {
     options: options::GlobalOptions,
     renamed: Vec<RenamedDevice>,
     junctions: BTreeMap<usize, JunctionProjection>,
+    transfers: Option<BTreeMap<usize, ControlledTransfer>>,
 }
 
 impl Functions {
-    fn new(input: &[u8], scopes: Scopes, options: options::GlobalOptions) -> Result<Self> {
+    fn new(
+        input: &[u8],
+        scopes: Scopes,
+        options: options::GlobalOptions,
+        defer_transfers: bool,
+    ) -> Result<Self> {
         let mut identifiers = crate::IdentifierAllocator::new(input, scopes.budget())?;
         let mut names = BTreeMap::new();
         for (name, _) in FUNCTIONS {
@@ -92,7 +99,37 @@ impl Functions {
             options,
             renamed: Vec::new(),
             junctions: BTreeMap::new(),
+            transfers: defer_transfers.then(BTreeMap::new),
         })
+    }
+
+    fn defer_transfer(&mut self, text: &str, line: usize) -> Result<bool> {
+        if self.transfers.is_none() {
+            return Ok(false);
+        }
+        let Some(mut transfer) =
+            controlled_transfer::parse_with_budget(text, self.scopes.budget())?
+        else {
+            return Ok(false);
+        };
+        let local = self.scopes.local_ground(self.scope);
+        transfer.map_nodes(|node| {
+            nodes::project_node(node, &self.ground, local, |name| {
+                self.scopes.hierarchical_ground(self.scope, name)
+            })
+            .unwrap_or_else(|| node.to_owned())
+        });
+        transfer.map_expressions(|expression| {
+            let expression = self.expression(expression, false)?;
+            nodes::rewrite(&expression, local, &self.ground, true, |node| {
+                self.scopes.hierarchical_ground(self.scope, node)
+            })
+        })?;
+        self.transfers
+            .as_mut()
+            .context("missing deferred transfers")?
+            .insert(line, transfer);
+        Ok(true)
     }
 
     fn allocate(&mut self, base: &str) -> Result<String> {
@@ -669,6 +706,7 @@ struct LoweredBody {
     definitions: (String, Vec<usize>),
     renamed: Vec<RenamedDevice>,
     junctions: BTreeMap<usize, JunctionProjection>,
+    transfers: BTreeMap<usize, ControlledTransfer>,
 }
 
 fn rewrite_statements(
@@ -716,6 +754,16 @@ fn rewrite_statements(
             })?
         } else {
             functions.scope = functions.scopes.scope(statement.line)?;
+            if functions.defer_transfer(text, statement.line)? {
+                // Keep the declaration row for provenance and hierarchy,
+                // but carry the physical transfer separately.
+                functions
+                    .scopes
+                    .budget()
+                    .charge(Resource::EmittedBytes, text.len())?;
+                rewritten_statements.push(text.to_owned());
+                continue;
+            }
             let text = instances::rewrite(
                 text,
                 functions.scopes.local_ground(functions.scope),
@@ -764,12 +812,13 @@ fn lower_body(
     origins: &[usize],
     dialects: SourceDialects<'_>,
     budget: &WorkBudget,
+    defer_transfers: bool,
 ) -> Result<LoweredBody> {
     budget.charge(Resource::ScannedBytes, body.len())?;
     let statements = lexical::statements(body)?;
     let scopes = Scopes::collect(&statements, origins, dialects, budget)?;
     let options = options::GlobalOptions::collect(&statements)?;
-    let mut functions = Functions::new(body, scopes, options)?;
+    let mut functions = Functions::new(body, scopes, options, defer_transfers)?;
     let rewritten_statements = rewrite_statements(&statements, &mut functions, origins, dialects)?;
     let mut edits: Vec<Edit> = Vec::new();
     let mut inserted = BTreeMap::<usize, usize>::new();
@@ -831,6 +880,7 @@ fn lower_body(
         definitions: functions.definitions()?,
         renamed: functions.renamed,
         junctions: functions.junctions,
+        transfers: functions.transfers.unwrap_or_default(),
     })
 }
 
@@ -875,7 +925,7 @@ pub fn project_rows(
     );
     budget.charge(Resource::GeneratedNodes, count)?;
     budget.charge(Resource::EmittedBytes, input.len())?;
-    lower_mapped(
+    project_mapped(
         MappedNormalization {
             model: crate::NormalizedModel {
                 bytes: input.to_vec(),
@@ -887,6 +937,7 @@ pub fn project_rows(
         kind,
         SourceDialects::Rows(dialects),
         budget,
+        true,
     )
 }
 
@@ -895,6 +946,16 @@ pub(crate) fn lower_mapped(
     kind: RootKind,
     dialects: SourceDialects<'_>,
     budget: &WorkBudget,
+) -> Result<NativeNormalization> {
+    project_mapped(shared, kind, dialects, budget, false)
+}
+
+fn project_mapped(
+    shared: MappedNormalization,
+    kind: RootKind,
+    dialects: SourceDialects<'_>,
+    budget: &WorkBudget,
+    defer_transfers: bool,
 ) -> Result<NativeNormalization> {
     budget.charge(Resource::EmittedBytes, shared.model.bytes.len())?;
     let first = usize::from(kind == RootKind::Deck);
@@ -914,11 +975,13 @@ pub(crate) fn lower_mapped(
         definitions: (definitions, definition_lines),
         mut renamed,
         junctions,
+        transfers,
     } = lower_body(
         &shared.model.bytes[title_end..],
         &shared.input_lines[first..],
         dialects,
         budget,
+        defer_transfers,
     )?;
     for device in &mut renamed {
         device.input_line = *shared
@@ -934,6 +997,16 @@ pub(crate) fn lower_mapped(
                 .get(first + line - 1)
                 .context("missing PSpice model declaration origin")?;
             Ok((original, selection))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let transfers = transfers
+        .into_iter()
+        .map(|(line, transfer)| {
+            let original = *shared
+                .input_lines
+                .get(first + line - 1)
+                .context("missing PSpice transfer origin")?;
+            Ok((original, transfer))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     budget.charge(
@@ -978,5 +1051,6 @@ pub(crate) fn lower_mapped(
         },
         renamed,
         pspice_junctions: junctions,
+        pspice_transfers: transfers,
     })
 }

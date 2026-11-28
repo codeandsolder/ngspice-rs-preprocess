@@ -767,6 +767,98 @@ impl ControlledTransfer {
     }
 }
 
+impl ControlledTransfer {
+    /// Transform scalar coefficients and runtime control expressions, leaving
+    /// electrical identities and the already separated Laplace variable alone.
+    ///
+    /// # Errors
+    /// The caller's expression projection or budget fails.
+    pub fn map_expressions(&mut self, mut map: impl FnMut(&str) -> Result<String>) -> Result<()> {
+        if let Control::Expression(expression) = &mut self.control {
+            *expression = map(expression)?;
+        }
+        match &mut self.transfer {
+            Transfer::Table { points, multiplier } => {
+                for value in points.iter_mut().flatten().chain(multiplier.iter_mut()) {
+                    *value = map(value)?;
+                }
+            }
+            Transfer::Frequency { points, .. } => {
+                for value in points.iter_mut().flatten() {
+                    *value = map(value)?;
+                }
+            }
+            Transfer::Rational {
+                numerator,
+                denominator,
+            } => {
+                for value in numerator.iter_mut().chain(denominator) {
+                    *value = map(value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Map only explicit electrical nodes; probes inside expressions are
+    /// handled by the expression projector.
+    pub fn map_nodes(&mut self, mut map: impl FnMut(&str) -> String) {
+        self.positive = map(&self.positive);
+        self.negative = map(&self.negative);
+        match &mut self.control {
+            Control::Differential { positive, negative } => {
+                *positive = map(positive);
+                *negative = map(negative);
+            }
+            Control::Node(node) => *node = map(node),
+            Control::Expression(_) => (),
+        }
+    }
+}
+
+/// Emit already-bound transfers through the same physical native lowering
+/// used for standalone decks, with a deck-wide collision-free namespace.
+pub struct TransferEmitter<'a> {
+    input: &'a [u8],
+    used: Option<super::IdentifierAllocator>,
+    serial: usize,
+    budget: &'a WorkBudget,
+}
+
+impl<'a> TransferEmitter<'a> {
+    /// Reserve identifiers lazily, only when a transfer requires them.
+    #[must_use]
+    pub const fn new(input: &'a [u8], budget: &'a WorkBudget) -> Self {
+        Self {
+            input,
+            used: None,
+            serial: 0,
+            budget,
+        }
+    }
+
+    /// Render a typed bound transfer without reparsing its source dialect.
+    ///
+    /// # Errors
+    /// Invalid transfer or exhausted resource budget.
+    pub fn emit(&mut self, transfer: &ControlledTransfer) -> Result<String> {
+        self.serial = self
+            .serial
+            .checked_add(1)
+            .context("transfer serial overflow")?;
+        validate_known(&transfer.transfer, self.budget)?;
+        emit_lowered_transfer(
+            transfer,
+            true,
+            self.input,
+            &mut self.used,
+            self.serial,
+            self.budget,
+        )?
+        .context("missing bound transfer output")
+    }
+}
+
 fn native_scalar(value: &str) -> std::borrow::Cow<'_, str> {
     if crate::model_card::parse_spice_constant(value).is_ok() || value.starts_with('{') {
         std::borrow::Cow::Borrowed(value)

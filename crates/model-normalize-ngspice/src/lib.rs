@@ -767,6 +767,8 @@ pub struct NativeNormalization {
     pub renamed: Vec<RenamedDevice>,
     /// Typed PSpice junction declarations keyed by the original input line.
     pub pspice_junctions: std::collections::BTreeMap<usize, pspice::JunctionProjection>,
+    /// Source transfers retained for occurrence binding instead of native emission.
+    pub pspice_transfers: BTreeMap<usize, controlled_transfer::ControlledTransfer>,
 }
 
 /// A declaration whose designator changed during native lowering.
@@ -842,7 +844,8 @@ pub fn normalize_linked(
         Ok(NativeNormalization {
             mapped,
             renamed: Vec::new(),
-            pspice_junctions: std::collections::BTreeMap::new(),
+            pspice_junctions: BTreeMap::new(),
+            pspice_transfers: BTreeMap::new(),
         })
     }
 }

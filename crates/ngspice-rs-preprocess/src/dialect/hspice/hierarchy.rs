@@ -5,6 +5,7 @@ use super::{LoweredExpansion, SelectedModels, analysis_plan, map_values, models,
 use crate::OriginLine;
 use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
+    controlled_transfer::{ControlledTransfer, TransferEmitter},
     linked_source::RootKind,
     model_card::{parse_assignments, parse_model_card, positional_prefix},
     parameter_scope::{ModelLibrary, SubcircuitIndex},
@@ -278,6 +279,8 @@ struct Binder<'a> {
     lines: &'a [&'a str],
     contexts: &'a [DialectContext],
     selections: &'a SelectedModels,
+    transfers: &'a BTreeMap<usize, ControlledTransfer>,
+    transfer_emitter: TransferEmitter<'a>,
     definitions: Vec<Definition>,
     known_functions: Arc<BTreeSet<String>>,
     precedence: Precedence,
@@ -634,6 +637,31 @@ impl<'a> Binder<'a> {
         Ok(call)
     }
 
+    fn bind_transfer(
+        &mut self,
+        line: usize,
+        names: &Scope,
+        multiplier: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(transfer) = self.transfers.get(&line) else {
+            return Ok(None);
+        };
+        // Clone once per physical occurrence; its coefficients and control
+        // expression are bound in that occurrence, not the declaration's
+        // caller or the native simulator's global scope.
+        self.budget
+            .charge(Resource::EmittedBytes, self.lines[line].len())?;
+        let mut transfer = transfer.clone();
+        transfer.map_expressions(|value| names.expression(value))?;
+        let native = self.transfer_emitter.emit(&transfer)?;
+        let result = if let Some((head, tail)) = native.split_once('\n') {
+            format!("{}\n{tail}", multiplier_card(head, multiplier)?)
+        } else {
+            multiplier_card(&native, multiplier)?
+        };
+        Ok(Some(result))
+    }
+
     fn card(
         &mut self,
         owner: usize,
@@ -654,6 +682,9 @@ impl<'a> Binder<'a> {
         }
         if command == ".PARAM" {
             return names.calls(text);
+        }
+        if let Some(transfer) = self.bind_transfer(line, names, multiplier)? {
+            return Ok(transfer);
         }
         let bound = bind_values(
             text,
@@ -779,6 +810,7 @@ pub(super) fn bind(
         origins,
         contexts,
         selections,
+        transfers,
         state,
     } = lowered;
     budget.charge(Resource::ScannedBytes, bytes.len())?;
@@ -818,6 +850,8 @@ pub(super) fn bind(
         lines: &lines,
         contexts,
         selections,
+        transfers,
+        transfer_emitter: TransferEmitter::new(bytes, budget),
         definitions,
         known_functions,
         precedence: state.parhier.unwrap_or_default(),
@@ -833,39 +867,51 @@ pub(super) fn bind(
         limit,
     };
     let rows = binder.finish(&state.mos)?;
+    project_bound_rows(rows, origins, contexts, limit, budget)
+}
+
+fn project_bound_rows(
+    rows: Rows,
+    origins: &[OriginLine],
+    contexts: &[DialectContext],
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<BoundExpansion> {
     let mut output = Vec::new();
     let mut mapped = Vec::new();
     let mut dialects = Vec::new();
     for (text, line) in rows {
-        ensure!(
-            output.len().saturating_add(text.len()).saturating_add(1) <= limit,
-            "HSPICE occurrence output byte budget exceeded"
-        );
-        budget.charge(Resource::EmittedBytes, text.len().saturating_add(1))?;
-        budget.charge(Resource::GeneratedNodes, 1)?;
-        budget.charge(
-            Resource::EmittedBytes,
-            origins
-                .get(line)
-                .context("invalid HSPICE occurrence origin")?
-                .source
-                .as_os_str()
-                .len(),
-        )?;
-        output.extend_from_slice(text.as_bytes());
-        output.push(b'\n');
-        dialects.push(
-            contexts
-                .get(line)
-                .context("missing bound row dialect")?
-                .language,
-        );
-        mapped.push(
-            origins
-                .get(line)
-                .context("invalid HSPICE occurrence origin")?
-                .clone(),
-        );
+        for text in text.split('\n') {
+            ensure!(
+                output.len().saturating_add(text.len()).saturating_add(1) <= limit,
+                "HSPICE occurrence output byte budget exceeded"
+            );
+            budget.charge(Resource::EmittedBytes, text.len().saturating_add(1))?;
+            budget.charge(Resource::GeneratedNodes, 1)?;
+            budget.charge(
+                Resource::EmittedBytes,
+                origins
+                    .get(line)
+                    .context("invalid HSPICE occurrence origin")?
+                    .source
+                    .as_os_str()
+                    .len(),
+            )?;
+            output.extend_from_slice(text.as_bytes());
+            output.push(b'\n');
+            dialects.push(
+                contexts
+                    .get(line)
+                    .context("missing bound row dialect")?
+                    .language,
+            );
+            mapped.push(
+                origins
+                    .get(line)
+                    .context("invalid HSPICE occurrence origin")?
+                    .clone(),
+            );
+        }
     }
     Ok(BoundExpansion {
         bytes: output,

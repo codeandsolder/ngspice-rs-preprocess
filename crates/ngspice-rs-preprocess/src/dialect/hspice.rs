@@ -10,6 +10,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
     SourceStatement,
+    controlled_transfer::ControlledTransfer,
     linked_source::{LinkLimits, LinkedSource, RootKind, SourceLinker},
     model_card::{
         FunctionSignature, parse_function_signature, parse_parameter_declarations,
@@ -752,6 +753,7 @@ struct LoweredExpansion {
     contexts: Vec<DialectContext>,
     /// Keys index the emitted logical source rows before occurrence binding.
     selections: SelectedModels,
+    transfers: BTreeMap<usize, ControlledTransfer>,
     state: DeckOptions,
 }
 
@@ -922,6 +924,7 @@ fn lower_expansion(
         origins,
         contexts,
         selections,
+        transfers: BTreeMap::new(),
         state,
     })
 }

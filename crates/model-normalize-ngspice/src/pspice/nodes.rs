@@ -5,6 +5,22 @@ use crate::{lexical, model_card::positional_prefix};
 use anyhow::{Context, Result, ensure};
 use std::ops::Range;
 
+pub(super) fn project_node(
+    node: &str,
+    generated: &str,
+    local: bool,
+    hierarchical: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if local && node.eq_ignore_ascii_case("gnd") {
+        Some(generated.to_owned())
+    } else if hierarchical(node) {
+        node.rsplit_once('.')
+            .map(|(path, _)| format!("{path}.{generated}"))
+    } else {
+        None
+    }
+}
+
 fn replace_nodes(
     text: &str,
     generated: &str,
@@ -15,14 +31,7 @@ fn replace_nodes(
 ) {
     for span in positions {
         let node = &text[span.clone()];
-        let replacement = if local && node.eq_ignore_ascii_case("gnd") {
-            Some(generated.to_owned())
-        } else if hierarchical(node) {
-            node.rsplit_once('.')
-                .map(|(path, _)| format!("{path}.{generated}"))
-        } else {
-            None
-        };
+        let replacement = project_node(node, generated, local, &hierarchical);
         if let Some(name) = replacement {
             edits.push((span, name.into_bytes()));
         }
