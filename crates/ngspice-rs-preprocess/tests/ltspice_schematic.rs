@@ -1,6 +1,6 @@
 //! Headless schematic import through the ordinary source preparation API.
 use anyhow::{Context, Result, ensure};
-use model_normalize_ngspice::linked_source::{LibrarySyntax, LinkLimits, RootKind, SourceLinker};
+use model_normalize_ngspice::linked_source::{LinkLimits, RootKind, SourceDialect, SourceLinker};
 use model_preprocess_command::{AdmissionConfig, AdmittedSource, SourceSession};
 use ngspice_rs_preprocess::{
     Cancellation, InputFormat, Options, PreparedBundle, Provenance, Request, SourceInput, prepare,
@@ -251,7 +251,7 @@ fn imported_semiconductor_terminal_and_library_bindings_match_native_deck() -> R
     )?;
     let linked = SourceLinker {
         search_paths: vec![lib],
-        library_syntax: LibrarySyntax::Ltspice,
+        dialect: SourceDialect::Ltspice,
     }
     .link_admitted(
         &AdmittedSource {

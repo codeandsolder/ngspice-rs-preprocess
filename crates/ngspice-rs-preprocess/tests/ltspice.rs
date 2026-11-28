@@ -1092,7 +1092,7 @@ fn diode_dispatch_is_deferred_to_each_resolved_occurrence() -> Result<()> {
         .replace(" d(", " ltspice_diode(")
         .replace("plain D\n", "plain ltspice_diode\n");
     assert_eq!(translated.primary.bytes, expected.as_bytes());
-    let Provenance::Native { lines } = &translated.primary.provenance else {
+    let Provenance::Native { lines, .. } = &translated.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), expected.lines().count());
