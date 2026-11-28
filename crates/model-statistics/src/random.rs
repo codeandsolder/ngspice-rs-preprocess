@@ -23,7 +23,7 @@ impl Word for u64 {
     #[inline]
     fn product(self, multiplier: u64) -> (Self, Self) {
         let full = u128::from(self) * u128::from(multiplier);
-        ((full >> 64) as u64, full as u64)
+        ((full >> 64) as Self, full as Self)
     }
 
     #[inline]
