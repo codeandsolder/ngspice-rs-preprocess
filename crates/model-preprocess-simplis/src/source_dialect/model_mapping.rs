@@ -807,24 +807,14 @@ impl ModelSelection {
                 );
                 (original_family.as_str(), device.source_level())
             }
-            GummelPoonLegacy | GummelPoonNative => {
-                ensure!(
-                    original_family != "LPNP",
-                    "lateral PNP substrate semantics are not qualified for classic BJT lowering"
-                );
-                let mut family = ClassicBjtFamily::parse(&original_family).with_context(|| {
-                    format!(
-                        "mapped BJT type {} does not specify polarity",
-                        self.card.family
-                    )
-                })?;
-                family.thermal = if device == GummelPoonLegacy {
-                    BjtThermalConvention::Legacy
-                } else {
-                    BjtThermalConvention::Ngspice
-                };
-                (family.name(), device.source_level())
-            }
+            GummelPoonLegacy => (
+                self.classic_bjt_family(BjtThermalConvention::Legacy)?,
+                device.source_level(),
+            ),
+            GummelPoonNative => (
+                self.classic_bjt_family(BjtThermalConvention::Ngspice)?,
+                device.source_level(),
+            ),
             Vbic => {
                 ensure!(
                     matches!(original_family.as_str(), "NPN" | "PNP"),
@@ -888,6 +878,21 @@ impl ModelSelection {
         }
         out.push(')');
         Ok(out)
+    }
+
+    fn classic_bjt_family(&self, thermal: BjtThermalConvention) -> Result<&'static str> {
+        ensure!(
+            !self.card.family.eq_ignore_ascii_case("LPNP"),
+            "lateral PNP substrate semantics are not qualified for classic BJT lowering"
+        );
+        let mut family = ClassicBjtFamily::parse(&self.card.family).with_context(|| {
+            format!(
+                "mapped BJT type {} does not specify polarity",
+                self.card.family
+            )
+        })?;
+        family.thermal = thermal;
+        Ok(family.name())
     }
 
     fn validate_native_variant(&self) -> Result<()> {
