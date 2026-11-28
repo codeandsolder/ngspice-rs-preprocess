@@ -805,6 +805,8 @@ pub(super) static DEFAULT_RULES: &[DefaultRule] = &[
     DefaultRule::copy(425, 426),
     DefaultRule::real(358, 0.5),
     DefaultRule::copy(357, 358),
+    DefaultRule::polarity(377, 6.25e41, 6.188e40),
+    DefaultRule::polarity(378, 3.125e26, 1.5e25),
     DefaultRule::real(379, 8.75e9),
     DefaultRule::real(98, 4.1e7),
     DefaultRule::real(95, 1.0),

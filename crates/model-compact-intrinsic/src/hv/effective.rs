@@ -30,7 +30,7 @@ pub struct HiSimHvEffectiveGeometry {
     pub capacitance_width_total_m: f64,
     /// Length after the `WL1` correction, used by the STI model, in meters.
     pub small_device_gate_length_m: f64,
-    /// `WL2 / (WG*LG)^WL2P` using the upstream cm-scale gate-area expression.
+    /// `WL2 / (WG*LG)^WL2P` using the upstream square-micrometre gate-area expression.
     pub small_device_threshold_correction_v: f64,
     /// Size-and-layout-corrected STI width parameter.
     pub width_sti: f64,
@@ -59,14 +59,14 @@ pub(super) fn prepare_effective_geometry(
 ) -> Result<HiSimHvEffectiveGeometry, ModelError> {
     let lgate = binning.gate_length_m;
     let wgate = binning.gate_width_per_finger_m;
-    let length_cm = lgate * 100.0;
-    let width_cm = wgate * 100.0;
-    let area_cm2 = length_cm * width_cm;
+    let length_um = lgate * 1e6;
+    let width_um = wgate * 1e6;
+    let area_um2 = length_um * width_um;
     let lln = model_real(model, "lln")?;
     let wln = model_real(model, "wln")?;
 
     // hsmhv[2]set.c: modelMKS->ll = ll / pow(100, lln), and likewise wl.
-    // hsmhv[2]temp.c: all three width corrections share the same WL term.
+    // hsmhv[2]temp.c: geometry corrections use LG and WG in micrometres, WL in square micrometres.
     let length_correction = (model_real(model, "ll")? / 100f64.powf(lln))
         / (lgate + model_real(model, "lld")?).powf(lln);
     let width_correction = (model_real(model, "wl")? / 100f64.powf(wln))
@@ -109,23 +109,22 @@ pub(super) fn prepare_effective_geometry(
 
     let lgatesm = finite(
         "HiSIM-HV short-channel gate length",
-        lgate + model_real(model, "wl1")? / area_cm2.powf(model_real(model, "wl1p")?),
+        lgate + model_real(model, "wl1")? / area_um2.powf(model_real(model, "wl1p")?),
     )?;
     let dvthsm = finite(
         "HiSIM-HV short-channel threshold correction",
-        source_binned_at_name(model, binned, "wl2")? / area_cm2.powf(model_real(model, "wl2p")?),
+        source_binned_at_name(model, binned, "wl2")? / area_um2.powf(model_real(model, "wl2p")?),
     )?;
     let wsti = finite(
         "HiSIM-HV STI width correction",
         source_binned_at_name(model, binned, "wsti")?
             * (1.0
-                + model_real(model, "wstil")?
-                    / (lgatesm * 100.0).powf(model_real(model, "wstilp")?))
-            * (1.0 + model_real(model, "wstiw")? / width_cm.powf(model_real(model, "wstiwp")?)),
+                + model_real(model, "wstil")? / (lgatesm * 1e6).powf(model_real(model, "wstilp")?))
+            * (1.0 + model_real(model, "wstiw")? / width_um.powf(model_real(model, "wstiwp")?)),
     )?;
     let clmmod = finite(
         "HiSIM-HV channel-length modulation factor",
-        length_cm
+        length_um
             .powf(model_real(model, "clm5")?)
             .mul_add(model_real(model, "clm6")?, 1.0),
     )?;

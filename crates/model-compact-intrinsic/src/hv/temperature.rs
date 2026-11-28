@@ -44,6 +44,8 @@ pub struct PreparedHiSimHvTemperature {
     pub ig_bandgap_sqrt: f64,
     /// C-model `egp32` bandgap-related 3/2 power.
     pub ig_bandgap_three_halves: f64,
+    /// Derivative of the unsquared gate-current bandgap (`Egp12²`) in eV/K.
+    pub ig_bandgap_derivative_ev_per_kelvin: f64,
     /// Inverse thermal voltage, `QE / (KB * T)`, in 1/V.
     pub inverse_thermal_voltage: f64,
     /// Inverse thermal voltage at TNOM, in 1/V.
@@ -142,6 +144,37 @@ fn intrinsic_carrier_concentration(
     Ok((carrier, exp))
 }
 
+fn gate_bandgap(
+    model: &PreparedHiSimHvModel,
+    slots: &TemperatureSlots,
+    temperature: f64,
+    nominal: f64,
+    egtnom: f64,
+) -> Result<(f64, f64, f64), ModelError> {
+    let inverse = temperature.recip();
+    let inverse_nominal = nominal.recip();
+    let inverse_squared = inverse * inverse;
+    let linear = source_real_at(model, slots.igtemp2)?;
+    let quadratic = source_real_at(model, slots.igtemp3)?;
+    let gap = checked_positive(
+        "HiSIM-HV gate-current bandgap",
+        quadratic.mul_add(
+            inverse_nominal.mul_add(-inverse_nominal, inverse_squared),
+            linear.mul_add(
+                inverse - inverse_nominal,
+                egtnom + source_real_at(model, slots.egig)?,
+            ),
+        ),
+    )?;
+    let root = gap.sqrt();
+    let power = checked_positive("HiSIM-HV gate-current bandgap power", gap * root)?;
+    let derivative = checked_finite(
+        "HiSIM-HV gate-current bandgap derivative",
+        (-2. * quadratic * inverse).mul_add(inverse_squared, -linear * inverse_squared),
+    )?;
+    Ok((root, power, derivative))
+}
+
 /// Calculate the common *leading* temperature laws in both HiSIM-HV sources.
 ///
 /// The caller supplies the circuit temperature **in kelvin** and the device's
@@ -199,20 +232,7 @@ pub fn prepare_hisim_hv_temperature(
         "HiSIM-HV bandgap derivative",
         (2.0 * t).mul_add(-bgtmp2, -bgtmp1),
     )?;
-    let inverse_t = 1.0 / t;
-    let inverse_tnom = 1.0 / nominal;
-    let inverse_t_squared_difference = inverse_tnom.mul_add(-inverse_tnom, inverse_t * inverse_t);
-    let t3 = checked_positive(
-        "HiSIM-HV gate-current bandgap",
-        source_real_at(model, slots.igtemp3)?.mul_add(
-            inverse_t_squared_difference,
-            source_real_at(model, slots.igtemp2)?.mul_add(
-                inverse_t - inverse_tnom,
-                egtnom + source_real_at(model, slots.egig)?,
-            ),
-        ),
-    )?;
-    let igsqrt = t3.sqrt();
+    let (igsqrt, igpower, ig_derivative) = gate_bandgap(model, &slots, t, nominal, egtnom)?;
     let beta = checked_positive(
         "HiSIM-HV inverse thermal voltage",
         ELECTRON_CHARGE_C / (BOLTZMANN_J_PER_K * t),
@@ -245,10 +265,8 @@ pub fn prepare_hisim_hv_temperature(
         bandgap_derivative_ev_per_kelvin: eg_derivative,
         sqrt_bandgap: eg.sqrt(),
         ig_bandgap_sqrt: igsqrt,
-        ig_bandgap_three_halves: checked_positive(
-            "HiSIM-HV gate-current bandgap power",
-            t3 * igsqrt,
-        )?,
+        ig_bandgap_three_halves: igpower,
+        ig_bandgap_derivative_ev_per_kelvin: ig_derivative,
         inverse_thermal_voltage: beta,
         nominal_inverse_thermal_voltage: beta_nom,
         inverse_thermal_voltage_derivative: beta_derivative,

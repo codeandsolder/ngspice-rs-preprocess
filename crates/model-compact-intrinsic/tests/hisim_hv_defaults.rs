@@ -113,6 +113,18 @@ fn polarity_versions_and_unsupported_selectors_are_explicit() -> Result<(), Mode
     for variant in [ModelVariant::HiSimHv1, ModelVariant::HiSimHv2] {
         let pmos = prepare(variant, &[("pmos", ParameterValue::Flag(true))])?;
         assert_eq!(pmos.polarity(), MosPolarity::Pmos);
+        assert_eq!(param(&pmos, "bb")?, &ParameterValue::Real(1.));
+        assert_eq!(
+            param(&prepare(variant, &[])?, "bb")?,
+            &ParameterValue::Real(2.)
+        );
+        assert_eq!(
+            param(
+                &prepare(variant, &[("bb", ParameterValue::Real(1.5))])?,
+                "bb"
+            )?,
+            &ParameterValue::Real(1.5)
+        );
         assert_eq!(param(&pmos, "mueph1")?, &ParameterValue::Real(9e3));
         if variant == ModelVariant::HiSimHv2 {
             assert_eq!(param(&pmos, "vgsmin")?, &ParameterValue::Real(100.0));

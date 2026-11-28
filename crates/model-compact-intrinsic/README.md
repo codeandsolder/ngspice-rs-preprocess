@@ -10,6 +10,8 @@ Rust MIT license. See the package [`LICENSE`](LICENSE) and the repository's
 
 The crate binds **source-defined model and instance parameters** and implements family-specific physical subkernels. BSIM1 and BSIM2 provide nonlinear intrinsic currents, conservative terminal charges, and analytic Jacobians; their complete generalized residual/charge/noise assembly is in [model-kernel-bsim](../model-kernel-bsim/). Other families have their own explicitly documented implementation boundaries. Source-derived
 **BSIMSOI 4.x and HiSIM-HV1/HV2 model setup defaults** are implemented.
+BSIMSOI 4.4 also has ordered instance setup, native terminal topology, and
+raw electrical/C–V effective geometry and 179 size-binning equations.
 HiSIM-HV1/HV2 additionally have source-derived **instance defaults, binning,
 metallurgical channel geometry and leading temperature-dependent bandgap,
 thermal-voltage and carrier-density inputs**. Legacy BSIM1/2 have complete model defaults, size-dependent preparation and intrinsic constitutive laws.
@@ -84,9 +86,245 @@ values are not a ready-to-evaluate physical kernel.
   substitutes its defaults; we intentionally reject implicit changes of physics.
 - Parameters without a registered, source-derived default remain absent in the
   prepared buffer rather than being assigned an invented zero.
-- This represents **setup-stage defaults**, not the later size-dependent
-  `b4soitemp.c` preparation, instance topology, temperature laws, or numerical
-  current/charge/noise kernels.
+- This represents **model-card setup-stage defaults**. The next preparation
+  stage resolves instance topology and raw size-dependent parameters; it does
+  not yet constitute a complete temperature or numerical physical kernel.
+
+### BSIMSOI ordered instance and size preparation
+
+`prepare_bsim_soi_setup(&model, &[BsimSoiInstanceInput { ... }])` consumes
+instances in **native setup traversal order**, keeping the corrected shared
+model with its resolved instances and size records. This preserves the C
+source's shared `rbody=1` correction on an explicit nonideal body-contact
+device with otherwise zero contact resistance, including its ordering effect
+on later body aliases. The model-wide ideal-FD doping limit is applied only
+when the global SOIMOD is 2. Explicit instance mode 3 resolves with the native
+film/material-specific Vbs0t thresholds; ideal FD disables body and body
+resistance nodes. The 4–7 source terminals are mapped using the original
+`tnodeoutGiven` bit, including the ideal-FD exception, and gate, drain/source,
+body resistance and thermal internal nodes are independently resolved.
+Debug-only observation nodes are not numerical unknowns here.
+
+Model and instance original presence bits remain accessible. BSIMSOI's
+4.4 IC setter intentionally writes only the last element of each vector,
+selected by its length (1–5 for DS, GS, BS, ES, PS respectively); repeated
+ordered IC assignments to different lengths preserve each scalar. Frontend
+geometry scale affects only explicitly supplied L/W/PD/PS and AD/AS, not
+defaults or body-contact dimensions.
+
+`PreparedBsimSoiSize` evaluates the exact leading B4SOItemp effective
+electrical, C–V, body/backgate and diode-width geometry, the gate tunneling
+length correction and the 179 raw L/W/P size-binning equations. Both
+`BINUNIT` branches are supported. The four bases K1, K2, VSDFB and VSDTH
+without setup defaults use the source zero-initialized raw value for this
+intermediate stage; their Given flags remain intact for the subsequent
+temperature-dependent physical derivation. The native size cache omits NBC,
+NSEG, PDBCP and PSBCP despite using them in these equations. We compute
+independent size records, avoiding cross-instance reuse of incorrect
+dimensions. These are raw binned inputs, not final effective coefficients
+after temperature, stress, electrostatic and parameter-checking corrections.
+
+### BSIMSOI material and passive thermal preparation
+
+`PreparedBsimSoiSetup::prepare_temperature(index, ambient_kelvin)` resolves
+the selected instance and its final shared model, including size-binned
+channel/substrate doping and the native gamma1-derived channel doping
+rule. The immutable `PreparedBsimSoiTemperature` evaluates absolute-kelvin
+trial points without parameter-name lookup or state mutation. Silicon
+and generalized-material bandgap and intrinsic-density expressions
+preserve the different native ambient and live-heating normalizations.
+It returns analytic temperature partials of thermal voltage, bandgap,
+intrinsic density, surface and built-in potentials, sign-dependent
+backgate flatband, depletion width and depletion capacitance. Isothermal
+instances use the bound ambient and have zero local thermal partials.
+
+The passive heat residual and stored energy use the native
+Rth0/(Weff+Wth0)*NSEG/NF and Cth0*(Weff+Wth0)*NF/NSEG expressions,
+including parallel multiplicity M. Self-heating is active only on a
+resolved thermal node. The heat-port coordinate is absolute kelvin;
+the zero of stored heat and conductive heat is the bound ambient.
+Generated device heat is a separate physical contribution, not yet
+assembled by this preparation layer.
+
+The focused derivative test covers 96 temperature points across
+silicon/generalized material, both polarities, both substrate signs,
+three ambients and four rises. The opt-in native ngspice-47 passive
+thermal oracle independently compares 12 DC/AC circuits at zero
+electrical bias, including multiplicity, finger count, segmentation,
+thermal width and effective geometry. Run
+`cargo +nightly test -p model-compact-intrinsic --test bsim_soi_temperature -- --include-ignored`.
+
+### BSIMSOI transport and electrostatic preparation
+
+`PreparedBsimSoiSetup::prepare_transport` binds temperature-scaled mobility,
+saturation velocity, UA/UB/UC, layout stress and both series resistance modes.
+The external access conductance includes parallel multiplicity; the internal
+series resistance uses the complete parallel channel width. Local temperature
+and bias partials are analytic. Layout sums preserve the native fractional NF
+loop convention, using a bounded-cost reciprocal progression for large NF.
+
+`prepare_electrostatics` binds ambient-dependent body coefficients, threshold
+and flatband presence rules, layout/DELVTO adjustments, oxide capacitance,
+effective inversion factors and Debye length. Its live evaluation supplies
+the temperature-dependent DIBL/output resistance factors.
+
+The focused tests compare 32 native access conductances and 128 native
+operating points with explicitly resolved transport or electrostatic cards,
+in addition to finite-difference and stress-sum checks.
+
+### BSIMSOI bias-dependent channel electrostatics
+
+`prepare_channel` binds the native poly depletion, PD/FD body potentials
+(both FD formulations), body limiting, threshold, subthreshold slope, noise
+carrier density and effective gate overdrive. The five-component forward-mode
+gradient follows physical Vgs, Vds, Vbs, Ves and absolute kelvin even when
+native source/drain orientation reverses. Outputs are normalized to the
+native conduction orientation; this is electrostatics, not yet a complete
+terminal current/charge stamp. Finite differences cover 192 operating points;
+96 native threshold comparisons cover both polarities, both thermal modes
+and all three depletion modes.
+
+### BSIMSOI intrinsic channel conduction
+
+`prepare_drain_channel` binds all four native mobility formulations, bulk
+charge and width corrections, temperature/stress-dependent mobility,
+intrinsic series resistance, velocity saturation, CLM, DIBL and DITS.
+The evaluated current is signed into the physical drain, including NF, M
+and NSEG; the other scalars use native source/drain orientation. Five
+physical bias/temperature derivatives accompany each output. The
+constitutive saturation root is rationalized to avoid a singular limit
+when Rds=0 and Lambda=1. This does not include bipolar, impact-ionization
+or gate leakage currents, intrinsic channel charges, or solver stamps.
+
+Finite differences cover 864 cases (including generalized materials and
+external-series mode); 432 native silicon model-card comparisons validate
+intrinsic current and saturation voltage across both polarities, all
+three depletion modes, four mobility modes, and heating/reversal.
+
+### BSIMSOI gate-induced junction leakage
+
+`prepare_gate_induced_leakage` binds both GIDLMOD formulations with
+asymmetric size-dependent GIDL/GISL coefficients, oxide/material scaling,
+native poly depletion and body-field corrections. Signed currents into
+physical drain and source are scaled by NF and M; all five physical
+partials follow the same constitutive function. Ideal FD disables both
+branches. Both 192-case finite-difference and 192-case native DC
+matrices pass, including silicon/generalized materials and reversed
+source/drain.
+
+### BSIMSOI extrinsic terminal storage
+
+`prepare_extrinsic_charges` binds nonlinear gate-to-drain/source overlap,
+linear gate-to-backgate overlap, and the source/drain bottom-film and fringe
+charges. The five pairwise charges have opposite signs at their second
+terminal, so their contributions conserve charge exactly. The overlap node
+is resolved from the gate-resistance topology (including gate-mid for
+RGATEMOD=3); bottom-film storage remains active in ideal FD. Bottom-film
+transition endpoints and capacitance densities are derived at preparation
+from the ambient substrate state or explicit model overrides.
+
+### BSIMSOI impact ionization
+
+`prepare_impact_ionization` binds both IIIMOD formulations, including the
+MOS avalanche ratio and the shared-ratio or independent bipolar avalanche
+contribution. The high-field branch follows physical source/drain reversal.
+It is disabled in ideal FD. The five channel-coordinate derivatives hold the
+physical body-source and body-drain junction voltages fixed; two additional
+partials support independently resolved body-resistance nodes. Currents include
+physical polarity and instance multiplicity.
+
+### BSIMSOI gate tunneling
+
+`prepare_gate_tunneling` binds the six physical gate-current branches:
+channel partition to source/drain, the two asymmetric edge currents,
+body tunneling (accumulation/inversion), and body-contact tunneling. The
+ordinary five physical partials are accompanied by an independent contact
+partial. Native NF/M scaling, ideal-FD suppression of body tunneling, and
+the separate contact area are preserved. The test matrix covers 768
+derivative cases and 768 native DC cases, both materials, both polarities,
+all depletion modes, both thermal modes, all gate-current selector pairs,
+asymmetric contacts and reversed conduction. The native reverse IGC
+stamp omits the backgate column while folding that derivative into its
+effective source column; the test explicitly removes the resulting
+`-Vds * dIgc/dVes` offset from the native terminal-current reference.
+The Rust law uses the physical derivative instead. Native individual
+IGS/IGD/IGCS/IGCD accessors are compared without a correction.
+
+### BSIMSOI intrinsic charge (CAPMOD=2 and 3)
+
+`prepare_intrinsic_charges` resolves the three native CV overdrive selectors and
+three charge partitions, including body, backgate, opposite-type contact
+area and inversion charge. It shares the zero-overdrive bulk factor with
+the intrinsic drain law. Physical terminal charges and five-coordinate
+Jacobians conserve charge and preserve physical drain/source orientation.
+The native intrinsic QB/QD/QS values and finite differences cover 1,728
+cases per CAPMOD across material, polarity, thermal, depletion, CV overdrive,
+partition and contact-area selectors. CAPMOD=3 adds charge-centroid oxide
+capacitance and surface-potential correction. Its physical oxide is derived
+from TOX minus DTOXCV or the generalized-material EOT reference iteration,
+including the native ordered size cache. Batch preparation shares the final
+model-wide oxide and each size-specific zero-bias flatband reference.
+
+### BSIMSOI RF, body resistance and active self-heating
+
+Prepared gate electrode/relaxation conductances cover all four `RGATEMOD`
+selectors, with gate relaxation using the channel's bias-dependent beta and
+output conductance ratio. Body contact and distributed source/drain body
+resistances preserve the native size-cache order and multiplicity. The
+thermal residual is passive heat flow minus intrinsic channel dissipation
+`Ids * Vds`; stored heat follows the passive thermal law. The native model
+intentionally excludes bipolar and leakage power from this thermal row.
+Analytic derivatives accompany gate relaxation and active heat.
+
+The native DC distributed-body loading path clears `GGjsb` and `GGjdb`
+while retaining the linearized junction equivalent sources. The resistor
+reference therefore compares the actual native stamped equivalent sources
+and separately checks the physical junction currents. A solver must use the
+physical junction residual and its full Jacobian, not the native DC omission.
+
+### BSIMSOI noise spectra
+
+The source-referred noise preparation supplies the three `TNOIMOD`
+channel models, both `FNOIMOD` flicker laws (including width normalization),
+source/drain access and gate-electrode thermal noise, distributed body and
+contact thermal noise, and gate and floating-body excess shot noise. Each
+result is a one-sided current PSD in A²/Hz, before circuit transfer. It
+preserves native multiplicity, the ambient-only source-body resistor noise,
+and the native unswapped channel partition used by reversed gate shot noise.
+Invalid negative/nonfinite densities are rejected; a zero raw body-contact
+resistance uses the actual finite physical resistor rather than infinite
+noise. The native clamped-terminal differential fixtures cover thermal and
+flicker selectors, frequency, polarity, temperature and reversal; numerical
+qualification is required before advertising a complete solver kernel.
+
+### BSIMSOI body junction transport and storage
+
+`PreparedBsimSoiSetup::prepare_junctions(index, ambient_kelvin)` binds
+independent source/drain temperature-dependent saturation densities,
+diffusion, recombination, tunneling, neutral-body bipolar transport and
+junction storage. The inputs are absolute kelvin and physical B-S/B-D
+voltages; output current and charge signs follow physical polarity, with
+source/drain identity retained in reverse operation. Effective junction
+geometry, NF, NSEG and parallel multiplicity follow the native equations.
+The neutral-body collector transfer is a separate physical D-to-S branch
+with both bias derivatives. BJTOFF disables that transfer but does not
+remove neutral-body recombination or its effective diffusion charge.
+Ideal-FD mode disables the body junction contributions.
+
+The storage law uses side-specific gate-sidewall depletion capacitance,
+temperature corrections, grading, the native 0.9-potential linear
+extension, and the TT-scaled neutral-body diffusion current. All subkernels
+return analytic derivatives of their constitutive values. In particular
+the reverse denominator floor and forward depletion extension are
+differentiated as actual piecewise functions, rather than reproducing
+the native suppressed or incomplete Newton tangents. The grading=1
+logarithmic limit is evaluated without a removable singularity.
+
+These are local conservative branch laws, not a complete MOS channel
+kernel or a solver stamp. The focused tests cover independent junction
+current, asymmetric neutral-body collector and storage derivatives,
+and independent native current and AC comparisons. Run
+`cargo +nightly test -p model-compact-intrinsic --test bsim_soi_junction --test bsim_soi_neutral -- --include-ignored`.
 
 Independent reference test: on Linux with ngspice 47 installed, run:
 
@@ -266,7 +504,7 @@ input expressed in microns. Source `modelMKS` conversion matters:
   C rejects nonpositive **Leff/Weff** as fatal; Rust returns an error and
   rejects nonfinite dependent geometry instead of emitting NaN.
 - The short-device `WL1/WL1P`, `WL2/WL2P`, `WSTI/WSTIL/WSTIW` and `CLM5/CLM6`
-  expressions are calculated using the source **centimeter-scale LG/WG** values.
+  expressions are calculated using the source **micrometre-scale LG/WG** values.
   This geometry stage is temperature-independent despite living in `*temp.c`.
 
 `prepare_hisim_hv_temperature(model, instance, circuit_temperature_kelvin,
@@ -535,6 +773,105 @@ tests**, and **95,806 independent source/executable numerical comparisons**.
 These are physical additive component checks rather than complete intrinsic
 MOS channel I/Q or operating-point/transient solver conformance.
 
+### Coupled nonlinear HiSIM-HV lateral-field charge
+
+The complete native lateral-field law combines the existing body-dependent
+`XQY1/XQY2` term with the gate/drain field contribution
+`-1.3*epsilon_si*Wcv*M*wdpl*(1-clm1)/XQY * (Vds-Idd/(beta*Qn0))`.
+The transport drop is zero in native `flg_noqi` regions or when `Idd < 1e-15`;
+HV1 applies its native positive-XQY minimum of 1 nm. The expression uses the
+same solved charge/transport state, including all four local derivatives,
+and is exposed by `evaluate_with_parasitics` as `lateral_gate_charge_c`.
+Subtract that charge from the intrinsic drain; source and bulk are unchanged.
+The coupled native oracle measures 3,360 paired operating points with the
+lateral mechanism toggled. In nearly depleted cases the native subtraction
+of endpoint potentials magnifies floating-point error when divided by Qn0;
+the comparison propagates a 16-epsilon endpoint rounding budget through
+that sensitivity, without changing the physical law or its derivatives.
+Independent finite differences check the intrinsic and thermal derivatives.
+
+### Physical and constant HiSIM-HV overlap charge network
+
+The prepared overlap evaluator implements the original constant, simplified
+and doped surface-potential branches, including original-given capacitance
+semantics, separate physical source/drain geometry, and HV2 QOVADD. The
+analytic modes use the native two-step depletion construction and cubic near
+flatband; mode 2 also limits the potential using the smoothed inversion bound.
+Mode 1 reuses the monotone native Poisson solver, and both families use the
+native bandgap confinement in overlap accumulation. Doped charge is split
+between intrinsic and external voltages by CVDSOVER. Reversal exchanges the
+physical source/drain parameters before evaluating normalized coordinates.
+The overlap-specific charge vectors conserve charge independently. All 6,720
+forward and 3,840 reverse paired native OPs and independent seven-coordinate
+finite differences passed. The mode-1 minority charge is evaluated as a
+rationalized difference to retain very small inversion density.
+
+The coupled evaluator's quasistatic_charge_network() assembles intrinsic channel
+plus lateral, physical overlap and gate/body overlap, independent external
+overlap, and gate-to-prime pairs (constant overlap plus fringing). The prime
+pair's other node receives the negative of its reported gate-oriented charge.
+The returned rows and derivatives are in normalized source-referenced
+coordinates; physical reversal must also swap the source/drain rows. Junction
+charges and NQS state remain separate mechanisms. The 1,536 paired native AC
+constant/overlap/fringing cases validate the assembled network.
+
+### HiSIM-HV non-quasistatic channel charge
+
+CONQS enables independent, signed inversion and bulk charge state coordinates.
+The constitutive kernel exposes equilibrium targets, native bias-dependent
+relaxation times (DLY1, DLY2 and DLY3), and residual/storage rows in the form
+(Qstate - Qequilibrium)/tau + dQstate/dt = 0. Terminal charge partition is
+conservative. Each row supplies six analytical derivatives with respect to
+Vgs, Vds, Vbs, temperature and both state coordinates. No timestep or previous
+charge is stored in the model; the solver owns its integration method and
+history. Use parasitic_charges with the trial channel charges, rather than
+adding trial charges to the assembled quasistatic network.
+
+The native AC reference compares paired QS/NQS circuits at 100 MHz, 1 GHz
+and 10 GHz across both model variants, polarities, orientations, temperatures,
+geometries and delay cards: 11,520 cases. Independent off-equilibrium trial
+rows are tested by fourth-order finite differences and conservation checks.
+
+### HiSIM-HV enhancement-mode channel noise
+
+The prepared channel noise evaluator uses the native one-sided, source-referred
+thermal, flicker and induced-gate drain/source current spectra. The physical
+noise input is the same solved channel, access, overlap and local temperature
+state used by the current and charge evaluations. The native unblended Alpha,
+channel-length modulation, source inversion density and drift/diffusion integral
+feed the thermal and induced-gate shape factors. Flicker uses a stable log1p
+divided difference at equal endpoint carrier densities. Multiplicity and the
+native trap-density, interface-capacitance and mobility-correlation units are
+applied exactly once. CONQS excludes equilibrium channel gate charge from the
+induced noise capacitance, as in the original evaluator.
+
+The native source-resolved noise oracle measures 6,144 combinations with a
+unit drain transresistance, including 1 kHz, 1 MHz and 1 GHz, both families,
+polarities, directions, temperatures and geometries, and mechanism-selective
+cards. Near depletion the original endpoint subtraction loses significant
+relative accuracy in Pds; the comparison propagates the endpoint ULP bound
+through the squared-current law while retaining the ordinary relative and
+absolute criteria. The Rust difference solve does not lose that precision.
+
+### Physical HiSIM-HV2 nonlinear drift resistance
+
+The CORDRIFT preparation binds the drift geometry, local-temperature mobility,
+velocity saturation and carrier density, overlap-controlled depletion, junction
+depth, substrate depletion multiplier and physical drain/source sheet resistance.
+The evaluator shares the physical drain-side overlap solution with the charge
+network, including when COADOV disables the charge stamp. The two physical
+branch currents retain independent intrinsic and external voltages, temperature,
+drain/source prime drops and optional substrate voltage (ten coordinates).
+The drain resistance uses the native smooth upper limit and the branch
+resistances include multiplicity and the native minimum resistance; thermal
+spectra use the physical, unclamped resistance.
+
+All 5,120 native isolated-device operating points compare physical branch
+currents using measured internal drain and source voltages, with five drift
+cards, both polarities and directions, temperatures, multifinger geometries,
+and optional substrate nodes. Independent fourth-order finite differences
+verify all ten coordinates for both currents and drain resistance.
+
 ### Physical HiSIM-HV1/HV2 external fringing capacitance
 
 `prepare_hisim_hv_fringing(model, instance)` now prepares a real, original
@@ -725,6 +1062,134 @@ model/instance comparisons** and physical-geometry acceptance/rejection.
 Native oracles do **not** inspect private mobility/velocity/RTH fields;
 full current/charge/thermal fidelity awaits physical nonlinear kernels.
 
+### HiSIM-HV gate-induced drain/source leakage
+
+`prepare_hisim_hv_gidl` binds the native HV1/HV2 GIDL/GISL coefficients,
+including length/width/cross binning, source-unit conversions, multiplicity,
+and the physical oxide thickness. `evaluate` uses normalized intrinsic
+`Vgs`, `Vds`, `Vbs` and the actual channel short-/long-channel threshold
+shifts and their four-coordinate derivatives. The gate-current bandgap and
+its temperature derivative come from the trial temperature preparation.
+The original drain-field smoothing, junction reverse-bias suppression and
+exponential cutoff are retained. The API does not independently estimate
+channel electrostatics.
+
+The 720-case checked-in reference fixture is regenerated from the original
+pinned ngspice C branches using `tools/hisim_hv_gidl_reference.py`; it covers
+both versions, selector states, binning, multiplicity, field and body-bias
+regions, and temperatures. Tests check both currents and four partials,
+plus independent finite differences of the Rust values.
+
+### HiSIM-HV non-edge gate currents and intrinsic surface electrostatics
+
+The prepared non-edge gate tunneling law evaluates inversion-layer tunneling,
+direct body tunneling and Fowler–Nordheim tunneling from the actual intrinsic
+channel state and its four-coordinate derivatives. Partitioning into drain and
+source currents belongs to the channel assembly. The independent 80-case native
+oracle checks branch values and finite-difference gradients.
+
+The normal-mode Poisson solver evaluates the source/drain surface equations in
+the native D1/D2/D3 regions. It uses a safeguarded Newton solve with a finite
+exponential upper bound and implicit differentiation, including the flatband
+limit. The 960-case native reference uses an independent extended-precision
+bisection and finite differences. The accumulation law retains the version-
+specific surface confinement and source cubic equation, using a rationalized
+Cardano expression and a Newton refinement; 320 native cases cover its charge
+and gradient. These are intrinsic electrostatic primitives, not yet the complete
+coupled HiSIM-HV channel evaluation.
+
+### HiSIM-HV material preparation and intrinsic bias conditioning
+
+The material preparation law retains original instance parameter presence,
+including optional DFM doping overrides, and prepares width/STI-corrected
+pocket and bulk doping, pocket overlap, native reference potentials, and
+version-specific drain smoothing. Its local-temperature evaluation supplies
+the physical Poisson coefficients and HV2 depletion-mode potentials. Native
+static material references cover 192 cases, with independent thermal
+finite differences for each case.
+
+The body conditioning law retains native forward-body confinement, its
+first and mixed derivatives, and the zero-drain symmetry polynomial. The
+1280-case effective drain smoothing oracle covers both native versions,
+including the positive square-root smoothing and drain saturation. The
+2688-case body bias oracle checks all seven returned scalars and their
+intrinsic gradients. Zero-drain limits and depletion-mode material selection
+are tested separately. The laws accept actual intrinsic model states rather
+than inventing replacement terminal potentials.
+
+### HiSIM-HV quantum oxide, threshold shifts and poly depletion
+
+The quantum correction evaluates both native oxide-capacitance laws, including
+HV2's bias-dependent limit and its complete derivative. The prepared threshold
+law computes pocket, short-channel, narrow-channel and small-device shifts,
+including HV1 punchthrough and HV2 depletion-mode contributions. Poly depletion
+uses the native variant-specific voltage and limiting laws. The shared smooth
+clipping primitives preserve the original values and differentiate moving
+limits, using cancellation-resistant expressions.
+
+The native-reference fixtures cover 5,120 quantum oxide, 3,456 threshold and
+4,320 poly-depletion cases, with independent finite-difference gradients.
+Effective geometry uses micrometres and square micrometres for the native
+size-dependent STI and short-device expressions, not centimetres.
+
+### HiSIM-HV coupled enhancement-mode channel
+
+The normal-channel evaluator composes the prepared electrostatic laws,
+source/drain surface solutions, native D1/D2/D3 charge integrals and
+no-inversion cutoff. It solves the drain potential relative to the source
+potential to avoid subtractive cancellation, preserves independent zero-drain
+Jacobian entries, and computes charge partition and conservative normalized
+terminal charges with capacitance width and device multiplicity.
+
+The channel transport law evaluates channel-length modulation, universal
+mobility, velocity saturation and the core drain current Ids0, including
+temperature derivatives. The prepared channel checks instance provenance
+against the transport state. Both native BB polarity defaults and the HV2
+symmetry factor are retained. The independent source-extracted reference
+fixtures cover 1,536 endpoint/integral cases (binary128 bisection and finite
+differences) and 864 channel-length/mobility cases. Composed-device tests
+check both variants and polarities, charge conservation, zero drain current
+and context ownership. Full ngspice 47 isolated-channel operating-point fixtures
+cover 1,344 default-card points and 4,032 HV2 PTL/GDL/GDSLEAK points,
+including separate and combined corrections, two polarities, three
+temperatures and multiple geometries including multifinger instances.
+The core current, optional parasitic channel term and ohmic leakage remain
+separate so native access correction can be applied in its original order.
+The composed CORSRD=2/3 nonlinear access law preserves the independent
+external and intrinsic voltage derivatives, applies multiplicity once, and
+uses the native low-drain smoothing. The 1,536 native CORSRD=2 circuit
+points include finite-difference gradients; separate seven-coordinate tests
+exercise the access law and its near-zero drain limit. The separate conventional CORSRD=1/3 physical series evaluator binds external
+node orientation independently of channel orientation, determines prime-node
+allocation from the unbinned geometry, and evaluates resistance, branch
+current, thermal noise and seven-coordinate derivatives. Both HV families,
+forward/reverse external biases, symmetric/asymmetric drift geometry,
+substrate coupling and temperature-dependent resistance are covered by
+6,912 native prime-drop/current points and 4,032 independent Jacobian
+comparisons including all four COTEMP modes.
+The STI edge channel is composed after nonlinear access resistance, with
+size-dependent width, doping, short-channel shift and the native surface
+potential smoothing. Rationalized inversion charge avoids cancellation of
+two nearly equal smoothed square roots. The 1,920 native STI circuit points
+include three cards, both polarities and families, multifinger geometry and
+finite-difference gradients; independent local temperature and bias
+derivatives are also tested.
+Channel and drift impact-ionization components retain independent intrinsic,
+external and HV2 drain-to-prime voltage derivatives (eight coordinates
+including temperature). The channel law is qualified against 1,920 native
+substrate-current points with same-branch finite differences at the HV1 D1
+cutoff. The drift impact branch and impact-induced bulk-potential feedback are
+qualified at 1,536 native operating points, including explicit drain-prime
+voltage drops. Independent finite differences verify all eight coordinates
+of channel impact, drift impact, bulk potential and feedback current. The coupled
+`evaluate_with_parasitics` path also evaluates the five terminal gate and
+junction leakage branches from the same solved channel state, including
+shared symmetric source potential and classical oxide capacitance. All 2,880
+native operating points and independent four-coordinate derivatives pass. The
+overlap, fringing, NQS, channel noise and HV2 CORDRIFT evaluators are
+qualified separately above. HV2 depletion-mode transport, full device topology and electrothermal
+assembly remain work.
+
 ## Reference test coverage
 
 `tests/fixtures/*.names` contains **only parameter names** extracted from eight
@@ -756,7 +1221,7 @@ cargo fmt --all -- --check
 1. Expand representative *actual PDK* model-card/mode/selector coverage, then
    prioritize HiSIM-HV and BSIMSOI numerical packages against measured usage.
 2. Extend defaults and selector checks to HiSIM2, BSIM3SOI and SOI3;
-   implement BSIMSOI per-instance preparation, and **temperature-dependent,
+   complete BSIMSOI temperature-dependent preparation and **temperature-dependent,
    remaining electrothermal and topology/state preparation** for both
    source-backed HiSIM-HV families. Verify real selector/parameter batches
    before building the numerical kernels; HV1/HV2 instance defaults, binning,

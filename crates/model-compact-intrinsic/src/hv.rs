@@ -2,28 +2,108 @@
 //!
 //! This is setup-stage parameter preparation, not a physical model implementation.
 
+mod access_correction;
+mod accumulation;
+mod bias_conditioning;
+mod channel_charge;
+mod channel_correction;
+mod channel_electrostatics;
+mod channel_mobility;
+mod channel_modulation;
+mod drain_smoothing;
+mod drift;
 mod edge_tunneling;
 mod effective;
+mod electrostatic_material;
+mod explicit_series;
 mod fringing;
+mod gate_tunneling;
+mod gidl;
 mod heat;
+mod impact;
 mod instance;
 mod junction;
 mod junction_current;
 mod lateral_field;
+mod leakage;
+mod noise;
+mod nqs;
+mod overlap;
+mod poly_depletion;
+mod quantum_oxide;
 mod rules;
+mod smoothing;
+mod sti;
+mod surface;
 mod temperature;
+mod threshold;
 mod transport;
 
+pub use access_correction::{
+    HiSimHvAccessCorrectionPoint, HiSimHvAccessInputs, HiSimHvExternalBias,
+    PreparedHiSimHvAccessCorrection, prepare_hisim_hv_access_correction,
+};
+pub use accumulation::{
+    HiSimHvAccumulationInputs, HiSimHvAccumulationPoint, evaluate_hisim_hv_accumulation,
+};
+pub use bias_conditioning::{
+    HiSimHvBiasConditioningInputs, HiSimHvBiasConditioningPoint,
+    evaluate_hisim_hv_bias_conditioning,
+};
+pub use channel_charge::{
+    HiSimHvChannelChargeInputs, HiSimHvChannelChargePoint, HiSimHvChannelRegion,
+    evaluate_hisim_hv_channel_charge,
+};
+pub use channel_correction::HiSimHvChannelCorrectionPoint;
+pub use channel_electrostatics::{
+    HiSimHvChannelElectrostaticPoint, PreparedHiSimHvChannelElectrostatics,
+    prepare_hisim_hv_channel_electrostatics,
+};
+pub use channel_mobility::{
+    HiSimHvChannelMobilityCoefficients, HiSimHvChannelMobilityInputs, HiSimHvChannelMobilityPoint,
+    HiSimHvNormalChannelPoint, HiSimHvNormalChannelWithAccessPoint,
+    HiSimHvNormalChannelWithParasiticsPoint, PreparedHiSimHvNormalChannel,
+    prepare_hisim_hv_normal_channel,
+};
+pub use channel_modulation::{
+    HiSimHvChannelModulationInputs, HiSimHvChannelModulationPoint, HiSimHvChannelTerminalCharges,
+    PreparedHiSimHvChannelChargeArea, PreparedHiSimHvChannelModulation,
+    prepare_hisim_hv_channel_modulation,
+};
+pub use drain_smoothing::{
+    HiSimHvDrainSmoothingInputs, HiSimHvDrainSmoothingPoint, evaluate_hisim_hv_drain_smoothing,
+};
+pub use drift::{
+    HiSimHvDriftBias, HiSimHvDriftPoint, HiSimHvDriftScalar, PreparedHiSimHvDrift,
+    prepare_hisim_hv_drift,
+};
 pub use edge_tunneling::{
     HiSimHvEdgeTunnelingCurrent, HiSimHvEdgeTunnelingCurrents, PreparedHiSimHvEdgeTunneling,
     prepare_hisim_hv_edge_tunneling,
 };
 pub use effective::HiSimHvEffectiveGeometry;
+pub use electrostatic_material::{
+    HiSimHvDepletionMaterialPoint, HiSimHvElectrostaticMaterialPoint,
+    PreparedHiSimHvElectrostaticMaterial, prepare_hisim_hv_electrostatic_material,
+};
+pub use explicit_series::{
+    HiSimHvExplicitSeriesBias, HiSimHvExplicitSeriesBranch, HiSimHvExplicitSeriesPoint,
+    HiSimHvExplicitSeriesScalar, PreparedHiSimHvExplicitSeries, prepare_hisim_hv_explicit_series,
+};
 pub use fringing::{HiSimHvFringingCharges, PreparedHiSimHvFringing, prepare_hisim_hv_fringing};
+pub use gate_tunneling::{
+    HiSimHvGateChannelState, HiSimHvGateTunnelingCurrents, PreparedHiSimHvGateTunneling,
+    prepare_hisim_hv_gate_tunneling,
+};
+pub use gidl::{
+    HiSimHvGidlCurrents, HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar, PreparedHiSimHvGidl,
+    prepare_hisim_hv_gidl,
+};
 pub use heat::{
     HiSimHvDrainBias, HiSimHvDrainCurrent, HiSimHvElectricalGradient, HiSimHvGeneratedHeat,
     HiSimHvThermalJacobianRow, evaluate_hisim_hv_generated_heat,
 };
+pub use impact::{HiSimHvImpactPoint, HiSimHvImpactScalar};
 pub use instance::{HiSimHvBinningGeometry, PreparedHiSimHvInstance, prepare_hisim_hv_instance};
 pub use junction::{
     HiSimHvJunctionBias, HiSimHvJunctionCharge, HiSimHvJunctionCharges,
@@ -37,7 +117,22 @@ pub use lateral_field::{
     HiSimHvLateralFieldCharge, PreparedHiSimHvLateralFieldCharge,
     prepare_hisim_hv_lateral_field_charge,
 };
+pub use leakage::HiSimHvLeakagePoint;
+pub use noise::HiSimHvChannelNoise;
+pub use nqs::{HiSimHvNqsEquilibrium, HiSimHvNqsPoint, HiSimHvNqsScalar, HiSimHvNqsState};
+pub use overlap::{
+    HiSimHvChargeNetwork, HiSimHvDrainOverlap, HiSimHvOverlapBias, HiSimHvOverlapPoint,
+    PreparedHiSimHvOverlap, prepare_hisim_hv_overlap,
+};
+pub use poly_depletion::{
+    HiSimHvPolyDepletionPoint, PreparedHiSimHvPolyDepletion, prepare_hisim_hv_poly_depletion,
+};
+pub use quantum_oxide::{
+    HiSimHvQuantumOxidePoint, PreparedHiSimHvQuantumOxide, prepare_hisim_hv_quantum_oxide,
+};
+pub use surface::{HiSimHvSurfaceInputs, HiSimHvSurfacePoint, evaluate_hisim_hv_surface};
 pub use temperature::{PreparedHiSimHvTemperature, prepare_hisim_hv_temperature};
+pub use threshold::{HiSimHvThresholdPoint, PreparedHiSimHvThreshold, prepare_hisim_hv_threshold};
 pub use transport::{
     HiSimHvDepletionTransport, HiSimHvThermalBranch, HiSimHvTransportGeometry,
     PreparedHiSimHvTransport, prepare_hisim_hv_transport,
@@ -216,9 +311,9 @@ fn parse_source_rules(source: &'static str) -> Result<Box<[HvRule]>, ModelError>
         }
         parsed.push(parse_rule(line + 1, text)?);
     }
-    if parsed.len() != 772 {
+    if parsed.len() != 773 {
         return Err(ModelError::CorruptSourceCatalog(format!(
-            "HiSIM-HV source rule pool has {} rows, expected 772",
+            "HiSIM-HV source rule pool has {} rows, expected 773",
             parsed.len()
         )));
     }
@@ -541,6 +636,7 @@ pub fn prepare_hisim_hv_model(
             variant,
             scope: ParameterScope::Model,
             values,
+            bsim_soi_ic: [None; 5],
         },
         polarity,
         original_given: source.values.iter().map(Option::is_some).collect(),
