@@ -6,6 +6,10 @@ use std::{collections::BTreeMap, fmt::Write as _, path::Path, process::Command};
 fn run_native(runtime: &Path, source: &str, control: &str) -> Result<String> {
     let translated = translate_simplis_deck(source.as_bytes())?;
     let text = std::str::from_utf8(&translated.bytes)?;
+    run_native_deck(runtime, text, control)
+}
+
+fn run_native_deck(runtime: &Path, text: &str, control: &str) -> Result<String> {
     let mut deck = text
         .strip_suffix(".end\n")
         .context("missing deck terminator")?
@@ -1247,6 +1251,9 @@ fn classic_clocked_state_elements(runtime: &Path) -> Result<()> {
     Ok(())
 }
 
+#[path = "logic_cases/clocked_requests.rs"]
+mod clocked_requests;
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model = args.next().context("usage: logic_ngspice RUNTIME_CM")?;
@@ -1260,6 +1267,7 @@ fn main() -> Result<()> {
     numbered_logic_all_arities_polarities_and_initial_states(&runtime)?;
     sr_latch_polarities_priorities_and_loaded_complements(&runtime)?;
     classic_clocked_state_elements(&runtime)?;
+    clocked_requests::qualify(&runtime)?;
     advanced_gate_receivers_ignore_output_initial_hint(&runtime)?;
     advanced_gate_vendor_boundaries_and_trailing_inversions(&runtime)?;
     advanced_latch_vendor_ambiguous_inputs(&runtime)?;

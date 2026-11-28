@@ -37,7 +37,11 @@ committing, including a pulse whose width equals its propagation delay.
 Event scheduling and state storage use the simulator's rollback-aware
 interfaces. Classic gates and SRFF propagate
 transport events; DIGITAL1 devices cancel pending transitions if the input
-condition ceases to hold. Inertial latches evaluate against committed Q.
+condition ceases to hold. Inertial latches evaluate against committed Q. Clocked SR/JK/D/T
+operations retain their captured request until a later triggering edge;
+a nontriggering receiver change or deadline wakeup cannot discard it.
+A toggle operates on the last logical capture, even when the previous
+output transition has not propagated. DC does not capture an edge.
 The output bridge is ideal, with the specified output resistance represented
 by a separate resistor. Complemented outputs use the same scheduled state.
 No artificial minimum propagation delay is imposed. Analog crossing
