@@ -44,6 +44,7 @@ jobs:
     name: Source archive, locked tests and C reference
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
     with:
+      apt-packages: ripgrep flex bison
       command: bash .github/scripts/verify-source.sh
 
   package-qualification:
