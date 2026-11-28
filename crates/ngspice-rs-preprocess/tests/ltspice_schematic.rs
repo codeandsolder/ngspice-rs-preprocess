@@ -1,6 +1,7 @@
 //! Headless schematic import through the ordinary source preparation API.
 use anyhow::{Context, Result, ensure};
-use model_preprocess_command::{AdmissionConfig, SourceSession};
+use model_normalize_ngspice::linked_source::{LibrarySyntax, LinkLimits, RootKind, SourceLinker};
+use model_preprocess_command::{AdmissionConfig, AdmittedSource, SourceSession};
 use ngspice_rs_preprocess::{
     Cancellation, InputFormat, Options, PreparedBundle, Provenance, Request, SourceInput, prepare,
 };
@@ -244,11 +245,26 @@ fn imported_semiconductor_terminal_and_library_bindings_match_native_deck() -> R
     let admitted = session.load(&root)?;
     let imported = model_import_ltspice::import(
         &admitted,
-        &[lib],
+        std::slice::from_ref(&lib),
         &mut session,
         Options::default().output_bytes,
     )?;
-    let observed = numerical_data(dir.path(), &imported.bytes, "device-import")?;
+    let linked = SourceLinker {
+        search_paths: vec![lib],
+        library_syntax: LibrarySyntax::Ltspice,
+    }
+    .link_admitted(
+        &AdmittedSource {
+            path: admitted.path.clone(),
+            bytes: imported.bytes.into(),
+        },
+        RootKind::Deck,
+        LinkLimits {
+            output_bytes: Options::default().output_bytes,
+        },
+        &mut session,
+    )?;
+    let observed = numerical_data(dir.path(), &linked.bytes, "device-import")?;
     let expected = numerical_data(dir.path(), reference.as_bytes(), "device-reference")?;
     for (observed, expected) in observed.iter().zip(&expected) {
         ensure!(!observed.is_empty(), "empty numerical trace");
