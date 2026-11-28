@@ -145,6 +145,7 @@ pub struct PreparedHiSimHvNormalChannel {
     lateral: PreparedHiSimHvLateralFieldCharge,
     overlap: PreparedHiSimHvOverlap,
     fringing: PreparedHiSimHvFringing,
+    nqs: super::nqs::Nqs,
     identity: Arc<()>,
 }
 
@@ -176,8 +177,10 @@ pub struct HiSimHvNormalChannelWithParasiticsPoint {
     /// Native Qy including multiplicity, added to gate and subtracted from drain.
     /// Derivatives use intrinsic voltage and device temperature coordinates.
     pub lateral_gate_charge_c: Jet,
-    /// Quasistatic channel, overlap, lateral and fringing charge network.
-    pub charges: HiSimHvChargeNetwork,
+    /// Overlap, lateral and fringing charges, excluding the channel state.
+    pub parasitic_charges: HiSimHvChargeNetwork,
+    /// Independent channel charge relaxation targets when CONQS is enabled.
+    pub nqs: Option<super::HiSimHvNqsEquilibrium>,
 }
 
 /// Prepare the native enhancement-mode channel for repeated local evaluation.
@@ -225,8 +228,31 @@ pub fn prepare_hisim_hv_normal_channel(
         lateral: prepare_hisim_hv_lateral_field_charge(model, instance)?,
         overlap: prepare_hisim_hv_overlap(model, instance)?,
         fringing: prepare_hisim_hv_fringing(model, instance)?,
+        nqs: super::nqs::Nqs::prepare(model)?,
         identity: Arc::clone(&instance.identity),
     })
+}
+
+impl HiSimHvNormalChannelWithParasiticsPoint {
+    /// Combine the equilibrium channel charge with the parasitic network.
+    ///
+    /// For NQS stamping, use the parasitic network and independent trial
+    /// channel charges instead, so that equilibrium charge is not counted twice.
+    /// # Errors
+    /// Nonfinite combined terminal charge or Jacobian.
+    pub fn quasistatic_charge_network(&self) -> Result<HiSimHvChargeNetwork, ModelError> {
+        let mut charges = self.parasitic_charges;
+        let core = self.channel.intrinsic.electrostatics.terminal_charges;
+        charges.intrinsic.gate =
+            (charges.intrinsic.gate + core.gate).checked("HiSIM-HV assembled gate charge")?;
+        charges.intrinsic.drain =
+            (charges.intrinsic.drain + core.drain).checked("HiSIM-HV assembled drain charge")?;
+        charges.intrinsic.source =
+            (charges.intrinsic.source + core.source).checked("HiSIM-HV assembled source charge")?;
+        charges.intrinsic.bulk =
+            (charges.intrinsic.bulk + core.bulk).checked("HiSIM-HV assembled bulk charge")?;
+        Ok(charges)
+    }
 }
 
 impl PreparedHiSimHvNormalChannel {
@@ -269,15 +295,10 @@ impl PreparedHiSimHvNormalChannel {
             electrostatics,
             &transport.temperature,
         )?;
-        let core = electrostatics.terminal_charges;
-        charges.intrinsic.gate = (charges.intrinsic.gate + core.gate + lateral_gate_charge_c)
+        charges.intrinsic.gate = (charges.intrinsic.gate + lateral_gate_charge_c)
             .checked("HiSIM-HV assembled intrinsic gate charge")?;
-        charges.intrinsic.drain = (charges.intrinsic.drain + core.drain - lateral_gate_charge_c)
+        charges.intrinsic.drain = (charges.intrinsic.drain - lateral_gate_charge_c)
             .checked("HiSIM-HV assembled intrinsic drain charge")?;
-        charges.intrinsic.source = (charges.intrinsic.source + core.source)
-            .checked("HiSIM-HV assembled intrinsic source charge")?;
-        charges.intrinsic.bulk = (charges.intrinsic.bulk + core.bulk)
-            .checked("HiSIM-HV assembled intrinsic bulk charge")?;
         let outer_gate = Jet::coordinate(external.vgs, 0, 1.);
         let outer_drain = Jet::coordinate(external.vds, 1, 1.);
         let fringe = self.fringing.effective_capacitance_f;
@@ -290,7 +311,8 @@ impl PreparedHiSimHvNormalChannel {
             impact,
             leakage,
             lateral_gate_charge_c,
-            charges,
+            parasitic_charges: charges,
+            nqs: self.nqs.equilibrium(&channel.intrinsic)?,
         })
     }
 

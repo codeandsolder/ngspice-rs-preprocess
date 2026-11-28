@@ -24,6 +24,7 @@ mod junction;
 mod junction_current;
 mod lateral_field;
 mod leakage;
+mod nqs;
 mod overlap;
 mod poly_depletion;
 mod quantum_oxide;
@@ -106,6 +107,7 @@ pub use lateral_field::{
     prepare_hisim_hv_lateral_field_charge,
 };
 pub use leakage::HiSimHvLeakagePoint;
+pub use nqs::{HiSimHvNqsEquilibrium, HiSimHvNqsPoint, HiSimHvNqsScalar, HiSimHvNqsState};
 pub use overlap::{
     HiSimHvChargeNetwork, HiSimHvOverlapBias, PreparedHiSimHvOverlap, prepare_hisim_hv_overlap,
 };

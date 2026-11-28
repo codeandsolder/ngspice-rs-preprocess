@@ -364,7 +364,7 @@ fn native_constant_and_fringe_ac_network() -> TestResult {
         let reverse = row[8] == 1.;
         let state = channel.evaluate_with_parasitics(intrinsic, external, 0., reverse, &temp)?;
         let core = state.channel.intrinsic.electrostatics.terminal_charges;
-        let q = state.charges;
+        let q = state.quasistatic_charge_network()?;
         let drain = q.gate_drain_prime.gradient[0];
         let source = q.gate_source_prime.gradient[0];
         let bulk = core.bulk.gradient[0] - q.intrinsic.bulk.gradient[0];

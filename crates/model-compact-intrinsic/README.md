@@ -806,13 +806,31 @@ forward and 3,840 reverse paired native OPs and independent seven-coordinate
 finite differences passed. The mode-1 minority charge is evaluated as a
 rationalized difference to retain very small inversion density.
 
-The coupled evaluator exposes a quasistatic charge network: intrinsic channel
+The coupled evaluator's quasistatic_charge_network() assembles intrinsic channel
 plus lateral, physical overlap and gate/body overlap, independent external
 overlap, and gate-to-prime pairs (constant overlap plus fringing). The prime
 pair's other node receives the negative of its reported gate-oriented charge.
 The returned rows and derivatives are in normalized source-referenced
 coordinates; physical reversal must also swap the source/drain rows. Junction
-charges and NQS state remain separate mechanisms.
+charges and NQS state remain separate mechanisms. The 1,536 paired native AC
+constant/overlap/fringing cases validate the assembled network.
+
+### HiSIM-HV non-quasistatic channel charge
+
+CONQS enables independent, signed inversion and bulk charge state coordinates.
+The constitutive kernel exposes equilibrium targets, native bias-dependent
+relaxation times (DLY1, DLY2 and DLY3), and residual/storage rows in the form
+(Qstate - Qequilibrium)/tau + dQstate/dt = 0. Terminal charge partition is
+conservative. Each row supplies six analytical derivatives with respect to
+Vgs, Vds, Vbs, temperature and both state coordinates. No timestep or previous
+charge is stored in the model; the solver owns its integration method and
+history. Use parasitic_charges with the trial channel charges, rather than
+adding trial charges to the assembled quasistatic network.
+
+The native AC reference compares paired QS/NQS circuits at 100 MHz, 1 GHz
+and 10 GHz across both model variants, polarities, orientations, temperatures,
+geometries and delay cards: 11,520 cases. Independent off-equilibrium trial
+rows are tested by fourth-order finite differences and conservation checks.
 
 ### Physical HiSIM-HV1/HV2 external fringing capacitance
 
