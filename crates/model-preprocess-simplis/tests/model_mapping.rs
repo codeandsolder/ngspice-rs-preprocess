@@ -366,3 +366,38 @@ fn classic_bjt_selection_is_not_a_lexical_dialect_or_lateral_pnp_guess() -> Resu
     }
     Ok(())
 }
+
+#[test]
+fn classic_bjt_selector_preserves_binned_model_names_and_physical_fields() -> Result<()> {
+    use model_normalize_ngspice::model_card::parse_model_cards;
+    let source = statements(
+        ".model q.1 NPN(LEVEL=1 IS=2p BF={beta} TNOM=40)\n.model q.2 NPN(IS=5p BF=150 TNOM=55)\n.model q.3 PNP(LEVEL=1 IS=7p BF=80 TNOM=65)",
+    );
+    let budget = WorkBudget::default();
+    let mapped = MappingTable::resolve(&DeviceConfiguration::default(), &source, &budget)?
+        .apply(&source, &budget)?;
+    let text = mapped
+        .statements
+        .iter()
+        .map(|statement| statement.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cards = parse_model_cards(text.as_bytes())?;
+    assert_eq!(cards.len(), 3);
+    for (card, selection) in cards.iter().zip(&mapped.selections) {
+        assert_eq!(card.name, selection.card.name);
+        assert!(card.family.starts_with("gummel_poon_legacy_"));
+        let fields = |card: &model_normalize_ngspice::model_card::ModelCard| {
+            card.parameters
+                .iter()
+                .filter(|parameter| !parameter.name.eq_ignore_ascii_case("LEVEL"))
+                .map(|parameter| (parameter.name.clone(), parameter.expression.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields(card), fields(&selection.card));
+    }
+    assert_eq!(cards[0].name, "q.1");
+    assert_eq!(cards[1].name, "q.2");
+    assert_eq!(cards[2].name, "q.3");
+    Ok(())
+}
