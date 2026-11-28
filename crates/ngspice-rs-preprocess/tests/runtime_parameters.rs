@@ -32,6 +32,47 @@ fn simetrix_runtime_builtin_reference_cases() -> Result<()> {
     Ok(())
 }
 
+/// Stock C ngspice cannot dispatch the prepared classic-BJT family. For the
+/// temperature-precedence witnesses only, independently execute the same
+/// topology and unmodified temperature/transport parameters with its native
+/// classic model. The pre-existing 0.1% current gate accounts for the native
+/// versus historical thermal constant difference; exact legacy constitutive
+/// tests live in the consumer. This projection is not a production lowering.
+fn native_bjt_temperature_reference(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        GUMMEL_POON_LEGACY_NPN, GUMMEL_POON_LEGACY_PNP,
+    };
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    let mut count = 0;
+    for line in std::str::from_utf8(bytes)?.lines() {
+        let mut fields = line.trim_start().splitn(3, char::is_whitespace);
+        let directive = fields.next().unwrap_or_default();
+        if directive.eq_ignore_ascii_case(".model") {
+            let name = fields.next().context("missing model name")?;
+            let body = fields.next().context("missing model family")?.trim_start();
+            let end = body
+                .find(|ch: char| ch.is_whitespace() || ch == '(')
+                .unwrap_or(body.len());
+            let (family, tail) = body.split_at(end);
+            let polarity = if family.eq_ignore_ascii_case(GUMMEL_POON_LEGACY_NPN) {
+                Some("NPN")
+            } else if family.eq_ignore_ascii_case(GUMMEL_POON_LEGACY_PNP) {
+                Some("PNP")
+            } else {
+                None
+            };
+            if let Some(polarity) = polarity {
+                writeln!(output, ".model {name} {polarity}{tail}")?;
+                count += 1;
+                continue;
+            }
+        }
+        writeln!(output, "{line}")?;
+    }
+    Ok((output.into_bytes(), count))
+}
+
 fn run_case(fixtures: &Path, name: &str, outcome: &str, abs: f64, rel: f64) -> Result<()> {
     let request = Request {
         format: InputFormat::SimetrixDeck,
@@ -62,9 +103,35 @@ fn run_case(fixtures: &Path, name: &str, outcome: &str, abs: f64, rel: f64) -> R
     }
 
     let dir = tempfile::tempdir()?;
-    for artifact in &bundle.companions {
-        fs::write(dir.path().join(&artifact.filename), &artifact.bytes)?;
+    let bjt_temperature = matches!(
+        name,
+        "global-model" | "instance-model" | "instance-precedence"
+    );
+    let mut selected = 0;
+    let mut reference_primary = Vec::new();
+    if bjt_temperature {
+        let (bytes, count) = native_bjt_temperature_reference(&bundle.primary.bytes)?;
+        reference_primary = bytes;
+        selected += count;
     }
+    for artifact in &bundle.companions {
+        if bjt_temperature {
+            let (bytes, count) = native_bjt_temperature_reference(&artifact.bytes)?;
+            selected += count;
+            fs::write(dir.path().join(&artifact.filename), bytes)?;
+        } else {
+            fs::write(dir.path().join(&artifact.filename), &artifact.bytes)?;
+        }
+    }
+    let primary = if bjt_temperature {
+        ensure!(
+            selected > 0,
+            "BJT temperature witness lost its typed source model"
+        );
+        reference_primary.as_slice()
+    } else {
+        bundle.primary.bytes.as_slice()
+    };
     let (vectors, expected) = if outcome == "pass" {
         let csv = fs::read_to_string(fixtures.join(format!("{name}.csv")))?;
         let mut rows = csv.lines();
@@ -87,9 +154,7 @@ fn run_case(fixtures: &Path, name: &str, outcome: &str, abs: f64, rel: f64) -> R
         ensure!(outcome == "undefined", "invalid outcome {outcome}");
         (String::from("v(x)"), Vec::new())
     };
-    let mut deck = bundle
-        .primary
-        .bytes
+    let mut deck = primary
         .strip_suffix(b".end\n")
         .context("missing deck terminator")?
         .to_vec();
