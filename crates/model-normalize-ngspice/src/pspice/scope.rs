@@ -119,32 +119,7 @@ impl Scopes {
                     .parent
                     .context("unmatched PSpice .ENDS")?;
             } else if first == ".model" {
-                let dialect = dialects.at_mapped(origins, statement.line)?;
-                let (card, base) = if dialect.is_pspice() {
-                    parse_model(text, statement.line)
-                        .with_context(|| dialects.describe_mapped(origins, statement.line))?
-                } else {
-                    (
-                        parse_model_card(text, statement.line, &[])
-                            .with_context(|| dialects.describe_mapped(origins, statement.line))?,
-                        None,
-                    )
-                };
-                charge_card(&card, budget)?;
-                result.entries[scope]
-                    .models
-                    .entry(card.name.to_ascii_lowercase())
-                    .or_default()
-                    .push(statement.line);
-                result.models.insert(
-                    statement.line,
-                    Declaration {
-                        scope,
-                        card,
-                        base,
-                        dialect,
-                    },
-                );
+                result.collect_model(scope, statement.line, text, origins, dialects)?;
             } else if first == ".global" {
                 result.global_ground |= text
                     .split_ascii_whitespace()
@@ -166,6 +141,42 @@ impl Scopes {
         }
         ensure!(scope == 0, "unterminated PSpice subcircuit");
         Ok(result)
+    }
+
+    fn collect_model(
+        &mut self,
+        scope: usize,
+        line: usize,
+        text: &str,
+        origins: &[usize],
+        dialects: SourceDialects<'_>,
+    ) -> Result<()> {
+        let dialect = dialects.at_mapped(origins, line)?;
+        let location = || dialects.describe_mapped(origins, line);
+        let (card, base) = if dialect.is_pspice() {
+            parse_model(text, line).with_context(location)?
+        } else {
+            (
+                parse_model_card(text, line, &[]).with_context(location)?,
+                None,
+            )
+        };
+        charge_card(&card, &self.budget)?;
+        self.entries[scope]
+            .models
+            .entry(card.name.to_ascii_lowercase())
+            .or_default()
+            .push(line);
+        self.models.insert(
+            line,
+            Declaration {
+                scope,
+                card,
+                base,
+                dialect,
+            },
+        );
+        Ok(())
     }
 
     pub(super) const fn budget(&self) -> &WorkBudget {
