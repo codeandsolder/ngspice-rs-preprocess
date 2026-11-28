@@ -919,9 +919,10 @@ fn classify(
             ".DC" => {
                 let args = arguments(statement)?;
                 // Statistical selection owns the original unbound MONTE form.
-                if args.windows(2).any(|pair| {
-                    pair[0].eq_ignore_ascii_case("SWEEP") && pair[1].eq_ignore_ascii_case("MONTE")
-                }) {
+                if simetrix::sweep_start(AnalysisKind::DcSweep, &args)
+                    .and_then(|index| args.get(index + 1))
+                    .is_some_and(|field| field.eq_ignore_ascii_case("MONTE"))
+                {
                     None
                 } else {
                     Some(Directive::DcSweep {

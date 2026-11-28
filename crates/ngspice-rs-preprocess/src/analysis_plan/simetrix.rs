@@ -15,7 +15,18 @@ use model_normalize_ngspice::statement_token_spans;
 fn keyword(raw: &str) -> bool {
     matches!(
         raw.to_ascii_uppercase().as_str(),
-        "DEVICE" | "TEMP" | "PARAM" | "MODEL" | "FREQ" | "STP" | "LIN" | "DEC" | "OCT" | "LIST"
+        "DEVICE"
+            | "TEMP"
+            | "PARAM"
+            | "MODEL"
+            | "FREQ"
+            | "STP"
+            | "LIN"
+            | "DEC"
+            | "OCT"
+            | "LIST"
+            | "SWEEP"
+            | "NUMCORES"
     )
 }
 
@@ -169,13 +180,69 @@ impl AxisParts {
     }
 }
 
-fn axis(mut fields: &[String], execution: SweepExecution) -> Result<SweepAxis> {
+fn clause_boundary(field: &str) -> bool {
+    field.eq_ignore_ascii_case("SWEEP") || field.eq_ignore_ascii_case("NUMCORES")
+}
+
+fn axis_prefix(fields: &mut &[String], execution: SweepExecution) -> Result<SweepAxis> {
     let mut parts = AxisParts::default();
-    while !fields.is_empty() {
-        let field = take(&mut fields)?;
-        parts.field(field, &mut fields)?;
+    while fields.first().is_some_and(|field| !clause_boundary(field)) {
+        let field = take(fields)?;
+        parts.field(field, fields)?;
     }
     parts.finish(execution)
+}
+
+fn axis(mut fields: &[String], execution: SweepExecution) -> Result<SweepAxis> {
+    let axis = axis_prefix(&mut fields, execution)?;
+    ensure!(fields.is_empty(), "unexpected trailing sweep clause");
+    Ok(axis)
+}
+
+fn base_shape(analysis: AnalysisKind, args: &[String]) -> bool {
+    let args = if analysis == AnalysisKind::Transient
+        && args
+            .last()
+            .is_some_and(|field| field.eq_ignore_ascii_case("UIC"))
+    {
+        &args[..args.len() - 1]
+    } else {
+        args
+    };
+    super::native_analysis_shape(analysis, args)
+}
+
+/// Locate the first independent clause at a grammar boundary, not inside a
+/// displayed source name or a target operand.
+pub(super) fn sweep_start(analysis: AnalysisKind, args: &[String]) -> Option<usize> {
+    if base_shape(analysis, args) {
+        return None;
+    }
+    if analysis == AnalysisKind::DcSweep {
+        for index in [8, 4] {
+            if args
+                .get(index)
+                .is_some_and(|field| field.eq_ignore_ascii_case("SWEEP"))
+                && base_shape(analysis, &args[..index])
+            {
+                return Some(index);
+            }
+        }
+        let mut rest = args;
+        if axis_prefix(&mut rest, SweepExecution::Continuation).is_ok()
+            && rest
+                .first()
+                .is_some_and(|field| field.eq_ignore_ascii_case("SWEEP"))
+        {
+            return Some(args.len() - rest.len());
+        }
+        return None;
+    }
+    // Ordinary analysis requests have at most seven operands before SWEEP.
+    args.iter().take(8).enumerate().find_map(|(index, field)| {
+        (field.eq_ignore_ascii_case("SWEEP") && base_shape(analysis, &args[..index]))
+            .then_some(index)
+    })
 }
 
 pub(super) fn dc_axes(args: &[String]) -> Result<Vec<SweepAxis>> {
@@ -230,10 +297,7 @@ pub(super) fn inline_sweeps(
     analysis: AnalysisKind,
     args: &[String],
 ) -> Result<Option<InlineSweeps>> {
-    let Some(first) = args
-        .iter()
-        .position(|field| field.eq_ignore_ascii_case("SWEEP"))
-    else {
+    let Some(first) = sweep_start(analysis, args) else {
         return Ok(None);
     };
     if args
@@ -254,33 +318,32 @@ pub(super) fn inline_sweeps(
         "SIMetrix analysis does not support independent sweeps"
     );
     let mut rest = &args[first + 1..];
-    let parallelism_hint = if let Some(index) = rest
-        .iter()
-        .position(|field| field.eq_ignore_ascii_case("NUMCORES"))
-    {
-        let mut tail = &rest[index + 1..];
-        let count = assigned_value(&mut tail)?.parse::<u32>()?;
+    let mut axes = Vec::new();
+    let parallelism_hint = loop {
+        let axis = axis_prefix(&mut rest, SweepExecution::Independent)?;
         ensure!(
-            count > 0 && tail.is_empty(),
-            "invalid trailing NUMCORES scheduling hint"
+            !matches!(analysis, AnalysisKind::DcSweep | AnalysisKind::Transient)
+                || axis.target != SweepTarget::Frequency,
+            "frequency is not an independent DC/transient sweep target"
         );
-        rest = &rest[..index];
-        Some(count)
-    } else {
-        None
-    };
-    let axes = rest
-        .split(|field| field.eq_ignore_ascii_case("SWEEP"))
-        .map(|fields| {
-            let axis = axis(fields, SweepExecution::Independent)?;
+        axes.push(axis);
+        if rest.is_empty() {
+            break None;
+        }
+        let clause = take(&mut rest)?;
+        if clause.eq_ignore_ascii_case("NUMCORES") {
+            let count = assigned_value(&mut rest)?.parse::<u32>()?;
             ensure!(
-                !matches!(analysis, AnalysisKind::DcSweep | AnalysisKind::Transient)
-                    || axis.target != SweepTarget::Frequency,
-                "frequency is not an independent DC/transient sweep target"
+                count > 0 && rest.is_empty(),
+                "invalid trailing NUMCORES scheduling hint"
             );
-            Ok(axis)
-        })
-        .collect::<Result<Vec<_>>>()?;
+            break Some(count);
+        }
+        ensure!(
+            clause.eq_ignore_ascii_case("SWEEP"),
+            "unexpected sweep clause"
+        );
+    };
     Ok(Some(InlineSweeps {
         arguments: args[..first].to_vec(),
         axes,
@@ -330,6 +393,46 @@ mod tests {
             }
         );
         assert_eq!(axes[0].bind(parse_spice_constant, &budget)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn clause_keywords_are_legal_target_operands() -> Result<()> {
+        let args = super::super::arguments(
+            ".tran 1m SWEEP PARAM sweep STP 0 1 1 SWEEP DEVICE numcores LIST 1 2 NUMCORES=2",
+        )?;
+        let sweeps = inline_sweeps(AnalysisKind::Transient, &args)?.context("missing sweeps")?;
+        assert_eq!(
+            sweeps.axes[0].target,
+            SweepTarget::Parameter {
+                name: "sweep".into()
+            }
+        );
+        assert_eq!(
+            sweeps.axes[1].target,
+            SweepTarget::Device {
+                name: "numcores".into()
+            }
+        );
+        assert_eq!(sweeps.parallelism_hint, Some(2));
+        for text in [
+            ".dc sweep 0 2 1",
+            ".dc v1 0 1 1 sweep 0 2 1",
+            ".dc PARAM sweep STP 0 2 1",
+        ] {
+            let args = super::super::arguments(text)?;
+            assert!(inline_sweeps(AnalysisKind::DcSweep, &args)?.is_none());
+            assert!(!dc_axes(&args)?.is_empty());
+        }
+        let args = super::super::arguments(".dc PARAM sweep STP 0 2 1 SWEEP TEMP LIST 20 40")?;
+        let sweeps = inline_sweeps(AnalysisKind::DcSweep, &args)?.context("missing sweep")?;
+        assert_eq!(
+            dc_axes(&sweeps.arguments)?[0].target,
+            SweepTarget::Parameter {
+                name: "sweep".into()
+            }
+        );
+        assert_eq!(sweeps.axes[0].target, SweepTarget::Temperature);
         Ok(())
     }
 
