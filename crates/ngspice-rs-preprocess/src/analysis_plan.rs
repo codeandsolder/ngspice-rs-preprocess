@@ -811,7 +811,7 @@ pub(crate) fn analysis_kind(name: &str) -> AnalysisKind {
         ".OP" => AnalysisKind::OperatingPoint,
         ".DC" => AnalysisKind::DcSweep,
         ".AC" => AnalysisKind::Ac,
-        ".TRAN" | ".TRAN/OP" => AnalysisKind::Transient,
+        ".TRAN" => AnalysisKind::Transient,
         ".POP" => AnalysisKind::Pop,
         ".NOISE" => AnalysisKind::Noise,
         ".TF" => AnalysisKind::TransferFunction,
@@ -1505,6 +1505,35 @@ mod typed_analysis_tests {
             budget,
             AnalysisDialect::Ltspice,
         )
+    }
+
+    #[test]
+    fn pspice_transient_operating_point_is_dialect_specific() -> Result<()> {
+        let statement = ".TRAN/OP 1u 1m";
+        let (directive, disposition) =
+            classify(".TRAN/OP", statement, AnalysisDialect::Pspice, false)?;
+        assert_eq!(disposition, Disposition::RequiresBinding);
+        assert!(matches!(
+            directive,
+            Directive::Analysis {
+                analysis: AnalysisKind::Transient,
+                ..
+            }
+        ));
+        for dialect in [
+            AnalysisDialect::Native,
+            AnalysisDialect::Ltspice,
+            AnalysisDialect::Hspice,
+            AnalysisDialect::Simetrix,
+            AnalysisDialect::Simplis,
+            AnalysisDialect::Tina,
+            AnalysisDialect::Qspice,
+            AnalysisDialect::Expanded,
+        ] {
+            let (_, disposition) = classify(".TRAN/OP", statement, dialect, false)?;
+            assert_eq!(disposition, Disposition::Unsupported, "{dialect:?}");
+        }
+        Ok(())
     }
 
     #[test]
