@@ -264,6 +264,17 @@ must also be implemented; `HSPICEMODELS` selects models alone.
 
 See the [SIMetrix device configuration reference](https://help.simetrix.co.uk/9.3/simetrix/simulator_reference/topics/simulatordevices_customisingdeviceconfiguration.htm).
 
+`Options::power_target` (CLI `--power-target`) selects the consumer's
+power-expression contract. `native-ngspice` is the default and keeps the
+existing portable guarded power expressions. For `simetrix-deck`,
+`prepared-solver-v1` preserves the explicit absolute-base, caret, real-part
+and ordered absolute-product operations instead. A prepared consumer must
+implement the four named operations and resolve function bodies in their
+actual scalar or behavioural phase. This capability is recorded in the
+bundle, not inferred from simulator names or a compatibility mode. Source
+catalog libraries remain target-neutral until linked; other source formats
+reject the prepared power target.
+
 Native linking preserves physical source lines, comments, continuations,
 scope boundaries and the root title. Static `.include`, `.inc` and named
 `.lib path section` resources are resolved relative to their containing
@@ -277,7 +288,8 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 9 includes typed PWL resistor declarations as well as
+counts, dependencies and provenance. Manifest version 10 records the explicit `power_target` capability and
+includes typed PWL resistor declarations as well as
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
 `Artifact::required_code_models` and `PreparedBundle::required_code_models()`.

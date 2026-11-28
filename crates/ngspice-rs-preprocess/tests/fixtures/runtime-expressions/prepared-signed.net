@@ -1,0 +1,15 @@
+* Source power laws, exponent directions and zero-factor convention
+V1 x 0 DC -2 AC 0
+V2 p 0 DC 3 AC 1
+V3 z 0 DC 0 AC 1
+B1 caret 0 V=V(x)^V(p)
+B2 realpart 0 V=POW(V(x),V(p))
+B3 absolute 0 V=V(x)**V(p)
+B4 masked 0 V=SGN(V(z))*V(z)**(-.5)
+B5 caretzero 0 V=V(z)^.5
+B6 abszero 0 V=V(z)**.5
+.func sourcepower(x,p) {x**p}
+B7 macro 0 V=sourcepower(V(x),V(p))
+.op
+.ac lin 2 1k 2k
+.end

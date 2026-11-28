@@ -15,7 +15,7 @@ pub use model_preprocess_command::{
     AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, Resource,
     SourceSession, WorkBudget, WorkLimits,
 };
-pub use model_preprocess_simplis::{LibrarySimulator, ParsedLibrary};
+pub use model_preprocess_simplis::{LibrarySimulator, ParsedLibrary, source_dialect::PowerTarget};
 pub use model_translate_simplis::CodeModelRuntime;
 use serde::Serialize;
 use std::{
@@ -179,6 +179,8 @@ pub struct Options {
     pub device_config: Option<PathBuf>,
     /// Explicit experiment seed and sample; absent means nominal.
     pub statistical_sample: Option<StatisticalSample>,
+    /// Explicit consumer power-expression contract.
+    pub power_target: PowerTarget,
 }
 
 impl Default for Options {
@@ -190,6 +192,7 @@ impl Default for Options {
             conditioning: ConditioningPolicy::default(),
             device_config: None,
             statistical_sample: None,
+            power_target: PowerTarget::NativeNgspice,
         }
     }
 }
@@ -249,6 +252,8 @@ pub struct Artifact {
 pub struct PreparedBundle {
     /// Explicit input format.
     pub format: InputFormat,
+    /// Power-expression contract required by the emitted artifact.
+    pub power_target: PowerTarget,
     /// Canonical root origin.
     pub origin: PathBuf,
     /// Main artifact (native deck, include, or parsed-library JSON).
@@ -557,6 +562,7 @@ fn native_bundle(
         .collect::<Result<Vec<_>>>()?;
     Ok(PreparedBundle {
         format,
+        power_target: PowerTarget::NativeNgspice,
         origin,
         primary: Artifact {
             filename: if kind == RootKind::Deck {
@@ -631,6 +637,11 @@ pub fn prepare(
 ) -> Result<PreparedBundle> {
     validate_request(request)?;
     ensure!(
+        options.power_target == PowerTarget::NativeNgspice
+            || request.format == InputFormat::SimetrixDeck,
+        "prepared power target requires a SIMetrix deck"
+    );
+    ensure!(
         options.device_config.is_none() || request.format == InputFormat::SimetrixDeck,
         "device configuration is only valid for SIMetrix decks"
     );
@@ -660,6 +671,7 @@ pub fn prepare(
         | InputFormat::QspiceLibrary => native(&root, request, options, &mut session),
         _ => dialect::prepare(&root, request, options, cancellation, &mut session),
     }?;
+    result.power_target = options.power_target;
     if request.format == InputFormat::SimetrixDeck
         && options.conditioning == ConditioningPolicy::PrivateDifferentiators
     {

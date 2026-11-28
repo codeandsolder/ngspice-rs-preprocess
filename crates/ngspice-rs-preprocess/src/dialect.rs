@@ -75,6 +75,7 @@ fn bundle(
 ) -> PreparedBundle {
     PreparedBundle {
         format,
+        power_target: super::PowerTarget::NativeNgspice,
         origin: root.path.clone(),
         primary,
         companions,
@@ -583,6 +584,7 @@ fn catalog(
     simulator: LibrarySimulator,
     members: Vec<(Cow<'_, ParsedLibrary>, String)>,
     mapping: Option<&MappingTable>,
+    target: super::PowerTarget,
     limit: usize,
     budget: &super::WorkBudget,
 ) -> Result<ResolvedLibraries> {
@@ -592,7 +594,7 @@ fn catalog(
     let mut model_selections = Vec::new();
     for (parsed, origin) in members {
         let parsed = if let Some(mapping) = mapping {
-            let (parsed, selections) = parsed.mapped(mapping, limit, budget)?;
+            let (parsed, selections) = parsed.mapped(mapping, target, limit, budget)?;
             model_selections.extend(selections);
             Cow::Owned(parsed)
         } else {
@@ -897,25 +899,28 @@ fn resolve_deck(
     } else {
         None
     };
-    let (expanded_root, mut device_identities, mut model_selections) = if let Some(mapping) =
-        &mapping
-    {
-        let mapped = mapping.apply(&statements, session.budget())?;
-        let lowered =
-            lower_scoped_statements(&mapped.statements, options.output_bytes, session.budget())?;
-        let resolved = resolve_device_identities(&lowered, session.budget())?;
-        ensure!(
-            resolved.text.len() <= options.output_bytes,
-            "device identity expansion byte budget exceeded"
-        );
-        (
-            resolved.text.into_bytes(),
-            resolved.identities,
-            mapped.selections,
-        )
-    } else {
-        (output, Vec::new(), Vec::new())
-    };
+    let (expanded_root, mut device_identities, mut model_selections) =
+        if let Some(mapping) = &mapping {
+            let mapped = mapping.apply(&statements, session.budget())?;
+            let lowered = lower_scoped_statements(
+                &mapped.statements,
+                options.power_target,
+                options.output_bytes,
+                session.budget(),
+            )?;
+            let resolved = resolve_device_identities(&lowered, session.budget())?;
+            ensure!(
+                resolved.text.len() <= options.output_bytes,
+                "device identity expansion byte budget exceeded"
+            );
+            (
+                resolved.text.into_bytes(),
+                resolved.identities,
+                mapped.selections,
+            )
+        } else {
+            (output, Vec::new(), Vec::new())
+        };
     let ResolvedLibraries {
         catalog,
         sources,
@@ -925,6 +930,7 @@ fn resolve_deck(
         projection(request.format),
         members,
         mapping.as_ref(),
+        options.power_target,
         options.output_bytes,
         session.budget(),
     )?;

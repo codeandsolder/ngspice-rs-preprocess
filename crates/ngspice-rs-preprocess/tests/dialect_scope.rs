@@ -252,3 +252,72 @@ fn standalone_and_catalog_libraries_share_scoped_source_admission() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn prepared_power_target_survives_nested_source_and_catalog_roundtrip() -> Result<()> {
+    use ngspice_rs_preprocess::PowerTarget;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path();
+    let root = path.join("root.net");
+    fs::write(&root, b"* prepared\n*#SIMETRIX\nV1 x 0 -2\nV2 p 0 3\n.inc 'hs.lib'\n.func f(x,p) {x**p}\nB1 abs 0 V={f(V(x),V(p))}\nB2 caret 0 V=V(x)^V(p)\nB3 real 0 V=POW(V(x),V(p))\nB4 masked 0 V={0*PWR(V(x),-1)}\nX1 x p y 0 cell\n.end\n")?;
+    fs::write(path.join("hs.lib"), b"*#HSPICE\n.param hs={PWR(-2,3)}\n.inc 'ps.lib'\nE1 h 0 VALUE={PWR(V(x),3)}\nB5 native_b 0 V=V(x)**3\n")?;
+    fs::write(path.join("ps.lib"), b"*#PSPICE\n.param ps={PWR(-2,3)}\n")?;
+    let library_path = path.join("cell.lb");
+    fs::write(
+        &library_path,
+        b"*#SIMETRIX\n.subckt cell x p y rtn\nB1 y rtn V=V(x)**V(p)\n.ends cell\n",
+    )?;
+    let cancel = Cancellation::default();
+    let mut request = Request {
+        format: InputFormat::SimetrixLibrary,
+        input: SourceInput::File(library_path),
+        libraries: Vec::new(),
+        search_paths: Vec::new(),
+    };
+    let library = prepare(&request, &Options::default(), &cancel)?;
+    let parsed = ParsedLibrary::from_json(&library.primary.bytes)?;
+    let restored = ParsedLibrary::from_json(&parsed.to_json()?)?;
+    request.format = InputFormat::SimetrixDeck;
+    request.input = SourceInput::File(root);
+    request.libraries = vec![LibraryInput::Parsed(parsed)];
+    let options = Options {
+        power_target: PowerTarget::PreparedSolverV1,
+        ..Options::default()
+    };
+    let first = prepare(&request, &options, &cancel)?;
+    request.libraries = vec![LibraryInput::Parsed(restored)];
+    let second = prepare(&request, &options, &cancel)?;
+    assert_eq!(first.power_target, PowerTarget::PreparedSolverV1);
+    assert_eq!(first.primary.bytes, second.primary.bytes);
+    assert_eq!(first.companions.len(), second.companions.len());
+    for (a, b) in first.companions.iter().zip(&second.companions) {
+        assert_eq!(a.bytes, b.bytes);
+    }
+    let deck = std::str::from_utf8(&first.primary.bytes)?.to_ascii_lowercase();
+    for name in [
+        "simetrix_abs_pow(",
+        "simetrix_caret_pow(",
+        "simetrix_pow(",
+        "simetrix_abs_pow_product(",
+    ] {
+        ensure!(deck.contains(name), "missing {name}: {deck}");
+    }
+    assert!(first.companions.iter().any(|artifact| {
+        String::from_utf8_lossy(&artifact.bytes)
+            .to_ascii_lowercase()
+            .contains("simetrix_abs_pow(")
+    }));
+    let native = prepare(&request, &Options::default(), &cancel)?;
+    assert_eq!(native.power_target, PowerTarget::NativeNgspice);
+    assert!(!String::from_utf8_lossy(&native.primary.bytes).contains("simetrix_abs_pow("));
+    request.format = InputFormat::NativeDeck;
+    request.libraries.clear();
+    let error = prepare(&request, &options, &cancel)
+        .err()
+        .context("incompatible power target accepted")?;
+    ensure!(
+        format!("{error:#}").contains("prepared power target requires"),
+        "{error:#}"
+    );
+    Ok(())
+}

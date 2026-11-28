@@ -909,6 +909,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_prepared_power_has_a_separate_scalar_phase() -> Result<()> {
+        for (input, expected) in [
+            ("simetrix_abs_pow(-2,3)", 8.),
+            ("simetrix_abs_pow(0,0)", 1.),
+            ("simetrix_abs_pow(0,0.5)", 1e-154),
+            ("simetrix_abs_pow(2,-3)", 0.125),
+            ("simetrix_caret_pow(-2,3)", -8.),
+            ("simetrix_caret_pow(simetrix_abs_pow(2,3),2)", 64.),
+            ("simetrix_pow(-2,3)", -8.),
+            ("simetrix_abs_pow_product(0,0,-1)", 0.),
+            ("simetrix_abs_pow_product(2,-2,3)", 16.),
+            ("(-2)^3", 8.),
+            ("0^0.5", 0.),
+        ] {
+            let actual = evaluate(input)?;
+            ensure!(
+                (actual - expected).abs() <= expected.abs() * 1e-12,
+                "{input}: {actual:e} != {expected:e}"
+            );
+        }
+        assert!(evaluate("simetrix_abs_pow(0,-1)").is_err());
+        assert!(evaluate("simetrix_caret_pow(-2,0.5)").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn native_and_ltspice_operator_domains_remain_distinct() -> Result<()> {
         let budget = WorkBudget::default();
         for (input, lowered) in [
