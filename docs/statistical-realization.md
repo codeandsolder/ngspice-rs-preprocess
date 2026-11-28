@@ -23,10 +23,13 @@ are not part of this key.
 
 The generator is Philox4x64-10, with the low and high halves of the stream
 key as the two Philox key words and counter coordinates
-[block index, sample index, seed, 0]. The full 64-bit seed, sample and block
+[block index, sample index, seed, domain]. Prepared source laws use
+domain zero; other numerical consumers use explicitly distinct domains. The full 64-bit seed, sample and block
 coordinates are retained. The four words of a block give independently
 addressable scalar draws; a normal proposal uses two words of the same
-block. A uniform value is the midpoint of one of 2^52 equal intervals in
+block. Portable SIMD batch blocks use the same permutation and exact
+widening product as scalar blocks, with independently bound coordinates in
+each lane. A uniform value is the midpoint of one of 2^52 equal intervals in
 (0, 1). The endpoints are excluded. Truncated Gaussian sampling uses the
 existing bounded rejection laws with distinct indexed uniform pairs.
 Distribution transforms, finite-domain validation and lot semantics are
@@ -47,7 +50,10 @@ platforms; they are not an independent source of random state.
 
 ## Preparation boundary
 
-Validate and bind the distribution before repeated realization. Do not
+Bind the static source function and occurrence once with
+`Function::bind(site)` or `Invocation::bind(site)`, then call
+`BoundFunction::prepare(args)` on its evaluated law operands. Reuse
+the resulting distribution for repeated realization. Do not
 reconstruct stable declaration paths or density tables for each Monte
 Carlo draw. If the law's evaluated tolerance operands change, validate
 the changed law while preserving the original stream identity.

@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 //! Static statistical realization, independent of circuit traversal order,
 //! parameter candidates, and numerical integration steps.
 //!
@@ -64,32 +66,37 @@ impl Function {
     #[must_use = "the result identifies the typed distribution and correlation"]
     pub fn simetrix(name: &str) -> Option<Self> {
         use Correlation::{Independent, Lot};
-        let (kind, correlation) = match name.to_ascii_lowercase().as_str() {
-            "gauss" => (Kind::Gaussian, Independent),
-            "gaussl" => (Kind::Gaussian, Lot),
-            "gausssigma" => (Kind::GaussianSigma, Independent),
-            "gausssigmal" => (Kind::GaussianSigma, Lot),
-            "gausstrunc" => (Kind::GaussianTruncated, Independent),
-            "gausstruncl" => (Kind::GaussianTruncated, Lot),
-            "unif" => (Kind::Uniform, Independent),
-            "unifl" => (Kind::Uniform, Lot),
-            "unif2" => (Kind::UniformAsymmetric, Independent),
-            "unifl2" => (Kind::UniformAsymmetric, Lot),
-            "wc" => (Kind::Endpoints, Independent),
-            "wcl" => (Kind::Endpoints, Lot),
-            "wc2" => (Kind::EndpointsAsymmetric, Independent),
-            "wcl2" => (Kind::EndpointsAsymmetric, Lot),
-            "distribution2" | "ud2" => (Kind::Density, Independent),
-            "distribution2l" | "ud2l" => (Kind::Density, Lot),
-            "gausse" => (Kind::LogGaussian, Independent),
-            "gaussel" => (Kind::LogGaussian, Lot),
-            "unife" => (Kind::LogUniform, Independent),
-            "unifel" => (Kind::LogUniform, Lot),
-            "wce" => (Kind::LogEndpoints, Independent),
-            "wcel" => (Kind::LogEndpoints, Lot),
-            _ => return None,
+        for correlation in [Independent, Lot] {
+            for kind in [
+                Kind::Gaussian,
+                Kind::GaussianSigma,
+                Kind::GaussianTruncated,
+                Kind::Uniform,
+                Kind::UniformAsymmetric,
+                Kind::Endpoints,
+                Kind::EndpointsAsymmetric,
+                Kind::Density,
+                Kind::LogGaussian,
+                Kind::LogUniform,
+                Kind::LogEndpoints,
+            ] {
+                let function = Self { kind, correlation };
+                if name.eq_ignore_ascii_case(function.name()) {
+                    return Some(function);
+                }
+            }
+        }
+        let correlation = if name.eq_ignore_ascii_case("ud2") {
+            Independent
+        } else if name.eq_ignore_ascii_case("ud2l") {
+            Lot
+        } else {
+            return None;
         };
-        Some(Self { kind, correlation })
+        Some(Self {
+            kind: Kind::Density,
+            correlation,
+        })
     }
 
     /// Canonical source spelling; aliases share one distribution identity.
@@ -153,13 +160,7 @@ impl Function {
         )
     }
 
-    /// Validate and prepare the immutable law after evaluating its arguments
-    /// in the correct lexical occurrence. Reuse for repeated sample indices.
-    ///
-    /// # Errors
-    /// Wrong arity, invalid tolerance, sigma or density, or an unverified
-    /// logarithmic distribution. No nominal fallback is performed.
-    pub fn prepare(self, args: &[f64]) -> Result<PreparedDistribution> {
+    fn prepare_law(self, args: &[f64]) -> Result<Law> {
         self.validate_arity(args.len())?;
         ensure!(
             args.iter().all(|v| v.is_finite()),
@@ -204,9 +205,28 @@ impl Function {
                 self.name()
             ),
         };
-        Ok(PreparedDistribution {
+        Ok(law)
+    }
+
+    /// Bind the source law to its physical owner and declaration.
+    /// This does not depend on seed, sample index, or tolerance values.
+    ///
+    /// # Errors
+    /// Lot-correlated distributions require a bound model owner.
+    pub fn bind(self, site: Site) -> Result<BoundFunction> {
+        let owner = match self.correlation {
+            Correlation::Independent => site.occurrence,
+            Correlation::Lot => site
+                .lot
+                .context("lot distribution requires a bound model identity")?,
+        };
+        let key = Identity::root(b"model-statistics/v2")
+            .child(self.name().as_bytes())
+            .combine(site.expression)
+            .combine(owner);
+        Ok(BoundFunction {
             function: self,
-            law,
+            key,
         })
     }
 }
@@ -222,6 +242,7 @@ pub struct Realization {
 }
 
 /// Stable binding identity, constructed once after lexical expansion.
+///
 /// Callers keep the actual circuit occurrence identity for correctness;
 /// these compact keys identify pseudorandom streams, not circuit objects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,11 +302,13 @@ impl Identity {
         self.0.to_le_bytes()
     }
 
+    /// The low and high 64-bit words of this sampling key.
+    #[must_use = "the returned words identify the immutable stream key"]
     #[expect(
         clippy::cast_possible_truncation,
         reason = "split the 128-bit identity into exact low and high limbs"
     )]
-    const fn key(self) -> [u64; 2] {
+    pub const fn words(self) -> [u64; 2] {
         [self.0 as u64, (self.0 >> 64) as u64]
     }
 }
@@ -349,9 +372,11 @@ impl Invocation {
     /// Recognize a canonical prepared source function.
     #[must_use = "the result identifies the encoded source distribution"]
     pub fn function_for_marker(name: &str) -> Option<Function> {
-        let name = name.to_ascii_lowercase();
-        let suffix = name.strip_prefix(PREPARED_PREFIX)?;
-        Function::simetrix(suffix).filter(|function| function.name() == suffix)
+        let (prefix, suffix) = name.split_at_checked(PREPARED_PREFIX.len())?;
+        if !prefix.eq_ignore_ascii_case(PREPARED_PREFIX) {
+            return None;
+        }
+        Function::simetrix(suffix).filter(|function| function.name().eq_ignore_ascii_case(suffix))
     }
 
     /// Decode the exact numeric metadata and return the tolerance operands.
@@ -404,20 +429,16 @@ impl Invocation {
         ))
     }
 
-    /// Realize a call at its bound occurrence. The consumer supplies the
-    /// enclosing expression/macro invocation identity as well as physical
-    /// occurrence and lot identities. The source call site is mixed here.
+    /// Bind a call at its lexical and physical occurrence. The declaration-local
+    /// source ordinal is mixed here, once, independently of evaluated operands.
     ///
     /// # Errors
-    /// Invalid law, identity or non-finite realization.
-    pub fn sample(self, args: &[f64], site: Site) -> Result<f64> {
-        self.function
-            .prepare(args)?
-            .bind(Site {
-                expression: site.expression.child(&self.site.to_le_bytes()),
-                ..site
-            })?
-            .sample(self.realization)
+    /// Missing lot owner.
+    pub fn bind(self, site: Site) -> Result<BoundFunction> {
+        self.function.bind(Site {
+            expression: site.expression.child(&self.site.to_le_bytes()),
+            ..site
+        })
     }
 }
 
@@ -439,31 +460,27 @@ enum Law {
     },
 }
 
-/// A validated distribution, without mutable RNG state.
-#[derive(Clone, Debug)]
-pub struct PreparedDistribution {
+/// A source function with its immutable stream identity.
+///
+/// Candidate-dependent tolerance expressions can change the law without rebuilding that identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundFunction {
     function: Function,
-    law: Law,
+    key: Identity,
 }
 
-impl PreparedDistribution {
-    /// Bind an immutable law to its physical owner and declaration.
-    /// This does not depend on seed, sample index, or tolerance values.
+impl BoundFunction {
+    /// Validate the evaluated operands and prepare the immutable distribution.
+    /// Reuse the result across samples until those operands change.
     ///
     /// # Errors
-    /// Lot-correlated distributions require a bound model owner.
-    pub fn bind(self, site: Site) -> Result<BoundDistribution> {
-        let owner = match self.function.correlation {
-            Correlation::Independent => site.occurrence,
-            Correlation::Lot => site
-                .lot
-                .context("lot distribution requires a bound model identity")?,
-        };
-        let key = Identity::root(b"model-statistics/v2")
-            .child(self.function.name().as_bytes())
-            .combine(site.expression)
-            .combine(owner);
-        Ok(BoundDistribution { key, law: self.law })
+    /// Wrong arity, invalid tolerance, sigma or density, or an unverified
+    /// logarithmic distribution.
+    pub fn prepare(self, args: &[f64]) -> Result<BoundDistribution> {
+        Ok(BoundDistribution {
+            key: self.key,
+            law: self.function.prepare_law(args)?,
+        })
     }
 }
 
@@ -483,7 +500,7 @@ impl BoundDistribution {
     /// Exhausted rejection budget or a non-finite result.
     #[inline]
     pub fn sample(&self, realization: Realization) -> Result<f64> {
-        let random = CounterStream::new(self.key, realization);
+        let random = CounterStream::new(self.key.words(), realization, 0);
         let value = match &self.law {
             Law::Gaussian {
                 tolerance,

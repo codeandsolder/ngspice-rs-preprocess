@@ -1,35 +1,75 @@
 //! Counter-based Philox4x64-10. Each key selects an independent stream;
 //! seed, sample index and block index are disjoint counter coordinates.
 //! No shared state, platform byte order, or hash per random variate.
-use crate::{Identity, Realization};
+use crate::Realization;
 use anyhow::{Result, bail};
+use std::{ops::BitXor, simd::Simd};
 
 const MULTIPLIERS: [u64; 2] = [0xd2e7_470e_e14c_6c93, 0xca5a_8263_9512_1157];
 const WEYL: [u64; 2] = [0x9e37_79b9_7f4a_7c15, 0xbb67_ae85_84ca_a73b];
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "split the full product into its exact low and high limbs"
-)]
-const fn product(a: u64, b: u64) -> (u64, u64) {
-    let full = (a as u128) * (b as u128);
-    ((full >> 64) as u64, full as u64)
+// One permutation for scalar and SIMD words. Only the exact widening
+// multiplication and modular key increment differ by representation.
+trait Word: Copy + BitXor<Output = Self> {
+    fn product(self, multiplier: u64) -> (Self, Self);
+    fn add_constant(self, constant: u64) -> Self;
 }
 
-const fn philox(mut counter: [u64; 4], mut key: [u64; 2]) -> [u64; 4] {
-    let mut round = 0;
-    while round < 10 {
-        let (hi0, lo0) = product(MULTIPLIERS[0], counter[0]);
-        let (hi1, lo1) = product(MULTIPLIERS[1], counter[2]);
+impl Word for u64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "split the full product into its exact low and high limbs"
+    )]
+    #[inline]
+    fn product(self, multiplier: u64) -> (Self, Self) {
+        let full = u128::from(self) * u128::from(multiplier);
+        ((full >> 64) as u64, full as u64)
+    }
+
+    #[inline]
+    fn add_constant(self, constant: u64) -> Self {
+        self.wrapping_add(constant)
+    }
+}
+
+impl<const N: usize> Word for Simd<u64, N> {
+    #[inline]
+    fn product(self, multiplier: u64) -> (Self, Self) {
+        // Four exact 32x32 products per lane. The three middle limbs
+        // fit in u64; the carry is incorporated before joining the low word.
+        let mask = Self::splat(u64::from(u32::MAX));
+        let low = self & mask;
+        let high = self >> 32;
+        let multiplier_low = Self::splat(multiplier & u64::from(u32::MAX));
+        let multiplier_high = Self::splat(multiplier >> 32);
+        let low_low = low * multiplier_low;
+        let high_low = high * multiplier_low;
+        let low_high = low * multiplier_high;
+        let high_high = high * multiplier_high;
+        let middle = (low_low >> 32) + (high_low & mask) + (low_high & mask);
+        let upper = high_high + (high_low >> 32) + (low_high >> 32) + (middle >> 32);
+        (upper, (low_low & mask) | (middle << 32))
+    }
+
+    #[inline]
+    fn add_constant(self, constant: u64) -> Self {
+        self + Self::splat(constant)
+    }
+}
+
+#[inline]
+fn philox<W: Word>(mut counter: [W; 4], mut key: [W; 2]) -> [W; 4] {
+    for _ in 0..10 {
+        let (hi0, lo0) = counter[0].product(MULTIPLIERS[0]);
+        let (hi1, lo1) = counter[2].product(MULTIPLIERS[1]);
         counter = [
             hi1 ^ counter[1] ^ key[0],
             lo1,
             hi0 ^ counter[3] ^ key[1],
             lo0,
         ];
-        key[0] = key[0].wrapping_add(WEYL[0]);
-        key[1] = key[1].wrapping_add(WEYL[1]);
-        round += 1;
+        key[0] = key[0].add_constant(WEYL[0]);
+        key[1] = key[1].add_constant(WEYL[1]);
     }
     counter
 }
@@ -51,34 +91,71 @@ fn unit(bits: u64) -> f64 {
 pub struct CounterStream {
     key: [u64; 2],
     realization: Realization,
+    domain: u64,
 }
 
 impl CounterStream {
-    /// Bind an experiment to a previously selected stream key.
+    /// Bind an experiment to a previously selected two-word stream key.
+    ///
+    /// The caller selects a stable domain independently of the seed,
+    /// sample, and block. Domain zero is reserved for prepared source laws.
     #[must_use = "the stream defines independently addressable draws"]
     #[inline]
-    pub const fn new(key: Identity, realization: Realization) -> Self {
+    pub const fn new(key: [u64; 2], realization: Realization, domain: u64) -> Self {
         Self {
-            key: key.key(),
+            key,
             realization,
+            domain,
         }
     }
 
     /// Generate four integer words at the given block index.
     #[must_use = "the block contains four deterministic draws"]
     #[inline]
-    pub const fn block(self, index: u64) -> [u64; 4] {
+    pub fn block(self, index: u64) -> [u64; 4] {
         philox(
-            [index, self.realization.sample, self.realization.seed, 0],
+            [
+                index,
+                self.realization.sample,
+                self.realization.seed,
+                self.domain,
+            ],
             self.key,
         )
+    }
+
+    /// Generate blocks for independent stream/counter lanes.
+    ///
+    /// The permutation is identical to scalar draws. The lane count is any supported
+    /// portable SIMD width; each lane may have different seed, sample and key.
+    #[must_use = "the returned blocks contain the independently indexed draws"]
+    #[inline]
+    pub fn blocks<const N: usize>(streams: &[Self; N], indices: [u64; N]) -> [[u64; 4]; N] {
+        let counter = [
+            Simd::from_array(indices),
+            Simd::from_array(std::array::from_fn(|lane| streams[lane].realization.sample)),
+            Simd::from_array(std::array::from_fn(|lane| streams[lane].realization.seed)),
+            Simd::from_array(std::array::from_fn(|lane| streams[lane].domain)),
+        ];
+        let key = [
+            Simd::from_array(std::array::from_fn(|lane| streams[lane].key[0])),
+            Simd::from_array(std::array::from_fn(|lane| streams[lane].key[1])),
+        ];
+        let words = philox(counter, key).map(Simd::to_array);
+        std::array::from_fn(|lane| words.map(|word| word[lane]))
     }
 
     /// Generate a scalar uniform draw, excluding both endpoints.
     #[must_use = "the returned value is an independently indexed uniform draw"]
     #[inline]
     pub fn uniform(self, index: u64) -> f64 {
-        unit(self.block(index / 4)[(index % 4) as usize])
+        let [a, b, c, d] = self.block(index / 4);
+        unit(match index % 4 {
+            0 => a,
+            1 => b,
+            2 => c,
+            _ => d,
+        })
     }
 
     /// Generate two successive uniform values in a single permutation.
@@ -86,9 +163,12 @@ impl CounterStream {
     #[must_use = "the returned pair is an independently indexed uniform draw"]
     #[inline]
     pub fn uniform_pair(self, index: u64) -> [f64; 2] {
-        let words = self.block(index / 2);
-        let offset = ((index % 2) * 2) as usize;
-        [unit(words[offset]), unit(words[offset + 1])]
+        let [a, b, c, d] = self.block(index / 2);
+        if index.is_multiple_of(2) {
+            [unit(a), unit(b)]
+        } else {
+            [unit(c), unit(d)]
+        }
     }
 
     /// Standard normal variate from the indexed uniform pair.
@@ -130,7 +210,7 @@ mod tests {
         // Random123 upstream tests/kat_vectors: Philox4x64, ten rounds,
         // zero counter and key.
         assert_eq!(
-            philox([0; 4], [0; 2]),
+            philox([0_u64; 4], [0; 2]),
             [
                 0x1655_4d9e_ca36_314c,
                 0xdb20_fe9d_672d_0fdc,
@@ -154,7 +234,7 @@ mod tests {
         assert_eq!(
             philox(
                 [
-                    0x243f_6a88_85a3_08d3,
+                    0x243f_6a88_85a3_08d3_u64,
                     0x1319_8a2e_0370_7344,
                     0xa409_3822_299f_31d0,
                     0x082e_fa98_ec4e_6c89
