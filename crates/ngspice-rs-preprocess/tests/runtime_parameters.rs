@@ -16,12 +16,24 @@ fn simetrix_runtime_parameter_reference_cases() -> Result<()> {
 
 #[test]
 fn simetrix_runtime_builtin_reference_cases() -> Result<()> {
+    run_builtin_reference_cases(false)
+}
+
+#[test]
+fn simetrix_legacy_bjt_reference_cases() -> Result<()> {
+    run_builtin_reference_cases(true)
+}
+
+fn run_builtin_reference_cases(legacy_bjt: bool) -> Result<()> {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runtime-builtins");
     for line in include_str!("fixtures/runtime-builtins/outcomes.tsv").lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
         let [name, outcome, abs, rel] = fields.as_slice() else {
             anyhow::bail!("invalid reference row");
         };
+        if (*outcome == "legacy-bjt") != legacy_bjt {
+            continue;
+        }
         let (abs, rel) = if *outcome == "error" {
             (0., 0.)
         } else {
@@ -216,12 +228,17 @@ fn measured_classic_bjt_temperatures(
     bundle: &ngspice_rs_preprocess::PreparedBundle,
     fixtures: &Path,
     name: &str,
+    abs: f64,
+    rel: f64,
 ) -> Result<()> {
     use model_normalize_ngspice::{
         bjt_card::{BjtPolarity, BjtThermalConvention, ClassicBjtFamily},
         linked_source::RootKind,
         model_card::{instance_fields, positional_prefix},
-        parameter_scope::{ModelLibrary, topology::Limits},
+        parameter_scope::{
+            ModelLibrary,
+            topology::{Limits, Node},
+        },
     };
     let linked = prepared_diode::linked_source(bundle)?;
     let source = ModelLibrary::parse_linked(&linked, RootKind::Deck)?;
@@ -229,6 +246,7 @@ fn measured_classic_bjt_temperatures(
     let text = std::str::from_utf8(&linked.bytes)?;
     let mut cards = vec![Vec::new(); source.scopes.len()];
     let mut ambient = None;
+    let mut voltages = std::collections::BTreeMap::new();
     for (index, line) in text.lines().enumerate().skip(1) {
         let line = line.trim();
         if line
@@ -236,13 +254,6 @@ fn measured_classic_bjt_temperatures(
             .is_some_and(|s| s.eq_ignore_ascii_case(".temp"))
         {
             ambient = Some(source.evaluate_scalar(0, line[5..].trim(), &[])?);
-        }
-        if !line
-            .as_bytes()
-            .first()
-            .is_some_and(|b| b.eq_ignore_ascii_case(&b'Q'))
-        {
-            continue;
         }
         let scope = source
             .scopes
@@ -255,10 +266,28 @@ fn measured_classic_bjt_temperatures(
                     && index + 1 < scope.end_line
             })
             .map_or(0, |(id, _)| id);
-        cards[scope].push(line);
+        match line.as_bytes().first().map(u8::to_ascii_uppercase) {
+            Some(b'Q') => cards[scope].push(line),
+            Some(b'V') => {
+                // These fixtures contain independent DC sources to ground.
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                let [source_name, node, "0", value] = fields.as_slice() else {
+                    anyhow::bail!("unsupported fixture bias source {line}");
+                };
+                ensure!(scope == 0, "non-root fixture bias source {line}");
+                let source_name = source_name.to_ascii_lowercase();
+                let node = node.to_ascii_lowercase();
+                let value = source.evaluate_scalar(0, value, &[])?;
+                ensure!(
+                    voltages.insert(node, (source_name, value)).is_none(),
+                    "duplicate fixture bias source"
+                );
+            }
+            _ => {}
+        }
     }
     let ambient = ambient.context("missing fixture ambient temperature")?;
-    let mut currents = Vec::new();
+    let mut currents = std::collections::BTreeMap::new();
     for frame in &topology.frames {
         let overrides = frame
             .overrides
@@ -330,14 +359,45 @@ fn measured_classic_bjt_temperatures(
             let isat = saturation.context("missing fixture IS")?
                 * ratio.powi(3)
                 * (1.11 * (ratio - 1.0) / vt).exp();
-            // VBE=.65, VCE=2 in these independent fixed-bias fixtures.
-            currents.push(-isat * (0.65 / vt).exp_m1());
+            let voltage = |name: &str| -> Result<(&str, f64)> {
+                let name = name.to_ascii_lowercase();
+                let global = match frame.ports.get(&name) {
+                    Some(Node::Global(global)) => global.as_str(),
+                    None if frame.declaration == 0 || name == "0" => name.as_str(),
+                    _ => anyhow::bail!("fixture terminal is not a fixed global node: {name}"),
+                };
+                if global == "0" {
+                    return Ok(("", 0.));
+                }
+                let (source, value) = voltages.get(global).context("unbiased fixture terminal")?;
+                Ok((source.as_str(), *value))
+            };
+            let (collector_source, collector) = voltage(prefix[1].0)?;
+            let (_, base) = voltage(prefix[2].0)?;
+            let (_, emitter) = voltage(prefix[3].0)?;
+            // These fixtures use forward-active ideal GP transport. Check
+            // the actual emitted bias and the reverse exponential bound.
+            let vbe = base - emitter;
+            let vbc = base - collector;
+            ensure!(vbe > 0. && vbc < -20. * vt, "fixture is not forward active");
+            let current = -isat * (vbe / vt).exp_m1();
+            ensure!(
+                currents
+                    .insert(format!("i({collector_source})"), current)
+                    .is_none(),
+                "fixture collector source is shared"
+            );
         }
     }
     let csv = fs::read_to_string(fixtures.join(format!("{name}.csv")))?;
-    let expected = csv
-        .lines()
-        .nth(1)
+    let mut rows = csv.lines();
+    let columns = rows
+        .next()
+        .context("missing BJT reference columns")?
+        .split(',')
+        .skip(1);
+    let expected = rows
+        .next()
         .context("missing BJT reference row")?
         .split(',')
         .skip(1)
@@ -347,12 +407,16 @@ fn measured_classic_bjt_temperatures(
         currents.len() == expected.len(),
         "BJT temperature reference shape"
     );
-    for (actual, expected) in currents.into_iter().zip(expected) {
+    for (column, expected) in columns.zip(expected) {
+        let actual = currents
+            .remove(&column.to_ascii_lowercase())
+            .context("missing measured collector source")?;
         ensure!(
-            (actual - expected).abs() <= 1e-10 + 1e-7 * expected.abs(),
-            "legacy BJT transport: {actual} vs {expected}"
+            (actual - expected).abs() <= rel.mul_add(expected.abs(), abs),
+            "legacy BJT transport {column}: {actual} vs {expected}"
         );
     }
+    ensure!(currents.is_empty(), "unmeasured fixture collector source");
     Ok(())
 }
 
