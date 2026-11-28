@@ -787,7 +787,17 @@ pub(super) fn prepare(
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
     }
-    let (electrical, analysis_plan) = analysis::extract(&bytes, &origins, &original, budget)?;
+    let (electrical, analysis_plan) = analysis::extract(
+        &bytes,
+        &origins,
+        &original,
+        &statements
+            .first()
+            .context("missing HSPICE deck title")?
+            .text,
+        options.output_bytes,
+        budget,
+    )?;
     bytes = models::resolve_breakdown(&electrical, RootKind::Deck, options.output_bytes, budget)?;
     let mut bundle = native_bundle(
         root.path.clone(),

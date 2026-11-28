@@ -202,6 +202,7 @@ pub(super) fn original_statements<'a>(
 ) -> Result<OriginalStatements<'a>> {
     let mut original = BTreeMap::new();
     for (statement, origin) in statements.iter().zip(origins) {
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
         if matches!(
             command(&statement.text).as_str(),
             ".OP" | ".DC" | ".AC" | ".TRAN"
@@ -223,6 +224,8 @@ pub(super) fn extract(
     bytes: &[u8],
     origins: &[OriginLine],
     original: &OriginalStatements<'_>,
+    title: &str,
+    limit: usize,
     budget: &WorkBudget,
 ) -> Result<(Vec<u8>, Option<AnalysisPlan>)> {
     let text = std::str::from_utf8(bytes)?;
@@ -233,7 +236,7 @@ pub(super) fn extract(
     let mut plan = AnalysisPlan::new(
         AnalysisDialect::Hspice,
         PlanKind::Deck,
-        text.lines().next().map(str::to_owned),
+        Some(title.to_owned()),
     );
     let mut electrical = String::new();
     let mut delmax = None;
@@ -277,6 +280,11 @@ pub(super) fn extract(
                     .saturating_add(line.len())
                     .saturating_add(origin.source.as_os_str().len()),
             )?;
+            let disposition = if name == ".TRAN" || !independent_axes.is_empty() {
+                Disposition::RequiresBinding
+            } else {
+                Disposition::NativeRequest
+            };
             plan.entries.push(PlanEntry {
                 origin: DirectiveOrigin::Source {
                     path: origin.source.clone(),
@@ -290,7 +298,7 @@ pub(super) fn extract(
                 directive,
                 independent_axes,
                 parallelism_hint: None,
-                disposition: Disposition::RequiresBinding,
+                disposition,
             });
             writeln!(electrical, "* {line}")?;
         } else if index != 0 && matches!(name.as_str(), ".OPTIONS" | ".OPTION" | ".OPT") {
@@ -330,6 +338,10 @@ pub(super) fn extract(
             intent.try_bind_closed(budget)?;
         }
     }
+    ensure!(
+        electrical.len() <= limit,
+        "standalone SPICE output byte budget exceeded"
+    );
     budget.charge(Resource::EmittedBytes, electrical.len())?;
     Ok((
         electrical.into_bytes(),

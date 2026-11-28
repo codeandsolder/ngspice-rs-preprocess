@@ -494,6 +494,8 @@ fn segmented_transient_preserves_continuation_origins_and_candidate_axes() -> Re
     let bundle = compile(&root, InputFormat::HspiceDeck)?;
     let plan = bundle.analysis_plan.context("missing plan")?;
     assert_eq!(plan.entries.len(), 2);
+    assert_eq!(plan.native_requests().count(), 1);
+    assert_eq!(plan.title.as_deref(), Some("Timing"));
     let entry = &plan.entries[0];
     assert!(
         matches!(&entry.origin, DirectiveOrigin::Source { path, first_line: 1, last_line: 2 } if path == &child)
