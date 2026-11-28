@@ -10,8 +10,9 @@ mod sources;
 mod table;
 
 use crate::{
-    IdentifierAllocator, MappedNormalization, NormalizationPass, expression_start,
+    IdentifierAllocator, MappedNormalization, NormalizationPass, SourceDialects, expression_start,
     lexical::{self, Edit},
+    linked_source::SourceDialect,
 };
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
@@ -344,6 +345,8 @@ fn plan_rewrites(
     body: &[u8],
     title_lines: usize,
     static_macros: &BTreeSet<Vec<u8>>,
+    origins: &[usize],
+    dialects: SourceDialects<'_>,
     budget: &WorkBudget,
 ) -> Result<RewritePlan> {
     budget.charge(Resource::ScannedBytes, body.len())?;
@@ -367,7 +370,9 @@ fn plan_rewrites(
             control = false;
             continue;
         }
-        if control {
+        if control
+            || dialects.at_mapped(origins, statement.line + title_lines)? != SourceDialect::Ltspice
+        {
             continue;
         }
         if first.eq_ignore_ascii_case(b".backanno") {
@@ -425,6 +430,7 @@ fn normalize_sources(
     kind: crate::linked_source::RootKind,
     title: usize,
     title_lines: usize,
+    dialects: SourceDialects<'_>,
     budget: &WorkBudget,
 ) -> Result<()> {
     let artifact = if kind == crate::linked_source::RootKind::Deck {
@@ -436,6 +442,7 @@ fn normalize_sources(
         &input.model.bytes[title..],
         artifact,
         &input.input_lines[title_lines..],
+        dialects,
         budget,
     )? {
         input.model.bytes.truncate(title);
@@ -456,9 +463,10 @@ fn normalize_sources(
 ///
 /// # Errors
 /// Malformed statements, conflicting flags, or ambiguous intrinsic definitions.
-pub fn normalize(
+pub(crate) fn normalize(
     mut input: MappedNormalization,
     kind: crate::linked_source::RootKind,
+    dialects: SourceDialects<'_>,
     budget: &WorkBudget,
 ) -> Result<MappedNormalization> {
     let title = if kind == crate::linked_source::RootKind::Deck {
@@ -473,8 +481,13 @@ pub fn normalize(
         0
     };
     let title_lines = usize::from(title != 0);
-    normalize_sources(&mut input, kind, title, title_lines, budget)?;
-    if let Some(lowered) = operators::rewrite(&input.model.bytes[title..], budget)? {
+    normalize_sources(&mut input, kind, title, title_lines, dialects, budget)?;
+    if let Some(lowered) = operators::rewrite(
+        &input.model.bytes[title..],
+        &input.input_lines[title_lines..],
+        dialects,
+        budget,
+    )? {
         input.model.bytes.truncate(title);
         input.model.bytes.extend_from_slice(&lowered);
         input.model.passes.push(NormalizationPass::LtspiceOperators);
@@ -484,6 +497,7 @@ pub fn normalize(
         &input.model.bytes,
         &input.model.bytes[title..],
         &input.input_lines[title_lines..],
+        dialects,
         budget,
     )? {
         input.model.bytes.truncate(title);
@@ -496,7 +510,7 @@ pub fn normalize(
             .passes
             .push(NormalizationPass::LtspiceIntrinsics);
     }
-    apply_plan(input, title, title_lines, &static_macros, budget)
+    apply_plan(input, title, title_lines, &static_macros, dialects, budget)
 }
 
 fn apply_plan(
@@ -504,11 +518,20 @@ fn apply_plan(
     title: usize,
     title_lines: usize,
     static_macros: &BTreeSet<Vec<u8>>,
+    dialects: SourceDialects<'_>,
     budget: &WorkBudget,
 ) -> Result<MappedNormalization> {
     let bytes = &input.model.bytes;
     let body = &bytes[title..];
-    let plan = plan_rewrites(bytes, body, title_lines, static_macros, budget)?;
+    let plan = plan_rewrites(
+        bytes,
+        body,
+        title_lines,
+        static_macros,
+        &input.input_lines,
+        dialects,
+        budget,
+    )?;
     let RewritePlan {
         edits,
         helpers,

@@ -321,3 +321,71 @@ fn prepared_power_target_survives_nested_source_and_catalog_roundtrip() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn native_and_ltspice_statements_keep_separate_laws_in_one_deck() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let vendor = dir.path().join("vendor.lib");
+    fs::write(
+        &root,
+        b"mixed source laws\n.func limit(x,a,b) {x+a+b}\n.param native_result={limit(5,2,1)}\n.include vendor.lib\n.func bridge(x) {tbl(x)+1}\n.param table_result={bridge(0.25)}\nVnative a 0 {native_result}\nVvendor b 0 {vendor_result}\nVtable c 0 {table_result}\nVin input 0 0.25\nBtable d 0 V=bridge(v(input))\n.subckt native_cell p n\nLnative p n 1m\n.ends\n.end\n",
+    )?;
+    fs::write(
+        &vendor,
+        b"*#LTSPICE\n.param vendor_result={limit(5,2,1)}\n.func tbl(x) {table(x,0,0,1,2)}\n.subckt vendor_cell p n\nLvendor p n 1m\n.ends\n",
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root.clone()),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".func limit(x,a,b) {x+a+b}"));
+    assert!(text.contains(".param native_result={limit(5,2,1)}"));
+    assert!(text.contains(".param vendor_result={__lt_intrinsic_limit("));
+    assert!(text.contains("Lnative p n 1m"));
+    assert!(!text.contains("R__Lnative_RSER"));
+    assert!(text.contains("R__Lvendor_RSER"));
+    let Provenance::Native { lines } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native line map");
+    };
+    assert_eq!(lines.len(), text.lines().count());
+    let origin = text
+        .lines()
+        .zip(lines)
+        .find_map(|(line, origin)| line.starts_with("R__Lvendor_RSER").then_some(origin))
+        .context("missing generated series resistor")?;
+    assert_eq!(origin.source, vendor.canonicalize()?);
+    assert_eq!(origin.line, 5);
+    run_prepared(&bundle, "v(a) v(b) v(c) v(d)", &[8.0, 2.0, 1.5, 1.5])
+}
+
+#[test]
+fn ltspice_root_does_not_apply_its_default_inductor_loss_to_native_include() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"LTspice with native subcircuit\n.include native.inc\n.func f(x) {limit(x,0,1)}\nV1 x 0 {f(2)}\n.subckt vendor p n\nLvendor p n 1m\n.ends\n.end\n")?;
+    fs::write(dir.path().join("native.inc"), b"*#NATIVE\n.subckt native_cell p n\nLnative p n 1m\n.ends\n.param native_result={(-2)^3}\n")?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::LtspiceDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".param native_result={(-2)^3}"));
+    assert!(text.contains("Lnative p n 1m"));
+    assert!(!text.contains("R__Lnative_RSER"));
+    assert!(text.contains("R__Lvendor_RSER"));
+    run_prepared(&bundle, "v(x)", &[1.0])
+}

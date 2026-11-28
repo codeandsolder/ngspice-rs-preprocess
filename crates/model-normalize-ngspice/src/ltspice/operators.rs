@@ -196,7 +196,12 @@ fn rewrite_card(
     }
 }
 
-pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+pub(super) fn rewrite(
+    body: &[u8],
+    origins: &[usize],
+    dialects: crate::SourceDialects<'_>,
+    budget: &WorkBudget,
+) -> Result<Option<Vec<u8>>> {
     budget.charge(Resource::ScannedBytes, body.len())?;
     let mut edits = Vec::new();
     let mut control = false;
@@ -213,7 +218,10 @@ pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>
             control = false;
             continue;
         }
-        if !control {
+        if !control
+            && dialects.at_mapped(origins, statement.line)?
+                == crate::linked_source::SourceDialect::Ltspice
+        {
             rewrite_card(&statement, first, &mut edits, budget)?;
         }
     }

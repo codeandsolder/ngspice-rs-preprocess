@@ -5,19 +5,28 @@
 //! directly on a .SUBCKT header (e.g. TI ISO224X export).
 //! Separate that declaration without making it an overridable formal.
 
-use crate::{NormalizationPass, lexical, linked_source::RootKind, pspice::PspiceNormalization};
+use crate::{
+    NativeNormalization, NormalizationPass, SourceDialects, lexical,
+    linked_source::{RootKind, SourceDialect},
+};
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 
 /// A TINA source projection before the common SPICE normalization stage.
-struct Projection {
-    bytes: Vec<u8>,
-    lines: Vec<usize>,
-    passes: Vec<NormalizationPass>,
+pub(crate) struct Projection {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) lines: Vec<usize>,
+    pub(crate) passes: Vec<NormalizationPass>,
 }
 
 impl Projection {
-    fn build(input: &[u8], kind: RootKind) -> Result<Self> {
+    pub(crate) fn build(
+        input: &[u8],
+        kind: RootKind,
+        dialects: SourceDialects<'_>,
+        budget: &WorkBudget,
+    ) -> Result<Self> {
+        budget.charge(Resource::ScannedBytes, input.len())?;
         validate_plaintext(input)?;
         let title_length = if kind == RootKind::Deck {
             input
@@ -29,6 +38,7 @@ impl Projection {
             0
         };
         let (title, body) = input.split_at(title_length);
+        let title_lines = usize::from(title_length != 0);
         let mut passes = Vec::new();
         let normalized = lexical::normalize_nbsp(body);
         if normalized.is_some() {
@@ -55,15 +65,17 @@ impl Projection {
                 control = true;
             } else if first.eq_ignore_ascii_case(b".endc") {
                 control = false;
-            } else if !control && first.eq_ignore_ascii_case(b".subckt") {
+            } else if !control
+                && first.eq_ignore_ascii_case(b".subckt")
+                && dialects.at(statement.line + title_lines)? == SourceDialect::Tina
+            {
                 split_inline_parameters(body, &line_starts, &statement, &mut edits, &mut inserted)?;
             }
         }
-        let output = lexical::apply_edits(body, edits);
+        let output = lexical::apply_budgeted_edits(body, edits, budget)?;
         if output.is_some() {
             passes.push(NormalizationPass::TinaInlineParam);
         }
-        let title_lines = usize::from(title_length != 0);
         let mut lines = Vec::new();
         if title_lines != 0 {
             lines.push(1);
@@ -162,9 +174,14 @@ pub fn normalize_mapped(
     input: &[u8],
     kind: RootKind,
     budget: &WorkBudget,
-) -> Result<PspiceNormalization> {
+) -> Result<NativeNormalization> {
     budget.charge(Resource::ScannedBytes, input.len())?;
-    let projection = Projection::build(input, kind)?;
+    let projection = Projection::build(
+        input,
+        kind,
+        SourceDialects::Uniform(SourceDialect::Tina),
+        budget,
+    )?;
     budget.charge(Resource::EmittedBytes, projection.bytes.len())?;
     let mut result = crate::pspice::normalize_mapped(&projection.bytes, kind, budget)?;
     for line in result.mapped.input_lines.iter_mut().chain(

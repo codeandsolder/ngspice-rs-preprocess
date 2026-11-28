@@ -18,6 +18,8 @@ pub struct SourceOrigin {
     pub line: usize,
     /// Index into the linked source occurrence table.
     pub visit: usize,
+    /// Electrical declaration scope, independent of the source occurrence.
+    pub scope: usize,
 }
 
 /// Linked byte buffer and one origin for each physical output line.
@@ -29,6 +31,19 @@ pub struct LinkedSource {
     pub origins: Vec<SourceOrigin>,
     /// Source occurrences in traversal order, including repeated includes.
     pub visits: Vec<SourceVisit>,
+    /// Lexical subcircuit scopes; index zero is the deck scope.
+    pub scopes: Vec<SourceScope>,
+}
+
+/// A subcircuit declaration in the linked statement stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceScope {
+    /// Parent lexical scope, absent at the deck level.
+    pub parent: Option<usize>,
+    /// Name of the declared subcircuit, absent at the deck level.
+    pub name: Option<String>,
+    /// Declaration location in the original resource.
+    pub declaration: Option<SourceOrigin>,
 }
 
 /// One lexical source occurrence, independent of the cached source bytes.
@@ -38,6 +53,8 @@ pub struct SourceVisit {
     pub path: PathBuf,
     /// Parent occurrence; absent for the root.
     pub parent: Option<usize>,
+    /// Lexical scope at the resource reference.
+    pub scope: usize,
     /// Selected named section.
     pub section: Option<String>,
     /// Effective source language.
@@ -94,6 +111,10 @@ pub enum SourceDialect {
 }
 
 impl SourceDialect {
+    pub(crate) const fn is_pspice(self) -> bool {
+        matches!(self, Self::Pspice | Self::Tina)
+    }
+
     const fn named_sections(self) -> bool {
         matches!(self, Self::Native | Self::Hspice | Self::Simetrix)
     }
@@ -169,6 +190,7 @@ struct LinkState<'a> {
     admission: &'a mut SourceSession,
     limits: LinkLimits,
     stack: Vec<VisitFrame>,
+    scope: usize,
     output: LinkedSource,
 }
 
@@ -371,13 +393,20 @@ impl SourceLinker {
             admission,
             limits,
             stack: Vec::new(),
+            scope: 0,
             output: LinkedSource {
                 bytes: Vec::new(),
                 origins: Vec::new(),
                 visits: Vec::new(),
+                scopes: vec![SourceScope {
+                    parent: None,
+                    name: None,
+                    declaration: None,
+                }],
             },
         };
         state.expand_source(source, None, kind, &mut Projection::All)?;
+        ensure!(state.scope == 0, "unclosed subcircuit in linked source");
         Ok(state.output)
     }
 }
@@ -548,6 +577,7 @@ impl LinkState<'_> {
             path: path.to_path_buf(),
             line: physical_line,
             visit: frame.visit,
+            scope: self.scope,
         });
         Ok(())
     }
@@ -623,6 +653,7 @@ impl LinkState<'_> {
         self.output.visits.push(SourceVisit {
             path: path.clone(),
             parent: self.stack.last().map(|frame| frame.visit),
+            scope: self.scope,
             section: section_key,
             dialect: inherited,
             declaration: None,
@@ -650,13 +681,11 @@ impl LinkState<'_> {
         projection: &mut Projection,
     ) -> Result<()> {
         let path = &source.path;
-        let decoded = if self.dialect() == SourceDialect::Qspice {
-            crate::qspice::decode_resource(path, &source.bytes, self.admission.budget())?
-        } else {
-            std::borrow::Cow::Borrowed(&source.bytes[..])
-        };
-        crate::lexical::ensure_textual(&decoded)?;
-        if let Some((dialect, line)) = source_declaration(&decoded, kind, path)? {
+        let raw = source
+            .bytes
+            .strip_prefix(b"\xef\xbb\xbf")
+            .unwrap_or(&source.bytes);
+        if let Some((dialect, line)) = source_declaration(raw, kind, path)? {
             let frame = self
                 .stack
                 .last()
@@ -664,6 +693,12 @@ impl LinkState<'_> {
             self.output.visits[frame.visit].dialect = dialect;
             self.output.visits[frame.visit].declaration = Some(line);
         }
+        let decoded = if self.dialect() == SourceDialect::Qspice {
+            crate::qspice::decode_resource(path, &source.bytes, self.admission.budget())?
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
+        crate::lexical::ensure_textual(&decoded)?;
         let (body, first_line) = if kind == RootKind::Deck {
             let title = decoded
                 .split_inclusive(|byte| *byte == b'\n')
@@ -676,7 +711,7 @@ impl LinkState<'_> {
         };
         let records = records(body, first_line)?;
         if self.is_qspice_root() {
-            self.collect_source_paths(path, &records)?;
+            self.collect_source_paths(path, &records, section)?;
         }
         let mut selection = SectionSelection::new(section);
         let mut in_control = false;
@@ -734,11 +769,40 @@ impl LinkState<'_> {
         selection.finish(path)
     }
 
-    fn collect_source_paths(&mut self, path: &Path, records: &[Record]) -> Result<()> {
+    fn collect_source_paths(
+        &mut self,
+        path: &Path,
+        records: &[Record],
+        section: Option<&str>,
+    ) -> Result<()> {
         let mut depth = 0usize;
+        let mut selection = SectionSelection::new(section);
+        let mut in_control = false;
         for record in records {
             let text = std::str::from_utf8(&record.logical)?;
-            crate::qspice::check_topology_directive(path, record.line, text)?;
+            let control_start = directive(text, ".control").is_some();
+            let control_end = directive(text, ".endc").is_some();
+            if !in_control
+                && !control_start
+                && !selection.observe_with_syntax(text, path, record.line, SourceDialect::Qspice)?
+            {
+                continue;
+            }
+            if control_start {
+                in_control = true;
+            }
+            if !selection.selected() {
+                if control_end {
+                    in_control = false;
+                }
+                continue;
+            }
+            if !in_control {
+                crate::qspice::check_topology_directive(path, record.line, text)?;
+            }
+            if control_end {
+                in_control = false;
+            }
             if [".subckt", ".control"]
                 .iter()
                 .any(|name| directive(text, name).is_some())
@@ -780,7 +844,7 @@ impl LinkState<'_> {
                     .push(search);
             }
         }
-        Ok(())
+        selection.finish(path)
     }
 
     fn emit_record(&mut self, path: &Path, record: &Record, physical: &[&[u8]]) -> Result<()> {
@@ -832,7 +896,43 @@ impl LinkState<'_> {
             }
             return Ok(());
         }
-        self.emit_record(path, record, physical)
+        if let Some(rest) = directive(text, ".subckt") {
+            let name = rest
+                .split_whitespace()
+                .next()
+                .context("missing subcircuit name")?;
+            let visit = self
+                .stack
+                .last()
+                .context("missing linked source occurrence")?
+                .visit;
+            self.admission
+                .budget()
+                .charge(Resource::GeneratedNodes, 1)?;
+            self.admission.budget().charge(
+                Resource::EmittedBytes,
+                name.len().saturating_add(path.as_os_str().len()),
+            )?;
+            let scope = self.output.scopes.len();
+            self.output.scopes.push(SourceScope {
+                parent: Some(self.scope),
+                name: Some(name.to_owned()),
+                declaration: Some(SourceOrigin {
+                    path: path.to_path_buf(),
+                    line: physical_line,
+                    visit,
+                    scope,
+                }),
+            });
+            self.scope = scope;
+        }
+        self.emit_record(path, record, physical)?;
+        if directive(text, ".ends").is_some() {
+            self.scope = self.output.scopes[self.scope]
+                .parent
+                .with_context(|| format!("{}:{physical_line}: unmatched .ends", path.display()))?;
+        }
+        Ok(())
     }
 }
 
@@ -1018,6 +1118,39 @@ mod tests {
         assert!(text.contains("* #PSPICE"));
         assert!(!text.contains("missing.inc"));
         assert_eq!(linked.origins.len(), text.lines().count());
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_resources_keep_distinct_electrical_scopes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root.cir");
+        fs::write(&root, b"title\n.subckt a p n\n.include shared.inc\n.ends a\n.subckt b p n\n.include shared.inc\n.ends b\n.end\n")?;
+        fs::write(
+            temp.path().join("shared.inc"),
+            b"*#PSPICE\n.param value=2\n",
+        )?;
+        let mut session = SourceSession::default();
+        let admitted = session.load(&root)?;
+        let linked = SourceLinker::default().link_admitted(
+            &admitted,
+            RootKind::Deck,
+            LinkLimits::default(),
+            &mut session,
+        )?;
+        assert_eq!(linked.scopes.len(), 3);
+        assert_eq!(linked.scopes[1].name.as_deref(), Some("a"));
+        assert_eq!(linked.scopes[2].name.as_deref(), Some("b"));
+        assert_eq!(linked.visits[1].scope, 1);
+        assert_eq!(linked.visits[2].scope, 2);
+        let parameters = linked
+            .bytes
+            .split_inclusive(|&byte| byte == b'\n')
+            .zip(&linked.origins)
+            .filter(|(line, _)| line.starts_with(b".param"))
+            .map(|(_, origin)| (origin.visit, origin.scope, origin.line))
+            .collect::<Vec<_>>();
+        assert_eq!(parameters, [(1, 1, 2), (2, 2, 2)]);
         Ok(())
     }
 

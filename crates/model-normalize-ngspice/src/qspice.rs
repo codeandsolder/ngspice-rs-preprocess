@@ -5,7 +5,7 @@ mod numeric;
 mod sources;
 use crate::{
     lexical::{Edit, Statement, apply_budgeted_edits, remove_spans, statements, tokens},
-    linked_source::{LinkedSource, RootKind, SourceOrigin},
+    linked_source::{LinkedSource, RootKind, SourceDialect, SourceOrigin},
     model_card::{ModelCard, parse_model_card, parse_spice_constant},
     parameter_scope::declarations::Declarations,
     waveform::{PreparedWaveform, WaveformSpec},
@@ -584,8 +584,12 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind, budget: &WorkBudget) 
     for statement in source_statements {
         budget.charge(Resource::Statements, 1)?;
         budget.charge(Resource::ScannedBytes, statement.text.len())?;
+        let line = statement.line + usize::from(title_len != 0);
+        if linked.dialect_at(line) != Some(SourceDialect::Qspice) {
+            continue;
+        }
         let origin = linked
-            .origin(statement.line + usize::from(title_len != 0))
+            .origin(line)
             .context("missing QSPICE source location")?;
         numeric::rewrite(&statement, origin, &declarations, &mut numeric_edits)?;
     }
@@ -599,6 +603,9 @@ pub fn lower_linked(linked: &LinkedSource, kind: RootKind, budget: &WorkBudget) 
         budget.charge(Resource::Statements, 1)?;
         budget.charge(Resource::ScannedBytes, statement.text.len())?;
         let line = statement.line + usize::from(title_len != 0);
+        if linked.dialect_at(line) != Some(SourceDialect::Qspice) {
+            continue;
+        }
         let origin = linked
             .origin(line)
             .context("missing QSPICE source location")?;
