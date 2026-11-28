@@ -19,7 +19,8 @@ use super::{DialectContext, OpaqueSource, ScopedStatement};
 mod bsim3_junction;
 mod bsim4_occurrence;
 pub use bsim3_junction::{
-    HspiceBsim3JunctionInput, HspiceBsim3Junctions, HspiceJunctionSourceOptions,
+    HspiceBsim3JunctionInput, HspiceBsim3Junctions, HspiceBsim3OccurrenceOptions,
+    HspiceJunctionSourceOptions,
 };
 
 /// Simulator implementation identity. Different charge, temperature and

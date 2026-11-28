@@ -7,7 +7,9 @@
 use super::{HspiceBsim3Defaults, HspiceMosJunctionMode, ModelSelection, finite_coefficient};
 
 mod linear_reverse;
+mod occurrence;
 use anyhow::{Context, Result, ensure};
+pub use occurrence::HspiceBsim3OccurrenceOptions;
 
 use model_compact_intrinsic::{
     Bsim3JunctionModel, Bsim3JunctionRules, Bsim3KneeReference, MosBottomDensity,

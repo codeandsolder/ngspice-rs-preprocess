@@ -863,3 +863,126 @@ fn hspice_bsim4_occurrence_modifiers_preserve_scope_bins_and_revisions() -> Resu
     }
     Ok(())
 }
+
+#[test]
+fn hspice_bsim3_occurrence_geometry_preserves_defaults_scaling_and_sharing() -> Result<()> {
+    use model_normalize_ngspice::model_card::{instance_fields, parse_spice_constant};
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        HspiceBsim3OccurrenceOptions, HspiceJunctionSourceOptions,
+    };
+
+    let mapping = table(".options HSPICEMODELS=1")?;
+    let source_options = HspiceJunctionSourceOptions {
+        nominal_temperature_k: 300.15,
+        model_scale: 1.,
+        aspec: false,
+        update: 0,
+    };
+    let options = HspiceBsim3OccurrenceOptions {
+        element_scale: 1e-6,
+        default_width_m: 12e-6,
+        default_area_m2: [Some(19e-12), Some(23e-12)],
+        default_perimeter_m: [Some(13e-6), Some(17e-6)],
+        default_squares: [2., 3.],
+        temperature_k: 310.15,
+    };
+    let close = |actual: f64, expected: f64| {
+        assert!(
+            (actual - expected).abs() <= expected.abs() * 1e-12 + 1e-24,
+            "{actual:e} != {expected:e}"
+        );
+    };
+    for (acm, calcacm, explicit_defaults) in [
+        (0, 0, true),
+        (1, 0, false),
+        (2, 0, false),
+        (3, 0, false),
+        (10, 0, true),
+        (11, 0, true),
+        (12, 0, true),
+        (12, 1, false),
+        (13, 0, true),
+    ] {
+        let source = statements(&format!(
+            ".model m NMOS LEVEL=53 VERSION=3.3 ACM={acm} CALCACM={calcacm} HDIF=2u RSH=40 CJ=1e-3 CJSW=1e-10"
+        ));
+        let bound = mapping
+            .select_card(&source[0], &[], &WorkBudget::default())?
+            .context("selection")?
+            .bind_hspice_bsim3_junctions(source_options, |raw| Ok(parse_spice_constant(raw)?))?;
+        for (geo, shared) in [
+            (0, [false, false]),
+            (1, [true, false]),
+            (2, [false, true]),
+            (3, [true, true]),
+        ] {
+            let fields = instance_fields(
+                &format!("W='local_width' AD=0 PS=7 NRD=0 GEO={geo} DTEMP=15"),
+                3,
+            )?;
+            let input = bound.bind_occurrence_geometry(&fields, options, 9e-6, |raw| {
+                if raw.trim_matches(['\'', '"']) == "local_width" {
+                    Ok(10.)
+                } else {
+                    Ok(parse_spice_constant(raw)?)
+                }
+            })?;
+            close(input.drawn_width_m, 10e-6);
+            close(input.gate_width_m, 9e-6);
+            close(input.operating_temperature_k, 325.15);
+            assert_eq!(input.diffusion.map(|terminal| terminal.shared), shared);
+            assert_eq!(input.diffusion[0].area_m2, Some(0.));
+            close(
+                input.diffusion[1]
+                    .perimeter_m
+                    .context("explicit perimeter")?,
+                7e-6,
+            );
+            assert_eq!(
+                input.diffusion[1].area_m2,
+                if explicit_defaults {
+                    options.default_area_m2[1]
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                input.diffusion[0].perimeter_m,
+                if explicit_defaults {
+                    options.default_perimeter_m[0]
+                } else {
+                    None
+                }
+            );
+            assert_eq!(input.squares, [Some(0.), None]);
+            assert_eq!(input.default_squares, options.default_squares);
+            let [drain, source] = bound.prepare(input)?;
+            assert!(drain.evaluate(-0.2)?.capacitance_f.is_finite());
+            assert!(source.evaluate(-0.2)?.capacitance_f.is_finite());
+        }
+        let default = bound
+            .bind_occurrence_geometry(&[], options, 10e-6, |raw| Ok(parse_spice_constant(raw)?))?;
+        close(default.drawn_width_m, options.default_width_m);
+        assert_eq!(default.squares, [None; 2]);
+        for invalid in [
+            "GEO=4",
+            "GEO=0.5",
+            "W=0",
+            "AD=-1",
+            "NRD=-1",
+            "DTEMP=-400",
+            "PS=1 PS=2",
+        ] {
+            let fields = instance_fields(invalid, 3)?;
+            assert!(
+                bound
+                    .bind_occurrence_geometry(&fields, options, 9e-6, |raw| Ok(
+                        parse_spice_constant(raw)?
+                    ))
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+    }
+    Ok(())
+}

@@ -50,7 +50,7 @@ pub struct Bsim4ModifiedChannel {
     pub resets: Bsim4ChannelModifierResets,
 }
 
-fn finite(value: f64, parameter: &'static str) -> Result<f64, ModelError> {
+const fn finite(value: f64, parameter: &'static str) -> Result<f64, ModelError> {
     if value.is_finite() {
         Ok(value)
     } else {
