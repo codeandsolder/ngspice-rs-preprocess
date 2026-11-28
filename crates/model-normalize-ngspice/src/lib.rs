@@ -32,7 +32,9 @@ pub struct SourceStatement {
 }
 
 /// Scan logical source statements with the same lexical rules used by the
-/// normalization passes. A complete deck's first physical line is its title,
+/// normalization passes.
+///
+/// A complete deck's first physical line is its title,
 /// never a statement. No source-specific expression is interpreted here.
 ///
 /// # Errors
@@ -67,8 +69,9 @@ pub fn source_statements(
 }
 
 /// Remove selected fields of one logical source statement while preserving
-/// its physical lines, including wholly consumed continuation lines. Spans
-/// refer to the text returned by the shared logical statement scanner.
+/// its physical lines, including wholly consumed continuation lines.
+///
+/// Spans refer to the text returned by the shared logical statement scanner.
 ///
 /// # Errors
 /// Invalid physical statement or field spans, or exhausted work budget.

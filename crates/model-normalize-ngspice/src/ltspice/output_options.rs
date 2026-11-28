@@ -31,7 +31,7 @@ pub fn is_projected(name: &str) -> bool {
         .is_some_and(|name| SOURCE_NAMES.contains(&name))
 }
 
-/// Parse one logical LTspice option card, retaining exact source field spans.
+/// Parse one logical `LTspice` option card, retaining exact source field spans.
 /// The qualified presentation controls accept both assignments and bare values.
 ///
 /// # Errors

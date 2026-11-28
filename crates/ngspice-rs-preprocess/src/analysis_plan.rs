@@ -18,9 +18,9 @@ use sweep::{BoundAxis, CoordinateOrder, SweepAxis, SweepExecution};
 pub enum AnalysisDialect {
     /// Native ngspice analysis semantics.
     Native,
-    /// LTspice analysis and independent parameter stepping.
+    /// `LTspice` analysis and independent parameter stepping.
     Ltspice,
-    /// PSpice source analysis declarations.
+    /// `PSpice` source analysis declarations.
     Pspice,
     /// TINA source analysis declarations.
     Tina,
@@ -699,23 +699,16 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
     }
     match (dialect, name) {
         (
-            AnalysisDialect::Ltspice,
+            AnalysisDialect::Ltspice | AnalysisDialect::Simetrix,
             "RELTOL" | "ABSTOL" | "VNTOL" | "CHGTOL" | "TRTOL" | "GMIN" | "TNOM" | "MAXORD"
             | "ITL1" | "ITL2" | "ITL4",
-        ) => Circuit,
+        )
+        | (AnalysisDialect::Simetrix, "TEMP" | "RSHUNT" | "CSHUNT" | "METHOD") => Circuit,
         (
             AnalysisDialect::Ltspice,
             "MAXSTEP" | "TEMP" | "METHOD" | "SSTOL" | "STSTDELAY" | "STSTCLOCKS",
-        ) => RequiresBinding,
-        (AnalysisDialect::Ltspice, "MEASDGT" | "LOGPARAMS" | "LOGOPINFO" | "DEBUGTRAN") => Metadata,
-        (AnalysisDialect::Simetrix, "HSPICEMODELS" | "HSPICECOMPATIBILITY") => ModelSelection,
-        (AnalysisDialect::Simetrix, "INITCONDMODE" | "ICRES") => Initialization,
-        (
-            AnalysisDialect::Simetrix,
-            "TEMP" | "TNOM" | "RELTOL" | "ABSTOL" | "VNTOL" | "CHGTOL" | "TRTOL" | "GMIN"
-            | "RSHUNT" | "CSHUNT" | "METHOD" | "MAXORD" | "ITL1" | "ITL2" | "ITL4",
-        ) => Circuit,
-        (
+        )
+        | (
             AnalysisDialect::Simplis,
             "PSP_START"
             | "PSP_END"
@@ -731,6 +724,9 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
             | "MIN_AVG_TOPOLOGY_DUR"
             | "AVG_TOPOLOGY_DUR_MEASUREMENT_WINDOW",
         ) => RequiresBinding,
+        (AnalysisDialect::Ltspice, "MEASDGT" | "LOGPARAMS" | "LOGOPINFO" | "DEBUGTRAN") => Metadata,
+        (AnalysisDialect::Simetrix, "HSPICEMODELS" | "HSPICECOMPATIBILITY") => ModelSelection,
+        (AnalysisDialect::Simetrix, "INITCONDMODE" | "ICRES") => Initialization,
         (_, "EMSG_MAX" | "EXPAND" | "POP_SHOWDATA" | "LIST" | "NODE" | "NOMOD" | "NOPAGE") => {
             Metadata
         }
@@ -975,51 +971,59 @@ fn pspice_directive(
     Ok(Some((directive, disposition)))
 }
 
+fn dialect_directive(
+    name: &str,
+    statement: &str,
+    dialect: AnalysisDialect,
+    scoped: bool,
+) -> Result<Option<(Directive, Disposition)>> {
+    match dialect {
+        AnalysisDialect::Simetrix => {
+            let directive = match name {
+                ".STEP" => Some(Directive::Sweep {
+                    axis: SweepAxis::simetrix_step(&arguments(statement)?)?,
+                }),
+                ".DC" => {
+                    let args = arguments(statement)?;
+                    // Statistical selection owns the original unbound MONTE form.
+                    if simetrix::sweep_start(AnalysisKind::DcSweep, &args)
+                        .and_then(|index| args.get(index + 1))
+                        .is_some_and(|field| field.eq_ignore_ascii_case("MONTE"))
+                    {
+                        None
+                    } else {
+                        Some(Directive::DcSweep {
+                            axes: simetrix::dc_axes(&args)?,
+                        })
+                    }
+                }
+                _ => None,
+            };
+            Ok(directive.map(|directive| {
+                (
+                    directive,
+                    if scoped {
+                        Disposition::Unsupported
+                    } else {
+                        Disposition::RequiresBinding
+                    },
+                )
+            }))
+        }
+        AnalysisDialect::Ltspice => ltspice_directive(name, statement, scoped),
+        AnalysisDialect::Pspice => pspice_directive(name, statement, scoped),
+        _ => Ok(None),
+    }
+}
+
 fn classify(
     name: &str,
     statement: &str,
     dialect: AnalysisDialect,
     scoped: bool,
 ) -> Result<(Directive, Disposition)> {
-    use Disposition::{
-        Circuit, Initialization, Metadata, NativeRequest, RequiresBinding, Unsupported,
-    };
-    if dialect == AnalysisDialect::Simetrix {
-        let directive = match name {
-            ".STEP" => Some(Directive::Sweep {
-                axis: SweepAxis::simetrix_step(&arguments(statement)?)?,
-            }),
-            ".DC" => {
-                let args = arguments(statement)?;
-                // Statistical selection owns the original unbound MONTE form.
-                if simetrix::sweep_start(AnalysisKind::DcSweep, &args)
-                    .and_then(|index| args.get(index + 1))
-                    .is_some_and(|field| field.eq_ignore_ascii_case("MONTE"))
-                {
-                    None
-                } else {
-                    Some(Directive::DcSweep {
-                        axes: simetrix::dc_axes(&args)?,
-                    })
-                }
-            }
-            _ => None,
-        };
-        if let Some(directive) = directive {
-            return Ok((
-                directive,
-                if scoped { Unsupported } else { RequiresBinding },
-            ));
-        }
-    }
-    if dialect == AnalysisDialect::Ltspice
-        && let Some(directive) = ltspice_directive(name, statement, scoped)?
-    {
-        return Ok(directive);
-    }
-    if dialect == AnalysisDialect::Pspice
-        && let Some(directive) = pspice_directive(name, statement, scoped)?
-    {
+    use Disposition::{Circuit, Initialization, Metadata, RequiresBinding, Unsupported};
+    if let Some(directive) = dialect_directive(name, statement, dialect, scoped)? {
         return Ok(directive);
     }
     if matches!(
@@ -1077,6 +1081,16 @@ fn classify(
     ) {
         return Ok((Directive::Observation { arguments: args }, RequiresBinding));
     }
+    Ok(classify_request(name, args, dialect, scoped))
+}
+
+fn classify_request(
+    name: &str,
+    args: Vec<String>,
+    dialect: AnalysisDialect,
+    scoped: bool,
+) -> (Directive, Disposition) {
+    use Disposition::{NativeRequest, RequiresBinding, Unsupported};
     let analysis = analysis_kind(name);
     let mut args = args;
     let uic = matches!(dialect, AnalysisDialect::Simetrix | AnalysisDialect::Native)
@@ -1135,14 +1149,14 @@ fn classify(
             _ => Unsupported,
         }
     };
-    Ok((
+    (
         Directive::Analysis {
             analysis,
             arguments: args,
             uic,
         },
         disposition,
-    ))
+    )
 }
 
 fn push_entry(
@@ -1539,7 +1553,14 @@ mod typed_analysis_tests {
             }
         })?;
         assert_eq!(timing.max_step.to_bits(), (5e-3_f64 / 1024.).to_bits());
-        assert!(timing.modes.startup && !timing.modes.uic);
+        assert!(
+            timing
+                .modes
+                .contains(model_normalize_ngspice::ltspice::transient::TransientModifier::Startup)
+                && !timing
+                    .modes
+                    .contains(model_normalize_ngspice::ltspice::transient::TransientModifier::Uic)
+        );
         assert!(timing.native_timing().is_err());
         assert!(matches!(
             plan.entries[3].directive,

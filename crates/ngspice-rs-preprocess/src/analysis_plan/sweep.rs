@@ -147,7 +147,7 @@ pub enum CoordinateOrder {
 }
 
 /// Source-specific minimum coordinate policy. A one-coordinate independent
-/// run is meaningful in some dialects, but LTspice STEP requires variation.
+/// run is meaningful in some dialects, but `LTspice` STEP requires variation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cardinality {
@@ -290,7 +290,7 @@ fn law(args: &[String], mode: Option<RangeMode>) -> Result<CoordinateLaw> {
 }
 
 impl SweepAxis {
-    /// Parse the documented LTspice STEP target and coordinate syntax.
+    /// Parse the documented `LTspice` STEP target and coordinate syntax.
     /// The caller retains the statement origin and lexical scope in the plan.
     ///
     /// # Errors
@@ -300,7 +300,7 @@ impl SweepAxis {
         Self::compatibility_step(args, false)
     }
 
-    /// Parse the SIMetrix single-level compatibility STEP form.
+    /// Parse the `SIMetrix` single-level compatibility STEP form.
     ///
     /// # Errors
     /// Malformed target or range; nested or file-backed forms require the
@@ -333,7 +333,7 @@ impl SweepAxis {
         })
     }
 
-    /// The ordered axes of one LTspice DC continuation analysis.
+    /// The ordered axes of one `LTspice` DC continuation analysis.
     /// The first axis is the innermost; each outer coordinate starts a
     /// separate continuation of the inner analysis.
     ///
@@ -530,13 +530,13 @@ pub struct BoundAxis {
 impl BoundAxis {
     /// Number of coordinates, including repeated list entries.
     #[must_use = "the count bounds analysis work"]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.coordinates.len()
     }
 
     /// Whether the axis is empty. Successful binding never produces an empty axis.
     #[must_use = "an empty axis cannot drive an analysis"]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -554,7 +554,7 @@ enum Coordinates {
 }
 
 impl Coordinates {
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         match self {
             Self::List(values) => values.len(),
             Self::Range(range) => range.count as usize,

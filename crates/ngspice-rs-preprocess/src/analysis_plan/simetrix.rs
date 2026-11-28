@@ -1,4 +1,4 @@
-//! SIMetrix sweep declarations. Its general sweep grammar is distinct from
+//! `SIMetrix` sweep declarations. Its general sweep grammar is distinct from
 //! the compatibility STEP grammar: LIN takes a point count, not a step size.
 //! Inline SWEEP axes belong to their individual analysis request.
 
@@ -181,7 +181,7 @@ impl AxisParts {
     }
 }
 
-fn clause_boundary(field: &str) -> bool {
+const fn clause_boundary(field: &str) -> bool {
     field.eq_ignore_ascii_case("SWEEP") || field.eq_ignore_ascii_case("NUMCORES")
 }
 
@@ -321,13 +321,13 @@ pub(super) fn inline_sweeps(
     let mut rest = &args[first + 1..];
     let mut axes = Vec::new();
     let parallelism_hint = loop {
-        let axis = axis_prefix(&mut rest, SweepExecution::Independent)?;
+        let sweep = axis_prefix(&mut rest, SweepExecution::Independent)?;
         ensure!(
             !matches!(analysis, AnalysisKind::DcSweep | AnalysisKind::Transient)
-                || axis.target != SweepTarget::Frequency,
+                || sweep.target != SweepTarget::Frequency,
             "frequency is not an independent DC/transient sweep target"
         );
-        axes.push(axis);
+        axes.push(sweep);
         if rest.is_empty() {
             break None;
         }

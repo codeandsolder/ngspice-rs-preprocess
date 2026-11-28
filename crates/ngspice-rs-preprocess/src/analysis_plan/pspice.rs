@@ -1,4 +1,4 @@
-//! PSpice numerical sweeps. The reference grammar uses positive linear
+//! `PSpice` numerical sweeps. The reference grammar uses positive linear
 //! increment magnitudes, ordered lists, and a distinct nested DC continuation.
 //! Statistical realizations are not numerical sweep coordinates.
 

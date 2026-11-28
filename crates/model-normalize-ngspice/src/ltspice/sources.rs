@@ -58,7 +58,10 @@ fn rewrite_tran(
     let intent = super::transient::TransientIntent::parse(&args)?;
     let bound = intent.bind_closed(budget)?;
     let resolved = bound.native_timing()?;
-    let timing = if intent.modes.uic {
+    let timing = if intent
+        .modes
+        .contains(crate::ltspice::transient::TransientModifier::Uic)
+    {
         &fields[1..fields.len() - 1]
     } else {
         &fields[1..]

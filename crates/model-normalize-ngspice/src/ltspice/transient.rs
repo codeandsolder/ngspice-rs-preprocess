@@ -1,49 +1,60 @@
-//! LTspice transient intent and occurrence-bound timing. The output window,
+//! `LTspice` transient intent and occurrence-bound timing. The output window,
 //! integration cap and initialization/termination modes are independent.
 
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 
-/// Source transient modifiers. Preserve them independently rather than
-/// treating startup as UIC or steady-state termination as a fixed duration.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TransientModes {
+/// Independent source transient modifier.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransientModifier {
     /// Skip the operating-point solve.
-    pub uic: bool,
+    Uic,
     /// Source-specific initialization and source startup ramp.
-    pub startup: bool,
+    Startup,
     /// Enable steady-state detection and early termination.
-    pub steady: bool,
+    Steady,
     /// Preserve data prior to steady-state detection.
-    pub nodiscard: bool,
+    Nodiscard,
     /// Request the step response instead of the ordinary transient.
-    pub step_response: bool,
+    StepResponse,
     /// Request convergence diagnostics.
-    pub convergence_report: bool,
+    ConvergenceReport,
 }
 
-impl TransientModes {
-    fn flag(&mut self, field: &str) -> Option<&mut bool> {
+impl TransientModifier {
+    fn parse(field: &str) -> Option<Self> {
         Some(match field.to_ascii_lowercase().as_str() {
-            "uic" => &mut self.uic,
-            "startup" => &mut self.startup,
-            "steady" => &mut self.steady,
-            "nodiscard" => &mut self.nodiscard,
-            "step" => &mut self.step_response,
-            "convreport" => &mut self.convergence_report,
+            "uic" => Self::Uic,
+            "startup" => Self::Startup,
+            "steady" => Self::Steady,
+            "nodiscard" => Self::Nodiscard,
+            "step" => Self::StepResponse,
+            "convreport" => Self::ConvergenceReport,
             _ => return None,
         })
+    }
+}
+
+/// Source transient modifiers, retaining independent combinations.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TransientModes(std::collections::BTreeSet<TransientModifier>);
+
+impl TransientModes {
+    /// Whether a particular original source modifier was requested.
+    #[must_use = "each modifier controls its own source analysis policy"]
+    pub fn contains(&self, modifier: TransientModifier) -> bool {
+        self.0.contains(&modifier)
     }
 
     /// The ordinary native transient card cannot express the other modes.
     #[must_use = "non-native modes require a separately qualified execution policy"]
-    pub const fn native_compatible(self) -> bool {
-        !(self.startup
-            || self.steady
-            || self.nodiscard
-            || self.step_response
-            || self.convergence_report)
+    pub fn native_compatible(&self) -> bool {
+        self.0
+            .iter()
+            .all(|modifier| *modifier == TransientModifier::Uic)
     }
 }
 
@@ -63,7 +74,7 @@ pub struct TransientIntent {
 }
 
 /// Numeric timing and requested policy, independent of source spelling.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BoundTransient {
     /// Plotting increment / initial step hint.
     pub interval: f64,
@@ -82,7 +93,7 @@ impl BoundTransient {
     ///
     /// # Errors
     /// Source-specific execution modes that need explicit consumer support.
-    pub fn native_timing(self) -> Result<[f64; 4]> {
+    pub fn native_timing(&self) -> Result<[f64; 4]> {
         ensure!(
             self.modes.native_compatible(),
             "LTspice transient modes require typed analysis binding"
@@ -103,9 +114,11 @@ impl TransientIntent {
         let mut timing = Vec::new();
         let mut flags_started = false;
         for &field in fields {
-            if let Some(flag) = modes.flag(field) {
-                ensure!(!*flag, "duplicate LTspice transient modifier {field}");
-                *flag = true;
+            if let Some(modifier) = TransientModifier::parse(field) {
+                ensure!(
+                    modes.0.insert(modifier),
+                    "duplicate LTspice transient modifier {field}"
+                );
                 flags_started = true;
             } else {
                 let keyword = field.split_once('=').map_or(field, |(key, _)| key);
@@ -192,7 +205,7 @@ impl TransientIntent {
             stop,
             output_start,
             max_step,
-            modes: self.modes,
+            modes: self.modes.clone(),
         })
     }
 
@@ -210,11 +223,10 @@ impl TransientIntent {
                 .strip_prefix('{')
                 .and_then(|text| text.strip_suffix('}'));
             let expression = grouped.unwrap_or(text);
-            if let Ok(value) = crate::model_card::parse_spice_constant(expression) {
-                Ok(Some(value))
-            } else {
-                super::constants::try_evaluate(expression, grouped.is_none(), budget)
-            }
+            crate::model_card::parse_spice_constant(expression).map_or_else(
+                |_| super::constants::try_evaluate(expression, grouped.is_none(), budget),
+                |value| Ok(Some(value)),
+            )
         };
         let interval = self.interval.as_deref().map_or(Ok(Some(0.)), scalar)?;
         let stop = scalar(&self.stop)?;
@@ -280,7 +292,7 @@ mod tests {
         assert_eq!(bound.output_start.to_bits(), 0.002_f64.to_bits());
         assert_eq!(bound.interval.to_bits(), 1e-6_f64.to_bits());
         assert!((bound.max_step - 50e-9).abs() < 1e-20);
-        assert!(bound.modes.uic);
+        assert!(bound.modes.contains(TransientModifier::Uic));
         Ok(())
     }
 
@@ -288,11 +300,17 @@ mod tests {
     fn source_modes_are_never_silently_substituted() -> Result<()> {
         let startup =
             TransientIntent::parse(&["0", "1m", "startup"])?.bind_closed(&WorkBudget::default())?;
-        assert!(startup.modes.startup && !startup.modes.uic);
+        assert!(
+            startup.modes.contains(TransientModifier::Startup)
+                && !startup.modes.contains(TransientModifier::Uic)
+        );
         assert!(startup.native_timing().is_err());
         let steady = TransientIntent::parse(&["1m", "steady", "nodiscard"])?
             .bind_closed(&WorkBudget::default())?;
-        assert!(steady.modes.steady && steady.modes.nodiscard);
+        assert!(
+            steady.modes.contains(TransientModifier::Steady)
+                && steady.modes.contains(TransientModifier::Nodiscard)
+        );
         assert!(steady.native_timing().is_err());
         assert!(TransientIntent::parse(&["1m", "startup", "startup"]).is_err());
         assert!(TransientIntent::parse(&["1m", "savestate", "=", "state.dat"]).is_err());

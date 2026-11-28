@@ -1,4 +1,6 @@
-//! Direct source analysis extraction. The admitted graph supplies physical
+//! Direct source analysis extraction.
+//!
+//! The admitted graph supplies physical
 //! source identity and effective dialect for each logical statement; this
 //! pass owns only analysis semantics and line-preserving electrical edits.
 
@@ -406,6 +408,7 @@ fn emit(physical: &[&[u8]], rewrites: Vec<Rewrite>, budget: &WorkBudget) -> Resu
 }
 
 /// Capture source-specific analysis intent from a directly linked graph.
+///
 /// The location resolver is called on physical statement spans, never on a
 /// reconstructed filename or guessed root dialect. A pure native circuit
 /// without source-specific analysis keeps its ordinary native execution path.

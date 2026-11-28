@@ -609,7 +609,12 @@ fn vendor_transient_timing_is_explicit_in_native_decks() -> Result<()> {
         for (&actual, expected) in actual.iter().zip(expected) {
             near(actual, expected)?;
         }
-        assert_eq!(source.ends_with("uic"), bound.modes.uic);
+        assert_eq!(
+            source.ends_with("uic"),
+            bound
+                .modes
+                .contains(model_normalize_ngspice::ltspice::transient::TransientModifier::Uic)
+        );
         let mut deck = bundle.primary.bytes.clone();
         let card = format!(
             ".tran {} {} {} {}{}\n.print tran v(a)\n.end\n",
@@ -617,7 +622,14 @@ fn vendor_transient_timing_is_explicit_in_native_decks() -> Result<()> {
             actual[1],
             actual[2],
             actual[3],
-            if bound.modes.uic { " UIC" } else { "" }
+            if bound
+                .modes
+                .contains(model_normalize_ngspice::ltspice::transient::TransientModifier::Uic)
+            {
+                " UIC"
+            } else {
+                ""
+            }
         );
         let end = deck
             .len()
