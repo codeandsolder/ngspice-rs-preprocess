@@ -16,7 +16,7 @@ mod runtime_params;
 mod source_aliases;
 mod source_includes;
 use runtime_params::RuntimeScope;
-pub(super) use source_includes::RootIncludes;
+pub use source_includes::RootIncludes;
 
 const PARSED_LIBRARY_FORMAT_VERSION: u32 = 8;
 
