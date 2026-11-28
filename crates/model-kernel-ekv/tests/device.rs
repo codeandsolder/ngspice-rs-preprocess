@@ -211,3 +211,47 @@ fn structural_nodes_and_noise() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn trial_limiting_preserves_series_nodes_and_exact_residuals() -> Result<()> {
+    use model_kernel_api::trial::{TrialInput, TrialOutcome, TrialPhase};
+    for polarity in [Polarity::N, Polarity::P] {
+        let artifact = device(polarity).artifact(GEOMETRY, [5; 16])?;
+        let prepared = artifact.prepare(&SLOTS, 300.15)?;
+        let sign = if polarity == Polarity::N { 1. } else { -1. };
+        let previous = [0.; 8];
+        let raw = [0., sign, 0., 0., -10. * sign, sign, -12. * sign, 0.];
+        let mut actual = [0.; 8];
+        let outcome = artifact.linearize_trial(
+            &prepared,
+            TrialInput {
+                proposed: &raw,
+                phase: TrialPhase::Newton {
+                    previous: &previous,
+                },
+            },
+            &mut actual,
+        )?;
+        assert_eq!(outcome, TrialOutcome::Limited);
+        for i in [0, 1, 2, 3, 5, 7] {
+            assert_eq!(actual[i].to_bits(), raw[i].to_bits());
+        }
+        for i in [4, 6] {
+            assert!(actual[i].abs() < raw[i].abs());
+            assert!(actual[i] * sign < 0.);
+        }
+        let mut point = PointBuffer::new(8)?;
+        artifact.evaluate(&prepared, &actual, &mut point.point())?;
+        let outcome = artifact.linearize_trial(
+            &prepared,
+            TrialInput {
+                proposed: &raw,
+                phase: TrialPhase::Exact,
+            },
+            &mut actual,
+        )?;
+        assert_eq!(outcome, TrialOutcome::Exact);
+        assert_eq!(actual.map(f64::to_bits), raw.map(f64::to_bits));
+    }
+    Ok(())
+}

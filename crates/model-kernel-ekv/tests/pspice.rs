@@ -59,9 +59,9 @@ fn process_defaults_and_explicit_precedence() -> Result<()> {
         close(
             channel.threshold,
             if polarity == Polarity::N {
-                -0.1 + phi + gamma * phi.sqrt()
+                gamma.mul_add(phi.sqrt(), -0.1 + phi)
             } else {
-                -0.1 - phi - gamma * phi.sqrt()
+                gamma.mul_add(-phi.sqrt(), -0.1 - phi)
             },
         );
         close(channel.mobility_field, 0.);
@@ -200,5 +200,43 @@ fn unsupported_physics_and_operating_point_flags() -> Result<()> {
         .prepare_segmented(high.geometry, 300.15)?
         .evaluate(bias)?;
     assert_eq!(a.current.map(f64::to_bits), b.current.map(f64::to_bits));
+    Ok(())
+}
+
+#[test]
+fn absolute_and_relative_temperature_affect_actual_artifact() -> Result<()> {
+    use model_kernel_ekv::device::OperatingTemperature;
+    let model = PspiceModel::compile(Polarity::N, [("T_ABS", 50.)], DEFAULTS)?;
+    let absolute = model.bind([])?;
+    let relative = model.bind([("DTEMP", 10.)])?;
+    assert!(matches!(
+        absolute.device.temperature,
+        OperatingTemperature::Absolute(_)
+    ));
+    assert!(matches!(
+        relative.device.temperature,
+        OperatingTemperature::Offset(_)
+    ));
+    let bias = [1., 0.8, 0., -0.1];
+    let currents = |bound: model_kernel_ekv::pspice::BoundDevice, ambient| -> Result<[f64; 4]> {
+        let artifact = bound.artifact([6; 16])?;
+        let prepared = artifact.prepare(&bound.slots(), ambient)?;
+        let mut buffer = PointBuffer::new(4)?;
+        let mut point = buffer.point();
+        artifact.evaluate(&prepared, &bias, &mut point)?;
+        point
+            .current
+            .try_into()
+            .map_err(|_| model_kernel_api::Error::Shape("four terminals"))
+    };
+    let cold = currents(absolute, 273.15)?;
+    let hot = currents(absolute, 400.)?;
+    assert_eq!(cold.map(f64::to_bits), hot.map(f64::to_bits));
+    let same = currents(relative, 313.15)?;
+    for (a, e) in same.into_iter().zip(cold) {
+        close(a, e);
+    }
+    let different = currents(relative, 273.15)?;
+    assert!((different[0] - cold[0]).abs() > 1e-10);
     Ok(())
 }
