@@ -167,7 +167,18 @@ fn unqualified_hspice_semantics_are_errors() -> Result<()> {
             "recursive HSPICE subcircuit",
         ),
         (".option XMULT_IN_EXP=maybe", "invalid HSPICE XMULT_IN_EXP"),
-        (".model mos NMOS LEVEL=49", "qualified native mapping"),
+        (
+            ".model mos NMOS LEVEL=49",
+            "requires an exact supported VERSION",
+        ),
+        (
+            ".model mos NMOS LEVEL=49 VERSION=3.24",
+            "has no qualified native lowering",
+        ),
+        (
+            ".model mos NMOS LEVEL=53 VERSION=3.3 ACM=4",
+            "unsupported HSPICE ACM selector",
+        ),
         (".temp 25 50", "multiple-temperature"),
         (
             ".tran 1n 10n 2n 8n START=0",
@@ -713,6 +724,11 @@ fn bsim4_unqualified_versions_parameters_and_bin_gaps_reject() -> Result<()> {
             "L=1u W=2u HSPICEONLY=3",
             "unqualified HSPICE BSIM4 instance parameter",
         ),
+        (
+            "LEVEL=54 VERSION=4.7",
+            "L=1u W=2u DELVTO=0.1 DELVT0=0.2",
+            "duplicate HSPICE MOS instance parameter DELVTO",
+        ),
     ] {
         fs::write(
             &root,
@@ -1092,5 +1108,125 @@ V1 a 0 'outside(2)'
         format!("{error:#}").contains("not visible in this occurrence"),
         "{error:#}"
     );
+    Ok(())
+}
+
+#[test]
+fn bsim4_lithography_scaling_preserves_occurrence_scope_and_drawn_bin_selection() -> Result<()> {
+    let actual = tempfile::tempdir()?;
+    let expected = tempfile::tempdir()?;
+    let source = r#"Model lithography scaling
+.option parhier=local
+Vg g 0 dc 0.8 ac 1 PULSE(0.3 1 1n 0.5n 0.5n 2n 5n)
+Vd d 0 0.7
+Ve e 0 0.7
+Vf f 0 0.7
+Vh h 0 0.7
+X1 d g cell f=0.5
+X2 e g cell f=0.75
+X3 f g cell f=-1
+M4 h g 0 0 shrink L=1u W=4u NF=2
+.subckt cell d g f=1
+M1 d g 0 0 local L=1u W=4u NF=2
+.model local NMOS LEVEL=54 VERSION=4.7 VTH0=0.4 XL=0.03u XW=0.05u LMLT='f' WMLT='f'
+.ends cell
+.model shrink.1 NMOS LEVEL=54 VERSION=4.7 VTH0=0.7 LMIN=0.1u LMAX=0.9u WMIN=0.1u WMAX=4u
+.model shrink.2 NMOS LEVEL=54 VERSION=4.7 VTH0=0.4 XL=0.03u XW=0.05u LMIN=0.9u LMAX=2u WMIN=0.1u WMAX=4u LMLT=0.5 WMLT=0.5
+.end
+"#;
+    let reference = r#"Explicit scaled channel dimensions
+.options TNOM=25
+.temp 25
+Vg g 0 dc 0.8 ac 1 PULSE(0.3 1 1n 0.5n 0.5n 2n 5n)
+Vd d 0 0.7
+Ve e 0 0.7
+Vf f 0 0.7
+Vh h 0 0.7
+Md d g 0 0 model L=0.5u W=2u NF=2
+Me e g 0 0 model L=0.75u W=3u NF=2
+Mf f g 0 0 model L=1u W=4u NF=2
+Mh h g 0 0 model L=0.5u W=2u NF=2
+.model model NMOS LEVEL=14 VERSION=4.70 VTH0=0.4 XL=0.03u XW=0.05u
+.end
+"#;
+    let script = "dc Vg 0.4 1.2 0.1\nwrdata dc.dat i(vd) i(ve) i(vf) i(vh)\nop\nac lin 2 1k 1meg\nwrdata ac.dat i(vd) i(ve) i(vf) i(vh)\ntran 0.1n 10n 0 0.1n\nlinearize i(vd) i(ve) i(vf) i(vh)\nwrdata tran.dat i(vd) i(ve) i(vf) i(vh)";
+    for (version, native) in [("4.5", "4.5"), ("4.6.4", "4.64"), ("4.7", "4.70")] {
+        let source = source.replace("VERSION=4.7", &format!("VERSION={version}"));
+        let reference = reference.replace("VERSION=4.70", &format!("VERSION={native}"));
+        let text = numeric_deck(actual.path(), &source, script)?;
+        measure_native(expected.path(), &reference, script)?;
+        for file in ["dc.dat", "ac.dat", "tran.dat"] {
+            let rows = values(actual.path(), file)?;
+            let reference_values = values(expected.path(), file)?;
+            assert_eq!(rows.len(), reference_values.len());
+            for (row, reference) in rows.iter().zip(reference_values) {
+                assert_eq!(row.len(), reference.len());
+                for (&actual, expected) in row.iter().zip(reference) {
+                    ensure!(
+                        (actual - expected).abs() <= expected.abs() * 1e-7 + 1e-13,
+                        "{file}: {actual:e} != {expected:e}\n{text}"
+                    );
+                }
+            }
+        }
+        assert!(!text.contains("LMLT") && !text.contains("WMLT"), "{text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn bsim4_mobility_reset_and_threshold_alias_preserve_occurrence_scope() -> Result<()> {
+    let actual = tempfile::tempdir()?;
+    let expected = tempfile::tempdir()?;
+    let source = r#"Occurrence mobility and threshold modifiers
+.option parhier=local
+Vg g 0 dc 0.8 ac 1 PULSE(0.3 1 1n 0.5n 0.5n 2n 5n)
+Vd d 0 0.7
+Ve e 0 0.7
+Vf f 0 0.7
+X1 d g cell u=0.5 dv=0.03
+X2 e g cell u=-0.75 dv=-0.02
+M3 f g 0 0 n L=1u W=4u NF=2 MULU0=-2 DELVTO=0.01
+.subckt cell d g u=1 dv=0
+M1 d g 0 0 n L=1u W=4u NF=2 MULU0='u' DELVT0='dv'
+.ends cell
+.model n NMOS LEVEL=54 VERSION=4.7 VTH0=0.4
+.end
+"#;
+    let reference = r#"Explicit occurrence modifiers
+.options TNOM=25
+.temp 25
+Vg g 0 dc 0.8 ac 1 PULSE(0.3 1 1n 0.5n 0.5n 2n 5n)
+Vd d 0 0.7
+Ve e 0 0.7
+Vf f 0 0.7
+Md d g 0 0 model L=1u W=4u NF=2 MULU0=0.5 DELVTO=0.03
+Me e g 0 0 model L=1u W=4u NF=2 MULU0=1 DELVTO=-0.02
+Mf f g 0 0 model L=1u W=4u NF=2 MULU0=1 DELVTO=0.01
+.model model NMOS LEVEL=14 VERSION=4.70 VTH0=0.4
+.end
+"#;
+    let script = "dc Vg 0.4 1.2 0.1\nwrdata dc.dat i(vd) i(ve) i(vf)\nop\nac lin 2 1k 1meg\nwrdata ac.dat i(vd) i(ve) i(vf)\ntran 0.1n 10n 0 0.1n\nlinearize i(vd) i(ve) i(vf)\nwrdata tran.dat i(vd) i(ve) i(vf)";
+    for (version, native) in [("4.5", "4.5"), ("4.6.4", "4.64"), ("4.7", "4.70")] {
+        let source = source.replace("VERSION=4.7", &format!("VERSION={version}"));
+        let reference = reference.replace("VERSION=4.70", &format!("VERSION={native}"));
+        let text = numeric_deck(actual.path(), &source, script)?;
+        measure_native(expected.path(), &reference, script)?;
+        for file in ["dc.dat", "ac.dat", "tran.dat"] {
+            let rows = values(actual.path(), file)?;
+            let reference_values = values(expected.path(), file)?;
+            assert_eq!(rows.len(), reference_values.len());
+            for (row, reference) in rows.iter().zip(reference_values) {
+                assert_eq!(row.len(), reference.len());
+                for (&actual, expected) in row.iter().zip(reference) {
+                    ensure!(
+                        (actual - expected).abs() <= expected.abs() * 1e-7 + 1e-13,
+                        "{file}: {actual:e} != {expected:e}\n{text}"
+                    );
+                }
+            }
+        }
+        assert!(!text.contains("DELVT0"), "{text}");
+    }
     Ok(())
 }

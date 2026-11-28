@@ -17,6 +17,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{DialectContext, OpaqueSource, ScopedStatement};
 
+mod bsim3_junction;
+mod bsim4_occurrence;
+pub use bsim3_junction::{
+    HspiceBsim3JunctionInput, HspiceBsim3Junctions, HspiceBsim3OccurrenceOptions,
+    HspiceJunctionSourceOptions,
+};
+pub use bsim4_occurrence::{Bsim4SeriesInput, HspiceBsim4Occurrence};
+
 /// Simulator implementation identity. Different charge, temperature and
 /// geometry laws must not share an identity solely because a native
 /// simulator uses the same level number.
@@ -199,6 +207,29 @@ fn one<'a>(fields: &'a [ModelParameter], name: &str) -> Result<Option<&'a str>> 
         .as_deref()
         .map(Some)
         .with_context(|| format!("{name} requires a value"))
+}
+
+/// Resolve one coefficient across all of its source aliases. Presence is
+/// distinct from an explicit zero and duplicate aliases are errors.
+fn finite_coefficient(
+    fields: &[ModelParameter],
+    names: &[&str],
+    mut evaluate: impl FnMut(&str) -> Result<f64>,
+) -> Result<Option<f64>> {
+    let mut selected = None;
+    for name in names {
+        if let Some(raw) = one(fields, name)? {
+            ensure!(
+                selected.is_none(),
+                "duplicate coefficient aliases {names:?}"
+            );
+            let value =
+                evaluate(raw).with_context(|| format!("model or occurrence coefficient {name}"))?;
+            ensure!(value.is_finite(), "nonfinite coefficient {name}");
+            selected = Some(value);
+        }
+    }
+    Ok(selected)
 }
 
 fn required<'a>(fields: &'a [ModelParameter], name: &str) -> Result<&'a str> {
@@ -582,6 +613,19 @@ impl MappingTable {
                     .map(|v| v.trim_matches(['\'', '"'])),
                 Some("4.5" | "4.50" | "4.5.0" | "4.64" | "4.6.4" | "4.7" | "4.70" | "4.7.0")
             );
+        if let Some(defaults) = selection.hspice_bsim3_defaults() {
+            let junction = selection
+                .hspice_mos_junction()?
+                .context("missing BSIM3 junction selection")?;
+            bail!(
+                "HSPICE BSIM3 level {} VERSION={} (junction {:?}, default ACM={}, CAPMOD={}) has no qualified native lowering",
+                selection.mapping.key.level,
+                selection.effective_version.as_deref().unwrap_or("unknown"),
+                junction.mode,
+                defaults.acm,
+                defaults.capmod,
+            );
+        }
         ensure!(
             diode || bsim4,
             "HSPICE model {} has no qualified native mapping (BSIM4 requires an exact supported VERSION)",
@@ -709,10 +753,13 @@ impl MappingTable {
 fn resolve_version(device: Device, version: Option<&str>) -> Result<Option<String>> {
     let version = version.map(|value| value.trim_matches(['\'', '"']));
     let selected = match device {
-        Device::Bsim3Pspice
-        | Device::Bsim3Berkeley
-        | Device::Bsim3HspiceJunction
-        | Device::Bsim3HspiceBerkeleyJunction => match version {
+        Device::Bsim3HspiceJunction | Device::Bsim3HspiceBerkeleyJunction => match version {
+            Some("3.24" | "3.2.4") => "3.24",
+            Some("3.3" | "3.30" | "3.3.0") => "3.3",
+            Some(other) => bail!("unqualified HSPICE BSIM3 source VERSION={other}"),
+            None => bail!("HSPICE BSIM3 requires an exact supported VERSION"),
+        },
+        Device::Bsim3Pspice | Device::Bsim3Berkeley => match version {
             None | Some("3.3" | "3.30" | "3.3.0") => "3.3",
             Some(
                 "3.2" | "3.20" | "3.21" | "3.22" | "3.23" | "3.24" | "3.2.0" | "3.2.1" | "3.2.2"
@@ -773,7 +820,117 @@ pub struct MappedSource {
     pub selections: Vec<ModelSelection>,
 }
 
+/// The source junction/series-resistance selector, not a native ACM number.
+///
+/// Berkeley variants share a junction law but retain distinct extrinsic
+/// resistance geometry. Do not equate these with ngspice ACM=10–13.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HspiceMosJunctionMode {
+    HspiceExplicit,
+    HspiceWidthNormalized,
+    HspiceIsolated,
+    HspiceStacked,
+    BerkeleyExplicit,
+    BerkeleyWidthNormalized,
+    BerkeleyIsolated,
+    BerkeleyStacked,
+}
+
+/// The selected structural junction mode before occurrence preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HspiceMosJunctionSelection {
+    pub mode: HspiceMosJunctionMode,
+    /// Automatic area and perimeter calculation applies only to BSIM3 ACM12.
+    pub automatic_bsim3_geometry: bool,
+}
+
+/// Source defaults for BSIM3 levels 49 and 53. These differ from the native
+/// defaults even when the channel release has the same version number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HspiceBsim3Defaults {
+    pub acm: u8,
+    pub capmod: u8,
+    pub xpart: u8,
+}
+
+impl HspiceBsim3Defaults {
+    /// Both source levels use zero default bottom saturation-current density.
+    pub const JUNCTION_CURRENT_DENSITY: f64 = 0.;
+    /// Source defaults differ from Berkeley for both capacitance densities.
+    pub const BOTTOM_CAPACITANCE_DENSITY: f64 = 5.79e-4;
+    pub const SIDEWALL_CAPACITANCE_DENSITY: f64 = 0.;
+    pub const SIDEWALL_CURRENT_DENSITY: f64 = 0.;
+}
+
 impl ModelSelection {
+    /// Defaults of the source model, before explicit or occurrence-dependent
+    /// parameters are applied. This is not a native lowering qualification.
+    #[must_use = "source defaults must be applied before explicit parameters"]
+    pub const fn hspice_bsim3_defaults(&self) -> Option<HspiceBsim3Defaults> {
+        // HSPICE MOSFET Models Manual X-2005.09, pp. 403, 414–415.
+        match self.mapping.device {
+            Device::Bsim3HspiceJunction => Some(HspiceBsim3Defaults {
+                acm: 0,
+                capmod: 0,
+                xpart: 1,
+            }),
+            Device::Bsim3HspiceBerkeleyJunction => Some(HspiceBsim3Defaults {
+                acm: 10,
+                capmod: 3,
+                xpart: 0,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Select the source-specific ACM and CALCACM interpretation.
+    ///
+    /// The caller must be processing an HSPICE model. Literal structural
+    /// selectors must be known before choosing the electrical implementation.
+    ///
+    /// # Errors
+    /// Duplicate, nonliteral or unsupported structural selectors.
+    pub fn hspice_mos_junction(&self) -> Result<Option<HspiceMosJunctionSelection>> {
+        let bsim3 = self.hspice_bsim3_defaults();
+        let default_acm = if let Some(defaults) = bsim3 {
+            f64::from(defaults.acm)
+        } else if self.mapping.device == Device::Bsim4 && self.mapping.key.level == 54 {
+            12.
+        } else {
+            return Ok(None);
+        };
+        let acm = one(&self.card.parameters, "ACM")?
+            .map(parse_spice_constant)
+            .transpose()?
+            .unwrap_or(default_acm);
+        let mode = match acm {
+            0. => HspiceMosJunctionMode::HspiceExplicit,
+            1. => HspiceMosJunctionMode::HspiceWidthNormalized,
+            2. => HspiceMosJunctionMode::HspiceIsolated,
+            3. => HspiceMosJunctionMode::HspiceStacked,
+            10. => HspiceMosJunctionMode::BerkeleyExplicit,
+            11. => HspiceMosJunctionMode::BerkeleyWidthNormalized,
+            12. => HspiceMosJunctionMode::BerkeleyIsolated,
+            13. => HspiceMosJunctionMode::BerkeleyStacked,
+            _ => bail!("unsupported HSPICE ACM selector {acm}"),
+        };
+        let calculate = match one(&self.card.parameters, "CALCACM")?
+            .map(parse_spice_constant)
+            .transpose()?
+        {
+            Some(0.) => false,
+            Some(1.) => true,
+            None => bsim3.is_none(),
+            Some(value) => bail!("invalid HSPICE CALCACM selector {value}"),
+        };
+        Ok(Some(HspiceMosJunctionSelection {
+            mode,
+            automatic_bsim3_geometry: bsim3.is_some()
+                && mode == HspiceMosJunctionMode::BerkeleyIsolated
+                && calculate,
+        }))
+    }
+
     /// Canonical model card for the existing electrical lowering stage.
     ///
     /// Selection does not certify full numerical equivalence of a device

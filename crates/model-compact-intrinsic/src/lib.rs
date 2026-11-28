@@ -4,11 +4,17 @@
 //! constitutive routines. Binding alone is not proof of complete device support.
 //! Solver-ready residual/charge artifacts are provided by separate kernel crates.
 
+mod bsim4_occurrence;
 mod catalog;
 mod defaults;
 mod hv;
 mod legacy_bsim;
+mod mos_junction;
 
+pub use bsim4_occurrence::{
+    Bsim4ChannelModifierResets, Bsim4ChannelModifiers, Bsim4ModifiedChannel, Bsim4ModifiedSeries,
+    Bsim4OccurrenceModifiers, Bsim4PrimaryCoefficients, Bsim4SeriesModifiers,
+};
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use legacy_bsim::{
     BSIM1_REFERENCE_THERMAL_VOLTAGE, Bsim1Coefficients, Bsim2Coefficients, LegacyBsimBias,
@@ -16,6 +22,19 @@ pub use legacy_bsim::{
     LegacyBsimJunctionLaw, LegacyBsimOverlap, PreparedLegacyBsimInstance, PreparedLegacyBsimModel,
     evaluate_bsim1_intrinsic, evaluate_bsim2_intrinsic, evaluate_legacy_bsim_intrinsic,
     legacy_bsim_threshold, prepare_legacy_bsim_model,
+};
+
+pub use mos_junction::{
+    Bsim3BerkeleyJunction, Bsim3JunctionModel, Bsim3JunctionRules, Bsim3JunctionTemperature,
+    Bsim3KneeReference, MosBottomDensity, MosBottomMeasure, MosDepletionComponent,
+    MosDepletionPoint, MosDepletionShape, MosDepletionTemperatureCoefficients,
+    MosDepletionThermalLaw, MosDiffusionDimensions, MosDiffusionGeometry, MosDiffusionRule,
+    MosDiffusionTerminal, MosJunctionBandgap, MosJunctionDepletion, MosJunctionOccurrence,
+    MosJunctionPoint, MosJunctionSaturation, MosLinearReverseGeometry, MosLinearReverseJunction,
+    MosLinearReverseModel, MosLinearReverseTemperature, MosSaturationFallback, MosSeriesResistance,
+    MosSeriesResistanceRule, MosSidewallLengths, MosSidewallRule, PreparedBsim3Junction,
+    PreparedMosJunction, PreparedMosLinearReverseJunction, mos_resistance_at_temperature,
+    prepare_mos_diffusion,
 };
 
 pub use hv::{

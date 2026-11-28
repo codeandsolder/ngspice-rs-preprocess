@@ -135,7 +135,7 @@ fn collect_definitions(
     Ok(definitions)
 }
 
-fn inner(expression: &str) -> &str {
+pub(super) fn inner(expression: &str) -> &str {
     expression
         .trim()
         .strip_prefix('{')

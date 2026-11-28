@@ -13,7 +13,8 @@ use model_normalize_ngspice::{
 };
 use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::{
-    lower_spice_expression, source_dialect::model_mapping::ModelSelection,
+    lower_spice_expression,
+    source_dialect::model_mapping::{HspiceMosJunctionMode, ModelSelection},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -96,7 +97,9 @@ fn supported(table: &[(&str, u8)], name: &str, mask: u8) -> bool {
         .is_ok_and(|index| table[index].1 & mask != 0)
 }
 
-const BIN_FIELDS: &[&str] = &["LMIN", "LMAX", "WMIN", "WMAX", "XLREF", "XWREF"];
+const SOURCE_ONLY_FIELDS: &[&str] = &[
+    "LMIN", "LMAX", "WMIN", "WMAX", "XLREF", "XWREF", "LMLT", "WMLT",
+];
 
 pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
     let mask = version_mask(
@@ -105,6 +108,13 @@ pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
             .as_deref()
             .context("missing BSIM4 version")?,
     )?;
+    let junction = selection
+        .hspice_mos_junction()?
+        .context("missing BSIM4 junction selection")?;
+    ensure!(
+        junction.mode == HspiceMosJunctionMode::BerkeleyIsolated,
+        "HSPICE BSIM4 ACM mode requires distinct junction kernel"
+    );
     let mut seen = BTreeSet::new();
     for field in &mut selection.card.parameters {
         field.name.make_ascii_uppercase();
@@ -116,21 +126,13 @@ pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
             "duplicate HSPICE BSIM4 field {}",
             field.name
         );
-        let value = field
-            .expression
-            .as_deref()
-            .context("BSIM4 model field requires a value")?;
+        ensure!(
+            field.expression.is_some(),
+            "BSIM4 model field requires a value"
+        );
         match field.name.as_str() {
-            // The documented ACM=12 mode uses the original Berkeley junction
-            // and parasitic equations; CALCACM is inactive in this mode.
-            "ACM" => ensure!(
-                matches!(parse_spice_constant(value)?, 12.),
-                "HSPICE BSIM4 ACM mode requires distinct junction kernel"
-            ),
-            "CALCACM" => {
-                flag(parse_spice_constant(value)?, "CALCACM")?;
-            }
-            "LEVEL" | "VERSION" | "XLREF" | "XWREF" => (),
+            // The junction selector was checked before visiting the other fields.
+            "ACM" | "CALCACM" | "LEVEL" | "VERSION" | "XLREF" | "XWREF" | "LMLT" | "WMLT" => (),
             _ => ensure!(
                 supported(bsim4_catalog::MODEL, &field.name, mask),
                 "unqualified HSPICE BSIM4 model parameter {} for version {}",
@@ -200,7 +202,10 @@ fn instance_parameters(
         consumed = span.end;
     }
     for parameter in instance_fields(&tail[consumed..], 3)? {
-        let name = parameter.name.to_ascii_uppercase();
+        let mut name = parameter.name.to_ascii_uppercase();
+        if name == "DELVT0" {
+            "DELVTO".clone_into(&mut name);
+        }
         ensure!(
             fields.insert(name.clone(), parameter.expression).is_none(),
             "duplicate HSPICE MOS instance parameter {name}"
@@ -330,6 +335,67 @@ fn initial_vector(expression: &str) -> Result<String> {
     Ok(native.join(","))
 }
 
+// HSPICE selects the bin using the drawn dimensions (Appendix A), then
+// applies the model-specific lithography multipliers to the selected device.
+// Keep parameter expressions symbolic so parameter changes do not freeze the
+// transformed channel geometry at source preparation time. The documented
+// nonpositive-factor reset is encoded in the native expression.
+fn scale_dimension(
+    fields: &mut Fields,
+    model: &Fields,
+    dimension: &str,
+    multiplier: &str,
+    budget: &WorkBudget,
+) -> Result<()> {
+    let Some(factor) = field(model, multiplier) else {
+        return Ok(());
+    };
+    let drawn = field(fields, dimension).context("missing drawn MOS dimension")?;
+    let drawn = super::hierarchy::inner(drawn);
+    let factor = super::hierarchy::inner(factor);
+    budget.charge(
+        Resource::EmittedBytes,
+        drawn
+            .len()
+            .saturating_add(factor.len().saturating_mul(2))
+            .saturating_add(32),
+    )?;
+    let scaled = if let Ok(value) = parse_spice_constant(factor) {
+        if value <= 0. || value.to_bits() == 1.0f64.to_bits() {
+            return Ok(());
+        }
+        format!("{{({drawn})*({factor})}}")
+    } else {
+        format!("{{({drawn})*ternary_fcn(({factor})>0,({factor}),1)}}")
+    };
+    fields.insert(dimension.to_owned(), Some(scaled));
+    Ok(())
+}
+
+// The source mobility modifier resets negative values to unity (zero is
+// retained). Preserve symbolic occurrence expressions, rather than evaluating
+// them at deck preparation and freezing parameter sweeps.
+fn normalize_mobility_multiplier(fields: &mut Fields, budget: &WorkBudget) -> Result<()> {
+    let Some(raw) = field(fields, "MULU0") else {
+        return Ok(());
+    };
+    let factor = super::hierarchy::inner(raw);
+    let normalized = if let Ok(value) = parse_spice_constant(factor) {
+        if value >= 0. {
+            return Ok(());
+        }
+        "1".to_owned()
+    } else {
+        budget.charge(
+            Resource::EmittedBytes,
+            factor.len().saturating_mul(2).saturating_add(32),
+        )?;
+        format!("{{ternary_fcn(({factor})<0,1,({factor}))}}")
+    };
+    fields.insert("MULU0".to_owned(), Some(normalized));
+    Ok(())
+}
+
 fn bind_instance(
     text: &str,
     model_end: usize,
@@ -344,6 +410,9 @@ fn bind_instance(
     let model = model_fields(card, budget)?;
     let mask = version_mask(field(&model, "VERSION").context("missing bound BSIM4 version")?)?;
     fields.remove("WNFLAG");
+    normalize_mobility_multiplier(&mut fields, budget)?;
+    scale_dimension(&mut fields, &model, "L", "LMLT", budget)?;
+    scale_dimension(&mut fields, &model, "W", "WMLT", budget)?;
     let spans = statement_token_spans(text)?;
     let start = spans.get(5).context("missing MOS model token")?.start;
     let mut out = format!("{}{}", &text[..start], card.name);
@@ -411,7 +480,7 @@ pub fn finish(
             let mut card = parse_model_card(row, 0, &[])?;
             if matches!(card.family.to_ascii_uppercase().as_str(), "NMOS" | "PMOS") {
                 card.parameters.retain(|field: &ModelParameter| {
-                    !BIN_FIELDS
+                    !SOURCE_ONLY_FIELDS
                         .iter()
                         .any(|name| field.name.eq_ignore_ascii_case(name))
                 });
