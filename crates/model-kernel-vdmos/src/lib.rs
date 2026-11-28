@@ -1285,6 +1285,33 @@ fn depletion_charge<S: Scalar>(
     }
 }
 
+/// Keep the factored saturation law common to physical evaluation and
+/// the trial limiter. The latter must locate breakdown using the very
+/// same saturation current, including multiplicity and temperature.
+struct DiodeActivation<S: Scalar> {
+    thermal_voltage: Jet<S>,
+    vte: Jet<S>,
+    activation: Jet<S>,
+    log_prefactor: Jet<S>,
+}
+
+impl<S: Scalar> DiodeActivation<S> {
+    fn new(temperature: Jet<S>, mult: f64, d: BodyDiode, tnom: f64) -> Self {
+        let ratio = temperature / tnom;
+        let thermal_voltage = K_OVER_Q * temperature;
+        Self {
+            thermal_voltage,
+            vte: d.n * thermal_voltage,
+            activation: (ratio - 1.0) * d.eg,
+            log_prefactor: mult.ln() + d.is.ln() + (d.xti / d.n) * ratio.ln(),
+        }
+    }
+
+    fn saturation_log(&self) -> Jet<S> {
+        self.log_prefactor + self.activation / self.vte
+    }
+}
+
 fn diode_current<S: Scalar>(
     vd: Jet<S>,
     temperature: Jet<S>,
@@ -1292,12 +1319,14 @@ fn diode_current<S: Scalar>(
     d: BodyDiode,
     tnom: f64,
 ) -> Result<Jet<S>, ModelError> {
-    let ratio = temperature / tnom;
-    let thermal_voltage = K_OVER_Q * temperature;
-    let vte = d.n * thermal_voltage;
-    let activation = (ratio - 1.0) * d.eg;
-    let log_prefactor = mult.ln() + d.is.ln() + (d.xti / d.n) * ratio.ln();
-    let saturation_current = (log_prefactor + activation / vte).exp();
+    let terms = DiodeActivation::new(temperature, mult, d, tnom);
+    let saturation_current = terms.saturation_log().exp();
+    let DiodeActivation {
+        thermal_voltage,
+        vte,
+        activation,
+        log_prefactor,
+    } = terms;
     if vd.v.compare_to(vte.v.scale(-3.)) != Some(Ordering::Less) {
         let exponent = vd / vte;
         // Combine activation and bias before division to avoid cancellation
@@ -1320,6 +1349,13 @@ fn diode_current<S: Scalar>(
     Ok(-saturation_current * (1.0 + arg * arg * arg))
 }
 
+// The physical equations and numerical trial policy share the same
+// temperature-adjusted depletion potential.
+fn junction_potential<S: Scalar>(prepared: &PreparedModel, temp: Jet<S>) -> Jet<S> {
+    let ratio = temp / prepared.model.tnom;
+    pbfact(temp) + ratio * prepared.pbo * (prepared.model.tnom / REFERENCE_T)
+}
+
 fn diode_at<S: Scalar>(
     prepared: &PreparedModel,
     mult: f64,
@@ -1329,12 +1365,11 @@ fn diode_at<S: Scalar>(
 ) -> Result<DiodeAt<S>, ModelError> {
     let model = &prepared.model;
     let d = model.diode;
-    let ratio = temp / model.tnom;
     let dt = temp - model.tnom;
     let grading = d.m * (1.0 + d.tm1 * dt + d.tm2 * dt * dt);
     let pbo = prepared.pbo;
     let gmaold = (d.vj - pbo) / pbo;
-    let potential = pbfact(temp) + ratio * pbo * (model.tnom / REFERENCE_T);
+    let potential = junction_potential(prepared, temp);
     if potential.v.value() <= 0.0 {
         return Err(ModelError::Invalid("temperature-adjusted diode potential"));
     }
