@@ -1179,16 +1179,21 @@ fn shared_linker_retains_repeated_resource_visits_and_restores_language() -> Res
         anyhow::bail!("missing common linked source graph");
     };
     let path = shared.canonicalize()?;
-    let origins = lines
+    let mut occurrences = std::collections::BTreeMap::new();
+    for origin in lines
         .iter()
         .filter(|origin| origin.source == path && origin.line == 1)
-        .collect::<Vec<_>>();
-    let [first, second] = origins.as_slice() else {
-        anyhow::bail!("expected two bound source declarations, got {origins:?}");
+    {
+        assert_eq!(origin.last_line, 2);
+        let location = origin.linked.context("missing linked occurrence")?;
+        if let Some(previous) = occurrences.insert(location.visit, location) {
+            assert_eq!(previous, location);
+        }
+    }
+    let locations = occurrences.into_values().collect::<Vec<_>>();
+    let [first, second] = locations.as_slice() else {
+        anyhow::bail!("expected two resource visits, got {locations:?}");
     };
-    assert_eq!((first.last_line, second.last_line), (2, 2));
-    let first = first.linked.context("missing first linked occurrence")?;
-    let second = second.linked.context("missing second linked occurrence")?;
     assert_ne!(first.visit, second.visit);
     assert_ne!(first.scope, second.scope);
     assert_eq!(graph.visits[first.visit].dialect, SourceDialect::Hspice);
@@ -1402,7 +1407,7 @@ fn same_named_pspice_and_hspice_junctions_use_independent_physical_variants() ->
         &child,
         r#"*#PSPICE
 .subckt ps d m g params: sat=2p
-.model diode_base D(IS={sat} N=1.2 BV=5 IBV=1m)
+.model diode_base D(IS={sat} N=1.2 BV=5 IBV=1m CJO=2p TT=2n)
 .model junction AKO:diode_base D(RS=2)
 .model channel NMOS(LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02)
 D1 d 0 junction 2
@@ -1415,15 +1420,15 @@ M1 m g 0 0 channel L=1u W=2u
         r#"Mixed physical junction declarations
 .option parhier=local
 .inc ps.lib
-Vd1 hd 0 0.6
-Vd2 pd 0 0.6
+Vd1 hd 0 DC 0.6 AC 1
+Vd2 pd 0 DC 0.6 AC 1
 Vm1 hm 0 0.8
 Vm2 pm 0 0.8
 Vg g 0 1
 Xh hd hm g hs
 Xp pd pm g ps sat=2p
 .subckt hs d m g sat=1p
-.model junction D(IS='sat' N=1.2 BV=5 IBV=1m RS=2)
+.model junction D(IS='sat' N=1.2 BV=5 IBV=1m CJO=2p TT=2n RS=2)
 .model channel NMOS(LEVEL=54 VERSION=4.7 VTH0=0.4)
 D1 d 0 junction AREA=2
 M1 m g 0 0 channel L=1u W=2u
@@ -1463,8 +1468,8 @@ M1 m g 0 0 channel L=1u W=2u
         r#"Independent physical reference
 .options TNOM=25
 .temp 25
-Vd1 hd 0 0.6
-Vd2 pd 0 0.6
+Vd1 hd 0 DC 0.6 AC 1
+Vd2 pd 0 DC 0.6 AC 1
 Vm1 hm 0 0.8
 Vm2 pm 0 0.8
 Vg g 0 1
@@ -1472,8 +1477,8 @@ D1 hd 0 hdiode AREA=2
 D2 pd 0 pdiode AREA=2
 M1 hm g 0 0 hmos L=1u W=2u
 M2 pm g 0 0 pmos L=1u W=2u
-.model hdiode D(LEVEL=3 IS=1p N=1.2 BV=5 IBV=1m RS=2 FC=0 FCS=0)
-.model pdiode D(IS=2p N=1.2 BV=5 IBV=1m RS=2 TNOM=27)
+.model hdiode D(LEVEL=3 IS=1p N=1.2 BV=5 IBV=1m CJO=2p TT=2n RS=2 FC=0 FCS=0)
+.model pdiode D(IS=2p N=1.2 BV=5 IBV=1m CJO=2p TT=2n RS=2 TNOM=27)
 .model hmos NMOS(LEVEL=14 VERSION=4.70 VTH0=0.4)
 .model pmos NMOS(LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02 TNOM=27)
 .end
