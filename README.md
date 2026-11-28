@@ -253,6 +253,17 @@ unknown physical fields and unsupported levels are rejected. Explicit
 level-3 selection still emits the native level-3 model, and native-deck
 preparation does not substitute the SIMetrix kernel for ordinary `D`.
 
+SIMetrix classic Gummel–Poon BJTs (`NPN`/`PNP`, omitted level or level 1,
+or a mapping to `Device=BJT`) select the historical thermal-voltage
+convention. They emit `gummel_poon_legacy_npn` or
+`gummel_poon_legacy_pnp`, with canonical `LEVEL=1`; the typed selection
+remains distinct in the manifest. Native input retains native BJT physics.
+The producer also accepts an explicit `Device=NGSPICE_BJT` mapping for
+mixed-convention decks; this is a producer extension, not a SIMetrix
+device name. VBIC and other BJT implementations are not inferred to share
+the legacy convention. See [classic BJT selection](docs/classic-bjt-selection.md)
+for the physical distinction and qualification boundary.
+
 Selection identifies the intended physical implementation; it does not
 certify numerical equivalence of every parameter or geometry variant.
 Unsupported target implementations, versions, and access letters are

@@ -61,6 +61,13 @@ fn run_case(fixtures: &Path, name: &str, outcome: &str, abs: f64, rel: f64) -> R
         return measured_scoped_diode_temperatures(&bundle, fixtures, abs, rel);
     }
 
+    if matches!(
+        name,
+        "global-model" | "instance-model" | "instance-precedence"
+    ) {
+        return measured_classic_bjt_temperatures(&bundle, fixtures, name);
+    }
+
     let dir = tempfile::tempdir()?;
     for artifact in &bundle.companions {
         fs::write(dir.path().join(&artifact.filename), &artifact.bytes)?;
@@ -195,6 +202,155 @@ fn measured_scoped_diode_temperatures(
         ensure!(
             (actual - expected).abs() <= rel.mul_add(expected.abs(), abs),
             "diode temperature: {actual} vs {expected}"
+        );
+    }
+    Ok(())
+}
+
+// The three fixtures are fixed-bias, forward-active, ideal Gummel–Poon
+// transistors. Stock ngspice cannot execute the explicitly selected legacy
+// model, and substituting its native BJT would change the physical law.
+// Bind the emitted model and instance parameters in their actual lexical
+// occurrence, then evaluate the independent ideal transport equation.
+fn measured_classic_bjt_temperatures(
+    bundle: &ngspice_rs_preprocess::PreparedBundle,
+    fixtures: &Path,
+    name: &str,
+) -> Result<()> {
+    use model_normalize_ngspice::{
+        bjt_card::{BjtPolarity, BjtThermalConvention, ClassicBjtFamily},
+        linked_source::RootKind,
+        model_card::{instance_fields, positional_prefix},
+        parameter_scope::{ModelLibrary, topology::Limits},
+    };
+    let linked = prepared_diode::linked_source(bundle)?;
+    let source = ModelLibrary::parse_linked(&linked, RootKind::Deck)?;
+    let topology = source.instantiate(Limits::default())?;
+    let text = std::str::from_utf8(&linked.bytes)?;
+    let mut cards = vec![Vec::new(); source.scopes.len()];
+    let mut ambient = None;
+    for (index, line) in text.lines().enumerate().skip(1) {
+        let line = line.trim();
+        if line
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case(".temp"))
+        {
+            ambient = Some(source.evaluate_scalar(0, line[5..].trim(), &[])?);
+        }
+        if !line
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.eq_ignore_ascii_case(&b'Q'))
+        {
+            continue;
+        }
+        let scope = source
+            .scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, scope)| {
+                scope.parent.is_some()
+                    && scope.source_line < index + 1
+                    && index + 1 < scope.end_line
+            })
+            .map_or(0, |(id, _)| id);
+        cards[scope].push(line);
+    }
+    let ambient = ambient.context("missing fixture ambient temperature")?;
+    let mut currents = Vec::new();
+    for frame in &topology.frames {
+        let overrides = frame
+            .overrides
+            .iter()
+            .map(|(key, value)| (frame.declaration, key.as_str(), *value))
+            .collect::<Vec<_>>();
+        for card in &cards[frame.declaration] {
+            let (prefix, tail) = positional_prefix(card);
+            ensure!(
+                prefix.len() == 5,
+                "expected three-terminal fixture BJT: {card}"
+            );
+            let model_name = prefix[4].0;
+            let mut scope = frame.declaration;
+            let model = loop {
+                if let Some(model) = source.models.iter().find(|model| {
+                    model.scope == scope && model.card.name.eq_ignore_ascii_case(model_name)
+                }) {
+                    break model;
+                }
+                scope = source.scopes[scope]
+                    .parent
+                    .context("missing fixture BJT model")?;
+            };
+            ensure!(
+                ClassicBjtFamily::parse(&model.card.family)
+                    == Some(ClassicBjtFamily {
+                        polarity: BjtPolarity::Npn,
+                        thermal: BjtThermalConvention::Legacy,
+                    }),
+                "legacy BJT selection was lost"
+            );
+            let mut saturation = None;
+            let mut nominal = 27.0;
+            for parameter in &model.card.parameters {
+                let value = source.evaluate_scalar(
+                    model.scope,
+                    parameter
+                        .expression
+                        .as_deref()
+                        .context("missing BJT model value")?,
+                    &overrides,
+                )?;
+                match parameter.name.to_ascii_lowercase().as_str() {
+                    "is" => saturation = Some(value),
+                    "tnom" => nominal = value,
+                    "bf" => ensure!(value == 100.0, "unexpected fixture BF"),
+                    "level" => ensure!(value == 1.0, "unexpected fixture LEVEL"),
+                    other => anyhow::bail!("fixture transport equation cannot evaluate {other}"),
+                }
+            }
+            let mut temperature = ambient;
+            for parameter in instance_fields(tail, 2)? {
+                ensure!(
+                    parameter.name.eq_ignore_ascii_case("temp"),
+                    "unexpected fixture instance field {}",
+                    parameter.name
+                );
+                temperature = source.evaluate_scalar(
+                    frame.declaration,
+                    parameter.expression.as_deref().context("missing TEMP")?,
+                    &overrides,
+                )?;
+            }
+            let kelvin = temperature + 273.15;
+            let ratio = kelvin / (nominal + 273.15);
+            // Historical SPICE k and q, default EG=1.11, XTI=3 and NF=1.
+            let vt = (1.3806226e-23 / 1.6021918e-19) * kelvin;
+            let isat = saturation.context("missing fixture IS")?
+                * ratio.powi(3)
+                * (1.11 * (ratio - 1.0) / vt).exp();
+            // VBE=.65, VCE=2 in these independent fixed-bias fixtures.
+            currents.push(-isat * (0.65 / vt).exp_m1());
+        }
+    }
+    let csv = fs::read_to_string(fixtures.join(format!("{name}.csv")))?;
+    let expected = csv
+        .lines()
+        .nth(1)
+        .context("missing BJT reference row")?
+        .split(',')
+        .skip(1)
+        .map(str::parse::<f64>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        currents.len() == expected.len(),
+        "BJT temperature reference shape"
+    );
+    for (actual, expected) in currents.into_iter().zip(expected) {
+        ensure!(
+            (actual - expected).abs() <= 1e-10 + 1e-7 * expected.abs(),
+            "legacy BJT transport: {actual} vs {expected}"
         );
     }
     Ok(())

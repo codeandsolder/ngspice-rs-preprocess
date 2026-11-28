@@ -464,7 +464,7 @@ fn classic_bjt_mapping_survives_raw_and_parsed_libraries_and_native_selection() 
     let library = dir.path().join("bjt.lib");
     fs::write(
         &library,
-        "*#HSPICE\n.subckt cell c b e params: is_local=3p\nQ1 c b e same M=2 TEMP=45\n.model same PNP(LEVEL=1 IS={is_local} BF=70 TNOM=35 T_ABS=50)\n.ends\n",
+        "*#HSPICE\n.subckt cell c b e params: is_local=3p\nQ1 c b e same M=2 TEMP=45\nQ2 c b e same\n.model same PNP(LEVEL=1 IS={is_local} BF=70 TNOM=35 T_ABS=50)\n.ends\n",
     )?;
     fs::write(
         &root,
@@ -595,6 +595,7 @@ fn classic_bjt_mapping_survives_raw_and_parsed_libraries_and_native_selection() 
             .join("\n")
             .to_ascii_uppercase();
         assert!(deck.contains("TEMP=45"), "{deck}");
+        assert!(deck.contains("TEMP=50"), "{deck}");
         assert!(deck.contains("TEMP=60"), "{deck}");
         assert!(deck.contains("DTEMP=5"), "{deck}");
     }
