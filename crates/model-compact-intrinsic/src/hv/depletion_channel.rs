@@ -218,11 +218,11 @@ impl PreparedHiSimHvDepletionChannel {
                 ),
                 surface_saturation_velocity: temperature_axis(
                     transport.saturation_velocity_m_per_s,
-                    transport.saturation_velocity_derivative_m_per_kelvin,
+                    transport.saturation_velocity_derivative_m_per_s_kelvin,
                 ),
                 neutral_saturation_velocity: temperature_axis(
                     depletion.saturation_velocity_m_per_s,
-                    depletion.saturation_velocity_derivative_m_per_kelvin,
+                    depletion.saturation_velocity_derivative_m_per_s_kelvin,
                 ),
                 effective_neutral_drain: effective.drift,
             },
