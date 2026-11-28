@@ -1159,8 +1159,14 @@ The composed CORSRD=2/3 nonlinear access law preserves the independent
 external and intrinsic voltage derivatives, applies multiplicity once, and
 uses the native low-drain smoothing. The 1,536 native CORSRD=2 circuit
 points include finite-difference gradients; separate seven-coordinate tests
-exercise the access law and its near-zero drain limit. Explicit CORSRD=3
-series-node topology is not part of this intrinsic qualification.
+exercise the access law and its near-zero drain limit. The separate conventional CORSRD=1/3 physical series evaluator binds external
+node orientation independently of channel orientation, determines prime-node
+allocation from the unbinned geometry, and evaluates resistance, branch
+current, thermal noise and seven-coordinate derivatives. Both HV families,
+forward/reverse external biases, symmetric/asymmetric drift geometry,
+substrate coupling and temperature-dependent resistance are covered by
+6,912 native prime-drop/current points and 4,032 independent Jacobian
+comparisons including all four COTEMP modes.
 The STI edge channel is composed after nonlinear access resistance, with
 size-dependent width, doping, short-channel shift and the native surface
 potential smoothing. Rationalized inversion charge avoids cancellation of
@@ -1181,8 +1187,7 @@ junction leakage branches from the same solved channel state, including
 shared symmetric source potential and classical oxide capacitance. All 2,880
 native operating points and independent four-coordinate derivatives pass. The
 overlap, fringing, NQS, channel noise and HV2 CORDRIFT evaluators are
-qualified separately above. HV2 depletion-mode transport, conventional
-CORSRD=1/3 explicit series resistance, full device topology and electrothermal
+qualified separately above. HV2 depletion-mode transport, full device topology and electrothermal
 assembly remain work.
 
 ## Reference test coverage

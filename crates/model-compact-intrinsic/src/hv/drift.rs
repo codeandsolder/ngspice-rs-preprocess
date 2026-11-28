@@ -77,7 +77,7 @@ struct Transport {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Substrate {
     thickness: f64,
-    depletion_factor: f64,
+    depletion_factor: Option<f64>,
     built_in: f64,
     drain_coefficient: f64,
     bias_coefficient: f64,
@@ -177,9 +177,9 @@ impl PreparedHiSimHvDrift {
             return Jet::constant(1.);
         };
         let s = self.substrate;
-        if s.depletion_factor <= 0. {
+        let Some(factor) = s.depletion_factor else {
             return Jet::constant(1.);
-        }
+        };
         let normalized = Jet::coordinate(bias.external.vds, 5, 1.);
         let physical = if bias.reversed {
             -normalized
@@ -197,11 +197,12 @@ impl PreparedHiSimHvDrift {
             s.built_in - s.drain_coefficient * sym - s.bias_coefficient * substrate,
             10.,
         ) + EPS;
-        let depletion = upper(
-            (s.depletion_factor * potential).sqrt() + SMALL,
-            Jet::constant(s.thickness),
-            0.1 * s.thickness,
-        );
+        let width = if factor == 0. {
+            Jet::constant(SMALL)
+        } else {
+            (factor * potential).sqrt() + SMALL
+        };
+        let depletion = upper(width, Jet::constant(s.thickness), 0.1 * s.thickness);
         self.geometry.length / (positive(s.thickness - depletion, 1e-9) + EPS)
     }
 
@@ -257,7 +258,7 @@ impl PreparedHiSimHvDrift {
         let source_resistance = (g.source_sheet / g.multiplicity).max(RES_MIN);
         let factor = 4. * K * temperature.device_temperature_kelvin * g.multiplicity;
         let noise = |res: f64| {
-            if self.thermal_noise && res > 0. {
+            if self.thermal_noise && res > RES_MIN {
                 factor / res
             } else {
                 0.
@@ -369,9 +370,9 @@ pub fn prepare_hisim_hv_drift(
         substrate: Substrate {
             thickness: real("ddrift")?,
             depletion_factor: if doping * (substrate + doping) > 0. {
-                2. * ESI / Q * substrate / (doping * (substrate + doping))
+                Some(2. * ESI / Q * substrate / (doping * (substrate + doping)))
             } else {
-                0.
+                None
             },
             built_in: real("vbisub")?,
             drain_coefficient: real("rdvdsub")?,

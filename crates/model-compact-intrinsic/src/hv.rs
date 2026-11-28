@@ -15,6 +15,7 @@ mod drift;
 mod edge_tunneling;
 mod effective;
 mod electrostatic_material;
+mod explicit_series;
 mod fringing;
 mod gate_tunneling;
 mod gidl;
@@ -84,6 +85,10 @@ pub use effective::HiSimHvEffectiveGeometry;
 pub use electrostatic_material::{
     HiSimHvDepletionMaterialPoint, HiSimHvElectrostaticMaterialPoint,
     PreparedHiSimHvElectrostaticMaterial, prepare_hisim_hv_electrostatic_material,
+};
+pub use explicit_series::{
+    HiSimHvExplicitSeriesBias, HiSimHvExplicitSeriesBranch, HiSimHvExplicitSeriesPoint,
+    HiSimHvExplicitSeriesScalar, PreparedHiSimHvExplicitSeries, prepare_hisim_hv_explicit_series,
 };
 pub use fringing::{HiSimHvFringingCharges, PreparedHiSimHvFringing, prepare_hisim_hv_fringing};
 pub use gate_tunneling::{
