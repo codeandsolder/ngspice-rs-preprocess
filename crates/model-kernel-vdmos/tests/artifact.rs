@@ -402,3 +402,105 @@ fn changing_temperature_backward_euler_recovery_is_equivalent()
     }
     Ok(())
 }
+
+#[test]
+fn physical_taylor_reconstructs_electrothermal_laws()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use model_kernel_api::taylor::{TaylorBuffer, TaylorInput};
+    const ORDER: usize = 10;
+    for polarity in [Polarity::N, Polarity::P] {
+        for thermal in [false, true] {
+            for drain in [2., -0.5, 6.] {
+                let mut m = model(polarity);
+                m.diode.breakdown = Some(model_kernel_vdmos::Breakdown {
+                    bv: 5.,
+                    ibv: 1e-4,
+                    nbv: 1.2,
+                });
+                let a = artifact(Arc::new(m.prepare()?), thermal, [8; 16])?;
+                let prepared = a.prepare(&[1.5], 310.)?;
+                let width = a.descriptor().equations.len();
+                let mut x = vec![0.; width * (ORDER + 1)];
+                let sign = polarity.sign();
+                for (i, eq) in a.descriptor().equations.iter().enumerate() {
+                    let (value, slope, curvature) = match eq.name.as_str() {
+                        "drain" => (drain * sign, 0.02 * sign, 0.001),
+                        "gate" => (5.1 * sign, 0.03 * sign, -0.002),
+                        "source" => (0., -0.01, 0.001),
+                        "drain_prime" => ((drain - 0.1) * sign, 0.017 * sign, 0.002),
+                        "gate_prime" => (5. * sign, 0.025 * sign, -0.001),
+                        "source_prime" => (0.1 * sign, 0.003, -0.002),
+                        "body_prime" => (0.02 * sign, 0.007, 0.001),
+                        "junction" => (340., 0.7, -0.1),
+                        "case" => (320., 0.3, 0.05),
+                        "recovery" => (1e-8, 2e-10, -1e-11),
+                        name => return Err(format!("unexpected coordinate {name}").into()),
+                    };
+                    x[i] = value;
+                    x[width + i] = slope;
+                    x[2 * width + i] = curvature;
+                }
+                let mut t = TaylorBuffer::new(width, ORDER)?;
+                a.evaluate_taylor(
+                    &prepared,
+                    TaylorInput {
+                        order: ORDER,
+                        coefficients: &x,
+                    },
+                    &mut t.point(),
+                )?;
+                let p = t.point();
+                let mut scalar = PointBuffer::new(width)?;
+                for tau in [0., -0.25, 0.25, 0.5] {
+                    let reconstruct = |coeff: &[f64], stride: usize, i: usize| -> f64 {
+                        (0..=ORDER)
+                            .rev()
+                            .fold(0., |v: f64, k| v.mul_add(tau, coeff[k * stride + i]))
+                    };
+                    let coords: Vec<_> = (0..width).map(|i| reconstruct(&x, width, i)).collect();
+                    a.evaluate(&prepared, &coords, &mut scalar.point())?;
+                    let s = scalar.point();
+                    for (series, expected, stride, atol) in [
+                        (&*p.current, &*s.current, width, 1e-11),
+                        (&*p.charge, &*s.charge, width, 1e-21),
+                        (&*p.conductance, &*s.conductance, width * width, 1e-11),
+                        (&*p.capacitance, &*s.capacitance, width * width, 1e-21),
+                    ] {
+                        for (i, expected) in expected.iter().enumerate() {
+                            close(reconstruct(series, stride, i), *expected, atol, 2e-8);
+                        }
+                    }
+                }
+                for (values, jac) in [
+                    (&*p.current, &*p.conductance),
+                    (&*p.charge, &*p.capacitance),
+                ] {
+                    for k in 0..ORDER {
+                        let degree = f64::from(u32::try_from(k + 1)?);
+                        for row in 0..width {
+                            let mut sum = 0.;
+                            let mut norm = 0.;
+                            for j in 0..=k {
+                                let d = f64::from(u32::try_from(k + 1 - j)?);
+                                for col in 0..width {
+                                    let term = jac[j * width * width + row * width + col]
+                                        * x[(k + 1 - j) * width + col]
+                                        * d;
+                                    sum += term;
+                                    norm += term.abs();
+                                }
+                            }
+                            close(
+                                degree * values[(k + 1) * width + row],
+                                sum,
+                                1e-8 * norm,
+                                1e-8,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

@@ -1,9 +1,6 @@
 //! Physical Taylor coefficients in normalized local time. No integration,
 //! history or numerical trial limiting crosses this interface.
-use crate::{
-    Artifact, Capability, Descriptor, EquationKind, Error, Kernel, Point, Prepared, Result,
-    allocate,
-};
+use crate::{Artifact, Capability, EquationKind, Error, Kernel, Point, Prepared, Result, allocate};
 
 pub mod arithmetic;
 

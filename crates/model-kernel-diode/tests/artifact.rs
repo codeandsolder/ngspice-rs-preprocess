@@ -230,3 +230,76 @@ fn fowler_nordheim_artifact_reuses_terminal_law_and_candidate_slots() -> Result<
     assert!(compiled.prepare(&[2., 3., 1., 0.], 300.15).is_err());
     Ok(())
 }
+
+#[test]
+fn physical_taylor_diode_reconstructs_full_model() -> Result<()> {
+    use model_kernel_api::taylor::{TaylorBuffer, TaylorInput};
+    const ORDER: usize = 12;
+    for m in [0.4, 1., 1.2] {
+        for rs in [0., 3.] {
+            let model = compile_simetrix([
+                ("IS", 1e-12),
+                ("N", 1.3),
+                ("ISR", 2e-8),
+                ("NR", 2.),
+                ("IKF", 1e-4),
+                ("BV", 4.),
+                ("NBV", 1.4),
+                ("IBV", 1e-5),
+                ("IBVL", 1e-7),
+                ("NBVL", 2.2),
+                ("CJO", 1e-9),
+                ("VJ", 0.7),
+                ("M", m),
+                ("FC", 0.5),
+                ("TT", 20e-9),
+                ("RS", rs),
+            ])?;
+            let a = artifact(model, Instance::default(), [6; 16])?;
+            let prepared = a.prepare(&[1., 1., 1e-12, 0.], 300.15)?;
+            let width = a.descriptor().equations.len();
+            let anode = if width == 3 { 2 } else { 0 };
+            for v in [-4.1, -1., 0., 0.35, 0.6, 0.8] {
+                for slope in [-0.01, 0.01] {
+                    let mut x = vec![0.; width * (ORDER + 1)];
+                    x[anode] = v;
+                    x[width + anode] = slope;
+                    x[2 * width + anode] = 0.001;
+                    let mut t = TaylorBuffer::new(width, ORDER)?;
+                    a.evaluate_taylor(
+                        &prepared,
+                        TaylorInput {
+                            order: ORDER,
+                            coefficients: &x,
+                        },
+                        &mut t.point(),
+                    )?;
+                    let p = t.point();
+                    let mut scalar = PointBuffer::new(width)?;
+                    for tau in [0., 0.125, 0.5] {
+                        let reconstruct = |coeff: &[f64], stride: usize, i: usize| -> f64 {
+                            (0..=ORDER)
+                                .rev()
+                                .fold(0., |v: f64, k| v.mul_add(tau, coeff[k * stride + i]))
+                        };
+                        let coords: Vec<_> =
+                            (0..width).map(|i| reconstruct(&x, width, i)).collect();
+                        a.evaluate(&prepared, &coords, &mut scalar.point())?;
+                        let s = scalar.point();
+                        for (series, expected, stride, atol) in [
+                            (&*p.current, &*s.current, width, 1e-13),
+                            (&*p.charge, &*s.charge, width, 1e-21),
+                            (&*p.conductance, &*s.conductance, width * width, 1e-13),
+                            (&*p.capacitance, &*s.capacitance, width * width, 1e-21),
+                        ] {
+                            for (i, expected) in expected.iter().enumerate() {
+                                close(reconstruct(series,stride,i), *expected, atol, 1e-8).map_err(|e| format!("M={m} RS={rs} v={v} slope={slope} tau={tau} entry={i}: {e}"))?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
