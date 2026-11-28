@@ -1056,8 +1056,14 @@ including separate and combined corrections, two polarities, three
 temperatures and multiple geometries including multifinger instances.
 The core current, optional parasitic channel term and ohmic leakage remain
 separate so native access correction can be applied in its original order.
-HV2 depletion-mode transport, access/drift and STI corrections, parasitic
-assembly, noise and full circuit-level qualification remain separate work.
+The composed CORSRD=2/3 nonlinear access law preserves the independent
+external and intrinsic voltage derivatives, applies multiplicity once, and
+uses the native low-drain smoothing. The 1,536 native CORSRD=2 circuit
+points include finite-difference gradients; separate seven-coordinate tests
+exercise the access law and its near-zero drain limit. Explicit CORSRD=3
+series-node topology is not part of this intrinsic qualification.
+HV2 depletion-mode transport, explicit series/drift and STI corrections,
+parasitic assembly, noise and full circuit-level qualification remain work.
 
 ## Reference test coverage
 

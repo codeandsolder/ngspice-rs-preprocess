@@ -2,6 +2,7 @@
 //!
 //! This is setup-stage parameter preparation, not a physical model implementation.
 
+mod access_correction;
 mod accumulation;
 mod bias_conditioning;
 mod channel_charge;
@@ -30,6 +31,10 @@ mod temperature;
 mod threshold;
 mod transport;
 
+pub use access_correction::{
+    HiSimHvAccessCorrectionPoint, HiSimHvAccessInputs, HiSimHvExternalBias,
+    PreparedHiSimHvAccessCorrection, prepare_hisim_hv_access_correction,
+};
 pub use accumulation::{
     HiSimHvAccumulationInputs, HiSimHvAccumulationPoint, evaluate_hisim_hv_accumulation,
 };
@@ -48,7 +53,8 @@ pub use channel_electrostatics::{
 };
 pub use channel_mobility::{
     HiSimHvChannelMobilityCoefficients, HiSimHvChannelMobilityInputs, HiSimHvChannelMobilityPoint,
-    HiSimHvNormalChannelPoint, PreparedHiSimHvNormalChannel, prepare_hisim_hv_normal_channel,
+    HiSimHvNormalChannelPoint, HiSimHvNormalChannelWithAccessPoint, PreparedHiSimHvNormalChannel,
+    prepare_hisim_hv_normal_channel,
 };
 pub use channel_modulation::{
     HiSimHvChannelModulationInputs, HiSimHvChannelModulationPoint, HiSimHvChannelTerminalCharges,

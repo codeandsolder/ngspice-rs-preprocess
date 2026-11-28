@@ -37,6 +37,11 @@ impl<const N: usize> Differential<N> {
     pub(crate) fn exp_m1(self) -> Self {
         self.map(self.value.exp_m1(), self.value.exp())
     }
+    /// Real power of a strictly positive constitutive argument.
+    pub(crate) fn positive_pow(self, exponent: f64) -> Self {
+        let power = self.value.powf(exponent);
+        self.map(power, exponent * power / self.value)
+    }
     pub(crate) fn ln(self) -> Self {
         self.map(self.value.ln(), self.value.recip())
     }

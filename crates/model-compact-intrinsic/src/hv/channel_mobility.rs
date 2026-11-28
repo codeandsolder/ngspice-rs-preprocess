@@ -1,10 +1,12 @@
 //! Normal-channel HiSIM-HV universal mobility, velocity saturation and Ids0.
 use super::{
-    HiSimHvChannelChargePoint, HiSimHvChannelCorrectionPoint, HiSimHvChannelElectrostaticPoint,
-    HiSimHvChannelModulationPoint, HiSimHvChannelRegion, HiSimHvIntrinsicBias,
-    HiSimHvIntrinsicScalar as Jet, PreparedHiSimHvChannelElectrostatics, PreparedHiSimHvInstance,
+    HiSimHvAccessCorrectionPoint, HiSimHvAccessInputs, HiSimHvChannelChargePoint,
+    HiSimHvChannelCorrectionPoint, HiSimHvChannelElectrostaticPoint, HiSimHvChannelModulationPoint,
+    HiSimHvChannelRegion, HiSimHvExternalBias, HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar as Jet,
+    PreparedHiSimHvAccessCorrection, PreparedHiSimHvChannelElectrostatics, PreparedHiSimHvInstance,
     PreparedHiSimHvModel, PreparedHiSimHvTransport, channel_correction::ChannelCorrection,
-    instance::model_real, instance_real_at, lookup_slot, prepare_hisim_hv_channel_electrostatics,
+    instance::model_real, instance_real_at, lookup_slot, prepare_hisim_hv_access_correction,
+    prepare_hisim_hv_channel_electrostatics,
 };
 use crate::{ModelError, ParameterScope};
 use std::sync::Arc;
@@ -46,11 +48,6 @@ pub struct HiSimHvChannelMobilityPoint {
     pub mobility_m2_per_vs: Jet,
     /// Normalized Ids0, scaled by the instance multiplicity.
     pub drain_current_a: Jet,
-}
-
-fn positive_pow(value: Jet, exponent: f64) -> Jet {
-    let power = value.value.powf(exponent);
-    value.map(power, exponent * power / value.value)
 }
 
 fn saturation_factor(ratio: Jet, exponent: f64) -> Jet {
@@ -108,8 +105,8 @@ impl HiSimHvChannelMobilityCoefficients {
             ));
         }
         let inverse_mobility = 1. / coulomb
-            + inputs.phonon_coefficient * positive_pow(field, self.phonon_exponent)
-            + positive_pow(field, self.roughness_exponent) / self.roughness_mobility;
+            + inputs.phonon_coefficient * field.positive_pow(self.phonon_exponent)
+            + field.positive_pow(self.roughness_exponent) / self.roughness_mobility;
         let universal = 1. / (1e4 * inverse_mobility);
         let length = modulation.effective_length_m;
         let transport_field = charge.drift_diffusion_integral
@@ -138,6 +135,7 @@ pub struct PreparedHiSimHvNormalChannel {
     electrostatics: PreparedHiSimHvChannelElectrostatics,
     mobility: HiSimHvChannelMobilityCoefficients,
     correction: ChannelCorrection,
+    access: PreparedHiSimHvAccessCorrection,
     identity: Arc<()>,
 }
 
@@ -149,6 +147,13 @@ pub struct HiSimHvNormalChannelPoint {
     pub correction: HiSimHvChannelCorrectionPoint,
     /// Total intrinsic channel current before external access correction.
     pub drain_current_a: Jet,
+}
+
+/// Normal channel with the physically independent external-bias correction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiSimHvNormalChannelWithAccessPoint {
+    pub intrinsic: HiSimHvNormalChannelPoint,
+    pub access: HiSimHvAccessCorrectionPoint,
 }
 
 /// Prepare the native enhancement-mode channel for repeated local evaluation.
@@ -189,11 +194,37 @@ pub fn prepare_hisim_hv_normal_channel(
         electrostatics,
         mobility,
         correction: ChannelCorrection::prepare(model, instance, mobility.multiplicity)?,
+        access: prepare_hisim_hv_access_correction(model, instance)?,
         identity: Arc::clone(&instance.identity),
     })
 }
 
 impl PreparedHiSimHvNormalChannel {
+    /// Evaluate intrinsic charge and access-corrected channel current in their
+    /// independent physical coordinates, before explicit series/drift branches.
+    /// # Errors
+    /// Mismatched context or invalid local constitutive state.
+    pub fn evaluate_with_access(
+        &self,
+        bias: HiSimHvIntrinsicBias,
+        external: HiSimHvExternalBias,
+        transport: &PreparedHiSimHvTransport,
+    ) -> Result<HiSimHvNormalChannelWithAccessPoint, ModelError> {
+        let intrinsic = self.evaluate(bias, transport)?;
+        let access = self.access.evaluate(&HiSimHvAccessInputs {
+            intrinsic: bias,
+            external,
+            preaccess_current_a: intrinsic.mobility.drain_current_a
+                + intrinsic.correction.parasitic_channel_current_a,
+            postaccess_leakage_a: intrinsic.correction.ohmic_leakage_a,
+            conducting_channel: !matches!(
+                intrinsic.electrostatics.charge.region,
+                HiSimHvChannelRegion::Accumulation | HiSimHvChannelRegion::NoInversion
+            ),
+        })?;
+        Ok(HiSimHvNormalChannelWithAccessPoint { intrinsic, access })
+    }
+
     /// Evaluate core current and terminal charge with one consistent temperature state.
     /// # Errors
     /// Mismatched instance or nonphysical local constitutive state.

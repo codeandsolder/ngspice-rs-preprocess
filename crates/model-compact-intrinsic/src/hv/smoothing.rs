@@ -1,8 +1,8 @@
 //! Source-defined `HiSIM` smooth clipping laws with cancellation-resistant values
 //! and complete derivatives, including bias-dependent limits.
-use super::HiSimHvIntrinsicScalar as Jet;
+use crate::differential::Differential as Jet;
 
-pub(super) fn positive(value: Jet, delta: f64) -> Jet {
+pub(super) fn positive<const N: usize>(value: Jet<N>, delta: f64) -> Jet<N> {
     let root = value.value.hypot(2. * delta);
     let result = if value.value >= 0. {
         f64::midpoint(value.value, root)
@@ -12,7 +12,7 @@ pub(super) fn positive(value: Jet, delta: f64) -> Jet {
     value.map(result, result / root)
 }
 
-fn positive_quadratic(argument: Jet, product: Jet) -> Jet {
+fn positive_quadratic<const N: usize>(argument: Jet<N>, product: Jet<N>) -> Jet<N> {
     let product = if product.value < 0. {
         -product
     } else {
@@ -39,11 +39,11 @@ fn positive_quadratic(argument: Jet, product: Jet) -> Jet {
 }
 
 /// Native `Fn_SU` with the absolute-valued smoothing product.
-pub(super) fn upper(value: Jet, limit: Jet, delta: f64) -> Jet {
+pub(super) fn upper<const N: usize>(value: Jet<N>, limit: Jet<N>, delta: f64) -> Jet<N> {
     limit - positive_quadratic(limit - value - delta, 4. * delta * limit)
 }
 
 /// Native `Fn_SL`, with differentiation of the actual limit.
-pub(super) fn lower(value: Jet, limit: Jet, delta: f64) -> Jet {
+pub(super) fn lower<const N: usize>(value: Jet<N>, limit: Jet<N>, delta: f64) -> Jet<N> {
     -upper(-value, -limit, delta)
 }
