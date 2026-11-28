@@ -45,6 +45,32 @@ pub struct DigitalDeclaration {
     pub io: Vec<Located<IoModel>>,
 }
 
+impl DigitalDeclaration {
+    /// Resolve the last instance selector in its own occurrence context.
+    ///
+    /// # Errors
+    /// Unresolvable selector or exhausted budget.
+    pub fn resolve_selector(
+        &self,
+        name: &str,
+        mut resolve: impl FnMut(&Location, &crate::model_card::ModelParameter) -> Result<f64>,
+        budget: &WorkBudget,
+    ) -> Result<Option<f64>> {
+        budget.charge(
+            Resource::EvaluationSteps,
+            self.instance.declaration.selectors.len(),
+        )?;
+        self.instance
+            .declaration
+            .selectors
+            .iter()
+            .rev()
+            .find(|field| field.name.eq_ignore_ascii_case(name))
+            .map(|field| resolve(&self.instance.location, field))
+            .transpose()
+    }
+}
+
 struct Capture<'a> {
     scopes: &'a Scopes,
     origins: &'a [usize],
@@ -290,6 +316,71 @@ mod tests {
                 .as_deref(),
             Some("25")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn bind_io_defaults_overrides_and_selected_interface() -> Result<()> {
+        use super::super::digital_io::{InterfaceLevel, PulseRejection};
+        let input = b".model base UIO(DRVH={ignored} DRVL=70 AtoD2=rx AtoD4={unused})
+.model t UGATE
+.subckt cell p g a y
+.model io AKO:base UIO(DRVH=0 DtoA2=tx TPWRT=0)
+U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
+.ends
+";
+        let budget = WorkBudget::default();
+        let statements = lexical::statements(input)?;
+        let origins = (1..=6).collect::<Vec<_>>();
+        let dialects = SourceDialects::Uniform(SourceDialect::Pspice);
+        let scopes = Scopes::collect(&statements, &origins, dialects, &budget)?;
+        let declarations = capture(&statements, &scopes, &origins, dialects)?;
+        let declaration = declarations.first().context("missing U-device")?;
+        let selector = declaration.resolve_selector(
+            "IO_LEVEL",
+            |location, field| {
+                assert_eq!(location.scope, ["cell"]);
+                assert_eq!(field.expression.as_deref(), Some("2"));
+                Ok(2.)
+            },
+            &budget,
+        )?;
+        let level = InterfaceLevel::resolve(selector, Some(4.))?;
+        let io = declaration.bind_io(
+            level,
+            |location, field| match field.name.to_ascii_uppercase().as_str() {
+                "DRVH" | "TPWRT" => {
+                    assert_eq!(location.scope, ["cell"]);
+                    Ok(0.)
+                }
+                "DRVL" => {
+                    assert!(location.scope.is_empty());
+                    Ok(70.)
+                }
+                _ => anyhow::bail!("unexpected numeric I/O field {}", field.name),
+            },
+            |location, field| match field.name.to_ascii_uppercase().as_str() {
+                "ATOD2" => {
+                    assert!(location.scope.is_empty());
+                    Ok("rx".to_owned())
+                }
+                "DTOA2" => {
+                    assert_eq!(location.scope, ["cell"]);
+                    Ok("tx".to_owned())
+                }
+                _ => anyhow::bail!("unexpected interface reference {}", field.name),
+            },
+            &budget,
+        )?;
+        assert_eq!(io.level, InterfaceLevel::Two);
+        assert_eq!(io.drive_high.to_bits(), 0_f64.to_bits());
+        assert_eq!(io.drive_low.to_bits(), 70_f64.to_bits());
+        assert_eq!(io.drive_z.to_bits(), 250_000_f64.to_bits());
+        assert_eq!(io.pulse_rejection, PulseRejection::Explicit { seconds: 0. });
+        assert_eq!(io.analog_to_digital.name, "rx");
+        assert_eq!(io.digital_to_analog.name, "tx");
+        assert_eq!(io.power_supply.name, "DIGIFPWR");
+        assert!(io.power_supply.declaration.is_none());
         Ok(())
     }
 

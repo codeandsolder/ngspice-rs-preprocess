@@ -1,11 +1,17 @@
 //! Digital loading, drive and mixed-domain interface declarations.
 
+use super::{
+    digital_source::{DigitalDeclaration, Location},
+    scope::charge_scope,
+};
 use crate::model_card::{ModelCard, ModelParameter};
 use anyhow::{Context, Result, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// One of the four source-selectable mixed-domain interface levels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfaceLevel {
     /// Level one.
@@ -19,6 +25,25 @@ pub enum InterfaceLevel {
 }
 
 impl InterfaceLevel {
+    /// Select the interface level, using the global option for an absent or zero
+    /// instance selector. The default global level is one.
+    ///
+    /// # Errors
+    /// Invalid or nonintegral level.
+    pub fn resolve(instance: Option<f64>, global: Option<f64>) -> Result<Self> {
+        let value = match instance {
+            None | Some(0.) => global.unwrap_or(1.),
+            Some(value) => value,
+        };
+        Ok(match value {
+            1. => Self::One,
+            2. => Self::Two,
+            3. => Self::Three,
+            4. => Self::Four,
+            _ => anyhow::bail!("invalid PSpice interface level {value}"),
+        })
+    }
+
     const fn parse(level: &str) -> Option<Self> {
         match level.as_bytes() {
             b"1" => Some(Self::One),
@@ -31,7 +56,7 @@ impl InterfaceLevel {
 }
 
 /// Physical or interface property; the original expression remains unresolved.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "level", rename_all = "snake_case")]
 pub enum IoProperty {
     /// Input capacitance (farads).
@@ -141,6 +166,174 @@ impl IoModel {
             source_line: card.source_line,
             assignments,
         }))
+    }
+}
+
+/// A pulse rejection threshold can follow the eventual loaded propagation
+/// delay, or be an independent explicit threshold in seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PulseRejection {
+    /// Resolve from the applicable propagation path at execution binding.
+    PropagationDelay,
+    /// Explicit duration, including zero.
+    Explicit {
+        /// Seconds.
+        seconds: f64,
+    },
+}
+
+/// A selected interface reference, not an already elaborated subcircuit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InterfaceReference {
+    /// Selected subcircuit name.
+    pub name: String,
+    /// Declaration scope for an explicit name; default names use library lookup.
+    pub declaration: Option<Location>,
+}
+
+/// Electrical model quantities and selected interface references. No electrical
+/// topology, load-dependent delay, drive category or charge-storage dynamics
+/// are inferred here.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BoundIo {
+    /// High-state resistance in ohms.
+    pub drive_high: f64,
+    /// Low-state resistance in ohms.
+    pub drive_low: f64,
+    /// High-impedance leakage resistance in ohms.
+    pub drive_z: f64,
+    /// Input leakage resistance in ohms.
+    pub input_resistance: f64,
+    /// Input capacitance in farads.
+    pub input_load: f64,
+    /// Output capacitance in farads.
+    pub output_load: f64,
+    /// Minimum charge-storage duration in seconds.
+    pub storage_time: f64,
+    /// Pulse rejection policy.
+    pub pulse_rejection: PulseRejection,
+    /// Selected mixed-domain interface level.
+    pub level: InterfaceLevel,
+    /// Selected analog-to-digital subcircuit.
+    pub analog_to_digital: InterfaceReference,
+    /// Selected digital-to-analog subcircuit.
+    pub digital_to_analog: InterfaceReference,
+    /// Power supply subcircuit reference.
+    pub power_supply: InterfaceReference,
+    /// Low-to-high output threshold compensation in seconds.
+    pub switching_rise: f64,
+    /// High-to-low output threshold compensation in seconds.
+    pub switching_fall: f64,
+}
+
+type Effective<'a> = BTreeMap<IoProperty, (&'a Location, &'a ModelParameter)>;
+
+fn numeric(
+    fields: &Effective<'_>,
+    property: IoProperty,
+    default: f64,
+    resolve: &mut impl FnMut(&Location, &ModelParameter) -> Result<f64>,
+    budget: &WorkBudget,
+) -> Result<f64> {
+    let Some(&(location, field)) = fields.get(&property) else {
+        return Ok(default);
+    };
+    budget.charge(Resource::EvaluationSteps, 1)?;
+    let value = resolve(location, field)
+        .with_context(|| format!("PSpice I/O field {} at {location:?}", field.name))?;
+    ensure!(
+        value.is_finite() && value >= 0.,
+        "invalid PSpice I/O field {}",
+        field.name
+    );
+    Ok(value)
+}
+
+fn reference(
+    fields: &Effective<'_>,
+    property: IoProperty,
+    default: &str,
+    resolve: &mut impl FnMut(&Location, &ModelParameter) -> Result<String>,
+    budget: &WorkBudget,
+) -> Result<InterfaceReference> {
+    if let Some(&(location, field)) = fields.get(&property) {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        let name = resolve(location, field)
+            .with_context(|| format!("PSpice interface field {} at {location:?}", field.name))?;
+        ensure!(!name.trim().is_empty(), "empty PSpice interface name");
+        budget.charge(Resource::EmittedBytes, name.len())?;
+        charge_scope(&location.scope, budget)?;
+        if let Some(origin) = &location.linked {
+            budget.charge(Resource::EmittedBytes, origin.path.as_os_str().len())?;
+        }
+        Ok(InterfaceReference {
+            name,
+            declaration: Some(location.clone()),
+        })
+    } else {
+        budget.charge(Resource::EmittedBytes, default.len())?;
+        Ok(InterfaceReference {
+            name: default.to_owned(),
+            declaration: None,
+        })
+    }
+}
+
+impl DigitalDeclaration {
+    /// Resolve an occurrence's effective I/O fields in their declaration scopes.
+    ///
+    /// Defaults follow the PSpice Reference Guide 10.5, pp. 417–419. Interface
+    /// references are not instantiated; omitted pulse rejection remains dependent
+    /// on the actual propagation path. Unselected interface fields are not
+    /// evaluated.
+    ///
+    /// # Errors
+    /// Unresolvable or invalid values, missing model, or exceeded work budget.
+    pub fn bind_io(
+        &self,
+        level: InterfaceLevel,
+        mut resolve_number: impl FnMut(&Location, &ModelParameter) -> Result<f64>,
+        mut resolve_name: impl FnMut(&Location, &ModelParameter) -> Result<String>,
+        budget: &WorkBudget,
+    ) -> Result<BoundIo> {
+        ensure!(!self.io.is_empty(), "missing effective PSpice I/O model");
+        let mut fields = Effective::new();
+        for layer in &self.io {
+            for assignment in &layer.declaration.assignments {
+                budget.charge(Resource::EvaluationSteps, 1)?;
+                fields.insert(assignment.property, (&layer.location, &assignment.field));
+            }
+        }
+        let mut number =
+            |property, default| numeric(&fields, property, default, &mut resolve_number, budget);
+        let mut name =
+            |property, default| reference(&fields, property, default, &mut resolve_name, budget);
+        use IoProperty as P;
+        let pulse_rejection = if fields.contains_key(&P::PulseWidthRejection) {
+            PulseRejection::Explicit {
+                seconds: number(P::PulseWidthRejection, 0.)?,
+            }
+        } else {
+            PulseRejection::PropagationDelay
+        };
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        Ok(BoundIo {
+            drive_high: number(P::DriveHigh, 50.)?,
+            drive_low: number(P::DriveLow, 50.)?,
+            drive_z: number(P::DriveZ, 250_000.)?,
+            input_resistance: number(P::InputResistance, 30_000.)?,
+            input_load: number(P::InputLoad, 0.)?,
+            output_load: number(P::OutputLoad, 0.)?,
+            storage_time: number(P::StorageTime, 0.001)?,
+            pulse_rejection,
+            level,
+            analog_to_digital: name(P::AnalogToDigital(level), "AtoDDefault")?,
+            digital_to_analog: name(P::DigitalToAnalog(level), "DtoADefault")?,
+            power_supply: name(P::PowerSupply, "DIGIFPWR")?,
+            switching_rise: number(P::SwitchingRise(level), 0.)?,
+            switching_fall: number(P::SwitchingFall(level), 0.)?,
+        })
     }
 }
 
