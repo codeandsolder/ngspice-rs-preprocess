@@ -34,7 +34,7 @@ enum Dialect {
 }
 
 /// Source operators reuse the native spelling type for shared syntax, not
-/// its evaluation or associativity. LTspice's caret denotes XOR, not power.
+/// its evaluation or associativity. `LTspice`'s caret denotes XOR, not power.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceBinaryOp {
     Shared(BinaryOp),
@@ -50,7 +50,7 @@ impl SourceBinaryOp {
         }
     }
 
-    fn precedence(self) -> u8 {
+    const fn precedence(self) -> u8 {
         match self {
             Self::Xor | Self::Shared(BinaryOp::And | BinaryOp::Or) => 2,
             Self::Shared(op) => op.precedence(),
@@ -86,7 +86,7 @@ impl ParsedBinaryOp {
         (left, right)
     }
 
-    fn expression(self, lhs: Box<Expr>, rhs: Box<Expr>) -> Expr {
+    const fn expression(self, lhs: Box<Expr>, rhs: Box<Expr>) -> Expr {
         match self {
             Self::Native(op) => Expr::Binary(op, lhs, rhs),
             Self::Source(op) => Expr::SourceBinary(op, lhs, rhs),
@@ -668,7 +668,7 @@ impl Expr {
                         let function = match op {
                             SourceBinaryOp::Shared(BinaryOp::Pow) => "pow",
                             SourceBinaryOp::Xor => "xor",
-                            _ => "mod",
+                            SourceBinaryOp::Shared(_) => "mod",
                         };
                         write!(out, "{function}(")?;
                         lhs.render_ltspice(out, budget)?;
