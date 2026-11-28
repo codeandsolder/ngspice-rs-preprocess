@@ -283,7 +283,7 @@ fn reference(
 impl DigitalDeclaration {
     /// Resolve an occurrence's effective I/O fields in their declaration scopes.
     ///
-    /// Defaults follow the PSpice Reference Guide 10.5, pp. 417–419. Interface
+    /// Defaults follow the `PSpice` Reference Guide 10.5, pp. 417–419. Interface
     /// references are not instantiated; omitted pulse rejection remains dependent
     /// on the actual propagation path. Unselected interface fields are not
     /// evaluated.
@@ -297,6 +297,7 @@ impl DigitalDeclaration {
         mut resolve_name: impl FnMut(&Location, &ModelParameter) -> Result<String>,
         budget: &WorkBudget,
     ) -> Result<BoundIo> {
+        use IoProperty as P;
         ensure!(!self.io.is_empty(), "missing effective PSpice I/O model");
         let mut fields = Effective::new();
         for layer in &self.io {
@@ -309,7 +310,6 @@ impl DigitalDeclaration {
             |property, default| numeric(&fields, property, default, &mut resolve_number, budget);
         let mut name =
             |property, default| reference(&fields, property, default, &mut resolve_name, budget);
-        use IoProperty as P;
         let pulse_rejection = if fields.contains_key(&P::PulseWidthRejection) {
             PulseRejection::Explicit {
                 seconds: number(P::PulseWidthRejection, 0.)?,

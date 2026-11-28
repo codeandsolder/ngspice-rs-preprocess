@@ -867,6 +867,34 @@ fn normalize_selected(
     }
 }
 
+fn expanded_line_origins(
+    input: &[u8],
+    inserted_lines: &[usize],
+    budget: &WorkBudget,
+) -> Result<Option<Vec<usize>>> {
+    Ok(if inserted_lines.is_empty() {
+        None
+    } else {
+        budget.charge(
+            Resource::GeneratedNodes,
+            input
+                .split_inclusive(|byte| *byte == b'\n')
+                .count()
+                .saturating_add(inserted_lines.len()),
+        )?;
+        let mut origins = Vec::new();
+        let mut previous = inserted_lines.iter().copied().peekable();
+        for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
+            while previous.peek() == Some(&line) {
+                origins.push(line);
+                previous.next();
+            }
+            origins.push(line);
+        }
+        Some(origins)
+    })
+}
+
 fn normalize_body(
     input: &[u8],
     strip_end: bool,
@@ -936,27 +964,7 @@ fn normalize_body(
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
-    let origins = if inserted_lines.is_empty() {
-        None
-    } else {
-        budget.charge(
-            Resource::GeneratedNodes,
-            input
-                .split_inclusive(|byte| *byte == b'\n')
-                .count()
-                .saturating_add(inserted_lines.len()),
-        )?;
-        let mut origins = Vec::new();
-        let mut previous = inserted_lines.iter().copied().peekable();
-        for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
-            while previous.peek() == Some(&line) {
-                origins.push(line);
-                previous.next();
-            }
-            origins.push(line);
-        }
-        Some(origins)
-    };
+    let origins = expanded_line_origins(input, inserted_lines, budget)?;
     let original_line = |line: usize| {
         origins.as_ref().map_or(Ok(line), |mapping| {
             mapping

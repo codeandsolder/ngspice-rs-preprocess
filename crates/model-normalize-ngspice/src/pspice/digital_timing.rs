@@ -1,4 +1,4 @@
-//! Source timing declarations for PSpice digital primitives.
+//! Source timing declarations for `PSpice` digital primitives.
 //!
 //! The reference guide (10.5, digital devices, pp. 345–365) distinguishes
 //! directional propagation paths, timing checks and min/typ/max corners.

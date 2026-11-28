@@ -256,7 +256,7 @@ impl AnalysisPlan {
         }
     }
 
-    /// Bind effective global digital options from the ordered PSpice plan.
+    /// Bind effective global digital options from the ordered `PSpice` plan.
     ///
     /// The caller resolves the last assignment of each option in its source
     /// context. Conditional or non-global assignments need topology binding.

@@ -1,6 +1,6 @@
 //! Source timing-corner completion and selection, independent of event execution.
 //!
-//! Reference: PSpice A/D Reference Guide 10.5, pp. 338–340. Propagation
+//! Reference: `PSpice` A/D Reference Guide 10.5, pp. 338–340. Propagation
 //! delays and timing checks have different omitted-corner completion rules.
 
 use super::{

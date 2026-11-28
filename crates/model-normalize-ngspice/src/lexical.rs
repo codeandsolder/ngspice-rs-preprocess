@@ -10,9 +10,9 @@ pub fn ensure_textual(input: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Dollar tokens are comments in native/HSPICE syntax but identifiers in PSpice.
+/// Dollar tokens are comments in native/HSPICE syntax but identifiers in `PSpice`.
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum DollarMode {
+pub enum DollarMode {
     Comment,
     Identifier,
 }
@@ -114,7 +114,7 @@ pub fn statements(input: &[u8]) -> Result<Vec<Statement>> {
     statements_with(input, |_| Ok(DollarMode::Comment))
 }
 
-pub(crate) fn statements_with(
+pub fn statements_with(
     input: &[u8],
     mut dollars: impl FnMut(usize) -> Result<DollarMode>,
 ) -> Result<Vec<Statement>> {
@@ -231,7 +231,7 @@ pub fn normalize_nbsp(input: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-pub(crate) fn normalize_nbsp_with<E>(
+pub fn normalize_nbsp_with<E>(
     input: &[u8],
     mut dollars: impl FnMut(usize) -> std::result::Result<DollarMode, E>,
 ) -> std::result::Result<Option<Vec<u8>>, E> {

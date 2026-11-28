@@ -203,7 +203,7 @@ pub(super) fn capture(
         } else if first.eq_ignore_ascii_case(b".endc") {
             control = false;
         } else if control {
-            continue;
+            // Ignore simulator control-language statements.
         } else if first.eq_ignore_ascii_case(b".if") {
             conditional_depth += 1;
         } else if first.eq_ignore_ascii_case(b".endif") {

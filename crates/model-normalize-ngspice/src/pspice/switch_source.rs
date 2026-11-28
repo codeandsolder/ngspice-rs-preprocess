@@ -1,6 +1,6 @@
 //! Source switch classification and delayed threshold declaration binding.
 //!
-//! The PSpice Reference Guide 10.5, pp. 295–299 and 311–316, distinguishes
+//! The `PSpice` Reference Guide 10.5, pp. 295–299 and 311–316, distinguishes
 //! continuous log-resistance interpolation from short-transition switches.
 //! TD shifts the transition; it is not a finite transition duration.
 

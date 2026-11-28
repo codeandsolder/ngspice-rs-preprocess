@@ -1,6 +1,6 @@
 //! Circuit-wide digital option values, resolved before instance binding.
 //!
-//! Reference: PSpice A/D Reference Guide 10.5, pp. 70 and 352.
+//! Reference: `PSpice` A/D Reference Guide 10.5, pp. 70 and 352.
 
 use super::{
     digital_corners::{DelaySelection, TimingScales},
@@ -35,7 +35,7 @@ pub enum DigitalOption {
 }
 
 impl DigitalOption {
-    /// Recognize a PSpice digital option name, case-insensitively.
+    /// Recognize a `PSpice` digital option name, case-insensitively.
     #[must_use = "unrecognized options need a separate source analysis policy"]
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name.to_ascii_uppercase().as_str() {
@@ -97,11 +97,11 @@ impl DigitalOptions {
     /// # Errors
     /// Nonfinite or invalid option values.
     pub fn from_effective(values: &BTreeMap<DigitalOption, f64>) -> Result<Self> {
+        use DigitalOption as O;
         ensure!(
             values.values().all(|value| value.is_finite()),
             "nonfinite PSpice digital option"
         );
-        use DigitalOption as O;
         let get = |option, default| values.get(&option).copied().unwrap_or(default);
         let options = Self {
             delay_selection: DelaySelection::resolve(
