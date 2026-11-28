@@ -454,6 +454,18 @@ fn physical_taylor_reconstructs_electrothermal_laws()
                     &mut series_buffer.point(),
                 )?;
                 let series_point = series_buffer.point();
+                // Independent 100-digit differentiation of the external drain
+                // row (series resistance, diode, recovery, and shunt) for this
+                // forward-body-diode case. The degree-22 value specifically
+                // detects cancellation in separately expanded exponentials.
+                if polarity == Polarity::N && thermal && drain == -0.5 {
+                    close(
+                        series_point.current[22 * width],
+                        -3.870_974_049_562_93e-35,
+                        0.,
+                        1e-8,
+                    );
+                }
                 let mut scalar = PointBuffer::new(width)?;
                 for tau in [0., -0.25, 0.25, 0.5] {
                     let reconstruct = |coeff: &[f64], stride: usize, i: usize| -> f64 {
@@ -487,7 +499,7 @@ fn physical_taylor_reconstructs_electrothermal_laws()
                         }
                     }
                 }
-                verify_taylor_chain_rule(width, ORDER, &coefficients, &series_point)?;
+                verify_taylor_chain_rule(width, ORDER, &coefficients, &series_point).map_err(|error| format!("polarity={polarity:?} thermal={thermal} drain={drain} grading_one={grading_one}: {error}"))?;
             }
         }
     }
@@ -500,9 +512,9 @@ fn verify_taylor_chain_rule(
     coefficients: &[f64],
     series_point: &model_kernel_api::taylor::TaylorPoint<'_>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    for (values, jac) in [
-        (&*series_point.current, &*series_point.conductance),
-        (&*series_point.charge, &*series_point.capacitance),
+    for (quantity, values, jac) in [
+        ("F", &*series_point.current, &*series_point.conductance),
+        ("Q", &*series_point.charge, &*series_point.capacitance),
     ] {
         for k in 0..order {
             let degree = f64::from(u32::try_from(k + 1)?);
@@ -519,12 +531,22 @@ fn verify_taylor_chain_rule(
                         norm += term.abs();
                     }
                 }
-                close(
-                    degree * values[(k + 1) * width + row],
-                    sum,
-                    1e-8 * norm,
-                    1e-8,
-                );
+                let actual = degree * values[(k + 1) * width + row];
+                // Normwise roundoff floor on the normalized polynomial:
+                // high-order coefficients can be exponentially smaller than
+                // the row scale, particularly in a thermal germ. Retain the
+                // coefficientwise check wherever it is numerically resolved.
+                let row_scale = (1..=order).try_fold(0_f64, |scale, n| {
+                    Ok::<_, std::num::TryFromIntError>(
+                        scale.max(f64::from(u32::try_from(n)?) * values[n * width + row].abs()),
+                    )
+                })?;
+                let rounding_floor = 256. * f64::EPSILON * row_scale;
+                if (actual - sum).abs()
+                    > rounding_floor + 1e-8 * (norm + actual.abs().max(sum.abs()))
+                {
+                    return Err(format!("{quantity} degree={} row={row} actual={actual:e} chain={sum:e} norm={norm:e}", k+1).into());
+                }
             }
         }
     }

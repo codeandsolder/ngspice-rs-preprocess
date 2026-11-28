@@ -1044,6 +1044,9 @@ impl<S: Scalar> Jet<S> {
         let value = self.v.exp();
         self.compose(value, value)
     }
+    fn exp_m1(self) -> Self {
+        self.compose(self.v.exp_m1(), self.v.exp())
+    }
     fn ln(self) -> Self {
         self.compose(self.v.ln(), self.v.recip())
     }
@@ -1144,12 +1147,12 @@ impl<S: Scalar> Mul for Jet<S> {
 impl<S: Scalar> Div for Jet<S> {
     type Output = Self;
     fn div(self, other: Self) -> Self {
-        let inverse = (other.v * other.v).recip();
+        let value = self.v / other.v;
         Self {
-            v: self.v / other.v,
-            dx: self.v.mul_add(-other.dx, self.dx * other.v) * inverse,
-            dy: self.v.mul_add(-other.dy, self.dy * other.v) * inverse,
-            dt: self.v.mul_add(-other.dt, self.dt * other.v) * inverse,
+            v: value,
+            dx: (-value).mul_add(other.dx, self.dx) / other.v,
+            dy: (-value).mul_add(other.dy, self.dy) / other.v,
+            dt: (-value).mul_add(other.dt, self.dt) / other.v,
         }
     }
 }
@@ -1284,20 +1287,33 @@ fn depletion_charge<S: Scalar>(
 
 fn diode_current<S: Scalar>(
     vd: Jet<S>,
-    saturation_current: Jet<S>,
-    vte: Jet<S>,
-    thermal_voltage: Jet<S>,
-    avalanche: Option<Breakdown>,
+    temperature: Jet<S>,
+    mult: f64,
+    d: BodyDiode,
+    tnom: f64,
 ) -> Result<Jet<S>, ModelError> {
+    let ratio = temperature / tnom;
+    let thermal_voltage = K_OVER_Q * temperature;
+    let vte = d.n * thermal_voltage;
+    let activation = (ratio - 1.0) * d.eg;
+    let log_prefactor = mult.ln() + d.is.ln() + (d.xti / d.n) * ratio.ln();
+    let saturation_current = (log_prefactor + activation / vte).exp();
     if vd.v.compare_to(vte.v.scale(-3.)) != Some(Ordering::Less) {
-        return Ok(saturation_current * ((vd / vte).exp() - 1.0));
+        let exponent = vd / vte;
+        // Combine activation and bias before division to avoid cancellation
+        // between independently expanded thermal and forward exponentials.
+        return Ok(if exponent.v.compare(1.) == Some(Ordering::Greater) {
+            (log_prefactor + (activation + vd) / vte).exp() - saturation_current
+        } else {
+            saturation_current * exponent.exp_m1()
+        });
     }
-    if let Some(parameters) = avalanche {
+    if let Some(parameters) = d.breakdown {
         let xbv = breakdown::effective_voltage(parameters, saturation_current, thermal_voltage)?;
         if vd.v.compare_to(-xbv.v) == Some(Ordering::Less) {
-            return Ok(
-                -saturation_current * (-(xbv + vd) / (parameters.nbv * thermal_voltage)).exp()
-            );
+            return Ok(-(log_prefactor
+                + (activation / d.n - (xbv + vd) / parameters.nbv) / thermal_voltage)
+                .exp());
         }
     }
     let arg = 3.0 * vte / (vd * std::f64::consts::E);
@@ -1326,11 +1342,7 @@ fn diode_at<S: Scalar>(
     let cap = mult * d.cjo
         / (1.0 + grading * (400e-6f64.mul_add(model.tnom - REFERENCE_T, -gmaold)))
         * (1.0 + grading * (400e-6 * (temp - REFERENCE_T) - gmanew));
-    let thermal_voltage = K_OVER_Q * temp;
-    let vte = d.n * thermal_voltage;
-    let scale = ((ratio - 1.0) * d.eg / vte + (d.xti / d.n) * ratio.ln()).exp();
-    let isat = mult * d.is * scale;
-    let current = diode_current(vd, isat, vte, thermal_voltage, d.breakdown)?;
+    let current = diode_current(vd, temp, mult, d, model.tnom)?;
     // ngspice 47 vdmostemp.c limits the *temperature-adjusted* junction
     // potential when FC*VJ exceeds 2.5 V. The zero-bias capacitance is
     // computed using the original potential, before applying this limit.
