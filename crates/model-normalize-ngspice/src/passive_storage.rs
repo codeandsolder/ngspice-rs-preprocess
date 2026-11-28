@@ -130,9 +130,11 @@ mod tests {
             for index in -40..=40 {
                 let x = f64::from(index) / 10.;
                 let point = law.evaluate(x)?;
-                let reference = base * (x - 0.15 * x.powi(2) + 0.07 / 3. * x.powi(3));
-                let slope = base * (1. - 0.3 * x + 0.07 * x.powi(2));
-                let energy = base * (0.5 * x.powi(2) - 0.1 * x.powi(3) + 0.0175 * x.powi(4));
+                let reference =
+                    base * ((0.07_f64 / 3.).mul_add(x.powi(3), 0.15_f64.mul_add(-x.powi(2), x)));
+                let slope = base * (0.07_f64.mul_add(x.powi(2), 0.3_f64.mul_add(-x, 1.)));
+                let energy = base
+                    * (0.0175_f64.mul_add(x.powi(4), 0.1_f64.mul_add(-x.powi(3), 0.5 * x.powi(2))));
                 close(point.stored, reference);
                 close(point.differential, slope);
                 close(law.energy(x)?, energy);
@@ -152,16 +154,16 @@ mod tests {
         let mut energy_delta = 0.;
         for i in 0..=200 {
             let x = f64::from(i).mul_add(h, start);
-            let weight = if i == 0 || i == 200 {
+            let weight: f64 = if i == 0 || i == 200 {
                 1.
             } else if i % 2 == 0 {
                 2.
             } else {
                 4.
             };
-            let slope = 2e-3 * (1. + 0.2 * x - 0.03 * x * x);
-            storage_delta += weight * slope;
-            energy_delta += weight * x * slope;
+            let slope = 2e-3 * ((0.03 * x).mul_add(-x, 0.2_f64.mul_add(x, 1.)));
+            storage_delta = weight.mul_add(slope, storage_delta);
+            energy_delta = (weight * x).mul_add(slope, energy_delta);
             let step = 1e-5;
             let finite_difference =
                 (law.evaluate(x + step)?.stored - law.evaluate(x - step)?.stored) / (2. * step);

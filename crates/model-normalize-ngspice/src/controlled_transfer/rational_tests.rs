@@ -220,7 +220,7 @@ fn native_rational_reference_ac_transient_scope_and_current_polarity() -> Result
             ] {
                 let ramp = 1e-6;
                 let fraction = -(-ramp / tau).exp_m1() * tau / ramp;
-                let expected = gain * (1. - fraction * (-(time - ramp) / tau).exp());
+                let expected = gain * (fraction.mul_add(-(-(time - ramp) / tau).exp(), 1.));
                 near(voltage, expected, 8e-5);
                 near(current, -voltage, 1e-8);
             }

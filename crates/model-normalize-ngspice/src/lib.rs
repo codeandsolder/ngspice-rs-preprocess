@@ -15,6 +15,7 @@ pub fn statement_token_spans(text: &str) -> anyhow::Result<Vec<std::ops::Range<u
 pub mod linked_source;
 pub mod ltspice;
 pub mod model_card;
+pub mod native_scalar;
 pub mod param_expression;
 pub mod parameter_scope;
 pub mod passive_ic;

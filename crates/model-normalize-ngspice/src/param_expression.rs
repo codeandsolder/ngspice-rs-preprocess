@@ -5,9 +5,9 @@
 //! functions avoid silently substituting deterministic model parameters.
 
 use crate::model_card::parse_spice_constant;
+use crate::native_scalar::{BinaryOp, ConditionalChain, Function, UnaryOp};
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
-use std::cmp::Ordering;
 mod rational;
 pub(crate) use rational::coefficients as rational_coefficients;
 
@@ -33,17 +33,63 @@ enum Dialect {
     Ltspice,
 }
 
-impl Dialect {
-    fn precedence(self, op: &str) -> Option<u8> {
-        match op {
-            "||" | "&&" | "^" if matches!(self, Self::Ltspice) => Some(2),
-            "||" => Some(2),
-            "&&" => Some(3),
-            "==" | "!=" | "<=" | ">=" | "<" | ">" => Some(4),
-            "+" | "-" => Some(5),
-            "*" | "/" | "%" | "\\" => Some(6),
-            "**" => Some(8),
-            _ => None,
+/// Source operators reuse the native spelling type for shared syntax, not
+/// its evaluation or associativity. `LTspice`'s caret denotes XOR, not power.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceBinaryOp {
+    Shared(BinaryOp),
+    Xor,
+}
+
+impl SourceBinaryOp {
+    fn from_symbol(symbol: &str) -> Option<Self> {
+        if symbol == "^" {
+            Some(Self::Xor)
+        } else {
+            BinaryOp::from_symbol(symbol).map(Self::Shared)
+        }
+    }
+
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::Xor | Self::Shared(BinaryOp::And | BinaryOp::Or) => 2,
+            Self::Shared(op) => op.precedence(),
+        }
+    }
+}
+
+/// A parsed binary operator with its syntax domain attached.
+#[derive(Clone, Copy)]
+enum ParsedBinaryOp {
+    Native(BinaryOp),
+    Source(SourceBinaryOp),
+}
+
+impl ParsedBinaryOp {
+    fn from_symbol(dialect: Dialect, symbol: &str) -> Option<Self> {
+        match dialect {
+            Dialect::Native => BinaryOp::from_symbol(symbol).map(Self::Native),
+            Dialect::Ltspice => SourceBinaryOp::from_symbol(symbol).map(Self::Source),
+        }
+    }
+
+    const fn binding(self) -> (u8, u8) {
+        let left = match self {
+            Self::Native(op) => op.precedence(),
+            Self::Source(op) => op.precedence(),
+        };
+        let right = if matches!(self, Self::Source(SourceBinaryOp::Shared(BinaryOp::Pow))) {
+            left
+        } else {
+            left + 1
+        };
+        (left, right)
+    }
+
+    const fn expression(self, lhs: Box<Expr>, rhs: Box<Expr>) -> Expr {
+        match self {
+            Self::Native(op) => Expr::Binary(op, lhs, rhs),
+            Self::Source(op) => Expr::SourceBinary(op, lhs, rhs),
         }
     }
 }
@@ -181,6 +227,7 @@ fn single_token(
         b'!' => Token::Op("!"),
         b'<' => Token::Op("<"),
         b'>' => Token::Op(">"),
+        b'=' if dialect == Dialect::Native => Token::Op("="),
         _ => bail!(
             "unsupported ngspice expression character {:?}",
             char::from(byte)
@@ -297,8 +344,9 @@ enum Expr {
     SourceAtom(String),
     ParameterGroup(Box<Self>),
     Symbol(String),
-    Unary(&'static str, Box<Self>),
-    Binary(&'static str, Box<Self>, Box<Self>),
+    Unary(UnaryOp, Box<Self>),
+    Binary(BinaryOp, Box<Self>, Box<Self>),
+    SourceBinary(SourceBinaryOp, Box<Self>, Box<Self>),
     Conditional(Box<Self>, Box<Self>, Box<Self>),
     Call(String, Vec<Self>),
 }
@@ -360,7 +408,7 @@ impl Parser<'_> {
         self.node(Expr::Call(name, args), height + 1)
     }
 
-    fn prefix(&mut self) -> Result<Parsed> {
+    fn prefix(&mut self, minimum: u8) -> Result<Parsed> {
         match self.take() {
             Token::Value(value) => self.node(Expr::Number(value), 1),
             Token::SourceAtom(value) => self.node(Expr::SourceAtom(value), 1),
@@ -371,11 +419,16 @@ impl Parser<'_> {
                     self.node(Expr::Symbol(name), 1)
                 }
             }
-            Token::Op(op @ ("+" | "-" | "!")) => {
-                let binding = if self.dialect == Dialect::Ltspice {
-                    9
-                } else {
-                    8
+            Token::Op(symbol @ ("+" | "-" | "!")) => {
+                let op = UnaryOp::from_symbol(symbol).context("invalid prefix operator")?;
+                // Leading native signs bind below products, while signs
+                // following an operator bind atomically. Source signs always
+                // bind above power; source NOT is lowered rather than evaluated.
+                let binding = match (self.dialect, op, minimum) {
+                    (Dialect::Native, UnaryOp::Plus | UnaryOp::Minus, 0) => {
+                        BinaryOp::Add.precedence() + 1
+                    }
+                    _ => BinaryOp::Pow.precedence() + 1,
                 };
                 let child = self.expression(binding)?;
                 self.node(Expr::Unary(op, Box::new(child.expr)), child.height + 1)
@@ -396,13 +449,16 @@ impl Parser<'_> {
 
     fn expression(&mut self, minimum: u8) -> Result<Parsed> {
         let _depth = self.budget.enter()?;
-        let mut left = self.prefix()?;
+        let mut left = self.prefix(minimum)?;
         loop {
             if *self.peek() == Token::Question {
                 if minimum > 1 {
                     break;
                 }
                 self.take();
+                if self.dialect == Dialect::Native {
+                    return self.conditional(left);
+                }
                 let then_branch = self.expression(0)?;
                 self.expect(&Token::Colon)?;
                 let else_branch = self.expression(1)?;
@@ -417,29 +473,61 @@ impl Parser<'_> {
                 )?;
                 continue;
             }
-            let Token::Op(op) = self.peek() else { break };
-            let Some(precedence) = self.dialect.precedence(op) else {
+            let Token::Op(symbol) = self.peek() else {
                 break;
             };
+            let Some(op) = ParsedBinaryOp::from_symbol(self.dialect, symbol) else {
+                break;
+            };
+            let (precedence, right_binding) = op.binding();
             if precedence < minimum {
                 break;
             }
-            let Token::Op(op) = self.take() else {
-                unreachable!()
-            };
-            let right_binding = if self.dialect == Dialect::Ltspice && op == "**" {
-                precedence
-            } else {
-                precedence + 1
-            };
+            self.take();
             let right = self.expression(right_binding)?;
             let height = left.height.max(right.height) + 1;
             left = self.node(
-                Expr::Binary(op, Box::new(left.expr), Box::new(right.expr)),
+                op.expression(Box::new(left.expr), Box::new(right.expr)),
                 height,
             )?;
         }
         Ok(left)
+    }
+    fn conditional(&mut self, condition: Parsed) -> Result<Parsed> {
+        let mut chain = ConditionalChain::new(condition, ());
+        loop {
+            let operand = self.expression(2)?;
+            match self.peek() {
+                Token::Question => {
+                    self.take();
+                    chain.question(operand, ());
+                }
+                Token::Colon => {
+                    self.take();
+                    chain
+                        .colon(operand)
+                        .map_err(|_| anyhow::anyhow!("unmatched ':'"))?;
+                }
+                _ => {
+                    return chain.finish(
+                        operand,
+                        |_| anyhow::anyhow!("unmatched '?'"),
+                        |condition, positive, negative, ()| {
+                            let height =
+                                condition.height.max(positive.height).max(negative.height) + 1;
+                            self.node(
+                                Expr::Conditional(
+                                    Box::new(condition.expr),
+                                    Box::new(positive.expr),
+                                    Box::new(negative.expr),
+                                ),
+                                height,
+                            )
+                        },
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -566,43 +654,44 @@ impl Expr {
                 out.push('}');
             }
             Self::Unary(op, child) => {
-                if *op == "!" {
+                if *op == UnaryOp::Not {
                     out.push_str("inv(");
                 } else {
-                    write!(out, "({op}")?;
+                    write!(out, "({}", op.symbol())?;
                 }
                 child.render_ltspice(out, budget)?;
                 out.push(')');
             }
-            Self::Binary(op, lhs, rhs) => {
-                match *op {
-                    "**" | "^" | "%" => {
-                        let function = match *op {
-                            "**" => "pow",
-                            "^" => "xor",
-                            _ => "mod",
+            Self::SourceBinary(op, lhs, rhs) => {
+                match op {
+                    SourceBinaryOp::Xor | SourceBinaryOp::Shared(BinaryOp::Pow | BinaryOp::Rem) => {
+                        let function = match op {
+                            SourceBinaryOp::Shared(BinaryOp::Pow) => "pow",
+                            SourceBinaryOp::Xor => "xor",
+                            SourceBinaryOp::Shared(_) => "mod",
                         };
                         write!(out, "{function}(")?;
                         lhs.render_ltspice(out, budget)?;
                         out.push(',');
                         rhs.render_ltspice(out, budget)?;
                     }
-                    "&&" | "||" => {
+                    SourceBinaryOp::Shared(op @ (BinaryOp::And | BinaryOp::Or)) => {
                         out.push_str("((");
                         lhs.render_ltspice(out, budget)?;
-                        write!(out, ">0.5){op}(")?;
+                        write!(out, ">0.5){}(", op.symbol())?;
                         rhs.render_ltspice(out, budget)?;
                         out.push_str(">0.5)");
                     }
-                    _ => {
+                    SourceBinaryOp::Shared(op) => {
                         out.push('(');
                         lhs.render_ltspice(out, budget)?;
-                        out.push_str(op);
+                        out.push_str(op.symbol());
                         rhs.render_ltspice(out, budget)?;
                     }
                 }
                 out.push(')');
             }
+            Self::Binary(_, _, _) => bail!("native expression cannot be lowered as LTspice source"),
             Self::Conditional(condition, yes, no) => {
                 out.push_str("if(");
                 condition.render_ltspice(out, budget)?;
@@ -629,9 +718,6 @@ impl Expr {
 
 fn truthy(value: f64) -> bool {
     value != 0.0
-}
-const fn bool_value(value: bool) -> f64 {
-    if value { 1.0 } else { 0.0 }
 }
 fn finite(value: f64) -> Result<f64> {
     ensure!(value.is_finite(), "non-finite ngspice expression result");
@@ -679,21 +765,13 @@ impl Expr {
         budget.charge(Resource::EvaluationSteps, 1)?;
         let value = match self {
             Self::Number(value) => *value,
-            Self::SourceAtom(_) | Self::ParameterGroup(_) => {
+            Self::SourceAtom(_) | Self::ParameterGroup(_) | Self::SourceBinary(_, _, _) => {
                 bail!("source-only expression cannot be evaluated as native numparam")
             }
             Self::Symbol(name) => resolve
                 .symbol(name)
                 .with_context(|| format!("resolving parameter {name}"))?,
-            Self::Unary(op, arg) => {
-                let arg = arg.evaluate(resolve, budget)?;
-                match *op {
-                    "+" => arg,
-                    "-" => -arg,
-                    "!" => bool_value(!truthy(arg)),
-                    _ => unreachable!(),
-                }
-            }
+            Self::Unary(op, arg) => op.evaluate(arg.evaluate(resolve, budget)?),
             Self::Conditional(condition, positive, negative) => {
                 let selected = if truthy(condition.evaluate(resolve, budget)?) {
                     positive
@@ -704,29 +782,10 @@ impl Expr {
             }
             Self::Binary(op, lhs, rhs) => {
                 let l = lhs.evaluate(resolve, budget)?;
-                match *op {
-                    "&&" if !truthy(l) => return Ok(0.0),
-                    "||" if truthy(l) => return Ok(1.0),
-                    _ => {}
+                if let Some(value) = op.short_circuit(l) {
+                    return Ok(value);
                 }
-                let r = rhs.evaluate(resolve, budget)?;
-                match *op {
-                    "+" => l + r,
-                    "-" => l - r,
-                    "*" => l * r,
-                    "/" => l / r,
-                    "%" => l % r,
-                    "\\" => (l / r).trunc(),
-                    "**" => l.powf(r),
-                    "==" => bool_value(l.partial_cmp(&r) == Some(Ordering::Equal)),
-                    "!=" => bool_value(l.partial_cmp(&r) != Some(Ordering::Equal)),
-                    ">" => bool_value(l > r),
-                    "<" => bool_value(l < r),
-                    ">=" => bool_value(l >= r),
-                    "<=" => bool_value(l <= r),
-                    "&&" | "||" => bool_value(truthy(r)),
-                    _ => unreachable!(),
-                }
+                op.evaluate(l, rhs.evaluate(resolve, budget)?)
             }
             Self::Call(name, args) => {
                 if name == "ternary_fcn" {
@@ -738,12 +797,14 @@ impl Expr {
                     };
                     return branch.evaluate(resolve, budget);
                 }
-                if let Some(builtin) = built_in(name) {
+                if let Some(builtin) = Function::from_name(name) {
                     let values = args
                         .iter()
                         .map(|arg| arg.evaluate(resolve, budget))
                         .collect::<Result<Vec<_>>>()?;
-                    builtin.evaluate(name, &values)?
+                    builtin
+                        .evaluate(&values)
+                        .with_context(|| format!("{name} expects {} arguments", builtin.arity()))?
                 } else {
                     let source_args = args
                         .iter()
@@ -756,74 +817,6 @@ impl Expr {
         };
         finite(value)
     }
-}
-
-#[derive(Clone, Copy)]
-enum BuiltinFunction {
-    Unary(fn(f64) -> f64),
-    Binary(fn(f64, f64) -> f64),
-}
-impl BuiltinFunction {
-    fn evaluate(self, name: &str, args: &[f64]) -> Result<f64> {
-        match self {
-            Self::Unary(f) => {
-                ensure!(args.len() == 1, "{name} expects one argument");
-                finite(f(args[0]))
-            }
-            Self::Binary(f) => {
-                ensure!(args.len() == 2, "{name} expects two arguments");
-                finite(f(args[0], args[1]))
-            }
-        }
-    }
-}
-fn pwr(base: f64, power: f64) -> f64 {
-    base.abs().powf(power)
-}
-fn sgn(value: f64) -> f64 {
-    if value.partial_cmp(&0.0) == Some(Ordering::Equal) {
-        0.0
-    } else {
-        value.signum()
-    }
-}
-fn built_in(name: &str) -> Option<BuiltinFunction> {
-    let unary: Option<fn(f64) -> f64> = match name {
-        "sqrt" => Some(f64::sqrt),
-        "sin" => Some(f64::sin),
-        "cos" => Some(f64::cos),
-        "tan" => Some(f64::tan),
-        "sinh" => Some(f64::sinh),
-        "cosh" => Some(f64::cosh),
-        "tanh" => Some(f64::tanh),
-        "asin" => Some(f64::asin),
-        "acos" => Some(f64::acos),
-        "atan" | "arctan" => Some(f64::atan),
-        "asinh" => Some(f64::asinh),
-        "acosh" => Some(f64::acosh),
-        "atanh" => Some(f64::atanh),
-        "exp" => Some(f64::exp),
-        "ln" | "log" => Some(f64::ln),
-        "log10" => Some(f64::log10),
-        "abs" => Some(f64::abs),
-        "nint" => Some(f64::round_ties_even),
-        "int" => Some(f64::trunc),
-        "floor" => Some(f64::floor),
-        "ceil" => Some(f64::ceil),
-        "sgn" => Some(sgn),
-        _ => None,
-    };
-    if let Some(f) = unary {
-        return Some(BuiltinFunction::Unary(f));
-    }
-    let binary: Option<fn(f64, f64) -> f64> = match name {
-        "min" => Some(f64::min),
-        "max" => Some(f64::max),
-        "pow" => Some(f64::powf),
-        "pwr" => Some(pwr),
-        _ => None,
-    };
-    binary.map(BuiltinFunction::Binary)
 }
 
 #[cfg(test)]
@@ -877,6 +870,22 @@ mod tests {
             ("{2**3^2}", 64.0),
             ("-2^2", -4.0),
             ("2^-2", 0.25),
+            ("(-2)^3", 8.0),
+            ("pow(-2,3)", -8.0),
+            ("0^0", 1.0),
+            ("2==3<1", 1.0),
+            ("1=1", 1.0),
+            ("!2^0", 1.0),
+            ("-2*3^2", -18.0),
+            ("2*-3^2", 18.0),
+            ("1?0?3:4:5", 3.0),
+            ("1?(0?3:4):5", 4.0),
+            ("0?3:1?4:5", 4.0),
+            ("0?3:0?4:5", 5.0),
+            ("1?3:missing?missing:missing", 3.0),
+            ("sqr(4)", 16.0),
+            ("(-8)%3", -2.0),
+            ("(-8)\\3", 2.0),
             ("{2 * 3 + 4}", 10.0),
             ("{a>b ? 7 : min(a,b)}", 3.0),
             ("{(a<b) ? 3 : 1/0}", 3.0),
@@ -894,6 +903,95 @@ mod tests {
             ensure!(
                 (actual - expected).abs() <= expected.abs().max(1e-14) * 1e-12,
                 "{input}: actual {actual:e} expected {expected:e}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_and_ltspice_operator_domains_remain_distinct() -> Result<()> {
+        let budget = WorkBudget::default();
+        for (input, lowered) in [
+            ("2**3**2", "pow(2,pow(3,2))"),
+            ("2^3", "xor(2,3)"),
+            ("-2**2", "pow((-2),2)"),
+            ("1?0?3:4:5", "if(1,if(0,3,4),5)"),
+            ("1||0&&0", "((((1>0.5)||(0>0.5))>0.5)&&(0>0.5))"),
+        ] {
+            let actual = lower_ltspice(input, false, &budget)?;
+            ensure!(actual == lowered, "{input}: {actual} != {lowered}");
+        }
+        ensure!(evaluate("2^3^2")?.to_bits() == 64_f64.to_bits());
+        ensure!(evaluate("1?0?3:4:5")?.to_bits() == 3_f64.to_bits());
+        ensure!(evaluate("1||0&&0")?.to_bits() == 1_f64.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn native_scalar_semantics_match_ngspice() -> Result<()> {
+        use std::fmt::Write as _;
+        use std::process::Command;
+
+        let cases = [
+            "(-2)^3",
+            "pow(-2,3)",
+            "0^0",
+            "2==3<1",
+            "1=1",
+            "!2^0",
+            "-2*3^2",
+            "2*-3^2",
+            "1?0?3:4:5",
+            "1?(0?3:4):5",
+            "0?3:1?4:5",
+            "0?3:0?4:5",
+            "sqr(4)",
+            "(-8)%3",
+            "(-8)\\3",
+            "nint(2.5)",
+            "nint(3.5)",
+            "floor(-1.2)",
+            "ceil(-1.2)",
+            "pwr(-2,3)",
+            "log(2)",
+        ];
+        let directory = tempfile::tempdir()?;
+        let circuit = directory.path().join("native-scalar.cir");
+        let mut deck = String::from("Native scalar comparison\n");
+        for (index, expression) in cases.iter().enumerate() {
+            writeln!(deck, "V{index} scalar_{index} 0 {{{expression}}}")?;
+        }
+        deck.push_str(".control\nset numdgt=16\nop\n");
+        for index in 0..cases.len() {
+            writeln!(deck, "print v(scalar_{index})")?;
+        }
+        deck.push_str("quit\n.endc\n.end\n");
+        std::fs::write(&circuit, deck)?;
+        let execution = Command::new("ngspice")
+            .args(["-n", "-b"])
+            .arg(&circuit)
+            .current_dir(directory.path())
+            .output()?;
+        ensure!(
+            execution.status.success(),
+            "ngspice failed: {}",
+            String::from_utf8_lossy(&execution.stderr)
+        );
+        let output = String::from_utf8(execution.stdout)?;
+        for (index, expression) in cases.iter().enumerate() {
+            let label = format!("v(scalar_{index})");
+            let expected: f64 = output
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .find(|(name, _)| name.trim() == label)
+                .with_context(|| format!("missing {label} in {output}"))?
+                .1
+                .trim()
+                .parse()?;
+            let actual = evaluate(expression)?;
+            ensure!(
+                (actual - expected).abs() <= expected.abs().max(1.0) * 1e-12,
+                "{expression}: actual {actual:e}, ngspice {expected:e}"
             );
         }
         Ok(())
