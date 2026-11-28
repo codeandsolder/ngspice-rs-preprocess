@@ -345,3 +345,6 @@ impl Kernel for DiodeKernel {
         Ok(())
     }
 }
+
+/// Conservative LTspice semiconductor diode artifact.
+pub mod ltspice;

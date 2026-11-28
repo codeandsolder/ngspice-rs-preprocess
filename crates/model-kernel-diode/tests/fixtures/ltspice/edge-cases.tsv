@@ -1,0 +1,35 @@
+default||
+is0|is=0.0|
+isneg|is=-1e-12|
+n0|n=0.0|
+nneg|n=-1.0|
+rneg|rs=-2.0|
+rs0|rs=0.0|
+vj0|cjo=1e-09 vj=0.0|
+vjneg|cjo=1e-09 vj=-1.0|
+mneg|cjo=1e-09 m=-0.5|
+fc0|cjo=1e-09 fc=0.0|
+fcneg|cjo=1e-09 fc=-0.5|
+fc1|cjo=1e-09 fc=1.0|
+fcabove|cjo=1e-09 fc=2.0|
+cneg|cjo=-1e-09|
+ttneg|tt=-1e-06|
+ikf0|ikf=0.0|
+ikfneg|ikf=-1.0|
+isrneg|isr=-1e-12|
+nr0|isr=1e-12 nr=0.0|
+bv0|bv=0.0|
+bvneg|bv=-2.0|
+ibvneg|bv=2.0 ibv=-0.001|
+area_neg||area=-2.0
+area0||area=0.0
+m0||m=0.0
+mneginst||m=-2.0
+n0inst||n=0.0
+nneginst||n=-2.0
+nfrac||n=0.5
+perim_neg|isw=1e-12 cjsw=1e-09 perim=-2.0|
+side_c_rs|cjsw=1e-09 perim=2.0 rsw=4.0|
+side_is0|isw=0.0 cjsw=1e-09 perim=2.0|
+side_isneg|isw=-1e-12 cjsw=1e-09 perim=2.0|
+side_rsneg|isw=1e-12 cjsw=1e-09 perim=2.0 rsw=-4.0|
