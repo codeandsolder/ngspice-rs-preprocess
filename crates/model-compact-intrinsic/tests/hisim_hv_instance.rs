@@ -352,16 +352,16 @@ fn effective_channel_geometry_uses_upstream_mks_length_and_width_corrections()
         let e = instance.effective_geometry();
         let lg = b.gate_length_m;
         let wg = b.gate_width_per_finger_m;
-        let lg_cm = lg * 100.0;
-        let wg_cm = wg * 100.0;
-        let area_cm2 = lg_cm * wg_cm;
+        let lg_um = lg * 1e6;
+        let wg_um = wg * 1e6;
+        let area_um2 = lg_um * wg_um;
         let length_correction = (2e-10 / 100.0) / lg;
         let width_correction = (1e-10 / 100.0) / wg;
         let expected_length = lg - (0.2e-6 + length_correction + 0.4e-6 + length_correction);
         let expected_width = 2.0f64.mul_add(-(0.3e-6 + width_correction), wg);
         let expected_cv_width = 2.0f64.mul_add(-(0.5e-6 + width_correction), wg);
-        let expected_lgatesm = lg + 1e-10 / area_cm2;
-        let expected_wsti = 0.2 * (1.0 + 1e-3 / (expected_lgatesm * 100.0)) * (1.0 + 2e-3 / wg_cm);
+        let expected_lgatesm = lg + 1e-10 / area_um2;
+        let expected_wsti = 0.2 * (1.0 + 1e-3 / (expected_lgatesm * 1e6)) * (1.0 + 2e-3 / wg_um);
         for (actual, expected) in [
             (e.channel_length_m, expected_length),
             (e.channel_width_per_finger_m, expected_width),
@@ -373,9 +373,9 @@ fn effective_channel_geometry_uses_upstream_mks_length_and_width_corrections()
             (e.channel_width_total_m, expected_width * 3.0),
             (e.capacitance_width_total_m, expected_cv_width * 3.0),
             (e.small_device_gate_length_m, expected_lgatesm),
-            (e.small_device_threshold_correction_v, 1e-8 / area_cm2),
+            (e.small_device_threshold_correction_v, 1e-8 / area_um2),
             (e.width_sti, expected_wsti),
-            (e.channel_length_modulation_factor, lg_cm.mul_add(0.3, 1.0)),
+            (e.channel_length_modulation_factor, lg_um.mul_add(0.3, 1.0)),
         ] {
             assert!(
                 (actual - expected).abs() < 1e-12 * expected.abs().max(1e-30),

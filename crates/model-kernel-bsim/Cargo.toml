@@ -6,7 +6,7 @@ rust-version.workspace = true
 license = "MIT AND BSD-3-Clause"
 repository.workspace = true
 publish.workspace = true
-description = "Prepared Berkeley bulk BSIM generalized residual and charge kernels"
+description = "Prepared Berkeley bulk and SOI BSIM generalized residual and charge kernels"
 
 [lints]
 workspace = true

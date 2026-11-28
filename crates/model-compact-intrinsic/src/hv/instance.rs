@@ -35,6 +35,7 @@ pub struct HiSimHvBinningGeometry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedHiSimHvInstance {
     parameters: BoundParameters,
+    original_given: Box<[bool]>,
     geometry: HiSimHvBinningGeometry,
     effective_geometry: HiSimHvEffectiveGeometry,
     transport_geometry: HiSimHvTransportGeometry,
@@ -65,6 +66,15 @@ impl PreparedHiSimHvInstance {
     #[must_use = "the returned buffer supplies the prepared instance values"]
     pub const fn parameters(&self) -> &BoundParameters {
         &self.parameters
+    }
+
+    /// Whether the original instance card supplied this canonical slot.
+    #[must_use]
+    pub fn explicitly_given(&self, slot: u16) -> bool {
+        self.original_given
+            .get(usize::from(slot))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Source-bin geometry, independent of the model's later temperature laws.
@@ -469,7 +479,9 @@ pub fn prepare_hisim_hv_instance(
             variant: raw.variant(),
             scope: ParameterScope::Instance,
             values,
+            bsim_soi_ic: [None; 5],
         },
+        original_given: raw.values.iter().map(Option::is_some).collect(),
         geometry,
         effective_geometry,
         transport_geometry,

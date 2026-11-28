@@ -4,11 +4,33 @@
 //! constitutive routines. Binding alone is not proof of complete device support.
 //! Solver-ready residual/charge artifacts are provided by separate kernel crates.
 
+mod bsim_soi;
 mod catalog;
 mod defaults;
+mod differential;
 mod hv;
 mod legacy_bsim;
 
+pub use bsim_soi::{
+    BsimSoiBodyMode, BsimSoiChannelBias, BsimSoiChannelPoint, BsimSoiChannelScalar,
+    BsimSoiCollectorCurrent, BsimSoiDrainChannelPoint, BsimSoiElectrostaticBase,
+    BsimSoiElectrostaticPoint, BsimSoiExternalSeries, BsimSoiExtrinsicChargeBias,
+    BsimSoiExtrinsicCharges, BsimSoiGateBias, BsimSoiGateCurrents, BsimSoiGateInducedLeakage,
+    BsimSoiGeometry, BsimSoiHeatPoint, BsimSoiImpactBias, BsimSoiImpactBranch,
+    BsimSoiImpactIonization, BsimSoiInstanceInput, BsimSoiInternalResistance,
+    BsimSoiIntrinsicCharges, BsimSoiJunctionCharge, BsimSoiJunctionCharges, BsimSoiJunctionCurrent,
+    BsimSoiJunctionDensities, BsimSoiJunctionPoint, BsimSoiJunctionSide, BsimSoiJunctionStorage,
+    BsimSoiNeutralBody, BsimSoiNode, BsimSoiNoiseBias, BsimSoiNoisePoint, BsimSoiParasiticPoint,
+    BsimSoiSeriesBias, BsimSoiSeriesConductance, BsimSoiSeriesParameters, BsimSoiStressOffsets,
+    BsimSoiTemperaturePoint, BsimSoiThermalNetwork, BsimSoiThermalScalar, BsimSoiTopology,
+    BsimSoiTransportPoint, PreparedBsimSoiChannel, PreparedBsimSoiDrainChannel,
+    PreparedBsimSoiElectrostatics, PreparedBsimSoiExtrinsicCharges,
+    PreparedBsimSoiGateInducedLeakage, PreparedBsimSoiGateTunneling,
+    PreparedBsimSoiImpactIonization, PreparedBsimSoiInstance, PreparedBsimSoiIntrinsicCharges,
+    PreparedBsimSoiJunctions, PreparedBsimSoiNoise, PreparedBsimSoiParasitics,
+    PreparedBsimSoiSetup, PreparedBsimSoiSize, PreparedBsimSoiTemperature,
+    PreparedBsimSoiTransport, prepare_bsim_soi_setup,
+};
 pub use defaults::{MosPolarity, PreparedBsimSoiModel, prepare_bsim_soi_model};
 pub use legacy_bsim::{
     BSIM1_REFERENCE_THERMAL_VOLTAGE, Bsim1Coefficients, Bsim2Coefficients, LegacyBsimBias,
@@ -19,18 +41,42 @@ pub use legacy_bsim::{
 };
 
 pub use hv::{
-    HiSimHvBinningGeometry, HiSimHvDepletionTransport, HiSimHvDrainBias, HiSimHvDrainCurrent,
+    HiSimHvAccessCorrectionPoint, HiSimHvAccessInputs, HiSimHvAccumulationInputs,
+    HiSimHvAccumulationPoint, HiSimHvBiasConditioningInputs, HiSimHvBiasConditioningPoint,
+    HiSimHvBinningGeometry, HiSimHvChannelChargeInputs, HiSimHvChannelChargePoint,
+    HiSimHvChannelCorrectionPoint, HiSimHvChannelElectrostaticPoint,
+    HiSimHvChannelMobilityCoefficients, HiSimHvChannelMobilityInputs, HiSimHvChannelMobilityPoint,
+    HiSimHvChannelModulationInputs, HiSimHvChannelModulationPoint, HiSimHvChannelRegion,
+    HiSimHvChannelTerminalCharges, HiSimHvDepletionMaterialPoint, HiSimHvDepletionTransport,
+    HiSimHvDrainBias, HiSimHvDrainCurrent, HiSimHvDrainSmoothingInputs, HiSimHvDrainSmoothingPoint,
     HiSimHvEdgeTunnelingCurrent, HiSimHvEdgeTunnelingCurrents, HiSimHvEffectiveGeometry,
-    HiSimHvElectricalGradient, HiSimHvFringingCharges, HiSimHvGeneratedHeat, HiSimHvJunctionBias,
-    HiSimHvJunctionCharge, HiSimHvJunctionCharges, HiSimHvJunctionCurrent, HiSimHvJunctionCurrents,
-    HiSimHvLateralFieldCharge, HiSimHvThermalBranch, HiSimHvThermalJacobianRow,
-    HiSimHvTransportGeometry, PreparedHiSimHvEdgeTunneling, PreparedHiSimHvFringing,
-    PreparedHiSimHvInstance, PreparedHiSimHvJunctionCharges, PreparedHiSimHvJunctionDiodes,
-    PreparedHiSimHvLateralFieldCharge, PreparedHiSimHvModel, PreparedHiSimHvTemperature,
-    PreparedHiSimHvTransport, evaluate_hisim_hv_generated_heat, prepare_hisim_hv_edge_tunneling,
-    prepare_hisim_hv_fringing, prepare_hisim_hv_instance, prepare_hisim_hv_junction_charges,
-    prepare_hisim_hv_junction_diodes, prepare_hisim_hv_lateral_field_charge,
-    prepare_hisim_hv_model, prepare_hisim_hv_temperature, prepare_hisim_hv_transport,
+    HiSimHvElectricalGradient, HiSimHvElectrostaticMaterialPoint, HiSimHvExternalBias,
+    HiSimHvFringingCharges, HiSimHvGateChannelState, HiSimHvGateTunnelingCurrents,
+    HiSimHvGeneratedHeat, HiSimHvGidlCurrents, HiSimHvImpactPoint, HiSimHvImpactScalar,
+    HiSimHvIntrinsicBias, HiSimHvIntrinsicScalar, HiSimHvJunctionBias, HiSimHvJunctionCharge,
+    HiSimHvJunctionCharges, HiSimHvJunctionCurrent, HiSimHvJunctionCurrents,
+    HiSimHvLateralFieldCharge, HiSimHvNormalChannelPoint, HiSimHvNormalChannelWithAccessPoint,
+    HiSimHvNormalChannelWithImpactPoint, HiSimHvPolyDepletionPoint, HiSimHvQuantumOxidePoint,
+    HiSimHvSurfaceInputs, HiSimHvSurfacePoint, HiSimHvThermalBranch, HiSimHvThermalJacobianRow,
+    HiSimHvThresholdPoint, HiSimHvTransportGeometry, PreparedHiSimHvAccessCorrection,
+    PreparedHiSimHvChannelChargeArea, PreparedHiSimHvChannelElectrostatics,
+    PreparedHiSimHvChannelModulation, PreparedHiSimHvEdgeTunneling,
+    PreparedHiSimHvElectrostaticMaterial, PreparedHiSimHvFringing, PreparedHiSimHvGateTunneling,
+    PreparedHiSimHvGidl, PreparedHiSimHvInstance, PreparedHiSimHvJunctionCharges,
+    PreparedHiSimHvJunctionDiodes, PreparedHiSimHvLateralFieldCharge, PreparedHiSimHvModel,
+    PreparedHiSimHvNormalChannel, PreparedHiSimHvPolyDepletion, PreparedHiSimHvQuantumOxide,
+    PreparedHiSimHvTemperature, PreparedHiSimHvThreshold, PreparedHiSimHvTransport,
+    evaluate_hisim_hv_accumulation, evaluate_hisim_hv_bias_conditioning,
+    evaluate_hisim_hv_channel_charge, evaluate_hisim_hv_drain_smoothing,
+    evaluate_hisim_hv_generated_heat, evaluate_hisim_hv_surface,
+    prepare_hisim_hv_access_correction, prepare_hisim_hv_channel_electrostatics,
+    prepare_hisim_hv_channel_modulation, prepare_hisim_hv_edge_tunneling,
+    prepare_hisim_hv_electrostatic_material, prepare_hisim_hv_fringing,
+    prepare_hisim_hv_gate_tunneling, prepare_hisim_hv_gidl, prepare_hisim_hv_instance,
+    prepare_hisim_hv_junction_charges, prepare_hisim_hv_junction_diodes,
+    prepare_hisim_hv_lateral_field_charge, prepare_hisim_hv_model, prepare_hisim_hv_normal_channel,
+    prepare_hisim_hv_poly_depletion, prepare_hisim_hv_quantum_oxide, prepare_hisim_hv_temperature,
+    prepare_hisim_hv_threshold, prepare_hisim_hv_transport,
 };
 
 /// Exact ngspice model implementation selected by the SPICE model level/version.
@@ -132,7 +178,7 @@ pub enum ModelError {
     InvalidPhysicalParameter(&'static str),
     /// A caller supplied an ignored/unsupported version-specific instance input.
     UnsupportedInstanceParameter(&'static str),
-    /// Initial condition vector must contain 1-3 finite VDS/VGS/VBS values.
+    /// Initial condition vector length is invalid for the selected source family.
     InvalidInitialConditions(usize),
     /// A size-binned parameter became non-finite during C-source arithmetic.
     InvalidBinningParameter(u16),
@@ -159,10 +205,9 @@ impl std::fmt::Display for ModelError {
                 f,
                 "model preparation requires a supported family and model parameter block"
             ),
-            Self::MismatchedPreparedContext => write!(
-                f,
-                "incompatible prepared HiSIM-HV model, instance, or thermal state"
-            ),
+            Self::MismatchedPreparedContext => {
+                write!(f, "incompatible prepared model, instance, or thermal state")
+            }
             Self::ConflictingPolarity => write!(f, "both NMOS and PMOS flags were set"),
             Self::InvalidNominalTemperature => {
                 write!(f, "invalid nominal model/circuit temperature")
@@ -181,10 +226,10 @@ impl std::fmt::Display for ModelError {
                 write!(f, "unsupported instance input '{name}'")
             }
             Self::InvalidInitialConditions(length) => {
-                write!(f, "invalid HiSIM-HV IC vector length {length}")
+                write!(f, "invalid IC vector length {length}")
             }
             Self::InvalidBinningParameter(slot) => {
-                write!(f, "non-finite HiSIM-HV binned model parameter slot {slot}")
+                write!(f, "non-finite binned model parameter slot {slot}")
             }
             Self::CorruptSourceCatalog(problem) => write!(f, "invalid source catalog: {problem}"),
         }
@@ -275,6 +320,8 @@ pub struct BoundParameters {
     variant: ModelVariant,
     scope: ParameterScope,
     values: Box<[Option<ParameterValue>]>,
+    // B4SOIparam writes only the final component of each IC vector.
+    bsim_soi_ic: [Option<f64>; 5],
 }
 
 impl BoundParameters {
@@ -296,27 +343,50 @@ impl BoundParameters {
             .map(|entry| usize::from(entry.slot))
             .max()
             .map_or(0, |max| max + 1);
-        let mut values = vec![None; slots].into_boxed_slice();
-        for (name, value) in inputs {
-            let entry = variant
-                .parameter(scope, name)
-                .ok_or_else(|| ModelError::UnknownParameter(name.to_owned()))?;
-            if value.kind() != entry.kind {
-                return Err(ModelError::WrongType {
-                    name: name.to_owned(),
-                    expected: entry.kind,
-                });
-            }
-            if !value.finite() {
-                return Err(ModelError::NonFinite(name.to_owned()));
-            }
-            values[usize::from(entry.slot)] = Some(value);
-        }
-        Ok(Self {
+        let mut bound = Self {
             variant,
             scope,
-            values,
-        })
+            values: vec![None; slots].into_boxed_slice(),
+            bsim_soi_ic: [None; 5],
+        };
+        for (name, value) in inputs {
+            bound.assign(name, value)?;
+        }
+        Ok(bound)
+    }
+
+    /// Apply one more source assignment, preserving prior presence and ordered
+    /// initial-condition setters. This is a preparation-time operation.
+    ///
+    /// # Errors
+    /// Unknown parameter, wrong type, nonfinite value or invalid IC vector.
+    pub fn assign(&mut self, name: &str, value: ParameterValue) -> Result<(), ModelError> {
+        let entry = self
+            .variant
+            .parameter(self.scope, name)
+            .ok_or_else(|| ModelError::UnknownParameter(name.to_owned()))?;
+        if value.kind() != entry.kind {
+            return Err(ModelError::WrongType {
+                name: name.to_owned(),
+                expected: entry.kind,
+            });
+        }
+        if !value.finite() {
+            return Err(ModelError::NonFinite(name.to_owned()));
+        }
+        if self.variant == ModelVariant::BsimSoi
+            && self.scope == ParameterScope::Instance
+            && entry.name == "ic"
+            && let ParameterValue::RealVector(ref vector) = value
+        {
+            let length = vector.len();
+            if !(1..=5).contains(&length) {
+                return Err(ModelError::InvalidInitialConditions(length));
+            }
+            self.bsim_soi_ic[length - 1] = vector.last().copied();
+        }
+        self.values[usize::from(entry.slot)] = Some(value);
+        Ok(())
     }
 
     /// Retrieve a prepared parameter by slot, without names or allocations.
