@@ -151,12 +151,11 @@ impl<'a> Card<'a> {
     }
 
     fn rename(&mut self, source: &[u8], target: &str) -> Result<bool> {
-        if let Some(value) = self.take(source)? {
-            self.push(target, value);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let Some(value) = self.take(source)? else {
+            return Ok(false);
+        };
+        self.push(target, value);
+        Ok(true)
     }
 
     fn reject(&self, key: &[u8]) -> Result<()> {
@@ -310,6 +309,11 @@ fn storage(
         "line {}: LTspice passive IC requires independent bias topology and storage history",
         card.statement.line
     );
+    if inductor {
+        // LTspice diagnoses these capacitor-only setters on L cards.
+        card.reject(b"lser")?;
+        card.reject(b"rlshunt")?;
+    }
     let multiplicity = card.scalar(b"m")?.unwrap_or("1");
     let lser = card.scalar(b"lser")?;
     let cpar = card.scalar(b"cpar")?;
