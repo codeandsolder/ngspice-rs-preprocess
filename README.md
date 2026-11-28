@@ -288,7 +288,7 @@ The CLI publishes the complete artifact directory only after successful
 preparation, using a temporary sibling directory and a rename. The parent
 directory must already exist; the output directory must not exist. A
 versioned `manifest.json` records format, primary filename, artifact byte
-counts, dependencies and provenance. Manifest version 10 records the explicit `power_target` capability and
+counts, dependencies and provenance. Manifest version 11 records the explicit `power_target` capability and
 includes typed PWL resistor declarations as well as
 `required_code_models` for each artifact and the deduplicated union for
 the whole bundle. The Rust API exposes the same requirements through
@@ -305,7 +305,12 @@ boundary, including synthetic elements created during compatibility
 normalization. Generated dialect artifacts retain source identities and
 dependencies, but no invented one-to-one output line mapping. Native
 library callers receive exact source path values; the JSON manifest uses
-their display spellings.
+their display spellings. Directly linked artifacts also retain an admitted
+source graph: each mapped output line identifies its source occurrence and
+electrical lexical scope, including generated lines. The graph records the
+parent include, selected library section, effective dialect and declaration
+line. Specialized HSPICE output currently retains physical spans without a
+linked graph; full cross-dialect occurrence-model binding is tracked in #70.
 
 The combined artifact/intermediate-link byte limit defaults to 128 MiB and
 is configurable with `--max-output-bytes`. Per-source and command limits are
@@ -394,6 +399,19 @@ relative includes and named library sections. SIMPLIS callers use
 `preprocess_netlist_file` or `preprocess_netlist_linked_file`. Byte-oriented
 parsers accept already-admitted data. Previously compiled library artifacts
 are not raw sources and do not pass through the command.
+
+Native, LTspice, PSpice, QSPICE and TINA preparation share one admitted
+source linker. The chosen root format supplies the inherited language. A
+recognized `*#NATIVE` (or `*#NGSPICE`), `*#LTSPICE`, `*#PSPICE`,
+`*#QSPICE` or `*#TINA` declaration can override it at a resource's legal
+header position (second physical line of a complete deck; first or second
+line of an included resource after an initial comment or blank line).
+Unrelated later comments do not change the language. The parent context
+is restored after each include. Lowering uses the original statement's
+language while sharing lexical declarations across the linked graph. For
+example, an LTspice library does not make an unrelated native inductor
+acquire LTspice's default series resistance. Mixed physical-model and
+hierarchy policies for HSPICE/SIMetrix remain separate work ([#70](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/70)); the native pipeline rejects these declarations rather than selecting a global mode.
 
 Identity is the canonical source pathname, not a hash of its bytes: equal
 contents in different directories can have different relative dependencies.

@@ -29,6 +29,7 @@ pub mod vdmos_ltspice;
 pub mod waveform;
 
 use anyhow::{Context, Result, bail};
+use linked_source::SourceDialect;
 use model_preprocess_command::{Cancellation, ProcessLimits, Resource, WorkBudget, capture};
 use regex::bytes::Regex;
 use serde::Serialize;
@@ -502,7 +503,8 @@ pub fn normalize_ngspice(input: &[u8]) -> Result<NormalizedModel> {
         true,
         0,
         &mut Vec::new(),
-        NormalizationDialect::Native,
+        SourceDialects::Uniform(SourceDialect::Native),
+        None,
         &WorkBudget::default(),
     )
 }
@@ -518,13 +520,66 @@ pub struct MappedNormalization {
     pub waveforms: Vec<waveform::PreparedWaveform>,
 }
 
-/// Explicit source dialect for the linked normalization path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NormalizationDialect {
-    /// Native ngspice source and the existing narrow compatibility rewrites.
-    Native,
-    /// Source-specific `LTspice` semantics.
-    Ltspice,
+/// Dialect selection by original input line. A uniform source and a linked
+/// graph use the same lowering path; generated lines inherit their origin.
+#[derive(Clone, Copy)]
+pub(crate) enum SourceDialects<'a> {
+    Uniform(linked_source::SourceDialect),
+    Linked(&'a linked_source::LinkedSource),
+}
+
+impl SourceDialects<'_> {
+    pub(crate) fn at(self, line: usize) -> Result<linked_source::SourceDialect> {
+        match self {
+            Self::Uniform(dialect) => Ok(dialect),
+            Self::Linked(linked) => linked
+                .dialect_at(line)
+                .context("missing linked source dialect"),
+        }
+    }
+
+    fn includes(self, dialect: linked_source::SourceDialect) -> bool {
+        match self {
+            Self::Uniform(source) => source == dialect,
+            Self::Linked(linked) => linked.visits.iter().any(|visit| visit.dialect == dialect),
+        }
+    }
+
+    pub(crate) fn describe(self, line: usize) -> String {
+        match self {
+            Self::Linked(linked) => linked.origin(line).map_or_else(
+                || format!("linked line {line}"),
+                |origin| {
+                    format!(
+                        "{}:{} (source occurrence {})",
+                        origin.path.display(),
+                        origin.line,
+                        origin.visit
+                    )
+                },
+            ),
+            Self::Uniform(_) => format!("line {line}"),
+        }
+    }
+
+    pub(crate) fn describe_mapped(self, origins: &[usize], line: usize) -> String {
+        line.checked_sub(1)
+            .and_then(|index| origins.get(index))
+            .map_or_else(
+                || format!("unmapped line {line}"),
+                |origin| self.describe(*origin),
+            )
+    }
+
+    pub(crate) fn at_mapped(
+        self,
+        origins: &[usize],
+        line: usize,
+    ) -> Result<linked_source::SourceDialect> {
+        self.at(*origins
+            .get(line.checked_sub(1).context("invalid mapped source line")?)
+            .context("missing mapped source dialect")?)
+    }
 }
 
 /// Normalize either an include or a complete deck, preserving the deck title
@@ -537,7 +592,103 @@ pub enum NormalizationDialect {
 pub fn normalize_mapped(
     input: &[u8],
     kind: linked_source::RootKind,
-    dialect: NormalizationDialect,
+    dialect: SourceDialect,
+    budget: &WorkBudget,
+) -> Result<MappedNormalization> {
+    normalize_selected(input, kind, SourceDialects::Uniform(dialect), None, budget)
+}
+
+/// Native emitted source and identity changes from all selected lowerers.
+#[derive(Debug)]
+pub struct NativeNormalization {
+    /// Mapped native artifact.
+    pub mapped: MappedNormalization,
+    /// Source device declarations that changed identity during lowering.
+    pub renamed: Vec<RenamedDevice>,
+}
+
+/// A declaration whose designator changed during native lowering.
+#[derive(Debug)]
+pub struct RenamedDevice {
+    /// One-based original linked input line.
+    pub input_line: usize,
+    /// Enclosing source subcircuit declarations.
+    pub scope: Vec<String>,
+    /// Original source device identifier.
+    pub declared: String,
+    /// Native emitted device identifier.
+    pub linked: String,
+}
+
+/// Lower a linked source graph using its per-occurrence source language.
+///
+/// The source-specific passes share a complete declaration graph and compose
+/// physical origins; none reinterprets an unrelated source language.
+///
+/// # Errors
+/// Malformed source, missing dialect mapping, or unsupported physical semantics.
+pub fn normalize_linked(
+    linked: &linked_source::LinkedSource,
+    kind: linked_source::RootKind,
+    budget: &WorkBudget,
+) -> Result<NativeNormalization> {
+    let dialects = SourceDialects::Linked(linked);
+    for visit in &linked.visits {
+        anyhow::ensure!(
+            !matches!(
+                visit.dialect,
+                SourceDialect::Hspice | SourceDialect::Simetrix
+            ),
+            "{}:{}: explicit foreign source dialect {:?} requires source-projection binding",
+            visit.path.display(),
+            visit.declaration.unwrap_or(1),
+            visit.dialect,
+        );
+    }
+    let mut passes = Vec::new();
+    let mut waveforms = Vec::new();
+    let qspice = if dialects.includes(SourceDialect::Qspice) {
+        let lowered = qspice::lower_linked(linked, kind, budget)?;
+        waveforms = lowered.waveforms;
+        if lowered.bytes.is_some() {
+            passes.push(NormalizationPass::QspiceSource);
+        }
+        lowered.bytes
+    } else {
+        None
+    };
+    let input = qspice.as_deref().unwrap_or(&linked.bytes);
+    let tina = if dialects.includes(SourceDialect::Tina) {
+        Some(tina::Projection::build(input, kind, dialects, budget)?)
+    } else {
+        None
+    };
+    let (input, origins) = tina.as_ref().map_or((input, None), |projection| {
+        passes.extend_from_slice(&projection.passes);
+        (
+            projection.bytes.as_slice(),
+            Some(projection.lines.as_slice()),
+        )
+    });
+    let mut mapped = normalize_selected(input, kind, dialects, origins, budget)?;
+    passes.append(&mut mapped.model.passes);
+    mapped.model.passes = passes;
+    mapped.waveforms.extend(waveforms);
+    if dialects.includes(SourceDialect::Pspice) || dialects.includes(SourceDialect::Tina) {
+        pspice::lower_mapped(mapped, kind, dialects, budget)
+    } else {
+        Ok(NativeNormalization {
+            mapped,
+            renamed: Vec::new(),
+        })
+    }
+}
+
+fn normalize_selected(
+    input: &[u8],
+    kind: linked_source::RootKind,
+    dialects: SourceDialects<'_>,
+    origins: Option<&[usize]>,
     budget: &WorkBudget,
 ) -> Result<MappedNormalization> {
     ensure_textual(input)?;
@@ -557,7 +708,8 @@ pub fn normalize_mapped(
         kind == linked_source::RootKind::Include,
         title_lines,
         &mut inserted,
-        dialect,
+        dialects,
+        origins,
         budget,
     )?;
     let mut input_lines = Vec::new();
@@ -590,13 +742,20 @@ pub fn normalize_mapped(
             && input_lines.len() == model.bytes.split_inclusive(|byte| *byte == b'\n').count(),
         "normalization source mapping is inconsistent"
     );
+    if let Some(origins) = origins {
+        for line in &mut input_lines {
+            *line = *origins
+                .get(*line - 1)
+                .context("missing prior source origin")?;
+        }
+    }
     let mapped = MappedNormalization {
         model,
         input_lines,
         waveforms: Vec::new(),
     };
-    if dialect == NormalizationDialect::Ltspice {
-        ltspice::normalize(mapped, kind, budget)
+    if dialects.includes(SourceDialect::Ltspice) {
+        ltspice::normalize(mapped, kind, dialects, budget)
     } else {
         Ok(mapped)
     }
@@ -607,7 +766,8 @@ fn normalize_body(
     strip_end: bool,
     title_lines: usize,
     inserted_lines: &mut Vec<usize>,
-    dialect: NormalizationDialect,
+    dialects: SourceDialects<'_>,
+    origins: Option<&[usize]>,
     budget: &WorkBudget,
 ) -> Result<NormalizedModel> {
     budget.charge(Resource::ScannedBytes, input.len())?;
@@ -629,13 +789,22 @@ fn normalize_body(
         NormalizationPass::NormalizeNbspWhitespace,
         normalize_nbsp,
     );
-    if let Some(rewritten) = series::rewrite(&bytes, inserted_lines, dialect, strip_end, budget)? {
-        bytes = rewritten;
-        passes.push(if dialect == NormalizationDialect::Ltspice {
-            NormalizationPass::LtspiceSeriesParasitics
-        } else {
-            NormalizationPass::LtspiceInductorRser
-        });
+    if let Some(rewritten) = series::rewrite(
+        &bytes,
+        inserted_lines,
+        dialects,
+        title_lines,
+        strip_end,
+        origins,
+        budget,
+    )? {
+        bytes = rewritten.bytes;
+        if rewritten.ltspice {
+            passes.push(NormalizationPass::LtspiceSeriesParasitics);
+        }
+        if rewritten.native {
+            passes.push(NormalizationPass::LtspiceInductorRser);
+        }
     }
     if let Some(rewritten) = rewrite_pspice_arctan(&bytes, budget)? {
         bytes = rewritten;
@@ -1024,7 +1193,7 @@ mod tests {
         let result = normalize_mapped(
             source,
             linked_source::RootKind::Include,
-            NormalizationDialect::Native,
+            SourceDialect::Native,
             &WorkBudget::default(),
         )?;
         let actual = std::str::from_utf8(&result.model.bytes)?;

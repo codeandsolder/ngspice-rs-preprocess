@@ -45,7 +45,7 @@ fn links_whole_files_and_named_sections_with_original_line_mapping() -> Result<(
     assert!(!output.contains("Vignored"));
     assert!(!output.contains("Rignored"));
     assert!(!output.contains(".model wrong"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), output.lines().count());
@@ -74,7 +74,7 @@ fn source_specific_edits_preserve_names_control_and_native_admission() -> Result
     assert!(text.contains("__lt_intrinsic_if_1(0.4,1,__lt_intrinsic_limit("));
     assert!(text.contains("echo limit(x,y,z)"));
     assert!(text.contains("* limit(x,y,z)"));
-    let Provenance::Native { lines } = &translated.primary.provenance else {
+    let Provenance::Native { lines, .. } = &translated.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -400,7 +400,7 @@ fn vendor_duplicate_table_knots_preserve_both_macro_evaluation_phases() -> Resul
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
     assert!(text.contains(".func __lt_param_INNER"));
     assert!(text.contains(".func __lt_param_OUTER"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -438,7 +438,7 @@ fn series_parasitics_preserve_terminal_admittance_and_coupling_scope() -> Result
     assert!(text.contains(" 1m\n"));
     assert!(text.contains("L3 a3 0 3m\n"));
     assert!(text.contains(".subckt coupled a b\nL2 a 0 3m\nL3 b 0 3m\nK1"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -511,7 +511,7 @@ fn vendor_pulse_timing_defaults_and_relative_duplicate_pwl() -> Result<()> {
     fs::write(&root, b"title\nV1 a 0 PULSE(0 1 1u 0 0 2u 10u)\nV2 b 0 PULSE(0 1 1u 0 1u 8u 10u)\nV3 c 0 PULSE(0 1 -1u 0 0 -2u 10u)\nV4 d 0 PULSE(0 1 1u 0 0)\nV5 e 0 PULSE(0 1 1u .1u .1u 8u 10u 1.5)\nV6 f 0 PWL(0 0 +1u 1\n+ +0 3 +0 8\n+ +1u 0)\nV7 g 0 PWL(+1u 1 +1u 2 +2u 0)\nI1 0 h PULSE(0 1 1u 0 0 2u 10u)\nR1 h 0 1\n.end\n")?;
     let bundle = prepared(&root, InputFormat::LtspiceDeck)?;
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -663,7 +663,7 @@ fn vendor_scaled_pwl_signed_coordinates_and_closed_waveform_expressions() -> Res
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
     assert!(!text.to_ascii_lowercase().contains("scale_factor"));
     assert!(text.contains("PULSE(4 512"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -802,7 +802,7 @@ fn parameterized_source_waveforms_bind_in_actual_scope_and_rebind_candidates() -
         near(pwl.dc, gain * (1. + 3e-6 / width))?;
         near(pwl.startup, pwl.dc)?;
     }
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing provenance");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -899,7 +899,7 @@ fn voltage_source_series_resistance_preserves_identity_and_noise() -> Result<()>
     assert!(text.contains("R__V2_RSER b"));
     assert!(text.contains("V3 c 0 1"));
     assert!(!text.contains("R__V3_RSER"));
-    let Provenance::Native { lines } = &bundle.primary.provenance else {
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
         anyhow::bail!("missing source map");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -1045,7 +1045,7 @@ fn diode_dialect_retains_model_identity_and_ordered_setters() -> Result<()> {
     assert!(text.contains(".model dm ltspice_diode(Ron={r}"));
     assert!(text.contains("+ Roff=100 Vfwd=1 Ilimit=0.25 Epsilon=0.4)"));
     assert!(text.contains(".model dm ltspice_diode(IS=1p)"));
-    let Provenance::Native { lines } = &translated.primary.provenance else {
+    let Provenance::Native { lines, .. } = &translated.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), text.lines().count());
@@ -1067,7 +1067,7 @@ fn switch_selection_retains_ordered_setters_flags_and_native_isolation() -> Resu
     let translated = prepared(&root, InputFormat::LtspiceDeck)?;
     let expected = std::str::from_utf8(source)?.replace(" SW(", " ltspice_switch(");
     assert_eq!(translated.primary.bytes, expected.as_bytes());
-    let Provenance::Native { lines } = translated.primary.provenance else {
+    let Provenance::Native { lines, .. } = translated.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), expected.lines().count());
@@ -1092,7 +1092,7 @@ fn diode_dispatch_is_deferred_to_each_resolved_occurrence() -> Result<()> {
         .replace(" d(", " ltspice_diode(")
         .replace("plain D\n", "plain ltspice_diode\n");
     assert_eq!(translated.primary.bytes, expected.as_bytes());
-    let Provenance::Native { lines } = &translated.primary.provenance else {
+    let Provenance::Native { lines, .. } = &translated.primary.provenance else {
         anyhow::bail!("missing source mapping");
     };
     assert_eq!(lines.len(), expected.lines().count());

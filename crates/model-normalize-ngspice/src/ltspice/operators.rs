@@ -4,7 +4,7 @@
 //! model or device identifier as arithmetic.
 
 use crate::{expression_start, lexical, param_expression::lower_ltspice};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::ops::Range;
 
@@ -196,7 +196,12 @@ fn rewrite_card(
     }
 }
 
-pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>>> {
+pub(super) fn rewrite(
+    body: &[u8],
+    origins: &[usize],
+    dialects: crate::SourceDialects<'_>,
+    budget: &WorkBudget,
+) -> Result<Option<Vec<u8>>> {
     budget.charge(Resource::ScannedBytes, body.len())?;
     let mut edits = Vec::new();
     let mut control = false;
@@ -213,8 +218,12 @@ pub(super) fn rewrite(body: &[u8], budget: &WorkBudget) -> Result<Option<Vec<u8>
             control = false;
             continue;
         }
-        if !control {
-            rewrite_card(&statement, first, &mut edits, budget)?;
+        if !control
+            && dialects.at_mapped(origins, statement.line)?
+                == crate::linked_source::SourceDialect::Ltspice
+        {
+            rewrite_card(&statement, first, &mut edits, budget)
+                .with_context(|| dialects.describe_mapped(origins, statement.line))?;
         }
     }
     lexical::apply_budgeted_edits(body, edits, budget)
