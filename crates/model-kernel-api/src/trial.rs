@@ -4,6 +4,8 @@
 
 use crate::{Artifact, Descriptor, EquationKind, Error, Kernel, Prepared, Result};
 
+pub mod limiting;
+
 /// The explicitly selected owner of one numerical policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrialPolicy {
