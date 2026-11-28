@@ -6,7 +6,7 @@ use crate::{lexical, model_card::parse_spice_constant};
 use anyhow::{Context, Result, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 
-fn is_keyword(text: &[u8], key: &[u8]) -> bool {
+const fn is_keyword(text: &[u8], key: &[u8]) -> bool {
     text.eq_ignore_ascii_case(key)
 }
 
