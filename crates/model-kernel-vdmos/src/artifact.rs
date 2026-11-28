@@ -10,9 +10,12 @@ use model_kernel_api::{
     ABI_VERSION, Artifact, Binding, Capability, Descriptor, Equation, EquationKind, Error, Kernel,
     Parameter, Point, Result,
     noise::{Injection, Sink, Source},
+    trial::{TrialCapabilities, TrialPolicy, TrialReference},
 };
 
 use super::{Bias, Conductance, Evaluation, Instance, PreparedInstance, PreparedModel};
+
+mod trial;
 
 // Three exposed electrical, two exposed thermal, four internal electrical,
 // and one internal relaxation coordinate; all optional nodes are coalesced
@@ -125,7 +128,10 @@ pub fn artifact(
             }],
             charge: Capability::Computed,
             noise: Capability::Computed,
-            trial: model_kernel_api::trial::TrialCapabilities::ENGINE,
+            trial: TrialCapabilities {
+                limiting: TrialPolicy::Kernel,
+                ..TrialCapabilities::ENGINE
+            },
         },
         VdmosKernel { model, layout },
     )
@@ -502,6 +508,15 @@ impl Kernel for VdmosKernel {
         let mut assembly = Assembly { point: out, width };
         self.intrinsic(&point, &evaluation, &mut assembly)?;
         self.series_and_heat(&point, &evaluation, prepared.ambient_kelvin, &mut assembly)
+    }
+
+    fn limit_trial(
+        &self,
+        prepared: &Self::Prepared,
+        reference: TrialReference<'_>,
+        coordinates: &mut [f64],
+    ) -> Result<()> {
+        self.limit_coordinates(prepared, reference.coordinates(), coordinates)
     }
 
     fn evaluate_noise(

@@ -95,6 +95,34 @@ fn statistical_sample(value: &OsStr) -> Result<ngspice_rs_preprocess::Statistica
     })
 }
 
+fn command_config(
+    command: Option<PathBuf>,
+    command_args: Vec<OsString>,
+    cwd: Option<PathBuf>,
+) -> Result<Option<CommandConfig>> {
+    if let Some(executable) = command {
+        ensure!(
+            executable.is_absolute(),
+            "--command requires an absolute executable pathname"
+        );
+        ensure!(
+            cwd.as_ref().is_none_or(|path| path.is_absolute()),
+            "--command-cwd requires an absolute pathname"
+        );
+        Ok(Some(CommandConfig {
+            executable,
+            arguments: command_args,
+            working_directory: cwd,
+        }))
+    } else {
+        ensure!(
+            command_args.is_empty() && cwd.is_none(),
+            "command arguments and cwd require --command"
+        );
+        Ok(None)
+    }
+}
+
 fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>> {
     let first = args.next().context(USAGE)?;
     if first == "--help" || first == "-h" {
@@ -176,26 +204,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
             _ => bail!("unknown option {name:?}\n{USAGE}"),
         }
     }
-    if let Some(executable) = command {
-        ensure!(
-            executable.is_absolute(),
-            "--command requires an absolute executable pathname"
-        );
-        ensure!(
-            cwd.as_ref().is_none_or(|path| path.is_absolute()),
-            "--command-cwd requires an absolute pathname"
-        );
-        options.admission.command = Some(CommandConfig {
-            executable,
-            arguments: command_args,
-            working_directory: cwd,
-        });
-    } else {
-        ensure!(
-            command_args.is_empty() && cwd.is_none(),
-            "command arguments and cwd require --command"
-        );
-    }
+    options.admission.command = command_config(command, command_args, cwd)?;
     Ok(Some(Invocation {
         request,
         options,
