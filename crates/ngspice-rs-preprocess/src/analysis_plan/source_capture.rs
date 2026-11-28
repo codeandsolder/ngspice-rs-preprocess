@@ -179,7 +179,15 @@ impl Candidate {
                 self.location.origin
             );
             return Ok(match name.as_str() {
-                ".OPTIONS" | ".OPTION" | ".OPT" | ".IC" | ".NODESET" | ".CONTROL" => false,
+                ".OPTIONS" | ".OPTION" | ".OPT" => options(&self.text, self.location.dialect)?
+                    .iter()
+                    .any(|setting| {
+                        model_normalize_ngspice::pspice::digital_options::DigitalOption::from_name(
+                            &setting.name,
+                        )
+                        .is_some()
+                    }),
+                ".IC" | ".NODESET" | ".CONTROL" => false,
                 ".TEMP" => super::pspice::arguments(&self.text)?.len() != 1,
                 _ => true,
             });
@@ -286,6 +294,55 @@ fn extract_entry(
         conditional,
     } = candidate;
     let name = command(&text);
+    if location.dialect == AnalysisDialect::Pspice
+        && matches!(name.as_str(), ".OPTIONS" | ".OPTION" | ".OPT")
+    {
+        let fields = option_fields(&text, location.dialect)?;
+        let digital = fields
+            .iter()
+            .filter(|(setting, _)| {
+                model_normalize_ngspice::pspice::digital_options::DigitalOption::from_name(
+                    &setting.name,
+                )
+                .is_some()
+            })
+            .collect::<Vec<_>>();
+        if digital.is_empty() {
+            return Ok(None);
+        }
+        let library = plan.kind == PlanKind::Library;
+        push_entry(
+            plan,
+            location.origin,
+            &location.scope,
+            &text,
+            library || conditional,
+            budget,
+            location.dialect,
+        )?;
+        let entry = plan
+            .entries
+            .last_mut()
+            .context("missing digital option entry")?;
+        let Directive::Options { settings } = &mut entry.directive else {
+            anyhow::bail!("expected digital option entry");
+        };
+        settings.retain(|setting| {
+            model_normalize_ngspice::pspice::digital_options::DigitalOption::from_name(
+                &setting.name,
+            )
+            .is_some()
+        });
+        if entry.disposition != Disposition::Unsupported {
+            entry.disposition = Disposition::RequiresBinding;
+        }
+        return Ok(Some(Rewrite {
+            first,
+            last,
+            removed_fields: (digital.len() != fields.len())
+                .then(|| digital.into_iter().map(|(_, span)| span.clone()).collect()),
+        }));
+    }
     // Native circuit directives are already in the solver's source language.
     // They remain in the electrical artifact rather than being duplicated.
     if location.dialect != AnalysisDialect::Ltspice
