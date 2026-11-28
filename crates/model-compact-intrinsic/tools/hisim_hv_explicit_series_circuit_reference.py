@@ -13,12 +13,18 @@ CARDS=(
 )
 
 def main():
+    edge = "--zero-substrate" in sys.argv[2:]
+    temperatures = (27.,) if edge else (27.,100.)
+    cards = (1,) if edge else range(len(CARDS))
+    substrates = (True,) if edge else (False,True)
+    geometries = ((3e-6,10e-6,2.,1.),) if edge else ((3e-6,10e-6,2.,1.),(4e-6,30e-6,3.,3.))
     with tempfile.TemporaryDirectory(prefix='hisim-series-') as tmp, Path(sys.argv[1]).open('w') as f:
         f.write('# family corsrd polarity temp L W M NF card substrate reversed Vgs Vds Vbs Vsub; physical normalized prime D S, normalized external D/S currents, native normalized channel current\n')
-        for family,mode,polarity,temp,config,substrate in product((1,2),(1,3),(1,-1),(27.,100.),range(len(CARDS)),(False,True)):
-            rows=list(product(((3e-6,10e-6,2.,1.),(4e-6,30e-6,3.,3.)),(False,True),(2.,4.,8.),(.1,2.,10.),(0.,-.5)))
+        for family,mode,polarity,temp,config,substrate in product((1,2),(1,3),(1,-1),temperatures,cards,substrates):
+            rows=list(product(geometries,(False,True),(4.,8.) if edge else (2.,4.,8.),(2.,10.) if edge else (.1,2.,10.),(-.5,) if edge else (0.,-.5)))
             family_options = "cordrift=0 js0d=0 js0s=0 js0swd=0 js0sws=0" if family==2 else "js0=0 js0sw=0"
             model=f'{"nmos" if polarity==1 else "pmos"} level=73 version={"1.24" if family==1 else "2.20"} corsrd={mode} cosubnode={int(substrate)} nover=1e17 loverld=5e-7 lovers=3e-7 coovlp=0 coadov=0 rsh=10 coisti=0 coisub=0 coiigs=0 cogidl=0 conqs=0 {family_options} {CARDS[config]}'
+            if edge: model += " nsubsub=0"
             deck=['* wrapper title','* conventional series circuit',f'.model active {model}',f'.temp {temp}', '.options reltol=1e-9 abstol=1e-16 vntol=1e-11 gmin=1e-16']
             saves=[]
             for i,((length,width,m,nf),reverse,vg,vd,vb) in enumerate(rows):

@@ -10,6 +10,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn prepare(
     row: &[f64],
     cotemp: Option<i32>,
+    zero_substrate: bool,
 ) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance), ModelError> {
     let variant = if row[0] == 1. {
         ModelVariant::HiSimHv1
@@ -97,6 +98,9 @@ fn prepare(
     if let Some(mode) = cotemp {
         fields.push(("cotemp", ParameterValue::Integer(mode)));
     }
+    if zero_substrate {
+        fields.push(("nsubsub", ParameterValue::Real(0.)));
+    }
     let model = prepare_hisim_hv_model(&BoundParameters::bind(
         variant,
         ParameterScope::Model,
@@ -127,13 +131,27 @@ fn prepare(
 
 #[test]
 fn native_explicit_series_branches() -> TestResult {
+    compare_native(
+        include_str!("fixtures/hisim-hv-explicit-series-ngspice47.txt"),
+        6912,
+        false,
+    )
+}
+
+#[test]
+fn zero_substrate_doping() -> TestResult {
+    compare_native(
+        include_str!("fixtures/hisim-hv-explicit-series-zero-substrate-ngspice47.txt"),
+        64,
+        true,
+    )
+}
+
+fn compare_native(fixture: &str, expected_count: usize, zero_substrate: bool) -> TestResult {
     let mut count = 0;
     let mut failures = [0; 2];
     let mut worst = [0_f64; 2];
-    for (index, line) in include_str!("fixtures/hisim-hv-explicit-series-ngspice47.txt")
-        .lines()
-        .enumerate()
-    {
+    for (index, line) in fixture.lines().enumerate() {
         if line.starts_with('#') {
             continue;
         }
@@ -143,7 +161,7 @@ fn native_explicit_series_branches() -> TestResult {
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .map_err(|_| "native explicit series fixture width")?;
-        let (model, instance) = prepare(&row, None)?;
+        let (model, instance) = prepare(&row, None, zero_substrate)?;
         let series =
             prepare_hisim_hv_explicit_series(&model, &instance)?.ok_or("series law disabled")?;
         assert_eq!(series.prime_nodes(), [true, true]);
@@ -186,7 +204,7 @@ fn native_explicit_series_branches() -> TestResult {
         }
         count += 1;
     }
-    assert_eq!(count, 6912);
+    assert_eq!(count, expected_count);
     assert_eq!(failures, [0; 2], "worst relative {worst:?}");
     Ok(())
 }
@@ -210,7 +228,7 @@ fn independent_series_jacobians() -> TestResult {
                         f64::from(card),
                         if substrate { 1. } else { 0. },
                     ]);
-                    let (model, instance) = prepare(&row, Some(cotemp))?;
+                    let (model, instance) = prepare(&row, Some(cotemp), false)?;
                     let series = prepare_hisim_hv_explicit_series(&model, &instance)?
                         .ok_or("series law disabled")?;
                     let evaluate = |x: [f64; 7]| -> Result<_, Box<dyn std::error::Error>> {

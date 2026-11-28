@@ -6,7 +6,10 @@ use model_compact_intrinsic::{
     prepare_hisim_hv_normal_channel, prepare_hisim_hv_transport,
 };
 type TestResult = Result<(), Box<dyn std::error::Error>>;
-fn prepare(row: &[f64]) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance), ModelError> {
+fn prepare(
+    row: &[f64],
+    zero_substrate: bool,
+) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance), ModelError> {
     let variant = ModelVariant::HiSimHv2;
     let mut fields = vec![
         (
@@ -64,6 +67,9 @@ fn prepare(row: &[f64]) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance
             .map(|(n, v)| (n, ParameterValue::Real(v))),
         );
     }
+    if zero_substrate {
+        fields.push(("nsubsub", ParameterValue::Real(0.)));
+    }
     let model = prepare_hisim_hv_model(&BoundParameters::bind(
         variant,
         ParameterScope::Model,
@@ -89,13 +95,27 @@ fn prepare(row: &[f64]) -> Result<(PreparedHiSimHvModel, PreparedHiSimHvInstance
 }
 #[test]
 fn native_physical_drift_branch() -> TestResult {
+    compare_native(
+        include_str!("fixtures/hisim-hv-drift-ngspice47.txt"),
+        5120,
+        false,
+    )
+}
+
+#[test]
+fn zero_substrate_doping() -> TestResult {
+    compare_native(
+        include_str!("fixtures/hisim-hv-drift-zero-substrate-ngspice47.txt"),
+        16,
+        true,
+    )
+}
+
+fn compare_native(fixture: &str, expected_count: usize, zero_substrate: bool) -> TestResult {
     let mut count = 0;
     let mut failures = [0; 3];
     let mut worst = [0_f64; 3];
-    for (index, line) in include_str!("fixtures/hisim-hv-drift-ngspice47.txt")
-        .lines()
-        .enumerate()
-    {
+    for (index, line) in fixture.lines().enumerate() {
         if line.starts_with('#') {
             continue;
         }
@@ -105,7 +125,7 @@ fn native_physical_drift_branch() -> TestResult {
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .map_err(|_| "native drift fixture width")?;
-        let (model, instance) = prepare(&row)?;
+        let (model, instance) = prepare(&row, zero_substrate)?;
         let channel = prepare_hisim_hv_normal_channel(&model, &instance)?;
         let drift = prepare_hisim_hv_drift(&model, &instance)?.ok_or("drift law disabled")?;
         let temp = prepare_hisim_hv_transport(&model, &instance, row[1] + 273.15, 0.)?;
@@ -173,7 +193,7 @@ fn native_physical_drift_branch() -> TestResult {
         }
         count += 1;
     }
-    assert_eq!(count, 5120);
+    assert_eq!(count, expected_count);
     assert_eq!(failures, [0; 3], "worst relative {worst:?}");
     Ok(())
 }
@@ -194,7 +214,7 @@ fn independent_drift_jacobians() -> TestResult {
                     f64::from(card),
                     if substrate { 1. } else { 0. },
                 ]);
-                let (model, instance) = prepare(&row)?;
+                let (model, instance) = prepare(&row, false)?;
                 let channel = prepare_hisim_hv_normal_channel(&model, &instance)?;
                 let drift = prepare_hisim_hv_drift(&model, &instance)?.ok_or("drift disabled")?;
                 let eval = |x: [f64; 10]| -> Result<_, ModelError> {
