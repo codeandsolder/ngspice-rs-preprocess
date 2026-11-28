@@ -53,6 +53,7 @@ model-compact-intrinsic = { path = "crates/model-compact-intrinsic", version = "
 model-kernel-api = { path = "crates/model-kernel-api", version = "=0.1.0" }
 model-import-ltspice = { path = "crates/model-import-ltspice", version = "=0.1.0" }
 model-kernel-diode = { path = "crates/model-kernel-diode", version = "=0.1.0" }
+model-kernel-ekv = { path = "crates/model-kernel-ekv", version = "=0.1.0" }
 model-normalize-ngspice = { path = "crates/model-normalize-ngspice", version = "=0.1.0" }
 model-preprocess-command = { path = "crates/model-preprocess-command", version = "=0.1.0" }
 model-preprocess-simplis = { path = "crates/model-preprocess-simplis", version = "=0.1.0" }

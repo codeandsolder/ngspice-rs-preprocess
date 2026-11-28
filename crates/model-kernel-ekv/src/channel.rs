@@ -223,5 +223,7 @@ pub fn evaluate<S: Scalar>(p: &Prepared, v: [S; 4]) -> Intrinsic<S> {
         charge: charge.map(|x| x.scale(p.sign)),
         channel_current: id.scale(if reversed { -p.sign } else { p.sign }),
         thermal_conductance,
+        forward_normalized: t.forward,
+        reverse_normalized: t.reverse,
     }
 }

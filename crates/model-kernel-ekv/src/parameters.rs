@@ -1,8 +1,8 @@
 use model_kernel_api::{Error, Result};
 
-const EPS_SI: f64 = 11.7 * 8.854_187_923_944_2e-12;
+pub const EPS_SI: f64 = 11.7 * 8.854_187_923_944_2e-12;
 // CODATA 2010, as used by the revision-15 OpenVAF reference.
-const K_OVER_Q: f64 = 1.380_648_8e-23 / 1.602_176_565e-19;
+pub const K_OVER_Q: f64 = 1.380_648_8e-23 / 1.602_176_565e-19;
 
 /// Physical channel type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

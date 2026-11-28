@@ -13,6 +13,7 @@ pub mod device;
 pub mod geometry;
 pub mod junction;
 mod parameters;
+pub mod pspice;
 
 pub use parameters::{Geometry, Model, Polarity, Prepared};
 
@@ -28,6 +29,8 @@ pub struct Intrinsic<S = f64> {
     pub charge: [S; 4],
     pub channel_current: S,
     pub thermal_conductance: S,
+    pub forward_normalized: S,
+    pub reverse_normalized: S,
 }
 
 /// Intrinsic residuals and analytic voltage Jacobians in terminal order.
@@ -53,7 +56,12 @@ impl Prepared {
             .current
             .into_iter()
             .chain(result.charge)
-            .chain([result.channel_current, result.thermal_conductance])
+            .chain([
+                result.channel_current,
+                result.thermal_conductance,
+                result.forward_normalized,
+                result.reverse_normalized,
+            ])
             .all(Scalar::is_finite)
         {
             Ok(result)

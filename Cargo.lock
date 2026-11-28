@@ -223,6 +223,7 @@ name = "model-normalize-ngspice"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-kernel-ekv",
  "model-preprocess-command",
  "regex",
  "serde",

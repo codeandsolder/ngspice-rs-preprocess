@@ -5,8 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license = "MIT AND ECL-2.0"
 repository.workspace = true
+readme = "README.md"
 publish.workspace = true
-description = "Prepared EKV 2.6 intrinsic MOS current and charge equations"
+description = "Prepared EKV 2.6 MOS device equations and PSpice source binding"
 
 [lints]
 workspace = true

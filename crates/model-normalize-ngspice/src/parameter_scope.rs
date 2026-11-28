@@ -519,6 +519,30 @@ impl ModelLibrary {
             )
         })
     }
+
+    /// Resolve a source-selected EKV model in its lexical context.
+    ///
+    /// # Errors
+    /// Invalid model index, source expressions, overrides or EKV parameters.
+    pub fn resolve_ekv(
+        &self,
+        model_index: usize,
+        overrides: &[(usize, &str, f64)],
+        defaults: model_kernel_ekv::pspice::CircuitDefaults,
+    ) -> Result<Option<model_kernel_ekv::pspice::PspiceModel>> {
+        let model = self
+            .models
+            .get(model_index)
+            .context("model index out of bounds")?;
+        let mut resolver = ScopeResolver::new(self, overrides)?;
+        crate::ekv_card::ekv_resolved(&model.card, defaults, |expr| {
+            resolver.evaluate(
+                model.scope,
+                &SpiceExpression::parse_with_budget(expr, &self.budget)?,
+                None,
+            )
+        })
+    }
 }
 
 struct ScopeResolver<'a> {

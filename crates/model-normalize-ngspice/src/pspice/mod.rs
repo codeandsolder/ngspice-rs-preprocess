@@ -565,7 +565,14 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
         // Model levels are discrete identifiers, not measured quantities.
         if matches!(family.as_str(), "nmos" | "pmos") {
             match level {
-                5.0 => bail!("PSpice MOS level 5 requires an EKV physical kernel"),
+                5.0 => {
+                    let tag = if family == "nmos" {
+                        model_kernel_ekv::pspice::NMOS_FAMILY
+                    } else {
+                        model_kernel_ekv::pspice::PMOS_FAMILY
+                    };
+                    tag.clone_into(&mut card.family);
+                }
                 6.0 | 7.0 => {
                     set_parameter(&mut card, "level", "8")?;
                     set_parameter(&mut card, "version", "3.2.4")?;

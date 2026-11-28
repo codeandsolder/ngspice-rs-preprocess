@@ -33,11 +33,39 @@ pub struct ResistanceTemperature {
     pub quadratic: f64,
 }
 
+/// Operating temperature is separate from measurement temperature.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum OperatingTemperature {
+    #[default]
+    Ambient,
+    Absolute(f64),
+    Offset(f64),
+}
+
+impl OperatingTemperature {
+    /// Resolve against the analysis temperature (absolute kelvin).
+    ///
+    /// # Errors
+    /// Invalid or nonpositive absolute temperature.
+    pub fn resolve(self, ambient: f64) -> Result<f64> {
+        let value = match self {
+            Self::Ambient => ambient,
+            Self::Absolute(value) => value,
+            Self::Offset(delta) => ambient + delta,
+        };
+        if !ambient.is_finite() || ambient <= 0. || !value.is_finite() || value <= 0. {
+            return Err(Error::Domain("invalid EKV operating temperature".into()));
+        }
+        Ok(value)
+    }
+}
+
 /// Resolved full-device model and per-finger parasitics. The two
 /// junctions are drain-bulk and source-bulk, respectively.
 #[derive(Clone, Copy, Debug)]
 pub struct Device {
     pub channel: Model,
+    pub temperature: OperatingTemperature,
     pub junctions: [Junction; 2],
     /// Gate-drain, gate-source and gate-bulk overlap capacitance per
     /// unit of drawn width, width and length, respectively.
@@ -159,7 +187,7 @@ impl Device {
             .map(|(name, default)| Parameter {
                 name: name.into(),
                 default,
-                changes_topology: false,
+                changes_topology: true,
             })
             .collect();
         Artifact::new(
@@ -243,6 +271,7 @@ impl Kernel for DeviceKernel {
             series,
         };
         let d = self.device;
+        let temperature = d.temperature.resolve(temperature)?;
         let channel = d.channel.prepare_segmented(geometry, temperature)?;
         let delta = temperature - d.channel.nominal_temperature;
         let mut conductance = [0.; 4];

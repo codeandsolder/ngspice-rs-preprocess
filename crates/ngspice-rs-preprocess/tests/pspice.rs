@@ -277,7 +277,6 @@ fn model_scope_resolution_and_unsupported_physics_are_explicit() -> Result<()> {
         ".model A AKO:B D(IS=1e-12)\n.model B AKO:A D(IS=1e-12)\n",
         ".model A AKO:MISSING D(IS=1e-12)\n",
         ".model A D(IS=1e-12)\n.model B AKO:A NPN(BF=80)\n",
-        ".model A NMOS(LEVEL=5)\n",
         ".model A NPN(LEVEL=2)\n",
         ".model A D(IS=1e-12 DEV=5%)\n",
         ".distribution foo\n",
@@ -948,5 +947,18 @@ quit
             close(value, -14.);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn ekv_level_five_preserves_dialect_and_polarity() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("ekv.lib");
+    fs::write(&path, b".model base NMOS(LEVEL=5 KP=50u)\n.model child AKO:base NMOS(VTO=0.6)\n.model p PMOS(LEVEL=5 VTO=-0.5)\n")?;
+    let prepared = prepare_source(&path, InputFormat::PspiceLibrary)?;
+    let text = std::str::from_utf8(&prepared.primary.bytes)?;
+    assert!(text.contains(".model base pspice_ekv26_nmos("), "{text}");
+    assert!(text.contains(".model child pspice_ekv26_nmos("), "{text}");
+    assert!(text.contains(".model p pspice_ekv26_pmos("), "{text}");
     Ok(())
 }

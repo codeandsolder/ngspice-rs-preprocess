@@ -12,6 +12,7 @@ mod series;
 pub fn statement_token_spans(text: &str) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
     lexical::tokens(text.as_bytes())
 }
+pub mod ekv_card;
 pub mod linked_source;
 pub mod ltspice;
 pub mod model_card;
