@@ -427,7 +427,7 @@ fn transient_start_is_bound_without_reinterpreting_schedules() -> Result<()> {
     let root = dir.path().join("tran.sp");
     for (source, count, start, cap, uic) in [
         (".tran 1n 10n START=2n UIC", 1, 2e-9, 0.25e-9, true),
-        (".tran 1n 10n 2n 0.5n", 1, 2e-9, 0.5e-9, false),
+        (".tran 1n 10n 2n 0.25n", 1, 2e-9, 0.25e-9, false),
         (".tran 1n 10n 2n 20n START=2n", 2, 2e-9, 0.25e-9, false),
     ] {
         fs::write(
@@ -1092,5 +1092,97 @@ V1 a 0 'outside(2)'
         format!("{error:#}").contains("not visible in this occurrence"),
         "{error:#}"
     );
+    Ok(())
+}
+
+#[test]
+fn hspice_timing_options_are_bound_as_distinct_source_policies() -> Result<()> {
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use ngspice_rs_preprocess::analysis_plan::{
+        Directive, DirectiveOrigin,
+        timing::{IntegrationCeiling, SavedOutput, StepControl},
+    };
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("timing.sp");
+    for (options, expected_output, legacy) in [
+        ("", SavedOutput::AcceptedSteps, false),
+        (
+            ".option INTERP RMIN=1e-3 RMAX=2",
+            SavedOutput::LinearInterpolation,
+            false,
+        ),
+        (
+            ".option INTERP=0 RUNLVL=0 RMIN=1e-3 RMAX=2",
+            SavedOutput::AcceptedSteps,
+            true,
+        ),
+        (
+            ".option INTERP=1 RUNLVL=0",
+            SavedOutput::LinearInterpolation,
+            true,
+        ),
+    ] {
+        fs::write(
+            &root,
+            format!(
+                "Timing policies\nV1 a 0 1\nR1 a 0 1k\n.tran 1n 10n 2n 20n START=2n\n{options}\n.end\n"
+            ),
+        )?;
+        let bundle = compile(&root, InputFormat::HspiceDeck)?;
+        let native = std::str::from_utf8(&bundle.primary.bytes)?;
+        assert!(
+            !native
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with(".options"))
+        );
+        let plan = bundle.analysis_plan.context("missing timing plan")?;
+        let Directive::ScheduledTransient { intent } = &plan.entries[0].directive else {
+            anyhow::bail!("missing schedule");
+        };
+        let timing = intent.bind(parse_spice_constant)?;
+        assert_eq!(timing.saved_output, expected_output);
+        assert_eq!(timing.ceiling, IntegrationCeiling::Automatic);
+        if options.contains("INTERP") {
+            let option = intent.options.interp.as_ref().context("lost INTERP")?;
+            assert!(
+                matches!(&option.origin, DirectiveOrigin::Source {path, first_line: 5, last_line: 5} if path == &root)
+            );
+        }
+        match timing.step_control {
+            StepControl::RunLevel {
+                level,
+                soft_maximum,
+            } => {
+                assert!(!legacy);
+                assert_eq!(level, 3);
+                assert!((soft_maximum - 0.9e-9).abs() < 1e-22);
+            }
+            StepControl::Legacy(bounds) => {
+                assert!(legacy);
+                assert_eq!(bounds.len(), 2);
+                for (segment, step) in bounds.iter().zip([1e-9, 2e-9]) {
+                    let rmin = if options.contains("RMIN") { 1e-3 } else { 1e-9 };
+                    let rmax = if options.contains("RMAX") { 2. } else { 5. };
+                    assert!((segment.minimum / (step * rmin) - 1.).abs() < 1e-12);
+                    assert!((segment.maximum / (step * rmax) - 1.).abs() < 1e-12);
+                }
+            }
+        }
+    }
+    for (tran, options) in [
+        (".tran 1n 10n", ".option INTERP=2"),
+        (".tran 1n 10n", ".option RUNLVL=7"),
+        (".tran 1n 10n", ".option RUNLVL=0 RMIN=2 RMAX=1"),
+        (".tran 1n 10n 2n .5n", ".option DELMAX=.25n"),
+    ] {
+        fs::write(
+            &root,
+            format!("Invalid timing\nV1 a 0 1\nR1 a 0 1k\n{tran}\n{options}\n.end\n"),
+        )?;
+        assert!(
+            compile(&root, InputFormat::HspiceDeck).is_err(),
+            "{tran} {options}"
+        );
+    }
     Ok(())
 }

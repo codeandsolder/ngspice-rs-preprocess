@@ -1,0 +1,20 @@
+[package]
+name = "model-analysis-plan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+publish.workspace = true
+description = "Typed source analysis artifact and bounded coordinate binding"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+model-normalize-ngspice.workspace = true
+model-preprocess-command.workspace = true
+model-statistics.workspace = true

@@ -107,12 +107,14 @@ fn normalize_options(text: &str, state: &mut DeckOptions, budget: &WorkBudget) -
             "TNOM" => state.nominal_temperature = true,
             "TEMP" => state.temperature = true,
             "ABSTOL" | "VNTOL" | "RELTOL" | "GMIN" | "ITL1" | "ITL2" | "ITL4" | "CHGTOL"
-            | "DELMAX" => (),
+            | "DELMAX" | "INTERP" | "RUNLVL" | "RMIN" | "RMAX" => (),
             _ => bail!("unqualified HSPICE option {}", field.name),
         }
         write!(native, " {}", field.name)?;
         if let Some(value) = field.expression {
             write!(native, "={value}")?;
+        } else if key == "INTERP" {
+            write!(native, "=1")?;
         } else {
             bail!("HSPICE numeric option {} requires a value", field.name);
         }

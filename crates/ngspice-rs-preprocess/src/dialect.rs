@@ -1019,7 +1019,11 @@ fn linked(
         session.budget(),
     )?;
     if request.format == InputFormat::SimetrixDeck {
-        plan.select_statistical_sample(options.statistical_sample, session.budget())?;
+        analysis_plan::select_statistical_sample(
+            &mut plan,
+            options.statistical_sample,
+            session.budget(),
+        )?;
     }
     let mut initial_conditions =
         prepare_linked_runtime(&mut linked, request.format, options, session.budget())?;
@@ -1049,7 +1053,7 @@ fn linked(
             session.budget(),
         )?;
     }
-    plan.append_native_options(&mut translated_root.bytes, session.budget())?;
+    analysis_plan::append_native_options(&plan, &mut translated_root.bytes, session.budget())?;
     check_closed_includes(&translated_root.bytes, &known)?;
     let remaining = options
         .output_bytes

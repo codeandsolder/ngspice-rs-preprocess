@@ -2,6 +2,7 @@
 members = [
     "crates/model-alb-xspice-ffi",
     "crates/model-alb-experimental",
+    "crates/model-analysis-plan",
     "crates/model-kernel-api",
     "crates/model-import-ltspice",
     "crates/model-prepare-osdi",
@@ -19,6 +20,7 @@ members = [
     "crates/ngspice-rs-preprocess",
 ]
 default-members = [
+    "crates/model-analysis-plan",
     "crates/model-kernel-api",
     "crates/model-import-ltspice",
     "crates/model-prepare-osdi",
@@ -46,6 +48,7 @@ repository = "https://github.com/codeandsolder/ngspice-rs-preprocess"
 publish = false
 
 [workspace.dependencies]
+model-analysis-plan = { path = "crates/model-analysis-plan", version = "=0.1.0" }
 model-alb-experimental = { path = "crates/model-alb-experimental", version = "=0.1.0" }
 model-compact-intrinsic = { path = "crates/model-compact-intrinsic", version = "=0.1.0" }
 model-kernel-api = { path = "crates/model-kernel-api", version = "=0.1.0" }

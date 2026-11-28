@@ -161,6 +161,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-analysis-plan"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "model-normalize-ngspice",
+ "model-preprocess-command",
+ "model-statistics",
+ "serde",
+]
+
+[[package]]
 name = "model-compact-intrinsic"
 version = "0.1.0"
 dependencies = [
@@ -289,6 +300,7 @@ name = "ngspice-rs-preprocess"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-analysis-plan",
  "model-import-ltspice",
  "model-kernel-diode",
  "model-normalize-ngspice",

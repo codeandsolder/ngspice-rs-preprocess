@@ -71,7 +71,11 @@ pub struct MeasurementIntent {
 }
 
 impl MeasurementIntent {
-    pub(super) fn parse_ltspice(statement: &str) -> Result<Self> {
+    /// Capture source measurement intent without executing it.
+    ///
+    /// # Errors
+    /// Malformed declaration or unsupported operation.
+    pub fn parse_ltspice(statement: &str) -> Result<Self> {
         let spans = model_normalize_ngspice::statement_token_spans(statement)?;
         let (_, operands) = spans
             .split_first()

@@ -481,10 +481,12 @@ or capacitances, or requires unchanged internal current observations, select
 ### Original analysis intent
 
 A translated dialect deck is an electrical artifact, not an implicitly
-executable replica of the original netlist. Manifest v13 and
+executable replica of the original netlist. Manifest v14 and
 `PreparedBundle::analysis_plan` carry an ordered analysis plan alongside
 the circuit, with explicit source dialect, title, lexical scope and
-declaration locations. Complete SIMetrix decks reserve their first
+declaration locations. The canonical artifact types and bounded scalar/axis
+binding live in the independent `model-analysis-plan` crate; the solver does
+not need to link the source translators. Complete SIMetrix decks reserve their first
 physical line as the title; include files and raw SIMPLIS streams do not.
 
 HSPICE preparation extracts OP, AC, DC and transient requests after
@@ -493,9 +495,16 @@ lexical occurrence binding. Multi-segment transient timing is a symbolic
 START gates output, UIC selects startup, and explicit DELMAX is a separate
 integration ceiling with its source location. The four-positional-operand
 legacy form is distinguished from two segments at candidate binding, not
-guessed while parsing. Omitted DELMAX retains the automatic HSPICE policy
-and requires a qualified consumer; it is not substituted with a native
-ngspice default. Independent SWEEP axes on AC and transient requests stay
+guessed while parsing. Conflicting positional and option DELMAX values are
+rejected: the published command and option references disagree on precedence.
+Omitted DELMAX retains the automatic HSPICE policy rather than an invented
+native limit. RUNLVL=1..6 (default 3) retains its soft duration/20 hint and
+ignores RMIN/RMAX. RUNLVL=0 binds hard segment-wise RMIN/RMAX limits
+(default multipliers 1e-9 and 5). INTERP=0 (default) saves internal accepted
+points; INTERP=1 requests linear interpolation at the output intervals, not
+forced solver landings. The typed policies do not claim a native RUNLVL
+implementation. Source references: HSPICE User Guide H-2013.03 p. 546,
+Reference Manual J-2014.09 p. 524 (INTERP), and E-2010.12 .TRAN/.OPTION DELMAX. Independent SWEEP axes on AC and transient requests stay
 separate from DC continuation coordinates. Analyses are removed from the
 electrical artifact, so a consumer must execute the typed plan.
 

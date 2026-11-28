@@ -13,6 +13,7 @@ description = "Unified SPICE source preparation interface"
 workspace = true
 
 [dependencies]
+model-analysis-plan.workspace = true
 model-statistics.workspace = true
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

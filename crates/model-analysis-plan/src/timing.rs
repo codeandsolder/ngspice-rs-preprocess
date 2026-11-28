@@ -33,13 +33,29 @@ pub enum TimingLayout {
     },
 }
 
-/// Deck-wide explicit integration ceiling and its declaration provenance.
+/// Deck-wide symbolic timing option and its declaration provenance.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SymbolicCeiling {
-    /// Ceiling expression.
+pub struct SymbolicTimingOption {
+    /// Numeric source expression.
     pub value: String,
     /// Original option location.
     pub origin: super::DirectiveOrigin,
+}
+
+/// Deck-wide source timing options. Absence and explicit default values
+/// retain distinct provenance; the native circuit never receives these.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HspiceTimingOptions {
+    /// Explicit integration ceiling.
+    pub delmax: Option<SymbolicTimingOption>,
+    /// Saved output interpolation flag (default off).
+    pub interp: Option<SymbolicTimingOption>,
+    /// Timestep-control algorithm level (default 3).
+    pub runlvl: Option<SymbolicTimingOption>,
+    /// Legacy minimum timestep multiplier.
+    pub rmin: Option<SymbolicTimingOption>,
+    /// Legacy maximum timestep multiplier.
+    pub rmax: Option<SymbolicTimingOption>,
 }
 
 /// Symbolic timing and bias-selection policy.
@@ -47,9 +63,8 @@ pub struct SymbolicCeiling {
 pub struct ScheduleIntent {
     /// Output layout.
     pub layout: TimingLayout,
-    /// Deck-wide explicit DELMAX, if supplied. Legacy positional DELMAX
-    /// takes precedence. Omission retains the automatic source policy.
-    pub delmax: Option<SymbolicCeiling>,
+    /// Source output and integration control, including explicit ceilings.
+    pub options: HspiceTimingOptions,
     /// Skip the transient operating point.
     pub uic: bool,
 }
@@ -72,6 +87,41 @@ pub enum IntegrationCeiling {
     Explicit(Vec<BoundTimingSegment>),
 }
 
+/// Saved output is distinct from accepted integration timepoints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SavedOutput {
+    /// Save the solver's accepted internal timepoints after START.
+    AcceptedSteps,
+    /// Interpolate between accepted points at the requested output intervals.
+    LinearInterpolation,
+}
+
+/// Legacy hard timestep bounds per absolute segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LegacyStepBounds {
+    /// Absolute segment end.
+    pub until: f64,
+    /// Minimum accepted step, TSTEP times RMIN.
+    pub minimum: f64,
+    /// Automatic hard maximum, TSTEP times RMAX; DELMAX may override it.
+    pub maximum: f64,
+}
+
+/// Original source timestep-control policy. A soft RUNLVL hint is not a
+/// hard cap and does not constitute a native implementation of RUNLVL.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StepControl {
+    /// Adaptive source RUNLVL policy; RMIN/RMAX do not apply.
+    RunLevel {
+        /// Level 1 through 6.
+        level: u8,
+        /// Documented initial soft maximum, not a hard step ceiling.
+        soft_maximum: f64,
+    },
+    /// RUNLVL=0 with hard timestep bounds.
+    Legacy(Vec<LegacyStepBounds>),
+}
+
 /// Timing ready for execution-policy selection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundSchedule {
@@ -81,6 +131,10 @@ pub struct BoundSchedule {
     pub output: Vec<BoundTimingSegment>,
     /// Independent integration ceiling.
     pub ceiling: IntegrationCeiling,
+    /// Saved-output policy. TSTEP is never an implicit landing constraint.
+    pub saved_output: SavedOutput,
+    /// Source-selected timestep control (separate from explicit DELMAX).
+    pub step_control: StepControl,
     /// Skip the bias solve.
     pub uic: bool,
 }
@@ -124,8 +178,17 @@ impl ScheduleIntent {
                 segment(second)?;
             }
         }
-        if let Some(cap) = &self.delmax {
-            record(&cap.value)?;
+        for option in [
+            &self.options.delmax,
+            &self.options.interp,
+            &self.options.runlvl,
+            &self.options.rmin,
+            &self.options.rmax,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            record(&option.value)?;
         }
         if values.values().any(Option::is_none) {
             return Ok(None);
@@ -186,15 +249,72 @@ impl ScheduleIntent {
             previous = segment.until;
         }
         ensure!(!output.is_empty(), "empty transient output schedule");
-        let cap = match legacy_cap {
-            Some(cap) => Some(cap),
-            None => self
-                .delmax
+        let mut option = |option: &Option<SymbolicTimingOption>, default: f64| {
+            option
                 .as_ref()
-                .map(|cap| resolve(&cap.value))
-                .transpose()?,
+                .map_or(Ok(default), |option| resolve(&option.value))
         };
-        let ceiling = if let Some(step) = cap {
+        let saved_output = match option(&self.options.interp, 0.)? {
+            0. => SavedOutput::AcceptedSteps,
+            1. => SavedOutput::LinearInterpolation,
+            _ => anyhow::bail!("HSPICE INTERP requires 0 or 1"),
+        };
+        let level = match option(&self.options.runlvl, 3.)? {
+            0. => 0,
+            1. => 1,
+            2. => 2,
+            3. => 3,
+            4. => 4,
+            5. => 5,
+            6. => 6,
+            _ => anyhow::bail!("HSPICE RUNLVL requires an integer from 0 to 6"),
+        };
+        let step_control = if level == 0 {
+            let rmin = option(&self.options.rmin, 1e-9)?;
+            let rmax = option(&self.options.rmax, 5.)?;
+            ensure!(
+                rmin.is_finite() && rmax.is_finite() && rmin > 0. && rmax >= rmin,
+                "invalid HSPICE legacy timestep multipliers"
+            );
+            let limits = output
+                .iter()
+                .map(|segment| {
+                    let minimum = segment.step * rmin;
+                    let maximum = segment.step * rmax;
+                    ensure!(
+                        minimum > 0. && maximum.is_finite(),
+                        "HSPICE legacy timestep bounds overflow or underflow"
+                    );
+                    Ok(LegacyStepBounds {
+                        until: segment.until,
+                        minimum,
+                        maximum,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            StepControl::Legacy(limits)
+        } else {
+            StepControl::RunLevel {
+                level,
+                soft_maximum: (previous - start) / 20.,
+            }
+        };
+        let option_cap = self
+            .options
+            .delmax
+            .as_ref()
+            .map(|cap| resolve(&cap.value))
+            .transpose()?;
+        // The published .TRAN and .OPTION DELMAX references disagree on
+        // precedence. Do not select different physical integration bounds
+        // until independently qualified; equivalent settings are unambiguous.
+        if let (Some(positional), Some(deck)) = (legacy_cap, option_cap) {
+            ensure!(
+                positional.to_bits() == deck.to_bits(),
+                "conflicting positional and option HSPICE DELMAX requires qualified precedence"
+            );
+        }
+        let ceiling = if let Some(step) = legacy_cap.or(option_cap) {
             ensure!(step.is_finite() && step > 0., "invalid transient DELMAX");
             IntegrationCeiling::Explicit(vec![BoundTimingSegment {
                 until: previous,
@@ -207,6 +327,8 @@ impl ScheduleIntent {
             start,
             output,
             ceiling,
+            saved_output,
+            step_control,
             uic: self.uic,
         })
     }
@@ -214,7 +336,11 @@ impl ScheduleIntent {
 
 /// Parse already normalized HSPICE timing operands, excluding independent
 /// sweep clauses. No expression is evaluated before candidate binding.
-pub(crate) fn hspice(args: &[String]) -> Result<ScheduleIntent> {
+/// Parse symbolic segmented timing after HSPICE analysis sweep extraction.
+///
+/// # Errors
+/// Invalid or unsupported timing grammar.
+pub fn hspice(args: &[String]) -> Result<ScheduleIntent> {
     let mut operands = Vec::new();
     let mut start = None;
     let mut uic = false;
@@ -264,7 +390,7 @@ pub(crate) fn hspice(args: &[String]) -> Result<ScheduleIntent> {
     };
     Ok(ScheduleIntent {
         layout,
-        delmax: None,
+        options: HspiceTimingOptions::default(),
         uic,
     })
 }
@@ -281,7 +407,7 @@ mod tests {
     #[test]
     fn legacy_and_second_segment_are_selected_after_binding() -> Result<()> {
         let mut intent = parse(".tran 1n 10n {third} {fourth} UIC")?;
-        intent.delmax = Some(SymbolicCeiling {
+        intent.options.delmax = Some(SymbolicTimingOption {
             value: "0.25n".into(),
             origin: super::super::DirectiveOrigin::Generated {
                 artifact: "test.cir".into(),
@@ -289,7 +415,7 @@ mod tests {
                 last_line: 2,
             },
         });
-        for (fourth, expected_count) in [(0.5e-9, 1), (20e-9, 2)] {
+        for (fourth, expected_count) in [(0.25e-9, 1), (20e-9, 2)] {
             let result = intent.bind(|raw| match raw {
                 "{third}" => Ok(2e-9),
                 "{fourth}" => Ok(fourth),

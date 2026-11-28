@@ -42,7 +42,7 @@ fn cli_and_library_have_identical_artifacts_and_manifest() -> Result<()> {
     );
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
-    assert_eq!(manifest["version"], 13);
+    assert_eq!(manifest["version"], 14);
     assert_eq!(
         manifest["artifacts"][0]["provenance"]["source_graph"]["visits"][0]["dialect"],
         "native"

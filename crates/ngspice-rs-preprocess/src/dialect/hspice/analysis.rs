@@ -239,7 +239,7 @@ pub(super) fn extract(
         Some(title.to_owned()),
     );
     let mut electrical = String::new();
-    let mut delmax = None;
+    let mut timing_options = timing::HspiceTimingOptions::default();
     for (index, (line, origin)) in text.lines().zip(origins).enumerate() {
         budget.charge(Resource::ScannedBytes, line.len())?;
         let name = command(line);
@@ -307,9 +307,20 @@ pub(super) fn extract(
                 .map_or("", |(_, tail)| tail);
             let mut retained = String::from(".options");
             for field in parse_parameter_fields(tail, &[])? {
-                if field.name.eq_ignore_ascii_case("DELMAX") {
-                    delmax = Some(timing::SymbolicCeiling {
-                        value: field.expression.context("missing DELMAX value")?,
+                let key = field.name.to_ascii_uppercase();
+                let option = match key.as_str() {
+                    "DELMAX" => Some(&mut timing_options.delmax),
+                    "INTERP" => Some(&mut timing_options.interp),
+                    "RUNLVL" => Some(&mut timing_options.runlvl),
+                    "RMIN" => Some(&mut timing_options.rmin),
+                    "RMAX" => Some(&mut timing_options.rmax),
+                    _ => None,
+                };
+                if let Some(option) = option {
+                    *option = Some(timing::SymbolicTimingOption {
+                        value: field
+                            .expression
+                            .context("missing HSPICE timing option value")?,
                         origin: DirectiveOrigin::Source {
                             path: origin.source.clone(),
                             first_line: origin.line,
@@ -334,7 +345,7 @@ pub(super) fn extract(
     }
     for entry in &mut plan.entries {
         if let Directive::ScheduledTransient { intent } = &mut entry.directive {
-            intent.delmax.clone_from(&delmax);
+            intent.options.clone_from(&timing_options);
             intent.try_bind_closed(budget)?;
         }
     }

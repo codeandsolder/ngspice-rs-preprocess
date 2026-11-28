@@ -172,7 +172,11 @@ pub struct SweepAxis {
     pub cardinality: Cardinality,
 }
 
-pub(super) fn name(raw: &str) -> Result<String> {
+/// Validate and retain one source sweep identifier.
+///
+/// # Errors
+/// Empty identifier or a token containing source grammar delimiters.
+pub fn name(raw: &str) -> Result<String> {
     ensure!(
         !raw.is_empty()
             && raw
@@ -183,10 +187,11 @@ pub(super) fn name(raw: &str) -> Result<String> {
     Ok(raw.to_owned())
 }
 
-pub(super) fn target(
-    args: &[String],
-    allow_display_name: bool,
-) -> Result<(SweepTarget, &[String])> {
+/// Decode a source target and return its unconsumed coordinate operands.
+///
+/// # Errors
+/// Missing or malformed source target.
+pub fn target(args: &[String], allow_display_name: bool) -> Result<(SweepTarget, &[String])> {
     let (first, rest) = args.split_first().context("missing sweep target")?;
     if first.eq_ignore_ascii_case("param") {
         let (parameter, rest) = rest.split_first().context("missing swept parameter name")?;
@@ -229,12 +234,17 @@ pub(super) fn target(
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum RangeMode {
+/// Keyword-selected arithmetic or logarithmic sweep range.
+pub enum RangeMode {
+    /// Arithmetic increment.
     Linear,
+    /// Logarithmic interval density.
     Logarithmic(LogInterval),
 }
 
-pub(super) fn range_mode(value: &str) -> Option<RangeMode> {
+/// Decode a source range keyword without interpreting its scalar operands.
+#[must_use]
+pub fn range_mode(value: &str) -> Option<RangeMode> {
     match value.to_ascii_lowercase().as_str() {
         "lin" => Some(RangeMode::Linear),
         "oct" => Some(RangeMode::Logarithmic(LogInterval::Octave)),
