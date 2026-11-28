@@ -73,7 +73,7 @@ The SIMetrix diode records positive-current injection and depletion
 continuation when active. VDMOS records channel direction (including the
 quasi-saturation branch), mobility threshold, hard channel cutoff, triode/
 saturation boundary, gate-drain charge join, reverse diode continuation,
-avalanche, and thermal depletion potential/continuation. Numerical
+avalanche, its temperature-dependent matching regime, and thermal depletion potential/continuation. Numerical
 rearrangements of analytic functions (scaled exponential, softplus, etc.)
 are not physical branch sites. Invalid constitutive domains are errors,
 not synthetic guards.
@@ -87,6 +87,8 @@ channel, body diode, gate charge, series resistance, electrothermal and
 hidden recovery equations to the same arithmetic, sharing nodal assembly.
 The avalanche temperature root uses the converged scalar root and formal
 series Newton iteration, not differentiation of a finite scalar iteration.
+The matching excess is retained separately from one and the positive root
+is bracketed above the tangent, avoiding cancellation near the matching boundary.
 The existing recovery row transformation is retained; no fictitious storage
 term is introduced for a temperature-dependent recovery rate gain.
 
