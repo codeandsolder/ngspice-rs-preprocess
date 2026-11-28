@@ -346,7 +346,10 @@ fn named_analysis_coordinates_are_not_mistaken_for_native_devices() -> Result<()
 fn linked_ltspice_analysis_is_extracted_with_occurrence_and_bound_axes() -> Result<()> {
     use ngspice_rs_preprocess::{
         WorkBudget,
-        analysis_plan::sweep::{SweepExecution, SweepTarget},
+        analysis_plan::{
+            MeasurementOperation,
+            sweep::{SweepExecution, SweepTarget},
+        },
     };
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("root.cir");
