@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use super::{DialectContext, OpaqueSource, ScopedStatement};
 
 mod bsim3_junction;
+mod bsim4_occurrence;
 pub use bsim3_junction::{
-    HspiceBsim3BerkeleyJunctions, HspiceBsim3JunctionInput, HspiceBsim3LinearReverseJunctions,
-    HspiceJunctionSourceOptions,
+    HspiceBsim3JunctionInput, HspiceBsim3Junctions, HspiceJunctionSourceOptions,
 };
 
 /// Simulator implementation identity. Different charge, temperature and
@@ -192,6 +192,29 @@ fn one<'a>(fields: &'a [ModelParameter], name: &str) -> Result<Option<&'a str>> 
         .as_deref()
         .map(Some)
         .with_context(|| format!("{name} requires a value"))
+}
+
+/// Resolve one coefficient across all of its source aliases. Presence is
+/// distinct from an explicit zero and duplicate aliases are errors.
+fn finite_coefficient(
+    fields: &[ModelParameter],
+    names: &[&str],
+    mut evaluate: impl FnMut(&str) -> Result<f64>,
+) -> Result<Option<f64>> {
+    let mut selected = None;
+    for name in names {
+        if let Some(raw) = one(fields, name)? {
+            ensure!(
+                selected.is_none(),
+                "duplicate coefficient aliases {names:?}"
+            );
+            let value =
+                evaluate(raw).with_context(|| format!("model or occurrence coefficient {name}"))?;
+            ensure!(value.is_finite(), "nonfinite coefficient {name}");
+            selected = Some(value);
+        }
+    }
+    Ok(selected)
 }
 
 fn required<'a>(fields: &'a [ModelParameter], name: &str) -> Result<&'a str> {

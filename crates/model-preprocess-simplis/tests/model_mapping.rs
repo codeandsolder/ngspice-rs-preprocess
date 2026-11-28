@@ -344,9 +344,11 @@ fn hspice_junction_modes_keep_area_selection_separate_from_resistance() -> Resul
 
 #[test]
 fn hspice_berkeley_junction_binding_separates_geometry_and_series_modes() -> Result<()> {
-    use model_compact_intrinsic::MosDiffusionTerminal;
+    use model_compact_intrinsic::{MosDiffusionTerminal, PreparedMosJunction};
     use model_normalize_ngspice::model_card::parse_spice_constant;
-    use model_preprocess_simplis::source_dialect::model_mapping::HspiceBsim3JunctionInput;
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        HspiceBsim3JunctionInput, HspiceJunctionSourceOptions,
+    };
 
     fn close(actual: f64, expected: f64) {
         assert!(
@@ -381,10 +383,18 @@ fn hspice_berkeley_junction_binding_separates_geometry_and_series_modes() -> Res
                 let selection = mapping
                     .select_card(&lines[0], &[], &WorkBudget::default())?
                     .context("selection")?;
-                let bound = selection.bind_hspice_bsim3_berkeley_junctions(298.15, 1., |raw| {
-                    Ok(parse_spice_constant(raw)?)
-                })?;
+                let bound = selection.bind_hspice_bsim3_junctions(
+                    HspiceJunctionSourceOptions {
+                        nominal_temperature_k: 298.15,
+                        model_scale: 1.,
+                        aspec: false,
+                        update: 0,
+                    },
+                    |raw| Ok(parse_spice_constant(raw)?),
+                )?;
                 let [drain, source] = bound.prepare(input)?;
+                assert!(matches!(drain, PreparedMosJunction::BerkeleyBsim3(_)));
+                assert!(matches!(source, PreparedMosJunction::BerkeleyBsim3(_)));
                 close(drain.resistance_ohm(), drain_r);
                 // Width=9um, light path=0.7um, RS=60 and RSC=3.
                 let source_r = if acm == 10 {
@@ -422,13 +432,21 @@ fn hspice_berkeley_junction_binding_separates_geometry_and_series_modes() -> Res
         .select_card(&lines[0], &[], &WorkBudget::default())?
         .context("selection")?;
     let [drain, _source] = selection
-        .bind_hspice_bsim3_berkeley_junctions(300.15, 1., |raw| {
-            if raw.trim_matches(['\'', '"']) == "local_cj" {
-                Ok(0.002)
-            } else {
-                Ok(parse_spice_constant(raw)?)
-            }
-        })?
+        .bind_hspice_bsim3_junctions(
+            HspiceJunctionSourceOptions {
+                nominal_temperature_k: 300.15,
+                model_scale: 1.,
+                aspec: false,
+                update: 0,
+            },
+            |raw| {
+                if raw.trim_matches(['\'', '"']) == "local_cj" {
+                    Ok(0.002)
+                } else {
+                    Ok(parse_spice_constant(raw)?)
+                }
+            },
+        )?
         .prepare(HspiceBsim3JunctionInput {
             diffusion: [
                 MosDiffusionTerminal {
@@ -444,20 +462,22 @@ fn hspice_berkeley_junction_binding_separates_geometry_and_series_modes() -> Res
         drain.evaluate(0.)?.capacitance_f,
         2e-12 * 0.002 + 2e-6 * 1e-10 + 8e-6 * 3e-10,
     );
-    for suffix in [
-        "ACM=3",
-        "ACM=10 PB=0.8 PHIB=0.9",
-        "ACM=10 CJSW=1e-10 CJSW=2e-10",
-    ] {
+    for suffix in ["ACM=10 PB=0.8 PHIB=0.9", "ACM=10 CJSW=1e-10 CJSW=2e-10"] {
         let lines = statements(&format!(".model m NMOS LEVEL=53 VERSION=3.3 {suffix}"));
         let selection = mapping
             .select_card(&lines[0], &[], &WorkBudget::default())?
             .context("selection")?;
         assert!(
             selection
-                .bind_hspice_bsim3_berkeley_junctions(300.15, 1., |raw| Ok(parse_spice_constant(
-                    raw
-                )?))
+                .bind_hspice_bsim3_junctions(
+                    HspiceJunctionSourceOptions {
+                        nominal_temperature_k: 300.15,
+                        model_scale: 1.,
+                        aspec: false,
+                        update: 0
+                    },
+                    |raw| Ok(parse_spice_constant(raw)?)
+                )
                 .is_err()
         );
     }
@@ -468,7 +488,9 @@ fn hspice_berkeley_junction_binding_separates_geometry_and_series_modes() -> Res
 fn hspice_berkeley_junction_binding_converts_explicit_model_units() -> Result<()> {
     use model_compact_intrinsic::MosDiffusionTerminal;
     use model_normalize_ngspice::model_card::parse_spice_constant;
-    use model_preprocess_simplis::source_dialect::model_mapping::HspiceBsim3JunctionInput;
+    use model_preprocess_simplis::source_dialect::model_mapping::{
+        HspiceBsim3JunctionInput, HspiceJunctionSourceOptions,
+    };
 
     let mapping = table(".options HSPICEMODELS=1")?;
     let input = HspiceBsim3JunctionInput {
@@ -486,9 +508,15 @@ fn hspice_berkeley_junction_binding_converts_explicit_model_units() -> Result<()
             .select_card(&lines[0], &[], &WorkBudget::default())?
             .context("selection")?;
         selection
-            .bind_hspice_bsim3_berkeley_junctions(298.15, global_scale, |raw| {
-                Ok(parse_spice_constant(raw)?)
-            })?
+            .bind_hspice_bsim3_junctions(
+                HspiceJunctionSourceOptions {
+                    nominal_temperature_k: 298.15,
+                    model_scale: global_scale,
+                    aspec: false,
+                    update: 0,
+                },
+                |raw| Ok(parse_spice_constant(raw)?),
+            )?
             .prepare(input)
     };
     for (si, scaled) in [
@@ -533,7 +561,7 @@ fn hspice_berkeley_junction_binding_converts_explicit_model_units() -> Result<()
 
 #[test]
 fn hspice_linear_reverse_junctions_bind_source_laws_and_geometry() -> Result<()> {
-    use model_compact_intrinsic::MosDiffusionTerminal;
+    use model_compact_intrinsic::{MosDiffusionTerminal, PreparedMosJunction};
     use model_normalize_ngspice::model_card::parse_spice_constant;
     use model_preprocess_simplis::source_dialect::model_mapping::{
         HspiceBsim3JunctionInput, HspiceJunctionSourceOptions,
@@ -596,10 +624,10 @@ fn hspice_linear_reverse_junctions_bind_source_laws_and_geometry() -> Result<()>
                 .select_card(&lines[0], &[], &WorkBudget::default())?
                 .context("selection")?;
             let [drain, source] = selection
-                .bind_hspice_bsim3_linear_reverse_junctions(options, |raw| {
-                    Ok(parse_spice_constant(raw)?)
-                })?
+                .bind_hspice_bsim3_junctions(options, |raw| Ok(parse_spice_constant(raw)?))?
                 .prepare(input)?;
+            assert!(matches!(drain, PreparedMosJunction::LinearReverse(_)));
+            assert!(matches!(source, PreparedMosJunction::LinearReverse(_)));
             close(drain.resistance_ohm(), drain_r * 1.1);
             close(source.resistance_ohm(), source_r * 1.05);
             let weighted = js * extent + 3e-8 * perim;
@@ -662,9 +690,7 @@ fn hspice_linear_reverse_source_options_and_unit_scaling() -> Result<()> {
             .select_card(&lines[0], &[], &WorkBudget::default())?
             .context("selection")?;
         selection
-            .bind_hspice_bsim3_linear_reverse_junctions(settings, |raw| {
-                Ok(parse_spice_constant(raw)?)
-            })?
+            .bind_hspice_bsim3_junctions(settings, |raw| Ok(parse_spice_constant(raw)?))?
             .prepare(input)
     };
     let aspec = HspiceJunctionSourceOptions {
@@ -677,13 +703,19 @@ fn hspice_linear_reverse_source_options_and_unit_scaling() -> Result<()> {
     assert!(ordinary[0].evaluate(0.2)?.current_a > 0.);
     assert_eq!(absent[0].evaluate(0.2)?.current_a, 0.);
     assert_eq!(absent[0].evaluate(0.)?.capacitance_f, 0.);
-    let contact = bind("ACM=1 RD=30 RSH=5 RDC=3 CJ=0", aspec)?;
-    let old_update = bind(
-        "ACM=1 RD=30 RSH=5 RDC=3 CJ=0",
-        HspiceJunctionSourceOptions { update: 0, ..aspec },
-    )?;
-    assert_eq!(contact[0].resistance_ohm(), 43.);
-    assert_eq!(old_update[0].resistance_ohm(), 13.);
+    for acm in [1, 11] {
+        let fields = format!("ACM={acm} RD=30 RS=40 RSH=5 RDC=3 RSC=4 CJ=0");
+        let contact = bind(&fields, aspec)?;
+        let old_update = bind(&fields, HspiceJunctionSourceOptions { update: 0, ..aspec })?;
+        assert_eq!(contact[0].resistance_ohm(), 43.);
+        assert_eq!(contact[1].resistance_ohm(), 44.);
+        assert_eq!(old_update[0].resistance_ohm(), 13.);
+        assert_eq!(old_update[1].resistance_ohm(), 4.);
+        let thermal = bind(&format!("{fields} TRD=0.002 TRS=-0.001"), aspec)?;
+        let delta = input.operating_temperature_k - options.nominal_temperature_k;
+        assert!((thermal[0].resistance_ohm() - 43. * (1. + 0.002 * delta)).abs() < 1e-12);
+        assert!((thermal[1].resistance_ohm() - 44. * (1. - 0.001 * delta)).abs() < 1e-12);
+    }
     for (acm, physical_js, physical_cj, scaled_js, scaled_cj) in [
         (1, 2e-8, 2e-10, 2e-14, 2e-16),
         (2, 0.1, 0.001, 1e-13, 1e-15),
@@ -720,7 +752,6 @@ fn hspice_linear_reverse_source_options_and_unit_scaling() -> Result<()> {
         }
     }
     for suffix in [
-        "ACM=10",
         "ACM=0 TLEV=4",
         "ACM=0 TLEVC=4",
         "ACM=0 N=0",
@@ -729,6 +760,106 @@ fn hspice_linear_reverse_source_options_and_unit_scaling() -> Result<()> {
         "ACM=0 TLEV=2 GAP2=-1",
     ] {
         assert!(bind(suffix, options).is_err(), "{suffix}");
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_bsim4_occurrence_modifiers_preserve_scope_bins_and_revisions() -> Result<()> {
+    use model_compact_intrinsic::{Bsim4OccurrenceModifiers, Bsim4PrimaryCoefficients};
+    use model_normalize_ngspice::model_card::{instance_fields, parse_spice_constant};
+
+    let mapping = table(".options HSPICEMODELS=1")?;
+    let instance = instance_fields(
+        "RDC=12 RSC=-8 DELVTO=shift MULU0=1.5 DELK1=-0.5 DELNFCT=0.25",
+        3,
+    )?;
+    for version in ["4.5", "4.6.4", "4.70"] {
+        let lines = statements(&format!(
+            ".model m PMOS LEVEL=54 VERSION={version} TRD=shift TRS=-0.001"
+        ));
+        let selection = mapping
+            .select_card(&lines[0], &[], &WorkBudget::default())?
+            .context("selection")?;
+        let modifiers = selection.bind_hspice_bsim4_occurrence_modifiers(
+            &instance,
+            |raw| {
+                if raw == "shift" {
+                    Ok(0.002)
+                } else {
+                    Ok(parse_spice_constant(raw)?)
+                }
+            },
+            |raw| {
+                if raw == "shift" {
+                    Ok(0.1)
+                } else {
+                    Ok(parse_spice_constant(raw)?)
+                }
+            },
+        )?;
+        assert_eq!(modifiers.series.temperature_per_k, [0.002, -0.001]);
+        assert_eq!(modifiers.series.contact_per_finger_ohm, [12., -8.]);
+        assert_eq!(modifiers.channel.threshold_shift_v, 0.1);
+        assert_eq!(modifiers.channel.mobility_multiplier, 1.5);
+        assert_eq!(modifiers.channel.subthreshold_factor_shift, 0.25);
+        for k1 in [0.4, 0.8] {
+            let modified = modifiers.channel.apply(Bsim4PrimaryCoefficients {
+                threshold_voltage_v: -0.7,
+                mobility_m2_per_vs: 0.04,
+                body_effect_sqrt_v: k1,
+                subthreshold_factor: 1.,
+            })?;
+            assert_eq!(modified.resets.body_effect_shift, k1 < 0.5);
+            assert!((modified.coefficients.threshold_voltage_v + 0.6).abs() < 1e-15);
+        }
+        let series = modifiers.series.prepare([3., 4.], 4., 300., 350.)?;
+        assert_eq!(series.reset_contact, [false, true]);
+        assert!((series.resistance_ohm[0] - 6.6).abs() < 1e-13);
+        assert!((series.resistance_ohm[1] - 3.8).abs() < 1e-13);
+        for bad in [
+            "DELVTO=0.1 DELVT0=0.2",
+            "MULU0=1 MULU0=2",
+            "RDC",
+            "DELK1=missing",
+        ] {
+            let fields = instance_fields(bad, 3)?;
+            assert!(
+                selection
+                    .bind_hspice_bsim4_occurrence_modifiers(
+                        &fields,
+                        |_| Ok(0.),
+                        |raw| Ok(parse_spice_constant(raw)?)
+                    )
+                    .is_err(),
+                "{bad}"
+            );
+        }
+    }
+    let lines = statements(".model m NMOS LEVEL=54 VERSION=4.5");
+    let selection = mapping
+        .select_card(&lines[0], &[], &WorkBudget::default())?
+        .context("selection")?;
+    assert_eq!(
+        selection.bind_hspice_bsim4_occurrence_modifiers(&[], |_| Ok(0.), |_| Ok(0.))?,
+        Bsim4OccurrenceModifiers::default()
+    );
+    for model in [
+        ".model m NMOS LEVEL=54",
+        ".model m NMOS LEVEL=54 VERSION=4.80",
+        ".model m NMOS LEVEL=14 VERSION=4.5",
+        ".model m NMOS LEVEL=49 VERSION=3.24",
+    ] {
+        let lines = statements(model);
+        let selection = mapping
+            .select_card(&lines[0], &[], &WorkBudget::default())?
+            .context("selection")?;
+        assert!(
+            selection
+                .bind_hspice_bsim4_occurrence_modifiers(&[], |_| Ok(0.), |_| Ok(0.))
+                .is_err(),
+            "{model}"
+        );
     }
     Ok(())
 }

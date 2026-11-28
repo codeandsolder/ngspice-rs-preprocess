@@ -220,9 +220,8 @@ impl Bsim3JunctionModel {
             self.limiting_current_a,
             reference,
         )?;
-        let resistance_ohm = occurrence
-            .series
-            .prepare(rules.resistance, occurrence.dimensions)?;
+        let resistance_ohm =
+            occurrence.prepare_resistance(rules.resistance, self.nominal_temperature_k)?;
         Ok(PreparedBsim3Junction {
             conduction,
             depletion,

@@ -1,20 +1,20 @@
-//! Source binding for the Berkeley junction branch of BSIM3 levels 49/53.
+//! Source binding for both physical junction branches of BSIM3 levels 49/53.
 //!
 //! This resolves junction coefficients after occurrence-specific parameter
 //! evaluation. It does not choose, qualify or lower the intrinsic channel.
 //! HSPICE MOSFET Models Manual X-2005.09, pp. 402–404 and 423–425.
 
-use super::{HspiceBsim3Defaults, HspiceMosJunctionMode, ModelSelection, one};
+use super::{HspiceBsim3Defaults, HspiceMosJunctionMode, ModelSelection, finite_coefficient};
 
 mod linear_reverse;
-use anyhow::{Context, Result, bail, ensure};
-pub use linear_reverse::{HspiceBsim3LinearReverseJunctions, HspiceJunctionSourceOptions};
+use anyhow::{Context, Result, ensure};
+
 use model_compact_intrinsic::{
     Bsim3JunctionModel, Bsim3JunctionRules, Bsim3KneeReference, MosBottomDensity,
     MosDepletionShape, MosDepletionTemperatureCoefficients, MosDiffusionDimensions,
     MosDiffusionRule, MosDiffusionTerminal, MosJunctionDepletion, MosJunctionOccurrence,
-    MosJunctionSaturation, MosSaturationFallback, MosSeriesResistance, MosSeriesResistanceRule,
-    MosSidewallRule, PreparedBsim3Junction,
+    MosJunctionSaturation, MosLinearReverseGeometry, MosLinearReverseModel, MosSaturationFallback,
+    MosSeriesResistance, MosSeriesResistanceRule, MosSidewallRule, PreparedMosJunction,
 };
 
 /// The two independently supplied terminal geometries of one occurrence.
@@ -33,26 +33,70 @@ pub struct HspiceBsim3JunctionInput {
     pub operating_temperature_k: f64,
 }
 
-/// Source-selected Berkeley junction preparation. It holds no solver state.
+/// Global source settings in effect at a selected model occurrence.
+/// Model-card SCALM, TNOM/TREF and thermal selectors override their defaults.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HspiceBsim3BerkeleyJunctions {
-    model: Bsim3JunctionModel,
-    rules: Bsim3JunctionRules,
+pub struct HspiceJunctionSourceOptions {
+    pub nominal_temperature_k: f64,
+    pub model_scale: f64,
+    pub aspec: bool,
+    pub update: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum JunctionLaw {
+    Berkeley {
+        model: Bsim3JunctionModel,
+        rules: Bsim3JunctionRules,
+    },
+    LinearReverse {
+        model: MosLinearReverseModel,
+        direct_capacitance_f: [f64; 2],
+        mode: MosLinearReverseGeometry,
+        resistance: MosSeriesResistanceRule,
+    },
+}
+
+/// Source-selected physical junction preparation, with no solver state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HspiceBsim3Junctions {
+    law: JunctionLaw,
     geometry: JunctionGeometry,
 }
 
-impl HspiceBsim3BerkeleyJunctions {
-    /// Prepare drain/source junctions after channel and occurrence geometry
-    /// have been resolved. Parallel multiplicity is applied by the consumer.
+impl HspiceBsim3Junctions {
+    /// Prepare both terminals after occurrence geometry is resolved.
+    /// Parallel multiplicity is applied by the consumer.
     ///
     /// # Errors
     /// Invalid physical occurrence geometry, temperature or coefficients.
-    pub fn prepare(self, input: HspiceBsim3JunctionInput) -> Result<[PreparedBsim3Junction; 2]> {
+    pub fn prepare(&self, input: HspiceBsim3JunctionInput) -> Result<[PreparedMosJunction; 2]> {
         let [drain, source] = self.geometry.occurrences(input);
-        Ok([
-            self.model.prepare(self.rules, drain)?,
-            self.model.prepare(self.rules, source)?,
-        ])
+        let prepare = |index: usize, occurrence| -> Result<PreparedMosJunction> {
+            Ok(match self.law {
+                JunctionLaw::Berkeley { model, rules } => {
+                    PreparedMosJunction::BerkeleyBsim3(model.prepare(rules, occurrence)?)
+                }
+                JunctionLaw::LinearReverse {
+                    model,
+                    direct_capacitance_f,
+                    mode,
+                    resistance,
+                } => {
+                    let terminal = MosLinearReverseModel {
+                        depletion: MosJunctionDepletion {
+                            fallback_f: direct_capacitance_f[index],
+                            ..model.depletion
+                        },
+                        ..model
+                    };
+                    PreparedMosJunction::LinearReverse(
+                        terminal.prepare(mode, resistance, occurrence)?,
+                    )
+                }
+            })
+        };
+        Ok([prepare(0, drain)?, prepare(1, source)?])
     }
 }
 
@@ -62,6 +106,7 @@ struct JunctionGeometry {
     width_offset_m: f64,
     heavy_diffusion_m: f64,
     series: [MosSeriesResistance; 2],
+    resistance_temperature_per_k: [f64; 2],
 }
 
 impl JunctionGeometry {
@@ -81,6 +126,7 @@ impl JunctionGeometry {
                 default_squares: input.default_squares[index],
                 ..self.series[index]
             },
+            resistance_temperature_per_k: self.resistance_temperature_per_k[index],
             operating_temperature_k: input.operating_temperature_k,
         })
     }
@@ -93,23 +139,7 @@ struct Coefficients<'a, F> {
 
 impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
     fn optional(&mut self, names: &[&str]) -> Result<Option<f64>> {
-        let mut selected = None;
-        for name in names {
-            if let Some(raw) = one(&self.selection.card.parameters, name)? {
-                ensure!(
-                    selected.is_none(),
-                    "duplicate BSIM3 junction aliases {names:?}"
-                );
-                let value = (self.evaluate)(raw)
-                    .with_context(|| format!("BSIM3 junction parameter {name}"))?;
-                ensure!(
-                    value.is_finite(),
-                    "nonfinite BSIM3 junction parameter {name}"
-                );
-                selected = Some(value);
-            }
-        }
-        Ok(selected)
+        finite_coefficient(&self.selection.card.parameters, names, &mut self.evaluate)
     }
 
     fn real(&mut self, names: &[&str], default: f64) -> Result<f64> {
@@ -157,6 +187,7 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
             width_offset_m: self.real(&["XW"], 0.)? * model_scale,
             heavy_diffusion_m: self.real(&["HDIF"], 0.)? * model_scale,
             series: [drain, source],
+            resistance_temperature_per_k: [self.real(&["TRD"], 0.)?, self.real(&["TRS"], 0.)?],
         })
     }
 
@@ -245,24 +276,20 @@ impl<F: FnMut(&str) -> Result<f64>> Coefficients<'_, F> {
 }
 
 impl ModelSelection {
-    /// Resolve the source's Berkeley-mode junction coefficients using the
-    /// caller's occurrence-aware expression evaluator.
-    ///
-    /// `model_scale` is the global model length-unit scale, overridden by an
-    /// explicit card-local SCALM; the instance
-    /// dimensions supplied later are in SI. The source's junction geometry
-    /// and parasitic resistance modes are intentionally resolved separately.
-    /// This API prepares the junction branch only, not a complete BSIM3 model.
+    /// Bind the selected source junction law with an occurrence-aware scalar
+    /// evaluator. ACM selects the constitutive law and resistance policy;
+    /// the caller does not repeat that decision. Model SCALM overrides the
+    /// global length-unit scale; supplied occurrence geometry is in SI.
+    /// This does not qualify or lower the intrinsic BSIM3 channel.
     ///
     /// # Errors
-    /// Wrong source family, a non-Berkeley junction selector, duplicate
-    /// aliases, nonfinite coefficients or unsupported source revision.
-    pub fn bind_hspice_bsim3_berkeley_junctions(
+    /// Wrong source family, unsupported revision, duplicate aliases,
+    /// invalid selectors or nonfinite coefficients.
+    pub fn bind_hspice_bsim3_junctions(
         &self,
-        nominal_temperature_k: f64,
-        model_scale: f64,
+        options: HspiceJunctionSourceOptions,
         evaluate: impl FnMut(&str) -> Result<f64>,
-    ) -> Result<HspiceBsim3BerkeleyJunctions> {
+    ) -> Result<HspiceBsim3Junctions> {
         self.hspice_bsim3_defaults()
             .context("not an HSPICE BSIM3 model")?;
         ensure!(
@@ -272,38 +299,66 @@ impl ModelSelection {
         let selected = self
             .hspice_mos_junction()?
             .context("missing BSIM3 junction selector")?;
-        let resistance = match selected.mode {
-            HspiceMosJunctionMode::BerkeleyExplicit => MosSeriesResistanceRule::Explicit,
-            HspiceMosJunctionMode::BerkeleyWidthNormalized => {
-                MosSeriesResistanceRule::WidthDependent
-            }
-            HspiceMosJunctionMode::BerkeleyIsolated | HspiceMosJunctionMode::BerkeleyStacked => {
-                MosSeriesResistanceRule::AutomaticSquares
-            }
-            _ => bail!("non-Berkeley BSIM3 junction requires its distinct constitutive law"),
-        };
-        let rules = Bsim3JunctionRules {
-            diffusion: if selected.automatic_bsim3_geometry {
-                MosDiffusionRule::Isolated
-            } else {
-                MosDiffusionRule::ExplicitPhysical
-            },
-            sidewall: MosSidewallRule::SplitPerimeter,
-            resistance,
-            knee_reference: Bsim3KneeReference::Resolved,
-        };
         let mut c = Coefficients {
             selection: self,
             evaluate,
         };
-        let model_scale = c.model_scale(model_scale)?;
-        let model = c.junction_model(nominal_temperature_k, model_scale)?;
+        let scale = c.model_scale(options.model_scale)?;
         let ldif = c.real(&["LDIF"], 0.)?;
-        let geometry = c.geometry(model_scale, ldif)?;
-        Ok(HspiceBsim3BerkeleyJunctions {
-            model,
-            rules,
-            geometry,
+        let resistance = match selected.mode {
+            HspiceMosJunctionMode::HspiceExplicit | HspiceMosJunctionMode::BerkeleyExplicit => {
+                MosSeriesResistanceRule::Explicit
+            }
+            HspiceMosJunctionMode::HspiceWidthNormalized
+            | HspiceMosJunctionMode::BerkeleyWidthNormalized => {
+                if options.aspec && options.update >= 1 && ldif == 0. {
+                    MosSeriesResistanceRule::DirectContact
+                } else {
+                    MosSeriesResistanceRule::WidthDependent
+                }
+            }
+            HspiceMosJunctionMode::HspiceIsolated
+            | HspiceMosJunctionMode::HspiceStacked
+            | HspiceMosJunctionMode::BerkeleyIsolated
+            | HspiceMosJunctionMode::BerkeleyStacked => MosSeriesResistanceRule::AutomaticSquares,
+        };
+        let mode = match selected.mode {
+            HspiceMosJunctionMode::HspiceExplicit => Some(MosLinearReverseGeometry::Explicit),
+            HspiceMosJunctionMode::HspiceWidthNormalized => {
+                Some(MosLinearReverseGeometry::WidthNormalized)
+            }
+            HspiceMosJunctionMode::HspiceIsolated => Some(MosLinearReverseGeometry::Isolated),
+            HspiceMosJunctionMode::HspiceStacked => Some(MosLinearReverseGeometry::Stacked),
+            HspiceMosJunctionMode::BerkeleyExplicit
+            | HspiceMosJunctionMode::BerkeleyWidthNormalized
+            | HspiceMosJunctionMode::BerkeleyIsolated
+            | HspiceMosJunctionMode::BerkeleyStacked => None,
+        };
+        let law = if let Some(mode) = mode {
+            JunctionLaw::LinearReverse {
+                model: c.linear_reverse_model(options, scale, mode)?,
+                direct_capacitance_f: [c.real(&["CBD"], 0.)?, c.real(&["CBS"], 0.)?],
+                mode,
+                resistance,
+            }
+        } else {
+            JunctionLaw::Berkeley {
+                model: c.junction_model(options.nominal_temperature_k, scale)?,
+                rules: Bsim3JunctionRules {
+                    diffusion: if selected.automatic_bsim3_geometry {
+                        MosDiffusionRule::Isolated
+                    } else {
+                        MosDiffusionRule::ExplicitPhysical
+                    },
+                    sidewall: MosSidewallRule::SplitPerimeter,
+                    resistance,
+                    knee_reference: Bsim3KneeReference::Resolved,
+                },
+            }
+        };
+        Ok(HspiceBsim3Junctions {
+            law,
+            geometry: c.geometry(scale, ldif)?,
         })
     }
 }

@@ -8,7 +8,7 @@ use super::{
     MosDepletionComponent, MosDepletionShape, MosDepletionTemperatureCoefficients,
     MosDiffusionRule, MosJunctionDepletion, MosJunctionOccurrence, MosJunctionPoint,
     MosJunctionSaturation, MosLinearReverseJunction, MosSeriesResistanceRule, MosSidewallRule,
-    finite, mos_resistance_at_temperature, nonnegative, positive, prepare_mos_diffusion,
+    finite, nonnegative, positive, prepare_mos_diffusion,
 };
 use crate::ModelError;
 
@@ -161,7 +161,10 @@ impl MosLinearReverseTemperature {
                 let adjusted = potential.mul_add(self.ratio, self.potential_offset_v);
                 (
                     adjusted,
-                    grading.mul_add((400e-6 * self.delta_k + 1.) - adjusted / potential, 1.),
+                    grading.mul_add(
+                        400e-6_f64.mul_add(self.delta_k, 1.) - adjusted / potential,
+                        1.,
+                    ),
                 )
             }
             MosDepletionThermalLaw::Linear(coeff) => (
@@ -242,7 +245,6 @@ pub struct MosLinearReverseModel {
     pub reverse_transition_v: f64,
     pub reverse_slope_divisor: f64,
     pub transit_time_s: f64,
-    pub resistance_temperature_per_k: f64,
 }
 
 /// Immutable per-terminal current, charge and resistance preparation.
@@ -304,14 +306,8 @@ impl MosLinearReverseModel {
             )
         };
         let depletion = [adjust(0)?, adjust(1)?, adjust(2)?];
-        let resistance_ohm = mos_resistance_at_temperature(
-            occurrence
-                .series
-                .prepare(resistance, occurrence.dimensions)?,
-            self.resistance_temperature_per_k,
-            self.nominal_temperature_k,
-            occurrence.operating_temperature_k,
-        )?;
+        let resistance_ohm =
+            occurrence.prepare_resistance(resistance, self.nominal_temperature_k)?;
         Ok(PreparedMosLinearReverseJunction {
             conduction,
             depletion,

@@ -195,7 +195,6 @@ fn model(width_normalized: bool) -> MosLinearReverseModel {
         reverse_transition_v: -0.7,
         reverse_slope_divisor: 5.,
         transit_time_s: 4e-9,
-        resistance_temperature_per_k: 0.002,
     }
 }
 
@@ -327,6 +326,7 @@ fn geometry_current_charge_and_resistance_are_composed_without_losing_presence()
                 terminal,
                 gate_width_m: 0.1e-6,
                 series: SERIES,
+                resistance_temperature_per_k: 0.002,
                 operating_temperature_k: t,
             };
             let prepared = m.prepare(mode, resistance, occurrence)?;

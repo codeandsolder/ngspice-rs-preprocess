@@ -357,6 +357,7 @@ mod native_oracle {
                 terminal,
                 gate_width_m: DIMENSIONS.diffusion_width()?,
                 series: MosSeriesResistance { squares, ..MODEL },
+                resistance_temperature_per_k: 0.,
                 operating_temperature_k: temperature_c + 273.15,
             },
         )?)

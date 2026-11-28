@@ -319,7 +319,53 @@ pub struct MosJunctionOccurrence {
     /// Electrical width used for the sidewall/gate-edge split.
     pub gate_width_m: f64,
     pub series: MosSeriesResistance,
+    /// Terminal-specific temperature coefficient of the entire series resistance.
+    pub resistance_temperature_per_k: f64,
     pub operating_temperature_k: f64,
+}
+
+impl MosJunctionOccurrence {
+    fn prepare_resistance(
+        self,
+        rule: MosSeriesResistanceRule,
+        nominal_temperature_k: f64,
+    ) -> Result<f64, ModelError> {
+        mos_resistance_at_temperature(
+            self.series.prepare(rule, self.dimensions)?,
+            self.resistance_temperature_per_k,
+            nominal_temperature_k,
+            self.operating_temperature_k,
+        )
+    }
+}
+
+/// The physical constitutive law selected at preparation, independent of source syntax.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PreparedMosJunction {
+    BerkeleyBsim3(PreparedBsim3Junction),
+    LinearReverse(PreparedMosLinearReverseJunction),
+}
+
+impl PreparedMosJunction {
+    /// Single-device series resistance before parallel multiplicity.
+    #[must_use = "the solver uses the resistance for topology and stamping"]
+    pub const fn resistance_ohm(&self) -> f64 {
+        match self {
+            Self::BerkeleyBsim3(junction) => junction.resistance_ohm(),
+            Self::LinearReverse(junction) => junction.resistance_ohm(),
+        }
+    }
+
+    /// Evaluate current and charge, with analytic voltage derivatives.
+    ///
+    /// # Errors
+    /// Nonfinite voltage or nonrepresentable physical output.
+    pub fn evaluate(&self, voltage_v: f64) -> Result<MosJunctionPoint, ModelError> {
+        match self {
+            Self::BerkeleyBsim3(junction) => junction.evaluate(voltage_v),
+            Self::LinearReverse(junction) => junction.evaluate(voltage_v),
+        }
+    }
 }
 
 /// One zero-bias capacitance contribution with a power-law depletion region
