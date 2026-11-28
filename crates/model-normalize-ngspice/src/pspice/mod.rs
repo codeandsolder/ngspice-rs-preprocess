@@ -16,6 +16,8 @@ use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeMap, fmt::Write as _};
 
+pub mod digital_instance;
+pub mod digital_io;
 pub mod digital_timing;
 mod instances;
 mod nodes;
