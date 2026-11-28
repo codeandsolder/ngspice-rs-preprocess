@@ -76,7 +76,7 @@ pub struct ParsedLibrary {
     dialect: Option<crate::source_dialect::DialectContext>,
     device_identities: Vec<crate::source_dialect::DeviceIdentity>,
     source_id: String,
-    source_graph: Option<LibrarySourceGraph>,
+    source_graph: Option<Box<LibrarySourceGraph>>,
     scoped_statements: Vec<crate::source_dialect::ScopedStatement>,
     source_name: String,
     source_names: BTreeSet<String>,
@@ -148,8 +148,8 @@ impl ParsedLibrary {
 
     /// Physical resource graph retained by an admitted source library.
     #[must_use = "the returned graph maps retained statements to resource occurrences"]
-    pub const fn source_graph(&self) -> Option<&LibrarySourceGraph> {
-        self.source_graph.as_ref()
+    pub fn source_graph(&self) -> Option<&LibrarySourceGraph> {
+        self.source_graph.as_deref()
     }
 
     /// Original declarations and linked tokens before specialization.
@@ -1216,7 +1216,7 @@ pub fn parse_standalone_library(
         dialect,
         device_identities: Vec::new(),
         source_id: String::new(),
-        source_graph,
+        source_graph: source_graph.map(Box::new),
         scoped_statements: statements,
         source_name,
         source_names,

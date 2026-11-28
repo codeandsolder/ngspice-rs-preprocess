@@ -9,7 +9,8 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
-    linked_source::{LinkLimits, RootKind, SourceLinker},
+    SourceStatement,
+    linked_source::{LinkLimits, LinkedSource, RootKind, SourceLinker},
     model_card::{
         FunctionSignature, parse_function_signature, parse_parameter_declarations,
         parse_parameter_fields,
@@ -104,72 +105,9 @@ pub(super) fn linked_resource(
     let mut statements = Vec::new();
     let mut origins = Vec::new();
     for row in linked.logical_statements(kind, budget)? {
-        let first = linked
-            .origin(row.first_line)
-            .context("missing logical source origin")?;
-        let last = linked
-            .origin(row.last_line)
-            .context("missing continuation source origin")?;
-        ensure!(
-            first.visit == last.visit,
-            "logical statement crosses source visits"
-        );
-        let visit = linked
-            .visits
-            .get(first.visit)
-            .context("missing source visit")?;
-        let text = if row.text.trim_ascii_start().starts_with(b"*") {
-            String::from_utf8_lossy(&row.text).into_owned()
-        } else {
-            String::from_utf8(row.text).with_context(|| {
-                format!(
-                    "{}:{}: invalid source encoding",
-                    first.path.display(),
-                    first.line
-                )
-            })?
-        };
-        if kind != RootKind::Deck || row.first_line != 1 {
-            ensure!(
-                !matches!(
-                    analysis_plan::command(&text).as_str(),
-                    ".CONTROL" | ".ENDC" | ".FILE" | ".ENDF"
-                ),
-                "unsupported standalone SPICE command at {}:{}: {text}",
-                first.path.display(),
-                first.line
-            );
-        }
-        let source = display_path(&first.path);
-        budget.charge(Resource::GeneratedNodes, 2)?;
-        budget.charge(
-            Resource::EmittedBytes,
-            first
-                .path
-                .as_os_str()
-                .len()
-                .saturating_add(source.len())
-                .saturating_add(text.len()),
-        )?;
-        statements.push(ScopedStatement {
-            source,
-            context: DialectContext {
-                language: visit.dialect,
-                separator: visit.separator,
-            },
-            first_line: first.line,
-            last_line: last.line,
-            text,
-        });
-        origins.push(OriginLine {
-            source: first.path.clone(),
-            line: first.line,
-            last_line: last.line,
-            linked: Some(LinkedLocation {
-                visit: first.visit,
-                scope: first.scope,
-            }),
-        });
+        let (statement, origin) = project_linked_row(&linked, row, kind, budget)?;
+        statements.push(statement);
+        origins.push(origin);
     }
     let mut sources = BTreeSet::new();
     for visit in &linked.visits {
@@ -188,6 +126,81 @@ pub(super) fn linked_resource(
             scopes: linked.scopes,
         },
     })
+}
+
+fn project_linked_row(
+    linked: &LinkedSource,
+    row: SourceStatement,
+    kind: RootKind,
+    budget: &WorkBudget,
+) -> Result<(ScopedStatement, OriginLine)> {
+    let first = linked
+        .origin(row.first_line)
+        .context("missing logical source origin")?;
+    let last = linked
+        .origin(row.last_line)
+        .context("missing continuation source origin")?;
+    ensure!(
+        first.visit == last.visit,
+        "logical statement crosses source visits"
+    );
+    let visit = linked
+        .visits
+        .get(first.visit)
+        .context("missing source visit")?;
+    let text = if row.text.trim_ascii_start().starts_with(b"*") {
+        String::from_utf8_lossy(&row.text).into_owned()
+    } else {
+        String::from_utf8(row.text).with_context(|| {
+            format!(
+                "{}:{}: invalid source encoding",
+                first.path.display(),
+                first.line
+            )
+        })?
+    };
+    if kind != RootKind::Deck || row.first_line != 1 {
+        ensure!(
+            !matches!(
+                analysis_plan::command(&text).as_str(),
+                ".CONTROL" | ".ENDC" | ".FILE" | ".ENDF"
+            ),
+            "unsupported standalone SPICE command at {}:{}: {text}",
+            first.path.display(),
+            first.line
+        );
+    }
+    let source = display_path(&first.path);
+    budget.charge(Resource::GeneratedNodes, 2)?;
+    budget.charge(
+        Resource::EmittedBytes,
+        first
+            .path
+            .as_os_str()
+            .len()
+            .saturating_add(source.len())
+            .saturating_add(text.len()),
+    )?;
+    let statement = ScopedStatement {
+        source,
+        context: DialectContext {
+            language: visit.dialect,
+            separator: visit.separator,
+        },
+        first_line: first.line,
+        last_line: last.line,
+        text,
+    };
+    let origin = OriginLine {
+        source: first.path.clone(),
+        line: first.line,
+        last_line: last.line,
+        linked: Some(LinkedLocation {
+            visit: first.visit,
+            scope: first.scope,
+        }),
+    };
+    Ok((statement, origin))
 }
 
 #[derive(Default)]
@@ -547,6 +560,47 @@ fn lower_parameter_functions(
     Ok(Some(output))
 }
 
+fn validate_device(
+    command: &str,
+    text: &str,
+    fields: &[std::ops::Range<usize>],
+    hspice: bool,
+) -> Result<()> {
+    if !command.starts_with('.') {
+        let kind = command.as_bytes()[0];
+        ensure!(
+            matches!(
+                kind,
+                b'R' | b'C'
+                    | b'L'
+                    | b'V'
+                    | b'I'
+                    | b'E'
+                    | b'G'
+                    | b'F'
+                    | b'H'
+                    | b'B'
+                    | b'X'
+                    | b'D'
+                    | b'M'
+            ),
+            "HSPICE device {command} requires qualified model/device lowering"
+        );
+        if hspice && kind == b'D' {
+            for field in fields.iter().skip(4) {
+                let token = &text[field.clone()];
+                ensure!(
+                    !["W", "L", "LM", "LP", "WM", "WP", "THERMAL"]
+                        .iter()
+                        .any(|name| token.eq_ignore_ascii_case(name)),
+                    "geometric or thermal HSPICE diode instance is not qualified"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn lower_card(
     text: &str,
     context: DialectContext,
@@ -596,38 +650,7 @@ fn lower_card(
         budget.charge(Resource::GeneratedNodes, signature.formals.len())?;
         return lower_function(&signature, body, context, limit, budget);
     }
-    if !command.starts_with('.') {
-        let kind = command.as_bytes()[0];
-        ensure!(
-            matches!(
-                kind,
-                b'R' | b'C'
-                    | b'L'
-                    | b'V'
-                    | b'I'
-                    | b'E'
-                    | b'G'
-                    | b'F'
-                    | b'H'
-                    | b'B'
-                    | b'X'
-                    | b'D'
-                    | b'M'
-            ),
-            "HSPICE device {command} requires qualified model/device lowering"
-        );
-        if kind == b'D' {
-            for field in fields.iter().skip(4) {
-                let token = &text[field.clone()];
-                ensure!(
-                    !["W", "L", "LM", "LP", "WM", "WP", "THERMAL"]
-                        .iter()
-                        .any(|name| token.eq_ignore_ascii_case(name)),
-                    "geometric or thermal HSPICE diode instance is not qualified"
-                );
-            }
-        }
-    }
+    validate_device(&command, text, &fields, hspice)?;
     let mut source = match command.as_str() {
         ".OPTION" | ".OPTIONS" | ".OPT" if hspice => normalize_options(text, state, budget)?,
         ".TEMP" => {
@@ -754,17 +777,22 @@ fn validate_policy(statement: &ScopedStatement, independent_catalog: bool) -> Re
     Ok(())
 }
 
+fn validate_root_policies(statements: &[ScopedStatement], budget: &WorkBudget) -> Result<()> {
+    for statement in statements.iter().skip(1) {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
+        validate_policy(statement, false)?;
+    }
+    Ok(())
+}
+
 fn lower_expansion(
     statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
     input_origins: Vec<crate::OriginLine>,
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<LoweredExpansion> {
-    for statement in statements.iter().skip(1) {
-        budget.charge(Resource::EvaluationSteps, 1)?;
-        budget.charge(Resource::ScannedBytes, statement.text.len())?;
-        validate_policy(statement, false)?;
-    }
+    validate_root_policies(statements, budget)?;
     let dcap = depletion_mode(
         statements.get(1..).context("missing HSPICE deck title")?,
         budget,
