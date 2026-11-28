@@ -266,3 +266,26 @@ For the signed loss contract (#278), explicit Rpar emits
 unmodified. Negative series or series-inductance shunt conductance
 does not define a finite nonnegative thermal generator, while the
 network-level noiseless selector suppresses all generators.
+
+## Automatic capacitance partition and default leakage during startup
+
+When Lser is nonzero and Cpar omitted, the automatic Cpar is not an
+additive capacitor. It partitions the positive written C before the
+temperature polynomial, with Cpar=max(C,0)*1e-6 and primary C reduced
+by Cpar. At 10 kHz, C2u Lser3m RLshunt20 Rpar0 gives
+0.676692224531295-j0.06361808524489823, exactly matching explicit
+C1.999998u Cpar2p with the same loss coefficients. The negative RLshunt
+case likewise exactly matches the partition at 10 kHz, 505 kHz and
+1 MHz; m=3 also matches. Explicit Cpar is additive, including zero.
+For C2u Rser5 Lser3m tc=.01 at 127 C, the exact explicit comparison
+is C3.999996u Cpar2p, not C4u or C3.999998u. The omitted leakage law
+uses the reduced, temperature-adjusted primary: C1e9 Lser3m gives
+OP 1.980198039407902 V, with tc=.01 at 127 C gives 1.960784352172242 V.
+
+With a written capacitor IC, explicit Rpar is excluded from the soft
+voltage constraint equation, but the default terminal leakage remains
+active. For source 2 V via 10 ohms, C1e9 IC=.5 Rser5, OP is
+0.9966777408637874 V; tc=.01 at 127 C gives 0.9933774834437087 V;
+m=3 gives 0.9900990099009901 V. Explicit Rpar=20 or Rpar=0 gives 1 V.
+The native selector pn_gterminal_during_bias=1 keeps the independently
+defined terminal damping active without modifying the IC forcing RHS.

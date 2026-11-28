@@ -92,7 +92,11 @@ impl<'a> Card<'a> {
         if !self.appended.is_empty() {
             let suffix = format!(" {}", self.appended.join(" "));
             budget.charge(Resource::EmittedBytes, suffix.len())?;
-            if let Some((_, replacement)) = self.replacements.first_mut() {
+            if let Some((_, replacement)) = self
+                .replacements
+                .iter_mut()
+                .find(|(_, replacement)| replacement.is_empty())
+            {
                 *replacement = suffix.trim_ascii_start().as_bytes().to_vec();
             } else {
                 let field = self
@@ -274,7 +278,30 @@ fn storage(card: &mut Card<'_>, budget: &WorkBudget) -> Result<()> {
     let multiplicity = card.scalar(b"m")?.unwrap_or("1");
     let lser = card.scalar(b"lser")?;
     let cpar = card.scalar(b"cpar")?;
-    let mut physical = storage_initialization(card, inductor, multiplicity, budget)?;
+    let main = std::str::from_utf8(&text[card.fields[3].clone()])?;
+    // The automatic terminal capacitance is a partition of the written
+    // main capacitance, not an additive component. Explicit Cpar is additive.
+    // Partition before applying the main storage temperature polynomial.
+    let mut main_storage = main.to_owned();
+    if !inductor
+        && cpar.is_none()
+        && let Some(lser) = lser
+    {
+        let partition = format!(
+            "ternary_fcn(({})==0,0,max(({}),0)*1e-6)",
+            expression(lser),
+            expression(main)
+        );
+        let parallel = format!("{{{partition}}}");
+        let reduced = format!("{{({})-({partition})}}", expression(main));
+        main_storage = crate::ltspice::closed_scalar(reduced.as_bytes(), budget)?
+            .map_or(reduced, |value| value.to_string());
+        card.derived("pn_cparallel", &parallel, budget)?;
+        card.replacements
+            .push((card.fields[3].clone(), main_storage.as_bytes().to_vec()));
+    }
+    let has_initialization = storage_initialization(card, inductor, multiplicity, budget)?;
+    let mut physical = has_initialization;
     let explicit_rser = card.rename(b"rser", "pn_rseries")?;
     physical |= explicit_rser;
     if inductor && !explicit_rser {
@@ -282,14 +309,19 @@ fn storage(card: &mut Card<'_>, budget: &WorkBudget) -> Result<()> {
         physical = true;
     }
     if card.scalar(b"rpar")?.is_none() {
+        if !inductor && has_initialization {
+            card.push("pn_gterminal_during_bias", "1");
+        }
         // Only omitted Rpar enables terminal leakage. Explicit zero disables
         // it. The default is active in DC and transient, not AC.
         if contextual_leakage {
             card.push("pn_gterminal_positive_storage_dc", "1e-12");
             card.push("pn_gterminal_positive_storage_tran", "1e-12");
         } else {
-            let main = std::str::from_utf8(&text[card.fields[3].clone()])?;
-            let leakage = format!("{{{}}}", default_leakage(main, multiplicity, inductor));
+            let leakage = format!(
+                "{{{}}}",
+                default_leakage(&main_storage, multiplicity, inductor)
+            );
             card.derived("pn_gterminal_dc", &leakage, budget)?;
             card.derived("pn_gterminal_tran", &leakage, budget)?;
         }
@@ -303,21 +335,6 @@ fn storage(card: &mut Card<'_>, budget: &WorkBudget) -> Result<()> {
     }
     physical |= card.rename(b"lser", "pn_lseries")?;
     physical |= card.rename(b"cpar", "pn_cparallel")?;
-    if !inductor
-        && cpar.is_none()
-        && let Some(lser) = lser
-    {
-        let main = std::str::from_utf8(&text[card.fields[3].clone()])?;
-        card.derived(
-            "pn_cparallel",
-            &format!(
-                "{{ternary_fcn(({})==0,0,max(({}),0)*1e-6)}}",
-                expression(lser),
-                expression(main)
-            ),
-            budget,
-        )?;
-    }
     storage_shunt(card, lser, multiplicity, budget)?;
     // A symbolic multiplicity may remove the network at elaboration. Keep
     // its original name and scalar instead of dividing by M here.
@@ -531,6 +548,7 @@ mod tests {
                         "{name}: {actual} != {want}"
                     );
                 }
+                ensure!(value("pn_gterminal_during_bias")? == (name == "C1").then_some(1.));
                 if matches!(name, "L2" | "L3") {
                     ensure!(value("pn_rseries_uncoupled")? == Some(1e-3));
                     ensure!(value("pn_rseries")?.is_none());
@@ -569,7 +587,7 @@ mod tests {
         let library = ModelLibrary::parse_source(bytes, RootKind::Deck)?;
         let statements = crate::lexical::statements(bytes)?;
         for (c, l, m, c_leak, l_leak, cpar) in [
-            (2e-6, 3e-3, 1., 2e-18, 1e-12 / 3e-3, 2e-12),
+            (2e-6, 3e-3, 1., 1.999998e-18, 1e-12 / 3e-3, 2e-12),
             (-2e-6, -3e-3, 1., 0., 0., 0.),
             (2e-6, 3e-3, -2., 0., 0., 2e-12),
             (-2e-6, -3e-3, -2., -2e-18, -1e-12 / 3e-3, 0.),
@@ -600,6 +618,15 @@ mod tests {
                     .find(|card| card.text.starts_with(format!("{name} ").as_bytes()))
                     .context("missing device")?;
                 let text = std::str::from_utf8(&card.text)?;
+                if name == "C1" {
+                    let tokens = crate::lexical::tokens(&card.text)?;
+                    let actual =
+                        library.evaluate_scalar(1, &text[tokens[3].clone()], &overrides)?;
+                    ensure!(
+                        (actual - (c - cpar)).abs() <= 1e-13 * c.abs().max(1e-22),
+                        "primary capacitance partition {actual}"
+                    );
+                }
                 let fields =
                     parse_assignments(&text[text.find("pn_").context("missing coefficients")?..])?;
                 for (key, want) in expected {
