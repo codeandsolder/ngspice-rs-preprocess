@@ -1,14 +1,17 @@
 //! Standalone HSPICE resource admission and native artifact preparation.
 //! HSPICE compatibility is local to source resources; no simulator global
 //! compatibility flag is set by this producer.
-use super::{SourceExpansion, analysis_plan};
+use super::analysis_plan;
 use crate::{
-    AdmittedSource, Cancellation, NativeProjection, Options, PreparedBundle, Request, Resource,
-    SourceSession, WorkBudget, native_bundle,
+    AdmittedSource, Cancellation, LinkedLocation, NativeProjection, Options, OriginLine,
+    PreparedBundle, Request, Resource, SourceGraph, SourceSession, WorkBudget, display_path,
+    native_bundle,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
-    linked_source::RootKind,
+    SourceStatement,
+    controlled_transfer::ControlledTransfer,
+    linked_source::{LinkLimits, LinkedSource, RootKind, SourceLinker},
     model_card::{
         FunctionSignature, parse_function_signature, parse_parameter_declarations,
         parse_parameter_fields,
@@ -16,21 +19,191 @@ use model_normalize_ngspice::{
     statement_token_spans,
 };
 use model_preprocess_simplis::{
-    lower_spice_expression,
-    source_dialect::{DialectContext, SourceDialect},
+    LibrarySourceGraph, lower_spice_expression, parse_standalone_library,
+    source_dialect::{
+        DialectContext, ScopedStatement, SourceDialect, model_mapping::ModelSelection,
+    },
 };
-use std::fmt::Write as _;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+};
 
 mod analysis;
 mod bsim4_catalog;
 mod hierarchy;
 mod models;
 mod mos;
+mod pspice;
 
 pub(super) const HSPICE: DialectContext = DialectContext {
     language: SourceDialect::Hspice,
     separator: None,
 };
+
+pub(super) struct LinkedExpansion {
+    pub(super) context: DialectContext,
+    pub(super) statements: Vec<ScopedStatement>,
+    pub(super) sources: BTreeSet<String>,
+    origins: Vec<OriginLine>,
+    graph: SourceGraph,
+}
+
+impl LinkedExpansion {
+    pub(super) fn into_library(
+        self,
+        source: String,
+        budget: &WorkBudget,
+    ) -> Result<crate::ParsedLibrary> {
+        budget.charge(Resource::GeneratedNodes, self.origins.len())?;
+        let locations = self
+            .origins
+            .into_iter()
+            .map(|origin| origin.linked.context("missing admitted library occurrence"))
+            .collect::<Result<Vec<_>>>()?;
+        parse_standalone_library(
+            source,
+            self.sources,
+            self.context,
+            self.statements,
+            Some(LibrarySourceGraph {
+                graph: self.graph,
+                locations,
+            }),
+            budget,
+        )
+    }
+}
+
+/// Resource admission and lexical projection are shared with native decks.
+/// HSPICE-specific semantics begin only after the graph has been admitted.
+pub(super) fn linked_resource(
+    source: &AdmittedSource,
+    inherited: DialectContext,
+    kind: RootKind,
+    request: &Request,
+    options: &Options,
+    session: &mut SourceSession,
+) -> Result<LinkedExpansion> {
+    let linked = SourceLinker {
+        search_paths: request.search_paths.clone(),
+        dialect: inherited.language,
+    }
+    .link_admitted_with_separator(
+        source,
+        kind,
+        LinkLimits {
+            output_bytes: options.output_bytes,
+        },
+        inherited.separator,
+        session,
+    )?;
+    let root = linked.visits.first().context("missing root source visit")?;
+    let context = DialectContext {
+        language: root.dialect,
+        separator: root.separator,
+    };
+    let budget = session.budget();
+    let mut statements = Vec::new();
+    let mut origins = Vec::new();
+    for row in linked.logical_statements(kind, budget)? {
+        let (statement, origin) = project_linked_row(&linked, row, kind, budget)?;
+        statements.push(statement);
+        origins.push(origin);
+    }
+    let mut sources = BTreeSet::new();
+    for visit in &linked.visits {
+        let name = display_path(&visit.path);
+        budget.charge(Resource::EmittedBytes, name.len())?;
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        sources.insert(name);
+    }
+    Ok(LinkedExpansion {
+        context,
+        statements,
+        sources,
+        origins,
+        graph: SourceGraph {
+            visits: linked.visits,
+            scopes: linked.scopes,
+        },
+    })
+}
+
+fn project_linked_row(
+    linked: &LinkedSource,
+    row: SourceStatement,
+    kind: RootKind,
+    budget: &WorkBudget,
+) -> Result<(ScopedStatement, OriginLine)> {
+    let first = linked
+        .origin(row.first_line)
+        .context("missing logical source origin")?;
+    let last = linked
+        .origin(row.last_line)
+        .context("missing continuation source origin")?;
+    ensure!(
+        first.visit == last.visit,
+        "logical statement crosses source visits"
+    );
+    let visit = linked
+        .visits
+        .get(first.visit)
+        .context("missing source visit")?;
+    let text = if row.text.trim_ascii_start().starts_with(b"*") {
+        String::from_utf8_lossy(&row.text).into_owned()
+    } else {
+        String::from_utf8(row.text).with_context(|| {
+            format!(
+                "{}:{}: invalid source encoding",
+                first.path.display(),
+                first.line
+            )
+        })?
+    };
+    if kind != RootKind::Deck || row.first_line != 1 {
+        ensure!(
+            !matches!(
+                analysis_plan::command(&text).as_str(),
+                ".CONTROL" | ".ENDC" | ".FILE" | ".ENDF"
+            ),
+            "unsupported standalone SPICE command at {}:{}: {text}",
+            first.path.display(),
+            first.line
+        );
+    }
+    let source = display_path(&first.path);
+    budget.charge(Resource::GeneratedNodes, 2)?;
+    budget.charge(
+        Resource::EmittedBytes,
+        first
+            .path
+            .as_os_str()
+            .len()
+            .saturating_add(source.len())
+            .saturating_add(text.len()),
+    )?;
+    let statement = ScopedStatement {
+        source,
+        context: DialectContext {
+            language: visit.dialect,
+            separator: visit.separator,
+        },
+        first_line: first.line,
+        last_line: last.line,
+        text,
+    };
+    let origin = OriginLine {
+        source: first.path.clone(),
+        line: first.line,
+        last_line: last.line,
+        linked: Some(LinkedLocation {
+            visit: first.visit,
+            scope: first.scope,
+        }),
+    };
+    Ok((statement, origin))
+}
 
 #[derive(Default)]
 struct DeckOptions {
@@ -174,6 +347,7 @@ fn controlled_value_start(
     text: &str,
     ranges: &[std::ops::Range<usize>],
     kind: u8,
+    language: SourceDialect,
 ) -> Result<usize> {
     let token = |index: usize| ranges.get(index).map_or("", |range| &text[range.clone()]);
     let mode = token(3).to_ascii_uppercase();
@@ -207,6 +381,12 @@ fn controlled_value_start(
             .context("missing HSPICE controlled expression")?
             .start);
     }
+    if mode == "LAPLACE" && language == SourceDialect::Hspice && matches!(kind, b'E' | b'G') {
+        return Ok(ranges
+            .get(6)
+            .context("missing HSPICE Laplace coefficients")?
+            .start);
+    }
     ensure!(
         ![
             "TABLE", "LAPLACE", "FREQ", "VCR", "VCCAP", "CCCR", "CCCAP", "DELAY"
@@ -228,6 +408,7 @@ fn controlled_value_start(
 /// named 1x is legal and is not a one-mega engineering literal.
 fn map_values(
     text: &str,
+    language: SourceDialect,
     limit: usize,
     budget: &WorkBudget,
     mut map: impl FnMut(&str, usize) -> Result<String>,
@@ -309,7 +490,7 @@ fn map_values(
             Some(b'X') => assignment_start(),
             Some(b'M') => start(6),
             Some(b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => start(3),
-            Some(kind @ (b'E'..=b'H')) => controlled_value_start(text, &ranges, *kind)?,
+            Some(kind @ (b'E'..=b'H')) => controlled_value_start(text, &ranges, *kind, language)?,
             Some(b'D') => start(4),
             _ => text.len(),
         },
@@ -410,42 +591,25 @@ fn lower_parameter_functions(
     Ok(Some(output))
 }
 
-fn lower_card(
+fn validate_diode_geometry(text: &str, fields: &[std::ops::Range<usize>]) -> Result<()> {
+    for field in fields.iter().skip(4) {
+        let token = &text[field.clone()];
+        ensure!(
+            !["W", "L", "LM", "LP", "WM", "WP", "THERMAL"]
+                .iter()
+                .any(|name| token.eq_ignore_ascii_case(name)),
+            "geometric or thermal HSPICE diode instance is not qualified"
+        );
+    }
+    Ok(())
+}
+
+fn validate_device(
+    command: &str,
     text: &str,
-    context: DialectContext,
-    state: &mut DeckOptions,
-    limit: usize,
-    budget: &WorkBudget,
-) -> Result<String> {
-    let text = text.trim();
-    if text.is_empty() || text.starts_with('*') {
-        return Ok(text.to_owned());
-    }
-    let command = analysis_plan::command(text);
-    let hspice = context.language == SourceDialect::Hspice;
-    let fields = statement_token_spans(text)?;
-    if command == ".SUBCKT" {
-        state.depth += 1;
-        budget.check_depth(state.depth)?;
-    } else if command == ".ENDS" {
-        state.depth = state.depth.checked_sub(1).context("unmatched .ENDS")?;
-    }
-    if state.depth > 0
-        && (matches!(command.as_str(), ".OPTION" | ".OPTIONS" | ".OPT")
-            || matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN" | ".TEMP"))
-    {
-        bail!("HSPICE scoped parameters/options require hierarchy lowering");
-    }
-    if command == ".FUNC" {
-        let tail = text
-            .split_once(char::is_whitespace)
-            .context("empty function declaration")?
-            .1;
-        budget.charge(Resource::ScannedBytes, tail.len())?;
-        let (signature, body) = parse_function_signature(tail)?;
-        budget.charge(Resource::GeneratedNodes, signature.formals.len())?;
-        return lower_function(&signature, body, context, limit, budget);
-    }
+    fields: &[std::ops::Range<usize>],
+    hspice: bool,
+) -> Result<()> {
     if !command.starts_with('.') {
         let kind = command.as_bytes()[0];
         ensure!(
@@ -466,18 +630,82 @@ fn lower_card(
             ),
             "HSPICE device {command} requires qualified model/device lowering"
         );
-        if kind == b'D' {
-            for field in fields.iter().skip(4) {
-                let token = &text[field.clone()];
-                ensure!(
-                    !["W", "L", "LM", "LP", "WM", "WP", "THERMAL"]
-                        .iter()
-                        .any(|name| token.eq_ignore_ascii_case(name)),
-                    "geometric or thermal HSPICE diode instance is not qualified"
-                );
-            }
+        if hspice && kind == b'D' {
+            validate_diode_geometry(text, fields)?;
         }
     }
+    Ok(())
+}
+
+fn lower_card(
+    text: &str,
+    context: DialectContext,
+    state: &mut DeckOptions,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<String> {
+    let text = text.trim();
+    if text.is_empty() || text.starts_with('*') {
+        return Ok(text.to_owned());
+    }
+    let command = analysis_plan::command(text);
+    let hspice = context.language == SourceDialect::Hspice;
+    ensure!(
+        matches!(
+            context.language,
+            SourceDialect::Hspice | SourceDialect::Pspice | SourceDialect::Simetrix
+        ),
+        "foreign source dialect {:?} requires physical occurrence lowering",
+        context.language
+    );
+    ensure!(
+        context.language != SourceDialect::Simetrix
+            || !(command == ".SUBCKT" || command.starts_with('X')),
+        "SIMetrix hierarchy requires its own occurrence binding"
+    );
+    let fields = statement_token_spans(text)?;
+    if command == ".SUBCKT" {
+        state.depth += 1;
+        budget.check_depth(state.depth)?;
+    } else if command == ".ENDS" {
+        state.depth = state.depth.checked_sub(1).context("unmatched .ENDS")?;
+    }
+    if state.depth > 0
+        && (matches!(command.as_str(), ".OPTION" | ".OPTIONS" | ".OPT")
+            || matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN" | ".TEMP"))
+    {
+        bail!("HSPICE scoped parameters/options require hierarchy lowering");
+    }
+    if context.language == SourceDialect::Pspice {
+        validate_device(&command, text, &fields, false)?;
+        ensure!(
+            !command.starts_with('.')
+                || matches!(
+                    command.as_str(),
+                    ".PARAM"
+                        | ".FUNC"
+                        | ".SUBCKT"
+                        | ".ENDS"
+                        | ".GLOBAL"
+                        | ".END"
+                        | ".IC"
+                        | ".NODESET"
+                ),
+            "unqualified PSpice directive in occurrence-bound deck {command}"
+        );
+        return Ok(text.to_owned());
+    }
+    if command == ".FUNC" {
+        let tail = text
+            .split_once(char::is_whitespace)
+            .context("empty function declaration")?
+            .1;
+        budget.charge(Resource::ScannedBytes, tail.len())?;
+        let (signature, body) = parse_function_signature(tail)?;
+        budget.charge(Resource::GeneratedNodes, signature.formals.len())?;
+        return lower_function(&signature, body, context, limit, budget);
+    }
+    validate_device(&command, text, &fields, hspice)?;
     let mut source = match command.as_str() {
         ".OPTION" | ".OPTIONS" | ".OPT" if hspice => normalize_options(text, state, budget)?,
         ".TEMP" => {
@@ -492,11 +720,16 @@ fn lower_card(
         | ".TRAN" | ".IC" | ".NODESET" => text.to_owned(),
         ".MODEL" => bail!("model selection requires a qualified native mapping"),
         _ if command.starts_with('.') => bail!("unqualified HSPICE directive {command}"),
-        _ => lower_source(text)?,
+        _ if hspice => lower_source(text)?,
+        _ => text.to_owned(),
     };
-    source = map_values(&source, limit, budget, |value, remaining| {
-        lower_spice_expression(value, context, remaining, budget)
-    })?;
+    source = map_values(
+        &source,
+        context.language,
+        limit,
+        budget,
+        |value, remaining| lower_spice_expression(value, context, remaining, budget),
+    )?;
     if matches!(command.as_str(), ".OP" | ".DC" | ".AC" | ".TRAN") {
         source = analysis::lower(&source)?;
     }
@@ -511,10 +744,12 @@ fn depletion_mode(
     for statement in statements {
         budget.charge(Resource::Statements, 1)?;
         budget.charge(Resource::ScannedBytes, statement.text.len())?;
-        if !matches!(
-            analysis_plan::command(&statement.text).as_str(),
-            ".OPTION" | ".OPTIONS" | ".OPT"
-        ) {
+        if statement.context.language != SourceDialect::Hspice
+            || !matches!(
+                analysis_plan::command(&statement.text).as_str(),
+                ".OPTION" | ".OPTIONS" | ".OPT"
+            )
+        {
             continue;
         }
         let tail = statement
@@ -539,12 +774,17 @@ fn depletion_mode(
     Ok(mode.unwrap_or(2))
 }
 
-type LoweredExpansion = (
-    Vec<u8>,
-    Vec<crate::OriginLine>,
-    Vec<model_preprocess_simplis::source_dialect::model_mapping::ModelSelection>,
-    DeckOptions,
-);
+type SelectedModels = BTreeMap<usize, ModelSelection>;
+
+struct LoweredExpansion {
+    bytes: Vec<u8>,
+    origins: Vec<crate::OriginLine>,
+    contexts: Vec<DialectContext>,
+    /// Keys index the emitted logical source rows before occurrence binding.
+    selections: SelectedModels,
+    transfers: BTreeMap<usize, ControlledTransfer>,
+    state: DeckOptions,
+}
 
 fn append_lowered_line(
     bytes: &mut Vec<u8>,
@@ -566,12 +806,49 @@ fn append_lowered_line(
     Ok(())
 }
 
+// These commands select circuit-wide policies, not electrical declarations
+// local to a resource. A foreign language override or an independent catalog
+// cannot silently acquire authority over the receiving deck's analysis.
+fn root_policy(text: &str) -> bool {
+    matches!(
+        analysis_plan::command(text).as_str(),
+        ".OPTION" | ".OPTIONS" | ".OPT" | ".TEMP" | ".OP" | ".DC" | ".AC" | ".TRAN"
+    )
+}
+
+fn validate_policy(statement: &ScopedStatement, independent_catalog: bool) -> Result<()> {
+    ensure!(
+        !root_policy(&statement.text)
+            || (!independent_catalog && statement.context.language == SourceDialect::Hspice),
+        "{}:{}: circuit-wide policy belongs to the HSPICE root deck, not {:?} {}",
+        statement.source,
+        statement.first_line,
+        statement.context.language,
+        if independent_catalog {
+            "catalog resource"
+        } else {
+            "resource"
+        }
+    );
+    Ok(())
+}
+
+fn validate_root_policies(statements: &[ScopedStatement], budget: &WorkBudget) -> Result<()> {
+    for statement in statements.iter().skip(1) {
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        budget.charge(Resource::ScannedBytes, statement.text.len())?;
+        validate_policy(statement, false)?;
+    }
+    Ok(())
+}
+
 fn lower_expansion(
     statements: &[model_preprocess_simplis::source_dialect::ScopedStatement],
     input_origins: Vec<crate::OriginLine>,
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<LoweredExpansion> {
+    validate_root_policies(statements, budget)?;
     let dcap = depletion_mode(
         statements.get(1..).context("missing HSPICE deck title")?,
         budget,
@@ -580,10 +857,11 @@ fn lower_expansion(
         statements.len() == input_origins.len(),
         "HSPICE statement origin mismatch"
     );
-    let mut selections = Vec::new();
+    let mut selections = SelectedModels::new();
     let mut scope = Vec::new();
     let mut bytes = Vec::new();
     let mut origins = Vec::new();
+    let mut contexts = Vec::new();
     let mut state = DeckOptions::default();
     for (index, (statement, origin)) in statements.iter().zip(input_origins).enumerate() {
         budget.charge(Resource::Statements, 1)?;
@@ -609,6 +887,7 @@ fn lower_expansion(
                     limit,
                     budget,
                 )?;
+                contexts.push(statement.context);
             }
             continue;
         }
@@ -620,8 +899,12 @@ fn lower_expansion(
             } else {
                 statement.text.clone()
             }
+        } else if analysis_plan::command(&statement.text) == ".MODEL"
+            && statement.context.language == SourceDialect::Pspice
+        {
+            statement.text.clone()
         } else if analysis_plan::command(&statement.text) == ".MODEL" {
-            let (text, selection) = models::lower(
+            let (text, mut selection) = models::lower(
                 statement,
                 &scope,
                 dcap,
@@ -629,7 +912,8 @@ fn lower_expansion(
                 budget,
             )
             .with_context(|| format!("{}:{}", statement.source, statement.first_line))?;
-            selections.push(selection);
+            selection.linked = origin.linked;
+            selections.insert(origins.len(), selection);
             text
         } else {
             match analysis_plan::command(&statement.text).as_str() {
@@ -661,14 +945,23 @@ fn lower_expansion(
             })?
         };
         append_lowered_line(&mut bytes, &mut origins, &text, origin, limit, budget)?;
+        contexts.push(statement.context);
     }
     ensure!(state.depth == 0, "unclosed HSPICE subcircuit");
-    Ok((bytes, origins, selections, state))
+    Ok(LoweredExpansion {
+        bytes,
+        origins,
+        contexts,
+        selections,
+        transfers: BTreeMap::new(),
+        state,
+    })
 }
 
 fn add_catalog(
     statements: &mut Vec<model_preprocess_simplis::source_dialect::ScopedStatement>,
     origins: &mut Vec<crate::OriginLine>,
+    graph: &mut SourceGraph,
     members: Vec<(std::borrow::Cow<'_, crate::ParsedLibrary>, String)>,
     limit: usize,
     budget: &WorkBudget,
@@ -686,8 +979,13 @@ fn add_catalog(
         if !seen.insert(member.source_id().to_owned()) {
             continue;
         }
-        for statement in member.scoped_statements() {
+        let admitted = member.source_graph();
+        let remap = admitted
+            .map(|source| graph.append_root(&source.graph, budget))
+            .transpose()?;
+        for (index, statement) in member.scoped_statements().iter().enumerate() {
             budget.charge(Resource::Statements, 1)?;
+            validate_policy(statement, true)?;
             budget.charge(Resource::ScannedBytes, statement.text.len())?;
             size = size.saturating_add(statement.text.len()).saturating_add(1);
             ensure!(
@@ -696,11 +994,23 @@ fn add_catalog(
             );
             budget.charge(Resource::GeneratedNodes, 1)?;
             budget.charge(Resource::EmittedBytes, statement.source.len())?;
+            let location = if let (Some(source), Some(remap)) = (admitted, &remap) {
+                Some(
+                    remap.location(
+                        *source
+                            .locations
+                            .get(index)
+                            .context("missing catalog statement location")?,
+                    )?,
+                )
+            } else {
+                None
+            };
             linked_origins.push(crate::OriginLine {
                 source: std::path::PathBuf::from(&statement.source),
                 line: statement.first_line,
                 last_line: statement.last_line,
-                linked: None,
+                linked: location,
             });
             linked.push(statement.clone_with_budget(budget)?);
         }
@@ -723,36 +1033,40 @@ pub(super) fn prepare(
     cancellation: &Cancellation,
     session: &mut SourceSession,
 ) -> Result<PreparedBundle> {
-    let mut expansion = SourceExpansion::new(session, request, options);
-    let context = expansion.expand(root, HSPICE, RootKind::Deck, None)?;
-    let SourceExpansion {
+    let LinkedExpansion {
+        context,
         mut statements,
         mut origins,
+        mut graph,
         ..
-    } = expansion;
+    } = linked_resource(root, HSPICE, RootKind::Deck, request, options, session)?;
+    ensure!(
+        context.language == SourceDialect::Hspice,
+        "HSPICE deck requires HSPICE root analysis policy, got {:?}",
+        context.language
+    );
     let members = super::catalog_members(request, options, cancellation, session, context)?;
     let budget = session.budget();
     add_catalog(
         &mut statements,
         &mut origins,
+        &mut graph,
         members,
         options.output_bytes,
         budget,
     )?;
     let original = analysis::original_statements(&statements, &origins, budget)?;
-    let (mut bytes, mut origins, selections, state) =
-        lower_expansion(&statements, origins, options.output_bytes, budget)?;
+    let lowered = lower_expansion(&statements, origins, options.output_bytes, budget)?;
+    let lowered = pspice::project(lowered, options.output_bytes, budget)?;
+    let hierarchy::BoundExpansion {
+        mut bytes,
+        mut origins,
+        mut dialects,
+    } = hierarchy::bind(&lowered, options.output_bytes, budget)?;
+    let LoweredExpansion {
+        selections, state, ..
+    } = lowered;
     {
-        (bytes, origins) = hierarchy::bind(
-            &bytes,
-            &origins,
-            state.parhier.unwrap_or_default(),
-            state.xmult_in_exp.unwrap_or_default(),
-            &state.mos,
-            options.output_bytes,
-            budget,
-        )?;
-
         // HSPICE defaults to 25 C for both device nominal and analysis
         // temperatures. Native ngspice defaults to 27 C.
         let mut defaults = Vec::new();
@@ -786,6 +1100,10 @@ pub(super) fn prepare(
         )?;
         bytes.splice(insertion..insertion, default_text.bytes());
         origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
+        dialects.splice(
+            1..1,
+            std::iter::repeat_n(SourceDialect::Native, defaults.len()),
+        );
     }
     let (electrical, analysis_plan) = analysis::extract(
         &bytes,
@@ -798,17 +1116,17 @@ pub(super) fn prepare(
         options.output_bytes,
         budget,
     )?;
-    bytes = models::resolve_breakdown(&electrical, RootKind::Deck, options.output_bytes, budget)?;
+    bytes = electrical;
     let mut bundle = native_bundle(
         root.path.clone(),
         request.format,
         RootKind::Deck,
-        NativeProjection::plain(&bytes, RootKind::Deck, budget)?,
+        NativeProjection::bound(&bytes, RootKind::Deck, &dialects, budget)?,
         &origins,
-        None,
+        Some(graph),
         budget,
     )?;
-    bundle.model_selections = selections;
+    bundle.model_selections = selections.into_values().collect();
     bundle.analysis_plan = analysis_plan;
     Ok(bundle)
 }

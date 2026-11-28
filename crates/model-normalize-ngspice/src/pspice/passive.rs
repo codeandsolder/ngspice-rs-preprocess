@@ -101,7 +101,7 @@ impl PassiveModels {
                 })
             });
             let multiplier = if !polynomial && let Some(value) = parameter(&card, kind.native()) {
-                let mut base = String::from("__ps_passive_");
+                let mut base = String::from("ps_passive_");
                 for byte in card.name.bytes().map(|byte| byte.to_ascii_lowercase()) {
                     write!(base, "{byte:02x}")?;
                 }

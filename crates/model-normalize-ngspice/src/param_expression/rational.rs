@@ -8,7 +8,7 @@ use model_preprocess_command::{Resource, WorkBudget};
 
 // Bound expansion of hostile input, independently of the simulator's state
 // dimension. This is an expression-expansion resource limit, not a fit order.
-const MAX_DEGREE: usize = 256;
+pub const MAX_DEGREE: usize = 256;
 const MAX_COEFFICIENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

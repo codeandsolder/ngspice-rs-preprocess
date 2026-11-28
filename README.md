@@ -115,7 +115,7 @@ origin. Local variables remain local, while promoted globals are visible to
 subsequently specialized subcircuits. Active model cards and aliases are emitted
 once at the declaration scope; occurrence-specific declarations are specialized
 with their caller's bindings. Merely adding a catalog member does not execute
-its root control program. The parsed-library v8 format preserves the selected
+its root control program. The parsed-library v9 format preserves the selected
 source program separately from its indexed declarations and retains physical
 source positions. Regenerate older parsed artifacts before using them.
 
@@ -177,7 +177,8 @@ Select `hspice-deck` explicitly; no ngspice compatibility flag is required.
 Raw linked includes and named library sections inherit the including
 resource's lexical dialect, unless a local source header overrides it.
 The compiler preserves the admitted logical statement's physical source
-span, including continuation lines. A compiled HSPICE library is neutral
+span, including continuation lines, and the shared source occurrence graph.
+A compiled HSPICE library is neutral
 source, not a prematurely lowered native include:
 
 ```sh
@@ -186,12 +187,19 @@ ngspice-rs-preprocess hspice-deck circuit.sp native --parsed-library catalog/lib
 ```
 
 Raw catalog members and compiled members use the same occurrence binding.
+The serialized catalog preserves resource visits, lexical scopes and logical
+statement locations; independent catalog admission roots are retained and
+scope indices remapped into the consuming deck. Graph topology participates
+in the catalog digest, while resource relocation does not.
 The root deck owns `PARHIER`, `XMULT_IN_EXP`, temperature defaults and
-model-selection policies. Source parameter and model aliases preserve
-electrical terminal names, nested multiplier products, and source spans.
-Mixed scalar/function `.PARAM` declarations and `.FUNC` macros use the same
-occurrence binding: `PARHIER` selects visible declarations, free symbols
-resolve in the calling occurrence and formals shadow parameters. Native
+model-selection policies. HSPICE definitions use its parameter precedence
+policy; PSpice definitions instead inherit root globals and bind private
+local declarations, with actual expressions evaluated in the calling
+occurrence. HSPICE X-call multipliers are distinct from PSpice X-call
+parameters named M. Source parameter and model aliases preserve electrical
+terminal names, nested multiplier products, and source spans. Mixed
+scalar/function `.PARAM` declarations and `.FUNC` macros use the same
+occurrence binding, with definition-specific visibility and formal shadowing. Native
 function aliases retain nested calls and electrical probes without expanding
 expression trees in the producer. Cyclic and out-of-scope calls are diagnosed.
 Native output retains qualified OP, source DC, AC and single-interval
@@ -202,11 +210,15 @@ ACM=12 junction mode. Geometry bins use source-order, lexical model-family
 resolution and half-open length/width intervals, with XLREF/XWREF and
 WNFLAG, rather than native fuzzy bin matching. Version-specific parameter
 inventories reject unknown fields instead of allowing a native parser to
-ignore them.
+ignore them. Differential E/G LAPLACE coefficient lists are lowered to the
+shared rational-transfer implementation in descending coefficient order,
+preserving lexical coefficient parameters, SCALE and G-source M. Foreign
+resource overrides and independently admitted catalogs cannot set the root
+deck's global analysis, temperature or option policies.
 
 This is not blanket HSPICE equivalence. Other physical variants,
 non-HSPICE model cards inside an overridden resource,
-controlled transfer extensions, statistical or multi-interval analyses
+other controlled transfer extensions, statistical or multi-interval analyses
 and unqualified output directives are diagnosed rather than guessed.
 See issues [#68](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/68),
 [#69](https://github.com/codeandsolder/ngspice-rs-preprocess/issues/69),
@@ -230,7 +242,7 @@ are qualified. The source-language header controls expression and
 lexical semantics independently of model selection. The mapping table is
 shared across the deck's admitted includes; indexed catalog libraries
 cannot independently introduce global selection directives. Include such
-resources explicitly instead. Parsed-library format v8 retains projected
+resources explicitly instead. Parsed-library format v9 retains projected
 source statements so that a catalog can be selected again under a new
 request's mapping rather than baking in a previous request's defaults.
 
@@ -309,8 +321,10 @@ their display spellings. Directly linked artifacts also retain an admitted
 source graph: each mapped output line identifies its source occurrence and
 electrical lexical scope, including generated lines. The graph records the
 parent include, selected library section, effective dialect and declaration
-line. Specialized HSPICE output currently retains physical spans without a
-linked graph; full cross-dialect occurrence-model binding is tracked in #70.
+line. Specialized HSPICE output retains the original graph and physical spans,
+including independently admitted catalog graphs. Synthetic dialect defaults
+have no source occurrence. Cross-dialect physical model and hierarchy policy
+composition is tracked in #70.
 
 See [original analysis intent](#original-analysis-intent) for the binding contract.
 

@@ -4,10 +4,10 @@
 //! for LEVEL=1. Native level 3 provides this scaling without geometry
 //! when the instance has only dimensionless AREA/PJ. DCAP=2 is the
 //! zero-threshold special case of the native depletion-charge law.
+use super::SelectedModels;
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::{
-    linked_source::RootKind,
-    model_card::{ModelCard, parse_assignments, parse_model_card, parse_spice_constant},
+    model_card::{ModelCard, parse_assignments, parse_model_card},
     parameter_scope::ModelLibrary,
 };
 use model_preprocess_command::{Resource, WorkBudget};
@@ -65,20 +65,16 @@ pub fn render(
     let mut text = format!(".model {name} {} (", card.family);
     for parameter in &card.parameters {
         budget.charge(Resource::EvaluationSteps, 1)?;
-        let value = parameter
-            .expression
-            .as_deref()
-            .context("model field requires a value")?;
-        let mapped = map(value)?;
         budget.charge(
             Resource::EmittedBytes,
-            parameter
-                .name
-                .len()
-                .saturating_add(mapped.len())
-                .saturating_add(2),
+            parameter.name.len().saturating_add(1),
         )?;
-        write!(text, " {}={mapped}", parameter.name)?;
+        write!(text, " {}", parameter.name)?;
+        if let Some(value) = &parameter.expression {
+            let mapped = map(value)?;
+            budget.charge(Resource::EmittedBytes, mapped.len().saturating_add(1))?;
+            write!(text, "={mapped}")?;
+        }
     }
     text.push(')');
     Ok(text)
@@ -157,38 +153,22 @@ pub fn lower(
 
 /// Resolve HSPICE's zero-breakdown sentinel after occurrence binding. A
 /// standalone include cannot assume values of parameters supplied by its caller.
-pub fn resolve_breakdown(
-    bytes: &[u8],
-    kind: RootKind,
-    limit: usize,
+pub(super) fn resolve_breakdown(
+    rows: &mut [(String, usize)],
+    selections: &SelectedModels,
+    library: &ModelLibrary,
     budget: &WorkBudget,
-) -> Result<Vec<u8>> {
-    budget.charge(Resource::ScannedBytes, bytes.len())?;
-    budget.charge(Resource::EmittedBytes, bytes.len())?;
-    let source = std::str::from_utf8(bytes)?;
-    let library = if kind == RootKind::Deck {
-        Some(ModelLibrary::parse_source_with_budget(
-            bytes,
-            kind,
-            budget.clone(),
-        )?)
-    } else {
-        None
-    };
-    let mut output = String::with_capacity(bytes.len());
-    for (index, line) in source.lines().enumerate() {
+) -> Result<()> {
+    for (row, declaration) in rows.iter_mut().skip(1) {
         budget.charge(Resource::Statements, 1)?;
-        if (index == 0 && kind == RootKind::Deck)
-            || !super::analysis_plan::command(line).eq_ignore_ascii_case(".MODEL")
-        {
-            writeln!(output, "{line}")?;
+        budget.charge(Resource::ScannedBytes, row.len())?;
+        if !selections.get(declaration).is_some_and(|selection| {
+            selection.context.language == SourceDialect::Hspice
+                && selection.mapping.device == Device::Diode3
+        }) {
             continue;
         }
-        let mut card = parse_model_card(line, index + 1, &[])?;
-        if !card.family.eq_ignore_ascii_case("D") {
-            writeln!(output, "{line}")?;
-            continue;
-        }
+        let mut card = parse_model_card(row, *declaration + 1, &[])?;
         if let Some(position) = card
             .parameters
             .iter()
@@ -198,34 +178,16 @@ pub fn resolve_breakdown(
                 .expression
                 .as_deref()
                 .context("BV requires a value")?;
-            let value = if let Some(library) = &library {
-                library.evaluate_scalar(0, expression, &[])?
-            } else {
-                parse_spice_constant(expression).context("parameter-dependent BV in an independent HSPICE include requires consuming deck binding")?
-            };
+            let value = library.evaluate_scalar(0, expression, &[])?;
             ensure!(
                 value.is_finite() && value >= 0.,
                 "invalid HSPICE BV {value}"
             );
             if value == 0. {
                 card.parameters.remove(position);
+                *row = render(&card, &card.name, budget, |value| Ok(value.to_owned()))?;
             }
-            writeln!(
-                output,
-                "{}",
-                render(&card, &card.name, budget, |value| Ok(value.to_owned()))?
-            )?;
-        } else {
-            writeln!(output, "{line}")?;
         }
-        ensure!(
-            output.len() <= limit,
-            "HSPICE breakdown normalization exceeds byte budget"
-        );
     }
-    ensure!(
-        output.len() <= limit,
-        "HSPICE breakdown normalization exceeds byte budget"
-    );
-    Ok(output.into_bytes())
+    Ok(())
 }

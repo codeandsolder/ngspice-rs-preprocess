@@ -253,6 +253,16 @@ impl Scopes {
             .is_some_and(|model| model.dialect.is_pspice())
     }
 
+    pub(super) fn declaration(&self, line: usize) -> Result<ModelCard> {
+        let card = &self
+            .models
+            .get(&line)
+            .context("missing PSpice model declaration")?
+            .card;
+        charge_card(card, &self.budget)?;
+        Ok(card.clone())
+    }
+
     pub(super) fn model(&self, line: usize) -> Result<ModelCard> {
         // Resolve iteratively, avoiding recursive stack use on long AKO chains.
         let mut stack = Vec::new();

@@ -4,8 +4,8 @@ use super::analysis_plan::{
 };
 use super::{
     AdmittedSource, Artifact, Cancellation, CodeModelRuntime, InputFormat, LibraryInput,
-    LibrarySimulator, Options, OriginLine, ParsedLibrary, PreparedBundle, Provenance, Request,
-    SourceSession, display_path,
+    LibrarySimulator, Options, ParsedLibrary, PreparedBundle, Provenance, Request, SourceSession,
+    display_path,
 };
 use anyhow::{Context, Result, bail, ensure};
 use model_normalize_ngspice::linked_source::{
@@ -19,8 +19,7 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_scoped_statements, parse_library_with_budget, parse_scoped_library,
-    parse_standalone_library, preprocess_netlist_linked_at, project_resource,
-    project_spice_resource, source_include_target,
+    preprocess_netlist_linked_at, project_resource, source_include_target,
 };
 use model_translate_simplis::{
     WholeModelTranslation, capture_artifact_initial_conditions, capture_artifact_waveforms,
@@ -152,8 +151,6 @@ struct SourceExpansion<'a> {
     stack: Vec<(PathBuf, Option<String>)>,
     limit: usize,
     simulator: LibrarySimulator,
-    standalone: bool,
-    origins: Vec<OriginLine>,
     search_paths: &'a [PathBuf],
     statements: Vec<ScopedStatement>,
     declarations: Vec<SourceDeclaration>,
@@ -170,8 +167,6 @@ impl<'a> SourceExpansion<'a> {
             stack: Vec::new(),
             limit: options.output_bytes,
             simulator: projection(request.format),
-            standalone: request.format.is_hspice(),
-            origins: Vec::new(),
             search_paths: &request.search_paths,
             statements: Vec::new(),
             declarations: Vec::new(),
@@ -249,11 +244,8 @@ impl<'a> SourceExpansion<'a> {
         DialectContext,
         Vec<model_preprocess_simplis::source_dialect::ProjectedStatement>,
     )> {
-        let (context, mut projected) = if self.standalone {
-            project_spice_resource(&source.bytes, inherited, kind)?
-        } else {
-            project_resource(&source.bytes, inherited, kind, self.simulator)?
-        };
+        let (context, mut projected) =
+            project_resource(&source.bytes, inherited, kind, self.simulator)?;
         if let Some(section) = section {
             let selected = select_named_section_lines(
                 projected.iter().map(|line| line.text.as_str()),
@@ -283,18 +275,7 @@ impl<'a> SourceExpansion<'a> {
         let mut embedded = false;
         let mut projected = projected.into_iter();
         while let Some(line) = projected.next() {
-            if self.standalone && kind == RootKind::Deck && line.first_line == 1 {
-                self.append_projected(source, context, &line, &line.text)?;
-                continue;
-            }
             let name = analysis_plan::command(&line.text);
-            ensure!(
-                !self.standalone
-                    || !matches!(name.as_str(), ".CONTROL" | ".ENDC" | ".FILE" | ".ENDF"),
-                "unsupported standalone SPICE command {name} at {}:{}",
-                source.path.display(),
-                line.first_line
-            );
             if let Some(start) = model_translate_simplis::syntax::file_boundary(&line.text) {
                 embedded = start;
             }
@@ -386,21 +367,7 @@ impl<'a> SourceExpansion<'a> {
         original: &model_preprocess_simplis::source_dialect::ProjectedStatement,
         line: &str,
     ) -> Result<()> {
-        if self.standalone {
-            self.session
-                .budget()
-                .charge(super::Resource::GeneratedNodes, 1)?;
-            self.session
-                .budget()
-                .charge(super::Resource::EmittedBytes, source.path.as_os_str().len())?;
-            self.origins.push(OriginLine {
-                source: source.path.clone(),
-                line: original.first_line,
-                last_line: original.last_line,
-                linked: None,
-            });
-        }
-        if self.standalone || self.simulator == LibrarySimulator::Simetrix {
+        if self.simulator == LibrarySimulator::Simetrix {
             let source = display_path(&source.path);
             self.session
                 .budget()
@@ -434,14 +401,7 @@ impl<'a> SourceExpansion<'a> {
                 .extension()
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| value.eq_ignore_ascii_case("init"));
-            let path = if self.standalone {
-                Some(
-                    self.resolve_resource(&source.path, target)?
-                        .with_context(|| {
-                            format!("cannot resolve source include {}", target.display())
-                        })?,
-                )
-            } else if init {
+            let path = if init {
                 Some(resolve_init(self.session, &source.path, target)?)
             } else if self.simulator == LibrarySimulator::Simetrix {
                 self.resolve_resource(&source.path, target)?
@@ -454,7 +414,7 @@ impl<'a> SourceExpansion<'a> {
                 return Ok(true);
             }
         }
-        if (self.standalone || self.simulator == LibrarySimulator::Simetrix)
+        if self.simulator == LibrarySimulator::Simetrix
             && let Some((target, section)) = external_library_reference(line)?
         {
             let normalized = target.replace('\\', "/");
@@ -485,17 +445,19 @@ fn parse_admitted_library(
             session.budget(),
         );
     }
+    if request.format.is_hspice() {
+        let linked = hspice::linked_resource(
+            source,
+            inherited,
+            RootKind::Include,
+            request,
+            options,
+            session,
+        )?;
+        return linked.into_library(origin, session.budget());
+    }
     let mut expansion = SourceExpansion::new(session, request, options);
     let dialect = expansion.expand(source, inherited, RootKind::Include, None)?;
-    if request.format.is_hspice() {
-        return parse_standalone_library(
-            origin,
-            expansion.sources,
-            dialect,
-            expansion.statements,
-            expansion.session.budget(),
-        );
-    }
     parse_scoped_library(
         origin,
         expansion.sources,

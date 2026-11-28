@@ -8,12 +8,14 @@ use anyhow::{Context, Result, ensure};
 use model_normalize_ngspice::{
     MappedNormalization, NormalizationPass,
     linked_source::{
-        LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker, SourceOrigin, SourceScope,
-        SourceVisit,
+        LinkLimits, LinkedSource, RootKind, SourceDialect, SourceLinker, SourceOrigin,
     },
-    normalize_mapped,
+    normalize_bound_mapped,
 };
-pub use model_normalize_ngspice::{passive_ic, passive_storage, pwl_resistor, waveform};
+pub use model_normalize_ngspice::{
+    linked_source::{LinkedLocation, SourceGraph},
+    passive_ic, passive_storage, pwl_resistor, waveform,
+};
 pub use model_preprocess_command::{
     AdmissionConfig, AdmittedSource, Cancellation, CommandConfig, ProcessLimits, Resource,
     SourceSession, WorkBudget, WorkLimits,
@@ -214,24 +216,6 @@ pub struct OriginLine {
     pub linked: Option<LinkedLocation>,
 }
 
-/// Stable indices into the artifact's admitted source graph.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct LinkedLocation {
-    /// Zero-based index of the resource occurrence.
-    pub visit: usize,
-    /// Zero-based index of the lexical subcircuit scope.
-    pub scope: usize,
-}
-
-/// Admitted source occurrences and electrical lexical scopes.
-#[derive(Clone, Debug, Serialize)]
-pub struct SourceGraph {
-    /// Include occurrences in traversal order, including repeated resources.
-    pub visits: Vec<SourceVisit>,
-    /// Lexical scopes in declaration order, starting with the root scope.
-    pub scopes: Vec<SourceScope>,
-}
-
 /// Provenance of an artifact. Generated dialect output is not falsely given
 /// a one-to-one line map when specialization changes its structure.
 #[derive(Clone, Debug, Serialize)]
@@ -347,9 +331,14 @@ struct NativeProjection {
 }
 
 impl NativeProjection {
-    fn plain(bytes: &[u8], kind: RootKind, budget: &WorkBudget) -> Result<Self> {
+    fn bound(
+        bytes: &[u8],
+        kind: RootKind,
+        dialects: &[SourceDialect],
+        budget: &WorkBudget,
+    ) -> Result<Self> {
         Ok(Self {
-            normalized: normalize_mapped(bytes, kind, SourceDialect::Native, budget)?,
+            normalized: normalize_bound_mapped(bytes, kind, dialects, budget)?,
             device_identities: Vec::new(),
             waveforms: Vec::new(),
             initial_conditions: None,

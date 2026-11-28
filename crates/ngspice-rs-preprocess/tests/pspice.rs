@@ -611,7 +611,7 @@ quit
     let emitted = std::str::from_utf8(&prepared.primary.bytes)?;
     assert_eq!(lines.len(), emitted.lines().count());
     for (text, origin) in emitted.lines().zip(lines) {
-        if text.starts_with(".param __ps_passive_") {
+        if text.starts_with(".param ps_passive_") {
             assert!(
                 std::str::from_utf8(source)?
                     .lines()
@@ -753,7 +753,7 @@ X2 l 0 cell a=0 base=4
         assert_eq!(declaration.scope.first().map(String::as_str), scope);
         assert_eq!(declaration.mode.as_deref(), Some("2"));
     }
-    assert!(!text.contains("__ps_passive_"), "{text}");
+    assert!(!text.contains("ps_passive_"), "{text}");
     Ok(())
 }
 

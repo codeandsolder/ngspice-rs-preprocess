@@ -9,7 +9,9 @@ use crate::native_scalar::{BinaryOp, ConditionalChain, Function, UnaryOp};
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 mod rational;
-pub(crate) use rational::coefficients as rational_coefficients;
+pub(crate) use rational::{
+    MAX_DEGREE as MAX_RATIONAL_DEGREE, coefficients as rational_coefficients,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {

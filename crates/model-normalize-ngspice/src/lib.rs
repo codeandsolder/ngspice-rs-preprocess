@@ -648,12 +648,17 @@ pub struct MappedNormalization {
 pub(crate) enum SourceDialects<'a> {
     Uniform(linked_source::SourceDialect),
     Linked(&'a linked_source::LinkedSource),
+    Rows(&'a [SourceDialect]),
 }
 
 impl SourceDialects<'_> {
     pub(crate) fn at(self, line: usize) -> Result<linked_source::SourceDialect> {
         match self {
             Self::Uniform(dialect) => Ok(dialect),
+            Self::Rows(rows) => rows
+                .get(line.checked_sub(1).context("invalid source line")?)
+                .copied()
+                .context("missing row source dialect"),
             Self::Linked(linked) => linked
                 .dialect_at(line)
                 .context("missing linked source dialect"),
@@ -663,6 +668,7 @@ impl SourceDialects<'_> {
     fn includes(self, dialect: linked_source::SourceDialect) -> bool {
         match self {
             Self::Uniform(source) => source == dialect,
+            Self::Rows(rows) => rows.contains(&dialect),
             Self::Linked(linked) => linked.visits.iter().any(|visit| visit.dialect == dialect),
         }
     }
@@ -680,7 +686,7 @@ impl SourceDialects<'_> {
                     )
                 },
             ),
-            Self::Uniform(_) => format!("line {line}"),
+            Self::Uniform(_) | Self::Rows(_) => format!("line {line}"),
         }
     }
 
@@ -720,6 +726,38 @@ pub fn normalize_mapped(
     normalize_selected(input, kind, SourceDialects::Uniform(dialect), None, budget)
 }
 
+/// Normalize occurrence-bound rows while retaining their source transfer
+/// syntax.
+///
+/// Expressions and model declarations have already been bound and
+/// lowered by the producer. Do not rerun dialect-specific physical passes.
+///
+/// # Errors
+/// Invalid or unsupported bound dialect map, malformed transfer or source,
+/// or exceeded preparation budget.
+pub fn normalize_bound_mapped(
+    input: &[u8],
+    kind: linked_source::RootKind,
+    dialects: &[SourceDialect],
+    budget: &WorkBudget,
+) -> Result<MappedNormalization> {
+    anyhow::ensure!(
+        input.split_inclusive(|byte| *byte == b'\n').count() == dialects.len(),
+        "bound source dialect map is inconsistent"
+    );
+    anyhow::ensure!(
+        dialects.iter().all(|dialect| matches!(
+            dialect,
+            SourceDialect::Native
+                | SourceDialect::Hspice
+                | SourceDialect::Pspice
+                | SourceDialect::Simetrix
+        )),
+        "unqualified bound source dialect"
+    );
+    normalize_selected(input, kind, SourceDialects::Rows(dialects), None, budget)
+}
+
 /// Native emitted source and identity changes from all selected lowerers.
 #[derive(Debug)]
 pub struct NativeNormalization {
@@ -727,6 +765,10 @@ pub struct NativeNormalization {
     pub mapped: MappedNormalization,
     /// Source device declarations that changed identity during lowering.
     pub renamed: Vec<RenamedDevice>,
+    /// Typed `PSpice` junction declarations keyed by the original input line.
+    pub pspice_junctions: std::collections::BTreeMap<usize, pspice::JunctionProjection>,
+    /// Source transfers retained for occurrence binding instead of native emission.
+    pub pspice_transfers: BTreeMap<usize, controlled_transfer::ControlledTransfer>,
 }
 
 /// A declaration whose designator changed during native lowering.
@@ -802,6 +844,8 @@ pub fn normalize_linked(
         Ok(NativeNormalization {
             mapped,
             renamed: Vec::new(),
+            pspice_junctions: BTreeMap::new(),
+            pspice_transfers: BTreeMap::new(),
         })
     }
 }
@@ -883,6 +927,31 @@ fn normalize_selected(
     }
 }
 
+fn expanded_line_origins(
+    input: &[u8],
+    inserted_lines: &[usize],
+    budget: &WorkBudget,
+) -> Result<Option<Vec<usize>>> {
+    if inserted_lines.is_empty() {
+        return Ok(None);
+    }
+    let count = input.split_inclusive(|byte| *byte == b'\n').count();
+    budget.charge(
+        Resource::GeneratedNodes,
+        count.saturating_add(inserted_lines.len()),
+    )?;
+    let mut origins = Vec::new();
+    let mut previous = inserted_lines.iter().copied().peekable();
+    for line in 1..=count {
+        while previous.peek() == Some(&line) {
+            origins.push(line);
+            previous.next();
+        }
+        origins.push(line);
+    }
+    Ok(Some(origins))
+}
+
 fn normalize_body(
     input: &[u8],
     strip_end: bool,
@@ -944,27 +1013,8 @@ fn normalize_body(
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
-    let origins = if inserted_lines.is_empty() {
-        None
-    } else {
-        budget.charge(
-            Resource::GeneratedNodes,
-            input
-                .split_inclusive(|byte| *byte == b'\n')
-                .count()
-                .saturating_add(inserted_lines.len()),
-        )?;
-        let mut origins = Vec::new();
-        let mut previous = inserted_lines.iter().copied().peekable();
-        for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
-            while previous.peek() == Some(&line) {
-                origins.push(line);
-                previous.next();
-            }
-            origins.push(line);
-        }
-        Some(origins)
-    };
+    let prior_origins = origins;
+    let origins = expanded_line_origins(input, inserted_lines, budget)?;
     let original_line = |line: usize| {
         origins.as_ref().map_or(Ok(line), |mapping| {
             mapping
@@ -975,7 +1025,16 @@ fn normalize_body(
     };
     if let Some(lowered) = controlled_transfer::lower_sources(
         &bytes,
-        |line| Ok(original_line(line)? + title_lines),
+        |line| {
+            let line = original_line(line)? + title_lines;
+            let source = prior_origins.map_or(Ok(line), |mapping| {
+                mapping
+                    .get(line - 1)
+                    .copied()
+                    .context("missing prior transfer source line")
+            })?;
+            Ok((source, dialects.at(source)?))
+        },
         budget,
     )? {
         for line in lowered.inserted_lines {

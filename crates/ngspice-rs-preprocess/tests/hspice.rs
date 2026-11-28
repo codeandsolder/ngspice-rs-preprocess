@@ -112,13 +112,29 @@ fn standalone_library_keeps_neutral_source_and_binds_in_consuming_deck() -> Resu
     fs::write(&child, "*#PSPICE\n.param other={PWR(-2,2)}\n")?;
     fs::write(
         &root,
-        "Catalog consumption\n.option parhier=local\nV1 in 0 1\nX1 in out test scale=2\nR1 out 0 1k\n.end\n",
+        "Catalog consumption\n.option parhier=local\nV1 in 0 1\nX1 in out test scale=2\nR1 out 0 1k\n.subckt root_unused p n\nR2 p n 2k\n.ends root_unused\n.end\n",
     )?;
     let bundle = compile(&lib, InputFormat::HspiceLibrary)?;
     let parsed = ParsedLibrary::from_json(&bundle.primary.bytes)?;
     assert_eq!(parsed.simulator(), LibrarySimulator::Hspice);
     assert_eq!(parsed.definitions(), 1);
     assert_eq!(parsed.scoped_statements()[0].text, ".param gain='LOG(100)'");
+    let admitted = parsed
+        .source_graph()
+        .context("missing serialized catalog graph")?;
+    assert_eq!(admitted.graph.visits.len(), 2);
+    assert_eq!(admitted.graph.scopes.len(), 2);
+    assert_eq!(admitted.locations.len(), parsed.scoped_statements().len());
+    let mut invalid: serde_json::Value = serde_json::from_slice(&bundle.primary.bytes)?;
+    invalid["source_graph"]["locations"][0]["scope"] = serde_json::json!(1000);
+    assert!(ParsedLibrary::from_json(&serde_json::to_vec(&invalid)?).is_err());
+    let relocated = dir.path().join("relocated");
+    fs::create_dir(&relocated)?;
+    fs::copy(&lib, relocated.join("lib.sp"))?;
+    fs::copy(&child, relocated.join("child.sp"))?;
+    let relocated_bundle = compile(&relocated.join("lib.sp"), InputFormat::HspiceLibrary)?;
+    let relocated_parsed = ParsedLibrary::from_json(&relocated_bundle.primary.bytes)?;
+    assert_eq!(parsed.source_id(), relocated_parsed.source_id());
     let raw_request = Request {
         format: InputFormat::HspiceDeck,
         input: SourceInput::File(root.clone()),
@@ -145,13 +161,46 @@ fn standalone_library_keeps_neutral_source_and_binds_in_consuming_deck() -> Resu
         (actual - 2. * 100_f64.ln()).abs() < 1e-10,
         "{actual} {text}"
     );
-    let Provenance::Native { lines, .. } = &cached.primary.provenance else {
-        anyhow::bail!("missing native spans");
+    let Provenance::Native {
+        lines,
+        source_graph: Some(graph),
+    } = &cached.primary.provenance
+    else {
+        anyhow::bail!("missing native spans and catalog graph");
     };
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.source.ends_with("child.sp") && line.line == 2)
+    let Provenance::Native {
+        lines: raw_lines,
+        source_graph: Some(raw_graph),
+    } = &raw.primary.provenance
+    else {
+        anyhow::bail!("missing raw catalog graph");
+    };
+    assert_eq!(lines, raw_lines);
+    assert_eq!(graph, raw_graph);
+    assert_eq!(graph.visits.len(), 3);
+    assert_eq!(graph.scopes.len(), 3);
+    let child_origin = lines
+        .iter()
+        .find(|line| line.source.ends_with("child.sp") && line.line == 2)
+        .context("missing child physical origin")?;
+    let child_location = child_origin.linked.context("missing child location")?;
+    let child_visit = &graph.visits[child_location.visit];
+    assert_eq!(child_visit.parent, Some(1));
+    assert_eq!(child_location.scope, 0);
+    let model_scope = graph
+        .scopes
+        .iter()
+        .position(|scope| scope.name.as_deref() == Some("test"))
+        .context("missing catalog lexical scope")?;
+    assert_eq!(model_scope, 2);
+    assert_eq!(graph.scopes[model_scope].parent, Some(0));
+    assert_eq!(
+        graph.scopes[model_scope]
+            .declaration
+            .as_ref()
+            .context("missing catalog scope declaration")?
+            .visit,
+        1
     );
     Ok(())
 }
@@ -1092,5 +1141,551 @@ V1 a 0 'outside(2)'
         format!("{error:#}").contains("not visible in this occurrence"),
         "{error:#}"
     );
+    Ok(())
+}
+
+#[test]
+fn occurrence_model_binding_retains_typed_declarations_across_scopes() -> Result<()> {
+    use model_preprocess_simplis::source_dialect::model_mapping::Device;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("typed.sp");
+    fs::write(
+        &root,
+        r#"Typed model declaration identity
+.option parhier=local
+.param scale=1 f(x)='scale*x'
+Vd diode_node 0 0.6
+Vm mos_node 0 0.8
+Vg gate 0 1
+Xd diode_node dcell
+Xm mos_node gate mcell
+.subckt dcell p
+.param bv=0 isat=1e-14
+D1 p 0 shared
+.model shared D (IS='f(isat)' BV='bv')
+.ends dcell
+.subckt mcell d g
+M1 d g 0 0 shared L=1u W=2u
+.model shared NMOS LEVEL=54 VERSION=4.7 VTH0=0.4
+.ends mcell
+.op
+.end
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let [diode, mos] = bundle.model_selections.as_slice() else {
+        anyhow::bail!("expected exactly two typed model selections");
+    };
+    assert_eq!(diode.card.name.to_ascii_lowercase(), "shared");
+    assert_eq!(mos.card.name.to_ascii_lowercase(), "shared");
+    assert_eq!(diode.mapping.device, Device::Diode3);
+    assert_eq!(mos.mapping.device, Device::Bsim4);
+    assert_eq!(mos.effective_version.as_deref(), Some("4.70"));
+    assert_ne!(diode.scope, mos.scope);
+    let diode_location = diode.linked.context("missing diode declaration identity")?;
+    let mos_location = mos.linked.context("missing MOS declaration identity")?;
+    assert_eq!(diode_location.visit, mos_location.visit);
+    assert_ne!(diode_location.scope, mos_location.scope);
+    let Provenance::Native {
+        source_graph: Some(graph),
+        ..
+    } = &bundle.primary.provenance
+    else {
+        anyhow::bail!("missing combined source graph");
+    };
+    assert_eq!(
+        graph.scopes[diode_location.scope].name.as_deref(),
+        Some("dcell")
+    );
+    assert_eq!(
+        graph.scopes[mos_location.scope].name.as_deref(),
+        Some("mcell")
+    );
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    measure_native(dir.path(), native, "op\nwrdata actual.dat i(vd) i(vm)")?;
+    let reference = tempfile::tempdir()?;
+    measure_native(
+        reference.path(),
+        r#"Independent native model cards
+.options TNOM=25
+.temp 25
+Vd diode_node 0 0.6
+Vm mos_node 0 0.8
+Vg gate 0 1
+D1 diode_node 0 dmodel
+.model dmodel D (LEVEL=3 IS=1e-14 FC=0 FCS=0)
+M1 mos_node gate 0 0 mmodel L=1u W=2u
+.model mmodel NMOS LEVEL=14 VERSION=4.70 VTH0=0.4
+.op
+.end
+"#,
+        "op\nwrdata expected.dat i(vd) i(vm)",
+    )?;
+    let actual = values(dir.path(), "actual.dat")?;
+    let expected = values(reference.path(), "expected.dat")?;
+    assert_eq!(actual.len(), expected.len());
+    for (&a, &e) in actual[0][1..].iter().zip(&expected[0][1..]) {
+        ensure!(
+            (a - e).abs() <= 1e-12 + e.abs() * 1e-8,
+            "{a:e} != {e:e}\n{native}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn typed_model_binding_rejects_cross_family_instance_references() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("mismatch.sp");
+    for (card, instance, diagnostic) in [
+        (
+            ".model wrong D(IS=1e-14)",
+            "M1 a b 0 0 wrong L=1u W=2u",
+            "non-MOS model",
+        ),
+        (
+            ".model wrong NMOS LEVEL=54 VERSION=4.7",
+            "D1 a 0 wrong",
+            "non-diode model",
+        ),
+    ] {
+        fs::write(
+            &root,
+            format!("Wrong model family\n{card}\n{instance}\n.end\n"),
+        )?;
+        let error = compile(&root, InputFormat::HspiceDeck).expect_err("wrong model family");
+        ensure!(format!("{error:#}").contains(diagnostic), "{error:#}");
+    }
+    Ok(())
+}
+
+#[test]
+fn shared_linker_retains_repeated_resource_visits_and_restores_language() -> Result<()> {
+    use model_normalize_ngspice::linked_source::SourceDialect;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child_dir = dir.path().join("models");
+    fs::create_dir(&child_dir)?;
+    let shared = child_dir.join("shared.lib");
+    fs::write(&shared, ".param value={PWR(-2,\n+ 2)}\n")?;
+    fs::write(child_dir.join("ps.lib"), "*#PSPICE\n.inc shared.lib\n")?;
+    fs::write(
+        &root,
+        "Repeated physical declaration under distinct lexical contexts\n.option parhier=local\n.subckt hs p\n.inc 'models\\shared.lib'$attached comment\nV1 p 0 'value'\n.ends hs\n.subckt ps p\n.inc 'models\\ps.lib'\nV1 p 0 'value'\n.ends ps\nX1 hp hs\nX2 pp ps\n.param restored='PWR(-3,2)'\nV2 r 0 'restored'\n.op\n.end\n",
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let Provenance::Native {
+        lines,
+        source_graph: Some(graph),
+    } = &bundle.primary.provenance
+    else {
+        anyhow::bail!("missing common linked source graph");
+    };
+    let path = shared.canonicalize()?;
+    let mut occurrences = std::collections::BTreeMap::new();
+    for origin in lines
+        .iter()
+        .filter(|origin| origin.source == path && origin.line == 1)
+    {
+        assert_eq!(origin.last_line, 2);
+        let location = origin.linked.context("missing linked occurrence")?;
+        if let Some(previous) = occurrences.insert(location.visit, location) {
+            assert_eq!(previous, location);
+        }
+    }
+    let locations = occurrences.into_values().collect::<Vec<_>>();
+    let [first, second] = locations.as_slice() else {
+        anyhow::bail!("expected two resource visits, got {locations:?}");
+    };
+    assert_ne!(first.visit, second.visit);
+    assert_ne!(first.scope, second.scope);
+    assert_eq!(graph.visits[first.visit].dialect, SourceDialect::Hspice);
+    assert_eq!(graph.visits[second.visit].dialect, SourceDialect::Pspice);
+    assert_eq!(graph.scopes[first.scope].name.as_deref(), Some("hs"));
+    assert_eq!(graph.scopes[second.scope].name.as_deref(), Some("ps"));
+    assert_eq!(graph.visits[first.visit].parent, Some(0));
+    assert_ne!(graph.visits[second.visit].parent, Some(0));
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    measure_native(dir.path(), text, "op\nwrdata actual.dat v(hp) v(pp) v(r)")?;
+    let observed = values(dir.path(), "actual.dat")?;
+    for (a, e) in observed[0][1..].iter().zip([-4., 4., -9.]) {
+        ensure!((*a - e).abs() < 1e-12, "{a} != {e}\n{text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn shared_linker_rejects_resource_cycles_and_opaque_hspice_payloads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("child.lib");
+    fs::write(&root, "Resource cycle\n.inc child.lib\n.end\n")?;
+    fs::write(&child, ".inc root.sp\n")?;
+    let error = compile(&root, InputFormat::HspiceDeck).expect_err("include cycle");
+    ensure!(
+        format!("{error:#}").contains("recursive ngspice source include"),
+        "{error:#}"
+    );
+    for start in [".control", ".file hidden"] {
+        fs::write(&child, format!("{start}\n.inc missing.lib\n"))?;
+        let error = compile(&root, InputFormat::HspiceDeck).expect_err("opaque payload");
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains("unsupported standalone SPICE command") && text.contains("child.lib:1"),
+            "{text}"
+        );
+        ensure!(!text.contains("cannot resolve source file"), "{text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn pspice_definitions_keep_local_scope_and_ordinary_m_actuals() -> Result<()> {
+    for (policy, hs_current) in [("GLOBAL", -0.0001), ("LOCAL", -0.0005)] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root.sp");
+        fs::write(
+            dir.path().join("ps.lib"),
+            r#"*#PSPICE
+.subckt outer p n params: gain=2
+.param rbase=100 local=4
+X1 p n inner params: factor={gain} m={local}
+.ends outer
+.subckt inner p n params: factor=1 m=1
+R1 p n {rbase*factor*m}
+.ends inner
+"#,
+        )?;
+        fs::write(
+            &root,
+            format!(
+                r#"Mixed hierarchy
+.option parhier={policy} xmult_in_exp=no
+.param gain=10 rbase=1000
+.inc ps.lib
+Vps p 0 1
+Vhs h 0 1
+Xps p 0 outer gain=3
+Xhs h 0 hcell
+.subckt hcell p n gain=2
+R1 p n 'gain*1k'
+.ends hcell
+.end
+"#
+            ),
+        )?;
+        let bundle = compile(&root, InputFormat::HspiceDeck)?;
+        let text = std::str::from_utf8(&bundle.primary.bytes)?;
+        measure_native(dir.path(), text, "op\nwrdata actual.dat i(vps) i(vhs)")?;
+        let observed = values(dir.path(), "actual.dat")?;
+        // PSpice inner sees the main-circuit RBASE=1000, not its caller's
+        // RBASE=100; FACTOR and M actuals evaluate in OUTER. M is an
+        // ordinary argument, not an additional physical scaling factor.
+        for (a, e) in observed[0][1..].iter().zip([-1. / 12000., hs_current]) {
+            ensure!((*a - e).abs() < 1e-12, "{policy}: {a} != {e}\n{text}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_laplace_coefficients_preserve_scope_gain_and_polarity() -> Result<()> {
+    // HSPICE's positional coefficients ascend in powers of s, whereas
+    // native s_xfer vectors descend. "s" here is also a legal scalar
+    // parameter, not the physical transform variable.
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("root.sp");
+    fs::write(
+        &root,
+        "Scoped differential filters\n.option parhier=local reltol=1e-7\n.subckt filter p n out gout s=2 tau=1m\nE1 out 0 LAPLACE p n s,0 / 1,'tau' SCALE=2\nG1 gout 0 LAPLACE p n s/1,tau SCALE=2 M=3\n.ends filter\nV1 in ref DC 0 AC 1 PWL(0 0 1u 1 5m 1)\nVref ref 0 2\nX1 in ref out1 gout1 filter s=2 tau=1m\nX2 in ref out2 gout2 filter s=3 tau=2m\nR1 out1 0 1k\nR2 out2 0 1k\nRg1 gout1 0 1\nRg2 gout2 0 1\n.end\n",
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native source provenance");
+    };
+    assert_eq!(text.lines().count(), lines.len());
+    assert_eq!(text.matches("s_xfer").count(), 4);
+    for line in [4, 5] {
+        assert!(lines.iter().filter(|origin| origin.line == line).count() >= 6);
+    }
+    measure_native(
+        directory.path(),
+        text,
+        "ac lin 5 100 500\nwrdata ac.dat v(out1) v(gout1) v(out2) v(gout2)\ntran 0.1u 5m 0 0.1u\nwrdata tran.dat v(out1) v(gout1) v(out2) v(gout2)",
+    )?;
+    let ac = values(directory.path(), "ac.dat")?;
+    assert_eq!(ac.len(), 5);
+    for row in ac {
+        let [frequency, re1, im1, gre1, gim1, re2, im2, gre2, gim2] = row.as_slice() else {
+            anyhow::bail!("unexpected AC row {row:?}");
+        };
+        for (tau, gain, re, im, gre, gim) in [
+            (0.001, 4., *re1, *im1, *gre1, *gim1),
+            (0.002, 6., *re2, *im2, *gre2, *gim2),
+        ] {
+            let omega = std::f64::consts::TAU * frequency * tau;
+            let expected = gain / omega.mul_add(omega, 1.);
+            assert!((re - expected).abs() < 1e-8, "{row:?}");
+            assert!((im + expected * omega).abs() < 1e-8, "{row:?}");
+            assert!((gre + 3. * re).abs() < 1e-8, "{row:?}");
+            assert!((gim + 3. * im).abs() < 1e-8, "{row:?}");
+        }
+    }
+    let transient = values(directory.path(), "tran.dat")?;
+    for row in &transient {
+        let [time, out1, gout1, out2, gout2] = row.as_slice() else {
+            anyhow::bail!("unexpected transient row {row:?}");
+        };
+        if *time >= 1e-6 {
+            for (tau, gain, voltage, current) in [
+                (0.001_f64, 4., *out1, *gout1),
+                (0.002_f64, 6., *out2, *gout2),
+            ] {
+                let ramp = 1e-6;
+                let fraction = -(-ramp / tau).exp_m1() * tau / ramp;
+                let expected = gain * (fraction.mul_add(-(-(time - ramp) / tau).exp(), 1.));
+                assert!((voltage - expected).abs() < 2e-4, "{row:?}");
+                assert!((current + 3. * voltage).abs() < 1e-6, "{row:?}");
+            }
+        }
+    }
+    assert!(transient.last().context("missing transient samples")?[0] >= 0.004999);
+    Ok(())
+}
+
+#[test]
+fn foreign_resources_cannot_override_root_analysis_policy() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("child.lib");
+    fs::write(
+        &root,
+        "Root policy\n.include child.lib\nV1 a 0 1\nR1 a 0 1k\n.op\n.end\n",
+    )?;
+    for directive in [".temp 100", ".op", ".tran 1n 10n", ".option reltol=1e-3"] {
+        fs::write(&child, format!("*#PSPICE\n{directive}\n"))?;
+        let err = compile(&root, InputFormat::HspiceDeck).expect_err("foreign global policy");
+        let text = format!("{err:#}");
+        assert!(text.contains("circuit-wide policy belongs"), "{text}");
+        assert!(text.contains("child.lib:2"), "{text}");
+    }
+
+    // Ordinary same-language include files remain part of the root deck.
+    fs::write(&child, ".temp 50\n.option reltol=1e-5\n")?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(native.contains(".temp 50"), "{native}");
+    assert!(!native.contains(".temp 25"), "{native}");
+
+    // Independent catalogs have no authority over the receiving analysis,
+    // whether admitted directly or deserialized.
+    fs::write(&root, "Catalog policy\nV1 a 0 1\nR1 a 0 1k\n.op\n.end\n")?;
+    let library = compile(&child, InputFormat::HspiceLibrary)?;
+    let cached = ParsedLibrary::from_json(&library.primary.bytes)?;
+    for library in [
+        LibraryInput::Source(SourceInput::File(child.clone())),
+        LibraryInput::Parsed(cached),
+    ] {
+        let request = Request {
+            format: InputFormat::HspiceDeck,
+            input: SourceInput::File(root.clone()),
+            libraries: vec![library],
+            search_paths: Vec::new(),
+        };
+        let err = prepare(&request, &Options::default(), &Cancellation::default())
+            .expect_err("catalog global policy");
+        assert!(format!("{err:#}").contains("catalog resource"), "{err:#}");
+    }
+    Ok(())
+}
+
+#[test]
+fn same_named_pspice_and_hspice_junctions_use_independent_physical_variants() -> Result<()> {
+    use model_preprocess_simplis::source_dialect::model_mapping::{Device, SelectionOrigin};
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("ps.lib");
+    fs::write(
+        &child,
+        r#"*#PSPICE
+.subckt ps d m g params: sat=2p
+.model diode_base D(IS={sat} N=1.2 BV=5 IBV=1m CJO=2p TT=2n)
+.model junction AKO:diode_base D(RS=2)
+.model channel NMOS(LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02)
+D1 d 0 junction 2
+M1 m g 0 0 channel L=1u W=2u
+.ends ps
+"#,
+    )?;
+    fs::write(
+        &root,
+        r#"Mixed physical junction declarations
+.option parhier=local
+.inc ps.lib
+Vd1 hd 0 DC 0.6 AC 1
+Vd2 pd 0 DC 0.6 AC 1
+Vm1 hm 0 0.8
+Vm2 pm 0 0.8
+Vg g 0 1
+Xh hd hm g hs
+Xp pd pm g ps sat=2p
+.subckt hs d m g sat=1p
+.model junction D(IS='sat' N=1.2 BV=5 IBV=1m CJO=2p TT=2n RS=2)
+.model channel NMOS(LEVEL=54 VERSION=4.7 VTH0=0.4)
+D1 d 0 junction AREA=2
+M1 m g 0 0 channel L=1u W=2u
+.ends hs
+.op
+.end
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let selections = &bundle.model_selections;
+    assert_eq!(selections.len(), 5);
+    for (name, devices) in [
+        ("junction", [Device::NativeDiode, Device::Diode3]),
+        ("channel", [Device::Mos1, Device::Bsim4]),
+    ] {
+        let matches = selections
+            .iter()
+            .filter(|selection| selection.card.name.eq_ignore_ascii_case(name))
+            .collect::<Vec<_>>();
+        let [ps, hs] = matches.as_slice() else {
+            anyhow::bail!("missing mixed typed model {name}");
+        };
+        assert_eq!([ps.mapping.device, hs.mapping.device], devices);
+        assert_eq!(ps.mapping.origin, SelectionOrigin::StandalonePspice);
+        assert_eq!(hs.mapping.origin, SelectionOrigin::StandaloneHspice);
+        assert_ne!(
+            ps.linked.context("missing PSpice location")?.scope,
+            hs.linked.context("missing HSPICE location")?.scope
+        );
+    }
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    let script = "op\nwrdata actual.dat i(vd1) i(vd2) i(vm1) i(vm2)\ndc Vg 0 1.2 0.2\nwrdata dc.dat i(vm1) i(vm2)\nac lin 3 1k 3k\nwrdata ac.dat i(vd1) i(vd2)";
+    measure_native(dir.path(), native, script)?;
+    let reference = tempfile::tempdir()?;
+    measure_native(
+        reference.path(),
+        r#"Independent physical reference
+.options TNOM=25
+.temp 25
+Vd1 hd 0 DC 0.6 AC 1
+Vd2 pd 0 DC 0.6 AC 1
+Vm1 hm 0 0.8
+Vm2 pm 0 0.8
+Vg g 0 1
+D1 hd 0 hdiode AREA=2
+D2 pd 0 pdiode AREA=2
+M1 hm g 0 0 hmos L=1u W=2u
+M2 pm g 0 0 pmos L=1u W=2u
+.model hdiode D(LEVEL=3 IS=1p N=1.2 BV=5 IBV=1m CJ=2p TT=2n RS=2 FC=0 FCS=0 VJ=0.8 PHP=0.8)
+.model pdiode D(IS=2p N=1.2 BV=5 IBV=1m CJO=2p TT=2n RS=2 TNOM=27)
+.model hmos NMOS(LEVEL=14 VERSION=4.70 VTH0=0.4)
+.model pmos NMOS(LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02 TNOM=27)
+.end
+"#,
+        script,
+    )?;
+    for file in ["actual.dat", "dc.dat", "ac.dat"] {
+        let actual = values(dir.path(), file)?;
+        let expected = values(reference.path(), file)?;
+        assert_eq!(actual.len(), expected.len());
+        for (row, reference) in actual.iter().zip(expected) {
+            assert_eq!(row.len(), reference.len());
+            for (&a, e) in row.iter().zip(reference) {
+                ensure!(
+                    (a - e).abs() <= 1e-12 + e.abs() * 1e-8,
+                    "{file}: {a:e} != {e:e}\n{native}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pspice_transfers_bind_coefficients_without_rebinding_laplace_or_electrical_names() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("filters.lib");
+    fs::write(
+        &child,
+        r#"*#PSPICE
+.subckt filter s gnd out gout tab freq params: gain=2 tau=1m
+.param s=99
+E1 out gnd LAPLACE {V(s,gnd)} = {gain/(1+s*tau)}
+G1 gout gnd LAPLACE {V(s,gnd)} = {gain/(1+s*tau)}
+E2 tab gnd TABLE {V(s,gnd)} = (0,0) (2,{2*gain})
+E3 freq gnd FREQ {V(s,gnd)} R_I (100,{gain},0) (500,0,{gain})
+.ends filter
+"#,
+    )?;
+    fs::write(
+        &root,
+        r#"Mixed scoped transfer functions
+.option parhier=local
+.inc filters.lib
+V1 input ref DC 1 AC 1
+Vref ref 0 2
+X1 input ref o1 g1 t1 f1 filter gain=2 tau=1m
+X2 input ref o2 g2 t2 f2 filter gain=3 tau=2m
+R1 o1 ref 1k
+R2 o2 ref 1k
+Rg1 g1 ref 1
+Rg2 g2 ref 1
+Rt1 t1 ref 1k
+Rt2 t2 ref 1k
+Rf1 f1 ref 1k
+Rf2 f2 ref 1k
+.end
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing transfer provenance");
+    };
+    assert_eq!(native.lines().count(), lines.len());
+    assert_eq!(native.matches("s_xfer").count(), 4);
+    let path = child.canonicalize()?;
+    for (line, origin) in native.lines().zip(lines) {
+        if line.contains("s_xfer") || line.contains(" xfer ") {
+            assert_eq!(origin.source, path);
+            assert!((4..=7).contains(&origin.line));
+        }
+    }
+    measure_native(
+        dir.path(),
+        native,
+        "op\nwrdata op.dat v(o1,ref) v(g1,ref) v(t1,ref) v(o2,ref) v(g2,ref) v(t2,ref)\nac lin 2 100 500\nwrdata ac.dat v(o1,ref) v(g1,ref) v(f1,ref) v(o2,ref) v(g2,ref) v(f2,ref)",
+    )?;
+    let op = values(dir.path(), "op.dat")?;
+    for (&actual, expected) in op[0][1..].iter().zip([2., -2., 2., 3., -3., 3.]) {
+        ensure!((actual - expected).abs() <= 1e-8, "{op:?}\n{native}");
+    }
+    let ac = values(dir.path(), "ac.dat")?;
+    assert_eq!(ac.len(), 2);
+    for row in ac {
+        let frequency = row[0];
+        for (index, gain, tau) in [(1, 2., 0.001), (7, 3., 0.002)] {
+            let omega = std::f64::consts::TAU * frequency * tau;
+            let re = gain / omega.mul_add(omega, 1.);
+            let im = -re * omega;
+            let (freq_re, freq_im) = if frequency < 300. {
+                (gain, 0.)
+            } else {
+                (0., gain)
+            };
+            for (&actual, expected) in row[index..index + 6]
+                .iter()
+                .zip([re, im, -re, -im, freq_re, freq_im])
+            {
+                ensure!((actual - expected).abs() <= 1e-8, "{row:?}\n{native}");
+            }
+        }
+    }
     Ok(())
 }

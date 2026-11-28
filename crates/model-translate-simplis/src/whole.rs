@@ -5347,7 +5347,12 @@ fn translate_deck_items(
     reject_residual_simplis(&output.text)?;
     let bytes = match model_normalize_ngspice::controlled_transfer::lower_sources(
         output.text.as_bytes(),
-        Ok,
+        |line| {
+            Ok((
+                line,
+                model_normalize_ngspice::linked_source::SourceDialect::Native,
+            ))
+        },
         budget,
     )? {
         Some(lowered) => lowered.bytes,
