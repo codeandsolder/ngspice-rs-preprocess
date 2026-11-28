@@ -73,7 +73,7 @@ impl VdmosKernel {
             if temperature <= 0. || !temperature.is_finite() {
                 return false;
             }
-            let potential = junction_potential(&self.model, Jet::constant(temperature)).v;
+            let potential = junction_potential(&self.model, Jet::<f64>::constant(temperature)).v;
             potential > 0. && potential.is_finite()
         };
         let previous = reference[junction];
@@ -122,7 +122,7 @@ impl VdmosKernel {
             && let Some(avalanche) = diode.breakdown
         {
             let saturation = log_current.exp();
-            let knee = breakdown::effective_voltage(
+            let knee: f64 = breakdown::effective_voltage(
                 avalanche,
                 Jet::constant(saturation),
                 Jet::constant(thermal),
