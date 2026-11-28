@@ -95,6 +95,7 @@ pub fn artifact(
             family: "vbic".into(),
             fingerprint,
             abi: ABI_VERSION,
+            taylor: model_kernel_api::taylor::TaylorCapability::Unavailable,
             equations: equations(layout)?,
             parameters: parameters
                 .into_iter()

@@ -12,10 +12,11 @@ use std::sync::Arc;
 
 pub mod batch;
 pub mod noise;
+pub mod taylor;
 pub mod trial;
 
 /// Interface revision, independent of any model-family revision.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// A missing contribution is not a known physical zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +78,7 @@ pub struct Descriptor {
     pub charge: Capability,
     pub noise: Capability,
     pub trial: trial::TrialCapabilities,
+    pub taylor: taylor::TaylorCapability,
 }
 
 /// Failures carry model or interface context, never solver-specific types.
@@ -138,6 +140,7 @@ impl Descriptor {
         {
             return Err(Error::Schema("version, identity or equation dimensions"));
         }
+        self.taylor.validate(n, self.charge)?;
         for (i, row) in self.equations.iter().enumerate() {
             if !valid_name(&row.name)
                 || self.equations[..i]
@@ -320,6 +323,20 @@ pub trait Kernel: Debug + Send + Sync + 'static {
         coordinates: &[f64],
         out: &mut Point<'_>,
     ) -> Result<()>;
+
+    /// Fill exact normalized Taylor coefficients of F, Q and both Jacobians.
+    /// No history mutation, perturbation or companion integration is allowed.
+    ///
+    /// # Errors
+    /// Unsupported capability, invalid germ or nonregular physical law.
+    fn evaluate_taylor(
+        &self,
+        _prepared: &Self::Prepared,
+        _input: taylor::TaylorInput<'_>,
+        _out: &mut taylor::TaylorPoint<'_>,
+    ) -> Result<()> {
+        Err(Error::Unsupported("physical Taylor evaluation"))
+    }
 
     /// Homogeneous lane-major batch; families may specialize this for SIMD.
     ///
