@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use model_preprocess_command::WorkBudget;
 use model_preprocess_simplis::source_dialect::{
     DialectContext, ScopedStatement, SourceDialect,
-    model_mapping::{Device, DeviceConfiguration, MappingTable, SelectionOrigin},
+    model_mapping::{
+        Device, DeviceConfiguration, HspiceMosJunctionMode, MappingTable, SelectionOrigin,
+    },
 };
 
 fn statements(input: &str) -> Vec<ScopedStatement> {
@@ -280,6 +282,60 @@ fn hspice_bsim3_selection_preserves_exact_release_and_level_defaults() -> Result
                     .select_card(&lines[0], &[], &WorkBudget::default())
                     .is_err()
             );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hspice_junction_modes_keep_area_selection_separate_from_resistance() -> Result<()> {
+    use HspiceMosJunctionMode as Mode;
+    let mapping = table(".options HSPICEMODELS=1")?;
+    for (level, version, default) in [
+        (49, "3.24", Mode::HspiceExplicit),
+        (53, "3.3", Mode::BerkeleyExplicit),
+        (54, "4.7", Mode::BerkeleyIsolated),
+    ] {
+        let select = |parameters: &str| -> Result<_> {
+            let lines = statements(&format!(
+                ".model m NMOS LEVEL={level} VERSION={version} {parameters}"
+            ));
+            mapping
+                .select_card(&lines[0], &[], &WorkBudget::default())?
+                .context("model selection")?
+                .hspice_mos_junction()?
+                .context("junction selection")
+        };
+        let defaults = select("")?;
+        assert_eq!(defaults.mode, default);
+        assert!(!defaults.automatic_bsim3_geometry);
+        for (acm, mode) in [
+            (0, Mode::HspiceExplicit),
+            (1, Mode::HspiceWidthNormalized),
+            (2, Mode::HspiceIsolated),
+            (3, Mode::HspiceStacked),
+            (10, Mode::BerkeleyExplicit),
+            (11, Mode::BerkeleyWidthNormalized),
+            (12, Mode::BerkeleyIsolated),
+            (13, Mode::BerkeleyStacked),
+        ] {
+            for calcacm in [0, 1] {
+                let selected = select(&format!("ACM={acm} CALCACM={calcacm}"))?;
+                assert_eq!(selected.mode, mode);
+                assert_eq!(
+                    selected.automatic_bsim3_geometry,
+                    level != 54 && acm == 12 && calcacm == 1
+                );
+            }
+        }
+        for unsupported in [
+            "ACM=4",
+            "ACM=12.5",
+            "ACM=12 ACM=12",
+            "CALCACM=2",
+            "ACM={mode}",
+        ] {
+            assert!(select(unsupported).is_err());
         }
     }
     Ok(())

@@ -167,7 +167,18 @@ fn unqualified_hspice_semantics_are_errors() -> Result<()> {
             "recursive HSPICE subcircuit",
         ),
         (".option XMULT_IN_EXP=maybe", "invalid HSPICE XMULT_IN_EXP"),
-        (".model mos NMOS LEVEL=49", "qualified native mapping"),
+        (
+            ".model mos NMOS LEVEL=49",
+            "requires an exact supported VERSION",
+        ),
+        (
+            ".model mos NMOS LEVEL=49 VERSION=3.24",
+            "has no qualified native lowering",
+        ),
+        (
+            ".model mos NMOS LEVEL=53 VERSION=3.3 ACM=4",
+            "unsupported HSPICE ACM selector",
+        ),
         (".temp 25 50", "multiple-temperature"),
         (".tran 1n 10n 2n 20n", "multipoint transient"),
         (".dc gain 1 2 1", "parameter/temperature sweep"),

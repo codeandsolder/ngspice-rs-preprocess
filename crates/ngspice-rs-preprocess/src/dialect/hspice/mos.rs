@@ -13,7 +13,8 @@ use model_normalize_ngspice::{
 };
 use model_preprocess_command::{Resource, WorkBudget};
 use model_preprocess_simplis::{
-    lower_spice_expression, source_dialect::model_mapping::ModelSelection,
+    lower_spice_expression,
+    source_dialect::model_mapping::{HspiceMosJunctionMode, ModelSelection},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -107,6 +108,13 @@ pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
             .as_deref()
             .context("missing BSIM4 version")?,
     )?;
+    let junction = selection
+        .hspice_mos_junction()?
+        .context("missing BSIM4 junction selection")?;
+    ensure!(
+        junction.mode == HspiceMosJunctionMode::BerkeleyIsolated,
+        "HSPICE BSIM4 ACM mode requires distinct junction kernel"
+    );
     let mut seen = BTreeSet::new();
     for field in &mut selection.card.parameters {
         field.name.make_ascii_uppercase();
@@ -118,21 +126,13 @@ pub fn qualify_model(selection: &mut ModelSelection) -> Result<()> {
             "duplicate HSPICE BSIM4 field {}",
             field.name
         );
-        let value = field
-            .expression
-            .as_deref()
-            .context("BSIM4 model field requires a value")?;
+        ensure!(
+            field.expression.is_some(),
+            "BSIM4 model field requires a value"
+        );
         match field.name.as_str() {
-            // The documented ACM=12 mode uses the original Berkeley junction
-            // and parasitic equations; CALCACM is inactive in this mode.
-            "ACM" => ensure!(
-                matches!(parse_spice_constant(value)?, 12.),
-                "HSPICE BSIM4 ACM mode requires distinct junction kernel"
-            ),
-            "CALCACM" => {
-                flag(parse_spice_constant(value)?, "CALCACM")?;
-            }
-            "LEVEL" | "VERSION" | "XLREF" | "XWREF" | "LMLT" | "WMLT" => (),
+            // The junction selector was checked before visiting the other fields.
+            "ACM" | "CALCACM" | "LEVEL" | "VERSION" | "XLREF" | "XWREF" | "LMLT" | "WMLT" => (),
             _ => ensure!(
                 supported(bsim4_catalog::MODEL, &field.name, mask),
                 "unqualified HSPICE BSIM4 model parameter {} for version {}",

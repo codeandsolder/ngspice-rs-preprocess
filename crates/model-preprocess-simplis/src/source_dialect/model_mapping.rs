@@ -570,10 +570,14 @@ impl MappingTable {
                 Some("4.5" | "4.50" | "4.5.0" | "4.64" | "4.6.4" | "4.7" | "4.70" | "4.7.0")
             );
         if let Some(defaults) = selection.hspice_bsim3_defaults() {
+            let junction = selection
+                .hspice_mos_junction()?
+                .context("missing BSIM3 junction selection")?;
             bail!(
-                "HSPICE BSIM3 level {} VERSION={} (default ACM={}, CAPMOD={}) has no qualified native lowering",
+                "HSPICE BSIM3 level {} VERSION={} (junction {:?}, default ACM={}, CAPMOD={}) has no qualified native lowering",
                 selection.mapping.key.level,
                 selection.effective_version.as_deref().unwrap_or("unknown"),
+                junction.mode,
                 defaults.acm,
                 defaults.capmod,
             );
@@ -765,6 +769,30 @@ pub struct MappedSource {
     pub selections: Vec<ModelSelection>,
 }
 
+/// The source junction/series-resistance selector, not a native ACM number.
+///
+/// Berkeley variants share a junction law but retain distinct extrinsic
+/// resistance geometry. Do not equate these with ngspice ACM=10–13.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HspiceMosJunctionMode {
+    HspiceExplicit,
+    HspiceWidthNormalized,
+    HspiceIsolated,
+    HspiceStacked,
+    BerkeleyExplicit,
+    BerkeleyWidthNormalized,
+    BerkeleyIsolated,
+    BerkeleyStacked,
+}
+
+/// The selected structural junction mode before occurrence preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HspiceMosJunctionSelection {
+    pub mode: HspiceMosJunctionMode,
+    /// Automatic area and perimeter calculation applies only to BSIM3 ACM12.
+    pub automatic_bsim3_geometry: bool,
+}
+
 /// Source defaults for BSIM3 levels 49 and 53. These differ from the native
 /// defaults even when the channel release has the same version number.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -776,6 +804,10 @@ pub struct HspiceBsim3Defaults {
 impl HspiceBsim3Defaults {
     /// Both source levels use zero default bottom saturation-current density.
     pub const JUNCTION_CURRENT_DENSITY: f64 = 0.;
+    /// Source defaults differ from Berkeley for both capacitance densities.
+    pub const BOTTOM_CAPACITANCE_DENSITY: f64 = 5.79e-4;
+    pub const SIDEWALL_CAPACITANCE_DENSITY: f64 = 0.;
+    pub const SIDEWALL_CURRENT_DENSITY: f64 = 0.;
 }
 
 impl ModelSelection {
@@ -789,6 +821,54 @@ impl ModelSelection {
             Device::Bsim3HspiceBerkeleyJunction => Some(HspiceBsim3Defaults { acm: 10, capmod: 3 }),
             _ => None,
         }
+    }
+
+    /// Select the source-specific ACM and CALCACM interpretation.
+    ///
+    /// The caller must be processing an HSPICE model. Literal structural
+    /// selectors must be known before choosing the electrical implementation.
+    ///
+    /// # Errors
+    /// Duplicate, nonliteral or unsupported structural selectors.
+    pub fn hspice_mos_junction(&self) -> Result<Option<HspiceMosJunctionSelection>> {
+        let bsim3 = self.hspice_bsim3_defaults();
+        let default_acm = if let Some(defaults) = bsim3 {
+            f64::from(defaults.acm)
+        } else if self.mapping.device == Device::Bsim4 && self.mapping.key.level == 54 {
+            12.
+        } else {
+            return Ok(None);
+        };
+        let acm = one(&self.card.parameters, "ACM")?
+            .map(parse_spice_constant)
+            .transpose()?
+            .unwrap_or(default_acm);
+        let mode = match acm {
+            0. => HspiceMosJunctionMode::HspiceExplicit,
+            1. => HspiceMosJunctionMode::HspiceWidthNormalized,
+            2. => HspiceMosJunctionMode::HspiceIsolated,
+            3. => HspiceMosJunctionMode::HspiceStacked,
+            10. => HspiceMosJunctionMode::BerkeleyExplicit,
+            11. => HspiceMosJunctionMode::BerkeleyWidthNormalized,
+            12. => HspiceMosJunctionMode::BerkeleyIsolated,
+            13. => HspiceMosJunctionMode::BerkeleyStacked,
+            _ => bail!("unsupported HSPICE ACM selector {acm}"),
+        };
+        let calculate = match one(&self.card.parameters, "CALCACM")?
+            .map(parse_spice_constant)
+            .transpose()?
+        {
+            Some(0.) => false,
+            Some(1.) => true,
+            None => bsim3.is_none(),
+            Some(value) => bail!("invalid HSPICE CALCACM selector {value}"),
+        };
+        Ok(Some(HspiceMosJunctionSelection {
+            mode,
+            automatic_bsim3_geometry: bsim3.is_some()
+                && mode == HspiceMosJunctionMode::BerkeleyIsolated
+                && calculate,
+        }))
     }
 
     /// Canonical model card for the existing electrical lowering stage.
