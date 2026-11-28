@@ -519,7 +519,9 @@ impl LinkState<'_> {
         // the source dialect by a subsequent linker.
         let neutralized;
         let text = if visit.declaration == Some(physical_line) {
-            neutralized = [b"* ".as_slice(), text].concat();
+            let trimmed = text.trim_ascii_start();
+            let position = text.len() - trimmed.len() + 1;
+            neutralized = [&text[..position], b" ", &text[position..]].concat();
             neutralized.as_slice()
         } else {
             text
@@ -1013,7 +1015,7 @@ mod tests {
             shared,
             [Some(SourceDialect::Pspice), Some(SourceDialect::Native)]
         );
-        assert!(text.contains("* *#PSPICE"));
+        assert!(text.contains("* #PSPICE"));
         assert!(!text.contains("missing.inc"));
         assert_eq!(linked.origins.len(), text.lines().count());
         Ok(())
@@ -1034,7 +1036,7 @@ mod tests {
         )?;
         assert_eq!(linked.visits[0].dialect, SourceDialect::Ltspice);
         assert_eq!(linked.visits[0].declaration, Some(2));
-        assert!(linked.bytes.starts_with(b"*#PSPICE\n* *#LTSPICE\n"));
+        assert!(linked.bytes.starts_with(b"*#PSPICE\n* #LTSPICE\n"));
         assert_eq!(linked.origin(2).context("header origin")?.line, 2);
         Ok(())
     }
