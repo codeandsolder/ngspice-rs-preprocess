@@ -8,8 +8,11 @@
 use std::{collections::BTreeMap, fmt::Write as _};
 
 use anyhow::{Context, Result, bail, ensure};
-use model_normalize_ngspice::model_card::{
-    ModelCard, ModelParameter, parse_model_card, parse_parameter_fields, parse_spice_constant,
+use model_normalize_ngspice::{
+    bjt_card::{BjtThermalConvention, ClassicBjtFamily},
+    model_card::{
+        ModelCard, ModelParameter, parse_model_card, parse_parameter_fields, parse_spice_constant,
+    },
 };
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
@@ -35,7 +38,8 @@ pub enum Device {
     Bsim3HspiceJunction,
     Bsim3HspiceBerkeleyJunction,
     Bsim4,
-    GummelPoon,
+    GummelPoonLegacy,
+    GummelPoonNative,
     Vbic,
     VbicThermal,
     Hicum211,
@@ -50,7 +54,11 @@ impl Device {
         match self {
             Self::Diode1 | Self::Diode3 => 'D',
             Self::Resistor | Self::HspiceResistor => 'R',
-            Self::GummelPoon | Self::Vbic | Self::VbicThermal | Self::Hicum211 => 'Q',
+            Self::GummelPoonLegacy
+            | Self::GummelPoonNative
+            | Self::Vbic
+            | Self::VbicThermal
+            | Self::Hicum211 => 'Q',
             _ => 'M',
         }
     }
@@ -66,6 +74,11 @@ impl Device {
             "MOS1" => Ok(Self::Mos1),
             "MOS2" => Ok(Self::Mos2),
             "MOS3" => Ok(Self::Mos3),
+            // `BJT` is the documented SIMetrix internal classic device.
+            "BJT" => Ok(Self::GummelPoonLegacy),
+            // Explicit producer extension for a mixed native/legacy deck;
+            // not a SIMetrix vendor device identifier.
+            "NGSPICE_BJT" => Ok(Self::GummelPoonNative),
             "VBIC" => Ok(Self::Vbic),
             "PSP103_N" => Ok(Self::Psp103N),
             "PSP103_P" => Ok(Self::Psp103P),
@@ -78,7 +91,11 @@ impl Device {
     #[must_use = "the returned level identifies the source-model variant"]
     pub const fn source_level(self) -> u16 {
         match self {
-            Self::Diode1 | Self::Resistor | Self::Mos1 | Self::GummelPoon => 1,
+            Self::Diode1
+            | Self::Resistor
+            | Self::Mos1
+            | Self::GummelPoonLegacy
+            | Self::GummelPoonNative => 1,
             Self::HspiceResistor | Self::Mos2 => 2,
             Self::Diode3 | Self::Mos3 => 3,
             Self::Vbic => 4,
@@ -297,7 +314,7 @@ fn builtin(key: &ModelKey) -> Option<Device> {
         ("NMOS" | "PMOS", 53) => Some(Device::Bsim3HspiceBerkeleyJunction),
         ("NMOS" | "PMOS", 62) => Some(Device::HisimHv1),
         ("NMOS" | "PMOS", 73) => Some(Device::HisimHv2),
-        ("NPN" | "PNP" | "LPNP", 0 | 1) => Some(Device::GummelPoon),
+        ("NPN" | "PNP" | "LPNP", 0 | 1) => Some(Device::GummelPoonLegacy),
         ("NPN" | "PNP", 4) => Some(Device::Vbic),
         ("NPN" | "PNP", 8) | ("HICUM_211", 0) => Some(Device::Hicum211),
         ("NPN" | "PNP", 1004) => Some(Device::VbicThermal),
@@ -722,6 +739,13 @@ fn resolve_version(device: Device, version: Option<&str>) -> Result<Option<Strin
             Some("4.7" | "4.70" | "4.7.0") => "4.70",
             Some(other) => bail!("unsupported BSIM4 source VERSION={other}"),
         },
+        Device::GummelPoonLegacy | Device::GummelPoonNative => {
+            ensure!(
+                version.is_none(),
+                "classic Gummel-Poon source VERSION is not a qualified selector"
+            );
+            return Ok(None);
+        }
         Device::Hicum211 => match version {
             None | Some("2.11" | "2.1.1") => "2.11",
             Some(other) => bail!("unsupported HICUM source VERSION={other}"),
@@ -764,8 +788,8 @@ impl ModelSelection {
     /// Unsupported device family, version or access letter.
     pub fn lower(&self) -> Result<String> {
         use Device::{
-            Bsim3Berkeley, Bsim4, Diode1, Diode3, GummelPoon, Mos1, Mos2, Mos3, Mos17, Resistor,
-            Vbic,
+            Bsim3Berkeley, Bsim4, Diode1, Diode3, GummelPoonLegacy, GummelPoonNative, Mos1, Mos2,
+            Mos3, Mos17, Resistor, Vbic,
         };
         let device = self.mapping.device;
         ensure!(
@@ -787,7 +811,25 @@ impl ModelSelection {
                 );
                 (original_family.as_str(), device.source_level())
             }
-            GummelPoon | Vbic => {
+            GummelPoonLegacy | GummelPoonNative => {
+                ensure!(
+                    original_family != "LPNP",
+                    "lateral PNP substrate semantics are not qualified for classic BJT lowering"
+                );
+                let mut family = ClassicBjtFamily::parse(&original_family).with_context(|| {
+                    format!(
+                        "mapped BJT type {} does not specify polarity",
+                        self.card.family
+                    )
+                })?;
+                family.thermal = if device == GummelPoonLegacy {
+                    BjtThermalConvention::Legacy
+                } else {
+                    BjtThermalConvention::Ngspice
+                };
+                (family.name(), device.source_level())
+            }
+            Vbic => {
                 ensure!(
                     matches!(original_family.as_str(), "NPN" | "PNP"),
                     "mapped BJT type {} does not specify polarity",
@@ -804,7 +846,10 @@ impl ModelSelection {
         // Unchanged cards retain their original spelling, including
         // vendor-specific fields interpreted by downstream lowerers.
         let needs_level = self.declared_level.is_some()
-            || matches!(device, Diode1 | Diode3)
+            || matches!(
+                device,
+                Diode1 | Diode3 | GummelPoonLegacy | GummelPoonNative
+            )
             || self.mapping.origin != SelectionOrigin::Builtin;
         let native_version = self.effective_version.as_deref();
         let original_version = self.declared_version.as_deref();
