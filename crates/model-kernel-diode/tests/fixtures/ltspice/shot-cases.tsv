@@ -1,0 +1,16 @@
+zero|is=1e-12 n=1.5|
+neg3|is=1e-12 n=1.5|
+neg2|is=1e-12 n=1.5|
+neg1p33|is=1e-12 n=1.5|
+neg1p2|is=1e-12 n=1.5|
+neg0p5|is=1e-12 n=1.5|
+positive|is=1e-12 n=1.5|
+n1|is=1e-12 n=1.0|
+n3|is=1e-12 n=3.0|
+n3zero|is=1e-12 n=3.0|
+rec0|is=1e-12 n=1.5 isr=1e-10 nr=2.0|
+rec1|is=1e-12 n=1.5 isr=1e-10 nr=2.0|
+recneg|is=1e-12 n=1.5 isr=1e-10 nr=2.0|
+side0|is=1e-12 n=1.5 isw=1e-10 ns=2.0 perim=2.0|
+side1|is=1e-12 n=1.5 isw=1e-10 ns=2.0 perim=2.0|
+side_neg|is=1e-12 n=1.5 isw=1e-10 ns=2.0 perim=2.0|

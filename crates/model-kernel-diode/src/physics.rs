@@ -1,4 +1,5 @@
 //! Intrinsic physical current, charge and derivatives at bound temperature.
+pub mod ltspice;
 mod trial;
 use super::{
     BOLTZMANN, ELEMENTARY_CHARGE, Instance, Junction, K_OVER_Q, Model, ModelError, Noise, finite,
@@ -96,8 +97,10 @@ impl ExponentialJunction {
             )
         });
         let value = log_current.exp();
-        let derivative =
-            (log_current + self.inverse_vt.ln() + slope_factor.ln() - one_minus_exp.ln()).exp();
+        let derivative = (log_current + self.inverse_vt.abs().ln() + slope_factor.ln()
+            - one_minus_exp.ln())
+        .exp()
+        .copysign(self.inverse_vt);
         Slope { value, derivative }
     }
 }
@@ -264,6 +267,7 @@ struct JunctionEnvironment {
     temperature_delta: f64,
     potential: f64,
     capacitance_factor: f64,
+    signed_breakdown: bool,
 }
 
 impl JunctionLaw {
@@ -295,6 +299,7 @@ impl JunctionLaw {
             env.factor,
             env.thermal_voltage,
             env.temperature_delta,
+            env.signed_breakdown,
         )?;
         let depletion = Depletion::new(
             model.depletion,
@@ -332,13 +337,30 @@ impl JunctionLaw {
         }
     }
 
-    fn conduction(&self, voltage: f64) -> Slope {
+    fn forward(&self, voltage: f64) -> Slope {
         let transport = self.transport.evaluate(voltage, self.high_injection);
         let recombination = self.evaluate_recombination(voltage);
-        let mut physical = Slope {
+        Slope {
             value: transport.value + recombination.value,
             derivative: transport.derivative + recombination.derivative,
-        };
+        }
+    }
+
+    fn reverse(&self, voltage: f64) -> Slope {
+        let mut result = Slope::default();
+        if let Some(terms) = self.avalanche {
+            for term in terms {
+                let term = term.evaluate(voltage);
+                result.value += term.value;
+                result.derivative += term.derivative;
+            }
+        }
+        result
+    }
+
+    fn conduction(&self, voltage: f64) -> Slope {
+        let mut physical = self.forward(voltage);
+        // Preserve the original separate addition order for SIMetrix.
         if let Some(terms) = self.avalanche {
             for term in terms {
                 let term = term.evaluate(voltage);
@@ -418,6 +440,7 @@ impl PreparedInstance {
                 temperature_delta: delta,
                 potential,
                 capacitance_factor: 1.,
+                signed_breakdown: false,
             },
         )?;
         let series_resistance = model.series.resistance
@@ -526,6 +549,7 @@ fn prepare_avalanche(
     factor: f64,
     vt: f64,
     delta: f64,
+    signed: bool,
 ) -> Result<Option<[Avalanche; 2]>, ModelError> {
     let Some(breakdown) = model.breakdown else {
         return Ok(None);
@@ -536,14 +560,27 @@ fn prepare_avalanche(
             breakdown.quadratic_temperature,
             delta,
         );
-    positive("temperature-adjusted BV", voltage)?;
+    if signed {
+        finite("temperature-adjusted BV", &[voltage])?;
+    } else {
+        positive("temperature-adjusted BV", voltage)?;
+    }
     let terms = [breakdown.primary, breakdown.low_current].map(|term| Avalanche {
         voltage,
         log_current: term.current.ln() + factor.ln(),
         inverse_vt: (term.emission * vt).recip(),
     });
     for term in terms {
-        positive("avalanche inverse thermal voltage", term.inverse_vt)?;
+        if signed {
+            finite("avalanche inverse thermal voltage", &[term.inverse_vt])?;
+            if term.inverse_vt == 0. {
+                return Err(ModelError::Invalid(
+                    "zero avalanche inverse thermal voltage",
+                ));
+            }
+        } else {
+            positive("avalanche inverse thermal voltage", term.inverse_vt)?;
+        }
     }
     Ok(Some(terms))
 }
