@@ -1,0 +1,9 @@
+* IC corner semantics
+.options initCondMode=2 icres=0
+Vs s 0 10
+R1 s p 10
+R2 n 0 20
+C1 p n 1m IC=3
+.tran 1u 5u 0 100n
+.PRINT TRAN V(p) V(n)
+.end

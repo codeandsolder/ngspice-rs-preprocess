@@ -1,0 +1,4 @@
+* External third-party analog subcircuit absent from the original ALB deck.
+.subckt ANALOG_LINK IN OUT
+Rlink IN OUT 1k
+.ends ANALOG_LINK

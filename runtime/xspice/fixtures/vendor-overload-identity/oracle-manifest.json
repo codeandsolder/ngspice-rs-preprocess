@@ -1,0 +1,32 @@
+[
+    {
+        "case": "asymmetric-overload-interrupted",
+        "source_sha256": "D7B3A62C93B2166AA2D0914EF3BF2313546978E2185904C656F1A5A03BABBFE5",
+        "waveform_sha256": "FA65929BD072BC4087608D4409F7F72EF918DFC0854AF15DADC780B1FF692FCE",
+        "listing_sha256": "FD2E89829BB2DF0CABA3523B39E4DFBD23A93C045DD071DAAF930EBE5C1A1386",
+        "rows": 40001,
+        "warnings": 0,
+        "outputs": 12,
+        "current_samples": 4332
+    },
+    {
+        "case": "overload-request-identity",
+        "source_sha256": "DB1A4FFB7C3597852F29148B142111C1D676E2CA60A4BF1C13DCF15DF07462FF",
+        "waveform_sha256": "E86975990B4BB7ED1DAF4F590664BF45C9C0B63DE9DEBB9E3D100946083855B3",
+        "listing_sha256": "22410E039BF4DAFC5C72FC4CC658F2E91729A1608CA6F176E222F8111E255867",
+        "rows": 28001,
+        "warnings": 0,
+        "outputs": 12,
+        "current_samples": 888
+    },
+    {
+        "case": "startup-disabled",
+        "source_sha256": "12C96F52FFCCB285B4103593A19CBC2E0809101D7F9DDC47A733D6800C28E305",
+        "waveform_sha256": "6828B0225D10F657200C88E2C41A11B56F37387B8FE58442233E82EF4F9434A3",
+        "listing_sha256": "275131EFAA8817A10F14677B6D67E517AD37916A019F6990668115E7B5D1EBB1",
+        "rows": 8001,
+        "warnings": 0,
+        "outputs": 32,
+        "current_samples": 1056
+    }
+]

@@ -1,0 +1,13 @@
+* Inline DEF parameter ordering controls
+.file LOGIC
+PORT D in[0];
+PORT Q out[0];
+Q=D;
+.endf
+Vin5 in5 0 PWL(0 0 10n 0 50n 5 60n 5)
+A5 [in5] [q5] M5
+.model M5 d_logic_block file=LOGIC family="HC" vsupply=3.3 input_load=2p sink_current=-1m source_current=2m out_res=40 out_delay=1n
+R5 q5 0 100k
+.tran 5p 60n 0 5p
+.PRINT TRAN V(q5) I(Vin5)
+.end

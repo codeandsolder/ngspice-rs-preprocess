@@ -1,0 +1,5 @@
+* Statistical expression with explicit number of standard deviations
+.param g1={GAUSS(3,0.25,3)}
+V1 x 0 {g1}
+.op
+.end

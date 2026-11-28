@@ -16,7 +16,7 @@ trap 'rm -rf -- "$work"' EXIT
 cp -- "$here"/fixtures/family-adc/*.cir "$work/"
 printf 'codemodel %s\n' "$model" > "$work/.spiceinit"
 cd "$work"
-for circuit in adc-hc-ac adc-hc-dc adc-hc-rc adc-hc-threshold adc-hc-schmitt adc-ls-clamp adc-time-tol-coarse adc-time-tol-refined adc-time-tol-schmitt; do
+for circuit in adc-hc-ac adc-clamp-ac adc-hc-dc adc-hc-rc adc-hc-threshold adc-hc-schmitt adc-ls-clamp adc-time-tol-coarse adc-time-tol-refined adc-time-tol-schmitt; do
     if ! ngspice -b "$circuit.cir" > "$circuit.log" 2>&1; then
         tail -n 70 "$circuit.log" >&2
         exit 1
@@ -35,16 +35,31 @@ done
 awk '
   ($1>-.000001 && $1<.000001) && $2>.00999 && $2<.01001 {low=1}
   ($1>4.999999 && $1<5.000001) && $2>-.02001 && $2<-.01999 {high=1}
-  ($1>-.500001 && $1<-.499999) && $2>.0179 && $2<.0181 {lowclamp=1}
-  ($1>5.499999 && $1<5.500001) && $2>-.0281 && $2<-.0279 {highclamp=1}
+  ($1>-.500001 && $1<-.499999) && $2>.01558 && $2<.01560 {lowclamp=1}
+  ($1>5.499999 && $1<5.500001) && $2>-.02560 && $2<-.02558 {highclamp=1}
   END {exit !(low && high && lowclamp && highclamp)}
 ' adc-hc-dc.dat ||
     { echo 'ADC reflected current or nonlinear clamp I-V incorrect' >&2; exit 1; }
+# The original vendor diode branch at B-50mV has differential
+# conductance exp(-0.05/0.025864917)/10 = 14.470mS.
+# At and beyond B the slope is exactly 100mS, on either rail.
+awk '
+  $1>999 && $1<1001 {
+    if(NF!=18)exit 1
+    for(i=1;i<=6;i++) {
+      expected=(i==1 || i==4)?-exp(-.05/.025864917)/10:-.1
+      delta=$(3*i-1)-expected
+      if(delta>1e-5 || delta< -1e-5 || $(3*i)>1e-8 || $(3*i)< -1e-8)exit 1
+    }
+    pass=1
+  }
+  END {exit !pass}
+' adc-clamp-ac.dat || { echo 'ADC clamp differential conductance incorrect' >&2; exit 1; }
 # LS upper clamp is at 15V (no usual upper rail diode).
 awk '
   $1>3.49999 && $1<3.50001 && $2>-.0000001 && $2<.0000001 {logic_high=1}
   $1>14.99999 && $1<15.00001 && $2>-.0000001 && $2<.0000001 {unclamped=1}
-  $1>16.99999 && $1<17.00001 && $2<-.439 && $2>-.441 {clamped=1}
+  $1>16.99999 && $1<17.00001 && $2<-.41033 && $2>-.41036 {clamped=1}
   END {exit !(logic_high && unclamped && clamped)}
 ' adc-ls-clamp.dat ||
     { echo 'LS high clamp incorrectly tied to 3.5V logic rail' >&2; exit 1; }
@@ -60,12 +75,16 @@ awk '$1>2.995e-9 && $1<3.005e-9 && $2>3.10 && $2<3.22 {rc=1}
      END {exit !(rc && settled)}' adc-hc-rc.dat ||
     { echo 'Reflected physical input capacitor failed RC transient' >&2; exit 1; }
 # HC non-hysteretic thresholds with separate 2ns/3ns output delays.
+# The 2ns band transit preserves the equal-deadline rising UNKNOWN,
+# but cancels the pending falling UNKNOWN (3ns delay), as measured
+# in the original vendor adc-delay-equality circuit.
 awk '$1>49e-9 && $1<51e-9 && $2<.1 {low=1}
      $1>55e-9 && $1<56e-9 && $2>.45 && $2<.55 {unknown=1}
      $1>58e-9 && $1<60e-9 && $2>.9 {high=1}
-     $1>179e-9 && $1<181e-9 && $2>.45 && $2<.55 {fall_unknown=1}
+     $1>179e-9 && $1<180e-9 && $2>.9 {held_high=1}
+     $1>178e-9 && $1<180.9e-9 && $2<.9 {early_fall=1}
      $1>188e-9 && $1<190e-9 && $2<.1 {fall=1}
-     END {exit !(low && unknown && high && fall_unknown && fall)}' adc-hc-threshold.dat ||
+     END {exit !(low && unknown && high && held_high && !early_fall && fall)}' adc-hc-threshold.dat ||
     { echo 'ADC thresholds/delays/UNKNOWN band incorrect' >&2; exit 1; }
 # Hysteresis holds previous digital state in the threshold band;
 # startup is controlled explicitly by IC rather than inferred.
@@ -106,4 +125,6 @@ awk '
   END {exit !(rise && fall && !unknown)}
 ' adc-time-tol-schmitt.dat ||
     { echo 'Schmitt threshold rollback or hold-state correctness failed' >&2; exit 1; }
-echo 'All 9 experimental family-ADC native smokes passed.'
+"$here/smoke-adc-clamp-vendor.sh" "$model" "$scratch"
+"$here/smoke-adc-delay-vendor.sh" "$model" "$scratch"
+echo 'All 10 experimental family-ADC native smokes and original clamp oracles passed.'

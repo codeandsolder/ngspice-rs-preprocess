@@ -4,24 +4,24 @@ Aadc [ain] [din] ADC
 .model ADC adc_bridge(in_low=.25 in_high=.75 rise_delay=1p fall_delay=1p)
 * Bus L: pulse HIGH competes with constant low; short HIGH must be rejected.
 Acontend [din] buslow blsink blsource 0 BINARY
-.model BINARY sr_alb_lut_bit(table_values="01" delay=5n input_load=0 out_res=0 ic=0 inertial_delay=true)
+.model BINARY sr_alb_lut_bit(table_values="01" delay=5n input_load=0 out_res_pos=0 out_res_neg=0 ic=0 inertial_delay=true)
 Alow [din] buslow flsink flsource 0 FORCEL
-.model FORCEL sr_alb_lut_bit(table_values="00" delay=1n input_load=0 out_res=0 ic=0 inertial_delay=true)
+.model FORCEL sr_alb_lut_bit(table_values="00" delay=1n input_load=0 out_res_pos=0 out_res_neg=0 ic=0 inertial_delay=true)
 * Bus Z: temporary Z releases bus to the strong high driver; short Z must be rejected.
 Arelease [din] busz bzsink bzsource 0 TRISTATE
-.model TRISTATE sr_alb_lut_bit(table_values="0Z" delay=5n input_load=0 out_res=0 ic=0 inertial_delay=true)
+.model TRISTATE sr_alb_lut_bit(table_values="0Z" delay=5n input_load=0 out_res_pos=0 out_res_neg=0 ic=0 inertial_delay=true)
 Ahigh [din] busz fhsink fhsource 0 FORCEH
-.model FORCEH sr_alb_lut_bit(table_values="11" delay=1n input_load=0 out_res=0 ic=1 inertial_delay=true)
+.model FORCEH sr_alb_lut_bit(table_values="11" delay=1n input_load=0 out_res_pos=0 out_res_neg=0 ic=1 inertial_delay=true)
 * Loaded bus adds 4pF: the same 8ns pulse is shorter than its 9ns inertial delay.
 Aloaded [din] busload ldsink ldsource 0 LOADED
-.model LOADED sr_alb_lut_bit(table_values="01" delay=5n input_load=0 out_res=1k ic=0 inertial_delay=true)
+.model LOADED sr_alb_lut_bit(table_values="01" delay=5n input_load=0 out_res_pos=1k out_res_neg=1k ic=0 inertial_delay=true)
 Alowloaded [din] busload lfsink lfsource 0 FORCEL
 Aload1 busload ldsink ldsource CAP
 Aload2 busload ldsink ldsource CAP
 .model CAP sr_bundle_load(capacitance=2p sink_current=0 source_current=0)
 * Transport counterpart preserves the 2ns pulse, unlike inertial variants.
 Atransport [din] bustrans tdsink tdsource 0 TRANSPORT
-.model TRANSPORT sr_alb_lut_bit(table_values="01" delay=5n input_load=0 out_res=0 ic=0 inertial_delay=false)
+.model TRANSPORT sr_alb_lut_bit(table_values="01" delay=5n input_load=0 out_res_pos=0 out_res_neg=0 ic=0 inertial_delay=false)
 Alowtrans [din] bustrans tfsink tfsource 0 FORCEL
 Adacl [buslow] [outlow] DAC
 Adacz [busz] [outz] DAC

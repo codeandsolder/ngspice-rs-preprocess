@@ -1,0 +1,63 @@
+* DAC smoothing limits and knee domains
+Vlo lo 0 0
+Vhi hi 0 5
+.model ADC adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1n fall_delay=1n time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+.model DAC0 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=2.75 v_smooth=2.5)
+Aadc0 lo dig0 ADC
+Adac0 dig0 q0 DAC0
+Vforce0 q0 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+Aadc1 hi dig1 ADC
+Adac1 dig1 q1 DAC0
+Vforce1 q1 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+.model DAC1 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 input_load=0 t_rise=1n t_fall=1n knee_low=3 knee_high=4 v_smooth=4)
+Aadc2 lo dig2 ADC
+Adac2 dig2 q2 DAC1
+Vforce2 q2 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+Aadc3 hi dig3 ADC
+Adac3 dig3 q3 DAC1
+Vforce3 q3 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+.model DAC2 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 input_load=0 t_rise=1n t_fall=1n knee_low=1 knee_high=1 v_smooth=4)
+Aadc4 lo dig4 ADC
+Adac4 dig4 q4 DAC2
+Vforce4 q4 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+Aadc5 hi dig5 ADC
+Adac5 dig5 q5 DAC2
+Vforce5 q5 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+.model DAC3 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 input_load=0 t_rise=1n t_fall=1n knee_low=0 knee_high=2.75 v_smooth=.5)
+Aadc6 lo dig6 ADC
+Adac6 dig6 q6 DAC3
+Vforce6 q6 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+Aadc7 hi dig7 ADC
+Adac7 dig7 q7 DAC3
+Vforce7 q7 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+.model DAC4 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 input_load=0 t_rise=1n t_fall=1n knee_low=-1 knee_high=2.75 v_smooth=.5)
+Aadc8 lo dig8 ADC
+Adac8 dig8 q8 DAC4
+Vforce8 q8 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+Aadc9 hi dig9 ADC
+Adac9 dig9 q9 DAC4
+Vforce9 q9 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+.model DAC5 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=5 v_smooth=.5)
+Aadc10 lo dig10 ADC
+Adac10 dig10 q10 DAC5
+Vforce10 q10 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+Aadc11 hi dig11 ADC
+Adac11 dig11 q11 DAC5
+Vforce11 q11 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+.model DAC6 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=6 v_smooth=.5)
+Aadc12 lo dig12 ADC
+Adac12 dig12 q12 DAC6
+Vforce12 q12 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+Aadc13 hi dig13 ADC
+Adac13 dig13 q13 DAC6
+Vforce13 q13 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+.model DAC7 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=1e-9 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=2.75 v_smooth=-.5)
+Aadc14 lo dig14 ADC
+Adac14 dig14 q14 DAC7
+Vforce14 q14 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+Aadc15 hi dig15 ADC
+Adac15 dig15 q15 DAC7
+Vforce15 q15 0 PWL(0n -5 0.5n -5 1n -2 1.5n -2 2n -1 2.5n -1 3n 0 3.5n 0 4n .25 4.5n .25 5n .5 5.5n .5 6n 1 6.5n 1 7n 1.49 7.5n 1.49 8n 1.5 8.5n 1.5 9n 1.51 9.5n 1.51 10n 1.75 10.5n 1.75 11n 2 11.5n 2 12n 2.25 12.5n 2.25 13n 2.5 13.5n 2.5 14n 2.75 14.5n 2.75 15n 3 15.5n 3 16n 3.25 16.5n 3.25 17n 3.5 17.5n 3.5 18n 4 18.5n 4 19n 4.5 19.5n 4.5 20n 5 20.5n 5 21n 6 21.5n 6 22n 7 22.5n 7 23n 10 24n 10)
+.PRINT TRAN I(Vforce0) I(Vforce1) I(Vforce2) I(Vforce3) I(Vforce4) I(Vforce5) I(Vforce6) I(Vforce7) I(Vforce8) I(Vforce9) I(Vforce10) I(Vforce11) I(Vforce12) I(Vforce13) I(Vforce14) I(Vforce15)
+.tran 5p 24n 0 5p
+.end

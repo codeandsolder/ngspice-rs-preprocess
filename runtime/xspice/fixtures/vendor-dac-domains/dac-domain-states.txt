@@ -1,0 +1,13 @@
+* Signed DAC static drive strengths
+0n 0s
+10n 1s
+20n Us
+30n 0r
+40n 1r
+50n Ur
+60n 0z
+70n 1z
+80n Uz
+90n 0u
+100n 1u
+110n Uu

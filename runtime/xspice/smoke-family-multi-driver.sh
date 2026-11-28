@@ -55,19 +55,21 @@ printf 'codemodel %s\n' "$cm" > "$work/.spiceinit"
 # Columns: TIME PIN, TIME A, TIME B. Both drivers start LOW.
 awk '$1>6e-9 && $1<7e-9 && $2<.20 {seen=1} END {exit !seen}' "$work/result.dat" ||
     { echo 'Both native DACs did not drive LOW together' >&2; exit 1; }
-# With 40 ohm low drive, 0.55 V high-driver current knee and 100 kOhm
-# load, KCL predicts 0.54978 V (not an ideal symmetric divider).
-awk 'BEGIN {expect=(3.3-2.75)*(.025/(.025+1/100000)); tol=.025}
+# Original HC physical family bridges, independent of ALB OUT_RES:
+# Solve the nonlinear current balance including the 100 kOhm shunt.
+awk -f "$here/family-dc-equilibrium.awk" -f - "$work/result.dat" <<'AWK' || { echo 'A HIGH/B LOW must produce analog contention voltage, not digital resolution' >&2; exit 1; }
+     BEGIN {expect=hc_bus(3.3,1,1,1/100000); tol=.025}
      $1>12e-9 && $1<13e-9 && $2>expect-tol && $2<expect+tol &&
-     $4>3.2 && $6<.1 {seen=1} END {exit !seen}' "$work/result.dat" ||
-    { echo 'A HIGH/B LOW must produce analog contention voltage, not digital resolution' >&2; exit 1; }
+     $4>3.2 && $6<.1 {seen=1} END {exit !seen}
+AWK
 awk '$1>18e-9 && $1<19e-9 && $2>3.05 &&
      $4>3.2 && $6>3.2 {seen=1} END {exit !seen}' "$work/result.dat" ||
     { echo 'Both HIGH drivers failed to raise the physical bus' >&2; exit 1; }
-awk 'BEGIN {expect=(3.3-2.75)*(.025/(.025+1/100000)); tol=.025}
+awk -f "$here/family-dc-equilibrium.awk" -f - "$work/result.dat" <<'AWK' || { echo 'A LOW/B HIGH contention did not resolve electrically' >&2; exit 1; }
+     BEGIN {expect=hc_bus(3.3,1,1,1/100000); tol=.025}
      $1>26e-9 && $1<27e-9 && $2>expect-tol && $2<expect+tol &&
-     $4<.1 && $6>3.2 {seen=1} END {exit !seen}' "$work/result.dat" ||
-    { echo 'A LOW/B HIGH contention did not resolve electrically' >&2; exit 1; }
+     $4<.1 && $6>3.2 {seen=1} END {exit !seen}
+AWK
 awk '$1>35e-9 && $1<36e-9 && $2<.2 &&
      $4<.1 && $6<.1 {seen=1} END {exit !seen}' "$work/result.dat" ||
     { echo 'Bus did not return LOW under two low DAC drivers' >&2; exit 1; }

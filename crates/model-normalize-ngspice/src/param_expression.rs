@@ -6,27 +6,199 @@
 
 use crate::model_card::parse_spice_constant;
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::cmp::Ordering;
+mod rational;
+pub(crate) use rational::coefficients as rational_coefficients;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Value(f64),
+    SourceAtom(String),
     Name(String),
     Op(&'static str),
     Open,
     Close,
+    BraceOpen,
+    BraceClose,
     Comma,
     Question,
     Colon,
     End,
 }
 
-fn tokenize(raw: &str) -> Result<Vec<Token>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dialect {
+    Native,
+    Ltspice,
+}
+
+impl Dialect {
+    fn precedence(self, op: &str) -> Option<u8> {
+        match op {
+            "||" | "&&" | "^" if matches!(self, Self::Ltspice) => Some(2),
+            "||" => Some(2),
+            "&&" => Some(3),
+            "==" | "!=" | "<=" | ">=" | "<" | ">" => Some(4),
+            "+" | "-" => Some(5),
+            "*" | "/" | "%" | "\\" => Some(6),
+            "**" => Some(8),
+            _ => None,
+        }
+    }
+}
+
+fn source_probe(raw: &str, name_end: usize) -> Result<Option<usize>> {
+    let tail = raw[name_end..].trim_start();
+    if !tail.starts_with('(') {
+        return Ok(None);
+    }
+    let end = tail
+        .find(')')
+        .context("unterminated LTspice circuit probe")?;
+    let body = &tail[1..end];
+    ensure!(!body.contains('('), "nested circuit probe identifier");
+    Ok(Some(raw.len() - tail.len() + end + 1))
+}
+
+fn number_end(bytes: &[u8], mut cursor: usize) -> usize {
+    if bytes[cursor] == b'.' {
+        cursor += 1;
+    }
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+    }
+    if matches!(bytes.get(cursor), Some(b'e' | b'E' | b'd' | b'D')) {
+        let exponent = cursor + 1;
+        let offset = exponent + usize::from(matches!(bytes.get(exponent), Some(b'+' | b'-')));
+        if bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+            cursor = offset + 1;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor += 1;
+            }
+        }
+    }
+    while bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic) {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn name_token(raw: &str, start: usize, dialect: Dialect) -> Result<(Token, usize)> {
+    let mut cursor = start + 1;
+    while raw.as_bytes().get(cursor).is_some_and(|b| {
+        b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'#' | b'$' | b'[' | b']')
+    }) {
+        cursor += 1;
+    }
+    let name = &raw[start..cursor];
+    if dialect == Dialect::Ltspice {
+        if (name.eq_ignore_ascii_case("v") || name.eq_ignore_ascii_case("i"))
+            && let Some(end) = source_probe(raw, cursor)?
+        {
+            return Ok((Token::SourceAtom(raw[start..end].to_owned()), end));
+        }
+        return Ok((Token::Name(name.to_ascii_lowercase()), cursor));
+    }
+    let token = match name.to_ascii_lowercase().as_str() {
+        "not" => Token::Op("!"),
+        "and" => Token::Op("&&"),
+        "or" => Token::Op("||"),
+        "mod" => Token::Op("%"),
+        "div" => Token::Op("\\"),
+        _ => Token::Name(name.to_ascii_lowercase()),
+    };
+    Ok((token, cursor))
+}
+
+/// Runtime SPICE numeric literals use percent as an engineering suffix;
+/// the parameter language instead recognizes a remainder operator.
+fn percent_literal(raw: &str, start: usize, percent: usize) -> Result<(String, usize)> {
+    let bytes = raw.as_bytes();
+    let whole = &raw[start..percent];
+    let mut end = percent + 1;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    let fraction = &raw[percent + 1..end];
+    let number = if fraction.is_empty() {
+        while bytes.get(end).is_some_and(u8::is_ascii_alphabetic) {
+            end += 1;
+        }
+        format!("{:.17e}", parse_spice_constant(whole)? * 0.01)
+    } else {
+        ensure!(
+            whole.bytes().all(|byte| byte.is_ascii_digit()),
+            "fractional percent suffix requires an integer prefix"
+        );
+        format!("{whole}.{fraction}e-2")
+    };
+    Ok((number, end))
+}
+
+fn single_token(
+    byte: u8,
+    dialect: Dialect,
+    runtime: bool,
+    brace_depth: &mut usize,
+) -> Result<Token> {
+    Ok(match byte {
+        b'(' => Token::Open,
+        b')' => Token::Close,
+        b'{' if dialect == Dialect::Ltspice => {
+            *brace_depth += 1;
+            Token::BraceOpen
+        }
+        b'}' if dialect == Dialect::Ltspice => {
+            *brace_depth = brace_depth
+                .checked_sub(1)
+                .context("unmatched parameter brace")?;
+            Token::BraceClose
+        }
+        b',' => Token::Comma,
+        b'?' => Token::Question,
+        b':' => Token::Colon,
+        b'+' => Token::Op("+"),
+        b'-' => Token::Op("-"),
+        b'*' => Token::Op("*"),
+        b'/' => Token::Op("/"),
+        b'%' if dialect == Dialect::Ltspice && runtime && *brace_depth == 0 => {
+            bail!("runtime LTspice percent suffix must follow a numeric literal")
+        }
+        b'%' => Token::Op("%"),
+        b'\\' => Token::Op("\\"),
+        b'^' if dialect == Dialect::Ltspice => Token::Op("^"),
+        b'&' if dialect == Dialect::Ltspice => Token::Op("&&"),
+        b'|' if dialect == Dialect::Ltspice => Token::Op("||"),
+        b'~' if dialect == Dialect::Ltspice => Token::Op("!"),
+        b'^' => Token::Op("**"),
+        b'!' => Token::Op("!"),
+        b'<' => Token::Op("<"),
+        b'>' => Token::Op(">"),
+        _ => bail!(
+            "unsupported ngspice expression character {:?}",
+            char::from(byte)
+        ),
+    })
+}
+
+fn tokenize(raw: &str, dialect: Dialect, runtime: bool) -> Result<Vec<Token>> {
     ensure!(raw.is_ascii(), "non-ASCII ngspice parameter expression");
     let bytes = raw.as_bytes();
     let mut cursor = 0;
     let mut tokens = Vec::new();
+    let mut brace_depth = 0_usize;
     while let Some(&byte) = bytes.get(cursor) {
+        ensure!(
+            tokens.len() < MAX_TREE_NODES,
+            "parameter expression token budget ({MAX_TREE_NODES}) exceeded"
+        );
         if byte.is_ascii_whitespace() {
             cursor += 1;
             continue;
@@ -35,51 +207,30 @@ fn tokenize(raw: &str) -> Result<Vec<Token>> {
         if byte.is_ascii_digit()
             || (byte == b'.' && bytes.get(cursor + 1).is_some_and(u8::is_ascii_digit))
         {
-            if byte == b'.' {
-                cursor += 1;
+            cursor = number_end(bytes, cursor);
+            if dialect == Dialect::Ltspice
+                && runtime
+                && brace_depth == 0
+                && bytes.get(cursor) == Some(&b'%')
+            {
+                let (number, end) = percent_literal(raw, start, cursor)?;
+                tokens.push(Token::SourceAtom(number));
+                cursor = end;
+                continue;
             }
-            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                cursor += 1;
-            }
-            if bytes.get(cursor) == Some(&b'.') {
-                cursor += 1;
-                while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                    cursor += 1;
-                }
-            }
-            if matches!(bytes.get(cursor), Some(b'e' | b'E' | b'd' | b'D')) {
-                let exponent = cursor + 1;
-                let offset =
-                    exponent + usize::from(matches!(bytes.get(exponent), Some(b'+' | b'-')));
-                if bytes.get(offset).is_some_and(u8::is_ascii_digit) {
-                    cursor = offset + 1;
-                    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-                        cursor += 1;
-                    }
-                }
-            }
-            while bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic) {
-                cursor += 1;
-            }
-            tokens.push(Token::Value(parse_spice_constant(&raw[start..cursor])?));
+            let literal = &raw[start..cursor];
+            let value = parse_spice_constant(literal)?;
+            tokens.push(if dialect == Dialect::Ltspice {
+                Token::SourceAtom(literal.to_owned())
+            } else {
+                Token::Value(value)
+            });
             continue;
         }
         if byte.is_ascii_alphabetic() || byte == b'_' {
-            cursor += 1;
-            while bytes.get(cursor).is_some_and(|b| {
-                b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'#' | b'$' | b'[' | b']')
-            }) {
-                cursor += 1;
-            }
-            let name = &raw[start..cursor];
-            match name.to_ascii_lowercase().as_str() {
-                "not" => tokens.push(Token::Op("!")),
-                "and" => tokens.push(Token::Op("&&")),
-                "or" => tokens.push(Token::Op("||")),
-                "mod" => tokens.push(Token::Op("%")),
-                "div" => tokens.push(Token::Op("\\")),
-                _ => tokens.push(Token::Name(name.to_ascii_lowercase())),
-            }
+            let (token, end) = name_token(raw, cursor, dialect)?;
+            cursor = end;
+            tokens.push(token);
             continue;
         }
         let op = match bytes.get(cursor..cursor.saturating_add(2)) {
@@ -98,28 +249,12 @@ fn tokenize(raw: &str) -> Result<Vec<Token>> {
             continue;
         }
         cursor += 1;
-        tokens.push(match byte {
-            b'(' => Token::Open,
-            b')' => Token::Close,
-            b',' => Token::Comma,
-            b'?' => Token::Question,
-            b':' => Token::Colon,
-            b'+' => Token::Op("+"),
-            b'-' => Token::Op("-"),
-            b'*' => Token::Op("*"),
-            b'/' => Token::Op("/"),
-            b'%' => Token::Op("%"),
-            b'\\' => Token::Op("\\"),
-            b'^' => Token::Op("**"),
-            b'!' => Token::Op("!"),
-            b'<' => Token::Op("<"),
-            b'>' => Token::Op(">"),
-            _ => bail!(
-                "unsupported ngspice expression character {:?}",
-                char::from(byte)
-            ),
-        });
+        tokens.push(single_token(byte, dialect, runtime, &mut brace_depth)?);
     }
+    ensure!(
+        tokens.len() <= MAX_TREE_NODES,
+        "parameter expression token budget ({MAX_TREE_NODES}) exceeded"
+    );
     tokens.push(Token::End);
     Ok(tokens)
 }
@@ -159,6 +294,8 @@ pub struct SpiceExpression(Expr);
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
     Number(f64),
+    SourceAtom(String),
+    ParameterGroup(Box<Self>),
     Symbol(String),
     Unary(&'static str, Box<Self>),
     Binary(&'static str, Box<Self>, Box<Self>),
@@ -166,14 +303,26 @@ enum Expr {
     Call(String, Vec<Self>),
 }
 
-struct Parser {
+const MAX_TREE_NODES: usize = 100_000;
+
+struct Parsed {
+    expr: Expr,
+    height: usize,
+}
+
+struct Parser<'a> {
     tokens: Vec<Token>,
     offset: usize,
+    dialect: Dialect,
+    budget: &'a WorkBudget,
 }
-impl Parser {
+
+impl Parser<'_> {
     fn take(&mut self) -> Token {
         let token = self.tokens[self.offset].clone();
-        self.offset += 1;
+        if token != Token::End {
+            self.offset += 1;
+        }
         token
     }
     fn peek(&self) -> &Token {
@@ -187,42 +336,66 @@ impl Parser {
         );
         Ok(())
     }
-    fn prefix(&mut self) -> Result<Expr> {
-        match self.take() {
-            Token::Value(value) => Ok(Expr::Number(value)),
-            Token::Name(name) => {
-                if self.peek() != &Token::Open {
-                    return Ok(Expr::Symbol(name));
+    fn node(&self, expr: Expr, height: usize) -> Result<Parsed> {
+        self.budget.check_depth(height)?;
+        self.budget.charge(Resource::GeneratedNodes, 1)?;
+        Ok(Parsed { expr, height })
+    }
+    fn call(&mut self, name: String) -> Result<Parsed> {
+        self.take();
+        let mut args = Vec::new();
+        let mut height = 0;
+        if self.peek() != &Token::Close {
+            loop {
+                let parsed = self.expression(0)?;
+                height = height.max(parsed.height);
+                args.push(parsed.expr);
+                if self.peek() != &Token::Comma {
+                    break;
                 }
                 self.take();
-                let mut args = Vec::new();
-                if self.peek() != &Token::Close {
-                    loop {
-                        args.push(self.expression(0)?);
-                        if self.peek() != &Token::Comma {
-                            break;
-                        }
-                        self.take();
-                    }
-                }
-                self.expect(&Token::Close)?;
-                Ok(Expr::Call(name, args))
             }
-            Token::Op("+" | "-" | "!") => {
-                let Token::Op(op) = self.tokens[self.offset - 1] else {
-                    unreachable!()
+        }
+        self.expect(&Token::Close)?;
+        self.node(Expr::Call(name, args), height + 1)
+    }
+
+    fn prefix(&mut self) -> Result<Parsed> {
+        match self.take() {
+            Token::Value(value) => self.node(Expr::Number(value), 1),
+            Token::SourceAtom(value) => self.node(Expr::SourceAtom(value), 1),
+            Token::Name(name) => {
+                if self.peek() == &Token::Open {
+                    self.call(name)
+                } else {
+                    self.node(Expr::Symbol(name), 1)
+                }
+            }
+            Token::Op(op @ ("+" | "-" | "!")) => {
+                let binding = if self.dialect == Dialect::Ltspice {
+                    9
+                } else {
+                    8
                 };
-                Ok(Expr::Unary(op, Box::new(self.expression(8)?)))
+                let child = self.expression(binding)?;
+                self.node(Expr::Unary(op, Box::new(child.expr)), child.height + 1)
             }
             Token::Open => {
                 let value = self.expression(0)?;
                 self.expect(&Token::Close)?;
                 Ok(value)
             }
-            other => bail!("expected ngspice expression atom, got {other:?}"),
+            Token::BraceOpen => {
+                let value = self.expression(0)?;
+                self.expect(&Token::BraceClose)?;
+                self.node(Expr::ParameterGroup(Box::new(value.expr)), value.height + 1)
+            }
+            other => bail!("expected SPICE expression atom, got {other:?}"),
         }
     }
-    fn expression(&mut self, minimum: u8) -> Result<Expr> {
+
+    fn expression(&mut self, minimum: u8) -> Result<Parsed> {
+        let _depth = self.budget.enter()?;
         let mut left = self.prefix()?;
         loop {
             if *self.peek() == Token::Question {
@@ -233,19 +406,20 @@ impl Parser {
                 let then_branch = self.expression(0)?;
                 self.expect(&Token::Colon)?;
                 let else_branch = self.expression(1)?;
-                left =
-                    Expr::Conditional(Box::new(left), Box::new(then_branch), Box::new(else_branch));
+                let height = left.height.max(then_branch.height).max(else_branch.height) + 1;
+                left = self.node(
+                    Expr::Conditional(
+                        Box::new(left.expr),
+                        Box::new(then_branch.expr),
+                        Box::new(else_branch.expr),
+                    ),
+                    height,
+                )?;
                 continue;
             }
             let Token::Op(op) = self.peek() else { break };
-            let precedence = match *op {
-                "||" => 2,
-                "&&" => 3,
-                "==" | "!=" | "<=" | ">=" | "<" | ">" => 4,
-                "+" | "-" => 5,
-                "*" | "/" | "%" | "\\" => 6,
-                "**" => 8,
-                _ => break,
+            let Some(precedence) = self.dialect.precedence(op) else {
+                break;
             };
             if precedence < minimum {
                 break;
@@ -253,8 +427,17 @@ impl Parser {
             let Token::Op(op) = self.take() else {
                 unreachable!()
             };
-            let right = self.expression(precedence + 1)?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
+            let right_binding = if self.dialect == Dialect::Ltspice && op == "**" {
+                precedence
+            } else {
+                precedence + 1
+            };
+            let right = self.expression(right_binding)?;
+            let height = left.height.max(right.height) + 1;
+            left = self.node(
+                Expr::Binary(op, Box::new(left.expr), Box::new(right.expr)),
+                height,
+            )?;
         }
         Ok(left)
     }
@@ -269,6 +452,14 @@ impl SpiceExpression {
     /// Rejects invalid numbers, unknown tokens, mismatched delimiters and
     /// incomplete expressions before any symbol evaluation.
     pub fn parse(raw: &str) -> Result<Self> {
+        Self::parse_with_budget(raw, &WorkBudget::default())
+    }
+
+    /// Compile while sharing the caller's cumulative work counters.
+    /// # Errors
+    /// Malformed syntax, cancellation, or exhausted work budget.
+    pub fn parse_with_budget(raw: &str, budget: &WorkBudget) -> Result<Self> {
+        budget.charge(Resource::EvaluationSteps, raw.len().max(1))?;
         let raw = raw.trim();
         let inner = if (raw.starts_with('{') && raw.ends_with('}'))
             || (raw.starts_with('\'') && raw.ends_with('\''))
@@ -278,16 +469,24 @@ impl SpiceExpression {
             raw
         };
         let mut parser = Parser {
-            tokens: tokenize(inner)?,
+            tokens: tokenize(inner, Dialect::Native, false)?,
             offset: 0,
+            dialect: Dialect::Native,
+            budget,
         };
-        let expr = parser.expression(0)?;
+        let expr = parser.expression(0)?.expr;
         ensure!(
             parser.peek() == &Token::End,
             "trailing ngspice expression tokens: {:?}",
             parser.peek()
         );
         Ok(Self(expr))
+    }
+
+    /// Evaluate constants without requiring occurrence-scoped parameters.
+    /// Invalid constant expressions remain errors.
+    pub(crate) fn known_value(&self, budget: &WorkBudget) -> Result<Option<f64>> {
+        self.0.known_value(budget)
     }
 
     /// Evaluate a compiled expression against the provided symbol resolver.
@@ -308,7 +507,123 @@ impl SpiceExpression {
     ///
     /// Rejects unresolved names/functions and invalid expressions.
     pub fn evaluate_with(&self, context: &mut impl SpiceExpressionContext) -> Result<f64> {
-        self.0.evaluate(context)
+        self.evaluate_with_budget(context, &WorkBudget::default())
+    }
+
+    /// Evaluate while sharing the caller's cumulative work counters.
+    /// # Errors
+    /// Invalid evaluation, cancellation, or exhausted work budget.
+    pub fn evaluate_with_budget(
+        &self,
+        context: &mut impl SpiceExpressionContext,
+        budget: &WorkBudget,
+    ) -> Result<f64> {
+        self.0.evaluate(context, budget)
+    }
+}
+
+/// Lower `LTspice` operator precedence and Boolean coercion before native
+/// function-name lowering. Numeric spellings and circuit probe names remain
+/// untouched. The ordinary native evaluator never receives source atoms.
+pub(crate) fn lower_ltspice(raw: &str, runtime: bool, budget: &WorkBudget) -> Result<String> {
+    budget.charge(Resource::EvaluationSteps, raw.len().max(1))?;
+    let mut parser = Parser {
+        tokens: tokenize(raw, Dialect::Ltspice, runtime)?,
+        offset: 0,
+        dialect: Dialect::Ltspice,
+        budget,
+    };
+    let expression = parser.expression(0)?.expr;
+    ensure!(
+        parser.peek() == &Token::End,
+        "trailing LTspice expression tokens: {:?}",
+        parser.peek()
+    );
+    let mut output = String::new();
+    expression.render_ltspice(&mut output, budget)?;
+    Ok(output)
+}
+
+impl Expr {
+    fn render_ltspice(&self, out: &mut String, budget: &WorkBudget) -> Result<()> {
+        use std::fmt::Write as _;
+        let _depth = budget.enter()?;
+        budget.charge(Resource::EvaluationSteps, 1)?;
+        budget.charge(
+            Resource::EmittedBytes,
+            match self {
+                Self::SourceAtom(value) | Self::Symbol(value) => value.len(),
+                Self::Call(name, args) => name.len().saturating_add(args.len()).saturating_add(2),
+                _ => 32,
+            },
+        )?;
+        match self {
+            Self::Number(value) => write!(out, "{value}")?,
+            Self::SourceAtom(value) | Self::Symbol(value) => out.push_str(value),
+            Self::ParameterGroup(value) => {
+                out.push('{');
+                value.render_ltspice(out, budget)?;
+                out.push('}');
+            }
+            Self::Unary(op, child) => {
+                if *op == "!" {
+                    out.push_str("inv(");
+                } else {
+                    write!(out, "({op}")?;
+                }
+                child.render_ltspice(out, budget)?;
+                out.push(')');
+            }
+            Self::Binary(op, lhs, rhs) => {
+                match *op {
+                    "**" | "^" | "%" => {
+                        let function = match *op {
+                            "**" => "pow",
+                            "^" => "xor",
+                            _ => "mod",
+                        };
+                        write!(out, "{function}(")?;
+                        lhs.render_ltspice(out, budget)?;
+                        out.push(',');
+                        rhs.render_ltspice(out, budget)?;
+                    }
+                    "&&" | "||" => {
+                        out.push_str("((");
+                        lhs.render_ltspice(out, budget)?;
+                        write!(out, ">0.5){op}(")?;
+                        rhs.render_ltspice(out, budget)?;
+                        out.push_str(">0.5)");
+                    }
+                    _ => {
+                        out.push('(');
+                        lhs.render_ltspice(out, budget)?;
+                        out.push_str(op);
+                        rhs.render_ltspice(out, budget)?;
+                    }
+                }
+                out.push(')');
+            }
+            Self::Conditional(condition, yes, no) => {
+                out.push_str("if(");
+                condition.render_ltspice(out, budget)?;
+                out.push(',');
+                yes.render_ltspice(out, budget)?;
+                out.push(',');
+                no.render_ltspice(out, budget)?;
+                out.push(')');
+            }
+            Self::Call(name, arguments) => {
+                write!(out, "{name}(")?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index != 0 {
+                        out.push(',');
+                    }
+                    argument.render_ltspice(out, budget)?;
+                }
+                out.push(')');
+            }
+        }
+        Ok(())
     }
 }
 
@@ -323,15 +638,55 @@ fn finite(value: f64) -> Result<f64> {
     Ok(value)
 }
 
+#[derive(Debug)]
+struct RequiresBinding;
+
+impl std::fmt::Display for RequiresBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("expression requires occurrence binding")
+    }
+}
+
+impl std::error::Error for RequiresBinding {}
+
+impl SpiceExpressionContext for RequiresBinding {
+    fn symbol(&mut self, _name: &str) -> Result<f64> {
+        Err(Self.into())
+    }
+
+    fn function(&mut self, _name: &str, _args: &[SpiceExpression]) -> Result<f64> {
+        Err(Self.into())
+    }
+}
+
 impl Expr {
-    fn evaluate(&self, resolve: &mut impl SpiceExpressionContext) -> Result<f64> {
+    fn known_value(&self, budget: &WorkBudget) -> Result<Option<f64>> {
+        match self.evaluate(&mut RequiresBinding, budget) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.downcast_ref::<RequiresBinding>().is_some() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Expr {
+    fn evaluate(
+        &self,
+        resolve: &mut impl SpiceExpressionContext,
+        budget: &WorkBudget,
+    ) -> Result<f64> {
+        let _depth = budget.enter()?;
+        budget.charge(Resource::EvaluationSteps, 1)?;
         let value = match self {
             Self::Number(value) => *value,
+            Self::SourceAtom(_) | Self::ParameterGroup(_) => {
+                bail!("source-only expression cannot be evaluated as native numparam")
+            }
             Self::Symbol(name) => resolve
                 .symbol(name)
                 .with_context(|| format!("resolving parameter {name}"))?,
             Self::Unary(op, arg) => {
-                let arg = arg.evaluate(resolve)?;
+                let arg = arg.evaluate(resolve, budget)?;
                 match *op {
                     "+" => arg,
                     "-" => -arg,
@@ -340,21 +695,21 @@ impl Expr {
                 }
             }
             Self::Conditional(condition, positive, negative) => {
-                let selected = if truthy(condition.evaluate(resolve)?) {
+                let selected = if truthy(condition.evaluate(resolve, budget)?) {
                     positive
                 } else {
                     negative
                 };
-                return selected.evaluate(resolve);
+                return selected.evaluate(resolve, budget);
             }
             Self::Binary(op, lhs, rhs) => {
-                let l = lhs.evaluate(resolve)?;
+                let l = lhs.evaluate(resolve, budget)?;
                 match *op {
                     "&&" if !truthy(l) => return Ok(0.0),
                     "||" if truthy(l) => return Ok(1.0),
                     _ => {}
                 }
-                let r = rhs.evaluate(resolve)?;
+                let r = rhs.evaluate(resolve, budget)?;
                 match *op {
                     "+" => l + r,
                     "-" => l - r,
@@ -376,17 +731,17 @@ impl Expr {
             Self::Call(name, args) => {
                 if name == "ternary_fcn" {
                     ensure!(args.len() == 3, "ternary_fcn expects 3 arguments");
-                    let branch = if truthy(args[0].evaluate(resolve)?) {
+                    let branch = if truthy(args[0].evaluate(resolve, budget)?) {
                         &args[1]
                     } else {
                         &args[2]
                     };
-                    return branch.evaluate(resolve);
+                    return branch.evaluate(resolve, budget);
                 }
                 if let Some(builtin) = built_in(name) {
                     let values = args
                         .iter()
-                        .map(|arg| arg.evaluate(resolve))
+                        .map(|arg| arg.evaluate(resolve, budget))
                         .collect::<Result<Vec<_>>>()?;
                     builtin.evaluate(name, &values)?
                 } else {
@@ -480,6 +835,40 @@ mod tests {
             "b" => Ok(5.0),
             _ => bail!("undefined {name}"),
         })
+    }
+
+    #[test]
+    fn expression_depth_and_cumulative_steps_are_bounded() -> Result<()> {
+        use model_preprocess_command::{Cancellation, WorkLimits};
+        for expression in [
+            format!("{}1{}", "(".repeat(1000), ")".repeat(1000)),
+            format!("{}1", "1+".repeat(1000)),
+            format!("{}1", "-".repeat(1000)),
+        ] {
+            let error = SpiceExpression::parse(&expression)
+                .err()
+                .context("unbounded expression accepted")?;
+            ensure!(format!("{error:#}").contains("depth budget exceeded"));
+        }
+        let budget = WorkBudget::new(
+            WorkLimits {
+                evaluation_steps: 12,
+                ..WorkLimits::default()
+            },
+            Cancellation::default(),
+        );
+        let expression = SpiceExpression::parse_with_budget("1+2", &budget)?;
+        for _ in 0..3 {
+            let value = expression.evaluate_with_budget(&mut |_: &str| Ok(0.0), &budget)?;
+            ensure!((value - 3.0).abs() < f64::EPSILON);
+        }
+        ensure!(
+            expression
+                .evaluate_with_budget(&mut |_: &str| Ok(0.0), &budget)
+                .is_err()
+        );
+        ensure!(budget.check().is_err());
+        Ok(())
     }
 
     #[test]

@@ -1,0 +1,11 @@
+* IC corner semantics
+.options initCondMode=2 icres=2
+Vs s 0 10 AC 1
+R1 s p 10
+R2 n 0 20
+C1 p n 1m IC=3 BRANCH=1
+R3 s lp 10
+L1 lp 0 1m IC=3 BRANCH=0
+.ac lin 2 1 2
+.PRINT AC V(p) V(n) V(lp)
+.end

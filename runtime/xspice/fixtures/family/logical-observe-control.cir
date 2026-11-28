@@ -1,0 +1,11 @@
+* An ngspice control-script voltage observation is an analog contact.
+Vin analog_input 0 1.5
+A1 [analog_input] [analog_output] DL
+.model DL d_logic_block input_load=2p out_res=40 out_delay=2n family="HC" def="out[0]=in[0];"
+.tran 20p 15n
+.control
+run
+wrdata result.dat v(analog_output)
+quit
+.endc
+.end

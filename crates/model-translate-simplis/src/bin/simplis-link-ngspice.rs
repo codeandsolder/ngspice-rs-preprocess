@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, bail};
+use model_preprocess_command::WorkBudget;
 use model_preprocess_simplis::{
     LibrarySimulator, ParsedLibrary, SubcircuitCatalog, preprocess_netlist_linked,
 };
-use model_translate_simplis::{translate_simplis_deck, translate_simplis_expanded_library};
+use model_translate_simplis::{
+    capture_passive_initial_conditions, lower_simetrix_linked_runtime,
+    translate_simplis_linked_netlist,
+};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -142,7 +146,8 @@ fn main() -> Result<()> {
 
     let input_bytes = fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
     let input_bytes = inline_init_includes(&input, &input_bytes)?;
-    let mut catalog = SubcircuitCatalog::new();
+    let budget = WorkBudget::default();
+    let mut catalog = SubcircuitCatalog::for_simulator(simulator).with_budget(budget.clone());
     let mut definitions = 0usize;
     for library in &libraries {
         let bytes = fs::read(library).with_context(|| format!("reading {}", library.display()))?;
@@ -164,8 +169,18 @@ fn main() -> Result<()> {
         definitions = definitions.saturating_add(added);
     }
 
-    let linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
-    let translated_root = translate_simplis_deck(&linked.root_bytes)?;
+    let mut linked = preprocess_netlist_linked(&input_bytes, &catalog)?;
+    if simulator == LibrarySimulator::Simetrix {
+        lower_simetrix_linked_runtime(&mut linked, None, &budget)?;
+        let initialization = capture_passive_initial_conditions(&mut linked, &budget)?;
+        if !initialization.devices.is_empty() || !initialization.nodes.is_empty() {
+            bail!(
+                "source-specific initial conditions require ngspice-rs-preprocess simetrix-deck and its typed initialization manifest"
+            );
+        }
+    }
+    let (translated_root, translated_libraries) =
+        translate_simplis_linked_netlist(&linked, &budget)?;
     let output_dir = output_root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -175,9 +190,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("writing {}", output_root.display()))?;
 
     let mut translated_primitives = translated_root.primitives.len();
-    for library in &linked.libraries {
-        let translated = translate_simplis_expanded_library(&library.bytes)
-            .with_context(|| format!("translating linked library {}", library.source_id))?;
+    for (library, translated) in linked.libraries.iter().zip(translated_libraries) {
         translated_primitives = translated_primitives.saturating_add(translated.primitives.len());
         let path = output_dir.join(&library.filename);
         fs::write(&path, &translated.bytes)

@@ -1,0 +1,8 @@
+* Independent ngspice-native reproduction of the vendor's public inverter
+* transfer law and RC output stage. Not copied from the proprietary simulator;
+* source waveforms are archived separately from the original TI PSpice file.
+.subckt SR_TI_INVERTER OUT IN PARAMS: td=0 tt=2n
+Blogic drive 0 V=u(0.51-v(IN))
+Rstage drive OUT 10
+Cout OUT 0 {(td + 0.5*tt)/6.93}
+.ends SR_TI_INVERTER

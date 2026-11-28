@@ -1,0 +1,14 @@
+* Original ngspice d_to_real UNKNOWN midpoint overflows for equal finite bounds.
+Asource [Q0] INPUT_SOURCE
+.model INPUT_SOURCE d_source(input_file="source.txt" input_load=0)
+Aenable [EN] ENABLE_SOURCE
+.model ENABLE_SOURCE d_source(input_file="enable.txt" input_load=0)
+Abridge Q0 EN REAL_VALUE BRIDGE
+.model BRIDGE d_to_real(zero=1e308 one=1e308 delay=180p)
+.tran 10p 4n 0 10p
+.control
+run
+eprint q0 en real_value > events.txt
+quit
+.endc
+.end

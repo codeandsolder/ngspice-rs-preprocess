@@ -1,0 +1,16 @@
+* limit argument order, static and runtime
+.param low={LIMIT(-2,-1,1)} middle={LIMIT(.3,-1,1)} high={LIMIT(2,-1,1)}
+.param rlow={LIMIT(-2,1,-1)} rmiddle={LIMIT(.3,1,-1)} rhigh={LIMIT(2,1,-1)}
+V1 a 0 {low}
+V2 b 0 {middle}
+V3 c 0 {high}
+V4 d 0 {rlow}
+V5 e 0 {rmiddle}
+V6 f 0 {rhigh}
+V7 in 0 .3
+B1 x 0 V=LIMIT(V(in),-1,1)
+B2 y 0 V=LIMIT(V(in),1,-1)
+B3 z 0 V=LIMIT(V(in),V(a),V(c))
+B4 w 0 V=LIMIT(V(in),.2,.2)
+.op
+.end

@@ -1,0 +1,25 @@
+* Unmodified original Georgia Tech d_source drive inputs; twelve original digital states.
+0n 0r
+12n 1u
+24n Ur
+36n 0s
+48n 1z
+60n Us
+72n 0u
+84n 1r
+96n Uu
+108n 0z
+120n 1s
+132n Uz
+144n 0r
+156n 1u
+168n Ur
+180n 0s
+192n 1z
+204n Us
+216n 0u
+228n 1r
+240n Uu
+252n 0z
+264n 1s
+276n Uz

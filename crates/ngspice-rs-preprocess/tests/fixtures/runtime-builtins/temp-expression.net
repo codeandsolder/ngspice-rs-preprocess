@@ -1,0 +1,7 @@
+* Test whether TEMP can appear as parameter value
+.temp 85
+.param T1={TEMP}
+V1 x 0 {T1}
+B1 y 0 V=TEMP
+.op
+.end

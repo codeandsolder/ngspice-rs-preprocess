@@ -1,25 +1,27 @@
 //! Source-file linking for native ngspice `.include` and named `.lib` sections.
 //!
 //! This source-only stage expands library resources before `.param`/`.model`
-//! parsing. Each output logical line retains its original file and line.
+//! parsing. Each output physical line retains its original file and line.
 
-use crate::model_card::logical_statements;
+use crate::lexical::{normalize_nbsp, statements};
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{AdmittedSource, Resource, SourceSession};
 use std::path::{Path, PathBuf};
 
-/// Physical source location corresponding to a linked logical statement.
+/// Physical source location corresponding to a linked output line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceOrigin {
     /// Canonical input path whose bytes contained this statement.
     pub path: PathBuf,
-    /// 1-based physical source line, before `+` continuation merging.
+    /// 1-based admitted-source line.
+    /// External commands may change line numbering; the path remains original.
     pub line: usize,
 }
 
-/// Linked byte buffer and one origin for each `\n`-separated logical line.
+/// Linked byte buffer and one origin for each physical output line.
 #[derive(Clone, Debug)]
 pub struct LinkedSource {
-    /// Normalized concatenated source accepted by `ModelLibrary::parse`.
+    /// Concatenated source, with original physical statements retained.
     pub bytes: Vec<u8>,
     /// Provenance ordered in exact output-line order.
     pub origins: Vec<SourceOrigin>,
@@ -27,7 +29,7 @@ pub struct LinkedSource {
 
 impl LinkedSource {
     /// Map a linked 1-based source line back to the original file and line.
-    #[must_use]
+    #[must_use = "the returned origin maps a diagnostic to its admitted source"]
     pub fn origin(&self, linked_line: usize) -> Option<&SourceOrigin> {
         self.origins.get(linked_line.checked_sub(1)?)
     }
@@ -39,12 +41,94 @@ impl LinkedSource {
 pub struct SourceLinker {
     /// Directories to search after the including file's containing directory.
     pub search_paths: Vec<PathBuf>,
+    /// Meaning of one-operand library references.
+    pub library_syntax: LibrarySyntax,
+}
+
+/// Dialect-specific interpretation of library references.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LibrarySyntax {
+    /// A single operand introduces a named section; references require a section.
+    #[default]
+    NamedSections,
+    /// Whole-file imports suppress electrical cards outside subcircuits.
+    Ltspice,
+    /// A single operand references an entire file outside a selected section.
+    /// Two operands reference a named section in another file.
+    Qspice,
+    /// Whole-file and named-section imports with `PSpice` path and header rules.
+    Pspice,
+}
+
+/// Root source treatment. Included resources are always include-safe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootKind {
+    /// First physical line is a SPICE deck title.
+    Deck,
+    /// All lines are library source, not a deck title.
+    Include,
+}
+
+/// Limits on emitted linked source.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkLimits {
+    /// Maximum concatenated bytes, including repeated includes.
+    pub output_bytes: usize,
+}
+
+impl Default for LinkLimits {
+    fn default() -> Self {
+        Self {
+            output_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
+/// A library import suppresses electrical cards outside its subcircuits.
+/// Ordinary includes inherit the containing resource's projection.
+#[derive(Debug, Default)]
+enum Projection {
+    #[default]
+    All,
+    Library {
+        depth: usize,
+    },
+}
+
+impl Projection {
+    fn retain(&mut self, text: &str) -> Result<bool> {
+        let Self::Library { depth } = self else {
+            return Ok(true);
+        };
+        if directive(text, ".subckt").is_some() {
+            *depth = depth
+                .checked_add(1)
+                .context("LTspice library scope overflow")?;
+        } else if directive(text, ".ends").is_some() {
+            *depth = depth
+                .checked_sub(1)
+                .context("unmatched .ends in LTspice library")?;
+        } else if *depth == 0
+            && text
+                .trim_start()
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
 }
 
 struct LinkState<'a> {
     settings: &'a SourceLinker,
+    admission: &'a mut SourceSession,
+    limits: LinkLimits,
     stack: Vec<(PathBuf, Option<String>)>,
     output: LinkedSource,
+    source_root: PathBuf,
+    source_search_paths: Vec<PathBuf>,
 }
 
 fn directive<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -93,81 +177,108 @@ fn library_marker(line: &str) -> Result<Option<Vec<String>>> {
     directive(line, ".lib").map(operands).transpose()
 }
 
+/// Decode an external named-section reference from an already lexed statement.
+///
+/// # Errors
+/// A .lib directive without exactly a file and a section is invalid here.
+pub fn external_library_reference(text: &str) -> Result<Option<(String, String)>> {
+    let Some(args) = library_marker(text.trim_start())? else {
+        return Ok(None);
+    };
+    let [path, section] = args
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected .lib file section"))?;
+    Ok(Some([path, section].into()))
+}
+
+/// Select a named section from already projected, joined source statements.
+/// Shares the native linker's section validation and duplicate policy.
+///
+/// # Errors
+/// Missing, duplicate, mismatched, or nested section boundaries.
+pub fn select_named_section(text: &str, path: &Path, section: &str) -> Result<String> {
+    use std::fmt::Write as _;
+    let lines = text.lines().collect::<Vec<_>>();
+    let selected = select_named_section_lines(lines.iter().copied(), path, section)?;
+    let mut output = String::new();
+    for index in selected {
+        writeln!(output, "{}", lines[index])?;
+    }
+    Ok(output)
+}
+
+/// Return selected logical line indices without discarding the caller's map.
+/// # Errors
+/// Missing, duplicate, mismatched, or nested section boundaries.
+pub fn select_named_section_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    path: &Path,
+    section: &str,
+) -> Result<Vec<usize>> {
+    let mut selection = SectionSelection::new(Some(section));
+    let mut output = Vec::new();
+    for (index, line) in lines.enumerate() {
+        if selection.observe(line.trim(), path, index + 1)? && selection.selected() {
+            output.push(index);
+        }
+    }
+    selection.finish(path)?;
+    Ok(output)
+}
+
 const fn name_matches(selected: &str, name: &str) -> bool {
     selected.eq_ignore_ascii_case(name)
 }
 
-/// Select one named section, or retain only the statements outside all
-/// section definitions. Nested two-operand library references are left
-/// intact for recursive expansion by the caller.
-fn select_statements(
-    lines: Vec<(usize, Vec<u8>)>,
-    section: Option<&str>,
-    path: &Path,
-) -> Result<Vec<(usize, Vec<u8>)>> {
-    let mut selected = Vec::new();
-    let mut active: Option<String> = None;
-    let mut found = section.is_none();
-    for (number, bytes) in lines {
-        let text = std::str::from_utf8(&bytes)
-            .with_context(|| format!("{}:{number}: invalid source encoding", path.display()))?;
-        if let Some(args) = library_marker(text)?
-            && args.len() == 1
-        {
-            ensure!(
-                active.is_none(),
-                "{}:{number}: nested .lib section definitions",
-                path.display()
-            );
-            if section.is_some_and(|name| name_matches(name, &args[0])) {
-                ensure!(
-                    !found,
-                    "{}:{number}: duplicate section {}",
-                    path.display(),
-                    args[0]
-                );
-                found = true;
-            }
-            active = args.into_iter().next();
-            continue;
-        }
-        if let Some(rest) = directive(text, ".endl") {
-            let ending = operands(rest)?;
-            ensure!(
-                ending.len() <= 1,
-                "{}:{number}: invalid .endl",
-                path.display()
-            );
-            let opened = active
-                .take()
-                .with_context(|| format!("{}:{number}: .endl without .lib", path.display()))?;
-            ensure!(
-                ending.is_empty() || name_matches(&opened, &ending[0]),
-                "{}:{number}: .endl does not match .lib {opened}",
-                path.display()
-            );
-            continue;
-        }
-        let include = match (section, active.as_deref()) {
-            (None, None) => true,
-            (Some(wanted), Some(opened)) => name_matches(wanted, opened),
-            _ => false,
-        };
-        if include {
-            selected.push((number, bytes));
-        }
-    }
-    ensure!(
-        active.is_none(),
-        "{}: unterminated .lib section",
-        path.display()
-    );
-    if let Some(name) = section {
-        ensure!(found, "{}: no .lib section named {name}", path.display());
-    }
-    Ok(selected)
+// The lexical view recognizes directives and continuation boundaries, while
+// the emitted bytes retain physical lines, comments and original spelling.
+struct Record {
+    line: usize,
+    physical: std::ops::Range<usize>,
+    logical: Vec<u8>,
 }
 
+fn records(bytes: &[u8], first_line: usize) -> Result<Vec<Record>> {
+    let physical_count = bytes.split_inclusive(|byte| *byte == b'\n').count();
+    let normalized = normalize_nbsp(bytes);
+    let normalized = normalized.as_deref().unwrap_or(bytes);
+    let mut starts = vec![0];
+    for line in normalized.split_inclusive(|byte| *byte == b'\n') {
+        starts.push(starts.last().copied().unwrap_or_default() + line.len());
+    }
+    let mut result = Vec::new();
+    let mut cursor = 0;
+    for statement in statements(normalized)? {
+        let start = statement.line - 1;
+        let end = statement
+            .source_ranges(0..statement.text.len())
+            .last()
+            .map_or(start + 1, |range| {
+                starts.partition_point(|offset| *offset < range.end)
+            });
+        if cursor < start {
+            result.push(Record {
+                line: first_line + cursor,
+                physical: cursor..start,
+                logical: Vec::new(),
+            });
+        }
+        result.push(Record {
+            line: first_line + start,
+            physical: start..end,
+            logical: statement.text,
+        });
+        cursor = end;
+    }
+    if cursor < physical_count {
+        result.push(Record {
+            line: first_line + cursor,
+            physical: cursor..physical_count,
+            logical: Vec::new(),
+        });
+    }
+    Ok(result)
+}
 impl SourceLinker {
     /// Recursively load one native-ngspice source deck, expanding `.include`
     /// and `.inc`, and selected `.lib path section` references, with origin
@@ -178,77 +289,239 @@ impl SourceLinker {
     /// Errors on missing/ambiguous sections, include cycles, malformed
     /// directives, invalid text, and unsupported bare `.lib` references.
     pub fn link(&self, source: &Path) -> Result<LinkedSource> {
+        self.link_with_session(source, &mut SourceSession::default())
+    }
+
+    /// Link through a caller-owned source admission session. Repeated files
+    /// and named sections use one immutable transformed snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As in [`Self::link`], plus source admission and external command errors.
+    pub fn link_with_session(
+        &self,
+        source: &Path,
+        admission: &mut SourceSession,
+    ) -> Result<LinkedSource> {
+        let source = admission.load(source)?;
+        self.link_admitted(&source, RootKind::Include, LinkLimits::default(), admission)
+    }
+
+    /// Link an already-admitted root (including an in-memory source).
+    ///
+    /// # Errors
+    ///
+    /// Invalid source, missing or recursive resources, malformed sections,
+    /// or exceeded linked-output budget.
+    pub fn link_admitted(
+        &self,
+        source: &AdmittedSource,
+        kind: RootKind,
+        limits: LinkLimits,
+        admission: &mut SourceSession,
+    ) -> Result<LinkedSource> {
         let mut state = LinkState {
             settings: self,
+            admission,
+            limits,
             stack: Vec::new(),
+            source_root: source
+                .path
+                .parent()
+                .context("source root has no containing directory")?
+                .to_path_buf(),
+            source_search_paths: Vec::new(),
             output: LinkedSource {
                 bytes: Vec::new(),
                 origins: Vec::new(),
             },
         };
-        state.expand(source, None, None)?;
+        state.expand_source(source, None, kind, &mut Projection::All)?;
         Ok(state.output)
     }
 }
 
-impl LinkState<'_> {
-    fn resolve(&self, path: &Path, parent: Option<&Path>) -> Result<PathBuf> {
-        let local = parent
+fn portable_qspice_path(path: &Path) -> Result<PathBuf> {
+    let text = path.to_str().context("non-UTF-8 QSPICE resource path")?;
+    if !cfg!(windows) {
+        ensure!(
+            !text.starts_with("\\\\") && text.as_bytes().get(1).is_none_or(|byte| *byte != b':'),
+            "QSPICE Windows absolute resource path {} requires an explicit host path",
+            path.display()
+        );
+    }
+    Ok(PathBuf::from(text.replace('\\', "/")))
+}
+
+fn check_pspice_header(body: &[u8], path: &Path, kind: RootKind) -> Result<()> {
+    let mut lines = body.split_inclusive(|byte| *byte == b'\n');
+    let first = lines.next().unwrap_or_default().trim_ascii();
+    let second = lines.next().unwrap_or_default().trim_ascii();
+    let header = if kind == RootKind::Include && (first.is_empty() || first.starts_with(b"*")) {
+        [first, second]
             .into_iter()
-            .filter_map(Path::parent)
-            .map(|dir| dir.join(path));
+            .find(|line| line.starts_with(b"*#"))
+            .unwrap_or_default()
+    } else {
+        first
+    };
+    let declaration = header
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or_default();
+    ensure!(
+        ![
+            b"*#SIMETRIX".as_slice(),
+            b"*#HSPICE",
+            b"*#LTSPICE",
+            b"*#NATIVE"
+        ]
+        .iter()
+        .any(|name| declaration.eq_ignore_ascii_case(name)),
+        "{}: explicit foreign source dialect in standalone PSpice graph",
+        path.display()
+    );
+    Ok(())
+}
+
+impl LinkState<'_> {
+    fn resolve(&self, path: &Path, parent: &Path) -> Result<PathBuf> {
+        let portable;
+        let qspice = self.settings.library_syntax == LibrarySyntax::Qspice;
+        let path = if qspice {
+            portable = portable_qspice_path(path)?;
+            portable.as_path()
+        } else if matches!(
+            self.settings.library_syntax,
+            LibrarySyntax::Pspice | LibrarySyntax::Ltspice
+        ) {
+            portable = PathBuf::from(
+                path.to_str()
+                    .context("non-UTF-8 source resource path")?
+                    .replace('\\', "/"),
+            );
+            portable.as_path()
+        } else {
+            path
+        };
+        // QSPICE's library search is rooted in the original deck, not the
+        // current nested resource. Source-declared paths are ordered and the
+        // explicit caller directories are additional search roots.
+        let local = if qspice {
+            Some(self.source_root.as_path())
+        } else {
+            parent.parent()
+        };
         let candidates = local
-            .chain((parent.is_none()).then(|| path.to_path_buf()))
-            .chain(self.settings.search_paths.iter().map(|dir| dir.join(path)));
+            .into_iter()
+            .chain(self.source_search_paths.iter().map(PathBuf::as_path))
+            .chain(self.settings.search_paths.iter().map(PathBuf::as_path))
+            .map(|dir| dir.join(path));
         for candidate in candidates {
-            if let Ok(canonical) = candidate.canonicalize() {
-                ensure!(
-                    canonical.is_file(),
-                    "linked source is not a regular file: {}",
-                    canonical.display()
-                );
-                return Ok(canonical);
+            match self.admission.resolve_path(&candidate) {
+                Ok(canonical) => return Ok(canonical),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("resolving linked source {}", candidate.display())
+                    });
+                }
             }
         }
         bail!(
             "cannot resolve source file {} relative to {}",
             path.display(),
-            parent.map_or_else(|| "<root>".to_owned(), |p| p.display().to_string())
+            parent.display()
         )
     }
 
-    fn emit(&mut self, path: &Path, physical_line: usize, text: &[u8]) {
+    fn emit(&mut self, path: &Path, physical_line: usize, text: &[u8]) -> Result<()> {
+        let extra = usize::from(!text.ends_with(b"\n"));
+        ensure!(
+            text.len().saturating_add(extra)
+                <= self
+                    .limits
+                    .output_bytes
+                    .saturating_sub(self.output.bytes.len()),
+            "linked output byte budget exceeded at {}:{physical_line}",
+            path.display()
+        );
+        let budget = self.admission.budget();
+        budget.charge(Resource::EmittedBytes, text.len().saturating_add(extra))?;
+        budget.charge(Resource::GeneratedNodes, 1)?;
+        budget.charge(Resource::EmittedBytes, path.as_os_str().len())?;
         self.output.bytes.extend_from_slice(text);
-        self.output.bytes.push(b'\n');
+        if extra != 0 {
+            self.output.bytes.push(b'\n');
+        }
         self.output.origins.push(SourceOrigin {
             path: path.to_path_buf(),
             line: physical_line,
         });
+        Ok(())
     }
 
     fn expand(
         &mut self,
         requested: &Path,
-        parent: Option<&Path>,
+        parent: &Path,
         section: Option<&str>,
+        projection: &mut Projection,
     ) -> Result<()> {
         let path = self.resolve(requested, parent)?;
+        // Resolve an existing admitted snapshot before interpreting its syntax.
+        let source = self.admission.load(&path)?;
+        self.expand_source(&source, section, RootKind::Include, projection)
+    }
+
+    fn expand_library(
+        &mut self,
+        requested: &Path,
+        parent: &Path,
+        section: Option<&str>,
+        containing: &mut Projection,
+    ) -> Result<()> {
+        if self.settings.library_syntax != LibrarySyntax::Ltspice {
+            return self.expand(requested, parent, section, containing);
+        }
+        let mut projection = Projection::Library { depth: 0 };
+        self.expand(requested, parent, section, &mut projection)?;
         ensure!(
-            self.stack.len() < 128,
-            "ngspice source linking depth exceeded 128"
+            matches!(projection, Projection::Library { depth: 0 }),
+            "unterminated subcircuit in LTspice library {}",
+            requested.display()
         );
+        Ok(())
+    }
+
+    fn expand_source(
+        &mut self,
+        source: &AdmittedSource,
+        section: Option<&str>,
+        kind: RootKind,
+        projection: &mut Projection,
+    ) -> Result<()> {
+        let path = &source.path;
         let section_key = section.map(str::to_ascii_lowercase);
         ensure!(
             !self
                 .stack
                 .iter()
-                .any(|(candidate, selected)| candidate == &path && selected == &section_key),
+                .any(|(candidate, selected)| candidate == path && selected == &section_key),
             "recursive ngspice source include: {}{}",
             path.display(),
             section.map_or_else(String::new, |name| format!(" section {name}"))
         );
+        let budget = self.admission.budget().clone();
+        let _depth = budget.enter()?;
+        budget.charge(Resource::SourceVisits, 1)?;
+        budget.charge(Resource::ScannedBytes, source.bytes.len())?;
+        budget.charge(
+            Resource::Statements,
+            source.bytes.split_inclusive(|byte| *byte == b'\n').count(),
+        )?;
         self.stack.push((path.clone(), section_key));
-        let result = self.expand_inner(&path, section);
+        let result = self.expand_inner(source, section, kind, projection);
         self.stack.pop();
         result.with_context(|| {
             format!(
@@ -259,45 +532,282 @@ impl LinkState<'_> {
         })
     }
 
-    fn expand_inner(&mut self, path: &Path, section: Option<&str>) -> Result<()> {
-        let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let lines = logical_statements(&raw)?;
-        let selected = select_statements(lines, section, path)?;
+    fn expand_inner(
+        &mut self,
+        source: &AdmittedSource,
+        section: Option<&str>,
+        kind: RootKind,
+        projection: &mut Projection,
+    ) -> Result<()> {
+        let path = &source.path;
+        let decoded = if self.settings.library_syntax == LibrarySyntax::Qspice {
+            crate::qspice::decode_resource(path, &source.bytes, self.admission.budget())?
+        } else {
+            std::borrow::Cow::Borrowed(&source.bytes[..])
+        };
+        crate::lexical::ensure_textual(&decoded)?;
+        let (body, first_line) = if kind == RootKind::Deck {
+            let title = decoded
+                .split_inclusive(|byte| *byte == b'\n')
+                .next()
+                .context("native deck has no title line")?;
+            self.emit(path, 1, title)?;
+            (&decoded[title.len()..], 2)
+        } else {
+            (&decoded[..], 1)
+        };
+        if self.settings.library_syntax == LibrarySyntax::Pspice {
+            check_pspice_header(body, path, kind)?;
+        }
+        let records = records(body, first_line)?;
+        if self.settings.library_syntax == LibrarySyntax::Qspice && self.stack.len() == 1 {
+            self.collect_source_paths(path, &records)?;
+        }
+        let mut selection = SectionSelection::new(section);
         let mut in_control = false;
-        for (physical_line, bytes) in selected {
-            let text = std::str::from_utf8(&bytes).with_context(|| {
-                format!("{}:{physical_line}: non-UTF-8 statement", path.display())
+        let physical = body
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        for record in records {
+            // Non-ASCII QSPICE device designators require a qualified kernel.
+            if self.settings.library_syntax == LibrarySyntax::Qspice
+                && record.logical.first().is_some_and(|byte| !byte.is_ascii())
+            {
+                if selection.selected() {
+                    crate::qspice::reject_special_device(path, record.line)?;
+                }
+                continue;
+            }
+            let text = std::str::from_utf8(&record.logical).with_context(|| {
+                format!(
+                    "{}:{}: invalid source encoding",
+                    path.display(),
+                    record.line
+                )
             })?;
-            if directive(text, ".control").is_some() {
+            let control_start = directive(text, ".control").is_some();
+            let control_end = directive(text, ".endc").is_some();
+            if !in_control
+                && !control_start
+                && !selection.observe_with_syntax(
+                    text,
+                    path,
+                    record.line,
+                    self.settings.library_syntax,
+                )?
+            {
+                continue;
+            }
+            let selected = selection.selected();
+            if control_start {
                 in_control = true;
             }
-            if directive(text, ".endc").is_some() {
+            if selected {
+                if in_control || control_end {
+                    self.emit_record(path, &record, &physical)?;
+                } else if projection.retain(text)? {
+                    if self.settings.library_syntax == LibrarySyntax::Qspice {
+                        crate::qspice::check_topology_directive(path, record.line, text)?;
+                    }
+                    self.expand_record(path, &record, &physical, text, kind, projection)?;
+                }
+            }
+            if control_end {
                 in_control = false;
             }
-            if in_control || directive(text, ".endc").is_some() {
-                self.emit(path, physical_line, &bytes);
-                continue;
+        }
+        ensure!(
+            !in_control,
+            "{}: unterminated .control block",
+            path.display()
+        );
+        selection.finish(path)
+    }
+
+    fn collect_source_paths(&mut self, path: &Path, records: &[Record]) -> Result<()> {
+        let mut depth = 0usize;
+        for record in records {
+            let text = std::str::from_utf8(&record.logical)?;
+            crate::qspice::check_topology_directive(path, record.line, text)?;
+            if [".subckt", ".control"]
+                .iter()
+                .any(|name| directive(text, name).is_some())
+            {
+                depth = depth
+                    .checked_add(1)
+                    .context("QSPICE source scope overflow")?;
+            } else if [".ends", ".endc"]
+                .iter()
+                .any(|name| directive(text, name).is_some())
+            {
+                depth = depth.saturating_sub(1);
             }
-            if let Some(rest) = directive(text, ".include").or_else(|| directive(text, ".inc")) {
+            if let Some(rest) = directive(text, ".libpath") {
+                if depth != 0 {
+                    return Err(crate::qspice::reject_nested_search(path, record.line));
+                }
                 let args = operands(rest)?;
-                ensure!(
-                    args.len() == 1,
-                    "{}:{physical_line}: .include requires one pathname",
-                    path.display()
-                );
-                self.expand(Path::new(&args[0]), Some(path), None)?;
-                continue;
+                let [directory] = args.as_slice() else {
+                    bail!(
+                        "{}:{}: .libpath requires one directory",
+                        path.display(),
+                        record.line
+                    );
+                };
+                let portable = portable_qspice_path(Path::new(directory))
+                    .with_context(|| format!("{}:{}: .libpath", path.display(), record.line))?;
+                self.source_search_paths
+                    .push(self.source_root.join(portable));
             }
-            if let Some(args) = library_marker(text)? {
-                ensure!(
-                    args.len() == 2,
-                    "{}:{physical_line}: native .lib requires a file and section",
-                    path.display()
-                );
-                self.expand(Path::new(&args[0]), Some(path), Some(&args[1]))?;
-                continue;
+        }
+        Ok(())
+    }
+
+    fn emit_record(&mut self, path: &Path, record: &Record, physical: &[&[u8]]) -> Result<()> {
+        for (offset, line) in physical[record.physical.clone()].iter().enumerate() {
+            self.emit(path, record.line + offset, line)?;
+        }
+        Ok(())
+    }
+
+    fn expand_record(
+        &mut self,
+        path: &Path,
+        record: &Record,
+        physical: &[&[u8]],
+        text: &str,
+        kind: RootKind,
+        projection: &mut Projection,
+    ) -> Result<()> {
+        let physical_line = record.line;
+        if let Some(rest) = directive(text, ".include").or_else(|| directive(text, ".inc")) {
+            let args = operands(rest)?;
+            ensure!(
+                args.len() == 1,
+                "{}:{physical_line}: .include requires one pathname",
+                path.display()
+            );
+            return self.expand(Path::new(&args[0]), path, None, projection);
+        }
+        if let Some(args) = library_marker(text)? {
+            if self.settings.library_syntax != LibrarySyntax::NamedSections && args.len() == 1 {
+                return self.expand_library(Path::new(&args[0]), path, None, projection);
             }
-            self.emit(path, physical_line, &bytes);
+            ensure!(
+                args.len() == 2,
+                "{}:{physical_line}: native .lib requires a file and section",
+                path.display()
+            );
+            return self.expand_library(Path::new(&args[0]), path, Some(&args[1]), projection);
+        }
+        if (kind == RootKind::Include && text.eq_ignore_ascii_case(".end"))
+            || (self.settings.library_syntax == LibrarySyntax::Qspice
+                && self.stack.len() == 1
+                && directive(text, ".libpath").is_some())
+        {
+            // Consumed search paths and included terminators stay mapped as comments.
+            // Keep one mapped comment for each physical source line.
+            for (offset, line) in physical[record.physical.clone()].iter().enumerate() {
+                let mut comment = b"* ".to_vec();
+                comment.extend_from_slice(line);
+                self.emit(path, physical_line + offset, &comment)?;
+            }
+            return Ok(());
+        }
+        self.emit_record(path, record, physical)
+    }
+}
+
+struct SectionSelection<'a> {
+    wanted: Option<&'a str>,
+    active: Option<String>,
+    found: bool,
+}
+
+impl<'a> SectionSelection<'a> {
+    const fn new(wanted: Option<&'a str>) -> Self {
+        Self {
+            wanted,
+            active: None,
+            found: wanted.is_none(),
+        }
+    }
+
+    /// Return false for section boundary records; they are never emitted.
+    fn observe(&mut self, text: &str, path: &Path, line: usize) -> Result<bool> {
+        self.observe_with_syntax(text, path, line, LibrarySyntax::NamedSections)
+    }
+
+    fn observe_with_syntax(
+        &mut self,
+        text: &str,
+        path: &Path,
+        line: usize,
+        syntax: LibrarySyntax,
+    ) -> Result<bool> {
+        if let Some(args) = library_marker(text)?
+            && args.len() == 1
+            && (syntax == LibrarySyntax::NamedSections
+                || (self.wanted.is_some() && self.active.is_none()))
+        {
+            ensure!(
+                self.active.is_none(),
+                "{}:{line}: nested .lib section definitions",
+                path.display()
+            );
+            if self.wanted.is_some_and(|name| name_matches(name, &args[0])) {
+                ensure!(
+                    !self.found,
+                    "{}:{line}: duplicate section {}",
+                    path.display(),
+                    args[0]
+                );
+                self.found = true;
+            }
+            self.active = args.into_iter().next();
+            return Ok(false);
+        }
+        if let Some(rest) = directive(text, ".endl") {
+            let ending = operands(rest)?;
+            ensure!(
+                ending.len() <= 1,
+                "{}:{line}: invalid .endl",
+                path.display()
+            );
+            let opened = self
+                .active
+                .take()
+                .with_context(|| format!("{}:{line}: .endl without .lib", path.display()))?;
+            ensure!(
+                ending.is_empty() || name_matches(&opened, &ending[0]),
+                "{}:{line}: .endl does not match .lib {opened}",
+                path.display()
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn selected(&self) -> bool {
+        match (self.wanted, self.active.as_deref()) {
+            (None, None) => true,
+            (Some(wanted), Some(opened)) => name_matches(wanted, opened),
+            _ => false,
+        }
+    }
+
+    fn finish(self, path: &Path) -> Result<()> {
+        ensure!(
+            self.active.is_none(),
+            "{}: unterminated .lib section",
+            path.display()
+        );
+        if let Some(name) = self.wanted {
+            ensure!(
+                self.found,
+                "{}: no .lib section named {name}",
+                path.display()
+            );
         }
         Ok(())
     }
@@ -308,6 +818,52 @@ mod tests {
     use super::*;
     use crate::parameter_scope::ModelLibrary;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn command_runs_once_per_original_source_across_includes_and_sections() -> Result<()> {
+        use model_preprocess_command::{AdmissionConfig, Cancellation, CommandConfig};
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root.cir");
+        let library = temp.path().join("library.lib");
+        fs::write(
+            &root,
+            b"title\n.lib library.lib one\n.lib library.lib two\n.inc replacement.inc\n.inc alias.inc\n",
+        )?;
+        fs::write(
+            &library,
+            b".lib one\n.param a=1\n.endl one\n.lib two\n.param b=REPLACE_VALUE\n.endl two\n",
+        )?;
+        let common = temp.path().join("common.inc");
+        fs::write(&common, b".param c=3\n")?;
+        std::os::unix::fs::symlink(&common, temp.path().join("alias.inc"))?;
+        let config = AdmissionConfig {
+            command: Some(CommandConfig {
+                executable: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    r#"printf '%s\n' "$1" >> calls; sed "s/replacement.inc/common.inc/g; s/REPLACE_VALUE/2/g""#.into(),
+                    "fixture".into(),
+                ],
+                working_directory: None,
+            }),
+            ..AdmissionConfig::default()
+        };
+        let mut admission = SourceSession::new(config, Cancellation::default());
+        let linked = SourceLinker::default().link_with_session(&root, &mut admission)?;
+        let output = String::from_utf8(linked.bytes)?;
+        assert!(output.contains(".param a=1"));
+        assert!(output.contains(".param b=2"));
+        assert_eq!(output.matches(".param c=3").count(), 2);
+        let calls = fs::read_to_string(temp.path().join("calls"))?;
+        assert_eq!(calls.lines().count(), 3);
+        assert_eq!(calls.matches("library.lib").count(), 1);
+        assert_eq!(calls.matches("common.inc").count(), 1);
+        let again = SourceLinker::default().link_with_session(&root, &mut admission)?;
+        assert_eq!(again.bytes, output.as_bytes());
+        assert_eq!(fs::read_to_string(temp.path().join("calls"))?, calls);
+        Ok(())
+    }
 
     #[test]
     fn nested_includes_named_sections_provenance_and_scope() -> Result<()> {
@@ -403,6 +959,7 @@ mod tests {
         fs::write(&root,b"title\n.include part.inc\n.lib disabled\n.model invalid vdmos(vto=1)\n.endl disabled\n.model accepted vdmos (kp={scale})\n")?;
         let linked = SourceLinker {
             search_paths: vec![libs],
+            library_syntax: LibrarySyntax::NamedSections,
         }
         .link(&root)?;
         let library = ModelLibrary::parse(&linked.bytes)?;

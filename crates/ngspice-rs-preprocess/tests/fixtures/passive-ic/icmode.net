@@ -1,0 +1,26 @@
+* per-device ICMODE witness
+.options initCondMode=2 icres=2
+Vs s 0 10
+Rcpa s cpa 10
+Rcna cna 0 20
+Ca cpa cna 1m IC=3
+Rla s lpa 10
+La lpa 0 1m IC=3
+Rcpb s cpb 10
+Rcnb cnb 0 20
+Cb cpb cnb 1m IC=3 ICMODE=0
+Rlb s lpb 10
+Lb lpb 0 1m IC=3 ICMODE=0
+Rcpc s cpc 10
+Rcnc cnc 0 20
+Cc cpc cnc 1m IC=3 ICMODE=1
+Rlc s lpc 10
+Lc lpc 0 1m IC=3 ICMODE=1
+Rcpd s cpd 10
+Rcnd cnd 0 20
+Cd cpd cnd 1m IC=3 ICMODE=2
+Rld s lpd 10
+Ld lpd 0 1m IC=3 ICMODE=2
+.tran 1u 5u 0 100n
+.PRINT TRAN V(cpa) V(cna) V(lpa) V(cpb) V(cnb) V(lpb) V(cpc) V(cnc) V(lpc) V(cpd) V(cnd) V(lpd)
+.end

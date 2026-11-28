@@ -1,0 +1,22 @@
+* Original signed total-load timing controls
+Vinput d 0 PULSE(0 5 2n 1n 1n 5n 15n)
+.model DRV d_logic_block family="HC" input_load=0 out_res=1000 out_delay=1n def="out[0]=in[0];"
+Aprod0 [d] [p0] DRV
+Aprod1 [d] [p1] DRV
+Aprod2 [d] [p2] DRV
+Aprod3 [d] [p3] DRV
+.model R0 d_logic_block family="HC" input_load=0 out_res=40 out_delay=1n def="out[0]=in[0];"
+.model R1 d_logic_block family="HC" input_load=-.5p out_res=40 out_delay=1n def="out[0]=in[0];"
+.model R2 d_logic_block family="HC" input_load=-1p out_res=40 out_delay=1n def="out[0]=in[0];"
+.model R3 d_logic_block family="HC" input_load=-2p out_res=40 out_delay=1n def="out[0]=in[0];"
+Acons0 [p0] [q0] R0
+Acons1 [p1] [q1] R1
+Acons2 [p2] [q2] R2
+Acons3 [p3] [q3] R3
+Rload0 q0 0 100k
+Rload1 q1 0 100k
+Rload2 q2 0 100k
+Rload3 q3 0 100k
+.PRINT TRAN V(q0) V(q1) V(q2) V(q3)
+.tran 5p 20n 0 5p
+.end

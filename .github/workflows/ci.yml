@@ -3,74 +3,54 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-  CARGO_BUILD_WARNINGS: deny
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # PRs receive this check in the strict gate; direct campaign publication
+  # and merge queues also need an explicit immutable lockfile baseline.
+  quarantine:
+    name: Cargo release-age quarantine (push and merge queue)
+    if: (github.event_name == 'push' && github.ref_type == 'branch' && !github.event.deleted) || github.event_name == 'merge_group'
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","Linux","X64","local-ci"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: codeandsolder/ci-workflows/.github/actions/cargo-release-quarantine@9c14ef2d72423958c56944febc620ec50f01d65a # main
+        with:
+          base-ref: ${{ github.event.merge_group.base_sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || 'origin/main' }}
+          lockfile: auto
+          hours: "72"
+
   strict-rust:
     name: Strict Rust
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@073d436b3d759343900bdc5e4ddecfa120792b8c # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@cb9083676196a8ec3bf013e7253907b2759020c7 # main
     with:
       allow-test-panics: true
-      rust-toolchain: nightly-2026-11-20
 
   nightly:
-    name: Nightly Rust
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install repository toolchain
-        run: rustup toolchain install
-      - name: Toolchain versions
-        run: |
-          rustc --version
-          cargo --version
-      - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
-        with:
-          rust-toolchain: "nightly-2026-11-20"
-      - name: Install reference build dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential bison flex libtool pkg-config
-      - name: Install pinned translator reference simulator
-        id: simulator
-        run: |
-          set -euo pipefail
-          directory="$(mktemp -d "$RUNNER_TEMP/ngspice-reference.XXXXXXXX")"
-          printf 'directory=%s\n' "$directory" >> "$GITHUB_OUTPUT"
-          bash .github/scripts/install-reference-ngspice.sh "$directory/reference"
-          printf '%s\n' "$directory/reference/bin" >> "$GITHUB_PATH"
-      - name: Lockfile consistency
-        run: cargo metadata --locked --format-version 1 >/dev/null
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Check all targets
-        run: cargo check --locked --workspace --all-targets
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Tests
-        run: cargo test --locked --workspace --all-targets
-      - name: Documentation
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --locked --workspace --no-deps
-      - name: Remove reference simulator
-        if: always() && steps.simulator.outputs.directory != ''
-        env:
-          SIMULATOR_DIRECTORY: ${{ steps.simulator.outputs.directory }}
-        run: rm -rf -- "$SIMULATOR_DIRECTORY"
-      - name: Finalize mandatory sccache
-        if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+    name: Source archive, locked tests and C reference
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
+    with:
+      test-impact-mode: none
+      command: bash .github/scripts/verify-source.sh
+
+  package-qualification:
+    name: Standalone registry packages and install
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'tag')
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
+    with:
+      test-impact-mode: none
+      command: bash .github/scripts/verify-packages.sh

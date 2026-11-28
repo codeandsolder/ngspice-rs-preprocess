@@ -1,0 +1,13 @@
+* Interaction of instance and model temperature
+.temp 85
+Vb b 0 .65
+V1 c1 0 2
+V2 c2 0 2
+V3 c3 0 2
+Q1 c1 b 0 N1 TEMP=50
+Q2 c2 b 0 N2 TEMP=50
+Q3 c3 b 0 N2
+.model N1 NPN(IS=1e-15 BF=100)
+.model N2 NPN(IS=1e-15 BF=100 T_ABS=27)
+.op
+.end

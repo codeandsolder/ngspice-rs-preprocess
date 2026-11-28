@@ -1,0 +1,24 @@
+{
+  "connections": [
+    {
+      "analog_net": "ANALOG_INPUT", "digital_net": "d_in",
+      "direction": "input", "in_family": "HC", "supply_v": 3.3
+    },
+    {
+      "analog_net": "ANALOG_ON", "digital_net": "d_on",
+      "direction": "output", "out_family": "HC", "supply_v": 3.3
+    },
+    {
+      "analog_net": "ANALOG_OFF", "digital_net": "d_off",
+      "direction": "output", "out_family": "HC", "supply_v": 3.3
+    },
+    {
+      "analog_net": "ANALOG_COPY", "digital_net": "d_copy",
+      "direction": "output", "out_family": "HC", "supply_v": 3.3
+    }
+  ],
+  "bridge_models": [
+    {"name": "HC_ADC", "kind": "adc", "family": "HC", "nominal_supply_v": 5},
+    {"name": "HC_DAC", "kind": "dac", "family": "HC", "nominal_supply_v": 5}
+  ]
+}

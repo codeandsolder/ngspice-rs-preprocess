@@ -1,0 +1,6 @@
+source,control,expected_relation
+edge-port-0,edge-port-2n,identical
+comb-port-0,comb-port-2n,identical
+edge-default-1p,edge-default-2n,identical
+comb-default-1p,comb-default-2n,identical
+edge-port-0,edge-reg-3n,different

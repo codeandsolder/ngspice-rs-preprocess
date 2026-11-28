@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use model_preprocess_simplis::{ParsedLibrary, SubcircuitCatalog, preprocess_netlist};
+use model_preprocess_command::SourceSession;
+use model_preprocess_simplis::{
+    LibrarySimulator, ParsedLibrary, SubcircuitCatalog, preprocess_netlist_file,
+};
 use std::{env, fs, path::Path};
 
 fn is_parsed_library_path(path: &Path) -> bool {
@@ -19,22 +22,27 @@ fn main() -> Result<()> {
         bail!("at least one SIMPLIS library is required");
     }
 
-    let input_bytes = fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+    let mut admission = SourceSession::default();
     let mut catalog = SubcircuitCatalog::new();
     let mut definitions = 0usize;
     for library in &libraries {
-        let bytes = fs::read(library).with_context(|| format!("reading {}", library.display()))?;
         let display = library.to_string_lossy();
         let added = if is_parsed_library_path(Path::new(library)) {
+            let bytes =
+                fs::read(library).with_context(|| format!("reading {}", library.display()))?;
             let parsed = ParsedLibrary::from_json(&bytes)
                 .with_context(|| format!("loading parsed SIMPLIS library {display}"))?;
             catalog.add_parsed_library(&parsed)?
         } else {
-            catalog.add_library_named(display, &bytes)?
+            catalog.add_library_file(
+                Path::new(library),
+                LibrarySimulator::Simplis,
+                &mut admission,
+            )?
         };
         definitions = definitions.saturating_add(added);
     }
-    let preprocessed = preprocess_netlist(&input_bytes, &catalog)?;
+    let preprocessed = preprocess_netlist_file(Path::new(&input), &catalog, &mut admission)?;
     fs::write(&output, &preprocessed.bytes)
         .with_context(|| format!("writing {}", output.display()))?;
     eprintln!(

@@ -11,12 +11,56 @@ A reusable typed VDMOS model package for ngspice-rs-preprocess. Derived from ngs
 - Thermal RC: junction capacitance, junction-to-case and case-to-ambient conductances, channel/diode Joule power and per-ohmic-branch heating with derivatives. Unconnected zero-ohm branches are topology shorts, not artificially large conductances.
 - Branch-local source-current noise densities from ngspice's RD/RS Johnson, 2/3-channel thermal and KF/AF flicker laws; noise is evaluated at the temperature retained in the same device `Evaluation`, avoiding a separate mismatched temperature argument. The simulator applies the correct AC transfer functions to produce observation noise.
 
-`Model::prepare` validates a model and computes nominal constants once; `PreparedModel::bind` binds independent device multiplicity and heating; `PreparedInstance::evaluate` returns immutable current/charge/heat and Jacobians with no allocations, no accepted/trial-state mutation, no topology reconstruction, and no string lookup. `evaluate_batch` uses borrowed input/output buffers. `compile_ngspice` maps already parsed semantic field/value pairs and their aliases (`VTO/VTH0`, `VTOTC/TCVTH`, `BEX/MU`, etc.) to the same prepared representation, including Celsius-to-Kelvin TNOM and grouped RQ/VQ or BV/IBV/NBV activation. Unknown source fields, distortion-only PHI and unsupported SOA annotations **fail closed** rather than disappearing.
+`Model::prepare` validates a model and computes nominal constants once; `PreparedModel::bind` binds independent device multiplicity and heating; `PreparedInstance::evaluate` returns immutable current/charge/heat and Jacobians with no allocations, no accepted/trial-state mutation, no topology reconstruction, and no string lookup. `evaluate_batch` uses borrowed input/output buffers. `compile_ngspice` maps already parsed semantic field/value pairs and their aliases (`VTO/VTH0`, `VTOTC/TCVTH`, `BEX/MU`, etc.) to the same prepared representation, including Celsius-to-Kelvin TNOM and grouped RQ/VQ or BV/IBV/NBV activation. Unknown source fields and attempts to assign the read-only TYPE query **fail closed** rather than disappearing. PHI and native SOA declarations are retained in typed fields, separately from the numerical equations.
 
-**Plaintext source compiler boundary:** `model-normalize-ngspice::model_card` lexes generic `.model` statements, SPICE numeric suffixes, comments, physical line locations and `+` continuations. `param_expression::SpiceExpression` parses source-level arithmetic, ngspice operator precedence and builtin scalar functions (including lazy `?:`, logical short circuit, `ternary_fcn`). `parameter_scope::ModelLibrary` collects `.param` definitions and nested `.subckt` lexical scopes, resolves forward references/case-insensitive symbols and detects cycles/undefined names. Its `resolve_vdmos(model_index, overrides)` evaluates each VDMOS model's source expressions at preparation time using per-scope **numeric instance overrides**, preserving annotated `mfg`, `Vds`, `Ron`, `Qg` metadata separately. The linker supplies instantiated X-line parameters in their calling context; this model package does not expand circuit topology. The parser rejects builtin/reserved parameter names (ngspice 47 silently mishandles some, e.g. `.param pow=...`), undefined functions, cycles and non-finite calculations. Source-defined `.func` macros are compiled into the same expression AST, and receive unevaluated arguments so unused conditional branches stay lazy. Functions are located along the lexical scope chain, but **free variables in a function body resolve in the caller's instance scope**, exactly as ngspice 47 does; this differs from `.param` definitions, whose expression symbols are bound in the declaration's own scope. `ModelLibrary::evaluate_scalar(caller_scope, expression, overrides)` evaluates instance override expressions before binding callee parameters.
+**Plaintext source compiler boundary:** `model-normalize-ngspice::model_card` lexes generic `.model` statements, SPICE numeric suffixes, comments, physical line locations and `+` continuations. `param_expression::SpiceExpression` parses source-level arithmetic, ngspice operator precedence and builtin scalar functions (including lazy `?:`, logical short circuit, `ternary_fcn`). `parameter_scope::ModelLibrary` collects `.param` definitions and nested `.subckt` lexical scopes, resolves forward references/case-insensitive symbols and detects cycles/undefined names. Its `resolve_vdmos(model_index, overrides)` evaluates each VDMOS model's source expressions at preparation time using per-scope **numeric instance overrides**, preserving annotated `mfg`, `Vds`, `Ron`, `Qg` metadata separately. For reachable instances, `ModelLibrary::instantiate` recursively binds native X-lines and model-bearing MOS occurrences before preparation. It separates lexical model/function visibility from the actual caller parameter chain, evaluates call-site overrides, retains source locations and disjoint terminal identities, and interns equal evaluated model variants. `VdmosBinding::artifact_key` groups a model variant and its effective thermal topology; multiplicity and temperature are independently prepared through the kernel ABI. Native implicit subcircuit multipliers, explicit multiplier formals, TEMP/DTEMP precedence, model instance defaults, initial voltages and implicit thermal nodes are retained. Other MOS families remain explicitly unprepared; the binder does not implement general device elaboration or solver matrix-row assignment. The parser rejects builtin/reserved parameter names (ngspice 47 silently mishandles some, e.g. `.param pow=...`), undefined functions, cycles and non-finite calculations. Source-defined `.func` macros are compiled into the same expression AST, and receive unevaluated arguments so unused conditional branches stay lazy. Functions are located along the lexical scope chain, but **free variables in a function body resolve in the caller's instance scope**, exactly as ngspice 47 does; this differs from `.param` definitions, whose expression symbols are bound in the declaration's own scope. `ModelLibrary::evaluate_scalar(caller_scope, expression, overrides)` evaluates instance override expressions before binding callee parameters.
 
-There is **no runtime parsing dependency** on the kernel: normalizer and source compiler are `model-kernel-vdmos` *dev-dependencies* for integration/oracle tests, and the standalone numerical kernel consumes the already prepared typed model. All local C fixtures compile from their actual source declarations; additional ngspice-47 golden tests exercise forward references, last-wins `.param` assignments, function/conditional expressions, independent subcircuit overrides and caller-scope `X` parameters. `examples/vdmos_corpus.rs` applies the same linked-file and source compiler to full libraries. `model-normalize-ngspice::linked_source::SourceLinker` resolves native ngspice `.include`/`.inc` and `.lib path section` references, with the including file's directory taking precedence over explicit search paths, canonical-file/section cycle detection, named section selection and origin mapping back to physical file and line. Ordinary `.lib section` definitions do not leak into the calling model context unless selected. Unknown/malformed references fail explicitly, without environment-variable or implicit search-path fallback. The caller then feeds `LinkedSource.bytes` into `ModelLibrary::parse`; passing unresolved `.include`/`.lib` directives directly to the model parser is an explicit error, not a silently incomplete model. Circuit X-line expansion and its topology remain separate solver/compiler work.
-The caller owns instantiated X-line call-site scopes, topology binding, current and capacitance stamping, junction voltage limiting, timestep integration, historical states and rollback, and all circuit-level analyses.
+There is **no runtime parsing dependency** on the kernel: normalizer and source compiler are `model-kernel-vdmos` *dev-dependencies* for integration/oracle tests, and the standalone numerical kernel consumes the already prepared typed model. All local C fixtures compile from their actual source declarations; additional ngspice-47 golden tests exercise forward references, last-wins `.param` assignments, function/conditional expressions, independent subcircuit overrides and caller-scope `X` parameters. `examples/vdmos_corpus.rs` applies the same linked-file and source compiler to full libraries. `model-normalize-ngspice::linked_source::SourceLinker` resolves native ngspice `.include`/`.inc` and `.lib path section` references, with the including file's directory taking precedence over explicit search paths, canonical-file/section cycle detection, named section selection and origin mapping back to physical file and line. Ordinary `.lib section` definitions do not leak into the calling model context unless selected. Unknown/malformed references fail explicitly, without environment-variable or implicit search-path fallback. The caller feeds the linked buffer and origin map into `ModelLibrary::parse_linked` with an explicit deck/include root kind; passing unresolved `.include`/`.lib` directives directly to the model parser is an explicit error, not a silently incomplete model.
+The solver owns numerical topology binding, current and capacitance stamping, junction voltage limiting, timestep integration, historical states and rollback, and all circuit-level analyses.
+
+## Observation and distortion preparation
+
+`Model::soa` retains explicit native ngspice limits, including whether TNOM was
+given. `PreparedModel::observe_soa(SoaSample)` is a pure, allocation-free,
+accepted-point observer. It receives external terminal potentials, physical drain-to-source channel
+current, forward-oriented total body diode current, integrated gate displacement
+currents and either the fixed instance temperature or the solved case temperature
+in kelvin. The consumer schedules the observation and owns warning counts,
+instance identity, accepted/trial state and history. It may retain the same
+`Arc<PreparedModel>` supplied to the numerical artifact; no change to the
+shared residual ABI is required. There is no limiting, clamping, stamping or
+thermal-network modification from these fields.
+
+The native diagnostic law follows ngspice 47 (tag commit `a80f6e3`,
+`vdmossoachk.c`, `vdmosset.c`, `vdmosmpar.c`, `vdmosmask.c`):
+
+- Gate limits are symmetric unless a reverse limit is explicitly provided;
+  asymmetric limits use the model polarity. Vds and both current thresholds
+  are magnitude tests. The reverse-current diagnostic is the magnitude of
+  normalized channel current minus the body diode branch current.
+- Diagnostic power is the native proxy, not the physical heat residual:
+  (|channel| + |channel - diode|) * |Vds| plus absolute gate-displacement
+  powers. It is intentionally not substituted for Joule heating.
+- Derating requires explicit PD_MAX, DERATING and TNOM, and also TE_MAX for
+  thermal instances; the latter check uses case rather than junction
+  temperature. Native TE_MAX is specified in Celsius and converted to kelvin.
+  In the 47 setup code, omitted ID_MAX resets the effective PD_MAX to 1e99
+  even if PD_MAX was declared. The API preserves the declaration and exposes
+  the effective limit separately rather than changing the reference behavior.
+- RTH_EXT is observation metadata, defaulting to RTHCA; it is not used by
+  the native thermal stamping or warning calculation. LTspice-specific
+  thermal/SOA ladder fields remain a separate dialect observation path.
+- TYPE is a read-only string query (`vdmosn`/`vdmosp`). PHI is positive,
+  defaults to 0.6 V, and is only used by the historical distortion setup.
+  `distortion_inputs(T)` returns the temperature-corrected surface potential
+  and fixed oxide capacitance factor per unit multiplicity. It does not
+  implement or advertise a complete distortion analysis.
+
+The synthetic SOA reference fixtures exercise actual ngspice 47 warnings
+for both polarities, the PD_MAX default quirk and an explicitly bound thermal
+case. Run them with `cargo test --locked -p model-kernel-vdmos --test observation
+-- --ignored`. Ordinary tests verify metadata precedence, unchanged current,
+charge, heat, noise, and derivatives, and the explicit-given derating gates.
 
 ## Reproducible checks
 
@@ -40,7 +84,7 @@ The release-mode smoke benchmark runs 4096 prepared biases for 256 iterations. I
 
 ## Remaining integration gates
 
-- Expand actual X-line instance topology with caller-evaluated parameter overrides, extend linking to dialect-specific library formats only with explicit source semantics, broaden beyond the 773-card LTspice catalog to other manufacturer and behavioral dialects, and implement optional PHI distortion and SOA handling in their appropriate owners.
+- Extend linking to dialect-specific library formats only with explicit source semantics, broaden beyond the 773-card LTspice catalog to other manufacturer and behavioral dialects, and integrate the typed SOA observer and distortion setup inputs into their circuit-analysis owners.
 - Circuit-coupled buck and switching-converter references (not only prescribed external terminal voltages), transient temperature-varying VP/TT recovery history, and wider device geometry/vendor-model sweeps.
 - Generic artifact #183 and solver binding in ngspice-rs-fast #189, with topology/state lifecycle and charge/stamping agreement.
 - Profile homogeneous SoA/AoSoA evaluation and dependency-driven re-preparation; keep all solver-specific policy out of this crate.
@@ -150,3 +194,31 @@ ngspice-rs-fast #189. The Bramble LTC3854 synchronous buck, Bramble LTC3872
 boost, and ADI ADALM-SR1 boost use published component values with fixed PWM
 and explicit device models, compared against C47 on the same decks.
 These are power-stage reconstructions, not full controller-IC replicas.
+
+## Shared prepared artifact
+
+`artifact::artifact` binds the existing immutable prepared model to
+`model-kernel-api` ABI v4. The descriptor exposes three electrical terminals
+and, when enabled, junction and case thermal terminals in absolute kelvin.
+Positive series resistances add local electrical coordinates, while exact
+zero-ohm branches coalesce at preparation. The recovery coordinate, when
+present, is the polarity-normalized Qp variable already used by the kernel.
+Model parameter changes rebuild the artifact; parallel multiplicity remains
+a numeric candidate slot. The content fingerprint must identify the compiled
+model and structural options.
+
+The artifact assembles conservative residuals and stored quantities from the
+same native model laws and analytic derivatives; it neither duplicates those
+laws nor owns integration history. In particular, a temperature-dependent
+diode recovery gain `g(T)` multiplying `dQs/dt` cannot be represented by
+differentiating `g(T)*Qs`. Instead, use the recovery row
+`Fq + dQs/dt = 0` to substitute `-g(T)*Fq` for that electrical current.
+This exact row transformation preserves the DAE solution, including variable
+temperature; its Jacobian includes both the recovery-residual and gain
+temperature derivatives.
+
+The generalized residual tests verify every Jacobian entry by finite
+differences, both polarities, thermal and nonthermal configurations, common
+electrical reference shifts, candidate isolation, native noise densities
+and contiguous homogeneous batches. Circuit-coupled engine validation
+remains separate from the producer tests.

@@ -5,14 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 publish.workspace = true
+description = "Plaintext SPICE normalization, lexical expression binding and source linking"
 
 [lints]
 workspace = true
 
 [dependencies]
+model-preprocess-command.workspace = true
 anyhow = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
-wait-timeout = "0.2"

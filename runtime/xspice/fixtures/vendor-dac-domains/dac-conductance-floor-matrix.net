@@ -1,0 +1,72 @@
+* DAC Norton conductance floor and its source intercept
+.model SRC d_source(input_file="dac-domain-states.txt" input_load=0)
+Asrc [dig] SRC
+.model DAC0 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=.001 g_hiz=.01 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=2.75 v_smooth=.5)
+Adac0 dig q0 DAC0
+Vforce0 q0 0 0
+Adac1 dig q1 DAC0
+Vforce1 q1 0 1
+Adac2 dig q2 DAC0
+Vforce2 q2 0 2.35
+Adac3 dig q3 DAC0
+Vforce3 q3 0 4
+Adac4 dig q4 DAC0
+Vforce4 q4 0 5
+.model DAC1 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=-.024 g_pulldown=.034 g_resistive=.001 g_hiz=.01 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=2.75 v_smooth=.5)
+Adac5 dig q5 DAC1
+Vforce5 q5 0 0
+Adac6 dig q6 DAC1
+Vforce6 q6 0 1
+Adac7 dig q7 DAC1
+Vforce7 q7 0 2.35
+Adac8 dig q8 DAC1
+Vforce8 q8 0 4
+Adac9 dig q9 DAC1
+Vforce9 q9 0 5
+.model DAC2 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=-.034 g_resistive=.001 g_hiz=.01 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=2.75 v_smooth=.5)
+Adac10 dig q10 DAC2
+Vforce10 q10 0 0
+Adac11 dig q11 DAC2
+Vforce11 q11 0 1
+Adac12 dig q12 DAC2
+Vforce12 q12 0 2.35
+Adac13 dig q13 DAC2
+Vforce13 q13 0 4
+Adac14 dig q14 DAC2
+Vforce14 q14 0 5
+.model DAC3 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_resistive=-.001 g_hiz=.01 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=2.75 v_smooth=.5)
+Adac15 dig q15 DAC3
+Vforce15 q15 0 0
+Adac16 dig q16 DAC3
+Vforce16 q16 0 1
+Adac17 dig q17 DAC3
+Vforce17 q17 0 2.35
+Adac18 dig q18 DAC3
+Vforce18 q18 0 4
+Adac19 dig q19 DAC3
+Vforce19 q19 0 5
+.model DAC4 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=0 g_pulldown=0 g_resistive=0 g_hiz=.01 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=2.75 v_smooth=.5)
+Adac20 dig q20 DAC4
+Vforce20 q20 0 0
+Adac21 dig q21 DAC4
+Vforce21 q21 0 1
+Adac22 dig q22 DAC4
+Vforce22 q22 0 2.35
+Adac23 dig q23 DAC4
+Vforce23 q23 0 4
+Adac24 dig q24 DAC4
+Vforce24 q24 0 5
+.model DAC5 dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.001 g_pulldown=.001 g_resistive=.001 g_hiz=.01 input_load=0 t_rise=1n t_fall=1n knee_low=2 knee_high=2.75 v_smooth=.5)
+Adac25 dig q25 DAC5
+Vforce25 q25 0 0
+Adac26 dig q26 DAC5
+Vforce26 q26 0 1
+Adac27 dig q27 DAC5
+Vforce27 q27 0 2.35
+Adac28 dig q28 DAC5
+Vforce28 q28 0 4
+Adac29 dig q29 DAC5
+Vforce29 q29 0 5
+.PRINT TRAN I(Vforce0) I(Vforce1) I(Vforce2) I(Vforce3) I(Vforce4) I(Vforce5) I(Vforce6) I(Vforce7) I(Vforce8) I(Vforce9) I(Vforce10) I(Vforce11) I(Vforce12) I(Vforce13) I(Vforce14) I(Vforce15) I(Vforce16) I(Vforce17) I(Vforce18) I(Vforce19) I(Vforce20) I(Vforce21) I(Vforce22) I(Vforce23) I(Vforce24) I(Vforce25) I(Vforce26) I(Vforce27) I(Vforce28) I(Vforce29)
+.tran 10p 120n 0 10p
+.end

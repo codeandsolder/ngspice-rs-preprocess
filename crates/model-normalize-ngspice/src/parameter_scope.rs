@@ -1,16 +1,30 @@
 //! Lexically scoped ngspice parameter declarations and model preparation.
 //!
 //! Source processing is intentionally distinct from the hot-path device kernel.
-//! Instantiation supplies an evaluated scalar override for each nested
-//! subcircuit invocation; the solver/linker owns X-line expansion and nodes.
+//! Actual call-site bindings and terminal identities are derived by the
+//! source-side topology pass; the numerical solver owns equation binding.
 
 use crate::{
-    model_card::{ModelCard, logical_statements, parse_assignments, parse_model_cards},
+    linked_source::{LinkedSource, RootKind, SourceOrigin},
+    model_card::{
+        ModelCard, logical_statements, parse_assignments, parse_function_signature, parse_one,
+        positional_prefix,
+    },
     param_expression::{SpiceExpression, SpiceExpressionContext},
     vdmos_card::{VdmosLiterals, vdmos_resolved},
 };
 use anyhow::{Context, Result, bail, ensure};
+use model_preprocess_command::{Resource, WorkBudget};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) mod declarations;
+pub mod topology;
+
+#[derive(Clone, Debug)]
+struct SourceCard {
+    line: usize,
+    text: String,
+}
 
 /// An immutable lexical scope belonging to a source `.subckt` definition.
 #[derive(Clone, Debug)]
@@ -21,6 +35,11 @@ pub struct ParameterScope {
     pub parent: Option<usize>,
     /// Physical source line of the opening declaration.
     pub source_line: usize,
+    /// Physical source line of the closing declaration (zero for root).
+    pub end_line: usize,
+    /// Ordered formal terminals.
+    pub ports: Vec<String>,
+    cards: Vec<SourceCard>,
     defaults: BTreeMap<String, SpiceExpression>,
     local: BTreeMap<String, SpiceExpression>,
     functions: BTreeMap<String, UserFunction>,
@@ -48,6 +67,78 @@ pub struct ModelLibrary {
     pub scopes: Vec<ParameterScope>,
     /// Model declarations including those nested in `.subckt` definitions.
     pub models: Vec<ScopedModel>,
+    globals: BTreeSet<String>,
+    origins: Vec<SourceOrigin>,
+    budget: WorkBudget,
+}
+
+/// Shared declaration index for lexical subcircuit lookup, independently of
+/// a simulator's dynamic parameter inheritance rules.
+#[derive(Debug)]
+pub struct SubcircuitIndex {
+    declarations: Vec<BTreeMap<String, usize>>,
+    duplicates: Vec<usize>,
+}
+
+impl SubcircuitIndex {
+    /// Index definitions in declaration order. The first declaration remains
+    /// visible; consumers that reject duplicates can inspect them separately.
+    ///
+    /// # Errors
+    /// Invalid declaration parent or missing name.
+    pub fn new(source: &ModelLibrary) -> Result<Self> {
+        source
+            .budget
+            .charge(Resource::GeneratedNodes, source.scopes.len())?;
+        let mut result = Self {
+            declarations: vec![BTreeMap::new(); source.scopes.len()],
+            duplicates: Vec::new(),
+        };
+        for (id, scope) in source.scopes.iter().enumerate().skip(1) {
+            let parent = scope.parent.context("non-root scope without parent")?;
+            let name = scope.name.as_deref().context("unnamed subcircuit")?;
+            source.budget.charge(Resource::GeneratedNodes, 1)?;
+            source.budget.charge(Resource::EmittedBytes, name.len())?;
+            let table = result
+                .declarations
+                .get_mut(parent)
+                .context("invalid lexical parent")?;
+            match table.entry(name.to_owned()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(id);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => result.duplicates.push(id),
+            }
+        }
+        Ok(result)
+    }
+
+    /// Later declarations that conflict with an earlier lexical declaration.
+    #[must_use = "the returned declarations identify duplicate lexical names"]
+    pub fn duplicates(&self) -> &[usize] {
+        &self.duplicates
+    }
+
+    /// Find the visible subcircuit from a lexical calling scope.
+    #[must_use = "the returned scope identifies the visible subcircuit"]
+    pub fn resolve(&self, source: &ModelLibrary, scope: usize, name: &str) -> Option<usize> {
+        lexical_lookup(source, scope, name, &self.declarations)
+    }
+}
+
+fn lexical_lookup(
+    source: &ModelLibrary,
+    mut scope: usize,
+    name: &str,
+    table: &[BTreeMap<String, usize>],
+) -> Option<usize> {
+    let name = name.to_ascii_lowercase();
+    loop {
+        if let Some(&id) = table.get(scope)?.get(&name) {
+            return Some(id);
+        }
+        scope = source.scopes.get(scope)?.parent?;
+    }
 }
 
 fn directive<'a>(source: &'a str, name: &str) -> Option<&'a str> {
@@ -113,7 +204,11 @@ fn reserved_parameter(name: &str) -> bool {
     )
 }
 
-fn assignments(source: &str, line: usize) -> Result<BTreeMap<String, SpiceExpression>> {
+fn assignments(
+    source: &str,
+    line: usize,
+    budget: &WorkBudget,
+) -> Result<BTreeMap<String, SpiceExpression>> {
     let mut definitions = BTreeMap::new();
     for field in parse_assignments(source).with_context(|| format!("line {line}"))? {
         let value = field
@@ -135,7 +230,7 @@ fn assignments(source: &str, line: usize) -> Result<BTreeMap<String, SpiceExpres
         );
         definitions.insert(
             name,
-            SpiceExpression::parse(value)
+            SpiceExpression::parse_with_budget(value, budget)
                 .with_context(|| format!("line {line}: parameter {}", field.name))?,
         );
     }
@@ -145,75 +240,49 @@ fn assignments(source: &str, line: usize) -> Result<BTreeMap<String, SpiceExpres
 fn subcircuit_header(
     input: &str,
     line: usize,
-) -> Result<(String, BTreeMap<String, SpiceExpression>)> {
-    let name_end = input.find(char::is_whitespace).unwrap_or(input.len());
-    let name = input[..name_end].trim();
-    ensure!(!name.is_empty(), "line {line}: missing .subckt identifier");
-    let rest = input[name_end..].trim_start();
-    let marker = rest.to_ascii_lowercase().find("params:");
-    let params = marker.map_or_else(
-        || {
-            rest.find('=').map_or("", |eq| {
-                let prefix = rest[..eq].trim_end();
-                let start = prefix.rfind(char::is_whitespace).map_or(0, |pos| pos + 1);
-                &rest[start..]
-            })
-        },
-        |pos| rest[pos + "params:".len()..].trim_start(),
-    );
-    Ok((name.to_ascii_lowercase(), assignments(params, line)?))
+    budget: &WorkBudget,
+) -> Result<(String, Vec<String>, BTreeMap<String, SpiceExpression>)> {
+    let (tokens, params) = positional_prefix(input);
+    let (name, ports) = tokens
+        .split_first()
+        .with_context(|| format!("line {line}: missing .subckt identifier"))?;
+    let ports = ports
+        .iter()
+        .map(|(port, _)| port.to_ascii_lowercase())
+        .collect();
+    Ok((
+        name.0.to_ascii_lowercase(),
+        ports,
+        assignments(params, line, budget)?,
+    ))
 }
 
-fn parse_function(source: &str, line: usize) -> Result<(String, UserFunction)> {
-    let open = source.find('(').with_context(|| {
-        format!("line {line}: user-defined function requires formal argument list")
-    })?;
-    let close = source[open + 1..]
-        .find(')')
-        .map(|pos| pos + open + 1)
-        .with_context(|| {
-            format!("line {line}: user-defined function missing closing parenthesis")
-        })?;
-    let name = source[..open].trim().to_ascii_lowercase();
-    ensure!(
-        !name.is_empty() && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic),
-        "line {line}: invalid function identifier {name}"
-    );
+fn parse_function(
+    source: &str,
+    line: usize,
+    budget: &WorkBudget,
+) -> Result<(String, UserFunction)> {
+    budget.charge(Resource::ScannedBytes, source.len())?;
+    let (signature, body) =
+        parse_function_signature(source).with_context(|| format!("line {line}"))?;
+    let name = signature.name.to_ascii_lowercase();
     ensure!(
         !reserved_parameter(&name),
         "line {line}: builtin/reserved function identifier {name}"
     );
-    let raw = source[open + 1..close].trim();
-    let mut seen = BTreeSet::new();
-    let mut formals = Vec::new();
-    if !raw.is_empty() {
-        for field in raw.split(',') {
-            let argument = field.trim().to_ascii_lowercase();
-            ensure!(
-                !argument.is_empty()
-                    && argument
-                        .as_bytes()
-                        .first()
-                        .is_some_and(u8::is_ascii_alphabetic)
-                    && argument
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
-                "line {line}: invalid formal parameter {argument}"
-            );
-            ensure!(
-                seen.insert(argument.clone()),
-                "line {line}: repeated function formal {argument}"
-            );
-            formals.push(argument);
-        }
-    }
-    let body = source[close + 1..].trim().trim_start_matches('=').trim();
+    budget.charge(Resource::GeneratedNodes, signature.formals.len())?;
+    let formals = signature
+        .formals
+        .into_iter()
+        .map(|formal| formal.to_ascii_lowercase())
+        .collect();
+    let body = body.trim().trim_start_matches('=').trim();
     ensure!(
         !body.is_empty(),
         "line {line}: empty user-defined function body"
     );
-    let body =
-        SpiceExpression::parse(body).with_context(|| format!("line {line}: function {name}"))?;
+    let body = SpiceExpression::parse_with_budget(body, budget)
+        .with_context(|| format!("line {line}: function {name}"))?;
     Ok((name, UserFunction { formals, body }))
 }
 
@@ -227,25 +296,57 @@ impl ModelLibrary {
     /// Rejects unbalanced subcircuits, invalid assignments and model syntax;
     /// raw `.include`/`.lib` references must first be resolved by the linker.
     pub fn parse(source: &[u8]) -> Result<Self> {
-        let cards = parse_model_cards(source)?;
-        let mut by_line = cards
-            .into_iter()
-            .map(|card| (card.source_line, card))
-            .collect::<BTreeMap<_, _>>();
-        let mut library = Self {
-            scopes: vec![ParameterScope {
-                name: None,
-                parent: None,
-                source_line: 0,
-                defaults: BTreeMap::new(),
-                local: BTreeMap::new(),
-                functions: BTreeMap::new(),
-            }],
-            models: Vec::new(),
+        Self::parse_source(source, RootKind::Include)
+    }
+
+    /// Parse a linked deck or library with its original physical provenance.
+    /// A deck's first physical line is always its title, never an instance.
+    /// # Errors
+    /// Invalid declarations or a mismatched linked-source origin map.
+    pub fn parse_linked(source: &LinkedSource, kind: RootKind) -> Result<Self> {
+        ensure!(
+            source.bytes.split_inclusive(|&b| b == b'\n').count() == source.origins.len(),
+            "linked source origin count does not match physical lines"
+        );
+        let mut library = Self::parse_source(&source.bytes, kind)?;
+        library.origins.clone_from(&source.origins);
+        Ok(library)
+    }
+
+    /// Parse a deck or include buffer with explicit title-line handling.
+    /// # Errors
+    /// Invalid source declarations, as in [`Self::parse`].
+    pub fn parse_source(source: &[u8], kind: RootKind) -> Result<Self> {
+        Self::parse_source_with_budget(source, kind, WorkBudget::default())
+    }
+
+    /// Parse and bind a model library under shared cumulative counters.
+    /// # Errors
+    /// Invalid declarations or resource exhaustion.
+    pub fn parse_source_with_budget(
+        source: &[u8],
+        kind: RootKind,
+        budget: WorkBudget,
+    ) -> Result<Self> {
+        budget.charge(Resource::ScannedBytes, source.len())?;
+        budget.charge(
+            Resource::Statements,
+            source.split_inclusive(|byte| *byte == b'\n').count(),
+        )?;
+        let skip = if kind == RootKind::Deck {
+            source
+                .split_inclusive(|&b| b == b'\n')
+                .next()
+                .context("deck has no title")?
+                .len()
+        } else {
+            0
         };
+        let mut library = Self::empty(budget);
         let mut stack = vec![0];
         let mut in_control = false;
-        for (line, bytes) in logical_statements(source)? {
+        for (line, bytes) in logical_statements(&source[skip..])? {
+            let line = line + usize::from(kind == RootKind::Deck);
             let text = std::str::from_utf8(&bytes)
                 .with_context(|| format!("line {line}: invalid active source encoding"))?;
             if directive(text, ".control").is_some() {
@@ -268,13 +369,18 @@ impl ModelLibrary {
                 );
             }
             if let Some(rest) = directive(text, ".subckt") {
-                let (name, defaults) = subcircuit_header(rest, line)?;
+                library.budget.check_depth(stack.len())?;
+                library.budget.charge(Resource::GeneratedNodes, 1)?;
+                let (name, ports, defaults) = subcircuit_header(rest, line, &library.budget)?;
                 let parent = *stack.last().context("missing root parameter scope")?;
                 let id = library.scopes.len();
                 library.scopes.push(ParameterScope {
                     name: Some(name),
                     parent: Some(parent),
                     source_line: line,
+                    end_line: 0,
+                    ports,
+                    cards: Vec::new(),
                     defaults,
                     local: BTreeMap::new(),
                     functions: BTreeMap::new(),
@@ -293,35 +399,68 @@ impl ModelLibrary {
                     rest.is_empty() || rest.eq_ignore_ascii_case(actual),
                     "line {line}: .ends {rest} does not match .subckt {actual}"
                 );
+                library.scopes[closing].end_line = line;
                 continue;
             }
-            if let Some(rest) = directive(text, ".func") {
-                let (name, function) = parse_function(rest, line)?;
-                let current = *stack.last().context("missing function scope")?;
-                library.scopes[current].functions.insert(name, function);
-                continue;
-            }
-            if let Some(rest) = directive(text, ".param") {
-                let definitions = assignments(rest, line)?;
-                let current = *stack.last().context("missing parameter scope")?;
-                library.scopes[current].local.extend(definitions);
-                continue;
-            }
-            if directive(text, ".model").is_some() {
-                let card = by_line.remove(&line).ok_or_else(|| {
-                    anyhow::anyhow!("line {line}: parsed model has no corresponding source")
-                })?;
-                library.models.push(ScopedModel {
-                    card,
-                    scope: *stack.last().context("missing scope")?,
-                });
-            }
+            library.record(text, line, *stack.last().context("missing scope")?)?;
         }
         ensure!(
             stack.len() == 1,
             "unclosed .subckt at end of source library"
         );
         Ok(library)
+    }
+
+    fn record(&mut self, text: &str, line: usize, current: usize) -> Result<()> {
+        if let Some(rest) = directive(text, ".func") {
+            let (name, function) = parse_function(rest, line, &self.budget)?;
+            self.scopes[current].functions.insert(name, function);
+            return Ok(());
+        }
+        if let Some(rest) = directive(text, ".param") {
+            let definitions = assignments(rest, line, &self.budget)?;
+            self.scopes[current].local.extend(definitions);
+            return Ok(());
+        }
+        if directive(text, ".model").is_some() {
+            self.models.push(ScopedModel {
+                card: parse_one(text, line)?,
+                scope: current,
+            });
+        } else if let Some(rest) = directive(text, ".global") {
+            self.globals
+                .extend(rest.split_whitespace().map(str::to_ascii_lowercase));
+        } else if text
+            .as_bytes()
+            .first()
+            .is_some_and(|b| matches!(b.to_ascii_lowercase(), b'x' | b'm'))
+        {
+            self.scopes[current].cards.push(SourceCard {
+                line,
+                text: text.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn empty(budget: WorkBudget) -> Self {
+        Self {
+            scopes: vec![ParameterScope {
+                name: None,
+                parent: None,
+                source_line: 0,
+                end_line: 0,
+                ports: Vec::new(),
+                cards: Vec::new(),
+                defaults: BTreeMap::new(),
+                local: BTreeMap::new(),
+                functions: BTreeMap::new(),
+            }],
+            models: Vec::new(),
+            globals: BTreeSet::new(),
+            origins: Vec::new(),
+            budget,
+        }
     }
 
     /// Evaluate an X-line call-site scalar expression against the **calling**
@@ -345,7 +484,11 @@ impl ModelLibrary {
             "caller scope out of bounds"
         );
         let mut resolver = ScopeResolver::new(self, overrides)?;
-        resolver.evaluate(caller_scope, &SpiceExpression::parse(expression)?, None)
+        resolver.evaluate(
+            caller_scope,
+            &SpiceExpression::parse_with_budget(expression, &self.budget)?,
+            None,
+        )
     }
 
     /// Resolve a model's numeric SPICE expressions in their lexical context.
@@ -369,15 +512,20 @@ impl ModelLibrary {
             .context("model index out of bounds")?;
         let mut resolver = ScopeResolver::new(self, overrides)?;
         vdmos_resolved(&model.card, |expr| {
-            resolver.evaluate(model.scope, &SpiceExpression::parse(expr)?, None)
+            resolver.evaluate(
+                model.scope,
+                &SpiceExpression::parse_with_budget(expr, &self.budget)?,
+                None,
+            )
         })
     }
 }
 
 struct ScopeResolver<'a> {
     source: &'a ModelLibrary,
-    overrides: Vec<BTreeMap<String, f64>>,
-    active: BTreeSet<(usize, String)>,
+    overrides: BTreeMap<usize, BTreeMap<String, f64>>,
+    parameter_parents: BTreeMap<usize, Option<usize>>,
+    active: Vec<(usize, String)>,
     cache: BTreeMap<(usize, String), f64>,
     calls: Vec<FunctionFrame>,
 }
@@ -416,19 +564,22 @@ impl SpiceExpressionContext for ScopedExpressionContext<'_, '_> {
 
 impl<'a> ScopeResolver<'a> {
     fn new(source: &'a ModelLibrary, overrides: &[(usize, &str, f64)]) -> Result<Self> {
-        let mut values = vec![BTreeMap::new(); source.scopes.len()];
+        let mut values = BTreeMap::<usize, BTreeMap<String, f64>>::new();
         for &(scope, name, value) in overrides {
             ensure!(value.is_finite(), "non-finite override {name}");
-            let frame = values
-                .get_mut(scope)
-                .context("parameter override scope out of bounds")?;
+            ensure!(
+                scope < source.scopes.len(),
+                "parameter override scope out of bounds"
+            );
+            let frame = values.entry(scope).or_default();
             ensure!(!name.is_empty(), "empty parameter override name");
             frame.insert(name.to_ascii_lowercase(), value);
         }
         Ok(Self {
             source,
             overrides: values,
-            active: BTreeSet::new(),
+            parameter_parents: BTreeMap::new(),
+            active: Vec::new(),
             cache: BTreeMap::new(),
             calls: Vec::new(),
         })
@@ -440,12 +591,13 @@ impl<'a> ScopeResolver<'a> {
         expr: &SpiceExpression,
         frame: Option<usize>,
     ) -> Result<f64> {
+        let budget = self.source.budget.clone();
         let mut context = ScopedExpressionContext {
             resolver: self,
             scope,
             frame,
         };
-        expr.evaluate_with(&mut context)
+        expr.evaluate_with_budget(&mut context, &budget)
     }
 
     fn function(
@@ -457,6 +609,7 @@ impl<'a> ScopeResolver<'a> {
     ) -> Result<f64> {
         let mut current = Some(scope);
         while let Some(owner) = current {
+            self.source.budget.charge(Resource::EvaluationSteps, 1)?;
             if let Some(definition) = self.source.scopes[owner].functions.get(name).cloned() {
                 ensure!(
                     definition.formals.len() == args.len(),
@@ -465,7 +618,7 @@ impl<'a> ScopeResolver<'a> {
                     args.len()
                 );
                 ensure!(
-                    self.calls.len() < 512,
+                    self.calls.len() < 64,
                     "function {name}: recursive expression depth exceeded"
                 );
                 let arguments = definition
@@ -501,7 +654,12 @@ impl<'a> ScopeResolver<'a> {
         let name = name.to_ascii_lowercase();
         let mut current = Some(requested_scope);
         while let Some(scope) = current {
-            if let Some(value) = self.overrides[scope].get(&name) {
+            self.source.budget.charge(Resource::EvaluationSteps, 1)?;
+            if let Some(value) = self
+                .overrides
+                .get(&scope)
+                .and_then(|values| values.get(&name))
+            {
                 return Ok(*value);
             }
             let definitions = &self.source.scopes[scope];
@@ -514,21 +672,43 @@ impl<'a> ScopeResolver<'a> {
                 if let Some(value) = self.cache.get(&key) {
                     return Ok(*value);
                 }
+                // A direct self-reference in a local declaration inherits
+                // the caller's value (e.g. gain={gain*2}); indirect cycles
+                // remain errors. At the root there is no caller to inherit.
+                if self.active.last() == Some(&key)
+                    && let Some(parent) = self
+                        .parameter_parents
+                        .get(&scope)
+                        .copied()
+                        .unwrap_or(definitions.parent)
+                {
+                    current = Some(parent);
+                    continue;
+                }
                 ensure!(
-                    self.active.insert(key.clone()),
+                    !self.active.contains(&key),
                     "cyclic parameter reference: {name} in scope {scope}"
                 );
+                ensure!(
+                    self.active.len() < 64,
+                    "parameter expression depth exceeded"
+                );
+                self.active.push(key.clone());
                 // These expressions are parsed once at source ingestion. An
                 // owned AST allows mutable recursive resolution of other
                 // symbols without holding a borrow into the source scope.
                 let expr = expr.clone();
                 let result = self.evaluate(scope, &expr, None);
-                self.active.remove(&key);
+                self.active.pop();
                 let value = result.with_context(|| format!("parameter {name}, scope {scope}"))?;
                 self.cache.insert(key, value);
                 return Ok(value);
             }
-            current = definitions.parent;
+            current = self
+                .parameter_parents
+                .get(&scope)
+                .copied()
+                .unwrap_or(definitions.parent);
         }
         bail!("undefined ngspice model parameter {name}")
     }

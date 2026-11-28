@@ -38,11 +38,13 @@ rg -q '^AsrFamily[[:digit:]]+ D_OBSERVE D_OBSERVE_SR_SINK D_OBSERVE_SR_SOURCE %g
     { echo 'Expected three independent physical ADCs (A, B, PIN)' >&2; exit 1; }
 [[ $(rg -c 'sr_family_dac\(' "$work/base.cir") == 3 ]] ||
     { echo 'Expected three physical DACs (LEFT, RIGHT, OBSERVE)' >&2; exit 1; }
-[[ $(rg -c 'sr_bundle_load\(' "$work/generated.inc") == 2 ]] ||
-    { echo 'Expected separate ALB load models for both gate and monitor' >&2; exit 1; }
+[[ $(rg -c 'sr_bundle_load\(' "$work/generated.inc") == 1 ]] ||
+    { echo 'Identical ALB kernels must share one load-model declaration' >&2; exit 1; }
+rg -q '^XSR_A1 .* SRALB0$' "$work/base.cir"
+rg -q '^XSR_AMONITOR .* SRALB0$' "$work/base.cir"
 
 printf 'codemodel %s\n' "$cm" > "$work/.spiceinit"
-for shunt in 35 52 80; do
+for shunt in 18 20 35; do
     # Reuse identical compiled ALB/family models: vary only the physical load.
     sed "s/^Rshunt shunt 0 52$/Rshunt shunt 0 $shunt/" "$work/base.cir" > "$work/circuit.cir"
     rg -q "^Rshunt shunt 0 $shunt$" "$work/circuit.cir"
@@ -54,41 +56,41 @@ for shunt in 35 52 80; do
     fi
     test -s "$work/result.dat"
     # Columns: TIME PIN, TIME A, TIME B, TIME OBSERVE, TIME GATE.
-    # Two HIGH DACs current-limit at I=(3.3-2.75)*0.025 A each.
-    # The enabled shunt is Rshunt + switch Ron=0.05 ohm, in parallel
-    # with 100 kohm, so the predicted pin voltage includes both sources.
-    # A HIGH/LOW fight adds 40-ohm pulldown conductance in parallel.
+    # The HC family bridge has independently measured, asymmetric
+    # conductances: HIGH=0.024S and LOW=0.034S, regardless of ALB OUT_RES.
+    # Solve the measured nonlinear HIGH/LOW branch current balance.
+    # The enabled shunt is Rshunt + switch Ron=0.05 ohm in parallel
+    # with 100 kohm; a HIGH/LOW fight adds the LOW conductance.
     # ADC thresholds scale from nominal 5 V HC to 3.3 V: 1.386..1.452 V.
-    awk -v r="$shunt" '
+    awk -v r="$shunt" -f "$here/family-dc-equilibrium.awk" -f - "$work/result.dat" <<'AWK' || { echo "Failed native dynamic physical-load/readback regression at R=$shunt" >&2; exit 1; }
       function near(actual, expect, tolerance) {
         return actual > expect-tolerance && actual < expect+tolerance
       }
       BEGIN {
-        g_hi=.025; g_lo=.025; high=3.3; knee=2.75;
         s=.05+r; g_load=1/s+1/100000;
-        i_hi=g_hi*(high-knee);
-        eq_both=2*i_hi/g_load;
-        eq_opposed=i_hi/(g_lo+g_load);
+        eq_both=hc_bus(3.3,2,0,g_load);
+        eq_opposed=hc_bus(3.3,1,1,g_load);
+        eq_unloaded_opposed=hc_bus(3.3,1,1,1/100000);
         adc_low=2.1*3.3/5; adc_high=2.2*3.3/5;
-        # The physical HC ADC still reports UNKNOWN in the threshold band,
-        # but the source-compiled SIMetrix ALB expression coerces X to LOW.
-        # That differs from the old generic consensus experiment (0.54956 V).
-        expect_monitor=(eq_both>adc_high ? 3.3 : 0);
+        # Falling into UNKNOWN retains the prior HIGH; only crossing
+        # the lower threshold resets the sensed state.
+        expect_monitor=(eq_both>adc_low ? 3.3 : 0);
+        if (!(r==18 && eq_both<adc_low || r==20 && eq_both>adc_low && eq_both<adc_high || r==35 && eq_both>adc_high)) exit 1;
         printf "R=%d ohm: predicted loaded bus %.5f V, ALB monitor %.5f V, opposing-drive bus %.5f V\n",r,eq_both,expect_monitor,eq_opposed;
       }
       {
         t=$1*1e9; v=$2; a=$4; b=$6; observe=$8; gate=$10;
         if (t>8.3 && t<9 && v<.025 && observe<.12 && gate<.1) initial=1;
-        if (t>24.5 && t<25.5 && near(v,.54,.055) && observe<.12 && a>3.2 && b<.1) opposing=1;
+        if (t>24.5 && t<25.5 && near(v,eq_unloaded_opposed,.055) && observe<.12 && a>3.2 && b<.1) opposing=1;
         if (t>42.5 && t<43.5 && v>3.15 && observe>3.1 && a>3.2 && b>3.2 && gate<.1) high_phase=1;
         if (t>46 && t<47 && v>eq_both+.20 && v<3.31 && gate>3.2) capacitive=1;
         if (t>69.5 && t<70.5 && near(v,eq_both,.04) && near(observe,expect_monitor,.12) && gate>3.2) loaded=1;
         if (t>84.5 && t<85.5 && v>3.25 && observe>3.1 && gate<.1) release=1;
         if (t>103.5 && t<104.5 && near(v,eq_opposed,.045) && observe<.12 && gate>3.2) low_loaded=1;
-        if (t>113.5 && t<114.5 && near(v,.53,.07) && observe<.12 && gate<.1) low_release=1;
+        if (t>113.5 && t<114.5 && near(v,eq_unloaded_opposed,.07) && observe<.12 && gate<.1) low_release=1;
         if (t>134.5 && t<135.5 && v<.05 && observe<.12 && a<.1 && b<.1) end_low=1;
-        if (r==52 && NR>1) {
-          if (t>48 && t<72 && prior_v>adc_high && v<=adc_high && !down_v) down_v=t;
+        if (r==18 && NR>1) {
+          if (t>48 && t<72 && prior_v>adc_low && v<=adc_low && !down_v) down_v=t;
           if (t>48 && t<72 && prior_o>1.5 && observe<=1.5 && !down_o) down_o=t;
           if (t>72 && t<85 && prior_v<adc_high && v>=adc_high && !up_v) up_v=t;
           if (t>72 && t<85 && prior_o<1.5 && observe>=1.5 && !up_o) up_o=t;
@@ -101,10 +103,11 @@ for shunt in 35 52 80; do
           printf "R=%d: failed phases initial=%d opposing=%d both_high=%d capacitance=%d load=%d release=%d contested_load=%d contested_release=%d final=%d\n",r,initial,opposing,high_phase,capacitive,loaded,release,low_loaded,low_release,end_low > "/dev/stderr";
           exit 1;
         }
-        if (r==52) {
-          # The ADC and the sensing ALB must respond *after* the analog
-          # threshold crossing, but within the known 1ns ALB + 2ns DAC
-          # pipeline rather than waiting until the next phase.
+        if (r==18) {
+          # SIMetrix ALB input UNKNOWN retains its last known level.
+          # Falling HIGH does not become LOW until IN_LOW, whereas
+          # rising LOW becomes HIGH at IN_HIGH. Check from those
+          # direction-specific thresholds, not the entry into UNKNOWN.
           if (!down_v || !down_o || !up_v || !up_o ||
               down_o-down_v<.4 || down_o-down_v>3.5 ||
               up_o-up_v<.4 || up_o-up_v>3.5) {
@@ -114,6 +117,6 @@ for shunt in 35 52 80; do
           printf "ADC threshold crossing and readback edges: down %.3f -> %.3f ns, up %.3f -> %.3f ns\n",down_v,down_o,up_v,up_o;
         }
       }
-    ' "$work/result.dat" || { echo "Failed native dynamic physical-load/readback regression at R=$shunt" >&2; exit 1; }
+AWK
 done
 echo '3/3 ngspice dynamic physical-load ADC sensing and dual-DAC transient regressions pass'

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Install the pinned ngspice 47 reference simulator without system changes.
 set -euo pipefail
-[[ $# == 1 && -n "$1" ]] || { echo "Usage: $0 NEW_DIRECTORY" >&2; exit 64; }
+[[ $# -ge 1 && $# -le 4 && -n "$1" ]] || { echo "Usage: $0 NEW_DIRECTORY [--source MANAGED_COMPILER_WRAPPER [JOBS]]" >&2; exit 64; }
+if (( $# > 1 )); then
+    [[ $# -ge 3 && "$2" == --source && -x "$3" ]] || exit 64
+fi
 destination=$(realpath -m -- "$1")
 [[ ! -e "$destination" && -d "$(dirname "$destination")" ]]
 [[ "$(uname -m)" == x86_64 ]]
@@ -15,8 +18,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if [[ ! -f /etc/arch-release ]]; then
-    bash "$(dirname "$0")/install-reference-ngspice-source.sh" "$destination"
+if [[ ${2:-} == --source || ! -f /etc/arch-release ]]; then
+    bash "$(dirname "$0")/install-reference-ngspice-source.sh" "$destination" "${3:-/usr/local/libexec/sccache-client}" "${4:-$(nproc)}"
 else
 package=ngspice-47-1-x86_64.pkg.tar.zst
 digest=4dfaa2ad51f6724b65482b71e300190a495d5c50b658bb42bec4b84559c210d9

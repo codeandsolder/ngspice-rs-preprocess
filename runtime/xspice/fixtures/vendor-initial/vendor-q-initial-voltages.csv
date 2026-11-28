@@ -1,0 +1,6 @@
+scenario,pin,initial_v
+comb-implicit-zero,q,0
+edge-array-partial,q0,4.9979175344
+edge-array-partial,q1,0
+edge-implicit-zero,q,0
+level-implicit-zero,q,0

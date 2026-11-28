@@ -1,0 +1,24 @@
+* Original SIMetrix ALB dual-role PIN, tri-state high drive, external pull-down and sensed monitor.
+Vext ext 0 PWL(0 0 8n 0 9n 2.15 29n 2.15 30n 5 40n 5 41n 0 50n 0)
+Rext ext pin 1k
+Voe oe 0 0
+Xone pin oe observe TOP
+Robserve observe 0 100k
+.subckt TOP pin oe monitor
+A1 [pin oe] [pin monitor] DL
+.model DL d_logic_block file=logic input_load=2p out_res=40 out_delay=2n family="HC"
+.file logic
+PORT PIN in[0] ;
+PORT OE in[1] ;
+PORT DRIVE out[0] ;
+PORT MON out[1] ;
+
+
+DRIVE = 1 ;
+DRIVE.En = OE ;
+MON = PIN ;
+.endf
+.ends TOP
+.tran 20p 50n 0 20p
+.PRINT TRAN V(ext) V(pin) V(observe) V(oe)
+.end

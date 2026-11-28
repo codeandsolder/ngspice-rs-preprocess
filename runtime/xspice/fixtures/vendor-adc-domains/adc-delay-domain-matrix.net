@@ -1,0 +1,54 @@
+* ADC event delay and tolerance domain at 0.2ps resolution
+Vd d 0 PWL(0 0 .5n 0 1n 5 3n 5 3.5n 0 5n 0)
+.model ADC0 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=-1n fall_delay=-1n time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc0 d dig0 ADC0
+Adac0 dig0 q0 DAC
+R0 q0 0 100k
+.model ADC1 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=-1p fall_delay=-1p time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc1 d dig1 ADC1
+Adac1 dig1 q1 DAC
+R1 q1 0 100k
+.model ADC2 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=0 fall_delay=0 time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc2 d dig2 ADC2
+Adac2 dig2 q2 DAC
+R2 q2 0 100k
+.model ADC3 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=.5p fall_delay=.5p time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc3 d dig3 ADC3
+Adac3 dig3 q3 DAC
+R3 q3 0 100k
+.model ADC4 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1p fall_delay=1p time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc4 d dig4 ADC4
+Adac4 dig4 q4 DAC
+R4 q4 0 100k
+.model ADC5 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=2p fall_delay=2p time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc5 d dig5 ADC5
+Adac5 dig5 q5 DAC
+R5 q5 0 100k
+.model ADC6 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=5p fall_delay=5p time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc6 d dig6 ADC6
+Adac6 dig6 q6 DAC
+R6 q6 0 100k
+.model ADC7 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1n fall_delay=1n time_tol=-1n out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc7 d dig7 ADC7
+Adac7 dig7 q7 DAC
+R7 q7 0 100k
+.model ADC8 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1n fall_delay=1n time_tol=0 out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc8 d dig8 ADC8
+Adac8 dig8 q8 DAC
+R8 q8 0 100k
+.model ADC9 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1n fall_delay=1n time_tol=.5p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc9 d dig9 ADC9
+Adac9 dig9 q9 DAC
+R9 q9 0 100k
+.model ADC10 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1n fall_delay=1n time_tol=1p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc10 d dig10 ADC10
+Adac10 dig10 q10 DAC
+R10 q10 0 100k
+.model ADC11 adc_bridge(in_low=2.1 in_high=2.2 rise_delay=1n fall_delay=1n time_tol=2p out_low=0 out_high=5 clamp_low=0 clamp_high=5 clamp_res=10 clamp_bias=.5 out_family="HC")
+Aadc11 d dig11 ADC11
+Adac11 dig11 q11 DAC
+R11 q11 0 100k
+.model DAC dac_bridge(in_family="HC" out_low=0 out_high=5 g_pullup=.024 g_pulldown=.034 g_hiz=1e-9 g_resistive=.001 input_load=0 t_rise=10p t_fall=10p knee_low=2 knee_high=2.75 v_smooth=.5)
+.PRINT TRAN V(q0) V(q1) V(q2) V(q3) V(q4) V(q5) V(q6) V(q7) V(q8) V(q9) V(q10) V(q11)
+.tran .2p 5n 0 .2p
+.end

@@ -1,0 +1,15 @@
+* Original single-wire digital X call, supplied with a verified native triple ABI.
+Vin analog_input 0 PWL(0 0 2n 0 2.05n 1.5 9n 1.5 9.05n 0 15n 0)
+Ain [analog_input] [first] DL
+Xexternal first second LEGACY_DIGITAL_BUFFER
+Aout [second] [analog_output] DL
+Rload analog_output 0 100k
+.model DL d_logic_block family="HC" out_delay=1n def="out[0]=in[0];"
+.include "native-external-buffer.lib"
+.tran 20p 15n 0 20p
+.control
+run
+wrdata result.dat v(analog_output)
+quit
+.endc
+.end

@@ -1,0 +1,17 @@
+* Vendor-derived COMB cascade or positive-delay feedback experiment
+.model MCOMB_FEEDBACK_TWO_REGISTER d_logic_block file=FCOMB_FEEDBACK_TWO_REGISTER family="UNIV"
+.file FCOMB_FEEDBACK_TWO_REGISTER
+PORT Data in[0] ;
+PORT Q out[0] ;
+COMB (WIDTH=1, DELAY=1n) A=0 ;
+COMB (WIDTH=1, DELAY=2n) B=0 ;
+A=!B ;
+B=A ;
+Q=B ;
+.endf
+Vdata d 0 PWL(0 0 12n 0)
+Acomb [d] [q] MCOMB_FEEDBACK_TWO_REGISTER
+Rout q 0 100k
+.tran 20p 12n 0 20p
+.PRINT TRAN V(d) V(q)
+.end
