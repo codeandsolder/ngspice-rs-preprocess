@@ -45,14 +45,31 @@ fn fet_step(vgs: f64, vds: f64, old_vgs: f64, old_vds: f64, vto: f64) -> f64 {
     restrict_step(scale, drain, old_drain, limvds(drain, old_drain))
 }
 
+/// Return a representable admissible point on the proposed scalar step.
+/// The already evaluated reference is known admissible. Terminate even when
+/// rounding a midpoint would otherwise repeat the invalid endpoint.
+fn backtrack(reference: f64, mut next: f64, valid: impl Fn(f64) -> bool) -> f64 {
+    while !valid(next) {
+        let middle = f64::midpoint(reference, next);
+        if middle.to_bits() == next.to_bits() {
+            return reference;
+        }
+        next = middle;
+    }
+    next
+}
+
 impl VdmosKernel {
     fn limit_thermal(&self, reference: &[f64], coordinates: &mut [f64]) -> Result<()> {
         let Some([junction, case]) = self.layout.thermal else {
             return Ok(());
         };
         let valid_junction = |temperature| {
+            if temperature <= 0. || !temperature.is_finite() {
+                return false;
+            }
             let potential = junction_potential(&self.model, Jet::constant(temperature)).v;
-            temperature > 0. && temperature.is_finite() && potential > 0. && potential.is_finite()
+            potential > 0. && potential.is_finite()
         };
         let previous = reference[junction];
         if !valid_junction(previous) || reference[case] <= 0. {
@@ -60,26 +77,20 @@ impl VdmosKernel {
                 "invalid VDMOS thermal trial reference".into(),
             ));
         }
-        let mut next = limit_temperature(coordinates[junction], previous, THERMAL_STEP);
+        let next = limit_temperature(coordinates[junction], previous, THERMAL_STEP);
         // If a valid evaluated reference lies near a constitutive boundary,
         // even a compressed step may cross it. Bisect back toward that actual
         // reference, not a hard-coded operating-temperature clamp.
         if !next.is_finite() {
             return Err(Error::Domain("nonfinite VDMOS thermal trial step".into()));
         }
-        while !valid_junction(next) {
-            next = f64::midpoint(previous, next);
-        }
-        coordinates[junction] = next;
+        coordinates[junction] = backtrack(previous, next, valid_junction);
         if coordinates[case] <= 0. {
-            let mut next = limit_temperature(coordinates[case], reference[case], THERMAL_STEP);
+            let next = limit_temperature(coordinates[case], reference[case], THERMAL_STEP);
             if !next.is_finite() {
                 return Err(Error::Domain("nonfinite VDMOS case trial step".into()));
             }
-            while next <= 0. {
-                next = f64::midpoint(reference[case], next);
-            }
-            coordinates[case] = next;
+            coordinates[case] = backtrack(reference[case], next, |temperature| temperature > 0.);
         }
         Ok(())
     }
@@ -97,7 +108,9 @@ impl VdmosKernel {
         let vte = diode.n * thermal;
         let exponent = saturation_exponent(model, Jet::constant(temperature), Jet::constant(vte)).v;
         let log_current = prepared.multiplier.ln() + diode.is.ln() + exponent;
-        if let Some(avalanche) = diode.breakdown {
+        if raw < -3. * vte
+            && let Some(avalanche) = diode.breakdown
+        {
             let saturation = prepared.multiplier * diode.is * exponent.exp();
             let knee = breakdown::effective_voltage(
                 avalanche,
@@ -185,8 +198,16 @@ impl VdmosKernel {
                     visited[row] = true;
                     let old_difference = reference[row] - old_anchor;
                     let difference = coordinates[row] - anchor;
-                    coordinates[row] =
-                        anchor + scale.mul_add(difference - old_difference, old_difference);
+                    if !old_difference.is_finite() || !difference.is_finite() {
+                        return Err(Error::Domain("nonfinite VDMOS local voltage".into()));
+                    }
+                    let delta = difference - old_difference;
+                    let limited = if delta.is_finite() {
+                        scale.mul_add(delta, old_difference)
+                    } else {
+                        scale.mul_add(difference, (1. - scale) * old_difference)
+                    };
+                    coordinates[row] = anchor + limited;
                 }
             }
         }

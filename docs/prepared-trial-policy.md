@@ -71,10 +71,9 @@ the exact candidate. This row contains only the intrinsic junction, even
 when a series resistor is present. The comparison scales both quantities to
 avoid floating-point overflow and rejects nonrepresentable predictions.
 
-Other currently prepared families explicitly select engine policy; this
-contract does not yet claim specialized limiting for VDMOS, VBIC, HICUM2
-or BSIM1/2. Individual tile lanes use the same policy and prepared data
-as scalar and full-tile evaluation, including after selective replacement.
+Individual tile lanes use the same policy and prepared data as scalar and
+full-tile evaluation, including after selective replacement. Other families
+without specialized hooks explicitly select engine ownership.
 
 The tests use an independent monotone load-line bisection of a Shockley
 junction with external resistor and capacitor, including extreme forward
@@ -87,3 +86,35 @@ bias; ramp from -2 to 1000 V and back with external capacitance). It
 compares the accepted DC point and six transient observations. DC tolerance
 accounts for the historical physical constants; transient tolerance also
 accounts for fixed backward-Euler versus adaptive Gear integration.
+
+
+## VDMOS policy
+
+VDMOS declares kernel-owned limiting; cold initialization and the additional
+convergence test remain engine-owned. The trial reference must be the actual
+successfully evaluated point (previous Newton or last accepted step). The
+kernel first bounds junction-temperature changes with the ngspice 47
+`DEVlimitlog` 10 K threshold. Where the proposed temperature crosses the
+physical junction-potential domain, the step is contracted toward the valid
+reference until the potential is positive and finite. A nonpositive case
+temperature is similarly moved toward the previous valid case coordinate.
+The exact model still rejects invalid physical inputs; no final temperature
+is clamped and a limited point never certifies convergence.
+
+The FET gate and drain limiting regions follow `DEVfetlim` and `DEVlimvds`,
+selecting the conducting end from the previous polarity-normalized drain
+bias. Forward and reflected avalanche limiting share the diode's log-domain
+exponential compression and use the VDMOS temperature-adjusted saturation
+and breakdown laws. Rather than independently assign incompatible branch
+voltages when terminal coordinates coalesce, select the most restrictive
+fraction along the proposed electrical direction. Keep the proposed intrinsic
+source common-mode potential and interpolate all electrical differences
+relative to it. This preserves coherent voltages for arbitrary RD/RS/RG/RB
+alias combinations. The internal recovery coordinate remains untouched.
+
+The producer tests cover both polarities, all 16 series-node combinations,
+with and without self-heating, extreme forward and reverse proposals,
+near-boundary thermal steps, unchanged exact steps, common-mode invariance,
+rejected predictor retries, and bit-identical scalar and tile evaluation.
+The independent full converter is the solver conformance fixture in
+ngspice-rs-fast#259; qualification requires the accepted ABI4 consumer #246.

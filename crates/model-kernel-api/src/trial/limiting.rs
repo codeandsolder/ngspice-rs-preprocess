@@ -1,7 +1,7 @@
 //! Shared numerical trial limiters; no constitutive law or history is changed.
 
-#[derive(Clone, Copy, Debug)]
 /// Logarithmic compression of a steep exponential current-law trial.
+#[derive(Clone, Copy, Debug)]
 pub struct ExponentialLimit {
     scale: f64,
     critical: f64,
@@ -129,7 +129,8 @@ pub fn limvds(vnew: f64, vold: f64) -> f64 {
 
 /// `DEVlimitlog`: compress a large thermal Newton step (a temperature
 /// difference has identical numerical magnitude in Celsius and kelvin).
-/// This does not clip the final physical temperature.
+/// This does not clip the final physical temperature. The caller supplies
+/// finite coordinates and a positive finite step threshold.
 #[must_use = "the returned temperature is the local numerical trial point"]
 pub fn limit_temperature(proposed: f64, reference: f64, threshold: f64) -> f64 {
     let delta = proposed - reference;
@@ -140,7 +141,14 @@ pub fn limit_temperature(proposed: f64, reference: f64, threshold: f64) -> f64 {
     let log = if ratio.is_finite() {
         ratio.log10()
     } else {
-        delta.abs().log10() - threshold.log10()
+        let log_delta = if delta.is_finite() {
+            delta.abs().log10()
+        } else {
+            (proposed.mul_add(0.5, -reference * 0.5)).abs().log10() + std::f64::consts::LOG10_2
+        };
+        log_delta - threshold.log10()
     };
-    reference + (threshold + log).copysign(delta)
+    let next = reference + (threshold + log).copysign(delta);
+    next.min(reference.max(proposed))
+        .max(reference.min(proposed))
 }

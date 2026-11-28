@@ -3,13 +3,17 @@
 use std::sync::Arc;
 
 use model_kernel_api::{
-    Descriptor, EquationKind, PointBuffer,
+    Descriptor, EquationKind, Error, PointBuffer,
     batch::{BatchOutput, PreparedTile},
     trial::{TrialInput, TrialOutcome, TrialPhase},
 };
 use model_kernel_vdmos::{Breakdown, Model, Polarity, artifact::artifact};
 
-fn points(descriptor: &Descriptor, polarity: Polarity, forward: bool) -> (Vec<f64>, Vec<f64>) {
+fn points(
+    descriptor: &Descriptor,
+    polarity: Polarity,
+    forward: bool,
+) -> model_kernel_api::Result<(Vec<f64>, Vec<f64>)> {
     let sign = polarity.sign();
     let mut previous = Vec::new();
     let mut proposed = Vec::new();
@@ -29,12 +33,12 @@ fn points(descriptor: &Descriptor, polarity: Polarity, forward: bool) -> (Vec<f6
             "junction" => (300.15, 100_000.),
             "case" => (300.15, -1000.),
             "recovery" => (0., 1e-10),
-            name => panic!("unexpected equation {name}"),
+            name => return Err(Error::Domain(format!("unexpected equation {name}"))),
         };
         previous.push(old);
         proposed.push(new);
     }
-    (previous, proposed)
+    Ok((previous, proposed))
 }
 
 #[test]
@@ -60,7 +64,7 @@ fn extreme_trials_are_limited_coherently_across_all_series_aliases()
                 let width = compiled.descriptor().equations.len();
                 let mut buffer = PointBuffer::new(width)?;
                 for forward in [true, false] {
-                    let (previous, proposed) = points(compiled.descriptor(), polarity, forward);
+                    let (previous, proposed) = points(compiled.descriptor(), polarity, forward)?;
                     let saved = previous.clone();
                     let mut output = vec![0.; width];
                     compiled.evaluate(&prepared, &previous, &mut buffer.point())?;
@@ -178,8 +182,8 @@ fn scalar_tile_trial_evaluation_and_retry_are_identical() -> Result<(), Box<dyn 
         model.series.rs = 0.01;
         let compiled = artifact(Arc::new(model.prepare()?), true, [8; 16])?;
         let width = compiled.descriptor().equations.len();
-        let (previous, forward) = points(compiled.descriptor(), polarity, true);
-        let (_, reverse) = points(compiled.descriptor(), polarity, false);
+        let (previous, forward) = points(compiled.descriptor(), polarity, true)?;
+        let (_, reverse) = points(compiled.descriptor(), polarity, false)?;
         let inputs = [
             TrialInput {
                 proposed: &forward,
@@ -238,5 +242,43 @@ fn scalar_tile_trial_evaluation_and_retry_are_identical() -> Result<(), Box<dyn 
         tile.linearize_trials(&inputs, &mut coordinates, &mut outcomes)?;
         assert_eq!(coordinates, saved);
     }
+    Ok(())
+}
+
+#[test]
+fn thermal_trial_near_constitutive_boundary_retains_a_valid_point()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut model = Model::defaults(Polarity::N);
+    // A small positive fitted junction potential places the temperature
+    // boundary close to nominal. A <10 K proposal can cross it, so the
+    // logarithmic large-step rule alone is insufficient.
+    model.diode.vj = 0.01;
+    let compiled = artifact(Arc::new(model.prepare()?), true, [11; 16])?;
+    let prepared = compiled.prepare(&[1.], 300.15)?;
+    let previous = [0.25, 4., 0., 300.15, 300.15];
+    let proposed = [0.25, 4., 0., 309.15, 300.15];
+    let mut point = PointBuffer::new(previous.len())?;
+    compiled.evaluate(&prepared, &previous, &mut point.point())?;
+    assert!(
+        compiled
+            .evaluate(&prepared, &proposed, &mut point.point())
+            .is_err()
+    );
+    let mut output = [0.; 5];
+    assert_eq!(
+        compiled.linearize_trial(
+            &prepared,
+            TrialInput {
+                proposed: &proposed,
+                phase: TrialPhase::Newton {
+                    previous: &previous
+                }
+            },
+            &mut output
+        )?,
+        TrialOutcome::Limited
+    );
+    assert!(output[3] > previous[3] && output[3] < proposed[3]);
+    compiled.evaluate(&prepared, &output, &mut point.point())?;
     Ok(())
 }
