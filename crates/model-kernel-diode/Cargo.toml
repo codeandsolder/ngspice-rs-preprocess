@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Prepared SIMetrix level 1 diode current and charge laws"
+description = "Prepared source-specific diode current and charge laws"
 
 [dependencies]
 model-kernel-api.workspace = true

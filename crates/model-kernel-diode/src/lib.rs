@@ -7,6 +7,7 @@
 //! exact voltage derivatives. Units are SI, with temperature in kelvin.
 
 pub mod artifact;
+pub mod fowler_nordheim;
 mod parameters;
 mod physics;
 

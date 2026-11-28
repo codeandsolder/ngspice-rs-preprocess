@@ -153,3 +153,80 @@ fn candidate_temperature_policy_and_topology() -> Result<()> {
     close(buffer.point().current[0], 0.1, 1e-15, 1e-12)?;
     Ok(())
 }
+
+#[test]
+fn fowler_nordheim_artifact_reuses_terminal_law_and_candidate_slots() -> Result<()> {
+    use model_kernel_api::{Capability, trial::TrialCapabilities};
+    use model_kernel_diode::{
+        artifact::fowler_nordheim::{FAMILY, artifact},
+        fowler_nordheim::{Instance, Model},
+    };
+    let model = Model {
+        oxide_thickness: 50.,
+        length: 2.,
+        width: 3.,
+    };
+    let compiled = artifact(model, [7; 16])?;
+    let descriptor = compiled.descriptor();
+    assert_eq!(descriptor.family, FAMILY);
+    assert_eq!(descriptor.trial, TrialCapabilities::ENGINE);
+    assert_eq!(descriptor.charge, Capability::Computed);
+    assert_eq!(descriptor.noise, Capability::Computed);
+    assert_eq!(descriptor.equations.len(), 2);
+    assert!(
+        descriptor
+            .equations
+            .iter()
+            .all(|e| e.binding == Binding::Terminal)
+    );
+    assert_eq!(
+        descriptor
+            .parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["l", "w", "m", "n"]
+    );
+    let mut buffer = PointBuffer::new(2)?;
+    for [length, width, multiplier, series] in [
+        [2., 3., 1., 1.],
+        [0., 3., 2., 2.],
+        [-2., 3., 0.5, 0.5],
+        [2., 3., 0., 1.],
+        [2., 3., -2., -2.],
+    ] {
+        let local = model.bind(Instance {
+            length: Some(length),
+            width: Some(width),
+            multiplier,
+            series,
+        })?;
+        let prepared = compiled.prepare(&[length, width, multiplier, series], 300.15)?;
+        for voltage in [-10., -4., 0., 4., 10.] {
+            let coordinates = [voltage + 2., 2.];
+            let expected = local.evaluate(voltage)?;
+            compiled.evaluate(&prepared, &coordinates, &mut buffer.point())?;
+            let point = buffer.point();
+            assert_eq!(point.current, [expected.current, -expected.current]);
+            assert_eq!(point.charge, [expected.charge, -expected.charge]);
+            let g = expected.conductance;
+            let c = expected.capacitance;
+            assert_eq!(point.conductance, [g, -g, -g, g]);
+            assert_eq!(point.capacitance, [c, -c, -c, c]);
+            let mut noise = Noise::default();
+            let result = compiled.evaluate_noise(&prepared, &coordinates, 1e3, &mut noise);
+            match local.shot_noise(expected.current) {
+                Ok(density) => {
+                    result?;
+                    assert_eq!(noise.0, [("shot".into(), [0, 1], density)]);
+                }
+                Err(_) => {
+                    assert!(result.is_err());
+                    assert!(noise.0.is_empty());
+                }
+            }
+        }
+    }
+    assert!(compiled.prepare(&[2., 3., 1., 0.], 300.15).is_err());
+    Ok(())
+}
