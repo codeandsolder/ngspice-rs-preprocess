@@ -218,8 +218,8 @@ impl PreparedModel {
         }
         let nominal = self.model.tnom;
         let phi = (temperature / nominal).mul_add(
-            self.model.phi - pbfact(Jet::constant(nominal)).v,
-            pbfact(Jet::constant(temperature)).v,
+            self.model.phi - pbfact(Jet::<f64>::constant(nominal)).v,
+            pbfact(Jet::<f64>::constant(temperature)).v,
         );
         if !phi.is_finite() {
             return Err(ModelError::Invalid("distortion surface potential"));

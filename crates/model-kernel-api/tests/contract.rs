@@ -287,3 +287,86 @@ fn explicit_trial_capabilities_and_validation() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn physical_taylor_contract_rejects_bad_inputs_and_unavailable_kernels() -> Result<()> {
+    use model_kernel_api::taylor::{MAX_ORDER, TaylorBuffer, TaylorCapability, TaylorInput};
+    let mut invalid = descriptor();
+    invalid.taylor = TaylorCapability::Computed {
+        max_order: MAX_ORDER + 1,
+    };
+    assert!(Artifact::new(invalid, Linear).is_err());
+    let mut invalid = descriptor();
+    invalid.taylor = TaylorCapability::Computed { max_order: 2 };
+    invalid.charge = Capability::Unavailable;
+    assert!(Artifact::new(invalid, Linear).is_err());
+    assert!(TaylorBuffer::new(0, 0).is_err());
+    assert!(TaylorBuffer::new(usize::MAX, 1).is_err());
+    assert!(TaylorBuffer::new(1000, MAX_ORDER).is_err());
+    let model = Artifact::new(descriptor(), Linear)?;
+    let prepared = model.prepare(&[2.], 300.)?;
+    let input = TaylorInput {
+        order: 1,
+        coefficients: &[2., 1., 300., 0.1, 0., -2.],
+    };
+    let mut out = TaylorBuffer::new(3, 1)?;
+    assert!(matches!(
+        model.evaluate_taylor(&prepared, input, &mut out.point()),
+        Err(Error::Unsupported(_))
+    ));
+    let mut available = descriptor();
+    available.taylor = TaylorCapability::Computed { max_order: 1 };
+    let model = Artifact::new(available, Linear)?;
+    let other = model.prepare(&[2.], 300.)?;
+    assert_eq!(
+        model.evaluate_taylor(&prepared, input, &mut out.point()),
+        Err(Error::ForeignArtifact)
+    );
+    assert!(
+        model
+            .evaluate_taylor(&other, TaylorInput { order: 2, ..input }, &mut out.point())
+            .is_err()
+    );
+    assert!(
+        model
+            .evaluate_taylor(
+                &other,
+                TaylorInput {
+                    coefficients: &[0.; 6],
+                    ..input
+                },
+                &mut out.point()
+            )
+            .is_err()
+    );
+    assert!(
+        model
+            .evaluate_taylor(
+                &other,
+                TaylorInput {
+                    coefficients: &[1., 2., 300., f64::NAN, 0., 0.],
+                    ..input
+                },
+                &mut out.point()
+            )
+            .is_err()
+    );
+    assert!(
+        model
+            .evaluate_taylor(
+                &other,
+                TaylorInput {
+                    coefficients: &[1., 2., 300.],
+                    ..input
+                },
+                &mut out.point()
+            )
+            .is_err()
+    );
+    // Claiming support without an implementation does not silently use the ordinary point path.
+    assert!(matches!(
+        model.evaluate_taylor(&other, input, &mut out.point()),
+        Err(Error::Unsupported(_))
+    ));
+    Ok(())
+}

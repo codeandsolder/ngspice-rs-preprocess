@@ -14,6 +14,7 @@ use std::{
 pub trait Scalar:
     Copy
     + Debug
+    + Default
     + Add<Output = Self>
     + Sub<Output = Self>
     + Mul<Output = Self>
@@ -33,6 +34,19 @@ pub trait Scalar:
     fn powf(self, exponent: f64) -> Self;
     fn mul_add(self, multiplier: Self, addend: Self) -> Self;
     fn abs(self) -> Self;
+    fn tanh(self) -> Self;
+    fn atan(self) -> Self;
+    fn degree(self) -> usize;
+    fn with_value(self, value: f64) -> Self;
+
+    fn compare_to(self, rhs: Self) -> Option<Ordering> {
+        let ordering = self.value().partial_cmp(&rhs.value())?;
+        if ordering == Ordering::Equal {
+            (self - rhs).compare(0.)
+        } else {
+            Some(ordering)
+        }
+    }
 
     fn scale(self, factor: f64) -> Self {
         self * Self::constant(factor)
@@ -85,6 +99,18 @@ impl Scalar for f64 {
     fn abs(self) -> Self {
         self.abs()
     }
+    fn tanh(self) -> Self {
+        self.tanh()
+    }
+    fn atan(self) -> Self {
+        self.atan()
+    }
+    fn degree(self) -> usize {
+        0
+    }
+    fn with_value(self, value: f64) -> Self {
+        value
+    }
 }
 
 /// Bounded, allocation-free local series. The inactive suffix is always zero.
@@ -92,6 +118,12 @@ impl Scalar for f64 {
 pub struct Series {
     coefficients: [f64; MAX_ORDER + 1],
     order: usize,
+}
+
+impl Default for Series {
+    fn default() -> Self {
+        Self::constant_value(0.)
+    }
 }
 
 impl Series {
@@ -221,6 +253,12 @@ impl Sub for Series {
 impl Mul for Series {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self {
+        if self.order == 0 {
+            return rhs.scale(self.value());
+        }
+        if rhs.order == 0 {
+            return self.scale(rhs.value());
+        }
         let order = self.order.max(rhs.order);
         let mut result = Self::zero(order);
         result.coefficients[0] = self.value() * rhs.value();
@@ -239,6 +277,13 @@ impl Div for Series {
         let order = self.order.max(rhs.order);
         if rhs.value() == 0. {
             return Self::invalid(order);
+        }
+        if rhs.order == 0 {
+            let mut result = self;
+            for coefficient in &mut result.coefficients[..=result.order] {
+                *coefficient /= rhs.value();
+            }
+            return result;
         }
         let mut result = Self::zero(order);
         for n in 0..=order {
@@ -320,14 +365,14 @@ impl Scalar for Series {
         if exponent == 0. {
             return Self::constant(1.);
         }
+        if self.is_constant() {
+            return Self::constant(self.value().powf(exponent));
+        }
         if self.value() > 0. {
             let mut exponent_log = self.ln().scale(exponent);
             let value = self.value().powf(exponent);
             exponent_log.coefficients[0] = 0.;
             return exponent_log.exponential(value);
-        }
-        if self.is_constant() {
-            return Self::constant(self.value().powf(exponent));
         }
         if exponent.fract() != 0. || !exponent.is_finite() {
             return Self::invalid(self.order);
@@ -371,5 +416,76 @@ impl Scalar for Series {
         } else {
             self
         }
+    }
+    fn scale(mut self, factor: f64) -> Self {
+        for coefficient in &mut self.coefficients[..=self.order] {
+            *coefficient *= factor;
+        }
+        self
+    }
+    fn tanh(self) -> Self {
+        let tail = self.abs().scale(-2.).exp();
+        let correction = tail.scale(2.) / tail.offset(1.);
+        let result = if self.compare(0.) == Some(Ordering::Less) {
+            correction.offset(-1.)
+        } else {
+            Self::constant(1.) - correction
+        };
+        result.with_value(self.value().tanh())
+    }
+    fn atan(self) -> Self {
+        let slope = if self.value().abs() > 1. {
+            let inv = self.recip();
+            let square = inv * inv;
+            square / square.offset(1.)
+        } else {
+            (self * self).offset(1.).recip()
+        };
+        self.compose_derivative(self.value().atan(), slope)
+    }
+    fn degree(self) -> usize {
+        self.order
+    }
+    fn with_value(mut self, value: f64) -> Self {
+        self.coefficients[0] = value;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_order_exp_and_geometric_series() -> Result<()> {
+        let x = Series::from_coefficients(
+            [0., 1.]
+                .into_iter()
+                .chain(std::iter::repeat_n(0., MAX_ORDER - 1)),
+        )?;
+        let e = x.exp();
+        let geometric = (Series::constant(1.) - x).recip();
+        let mut expected = 1.;
+        let mut degree = 0.;
+        for k in 0..=MAX_ORDER {
+            if k != 0 {
+                degree += 1.;
+                expected /= degree;
+            }
+            assert!((e.coefficient(k) / expected - 1.).abs() < 3e-14);
+            assert_eq!(geometric.coefficient(k).to_bits(), 1_f64.to_bits());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn right_germ_and_regular_zero_integer_power() -> Result<()> {
+        let x = Series::from_coefficients([0., 0., -2., 1., 0.])?;
+        assert_eq!(x.compare(0.), Some(Ordering::Less));
+        assert_eq!(x.abs().coefficient(2).to_bits(), 2_f64.to_bits());
+        assert_eq!(x.powf(2.).coefficient(4).to_bits(), 4_f64.to_bits());
+        assert!(!x.powf(0.5).is_finite());
+        assert!(!x.recip().is_finite());
+        Ok(())
     }
 }
