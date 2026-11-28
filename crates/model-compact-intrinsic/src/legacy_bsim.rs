@@ -46,6 +46,7 @@ fn validate_bias(bias: LegacyBsimBias) -> Result<(), ModelError> {
 
 /// Evaluate the threshold at an already oriented bias using the same body and
 /// drain-voltage law as the intrinsic channel, without evaluating charge/current.
+///
 /// This is used by numerical trial policy, not an additional constitutive law.
 ///
 /// # Errors

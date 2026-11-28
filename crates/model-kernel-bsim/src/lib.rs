@@ -476,7 +476,8 @@ impl Kernel for LegacyBsimKernel {
     }
 
     fn initialize_trial(&self, prepared: &Self::Prepared, coordinates: &mut [f64]) -> Result<()> {
-        self.layout.initialize(&prepared.physical, coordinates)
+        self.layout.initialize(&prepared.physical, coordinates);
+        Ok(())
     }
 
     fn limit_trial(

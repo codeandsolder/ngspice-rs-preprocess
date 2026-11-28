@@ -154,7 +154,9 @@ pub fn limit_temperature(proposed: f64, reference: f64, threshold: f64) -> f64 {
 }
 
 /// Restrict the common electrical step to the interval permitted by one
-/// controlling voltage. This preserves all aliased rows, including the case
+/// controlling voltage.
+///
+/// This preserves all aliased rows, including the case
 /// where different branches refer to the same voltage difference.
 #[must_use = "the returned fraction restricts a common coordinate step"]
 pub fn restrict_step(scale: f64, raw: f64, previous: f64, limited: f64) -> f64 {

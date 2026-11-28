@@ -15,7 +15,7 @@ use model_kernel_api::{
 
 use super::{Layout, domain};
 
-fn sign(instance: &PreparedLegacyBsimInstance) -> f64 {
+const fn sign(instance: &PreparedLegacyBsimInstance) -> f64 {
     match instance.polarity {
         MosPolarity::Nmos => 1.,
         MosPolarity::Pmos => -1.,
@@ -32,11 +32,7 @@ fn difference(coordinates: &[f64], high: usize, low: usize, polarity: f64) -> Re
 }
 
 impl Layout {
-    pub(super) fn initialize(
-        self,
-        instance: &PreparedLegacyBsimInstance,
-        coordinates: &mut [f64],
-    ) -> Result<()> {
+    pub(super) fn initialize(self, instance: &PreparedLegacyBsimInstance, coordinates: &mut [f64]) {
         // C MODEINITJCT: VDS=0, VGS=von, VBS=-1. Source-supplied OFF and
         // initial conditions are already handled by the consuming engine.
         let polarity = sign(instance);
@@ -44,7 +40,6 @@ impl Layout {
         coordinates[self.drain] = source;
         coordinates[1] = polarity.mul_add(instance.threshold, source);
         coordinates[3] = source - polarity;
-        Ok(())
     }
 
     pub(super) fn limit(
