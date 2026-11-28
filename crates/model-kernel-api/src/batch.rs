@@ -268,6 +268,7 @@ impl<K: Kernel> PreparedTile<K> {
         input: crate::taylor::TaylorInput<'_>,
         out: &mut crate::taylor::TaylorPoint<'_>,
     ) -> Result<()> {
+        out.guards.reset();
         let data = self.data.get(lane).ok_or(Error::Shape("prepared lane"))?;
         self.artifact.evaluate_taylor_data(data, input, out)
     }
