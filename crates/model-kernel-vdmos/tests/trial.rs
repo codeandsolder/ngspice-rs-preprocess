@@ -204,7 +204,7 @@ fn scalar_tile_trial_evaluation_and_retry_are_identical() -> Result<(), Box<dyn 
         let mut outcomes = [TrialOutcome::Exact; 2];
         tile.linearize_trials(&inputs, &mut coordinates, &mut outcomes)?;
         assert_eq!(outcomes, [TrialOutcome::Limited; 2]);
-        let mut batch = BatchOutput::new(2, width)?;
+        let mut batch = BatchOutput::new(width, 2)?;
         tile.evaluate(&coordinates, &mut batch)?;
         let mut scalar = PointBuffer::new(width)?;
         let mut point = vec![0.; width];
