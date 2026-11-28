@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeMap, fmt::Write as _};
 
+pub mod digital_timing;
 mod instances;
 mod nodes;
 mod options;
@@ -541,6 +542,13 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
 
 fn model(line: usize, functions: &mut Functions) -> Result<String> {
     let mut card = functions.scopes.model(line)?;
+    if let Some(timing) = digital_timing::TimingModel::from_card(&card)? {
+        bail!(
+            "PSpice digital timing model {} ({:?}) requires occurrence-bound digital timing",
+            timing.name,
+            timing.family
+        );
+    }
     let family = card.family.to_ascii_lowercase();
     for p in &card.parameters {
         let name = p.name.to_ascii_lowercase();
