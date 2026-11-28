@@ -3,6 +3,8 @@
 use crate::{Artifact, Capability, EquationKind, Error, Kernel, Point, Prepared, Result, allocate};
 
 pub mod arithmetic;
+mod guards;
+pub use guards::{Guard, GuardPredicate, GuardRecorder, GuardTrace};
 
 /// Maximum degree of a normalized local germ.
 pub const MAX_ORDER: usize = 64;
@@ -98,6 +100,7 @@ pub struct TaylorPoint<'a> {
     pub conductance: &'a mut [f64],
     pub charge: &'a mut [f64],
     pub capacitance: &'a mut [f64],
+    pub guards: &'a mut GuardTrace,
 }
 
 impl TaylorPoint<'_> {
@@ -131,6 +134,7 @@ pub struct TaylorBuffer {
     conductance: Vec<f64>,
     charge: Vec<f64>,
     capacitance: Vec<f64>,
+    guards: GuardTrace,
 }
 
 impl TaylorBuffer {
@@ -143,6 +147,7 @@ impl TaylorBuffer {
             charge: allocate(shape.rows)?,
             conductance: allocate(shape.matrices)?,
             capacitance: allocate(shape.matrices)?,
+            guards: GuardTrace::default(),
         })
     }
 
@@ -152,6 +157,7 @@ impl TaylorBuffer {
             conductance: &mut self.conductance,
             charge: &mut self.charge,
             capacitance: &mut self.capacitance,
+            guards: &mut self.guards,
         }
     }
 }
@@ -168,6 +174,7 @@ impl<K: Kernel> Artifact<K> {
         input: TaylorInput<'_>,
         out: &mut TaylorPoint<'_>,
     ) -> Result<()> {
+        out.guards.reset();
         self.check(instance)?;
         self.evaluate_taylor_data(&instance.data, input, out)
     }
@@ -178,6 +185,7 @@ impl<K: Kernel> Artifact<K> {
         input: TaylorInput<'_>,
         out: &mut TaylorPoint<'_>,
     ) -> Result<()> {
+        out.guards.reset();
         let descriptor = self.descriptor();
         let TaylorCapability::Computed { max_order } = descriptor.taylor else {
             return Err(Error::Unsupported("physical Taylor evaluation"));
@@ -203,6 +211,7 @@ impl<K: Kernel> Artifact<K> {
             out.point(shape, degree).reset(descriptor.charge);
         }
         self.kernel.evaluate_taylor(data, input, out)?;
+        out.guards.validate(input.order)?;
         for degree in 0..=input.order {
             out.point(shape, degree).validate(descriptor)?;
         }

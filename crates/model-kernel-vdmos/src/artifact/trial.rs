@@ -5,6 +5,7 @@
 
 use model_kernel_api::{
     Error, Result,
+    taylor::GuardRecorder,
     trial::limiting::{ExponentialLimit, fetlim, limit_temperature, limvds, restrict_step},
 };
 
@@ -109,6 +110,7 @@ impl VdmosKernel {
                 avalanche,
                 Jet::constant(saturation),
                 Jet::constant(thermal),
+                &mut GuardRecorder::disabled(),
             )
             .map_err(|error| Error::Domain(error.to_string()))?
             .v;
