@@ -435,7 +435,9 @@ impl ChargeModel<'_> {
                 vdsat_cv * t4,
                 t5.mul_add(dt1_dvg - dt0_dvg, dt0_dvg * t4),
                 t5 * (dt1_dvd + 1.0),
-                t5.mul_add(dt1_dvb0, dt0_dvb * (1.0 - t5)),
+                // Differentiate VdsatCV * T4. Upstream b3ld.c uses
+                // (1 - T5) here, omitting T4 in the product rule.
+                t5.mul_add(dt1_dvb0, dt0_dvb * (t4 - t5)),
             )
         };
         // C zeroes VdseffCV's gate/body derivatives at Vds = 0 (not the drain

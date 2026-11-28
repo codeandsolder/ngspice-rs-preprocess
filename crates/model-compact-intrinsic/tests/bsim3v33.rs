@@ -20,7 +20,7 @@ fn defaults(
 }
 
 fn close(name: &str, actual: f64, expected: f64, relative: f64, absolute: f64) {
-    let tolerance = relative * actual.abs().max(expected.abs()) + absolute;
+    let tolerance = relative.mul_add(actual.abs().max(expected.abs()), absolute);
     assert!(
         actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= tolerance,
         "{name}: actual {actual:.17e}, expected {expected:.17e}"
@@ -237,22 +237,12 @@ fn render(values: &[(&str, ParameterValue)]) -> String {
 }
 
 fn native(deck: &str) -> Result<BTreeMap<String, f64>, Box<dyn std::error::Error>> {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-    };
     let dir = tempfile::tempdir()?;
-    let mut child = Command::new("ngspice")
+    std::fs::write(dir.path().join("witness.cir"), deck)?;
+    let output = std::process::Command::new("ngspice")
         .current_dir(dir.path())
-        .args(["-b", "/dev/stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(deck.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
+        .args(["-b", "witness.cir"])
+        .output()?;
     let log = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && !log.contains("Fatal error") && !log.contains("aborted"),
@@ -287,7 +277,7 @@ fn compare_native(
         ("pmos", -1.)
     };
     let source = format!(
-        "BSIM3 v3.3 independent witness\nvd d 0 {:e}\nvg g 0 {:e}\nvb b 0 {:e}\nm1 d g 0 b n{}\n.model n {family} level=8 version=3.3.0{}\n.options temp={temp_c} tnom=27\n.control\nset numdgt=17\nop\nprint {}\nquit\n.endc\n.end\n",
+        "BSIM3 v3.3 independent witness\nvd d 0 {:e}\nvg g 0 {:e}\nvb b 0 {:e}\nm1 d g 0 b n{}\n.model n {family} level=8 version=3.3.0{}\n.options temp={temp_c} tnom=27 bypass=0\n.control\nset numdgt=17\nop\nprint {}\nquit\n.endc\n.end\n",
         sign * bias.vds,
         sign * bias.vgs,
         sign * bias.vbs,
@@ -304,20 +294,24 @@ fn compare_native(
         vgs: asks["vgs"],
         vds: asks["vds"],
     };
+    if prepared.setup().drain_conductance == 0. && prepared.setup().source_conductance == 0. {
+        close("applied VDS", actual_bias.vds, bias.vds, 1e-9, 1e-12);
+        close("applied VGS", actual_bias.vgs, bias.vgs, 1e-9, 1e-12);
+        close("applied VBS", actual_bias.vbs, bias.vbs, 1e-9, 1e-12);
+    }
     let result = prepared.evaluate(actual_bias, 1e-12)?;
     let dc = &result.dc;
     for name in [
-        "vth", "id", "gm", "gds", "gmbs", "vdsat", "ibs", "ibd", "gbs",
+        "vth", "id", "gm", "gds", "gmbs", "vdsat", "ibs", "ibd", "gbs", "gbd",
     ] {
         close(
-            name,
+            &format!("{name} {bias:?}"),
             dc.ask(name).ok_or("missing DC ask")?,
             asks[name],
             1e-9,
             1e-16,
         );
     }
-    close("gbd", dc.gbd, asks["gbd"], 1e-9, 1e-16);
     let charge = result.charge;
     let q = charge.with_overlap(dc.mode, actual_bias.vgs - actual_bias.vbs);
     for (name, value) in [
@@ -326,16 +320,16 @@ fn compare_native(
         ("qd", q.qd),
         ("cgg", charge.cggb),
         ("cgd", charge.cgdb),
-        ("cgs", charge.cgsb),
         ("cdg", charge.cdgb),
         ("cdd", charge.cddb),
-        ("cds", charge.cdsb),
         ("cbg", charge.cbgb),
         ("cbd", charge.cbdb),
-        ("cbs", charge.cbsb),
     ] {
         close(name, value, asks[name], 1e-9, 1e-22);
     }
+    // The remaining three source columns include upstream's erroneous
+    // CTM body derivative via gauge invariance. The complete physical
+    // Jacobian is independently tested in terminal_jacobians_cover_both_polarities_and_modes.
     Ok(())
 }
 
@@ -371,6 +365,82 @@ fn native_v33_dc_charge_reference_matrix() -> TestResult {
             for temp in [0., 27., 85.] {
                 for (vgs, vds) in [(0.3, 0.1), (1.2, 0.05), (1.5, 0.8), (1.2, -0.5)] {
                     compare_native(model, &geometry, polarity, temp, Bias { vbs: 0., vgs, vds })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn terminal_jacobians_cover_both_polarities_and_modes() -> TestResult {
+    for polarity in [MosPolarity::Nmos, MosPolarity::Pmos] {
+        let sign = if polarity == MosPolarity::Nmos {
+            1.
+        } else {
+            -1.
+        };
+        let mut model = ModelSetup::new(
+            defaults(
+                &[
+                    ("alpha0", Real(1e-8)),
+                    ("beta0", Real(0.1)),
+                    ("cgdo", Real(2e-10)),
+                    ("cgso", Real(3e-10)),
+                ],
+                polarity,
+            )?,
+            330.,
+        )?;
+        let instance = model.prepare_instance(&bind_instance([
+            ("l", Real(0.5e-6)),
+            ("w", Real(3e-6)),
+            ("m", Real(3.)),
+            ("ad", Real(1e-12)),
+            ("as", Real(2e-12)),
+            ("pd", Real(3e-6)),
+            ("ps", Real(4e-6)),
+        ])?)?;
+        for drain in [0.07, 0.9, -0.07, -0.9] {
+            for gate in [0.3, 0.9, 1.8] {
+                let voltage = [drain, gate, 0., -1.1].map(|v| f64::mul_add(sign, v, 0.2));
+                let point = instance.terminal_point(voltage, 1e-12)?;
+                close("KCL", point.current.iter().sum(), 0., 0., 1e-15);
+                close(
+                    "charge conservation",
+                    point.charge.iter().sum(),
+                    0.,
+                    0.,
+                    1e-27,
+                );
+                for column in 0..4 {
+                    let mut plus = voltage;
+                    let mut minus = voltage;
+                    let h = 1e-5;
+                    plus[column] += h;
+                    minus[column] -= h;
+                    let plus = instance.terminal_point(plus, 1e-12)?;
+                    let minus = instance.terminal_point(minus, 1e-12)?;
+                    for row in 0..4 {
+                        close(
+                            &format!(
+                                "terminal conductance {polarity:?} {voltage:?} [{row},{column}]"
+                            ),
+                            point.conductance[row][column],
+                            (plus.current[row] - minus.current[row]) / (2. * h),
+                            2e-5,
+                            1e-13,
+                        );
+                        close(
+                            &format!(
+                                "terminal capacitance {polarity:?} {voltage:?} [{row},{column}]"
+                            ),
+                            point.capacitance[row][column],
+                            (plus.charge[row] - minus.charge[row]) / (2. * h),
+                            2e-5,
+                            1e-22,
+                        );
+                    }
                 }
             }
         }

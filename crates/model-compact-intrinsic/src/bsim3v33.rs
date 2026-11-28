@@ -16,6 +16,8 @@ mod noise;
 mod setup;
 mod size_data;
 mod temperature;
+mod terminal;
+pub use terminal::TerminalPoint;
 
 pub use charges::{ChargeEvaluation, OverlapCharges};
 pub use dc::{Bias, CvIntermediates, DcEvaluation};
@@ -108,7 +110,9 @@ impl Diagnostic {
     }
 }
 
-/// Resolve native instance setters, expanding IC vectors in their source
+/// Resolve native instance setters in source order.
+///
+/// Expand IC vectors in their source
 /// order. Scalar components following an IC vector override it, and later
 /// vectors replace only the components that they actually specify.
 /// Dimensions passed here have already undergone the deck's SCALE transform.
