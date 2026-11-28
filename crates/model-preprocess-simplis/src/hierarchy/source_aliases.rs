@@ -73,12 +73,18 @@ fn model_name(statement: &str) -> Option<&str> {
     }
 }
 
-fn model_alias_card(alias: &Alias, target: &str) -> Result<String> {
+pub(super) fn model_alias_card(
+    alias: &Alias,
+    target: &str,
+    source_family: Option<&str>,
+) -> Result<String> {
     let mut fields = target.split_whitespace().collect::<Vec<_>>();
     ensure!(fields.len() >= 3, "malformed SIMPLIS alias target model");
-    let model_type = fields[2]
-        .split_once('(')
-        .map_or(fields[2], |(head, _)| head);
+    let model_type = source_family.unwrap_or_else(|| {
+        fields[2]
+            .split_once('(')
+            .map_or(fields[2], |(head, _)| head)
+    });
     ensure!(
         model_type.eq_ignore_ascii_case(&alias.kind),
         "SIMPLIS alias {} expects {} but target {} is model type {model_type}",
@@ -126,12 +132,13 @@ pub(super) fn materialize(
         }
         let target = resolve_alias_target(&aliases, &alias.name, Some(&alias.kind), budget)?;
         let card = if let Some(card) = models.get(&target.to_ascii_uppercase()) {
-            model_alias_card(alias, card)?
+            model_alias_card(alias, card, None)?
         } else {
             let source = external
                 .source_for_model(target)?
                 .with_context(|| format!("SIMPLIS model alias target {target} was not found"))?;
-            model_alias_card(alias, &external.resolve_model_statement(target, &source)?)?
+            let (card, family) = external.resolve_model_statement(target, &source)?;
+            model_alias_card(alias, &card, Some(&family))?
         };
         budget.charge(Resource::EmittedBytes, card.len().saturating_add(1))?;
         generated.push(card);

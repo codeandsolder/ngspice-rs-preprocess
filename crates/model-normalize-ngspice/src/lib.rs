@@ -1,5 +1,6 @@
 //! Deterministic compatibility normalization and validation for ngspice model includes.
 
+pub mod bjt_card;
 pub mod conditioning;
 pub mod controlled_transfer;
 mod lexical;
