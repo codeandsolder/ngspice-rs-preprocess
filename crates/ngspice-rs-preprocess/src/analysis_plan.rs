@@ -136,7 +136,7 @@ pub enum Directive {
         analysis: AnalysisKind,
         /// Canonical native arguments for native requests; otherwise source operands.
         arguments: Vec<String>,
-        /// Skip transient bias; native UIC or PSpice SKIPBP, removed from arguments.
+        /// Skip transient bias; native UIC or `PSpice` SKIPBP, removed from arguments.
         uic: bool,
     },
     /// Independent analysis repetitions or continuation coordinates.
