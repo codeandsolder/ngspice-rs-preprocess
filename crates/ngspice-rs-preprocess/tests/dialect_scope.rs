@@ -532,3 +532,43 @@ fn mixed_dialect_error_identifies_physical_source_occurrence() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn raw_file_options_are_projected_only_in_their_source_language() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    let vendor = dir.path().join("vendor.lib");
+    fs::write(&root, b"Mixed source presentation\n.options numdgt=8\n.include vendor.lib\nV1 x 0 1\nR1 x 0 1k\n.end\n")?;
+    fs::write(
+        &vendor,
+        b"*#LTSPICE\n.param pw=0\n.options plotwinsize={pw}\n+ numdgt={7+8}\n",
+    )?;
+    let bundle = prepare(
+        &Request {
+            format: InputFormat::NativeDeck,
+            input: SourceInput::File(root),
+            libraries: Vec::new(),
+            search_paths: Vec::new(),
+        },
+        &Options::default(),
+        &Cancellation::default(),
+    )?;
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert!(text.contains(".options numdgt=8"));
+    assert!(text.contains(".options ltspice_output_plotwinsize={pw}"));
+    assert!(text.contains("+ ltspice_output_numdgt={7+8}"));
+    let Provenance::Native { lines, .. } = &bundle.primary.provenance else {
+        anyhow::bail!("missing native line map");
+    };
+    let origin = text
+        .lines()
+        .zip(lines)
+        .find_map(|(line, origin)| {
+            line.starts_with("+ ltspice_output_numdgt=")
+                .then_some(origin)
+        })
+        .context("missing projected output option")?;
+    assert_eq!(origin.source, vendor.canonicalize()?);
+    assert_eq!(origin.line, 4);
+    Ok(())
+}

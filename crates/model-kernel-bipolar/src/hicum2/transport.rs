@@ -10,7 +10,7 @@ mod lateral;
 use self::jet::{Jet, Mixed, Scalar};
 use super::{differentiation::Dual, junction};
 use crate::{
-    EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
+    EvaluationError, ModelError, Temperature, evaluate_lanes, validate_nonnegative,
     validate_positive,
 };
 
@@ -954,6 +954,9 @@ impl Prepared {
 
     /// Evaluate a homogeneous HICCR batch without allocation.
     ///
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Rejects incompatible buffers or a physical/numerical solve error.
     pub fn evaluate_batch(
@@ -961,11 +964,9 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (input, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(*input)?;
-        }
-        Ok(())
+        evaluate_lanes(inputs.iter().copied(), outputs, |input| {
+            self.evaluate(input)
+        })
     }
 }
 

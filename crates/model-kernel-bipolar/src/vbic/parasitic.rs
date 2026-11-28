@@ -9,7 +9,7 @@ use super::{
     transport::{CheckedGradient, Gradient},
 };
 use crate::{
-    EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
+    EvaluationError, ModelError, Temperature, evaluate_lanes, validate_nonnegative,
     validate_positive,
 };
 
@@ -151,6 +151,9 @@ impl Prepared {
         Ok(output)
     }
 
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Rejects unmatched buffers or invalid individual evaluations.
     pub fn evaluate_batch(
@@ -158,11 +161,7 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (bias, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(*bias)?;
-        }
-        Ok(())
+        evaluate_lanes(inputs.iter().copied(), outputs, |bias| self.evaluate(bias))
     }
 }
 

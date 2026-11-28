@@ -27,7 +27,7 @@ pub mod topology;
 pub mod transport;
 pub mod tunneling;
 use crate::{
-    Branch, EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
+    Branch, EvaluationError, ModelError, Temperature, evaluate_lanes, validate_nonnegative,
     validate_positive,
 };
 
@@ -254,6 +254,9 @@ impl Prepared {
         Ok(result)
     }
 
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Returns a length error for incompatible buffers or an evaluation error.
     pub fn evaluate_batch(
@@ -261,11 +264,9 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Currents],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (input, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(*input)?;
-        }
-        Ok(())
+        evaluate_lanes(inputs.iter().copied(), outputs, |input| {
+            self.evaluate(input)
+        })
     }
 }
 

@@ -8,9 +8,7 @@
 //! sources and two 1/f sources. Its total accumulator accidentally omits the
 //! ICCP shot source despite calculating it; our physical total includes it.
 
-use crate::{
-    EvaluationError, ModelError, Temperature, validate_batch_lengths, validate_nonnegative,
-};
+use crate::{EvaluationError, ModelError, Temperature, evaluate_lanes, validate_nonnegative};
 
 // These historical ngspice noise-analysis constants differ from VBIC's
 // internal current/charge/thermal-voltage constants.
@@ -246,6 +244,9 @@ impl Prepared {
 
     /// Evaluate a fixed-frequency batch without allocations.
     ///
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Returns mismatched buffer size or any invalid operating point.
     pub fn evaluate_batch(
@@ -254,10 +255,8 @@ impl Prepared {
         outputs: &mut [Output],
         frequency_hz: f64,
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(operating.len(), outputs.len())?;
-        for (operating, output) in operating.iter().zip(outputs) {
-            *output = self.evaluate(*operating, frequency_hz)?;
-        }
-        Ok(())
+        evaluate_lanes(operating.iter().copied(), outputs, |op| {
+            self.evaluate(op, frequency_hz)
+        })
     }
 }

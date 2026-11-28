@@ -3,6 +3,18 @@
 This standalone crate implements validated slices of two bipolar-model physics families.
 The families have separate physical equations; no Gummel-Poon substitution.
 
+## Borrowed batch evaluation
+
+Family-specific `evaluate_batch` methods are allocation-free scalar lane
+traversals over caller-owned slices. All input and output lengths must
+match before any writes; companion slices (such as per-lane frequencies)
+are checked independently. Empty matching slices succeed without evaluating
+a lane. Outputs equal the corresponding scalar evaluation; on the first
+evaluation error, only the preceding successful output slots are changed.
+The failing slot and untouched suffix retain their original values. This
+contract is not an accepted-step transaction, and does not replace the
+separate physical artifact/tile interface in `model-kernel-api`.
+
 ## Prepared VBIC model artifact
 
 The native VBIC 1.1.5 producer accepts resolved ordered model/instance

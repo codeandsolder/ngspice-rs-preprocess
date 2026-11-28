@@ -161,6 +161,21 @@ fn noise_batch_validation_and_negative_conductance_fail_closed() -> TestResult {
         prepared.evaluate(bad, 150.0),
         Err(EvaluationError::InvalidPhysicalDomain)
     ));
+    let sentinel = noise::Output::default();
+    let mut outputs = [sentinel; 3];
+    prepared.evaluate_batch(&[], &mut [], 0.0)?;
+    assert_eq!(
+        prepared.evaluate_batch(&operating, &mut outputs[..2], 150.0),
+        Err(EvaluationError::LengthMismatch)
+    );
+    assert_eq!(outputs, [sentinel; 3]);
+    let first = prepared.evaluate(operating[0], 150.0)?;
+    assert_ne!(first, sentinel);
+    assert_eq!(
+        prepared.evaluate_batch(&[operating[0], bad, operating[2]], &mut outputs, 150.0),
+        Err(EvaluationError::InvalidPhysicalDomain)
+    );
+    assert_eq!(outputs, [first, sentinel, sentinel]);
     bad = operating[0];
     bad.currents.ic = f64::NAN;
     assert!(matches!(

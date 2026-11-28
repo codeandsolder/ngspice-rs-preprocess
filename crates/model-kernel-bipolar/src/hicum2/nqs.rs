@@ -7,7 +7,7 @@
 //! mutation occurs in this numerical source kernel.
 
 use super::transport;
-use crate::{EvaluationError, ModelError, validate_batch_lengths, validate_nonnegative};
+use crate::{EvaluationError, ModelError, evaluate_lanes, validate_nonnegative};
 
 const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
 
@@ -386,6 +386,9 @@ impl Prepared {
         Ok(FrequencyResponse { current, charge })
     }
 
+    /// All slice lengths are checked before any writes. Lanes run in order;
+    /// the first error leaves that lane and the remaining outputs unchanged.
+    ///
     /// # Errors
     /// Reports incompatible buffers or invalid trial auxiliary state.
     pub fn evaluate_batch(
@@ -393,11 +396,7 @@ impl Prepared {
         inputs: &[Bias],
         outputs: &mut [Output],
     ) -> Result<(), EvaluationError> {
-        validate_batch_lengths(inputs.len(), outputs.len())?;
-        for (input, output) in inputs.iter().zip(outputs) {
-            *output = self.evaluate(input)?;
-        }
-        Ok(())
+        evaluate_lanes(inputs.iter(), outputs, |input| self.evaluate(input))
     }
 }
 
