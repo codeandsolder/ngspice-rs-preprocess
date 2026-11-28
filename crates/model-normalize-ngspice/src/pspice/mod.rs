@@ -16,13 +16,21 @@ use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
 use std::{collections::BTreeMap, fmt::Write as _};
 
+pub mod digital_corners;
+pub mod digital_instance;
+pub mod digital_io;
+pub mod digital_options;
+pub mod digital_source;
+pub mod digital_timing;
 mod initialization;
 mod instances;
 pub use initialization::capture_initialization;
-mod nodes;
+pub mod nodes;
+pub mod optional_ports;
 mod options;
 mod passive;
 mod scope;
+pub mod switch_source;
 mod temperature;
 use scope::Scopes;
 
@@ -305,66 +313,9 @@ fn rename_parameter(card: &mut ModelCard, from: &str, to: &str) {
     }
 }
 
-#[derive(Clone, Copy)]
-enum SwitchLaw {
-    ThresholdVoltage,
-    ThresholdCurrent,
-    ContinuousVoltage,
-    ContinuousCurrent,
-}
+use switch_source::SwitchLaw;
 
 impl SwitchLaw {
-    fn from_model(card: &ModelCard) -> Result<Option<Self>> {
-        let voltage = card.family.eq_ignore_ascii_case("vswitch");
-        if !voltage && !card.family.eq_ignore_ascii_case("iswitch") {
-            return Ok(None);
-        }
-        let (threshold, hysteresis, on, off) = if voltage {
-            ("vt", "vh", "von", "voff")
-        } else {
-            ("it", "ih", "ion", "ioff")
-        };
-        let discrete = parameter(card, threshold).is_some()
-            || parameter(card, hysteresis).is_some()
-            || parameter(card, "td").is_some();
-        let continuous = parameter(card, on).is_some() || parameter(card, off).is_some();
-        ensure!(
-            !(discrete && continuous),
-            "PSpice switch cannot mix threshold and continuous laws"
-        );
-        let allowed = if discrete {
-            [threshold, hysteresis, "ron", "roff"]
-        } else {
-            [on, off, "ron", "roff"]
-        };
-        for field in &card.parameters {
-            if discrete && field.name.eq_ignore_ascii_case("td") {
-                ensure!(
-                    field.expression.as_deref().is_some_and(|value| matches!(
-                        parse_spice_constant(temperature::expression(value)),
-                        Ok(0.0)
-                    )),
-                    "PSpice nonzero threshold-switch delay requires a timed switch kernel"
-                );
-                continue;
-            }
-            ensure!(
-                allowed
-                    .iter()
-                    .any(|name| field.name.eq_ignore_ascii_case(name))
-                    && field.expression.is_some(),
-                "unsupported PSpice switch parameter {}",
-                field.name
-            );
-        }
-        Ok(Some(match (voltage, discrete) {
-            (true, true) => Self::ThresholdVoltage,
-            (false, true) => Self::ThresholdCurrent,
-            (true, false) => Self::ContinuousVoltage,
-            (false, false) => Self::ContinuousCurrent,
-        }))
-    }
-
     fn lower_model(self, card: &mut ModelCard, control_conductance: f64) -> Result<()> {
         match self {
             Self::ThresholdVoltage | Self::ThresholdCurrent => {
@@ -493,7 +444,7 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
         return Ok(text.to_owned());
     }
     let model = functions.scopes.model(model_line)?;
-    let Some(law) = SwitchLaw::from_model(&model)? else {
+    let Some(law) = SwitchLaw::from_static_model(&model)? else {
         return Ok(text.to_owned());
     };
     if matches!(law, SwitchLaw::ThresholdVoltage) {
@@ -543,6 +494,19 @@ fn switch_instance(text: &str, line: usize, functions: &mut Functions) -> Result
 
 fn model(line: usize, functions: &mut Functions) -> Result<String> {
     let mut card = functions.scopes.model(line)?;
+    if let Some(timing) = digital_timing::TimingModel::from_card(&card)? {
+        bail!(
+            "PSpice digital timing model {} ({:?}) requires occurrence-bound digital timing",
+            timing.name,
+            timing.family
+        );
+    }
+    if let Some(io) = digital_io::IoModel::from_card(&card)? {
+        bail!(
+            "PSpice digital I/O model {} requires occurrence-bound native digital execution",
+            io.name
+        );
+    }
     let family = card.family.to_ascii_lowercase();
     for p in &card.parameters {
         let name = p.name.to_ascii_lowercase();
@@ -587,7 +551,7 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
         set_parameter(&mut card, "level", "1")?;
         set_parameter(&mut card, "subs", "-1")?;
     }
-    if let Some(switch) = SwitchLaw::from_model(&card)? {
+    if let Some(switch) = SwitchLaw::from_static_model(&card)? {
         switch.lower_model(&mut card, functions.options.gmin)?;
     }
     let multiplier = functions.passives.lower_model(line, &mut card);
@@ -757,8 +721,34 @@ fn lower_body(
     budget: &WorkBudget,
 ) -> Result<LoweredBody> {
     budget.charge(Resource::ScannedBytes, body.len())?;
-    let statements = lexical::statements(body)?;
+    let statements = lexical::statements_with(body, |line| {
+        Ok(lexical::DollarMode::for_dialect(
+            dialects.at_mapped(origins, line)?,
+        ))
+    })?;
     let scopes = Scopes::collect(&statements, origins, dialects, budget)?;
+    let declarations = digital_source::capture(&statements, &scopes, origins, dialects)?;
+    if let Some(declaration) = declarations.delayed_switches.first() {
+        bail!(
+            "PSpice nonzero threshold-switch delay requires a timed switch kernel: {} at {:?}",
+            declaration.name,
+            declaration.location
+        );
+    }
+    if let Some(declaration) = declarations.digital.first() {
+        bail!(
+            "PSpice digital primitive {} at {:?} requires occurrence-bound native digital execution",
+            declaration.instance.declaration.name,
+            declaration.instance.location
+        );
+    }
+    if let Some(signature) = declarations.optional_ports.first() {
+        bail!(
+            "PSpice OPTIONAL: ports require occurrence binding: {} at {:?}",
+            signature.declaration.name,
+            signature.location
+        );
+    }
     let options = options::GlobalOptions::collect(&statements)?;
     let mut functions = Functions::new(body, scopes, options)?;
     let rewritten_statements = rewrite_statements(&statements, &mut functions, origins, dialects)?;

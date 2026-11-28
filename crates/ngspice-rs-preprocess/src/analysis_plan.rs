@@ -7,10 +7,13 @@ pub mod sweep;
 pub mod timing;
 use anyhow::{Context, Result, ensure};
 use measurement::MeasurementIntent;
-use model_normalize_ngspice::ltspice::transient::TransientIntent;
+use model_normalize_ngspice::{
+    ltspice::transient::TransientIntent,
+    pspice::digital_options::{DigitalOption, DigitalOptions},
+};
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Write as _, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 use sweep::{BoundAxis, CoordinateOrder, SweepAxis, SweepExecution};
 
 /// Analysis semantics (not the syntax of individual model expressions).
@@ -260,6 +263,52 @@ impl AnalysisPlan {
             entries: Vec::new(),
             statistical_sample: None,
         }
+    }
+
+    /// Bind effective global digital options from the ordered `PSpice` plan.
+    ///
+    /// The caller resolves the last assignment of each option in its source
+    /// context. Conditional or non-global assignments need topology binding.
+    ///
+    /// # Errors
+    /// Invalid or unresolved effective options, unsupported scope, or budget.
+    pub fn bind_pspice_digital_options(
+        &self,
+        mut resolve: impl FnMut(&PlanEntry, &str) -> Result<f64>,
+        budget: &WorkBudget,
+    ) -> Result<DigitalOptions> {
+        let mut effective = BTreeMap::new();
+        for entry in &self.entries {
+            budget.charge(Resource::EvaluationSteps, 1)?;
+            if entry.dialect != AnalysisDialect::Pspice {
+                continue;
+            }
+            if let Directive::Options { settings } = &entry.directive {
+                for setting in settings {
+                    budget.charge(Resource::EvaluationSteps, 1)?;
+                    if let Some(option) = DigitalOption::from_name(&setting.name) {
+                        ensure!(
+                            entry.disposition != Disposition::Unsupported && entry.scope.is_empty(),
+                            "non-global PSpice digital option {} at {:?}",
+                            setting.name,
+                            entry.origin
+                        );
+                        let raw = setting.value.as_deref().with_context(|| {
+                            format!("missing value for PSpice digital option {}", setting.name)
+                        })?;
+                        effective.insert(option, (entry, raw));
+                    }
+                }
+            }
+        }
+        let mut values = BTreeMap::new();
+        for (option, (entry, raw)) in effective {
+            budget.charge(Resource::EvaluationSteps, 1)?;
+            let value = resolve(entry, raw)
+                .with_context(|| format!("digital option {option:?} at {:?}", entry.origin))?;
+            values.insert(option, value);
+        }
+        DigitalOptions::from_effective(&values)
     }
 
     /// Reject unsupported original-deck behavior. Binding-required entries
@@ -706,6 +755,9 @@ fn option_disposition(name: &str, dialect: AnalysisDialect) -> Disposition {
     {
         return Circuit;
     }
+    if dialect == AnalysisDialect::Pspice && DigitalOption::from_name(name).is_some() {
+        return RequiresBinding;
+    }
     match (dialect, name) {
         (
             AnalysisDialect::Ltspice | AnalysisDialect::Simetrix,
@@ -773,6 +825,12 @@ fn option_fields(
             ensure!(
                 !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
                 "invalid option name {name:?}"
+            );
+            ensure!(
+                dialect != AnalysisDialect::Pspice
+                    || !name.starts_with("DIG")
+                    || DigitalOption::from_name(&name).is_some(),
+                "unsupported PSpice digital option {name}"
             );
             let disposition = option_disposition(&name, dialect);
             ensure!(

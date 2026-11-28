@@ -263,7 +263,7 @@ pub fn looks_like_simplis(input: &[u8]) -> bool {
         || SIMPLIS_PREPROCESSOR_RE.is_match(input)
 }
 
-use lexical::{ensure_textual, normalize_nbsp};
+use lexical::ensure_textual;
 
 /// Reserve source identifiers, then allocate names with a monotonic cursor
 /// per canonical base. Scoped repetitions do not restart collision searches.
@@ -594,22 +594,6 @@ fn strip_standalone_end(input: &[u8], budget: &WorkBudget) -> Result<Option<Vec<
     lexical::apply_budgeted_edits(input, edits, budget)
 }
 
-fn apply_optional<F>(
-    current: &mut Vec<u8>,
-    passes: &mut Vec<NormalizationPass>,
-    pass: NormalizationPass,
-    rewrite: F,
-) where
-    F: FnOnce(&[u8]) -> Option<Vec<u8>>,
-{
-    if let Some(rewritten) = rewrite(current)
-        && rewritten != *current
-    {
-        *current = rewritten;
-        passes.push(pass);
-    }
-}
-
 /// Normalize a textual model into a passive, include-safe ngspice artifact.
 ///
 /// The function is deliberately narrow: it applies only compatibility rewrites proven by
@@ -883,6 +867,34 @@ fn normalize_selected(
     }
 }
 
+fn expanded_line_origins(
+    input: &[u8],
+    inserted_lines: &[usize],
+    budget: &WorkBudget,
+) -> Result<Option<Vec<usize>>> {
+    Ok(if inserted_lines.is_empty() {
+        None
+    } else {
+        budget.charge(
+            Resource::GeneratedNodes,
+            input
+                .split_inclusive(|byte| *byte == b'\n')
+                .count()
+                .saturating_add(inserted_lines.len()),
+        )?;
+        let mut origins = Vec::new();
+        let mut previous = inserted_lines.iter().copied().peekable();
+        for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
+            while previous.peek() == Some(&line) {
+                origins.push(line);
+                previous.next();
+            }
+            origins.push(line);
+        }
+        Some(origins)
+    })
+}
+
 fn normalize_body(
     input: &[u8],
     strip_end: bool,
@@ -905,12 +917,20 @@ fn normalize_body(
     if bytes.contains(&0xa0) {
         budget.charge(Resource::EmittedBytes, bytes.len())?;
     }
-    apply_optional(
-        &mut bytes,
-        &mut passes,
-        NormalizationPass::NormalizeNbspWhitespace,
-        normalize_nbsp,
-    );
+    if let Some(rewritten) = lexical::normalize_nbsp_with(&bytes, |line| {
+        let line = line + title_lines;
+        let origin = if let Some(origins) = origins {
+            *origins
+                .get(line - 1)
+                .context("missing source lexical origin")?
+        } else {
+            line
+        };
+        Ok::<_, anyhow::Error>(lexical::DollarMode::for_dialect(dialects.at(origin)?))
+    })? {
+        bytes = rewritten;
+        passes.push(NormalizationPass::NormalizeNbspWhitespace);
+    }
     if let Some(rewritten) = series::rewrite(
         &bytes,
         inserted_lines,
@@ -944,27 +964,7 @@ fn normalize_body(
         bytes = rewritten;
         passes.push(NormalizationPass::StripStandaloneEnd);
     }
-    let origins = if inserted_lines.is_empty() {
-        None
-    } else {
-        budget.charge(
-            Resource::GeneratedNodes,
-            input
-                .split_inclusive(|byte| *byte == b'\n')
-                .count()
-                .saturating_add(inserted_lines.len()),
-        )?;
-        let mut origins = Vec::new();
-        let mut previous = inserted_lines.iter().copied().peekable();
-        for line in 1..=input.split_inclusive(|byte| *byte == b'\n').count() {
-            while previous.peek() == Some(&line) {
-                origins.push(line);
-                previous.next();
-            }
-            origins.push(line);
-        }
-        Some(origins)
-    };
+    let origins = expanded_line_origins(input, inserted_lines, budget)?;
     let original_line = |line: usize| {
         origins.as_ref().map_or(Ok(line), |mapping| {
             mapping

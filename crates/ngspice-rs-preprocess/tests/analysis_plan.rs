@@ -757,6 +757,56 @@ fn pspice_capture_binds_independent_and_continuation_axes_separately() -> Result
 }
 
 #[test]
+fn pspice_digital_options_are_bound_not_emitted_as_native_options() -> Result<()> {
+    use model_normalize_ngspice::pspice::{
+        digital_corners::DelaySelection, digital_io::InterfaceLevel, digital_options::InitialState,
+    };
+    use ngspice_rs_preprocess::WorkBudget;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.cir");
+    fs::write(&root, b"PSpice digital policy\nV1 in 0 1\nR1 in 0 1k\n.options DIGMNTYMX={unused} DIGIOLVL=3\n+ DIGINITSTATE=0 DIGFREQ=1G DIGERRDEFAULT=0 GMIN=1e-10\n.options DIGMNTYMX=4 DIGERRLIMIT=100\n.end\n")?;
+    let bundle = prepare_path(&root, InputFormat::PspiceDeck)?;
+    let plan = bundle
+        .analysis_plan
+        .as_ref()
+        .context("missing digital option plan")?;
+    plan.validate_supported()?;
+    assert!(plan.requires_binding());
+    let bound = plan.bind_pspice_digital_options(
+        |_, raw| model_normalize_ngspice::model_card::parse_spice_constant(raw),
+        &WorkBudget::default(),
+    )?;
+    assert_eq!(bound.delay_selection, DelaySelection::WorstCase);
+    assert_eq!(bound.interface_level, InterfaceLevel::Three);
+    assert_eq!(bound.initial_state, InitialState::Clear);
+    assert_eq!(bound.frequency.to_bits(), 1e9_f64.to_bits());
+    assert_eq!(bound.constraint_error_limit, None);
+    assert_eq!(
+        bound.total_error_limit.map(f64::to_bits),
+        Some(100_f64.to_bits())
+    );
+    let text = std::str::from_utf8(&bundle.primary.bytes)?;
+    let active = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('*'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_uppercase();
+    assert!(active.contains("GMIN=1E-10"), "{text}");
+    assert!(!active.contains("DIGMNTYMX"), "{text}");
+    assert!(!active.contains("DIGIOLVL"), "{text}");
+    assert!(!active.contains("DIGINITSTATE"), "{text}");
+    assert!(!active.contains("DIGFREQ"), "{text}");
+    assert!(!active.contains("DIGERR"), "{text}");
+    fs::write(
+        &root,
+        b"Unknown digital policy\n.options DIGUNQUALIFIED=1\n.end\n",
+    )?;
+    assert!(prepare_path(&root, InputFormat::PspiceDeck).is_err());
+    Ok(())
+}
+
+#[test]
 fn pspice_temperature_and_statistical_policies_are_not_interchangeable() -> Result<()> {
     use ngspice_rs_preprocess::WorkBudget;
     let dir = tempfile::tempdir()?;

@@ -18,11 +18,13 @@ struct Scope {
     instances: BTreeSet<String>,
 }
 
-struct Declaration {
-    scope: usize,
-    card: ModelCard,
+pub(super) struct Declaration {
+    pub scope: usize,
+    pub card: ModelCard,
     base: Option<String>,
-    dialect: SourceDialect,
+    pub dialect: SourceDialect,
+    pub last_line: usize,
+    pub conditional: bool,
 }
 
 pub(super) struct Scopes {
@@ -49,10 +51,19 @@ fn parse_model(text: &str, line: usize) -> Result<(ModelCard, Option<String>)> {
         };
         ensure!(!base.is_empty(), "missing PSpice AKO base model");
         let direct = format!("{}{}", &text[..family.start], &text[end..]);
-        return Ok((
-            parse_model_card(&direct, line, &[])?,
-            Some(base.to_ascii_lowercase()),
-        ));
+        let mut card = parse_model_card(&direct, line, &[])?;
+        // Restore offsets into the original logical declaration, not the
+        // synthetic card from which the AKO prefix was removed.
+        let removed = end - family.start;
+        for field in &mut card.parameters {
+            field.span.name.start += removed;
+            field.span.name.end += removed;
+            if let Some(value) = &mut field.span.value {
+                value.start += removed;
+                value.end += removed;
+            }
+        }
+        return Ok((card, Some(base.to_ascii_lowercase())));
     }
     Ok((parse_model_card(text, line, &[])?, None))
 }
@@ -73,6 +84,7 @@ impl Scopes {
         };
         let mut scope = 0usize;
         let mut control = false;
+        let mut conditional_depth = 0usize;
         for statement in statements {
             budget.charge(Resource::Statements, 1)?;
             budget.charge(Resource::ScannedBytes, statement.text.len())?;
@@ -92,6 +104,16 @@ impl Scopes {
             }
             if control {
                 continue;
+            }
+            if first == ".if" {
+                conditional_depth = conditional_depth
+                    .checked_add(1)
+                    .context("PSpice conditional depth overflow")?;
+                budget.check_depth(conditional_depth)?;
+            } else if first == ".endif" {
+                conditional_depth = conditional_depth
+                    .checked_sub(1)
+                    .context("unmatched PSpice .ENDIF")?;
             }
             if first == ".subckt" {
                 let parent = scope;
@@ -119,7 +141,13 @@ impl Scopes {
                     .parent
                     .context("unmatched PSpice .ENDS")?;
             } else if first == ".model" {
-                result.collect_model(scope, statement.line, text, origins, dialects)?;
+                result.collect_model(
+                    scope,
+                    statement,
+                    origins,
+                    dialects,
+                    conditional_depth != 0,
+                )?;
             } else if first == ".global" {
                 result.global_ground |= text
                     .split_ascii_whitespace()
@@ -146,11 +174,13 @@ impl Scopes {
     fn collect_model(
         &mut self,
         scope: usize,
-        line: usize,
-        text: &str,
+        statement: &lexical::Statement,
         origins: &[usize],
         dialects: SourceDialects<'_>,
+        conditional: bool,
     ) -> Result<()> {
+        let line = statement.line;
+        let text = std::str::from_utf8(&statement.text)?;
         let dialect = dialects.at_mapped(origins, line)?;
         let location = || dialects.describe_mapped(origins, line);
         let (card, base) = if dialect.is_pspice() {
@@ -174,6 +204,8 @@ impl Scopes {
                 card,
                 base,
                 dialect,
+                last_line: statement.last_line,
+                conditional,
             },
         );
         Ok(())
@@ -253,7 +285,7 @@ impl Scopes {
             .is_some_and(|model| model.dialect.is_pspice())
     }
 
-    pub(super) fn model(&self, line: usize) -> Result<ModelCard> {
+    pub(super) fn model_chain(&self, line: usize) -> Result<Vec<&Declaration>> {
         // Resolve iteratively, avoiding recursive stack use on long AKO chains.
         let mut stack = Vec::new();
         let mut active = BTreeSet::new();
@@ -281,11 +313,17 @@ impl Scopes {
                 "PSpice AKO model inheritance across source dialects needs a qualified physical model contract"
             );
         }
-        let base = stack.pop().context("empty PSpice model chain")?;
+        stack.reverse();
+        Ok(stack)
+    }
+
+    pub(super) fn model(&self, line: usize) -> Result<ModelCard> {
+        let stack = self.model_chain(line)?;
+        let (base, derived) = stack.split_first().context("empty PSpice model chain")?;
         charge_card(&base.card, &self.budget)?;
         let mut model = base.card.clone();
         super::temperature::validate_base(&model)?;
-        for derived in stack.into_iter().rev() {
+        for derived in derived {
             ensure!(
                 derived.card.family.eq_ignore_ascii_case(&model.family),
                 "PSpice AKO model {} changes base family {} to {}",
@@ -310,7 +348,7 @@ pub(super) fn charge_scope(scope: &[String], budget: &WorkBudget) -> Result<()> 
     Ok(())
 }
 
-fn charge_card(card: &ModelCard, budget: &WorkBudget) -> Result<()> {
+pub(super) fn charge_card(card: &ModelCard, budget: &WorkBudget) -> Result<()> {
     budget.charge(Resource::GeneratedNodes, card.parameters.len())?;
     budget.charge(Resource::EvaluationSteps, card.parameters.len())?;
     budget.charge(
