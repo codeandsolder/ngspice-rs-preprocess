@@ -20,11 +20,12 @@ pub use legacy_bsim::{
 };
 
 pub use mos_junction::{
-    MosBottomDensity, MosBottomMeasure, MosDepletionComponent, MosDepletionPoint,
-    MosDepletionShape, MosDiffusionDimensions, MosDiffusionGeometry, MosDiffusionRule,
-    MosDiffusionTerminal, MosJunctionDepletion, MosJunctionPoint, MosJunctionSaturation,
-    MosLinearReverseJunction, MosSeriesResistance, MosSeriesResistanceRule, MosSidewallLengths,
-    MosSidewallRule, prepare_mos_diffusion,
+    Bsim3JunctionTemperature, MosBottomDensity, MosBottomMeasure, MosDepletionComponent,
+    MosDepletionPoint, MosDepletionShape, MosDepletionTemperatureCoefficients,
+    MosDiffusionDimensions, MosDiffusionGeometry, MosDiffusionRule, MosDiffusionTerminal,
+    MosJunctionDepletion, MosJunctionPoint, MosJunctionSaturation, MosLinearReverseJunction,
+    MosSeriesResistance, MosSeriesResistanceRule, MosSidewallLengths, MosSidewallRule,
+    mos_resistance_at_temperature, prepare_mos_diffusion,
 };
 
 pub use hv::{

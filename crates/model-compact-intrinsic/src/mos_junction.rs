@@ -12,6 +12,11 @@
 
 use crate::ModelError;
 
+mod temperature;
+pub use temperature::{
+    Bsim3JunctionTemperature, MosDepletionTemperatureCoefficients, mos_resistance_at_temperature,
+};
+
 /// Geometry law for the bottom and sidewall junction measures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MosDiffusionRule {
