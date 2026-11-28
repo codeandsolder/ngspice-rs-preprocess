@@ -19,8 +19,7 @@ use model_preprocess_simplis::source_dialect::{
 };
 use model_preprocess_simplis::{
     SubcircuitCatalog, lower_scoped_statements, parse_library_with_budget, parse_scoped_library,
-    parse_standalone_library, preprocess_netlist_linked_at, project_resource,
-    source_include_target,
+    preprocess_netlist_linked_at, project_resource, source_include_target,
 };
 use model_translate_simplis::{
     WholeModelTranslation, capture_artifact_initial_conditions, capture_artifact_waveforms,
@@ -455,13 +454,7 @@ fn parse_admitted_library(
             options,
             session,
         )?;
-        return parse_standalone_library(
-            origin,
-            linked.sources,
-            linked.context,
-            linked.statements,
-            session.budget(),
-        );
+        return linked.into_library(origin, session.budget());
     }
     let mut expansion = SourceExpansion::new(session, request, options);
     let dialect = expansion.expand(source, inherited, RootKind::Include, None)?;

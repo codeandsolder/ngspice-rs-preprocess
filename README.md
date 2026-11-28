@@ -115,7 +115,7 @@ origin. Local variables remain local, while promoted globals are visible to
 subsequently specialized subcircuits. Active model cards and aliases are emitted
 once at the declaration scope; occurrence-specific declarations are specialized
 with their caller's bindings. Merely adding a catalog member does not execute
-its root control program. The parsed-library v8 format preserves the selected
+its root control program. The parsed-library v9 format preserves the selected
 source program separately from its indexed declarations and retains physical
 source positions. Regenerate older parsed artifacts before using them.
 
@@ -177,7 +177,8 @@ Select `hspice-deck` explicitly; no ngspice compatibility flag is required.
 Raw linked includes and named library sections inherit the including
 resource's lexical dialect, unless a local source header overrides it.
 The compiler preserves the admitted logical statement's physical source
-span, including continuation lines. A compiled HSPICE library is neutral
+span, including continuation lines, and the shared source occurrence graph.
+A compiled HSPICE library is neutral
 source, not a prematurely lowered native include:
 
 ```sh
@@ -186,6 +187,10 @@ ngspice-rs-preprocess hspice-deck circuit.sp native --parsed-library catalog/lib
 ```
 
 Raw catalog members and compiled members use the same occurrence binding.
+The serialized catalog preserves resource visits, lexical scopes and logical
+statement locations; independent catalog admission roots are retained and
+scope indices remapped into the consuming deck. Graph topology participates
+in the catalog digest, while resource relocation does not.
 The root deck owns `PARHIER`, `XMULT_IN_EXP`, temperature defaults and
 model-selection policies. Source parameter and model aliases preserve
 electrical terminal names, nested multiplier products, and source spans.
@@ -309,8 +314,10 @@ their display spellings. Directly linked artifacts also retain an admitted
 source graph: each mapped output line identifies its source occurrence and
 electrical lexical scope, including generated lines. The graph records the
 parent include, selected library section, effective dialect and declaration
-line. Specialized HSPICE output currently retains physical spans without a
-linked graph; full cross-dialect occurrence-model binding is tracked in #70.
+line. Specialized HSPICE output retains the original graph and physical spans,
+including independently admitted catalog graphs. Synthetic dialect defaults
+have no source occurrence. Cross-dialect physical model and hierarchy policy
+composition is tracked in #70.
 
 See [original analysis intent](#original-analysis-intent) for the binding contract.
 

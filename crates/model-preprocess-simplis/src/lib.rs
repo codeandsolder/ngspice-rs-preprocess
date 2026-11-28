@@ -15,9 +15,9 @@ use std::{
 mod hierarchy;
 pub mod source_dialect;
 pub use hierarchy::{
-    BoundExpression, FunctionAlias, IncludedSource, LibrarySimulator, LinkedGeneratedLibrary,
-    LinkedPreprocessedNetlist, NetlistPreprocessStats, ParsedLibrary, PreprocessedNetlist,
-    SubcircuitCatalog, active_statement_prefix, capacitor_charge_assignments,
+    BoundExpression, FunctionAlias, IncludedSource, LibrarySimulator, LibrarySourceGraph,
+    LinkedGeneratedLibrary, LinkedPreprocessedNetlist, NetlistPreprocessStats, ParsedLibrary,
+    PreprocessedNetlist, SubcircuitCatalog, active_statement_prefix, capacitor_charge_assignments,
     linked_library_filename, lower_scoped_statements, lower_simetrix_source_view,
     lower_simetrix_source_view_with_budget, lower_spice_expression, parse_init_statement,
     parse_init_target_path, parse_library, parse_library_file, parse_library_for_simulator,

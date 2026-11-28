@@ -112,13 +112,29 @@ fn standalone_library_keeps_neutral_source_and_binds_in_consuming_deck() -> Resu
     fs::write(&child, "*#PSPICE\n.param other={PWR(-2,2)}\n")?;
     fs::write(
         &root,
-        "Catalog consumption\n.option parhier=local\nV1 in 0 1\nX1 in out test scale=2\nR1 out 0 1k\n.end\n",
+        "Catalog consumption\n.option parhier=local\nV1 in 0 1\nX1 in out test scale=2\nR1 out 0 1k\n.subckt root_unused p n\nR2 p n 2k\n.ends root_unused\n.end\n",
     )?;
     let bundle = compile(&lib, InputFormat::HspiceLibrary)?;
     let parsed = ParsedLibrary::from_json(&bundle.primary.bytes)?;
     assert_eq!(parsed.simulator(), LibrarySimulator::Hspice);
     assert_eq!(parsed.definitions(), 1);
     assert_eq!(parsed.scoped_statements()[0].text, ".param gain='LOG(100)'");
+    let admitted = parsed
+        .source_graph()
+        .context("missing serialized catalog graph")?;
+    assert_eq!(admitted.graph.visits.len(), 2);
+    assert_eq!(admitted.graph.scopes.len(), 2);
+    assert_eq!(admitted.locations.len(), parsed.scoped_statements().len());
+    let mut invalid: serde_json::Value = serde_json::from_slice(&bundle.primary.bytes)?;
+    invalid["source_graph"]["locations"][0]["scope"] = serde_json::json!(1000);
+    assert!(ParsedLibrary::from_json(&serde_json::to_vec(&invalid)?).is_err());
+    let relocated = dir.path().join("relocated");
+    fs::create_dir(&relocated)?;
+    fs::copy(&lib, relocated.join("lib.sp"))?;
+    fs::copy(&child, relocated.join("child.sp"))?;
+    let relocated_bundle = compile(&relocated.join("lib.sp"), InputFormat::HspiceLibrary)?;
+    let relocated_parsed = ParsedLibrary::from_json(&relocated_bundle.primary.bytes)?;
+    assert_eq!(parsed.source_id(), relocated_parsed.source_id());
     let raw_request = Request {
         format: InputFormat::HspiceDeck,
         input: SourceInput::File(root.clone()),
@@ -145,13 +161,46 @@ fn standalone_library_keeps_neutral_source_and_binds_in_consuming_deck() -> Resu
         (actual - 2. * 100_f64.ln()).abs() < 1e-10,
         "{actual} {text}"
     );
-    let Provenance::Native { lines, .. } = &cached.primary.provenance else {
-        anyhow::bail!("missing native spans");
+    let Provenance::Native {
+        lines,
+        source_graph: Some(graph),
+    } = &cached.primary.provenance
+    else {
+        anyhow::bail!("missing native spans and catalog graph");
     };
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.source.ends_with("child.sp") && line.line == 2)
+    let Provenance::Native {
+        lines: raw_lines,
+        source_graph: Some(raw_graph),
+    } = &raw.primary.provenance
+    else {
+        anyhow::bail!("missing raw catalog graph");
+    };
+    assert_eq!(lines, raw_lines);
+    assert_eq!(graph, raw_graph);
+    assert_eq!(graph.visits.len(), 3);
+    assert_eq!(graph.scopes.len(), 3);
+    let child_origin = lines
+        .iter()
+        .find(|line| line.source.ends_with("child.sp") && line.line == 2)
+        .context("missing child physical origin")?;
+    let child_location = child_origin.linked.context("missing child location")?;
+    let child_visit = &graph.visits[child_location.visit];
+    assert_eq!(child_visit.parent, Some(1));
+    assert_eq!(child_location.scope, 0);
+    let model_scope = graph
+        .scopes
+        .iter()
+        .position(|scope| scope.name.as_deref() == Some("test"))
+        .context("missing catalog lexical scope")?;
+    assert_eq!(model_scope, 2);
+    assert_eq!(graph.scopes[model_scope].parent, Some(0));
+    assert_eq!(
+        graph.scopes[model_scope]
+            .declaration
+            .as_ref()
+            .context("missing catalog scope declaration")?
+            .visit,
+        1
     );
     Ok(())
 }
@@ -1132,7 +1181,7 @@ fn shared_linker_retains_repeated_resource_visits_and_restores_language() -> Res
     let text = std::str::from_utf8(&bundle.primary.bytes)?;
     measure_native(dir.path(), text, "op\nwrdata actual.dat v(hp) v(pp) v(r)")?;
     let observed = values(dir.path(), "actual.dat")?;
-    for (a, e) in observed[0][1..].iter().zip([4., -4., 9.]) {
+    for (a, e) in observed[0][1..].iter().zip([-4., 4., -9.]) {
         ensure!((*a - e).abs() < 1e-12, "{a} != {e}\n{text}");
     }
     Ok(())

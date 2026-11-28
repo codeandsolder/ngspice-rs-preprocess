@@ -17,7 +17,7 @@ use model_normalize_ngspice::{
     statement_token_spans,
 };
 use model_preprocess_simplis::{
-    lower_spice_expression,
+    LibrarySourceGraph, lower_spice_expression, parse_standalone_library,
     source_dialect::{
         DialectContext, ScopedStatement, SourceDialect, model_mapping::ModelSelection,
     },
@@ -44,6 +44,32 @@ pub(super) struct LinkedExpansion {
     pub(super) sources: BTreeSet<String>,
     origins: Vec<OriginLine>,
     graph: SourceGraph,
+}
+
+impl LinkedExpansion {
+    pub(super) fn into_library(
+        self,
+        source: String,
+        budget: &WorkBudget,
+    ) -> Result<crate::ParsedLibrary> {
+        budget.charge(Resource::GeneratedNodes, self.origins.len())?;
+        let locations = self
+            .origins
+            .into_iter()
+            .map(|origin| origin.linked.context("missing admitted library occurrence"))
+            .collect::<Result<Vec<_>>>()?;
+        parse_standalone_library(
+            source,
+            self.sources,
+            self.context,
+            self.statements,
+            Some(LibrarySourceGraph {
+                graph: self.graph,
+                locations,
+            }),
+            budget,
+        )
+    }
 }
 
 /// Resource admission and lexical projection are shared with native decks.
@@ -782,6 +808,7 @@ fn lower_expansion(
 fn add_catalog(
     statements: &mut Vec<model_preprocess_simplis::source_dialect::ScopedStatement>,
     origins: &mut Vec<crate::OriginLine>,
+    graph: &mut SourceGraph,
     members: Vec<(std::borrow::Cow<'_, crate::ParsedLibrary>, String)>,
     limit: usize,
     budget: &WorkBudget,
@@ -799,7 +826,11 @@ fn add_catalog(
         if !seen.insert(member.source_id().to_owned()) {
             continue;
         }
-        for statement in member.scoped_statements() {
+        let admitted = member.source_graph();
+        let remap = admitted
+            .map(|source| graph.append_root(&source.graph, budget))
+            .transpose()?;
+        for (index, statement) in member.scoped_statements().iter().enumerate() {
             budget.charge(Resource::Statements, 1)?;
             budget.charge(Resource::ScannedBytes, statement.text.len())?;
             size = size.saturating_add(statement.text.len()).saturating_add(1);
@@ -809,11 +840,23 @@ fn add_catalog(
             );
             budget.charge(Resource::GeneratedNodes, 1)?;
             budget.charge(Resource::EmittedBytes, statement.source.len())?;
+            let location = if let (Some(source), Some(remap)) = (admitted, &remap) {
+                Some(
+                    remap.location(
+                        *source
+                            .locations
+                            .get(index)
+                            .context("missing catalog statement location")?,
+                    )?,
+                )
+            } else {
+                None
+            };
             linked_origins.push(crate::OriginLine {
                 source: std::path::PathBuf::from(&statement.source),
                 line: statement.first_line,
                 last_line: statement.last_line,
-                linked: None,
+                linked: location,
             });
             linked.push(statement.clone_with_budget(budget)?);
         }
@@ -840,7 +883,7 @@ pub(super) fn prepare(
         context,
         mut statements,
         mut origins,
-        graph,
+        mut graph,
         ..
     } = linked_resource(root, HSPICE, RootKind::Deck, request, options, session)?;
     let members = super::catalog_members(request, options, cancellation, session, context)?;
@@ -848,6 +891,7 @@ pub(super) fn prepare(
     add_catalog(
         &mut statements,
         &mut origins,
+        &mut graph,
         members,
         options.output_bytes,
         budget,

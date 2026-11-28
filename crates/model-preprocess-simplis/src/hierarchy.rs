@@ -14,11 +14,13 @@ use std::{
 
 mod runtime_params;
 mod source_aliases;
+mod source_graph;
 mod source_includes;
 use runtime_params::RuntimeScope;
+pub use source_graph::LibrarySourceGraph;
 pub use source_includes::RootIncludes;
 
-const PARSED_LIBRARY_FORMAT_VERSION: u32 = 8;
+const PARSED_LIBRARY_FORMAT_VERSION: u32 = 9;
 
 fn lower_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -74,6 +76,7 @@ pub struct ParsedLibrary {
     dialect: Option<crate::source_dialect::DialectContext>,
     device_identities: Vec<crate::source_dialect::DeviceIdentity>,
     source_id: String,
+    source_graph: Option<LibrarySourceGraph>,
     scoped_statements: Vec<crate::source_dialect::ScopedStatement>,
     source_name: String,
     source_names: BTreeSet<String>,
@@ -141,6 +144,12 @@ impl ParsedLibrary {
             budget,
         )?;
         Ok((parsed, mapped.selections))
+    }
+
+    /// Physical resource graph retained by an admitted source library.
+    #[must_use = "the returned graph maps retained statements to resource occurrences"]
+    pub const fn source_graph(&self) -> Option<&LibrarySourceGraph> {
+        self.source_graph.as_ref()
     }
 
     /// Original declarations and linked tokens before specialization.
@@ -218,15 +227,10 @@ impl ParsedLibrary {
                     .all(|identity| self.source_names.contains(&identity.source)),
             "parsed library source provenance is incomplete"
         );
-        let actual = parsed_library_digest(
-            self.simulator,
-            self.dialect,
-            &self.device_identities,
-            &self.scoped_statements,
-            &self.support_lines,
-            &self.aliases,
-            &self.definitions,
-        );
+        if let Some(graph) = &self.source_graph {
+            graph.validate(&self.scoped_statements, &self.source_names)?;
+        }
+        let actual = parsed_library_digest(self);
         if actual != self.source_id {
             bail!("parsed library content-address mismatch");
         }
@@ -1068,7 +1072,7 @@ pub fn parse_library_with_budget(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        return parse_standalone_library(source_name, sources, context, statements, budget);
+        return parse_standalone_library(source_name, sources, context, statements, None, budget);
     }
     if simulator == LibrarySimulator::Simetrix {
         let (context, view) = project_resource(
@@ -1163,6 +1167,7 @@ pub fn parse_standalone_library(
     source_names: BTreeSet<String>,
     context: crate::source_dialect::DialectContext,
     statements: Vec<crate::source_dialect::ScopedStatement>,
+    source_graph: Option<LibrarySourceGraph>,
     budget: &WorkBudget,
 ) -> Result<ParsedLibrary> {
     let mut scopes = Vec::new();
@@ -1202,13 +1207,16 @@ pub fn parse_standalone_library(
     anyhow::ensure!(scopes.is_empty(), "unclosed HSPICE library hierarchy");
     let simulator = LibrarySimulator::Hspice;
     let dialect = Some(context);
-    let source_id = parsed_library_digest(simulator, dialect, &[], &statements, &[], &[], &[]);
-    let parsed = ParsedLibrary {
+    if let Some(graph) = &source_graph {
+        graph.charge_scan(budget)?;
+    }
+    let mut parsed = ParsedLibrary {
         format_version: PARSED_LIBRARY_FORMAT_VERSION,
         simulator,
         dialect,
         device_identities: Vec::new(),
-        source_id,
+        source_id: String::new(),
+        source_graph,
         scoped_statements: statements,
         source_name,
         source_names,
@@ -1216,6 +1224,7 @@ pub fn parse_standalone_library(
         aliases: Vec::new(),
         definitions: Vec::new(),
     };
+    parsed.source_id = parsed_library_digest(&parsed);
     parsed.validate()?;
     Ok(parsed)
 }
@@ -1363,28 +1372,22 @@ fn parse_library_parts(
         definition.source_id = None;
         definition.source_name = None;
     }
-    let source_id = parsed_library_digest(
-        simulator,
-        dialect,
-        &device_identities,
-        &scoped_statements,
-        &support_lines,
-        &aliases,
-        &definitions,
-    );
-    Ok(ParsedLibrary {
+    let mut parsed = ParsedLibrary {
         format_version: PARSED_LIBRARY_FORMAT_VERSION,
         simulator,
         dialect,
         device_identities,
-        source_id,
+        source_id: String::new(),
+        source_graph: None,
         scoped_statements,
         source_name,
         source_names,
         support_lines,
         aliases,
         definitions,
-    })
+    };
+    parsed.source_id = parsed_library_digest(&parsed);
+    Ok(parsed)
 }
 
 /// Select the requested simulator projection before source interpretation.
@@ -1725,18 +1728,21 @@ fn parse_library_root(root_lines: &[String]) -> Result<(Vec<String>, Vec<Alias>)
     Ok((support_lines, aliases))
 }
 
-fn parsed_library_digest(
-    simulator: LibrarySimulator,
-    dialect: Option<crate::source_dialect::DialectContext>,
-    identities: &[crate::source_dialect::DeviceIdentity],
-    statements: &[crate::source_dialect::ScopedStatement],
-    support_lines: &[String],
-    aliases: &[Alias],
-    definitions: &[Definition],
-) -> String {
+fn parsed_library_digest(parsed: &ParsedLibrary) -> String {
+    let ParsedLibrary {
+        simulator,
+        dialect,
+        device_identities: identities,
+        scoped_statements: statements,
+        support_lines,
+        aliases,
+        definitions,
+        source_graph,
+        ..
+    } = parsed;
     let semantic_digest = library_digest(support_lines, aliases, definitions);
     let mut hasher = Sha256::new();
-    hasher.update(b"ngspice-rs-preprocess-parsed-library-v8\0");
+    hasher.update(b"ngspice-rs-preprocess-parsed-library-v9\0");
     if let Some(context) = dialect {
         hasher.update([context.language.stable_id()]);
         hasher.update(context.separator.map_or(0, u32::from).to_be_bytes());
@@ -1769,6 +1775,12 @@ fn parsed_library_digest(
         hasher.update(statement.text.len().to_string().as_bytes());
         hasher.update([0]);
         hasher.update(statement.text.as_bytes());
+    }
+    if let Some(graph) = source_graph {
+        hasher.update([1]);
+        graph.hash(&mut hasher);
+    } else {
+        hasher.update([0]);
     }
     hasher.update(simulator.as_str().as_bytes());
     hasher.update([0]);
@@ -1828,6 +1840,9 @@ fn definition_scope_id(bytes: &[u8]) -> String {
 }
 
 fn charge_catalog_scan(parsed: &ParsedLibrary, budget: &WorkBudget) -> Result<()> {
+    if let Some(graph) = &parsed.source_graph {
+        graph.charge_scan(budget)?;
+    }
     budget.charge(Resource::SourceVisits, 1)?;
     budget.charge(Resource::GeneratedNodes, parsed.definitions.len())?;
     for definition in &parsed.definitions {

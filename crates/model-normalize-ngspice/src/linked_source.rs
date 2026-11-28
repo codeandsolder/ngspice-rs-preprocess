@@ -11,8 +11,11 @@ use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{AdmittedSource, Resource, SourceSession, WorkBudget};
 use std::path::{Path, PathBuf};
 
+mod graph;
+pub use graph::{GraphRemap, LinkedLocation, SourceGraph};
+
 /// Physical source location corresponding to a linked output line.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SourceOrigin {
     /// Canonical input path whose bytes contained this statement.
     #[serde(serialize_with = "serialize_path")]
@@ -40,7 +43,7 @@ pub struct LinkedSource {
 }
 
 /// A subcircuit declaration in the linked statement stream.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SourceScope {
     /// Parent lexical scope, absent at the deck level.
     pub parent: Option<usize>,
@@ -51,7 +54,7 @@ pub struct SourceScope {
 }
 
 /// One lexical source occurrence, independent of the cached source bytes.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SourceVisit {
     /// Canonical source identity.
     #[serde(serialize_with = "serialize_path")]
