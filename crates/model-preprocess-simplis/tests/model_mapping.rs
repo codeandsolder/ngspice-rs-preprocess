@@ -239,3 +239,46 @@ fn diode_alias_uses_the_selected_kernel_parameter_grammar() -> Result<()> {
     assert!(card.contains("T_ABS={local_temp}"), "{card}");
     Ok(())
 }
+
+#[test]
+fn classic_bjt_implementation_selection_is_not_the_lexical_dialect() -> Result<()> {
+    let mut source = statements(
+        ".map ModelName=PNP Level=69 Device=BJT\n.model n NPN(IS=3p)\n.model p PNP(LEVEL=69 IS=4p TNOM=29)\n.model v NPN(LEVEL=4 IS=1p)\n",
+    );
+    source[2].context.language = SourceLanguage::Hspice;
+    let mapped = MappingTable::resolve(
+        &DeviceConfiguration::default(),
+        &source,
+        &WorkBudget::default(),
+    )?
+    .apply(&source, &WorkBudget::default())?;
+    assert_eq!(
+        mapped
+            .selections
+            .iter()
+            .map(|s| s.mapping.device)
+            .collect::<Vec<_>>(),
+        [Device::GummelPoon, Device::GummelPoon, Device::Vbic]
+    );
+    assert_eq!(
+        mapped.selections[1].mapping.origin,
+        SelectionOrigin::NetlistMap
+    );
+    assert!(
+        mapped.statements[1]
+            .text
+            .contains("gummel_poon_legacy_npn (LEVEL=1")
+    );
+    assert!(
+        mapped.statements[2]
+            .text
+            .contains("gummel_poon_legacy_pnp (LEVEL=1")
+    );
+    assert!(mapped.statements[3].text.contains("NPN (LEVEL=4"));
+    assert!(
+        table("")?
+            .apply(&statements(".model l LPNP(IS=3p)"), &WorkBudget::default())
+            .is_err()
+    );
+    Ok(())
+}
