@@ -25,7 +25,8 @@ pub mod digital_timing;
 mod initialization;
 mod instances;
 pub use initialization::capture_initialization;
-mod nodes;
+pub mod nodes;
+pub mod optional_ports;
 mod options;
 mod passive;
 mod scope;
@@ -739,6 +740,13 @@ fn lower_body(
             "PSpice digital primitive {} at {:?} requires occurrence-bound native digital execution",
             declaration.instance.declaration.name,
             declaration.instance.location
+        );
+    }
+    if let Some(signature) = declarations.optional_ports.first() {
+        bail!(
+            "PSpice OPTIONAL: ports require occurrence binding: {} at {:?}",
+            signature.declaration.name,
+            signature.location
         );
     }
     let options = options::GlobalOptions::collect(&statements)?;

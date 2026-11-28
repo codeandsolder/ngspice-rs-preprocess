@@ -3,7 +3,68 @@
 
 use crate::{lexical, model_card::positional_prefix};
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
+
+/// A named node is not necessarily local: explicit global declarations and
+/// enclosing formal ports are resolved at occurrence binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKind {
+    /// Ordinary named node, subject to normal hierarchy and port binding.
+    Named,
+    /// Implicit global reference (zero or a dollar-G-underscore name).
+    Global,
+    /// Fixed logic zero.
+    LogicLow,
+    /// Fixed logic one.
+    LogicHigh,
+    /// Fixed unknown logic value.
+    LogicUnknown,
+    /// A disconnected terminal; each occurrence is independent, not a net.
+    NotConnected,
+}
+
+/// Source node reference, with original spelling and explicit special semantics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeReference {
+    /// Original source node spelling.
+    pub name: String,
+    /// Source naming semantics.
+    pub kind: NodeKind,
+}
+
+impl NodeReference {
+    /// Classify a source node without assigning a numerical voltage or row.
+    ///
+    /// # Errors
+    /// Malformed node or an unqualified reserved digital constant.
+    pub fn parse(name: &str) -> Result<Self> {
+        ensure!(
+            !name.is_empty()
+                && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+                && !name.contains(['=', '(', ')', '{', '}', ',', '"', '\'']),
+            "invalid PSpice node {name}"
+        );
+        let upper = name.to_ascii_uppercase();
+        let kind = match upper.as_str() {
+            "$D_HI" => NodeKind::LogicHigh,
+            "$D_LO" => NodeKind::LogicLow,
+            "$D_X" => NodeKind::LogicUnknown,
+            "$D_NC" => NodeKind::NotConnected,
+            "0" => NodeKind::Global,
+            _ if upper.starts_with("$G_") => NodeKind::Global,
+            _ if upper.starts_with("$D_") => {
+                anyhow::bail!("unsupported reserved PSpice digital node {name}")
+            }
+            _ => NodeKind::Named,
+        };
+        Ok(Self {
+            name: name.to_owned(),
+            kind,
+        })
+    }
+}
 
 fn replace_nodes(
     text: &str,

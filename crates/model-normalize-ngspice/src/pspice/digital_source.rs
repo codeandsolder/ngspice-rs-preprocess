@@ -4,6 +4,7 @@ use super::{
     digital_instance::DigitalInstance,
     digital_io::IoModel,
     digital_timing::TimingModel,
+    optional_ports::OptionalPorts,
     scope::{Scopes, charge_card, charge_scope},
     switch_source::DelayedSwitchDeclaration,
 };
@@ -213,6 +214,8 @@ pub struct SourceDeclarations {
     pub digital: Vec<DigitalDeclaration>,
     /// Short-transition switch declarations with nonzero or symbolic delay.
     pub delayed_switches: Vec<DelayedSwitchDeclaration>,
+    /// Node-valued optional subcircuit signatures used by library devices.
+    pub optional_ports: Vec<Located<OptionalPorts>>,
 }
 
 pub(super) fn capture(
@@ -248,6 +251,24 @@ pub(super) fn capture(
             conditional_depth = conditional_depth
                 .checked_sub(1)
                 .context("unmatched digital source .ENDIF")?;
+        } else if first.eq_ignore_ascii_case(b".subckt")
+            && dialects.at_mapped(origins, statement.line)? == SourceDialect::Pspice
+        {
+            let text = std::str::from_utf8(&statement.text)?;
+            if let Some(signature) = OptionalPorts::parse(text, scopes.budget())? {
+                ensure!(
+                    conditional_depth == 0,
+                    "conditional PSpice optional ports require topology binding"
+                );
+                declarations.optional_ports.push(Located {
+                    location: capture.location(
+                        statement.line,
+                        statement.last_line,
+                        scopes.scope(statement.line)?,
+                    )?,
+                    declaration: signature,
+                });
+            }
         } else if first
             .first()
             .is_some_and(|byte| matches!(byte, b'u' | b'U'))
@@ -537,7 +558,7 @@ U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
             &root,
             concat!(
                 "Scoped digital\n.model base UGATE(TPLHTY=1n)\n",
-                ".subckt one p g a y\n.include gate.inc\n",
+                ".subckt one a y\n+ OPTIONAL: p=$G_DPWR g=$G_DGND\n.include gate.inc\n",
                 ".model local AKO:base UGATE(TPHLTY=2n)\n.model IO UIO(DRVH=10)\n.ends\n",
                 ".subckt two p g a y\n.include gate.inc\n",
                 ".model local AKO:base UGATE(TPHLTY=3n)\n.model IO UIO(DRVH=20)\n.ends\n.end\n",
@@ -557,6 +578,12 @@ U1 BUF p g a y t io IO_LEVEL=1 IO_LEVEL=2
         )?;
         let budget = WorkBudget::default();
         let declarations = capture_linked(&linked, RootKind::Deck, &budget)?;
+        assert_eq!(declarations.optional_ports.len(), 1);
+        let ports = &declarations.optional_ports[0];
+        assert_eq!(ports.location.scope, ["one"]);
+        assert_eq!(ports.declaration.required, ["a", "y"]);
+        assert_eq!(ports.declaration.optional[0].default.name, "$G_DPWR");
+        assert_eq!(ports.declaration.optional[1].default.name, "$G_DGND");
         let [one, two] = declarations.digital.as_slice() else {
             anyhow::bail!("expected two lexical declarations")
         };
