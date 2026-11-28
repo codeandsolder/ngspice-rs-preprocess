@@ -1660,25 +1660,26 @@ Rf2 f2 ref 1k
     measure_native(
         dir.path(),
         native,
-        "op\nwrdata op.dat v(o1,ref) v(g1,ref) v(t1,ref) v(o2,ref) v(g2,ref) v(t2,ref)\nac lin 2 100 500\nwrdata ac.dat v(o1,ref) v(g1,ref) v(f1,ref) v(o2,ref) v(g2,ref) v(f2,ref)",
+        "op\nwrdata op.dat v(t1,ref) v(t2,ref)\nac lin 3 100 500\nwrdata ac.dat v(o1,ref) v(g1,ref) v(f1,ref) v(o2,ref) v(g2,ref) v(f2,ref)",
     )?;
+    // The C XSPICE s_xfer reference initializes its output to zero in
+    // OP even for a nonzero constant input; qualify TABLE in OP and the
+    // dynamic kernels in AC instead of mistaking that behavior for the
+    // rational function's steady-state gain.
     let op = values(dir.path(), "op.dat")?;
-    for (&actual, expected) in op[0][1..].iter().zip([2., -2., 2., 3., -3., 3.]) {
+    for (&actual, expected) in op[0][1..].iter().zip([2., 3.]) {
         ensure!((actual - expected).abs() <= 1e-8, "{op:?}\n{native}");
     }
     let ac = values(dir.path(), "ac.dat")?;
-    assert_eq!(ac.len(), 2);
+    assert_eq!(ac.len(), 3);
     for row in ac {
         let frequency = row[0];
         for (index, gain, tau) in [(1, 2., 0.001), (7, 3., 0.002)] {
             let omega = std::f64::consts::TAU * frequency * tau;
             let re = gain / omega.mul_add(omega, 1.);
             let im = -re * omega;
-            let (freq_re, freq_im) = if frequency < 300. {
-                (gain, 0.)
-            } else {
-                (0., gain)
-            };
+            let fraction = (frequency - 100.) / 400.;
+            let (freq_re, freq_im) = (gain * (1. - fraction), gain * fraction);
             for (&actual, expected) in row[index..index + 6]
                 .iter()
                 .zip([re, im, -re, -im, freq_re, freq_im])
