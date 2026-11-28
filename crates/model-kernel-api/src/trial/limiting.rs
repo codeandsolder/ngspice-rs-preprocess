@@ -129,6 +129,7 @@ pub fn limvds(vnew: f64, vold: f64) -> f64 {
 
 /// `DEVlimitlog`: compress a large thermal Newton step (a temperature
 /// difference has identical numerical magnitude in Celsius and kelvin).
+///
 /// This does not clip the final physical temperature. The caller supplies
 /// finite coordinates and a positive finite step threshold.
 #[must_use = "the returned temperature is the local numerical trial point"]
@@ -149,6 +150,5 @@ pub fn limit_temperature(proposed: f64, reference: f64, threshold: f64) -> f64 {
         log_delta - threshold.log10()
     };
     let next = reference + (threshold + log).copysign(delta);
-    next.min(reference.max(proposed))
-        .max(reference.min(proposed))
+    next.clamp(reference.min(proposed), reference.max(proposed))
 }
