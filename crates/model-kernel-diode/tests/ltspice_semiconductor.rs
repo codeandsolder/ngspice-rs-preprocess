@@ -172,7 +172,7 @@ struct Circuit {
 }
 
 impl Circuit {
-    fn new(model: SourceModel, instance: Instance) -> Result<Self> {
+    fn new(model: &SourceModel, instance: Instance) -> Result<Self> {
         let artifact = artifact(model, instance, true, [5; 16])?;
         let values = artifact
             .descriptor()
@@ -282,7 +282,7 @@ impl Circuit {
 fn sidewall_topology_ac() -> Result<()> {
     let mut circuits = source_cases(include_str!("fixtures/ltspice/side-cases.tsv"))?
         .into_iter()
-        .map(|(name, model, instance)| Ok((name, Circuit::new(model, instance)?)))
+        .map(|(name, model, instance)| Ok((name, Circuit::new(&model, instance)?)))
         .collect::<Result<Vec<_>>>()?;
     let mut count = 0;
     for row in include_str!("fixtures/ltspice/side-ac-compact.tsv").lines() {
@@ -315,7 +315,7 @@ fn noise_rows(cases: &str, measured: &str, prefix: &str) -> Result<usize> {
         let label = format!("{prefix}{name}\t");
         let mut rows = measured.lines().filter(|row| row.starts_with(&label));
         let voltage = value(rows.next().ok_or("missing bias")?, "V(out)=")?;
-        let mut circuit = Circuit::new(model, instance)?;
+        let mut circuit = Circuit::new(&model, instance)?;
         circuit.bias(voltage)?;
         for row in rows {
             let frequency = value(row, "frequency=")?;

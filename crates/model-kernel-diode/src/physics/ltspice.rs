@@ -1,7 +1,7 @@
 //! Independently measured `LTspice` semiconductor diode preparation.
 //!
 //! The intrinsic exponential, generation, avalanche and depletion equations
-//! are the same shared primitives used by the SIMetrix producer. The source
+//! are the same shared primitives used by the `SIMetrix` producer. The source
 //! dialect determines its constants, geometry, conduction ceiling, noise,
 //! and temperature-dependent capacitance.
 
@@ -162,11 +162,14 @@ fn capacitance_correction(
     let nominal_ratio = nominal / REFERENCE_TEMPERATURE;
     let offset = (3. * K_OVER_Q * nominal).mul_add(
         -nominal_ratio.ln(),
-        bandgap(nominal) - nominal_ratio * REFERENCE_BANDGAP,
+        nominal_ratio.mul_add(-REFERENCE_BANDGAP, bandgap(nominal)),
     );
     let pbo = (depletion.potential - offset) / nominal_ratio;
     let adjustment = |t: f64, v: f64, grading: f64| {
-        grading.mul_add(4e-4 * (t - REFERENCE_TEMPERATURE) - (v - pbo) / pbo, 1.)
+        grading.mul_add(
+            4e-4_f64.mul_add(t - REFERENCE_TEMPERATURE, -((v - pbo) / pbo)),
+            1.,
+        )
     };
     adjustment(temperature, potential, thermal_grading)
         / adjustment(nominal, depletion.potential, depletion.grading)
@@ -339,7 +342,7 @@ impl PreparedBranch {
         let physical = (f.value + r.value) * self.factor;
         let current = self.floor.mul_add(local, physical);
         let conductance =
-            ((f.derivative + r.derivative) * self.factor + self.floor) / self.series_count;
+            (f.derivative + r.derivative).mul_add(self.factor, self.floor) / self.series_count;
         let depletion = self.law.depletion.evaluate(local);
         let depletion_charge = self.factor * depletion.value;
         let depletion_capacitance = self.factor * depletion.derivative / self.series_count;
@@ -583,9 +586,10 @@ impl PreparedInstance {
         } else {
             evaluated.total.current
         };
-        let shot = ((2. * ELEMENTARY_CHARGE) * (current + branch.shot_offset).abs()
-            + 4. * BOLTZMANN * branch.temperature * branch.floor)
-            / self.series;
+        let shot = (4. * BOLTZMANN * branch.temperature).mul_add(
+            branch.floor,
+            (2. * ELEMENTARY_CHARGE) * (current + branch.shot_offset).abs(),
+        ) / self.series;
         let flicker = if self.noise.coefficient == 0. {
             0.
         } else {

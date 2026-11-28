@@ -10,34 +10,51 @@ use model_kernel_api::{
 use super::{branch, domain, noise_branch, parameter};
 use crate::ltspice_semiconductor::{Instance, PreparedBranch, PreparedInstance, SourceModel};
 
-/// Explicit prepared family for the ordinary LTspice semiconductor law.
+/// Explicit prepared family for the ordinary `LTspice` semiconductor law.
 pub const FAMILY: &str = "ltspice_semiconductor_diode";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchTopology {
+    Absent,
+    Shared,
+    Series,
+}
+
+impl BranchTopology {
+    const fn new(branch: Option<&PreparedBranch>) -> Self {
+        match branch {
+            None => Self::Absent,
+            Some(branch) if branch.resistance() != 0. => Self::Series,
+            Some(_) => Self::Shared,
+        }
+    }
+
+    const fn has_series(self) -> bool {
+        matches!(self, Self::Series)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Topology {
-    bulk: bool,
-    sidewall: bool,
-    bulk_series: bool,
-    side_series: bool,
+    bulk: BranchTopology,
+    sidewall: BranchTopology,
 }
 
 impl Topology {
-    fn new(instance: PreparedInstance) -> Self {
+    const fn new(instance: &PreparedInstance) -> Self {
         Self {
-            bulk: instance.bulk.is_some(),
-            sidewall: instance.sidewall.is_some(),
-            bulk_series: instance.bulk.is_some_and(|b| b.resistance() != 0.),
-            side_series: instance.independent_sidewall,
+            bulk: BranchTopology::new(instance.bulk.as_ref()),
+            sidewall: BranchTopology::new(instance.sidewall.as_ref()),
         }
     }
 
     const fn bulk_node(self) -> usize {
-        if self.bulk_series { 2 } else { 0 }
+        if self.bulk.has_series() { 2 } else { 0 }
     }
 
     const fn side_node(self) -> usize {
-        if self.side_series {
-            if self.bulk_series { 3 } else { 2 }
+        if self.sidewall.has_series() {
+            if self.bulk.has_series() { 3 } else { 2 }
         } else {
             self.bulk_node()
         }
@@ -58,14 +75,14 @@ pub struct SemiconductorKernel {
 /// # Errors
 /// Invalid model, instance, series conductance or fingerprint.
 pub fn artifact(
-    model: SourceModel,
+    model: &SourceModel,
     reference: Instance,
     absolute_temperature: bool,
     fingerprint: [u8; 16],
 ) -> Result<Arc<Artifact<SemiconductorKernel>>> {
     let prepared = model.bind(reference).map_err(domain)?;
-    let topology = Topology::new(prepared);
-    check_resistance(prepared)?;
+    let topology = Topology::new(&prepared);
+    check_resistance(&prepared)?;
     let equation = |name: &str, binding| Equation {
         name: name.into(),
         kind: EquationKind::Electrical,
@@ -75,10 +92,10 @@ pub fn artifact(
         equation("anode", Binding::Terminal),
         equation("cathode", Binding::Terminal),
     ];
-    if topology.bulk_series {
+    if topology.bulk.has_series() {
         equations.push(equation("bulk_anode", Binding::Hidden));
     }
-    if topology.side_series {
+    if topology.sidewall.has_series() {
         equations.push(equation("sidewall_anode", Binding::Hidden));
     }
     let mut parameters = [
@@ -106,15 +123,18 @@ pub fn artifact(
             trial: TrialCapabilities::ENGINE,
         },
         SemiconductorKernel {
-            model,
+            model: *model,
             topology,
             absolute_temperature,
         },
     )
 }
 
-fn check_resistance(instance: PreparedInstance) -> Result<()> {
-    for junction in [instance.bulk, instance.sidewall].into_iter().flatten() {
+fn check_resistance(instance: &PreparedInstance) -> Result<()> {
+    for junction in [instance.bulk.as_ref(), instance.sidewall.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         let r = junction.resistance();
         if r != 0. && !r.recip().is_finite() {
             return Err(Error::Domain("nonrepresentable series conductance".into()));
@@ -124,10 +144,13 @@ fn check_resistance(instance: PreparedInstance) -> Result<()> {
 }
 
 impl SemiconductorKernel {
-    fn junctions(&self, instance: &PreparedInstance) -> [(Option<PreparedBranch>, usize, bool); 2] {
+    const fn junctions<'a>(
+        &self,
+        instance: &'a PreparedInstance,
+    ) -> [(Option<&'a PreparedBranch>, usize, bool); 2] {
         [
-            (instance.bulk, self.topology.bulk_node(), false),
-            (instance.sidewall, self.topology.side_node(), true),
+            (instance.bulk.as_ref(), self.topology.bulk_node(), false),
+            (instance.sidewall.as_ref(), self.topology.side_node(), true),
         ]
     }
 }
@@ -137,8 +160,13 @@ impl Kernel for SemiconductorKernel {
 
     fn prepare(&self, values: &[f64], ambient_kelvin: f64) -> Result<Self::Prepared> {
         let (base, temperature) = match (self.absolute_temperature, values) {
-            (false, [a, p, m, n, g]) => ([*a, *p, *m, *n, *g], ambient_kelvin),
-            (true, [a, p, m, n, g, t]) => ([*a, *p, *m, *n, *g], *t),
+            (false, [area, perimeter, multiplier, series, gmin]) => (
+                [*area, *perimeter, *multiplier, *series, *gmin],
+                ambient_kelvin,
+            ),
+            (true, [area, perimeter, multiplier, series, gmin, temp]) => {
+                ([*area, *perimeter, *multiplier, *series, *gmin], *temp)
+            }
             _ => return Err(Error::Shape("LTspice diode parameter count")),
         };
         let [area, perimeter, multiplier, series, gmin] = base;
@@ -153,12 +181,12 @@ impl Kernel for SemiconductorKernel {
                 gmin,
             })
             .map_err(domain)?;
-        if Topology::new(prepared) != self.topology {
+        if Topology::new(&prepared) != self.topology {
             return Err(Error::Unsupported(
                 "LTspice diode topology requires new artifact",
             ));
         }
-        check_resistance(prepared)?;
+        check_resistance(&prepared)?;
         Ok(prepared)
     }
 

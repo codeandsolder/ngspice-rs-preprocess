@@ -196,7 +196,7 @@ pub fn compile_simetrix<'a>(
     Ok(model.prepare()?)
 }
 
-/// Compile the already-resolved LTspice semiconductor model. Ordered
+/// Compile the already-resolved `LTspice` semiconductor model. Ordered
 /// duplicate assignments retain last-value precedence.
 ///
 /// The source dispatcher must select the semiconductor family before
