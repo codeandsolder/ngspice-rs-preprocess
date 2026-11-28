@@ -179,6 +179,31 @@ pub fn capture_initialization(
     {
         return Ok(None);
     }
+    capture_mapped(mapped, kind, SourceDialects::Linked(linked), budget)
+}
+
+/// Capture initialization after mixed-dialect occurrence binding.
+///
+/// # Errors
+/// Invalid mapped declaration, physical scope, or work budget.
+pub fn capture_bound_initialization(
+    mapped: &mut MappedNormalization,
+    dialects: &[SourceDialect],
+    kind: RootKind,
+    budget: &WorkBudget,
+) -> Result<Option<InitialConditions>> {
+    if !dialects.contains(&SourceDialect::Pspice) {
+        return Ok(None);
+    }
+    capture_mapped(mapped, kind, SourceDialects::Rows(dialects), budget)
+}
+
+fn capture_mapped(
+    mapped: &mut MappedNormalization,
+    kind: RootKind,
+    dialects: SourceDialects<'_>,
+    budget: &WorkBudget,
+) -> Result<Option<InitialConditions>> {
     let bytes = &mut mapped.model.bytes;
     budget.charge(Resource::ScannedBytes, bytes.len())?;
     let start = if kind == RootKind::Deck {
@@ -192,7 +217,6 @@ pub fn capture_initialization(
     let body = &bytes[start..];
     let statements = lexical::statements(body)?;
     let origins = &mapped.input_lines[usize::from(kind == RootKind::Deck)..];
-    let dialects = SourceDialects::Linked(linked);
     let source = Source {
         statements: &statements,
         scopes: Scopes::collect(&statements, origins, dialects, budget)?,

@@ -435,11 +435,7 @@ impl<'a> Binder<'a> {
                 .selections
                 .get(&line)
                 .context("missing typed model selection")?;
-            let alias = if scope == 0 && selection.mapping.device != Device::Bsim4 {
-                card.name.clone()
-            } else {
-                self.fresh('d')?
-            };
+            let alias = self.fresh('d')?;
             self.budget.charge(Resource::EmittedBytes, alias.len())?;
             aliases.insert(
                 card.name.to_ascii_uppercase(),
@@ -501,21 +497,87 @@ impl<'a> Binder<'a> {
         Ok(candidates)
     }
 
+    // A modeled passive has a positional value and a model declaration.
+    // The PSpice projection leaves its multiplier in a declaration-scoped
+    // scalar expression; never interpret its model name as that expression.
+    fn passive_reference(
+        &self,
+        scope: usize,
+        text: &str,
+        language: SourceDialect,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Result<Option<std::ops::Range<usize>>> {
+        let mut selected = None;
+        let positions = if language == SourceDialect::Pspice {
+            &[3][..]
+        } else {
+            &[3, 4][..]
+        };
+        for &index in positions {
+            let Some(range) = ranges.get(index) else {
+                continue;
+            };
+            if ranges
+                .get(index + 1)
+                .is_some_and(|next| &text[next.clone()] == "=")
+                || ranges
+                    .get(index.saturating_sub(1))
+                    .is_some_and(|previous| &text[previous.clone()] == "=")
+            {
+                continue;
+            }
+            if !self
+                .candidates(scope, &text[range.clone()].to_ascii_uppercase(), false)?
+                .is_empty()
+            {
+                ensure!(
+                    selected.replace(range.clone()).is_none(),
+                    "ambiguous modeled passive {text}"
+                );
+            }
+        }
+        Ok(selected)
+    }
+
     fn model_reference(
         &mut self,
         scope: usize,
         text: &str,
-        mos: bool,
         language: SourceDialect,
     ) -> Result<String> {
+        let Some(kind) = text.as_bytes().first().map(u8::to_ascii_uppercase) else {
+            return Ok(text.to_owned());
+        };
+        if !matches!(kind, b'D' | b'M' | b'R' | b'C' | b'L' | b'S' | b'W' | b'A') {
+            return Ok(text.to_owned());
+        }
         let spans = statement_token_spans(text)?;
-        let range = spans
-            .get(if mos { 5 } else { 3 })
-            .context("missing HSPICE device model name")?;
+        let range = match kind {
+            b'R' | b'C' | b'L' => {
+                let Some(range) = self.passive_reference(scope, text, language, &spans)? else {
+                    return Ok(text.to_owned());
+                };
+                range
+            }
+            // Generated PSpice continuous switch code models end with a
+            // model name, while their typed control ports contain nodes.
+            b'A' if language == SourceDialect::Pspice => {
+                spans.last().context("missing switch model")?.clone()
+            }
+            b'A' => anyhow::bail!("unqualified code model occurrence {text}"),
+            _ => spans
+                .get(match kind {
+                    b'D' => 3,
+                    b'W' => 4,
+                    _ => 5,
+                })
+                .context("missing device model")?
+                .clone(),
+        };
         let model = text[range.clone()].to_ascii_uppercase();
-        let candidates = self.candidates(scope, &model, mos)?;
-        ensure!(!candidates.is_empty(), "unknown HSPICE model {model}");
-        let replacement = if mos {
+        let candidates = self.candidates(scope, &model, kind == b'M')?;
+        ensure!(!candidates.is_empty(), "unknown model {model}");
+        let replacement = if kind == b'M' {
             ensure!(
                 candidates
                     .iter()
@@ -528,17 +590,31 @@ impl<'a> Binder<'a> {
             marker
         } else {
             let model = &candidates[0].model;
+            let selected = &model.selection.mapping;
+            let matches = if kind == b'A' {
+                matches!(
+                    selected.device,
+                    Device::PspiceContinuousVoltageSwitch | Device::PspiceContinuousCurrentSwitch
+                )
+            } else {
+                selected.letter == char::from(kind)
+            };
+            let device = if kind == b'D' {
+                "diode".to_owned()
+            } else {
+                char::from(kind).to_string()
+            };
             ensure!(
-                model.selection.mapping.letter == 'D',
-                "non-diode model referenced by diode occurrence"
+                matches,
+                "non-{device} model referenced by {device} occurrence"
             );
-            if model.selection.context.language == SourceDialect::Hspice {
+            if kind == b'D' && model.selection.context.language == SourceDialect::Hspice {
                 super::validate_diode_geometry(text, &spans)?;
             }
             model.alias.clone()
         };
         let mut output = text.to_owned();
-        output.replace_range(range.clone(), &replacement);
+        output.replace_range(range, &replacement);
         Ok(output)
     }
 
@@ -686,23 +762,9 @@ impl<'a> Binder<'a> {
         if let Some(transfer) = self.bind_transfer(line, names, multiplier)? {
             return Ok(transfer);
         }
-        let bound = bind_values(
-            text,
-            self.contexts[line].language,
-            names,
-            self.limit,
-            self.budget,
-        )?;
-        let bound = if command.starts_with(['D', 'M']) {
-            self.model_reference(
-                owner,
-                &bound,
-                command.starts_with('M'),
-                self.contexts[line].language,
-            )?
-        } else {
-            bound
-        };
+        let language = self.contexts[line].language;
+        let bound = self.model_reference(owner, text, language)?;
+        let bound = bind_values(&bound, language, names, self.limit, self.budget)?;
         multiplier_card(&bound, multiplier)
     }
 
@@ -812,6 +874,7 @@ pub(super) fn bind(
         selections,
         transfers,
         state,
+        ..
     } = lowered;
     budget.charge(Resource::ScannedBytes, bytes.len())?;
     let text = std::str::from_utf8(bytes)?;

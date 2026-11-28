@@ -2,7 +2,7 @@
 //! default component values. A generated parameter in the declaration's
 //! scope preserves the multiplier's binding across individual occurrences.
 
-use super::{parameter, scope::Scopes, temperature::expression};
+use super::{PhysicalKind, parameter, scope::Scopes, temperature::expression};
 use crate::{
     IdentifierAllocator, lexical,
     linked_source::SourceDialect,
@@ -120,6 +120,17 @@ impl PassiveModels {
             );
         }
         Ok(result)
+    }
+
+    pub(super) fn physical_kind(&self, line: usize) -> Option<PhysicalKind> {
+        let model = self.models.get(&line)?;
+        Some(match (model.kind, model.polynomial) {
+            (Kind::Resistor, _) => PhysicalKind::Resistor,
+            (Kind::Capacitor, false) => PhysicalKind::Capacitor,
+            (Kind::Inductor, false) => PhysicalKind::Inductor,
+            (Kind::Capacitor, true) => PhysicalKind::NonlinearCapacitor,
+            (Kind::Inductor, true) => PhysicalKind::NonlinearInductor,
+        })
     }
 
     // Return the additional parameter declaration separately so the caller

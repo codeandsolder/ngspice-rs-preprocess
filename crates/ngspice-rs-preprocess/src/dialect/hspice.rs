@@ -21,7 +21,8 @@ use model_normalize_ngspice::{
 use model_preprocess_simplis::{
     LibrarySourceGraph, lower_spice_expression, parse_standalone_library,
     source_dialect::{
-        DialectContext, ScopedStatement, SourceDialect, model_mapping::ModelSelection,
+        DeviceIdentity, DialectContext, ScopedStatement, SourceDialect,
+        model_mapping::ModelSelection,
     },
 };
 use std::{
@@ -492,6 +493,8 @@ fn map_values(
             Some(b'R' | b'C' | b'L' | b'V' | b'I' | b'B') => start(3),
             Some(kind @ (b'E'..=b'H')) => controlled_value_start(text, &ranges, *kind, language)?,
             Some(b'D') => start(4),
+            Some(b'W') => start(5),
+            Some(b'S') => start(6),
             _ => text.len(),
         },
     };
@@ -608,7 +611,7 @@ fn validate_device(
     command: &str,
     text: &str,
     fields: &[std::ops::Range<usize>],
-    hspice: bool,
+    language: SourceDialect,
 ) -> Result<()> {
     if !command.starts_with('.') {
         let kind = command.as_bytes()[0];
@@ -627,10 +630,10 @@ fn validate_device(
                     | b'X'
                     | b'D'
                     | b'M'
-            ),
+            ) || language == SourceDialect::Pspice && matches!(kind, b'S' | b'W'),
             "HSPICE device {command} requires qualified model/device lowering"
         );
-        if hspice && kind == b'D' {
+        if language == SourceDialect::Hspice && kind == b'D' {
             validate_diode_geometry(text, fields)?;
         }
     }
@@ -677,7 +680,7 @@ fn lower_card(
         bail!("HSPICE scoped parameters/options require hierarchy lowering");
     }
     if context.language == SourceDialect::Pspice {
-        validate_device(&command, text, &fields, false)?;
+        validate_device(&command, text, &fields, context.language)?;
         ensure!(
             !command.starts_with('.')
                 || matches!(
@@ -705,7 +708,7 @@ fn lower_card(
         budget.charge(Resource::GeneratedNodes, signature.formals.len())?;
         return lower_function(&signature, body, context, limit, budget);
     }
-    validate_device(&command, text, &fields, hspice)?;
+    validate_device(&command, text, &fields, context.language)?;
     let mut source = match command.as_str() {
         ".OPTION" | ".OPTIONS" | ".OPT" if hspice => normalize_options(text, state, budget)?,
         ".TEMP" => {
@@ -783,6 +786,7 @@ struct LoweredExpansion {
     /// Keys index the emitted logical source rows before occurrence binding.
     selections: SelectedModels,
     transfers: BTreeMap<usize, ControlledTransfer>,
+    device_identities: Vec<DeviceIdentity>,
     state: DeckOptions,
 }
 
@@ -954,6 +958,7 @@ fn lower_expansion(
         contexts,
         selections,
         transfers: BTreeMap::new(),
+        device_identities: Vec::new(),
         state,
     })
 }
@@ -1026,6 +1031,55 @@ fn add_catalog(
     Ok(())
 }
 
+fn insert_root_defaults(
+    bytes: &mut Vec<u8>,
+    origins: &mut Vec<OriginLine>,
+    dialects: &mut Vec<SourceDialect>,
+    state: &DeckOptions,
+    path: &std::path::Path,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<()> {
+    // HSPICE defaults to 25 C for both device nominal and analysis
+    // temperatures. Native ngspice defaults to 27 C.
+    let mut defaults = Vec::new();
+    if !state.nominal_temperature {
+        defaults.push(".options TNOM=25\n");
+    }
+    if !state.temperature {
+        defaults.push(".temp 25\n");
+    }
+    let insertion = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("missing HSPICE deck title")?
+        + 1;
+    let synthetic = crate::OriginLine {
+        source: path.to_owned(),
+        line: 0,
+        last_line: 0,
+        linked: None,
+    };
+    let default_text = defaults.concat();
+    ensure!(
+        bytes.len().saturating_add(default_text.len()) <= limit,
+        "standalone SPICE output byte budget exceeded"
+    );
+    budget.charge(Resource::EmittedBytes, default_text.len())?;
+    budget.charge(Resource::GeneratedNodes, defaults.len())?;
+    budget.charge(
+        Resource::EmittedBytes,
+        path.as_os_str().len().saturating_mul(defaults.len()),
+    )?;
+    bytes.splice(insertion..insertion, default_text.bytes());
+    origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
+    dialects.splice(
+        1..1,
+        std::iter::repeat_n(SourceDialect::Native, defaults.len()),
+    );
+    Ok(())
+}
+
 pub(super) fn prepare(
     root: &AdmittedSource,
     request: &Request,
@@ -1064,47 +1118,20 @@ pub(super) fn prepare(
         mut dialects,
     } = hierarchy::bind(&lowered, options.output_bytes, budget)?;
     let LoweredExpansion {
-        selections, state, ..
+        selections,
+        state,
+        device_identities,
+        ..
     } = lowered;
-    {
-        // HSPICE defaults to 25 C for both device nominal and analysis
-        // temperatures. Native ngspice defaults to 27 C.
-        let mut defaults = Vec::new();
-        if !state.nominal_temperature {
-            defaults.push(".options TNOM=25\n");
-        }
-        if !state.temperature {
-            defaults.push(".temp 25\n");
-        }
-        let insertion = bytes
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .context("missing HSPICE deck title")?
-            + 1;
-        let synthetic = crate::OriginLine {
-            source: root.path.clone(),
-            line: 0,
-            last_line: 0,
-            linked: None,
-        };
-        let default_text = defaults.concat();
-        ensure!(
-            bytes.len().saturating_add(default_text.len()) <= options.output_bytes,
-            "standalone SPICE output byte budget exceeded"
-        );
-        budget.charge(Resource::EmittedBytes, default_text.len())?;
-        budget.charge(Resource::GeneratedNodes, defaults.len())?;
-        budget.charge(
-            Resource::EmittedBytes,
-            root.path.as_os_str().len().saturating_mul(defaults.len()),
-        )?;
-        bytes.splice(insertion..insertion, default_text.bytes());
-        origins.splice(1..1, std::iter::repeat_n(synthetic, defaults.len()));
-        dialects.splice(
-            1..1,
-            std::iter::repeat_n(SourceDialect::Native, defaults.len()),
-        );
-    }
+    insert_root_defaults(
+        &mut bytes,
+        &mut origins,
+        &mut dialects,
+        &state,
+        &root.path,
+        options.output_bytes,
+        budget,
+    )?;
     let (electrical, analysis_plan) = analysis::extract(
         &bytes,
         &origins,
@@ -1127,6 +1154,7 @@ pub(super) fn prepare(
         budget,
     )?;
     bundle.model_selections = selections.into_values().collect();
+    bundle.device_identities = device_identities;
     bundle.analysis_plan = analysis_plan;
     Ok(bundle)
 }

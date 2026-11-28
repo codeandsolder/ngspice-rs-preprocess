@@ -1690,3 +1690,166 @@ Rf2 f2 ref 1k
     }
     Ok(())
 }
+
+#[test]
+fn pspice_passive_models_bind_declared_values_and_initialization_per_occurrence() -> Result<()> {
+    use model_normalize_ngspice::{linked_source::RootKind, parameter_scope::ModelLibrary};
+    use model_preprocess_simplis::source_dialect::model_mapping::Device;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    fs::write(
+        dir.path().join("passives.lib"),
+        r#"*#PSPICE
+.subckt cell r c l n params: factor=1
+.param RM=99
+.model RM RES(R={factor} TC1=0.001 T_MEASURED=0 T_ABS=25)
+.model CM CAP(C={factor} TC1=0.001 T_MEASURED=0 T_ABS=25)
+.model LM IND(L={factor} TC1=0.001 T_MEASURED=0 T_ABS=25)
+R1 r n RM 1k
+C1 c n CM 1n IC={factor*0.1}
+L1 l n LM 1m IC={factor*0.2}
+.ends cell
+"#,
+    )?;
+    fs::write(
+        &root,
+        r#"Mixed passive declarations
+.option parhier=global
+.param RM=9
+.inc passives.lib
+Vr1 r1 0 DC 1 AC 1
+Vr2 r2 0 DC 1 AC 1
+Vc1 c1 0 AC 1
+Vc2 c2 0 AC 1
+Il1 0 l1 AC 1
+Il2 0 l2 AC 1
+X1 r1 c1 l1 0 cell factor=2
+X2 r2 c2 l2 0 cell factor=3
+.end
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    let kinds = bundle
+        .model_selections
+        .iter()
+        .map(|selection| selection.mapping.device)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            Device::Resistor,
+            Device::NativeCapacitor,
+            Device::NativeInductor
+        ]
+    );
+    measure_native(
+        dir.path(),
+        native,
+        "op\nwrdata op.dat i(vr1) i(vr2)\nac lin 2 1k 3k\nwrdata ac.dat i(vr1) i(vc1) v(l1) i(vr2) i(vc2) v(l2)",
+    )?;
+    let op = values(dir.path(), "op.dat")?;
+    for (&actual, factor) in op[0][1..].iter().zip([2., 3.]) {
+        ensure!(
+            (actual + 1. / (1000. * factor * 1.025)).abs() < 1e-12,
+            "{op:?}\n{native}"
+        );
+    }
+    for row in values(dir.path(), "ac.dat")? {
+        let omega = row[0] * std::f64::consts::TAU;
+        for (index, factor) in [(1, 2. * 1.025), (7, 3. * 1.025)] {
+            let expected = [
+                -1. / (1000. * factor),
+                0.,
+                0.,
+                -omega * 1e-9 * factor,
+                0.,
+                omega * 1e-3 * factor,
+            ];
+            for (&actual, expected) in row[index..index + 6].iter().zip(expected) {
+                ensure!(
+                    (actual - expected).abs() <= 1e-12 + expected.abs() * 1e-8,
+                    "{row:?}\n{native}"
+                );
+            }
+        }
+    }
+    let policy = bundle
+        .initial_conditions
+        .context("missing PSpice initialization")?;
+    assert_eq!(policy.devices.len(), 4);
+    let library = ModelLibrary::parse_source(&bundle.primary.bytes, RootKind::Deck)?;
+    let mut coordinates = std::collections::BTreeMap::<String, Vec<f64>>::new();
+    for device in &policy.devices {
+        assert_eq!(device.scope.len(), 1);
+        assert_eq!(device.mode.as_deref(), Some("2"));
+        let target = device.target.as_deref().context("missing explicit IC")?;
+        coordinates
+            .entry(device.scope[0].clone())
+            .or_default()
+            .push(library.evaluate_scalar(0, target, &[])?);
+    }
+    assert_eq!(coordinates.len(), 2);
+    let mut groups = coordinates.into_values().collect::<Vec<_>>();
+    groups.sort_by(|left, right| left[0].total_cmp(&right[0]));
+    for (actual, expected) in groups.iter().flatten().zip([0.2, 0.4, 0.3, 0.6]) {
+        ensure!((actual - expected).abs() < 1e-12, "{groups:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn pspice_continuous_switch_model_and_source_identity_bind_together() -> Result<()> {
+    use model_preprocess_simplis::source_dialect::model_mapping::Device;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.sp");
+    let child = dir.path().join("switch.lib");
+    fs::write(
+        &child,
+        r#"*#PSPICE
+.subckt cell supply out ctrl n params: r=10
+.model SM VSWITCH(VON=1 VOFF=0 RON={r} ROFF=1k)
+S1 supply out ctrl n SM
+.ends cell
+"#,
+    )?;
+    fs::write(
+        &root,
+        r#"Mixed switch occurrence
+.option parhier=local
+.inc switch.lib
+V1 supply 0 1
+Vc ctrl 0 0.5
+X1 supply a ctrl 0 cell r=10
+X2 supply b ctrl 0 cell r=40
+R1 a 0 100
+R2 b 0 100
+.end
+"#,
+    )?;
+    let bundle = compile(&root, InputFormat::HspiceDeck)?;
+    let native = std::str::from_utf8(&bundle.primary.bytes)?;
+    assert_eq!(
+        bundle.model_selections[0].mapping.device,
+        Device::PspiceContinuousVoltageSwitch
+    );
+    let [identity] = bundle.device_identities.as_slice() else {
+        anyhow::bail!("expected one original switch declaration");
+    };
+    assert_eq!(identity.source, child.canonicalize()?.to_string_lossy());
+    assert_eq!(identity.scope, ["cell"]);
+    assert_eq!(identity.declared, "S1");
+    assert_eq!(
+        native
+            .lines()
+            .filter(|line| line.starts_with(&identity.linked))
+            .count(),
+        2
+    );
+    measure_native(dir.path(), native, "op\nwrdata op.dat v(a) v(b)")?;
+    let op = values(dir.path(), "op.dat")?;
+    for (&actual, expected) in op[0][1..].iter().zip([0.5, 1. / 3.]) {
+        ensure!((actual - expected).abs() < 1e-8, "{op:?}\n{native}");
+    }
+    Ok(())
+}

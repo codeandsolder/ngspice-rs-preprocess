@@ -1,22 +1,31 @@
-//! Model-declaration selection for `PSpice` junction devices. The source level
+//! Model-declaration selection for `PSpice` devices. The source level
 //! and target physical variant are distinct: `PSpice` levels 6 and 7 select
 //! Berkeley BSIM3v3.2.4, not the native level-6 or level-7 implementations.
 use super::{parameter, set_parameter};
 use crate::model_card::{ModelCard, parse_spice_constant};
 use anyhow::{Context, Result, bail, ensure};
 
-/// Qualified junction model implementation selected by the `PSpice` frontend.
+/// Qualified physical model implementation selected by the `PSpice` frontend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum JunctionKind {
+pub enum PhysicalKind {
     Diode,
     Mos1,
     Mos2,
     Mos3,
     Bsim3V324,
     Bsim4V450,
+    Resistor,
+    Capacitor,
+    Inductor,
+    NonlinearCapacitor,
+    NonlinearInductor,
+    ThresholdVoltageSwitch,
+    ThresholdCurrentSwitch,
+    ContinuousVoltageSwitch,
+    ContinuousCurrentSwitch,
 }
 
-impl JunctionKind {
+impl PhysicalKind {
     /// Target version fixed by the source physical-model selector.
     #[must_use = "the version identifies the selected implementation"]
     pub const fn version(self) -> Option<&'static str> {
@@ -25,6 +34,18 @@ impl JunctionKind {
             Self::Bsim4V450 => Some("4.5.0"),
             _ => None,
         }
+    }
+
+    /// Whether the physical model uses a nominal temperature coordinate.
+    #[must_use = "nominal temperature belongs to the selected physical law"]
+    pub const fn has_nominal_temperature(self) -> bool {
+        !matches!(
+            self,
+            Self::ThresholdVoltageSwitch
+                | Self::ThresholdCurrentSwitch
+                | Self::ContinuousVoltageSwitch
+                | Self::ContinuousCurrentSwitch
+        )
     }
 
     fn apply(self, card: &mut ModelCard) -> Result<()> {
@@ -48,7 +69,7 @@ impl JunctionKind {
 /// For AKO the selection uses the inherited
 /// effective declaration, while the declared card remains the source card.
 #[derive(Debug)]
-pub struct JunctionProjection {
+pub struct PhysicalProjection {
     /// Original lexical declaration, without inherited parameters.
     pub declaration: ModelCard,
     /// Enclosing lexical subcircuit path.
@@ -56,10 +77,10 @@ pub struct JunctionProjection {
     /// Effective source level after AKO inheritance, zero when omitted.
     pub source_level: u16,
     /// Actual selected physical implementation.
-    pub kind: JunctionKind,
+    pub kind: PhysicalKind,
 }
 
-pub(super) fn project(card: &mut ModelCard) -> Result<Option<(JunctionKind, u16)>> {
+pub(super) fn project_junction(card: &mut ModelCard) -> Result<Option<(PhysicalKind, u16)>> {
     let family = card.family.to_ascii_lowercase();
     if !matches!(family.as_str(), "d" | "nmos" | "pmos") {
         return Ok(None);
@@ -81,17 +102,17 @@ pub(super) fn project(card: &mut ModelCard) -> Result<Option<(JunctionKind, u16)
     let source_level: u16 = format!("{numeric:.0}").parse()?;
     let kind = if family == "d" {
         match source_level {
-            0 | 1 => JunctionKind::Diode,
+            0 | 1 => PhysicalKind::Diode,
             _ => return Ok(None),
         }
     } else {
         match source_level {
-            0 | 1 => JunctionKind::Mos1,
-            2 => JunctionKind::Mos2,
-            3 => JunctionKind::Mos3,
+            0 | 1 => PhysicalKind::Mos1,
+            2 => PhysicalKind::Mos2,
+            3 => PhysicalKind::Mos3,
             5 => bail!("PSpice MOS level 5 requires an EKV physical kernel"),
-            6 | 7 => JunctionKind::Bsim3V324,
-            8 => JunctionKind::Bsim4V450,
+            6 | 7 => PhysicalKind::Bsim3V324,
+            8 => PhysicalKind::Bsim4V450,
             _ => return Ok(None),
         }
     };
@@ -100,8 +121,8 @@ pub(super) fn project(card: &mut ModelCard) -> Result<Option<(JunctionKind, u16)
     {
         let version = version.trim_matches(['\'', '"']);
         let accepted = match kind {
-            JunctionKind::Bsim3V324 => matches!(version, "3.2.4" | "3.24"),
-            JunctionKind::Bsim4V450 => matches!(version, "4.5.0" | "4.5" | "4.50"),
+            PhysicalKind::Bsim3V324 => matches!(version, "3.2.4" | "3.24"),
+            PhysicalKind::Bsim4V450 => matches!(version, "4.5.0" | "4.5" | "4.50"),
             _ => false,
         };
         ensure!(

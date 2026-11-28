@@ -337,11 +337,19 @@ impl NativeProjection {
         dialects: &[SourceDialect],
         budget: &WorkBudget,
     ) -> Result<Self> {
+        let mut normalized = normalize_bound_mapped(bytes, kind, dialects, budget)?;
+        let initial_conditions = model_normalize_ngspice::pspice::capture_bound_initialization(
+            &mut normalized,
+            dialects,
+            kind,
+            budget,
+        )?;
+        let waveforms = std::mem::take(&mut normalized.waveforms);
         Ok(Self {
-            normalized: normalize_bound_mapped(bytes, kind, dialects, budget)?,
+            normalized,
             device_identities: Vec::new(),
-            waveforms: Vec::new(),
-            initial_conditions: None,
+            waveforms,
+            initial_conditions,
         })
     }
 }

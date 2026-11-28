@@ -13,7 +13,7 @@ use model_normalize_ngspice::linked_source::LinkedLocation;
 use model_normalize_ngspice::model_card::{
     ModelCard, ModelParameter, parse_model_card, parse_parameter_fields, parse_spice_constant,
 };
-use model_normalize_ngspice::pspice::{JunctionKind, JunctionProjection};
+use model_normalize_ngspice::pspice::{PhysicalKind, PhysicalProjection};
 use model_preprocess_command::{Resource, WorkBudget};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,14 @@ use super::{DialectContext, OpaqueSource, ScopedStatement};
 #[serde(rename_all = "kebab-case")]
 pub enum Device {
     NativeDiode,
+    NativeCapacitor,
+    NativeInductor,
+    PspiceNonlinearCapacitor,
+    PspiceNonlinearInductor,
+    NativeVoltageSwitch,
+    NativeCurrentSwitch,
+    PspiceContinuousVoltageSwitch,
+    PspiceContinuousCurrentSwitch,
     Diode1,
     Diode3,
     Resistor,
@@ -54,6 +62,10 @@ impl Device {
     const fn letter(self) -> char {
         match self {
             Self::NativeDiode | Self::Diode1 | Self::Diode3 => 'D',
+            Self::NativeCapacitor | Self::PspiceNonlinearCapacitor => 'C',
+            Self::NativeInductor | Self::PspiceNonlinearInductor => 'L',
+            Self::NativeVoltageSwitch | Self::PspiceContinuousVoltageSwitch => 'S',
+            Self::NativeCurrentSwitch | Self::PspiceContinuousCurrentSwitch => 'W',
             Self::Resistor | Self::HspiceResistor => 'R',
             Self::GummelPoonLegacy
             | Self::GummelPoonNative
@@ -110,7 +122,16 @@ impl Device {
             Self::VbicThermal => 1004,
             // A PSP alias carries the implementation identity itself;
             // no invented canonical source level is assigned.
-            Self::Psp103N | Self::Psp103P => 0,
+            Self::Psp103N
+            | Self::Psp103P
+            | Self::NativeCapacitor
+            | Self::NativeInductor
+            | Self::PspiceNonlinearCapacitor
+            | Self::PspiceNonlinearInductor
+            | Self::NativeVoltageSwitch
+            | Self::NativeCurrentSwitch
+            | Self::PspiceContinuousVoltageSwitch
+            | Self::PspiceContinuousCurrentSwitch => 0,
         }
     }
 }
@@ -782,19 +803,19 @@ pub struct MappedSource {
 }
 
 impl ModelSelection {
-    /// Retain the actual qualified model selected by the PSpice frontend.
+    /// Retain the actual qualified model selected by the `PSpice` frontend.
     ///
     /// The physical card is already lowered by that frontend; do not
     /// reinterpret its native spelling using SIMetrix mappings.
     ///
     /// # Errors
-    /// Invalid source model selector or a non-PSpice source context.
+    /// Invalid source model selector or a non-`PSpice` source context.
     pub fn from_pspice(
         line: &ScopedStatement,
-        projection: JunctionProjection,
+        projection: PhysicalProjection,
         budget: &WorkBudget,
     ) -> Result<Self> {
-        let JunctionProjection {
+        let PhysicalProjection {
             mut declaration,
             scope,
             source_level,
@@ -805,12 +826,21 @@ impl ModelSelection {
             "PSpice physical selection has a foreign lexical context"
         );
         let device = match kind {
-            JunctionKind::Diode => Device::NativeDiode,
-            JunctionKind::Mos1 => Device::Mos1,
-            JunctionKind::Mos2 => Device::Mos2,
-            JunctionKind::Mos3 => Device::Mos3,
-            JunctionKind::Bsim3V324 => Device::Bsim3Berkeley,
-            JunctionKind::Bsim4V450 => Device::Bsim4,
+            PhysicalKind::Diode => Device::NativeDiode,
+            PhysicalKind::Mos1 => Device::Mos1,
+            PhysicalKind::Mos2 => Device::Mos2,
+            PhysicalKind::Mos3 => Device::Mos3,
+            PhysicalKind::Bsim3V324 => Device::Bsim3Berkeley,
+            PhysicalKind::Bsim4V450 => Device::Bsim4,
+            PhysicalKind::Resistor => Device::Resistor,
+            PhysicalKind::Capacitor => Device::NativeCapacitor,
+            PhysicalKind::Inductor => Device::NativeInductor,
+            PhysicalKind::NonlinearCapacitor => Device::PspiceNonlinearCapacitor,
+            PhysicalKind::NonlinearInductor => Device::PspiceNonlinearInductor,
+            PhysicalKind::ThresholdVoltageSwitch => Device::NativeVoltageSwitch,
+            PhysicalKind::ThresholdCurrentSwitch => Device::NativeCurrentSwitch,
+            PhysicalKind::ContinuousVoltageSwitch => Device::PspiceContinuousVoltageSwitch,
+            PhysicalKind::ContinuousCurrentSwitch => Device::PspiceContinuousCurrentSwitch,
         };
         let declared_level = one(&declaration.parameters, "LEVEL")?
             .map(unsigned_level)

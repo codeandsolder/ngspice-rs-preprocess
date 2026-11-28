@@ -19,9 +19,9 @@ use std::{collections::BTreeMap, fmt::Write as _};
 
 mod initialization;
 mod instances;
-pub use initialization::capture_initialization;
-mod junction;
-pub use junction::{JunctionKind, JunctionProjection};
+pub use initialization::{capture_bound_initialization, capture_initialization};
+mod physical;
+pub use physical::{PhysicalKind, PhysicalProjection};
 mod nodes;
 mod options;
 mod passive;
@@ -61,7 +61,7 @@ struct Functions {
     gmin_name: String,
     options: options::GlobalOptions,
     renamed: Vec<RenamedDevice>,
-    junctions: BTreeMap<usize, JunctionProjection>,
+    physical_models: BTreeMap<usize, PhysicalProjection>,
     transfers: Option<BTreeMap<usize, ControlledTransfer>>,
 }
 
@@ -100,9 +100,25 @@ impl Functions {
             gmin_name,
             options,
             renamed: Vec::new(),
-            junctions: BTreeMap::new(),
+            physical_models: BTreeMap::new(),
             transfers: defer_transfers.then(BTreeMap::new),
         })
+    }
+
+    fn record_model(&mut self, line: usize, kind: PhysicalKind, source_level: u16) -> Result<()> {
+        let declaration = self.scopes.declaration(line)?;
+        scope::charge_scope(self.scopes.path(self.scope), self.scopes.budget())?;
+        self.scopes.budget().charge(Resource::GeneratedNodes, 1)?;
+        self.physical_models.insert(
+            line,
+            PhysicalProjection {
+                declaration,
+                scope: self.scopes.path(self.scope).to_vec(),
+                source_level,
+                kind,
+            },
+        );
+        Ok(())
     }
 
     fn defer_transfer(&mut self, text: &str, line: usize) -> Result<bool> {
@@ -355,6 +371,15 @@ enum SwitchLaw {
 }
 
 impl SwitchLaw {
+    const fn physical_kind(self) -> PhysicalKind {
+        match self {
+            Self::ThresholdVoltage => PhysicalKind::ThresholdVoltageSwitch,
+            Self::ThresholdCurrent => PhysicalKind::ThresholdCurrentSwitch,
+            Self::ContinuousVoltage => PhysicalKind::ContinuousVoltageSwitch,
+            Self::ContinuousCurrent => PhysicalKind::ContinuousCurrentSwitch,
+        }
+    }
+
     fn from_model(card: &ModelCard) -> Result<Option<Self>> {
         let voltage = card.family.eq_ignore_ascii_case("vswitch");
         if !voltage && !card.family.eq_ignore_ascii_case("iswitch") {
@@ -600,26 +625,9 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
     ] {
         rename_parameter(&mut card, from, to);
     }
-    if let Some((kind, source_level)) = junction::project(&mut card)? {
-        let declaration = functions.scopes.declaration(line)?;
-        scope::charge_scope(
-            functions.scopes.path(functions.scope),
-            functions.scopes.budget(),
-        )?;
-        functions
-            .scopes
-            .budget()
-            .charge(Resource::GeneratedNodes, 1)?;
-        functions.junctions.insert(
-            line,
-            JunctionProjection {
-                declaration,
-                scope: functions.scopes.path(functions.scope).to_vec(),
-                source_level,
-                kind,
-            },
-        );
-    } else if matches!(family.as_str(), "npn" | "pnp")
+    let mut selected = physical::project_junction(&mut card)?;
+    if selected.is_none()
+        && matches!(family.as_str(), "npn" | "pnp")
         && let Some(level) = parameter(&card, "level")
     {
         let level =
@@ -636,8 +644,15 @@ fn model(line: usize, functions: &mut Functions) -> Result<String> {
     }
     if let Some(switch) = SwitchLaw::from_model(&card)? {
         switch.lower_model(&mut card, functions.options.gmin)?;
+        selected = Some((switch.physical_kind(), 0));
+    }
+    if let Some(kind) = functions.passives.physical_kind(line) {
+        selected = Some((kind, 0));
     }
     let multiplier = functions.passives.lower_model(line, &mut card);
+    if let Some((kind, source_level)) = selected {
+        functions.record_model(line, kind, source_level)?;
+    }
     let mut output = String::new();
     if let Some((name, value)) = multiplier {
         let value = functions.expression(temperature::expression(&value), false)?;
@@ -707,7 +722,7 @@ struct LoweredBody {
     lines: Vec<usize>,
     definitions: (String, Vec<usize>),
     renamed: Vec<RenamedDevice>,
-    junctions: BTreeMap<usize, JunctionProjection>,
+    physical_models: BTreeMap<usize, PhysicalProjection>,
     transfers: BTreeMap<usize, ControlledTransfer>,
 }
 
@@ -881,7 +896,7 @@ fn lower_body(
         lines,
         definitions: functions.definitions()?,
         renamed: functions.renamed,
-        junctions: functions.junctions,
+        physical_models: functions.physical_models,
         transfers: functions.transfers.unwrap_or_default(),
     })
 }
@@ -976,7 +991,7 @@ fn project_mapped(
         lines,
         definitions: (definitions, definition_lines),
         mut renamed,
-        junctions,
+        physical_models,
         transfers,
     } = lower_body(
         &shared.model.bytes[title_end..],
@@ -991,7 +1006,7 @@ fn project_mapped(
             .get(first + device.input_line - 1)
             .context("missing renamed device origin")?;
     }
-    let junctions = junctions
+    let physical_models = physical_models
         .into_iter()
         .map(|(line, selection)| {
             let original = *shared
@@ -1052,7 +1067,7 @@ fn project_mapped(
             input_lines,
         },
         renamed,
-        pspice_junctions: junctions,
+        pspice_models: physical_models,
         pspice_transfers: transfers,
     })
 }
