@@ -137,6 +137,7 @@ pub struct PreparedHiSimHvNormalChannel {
     correction: ChannelCorrection,
     access: PreparedHiSimHvAccessCorrection,
     sti: super::sti::StiCorrection,
+    impact: super::impact::ImpactIonization,
     identity: Arc<()>,
 }
 
@@ -157,6 +158,13 @@ pub struct HiSimHvNormalChannelPoint {
 pub struct HiSimHvNormalChannelWithAccessPoint {
     pub intrinsic: HiSimHvNormalChannelPoint,
     pub access: HiSimHvAccessCorrectionPoint,
+}
+
+/// Coupled normal-channel state including the substrate impact currents.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HiSimHvNormalChannelWithImpactPoint {
+    pub channel: HiSimHvNormalChannelWithAccessPoint,
+    pub impact: super::HiSimHvImpactPoint,
 }
 
 /// Prepare the native enhancement-mode channel for repeated local evaluation.
@@ -199,11 +207,34 @@ pub fn prepare_hisim_hv_normal_channel(
         correction: ChannelCorrection::prepare(model, instance, mobility.multiplicity)?,
         access: prepare_hisim_hv_access_correction(model, instance)?,
         sti: super::sti::StiCorrection::prepare(model, instance, mobility.multiplicity)?,
+        impact: super::impact::ImpactIonization::prepare(model, instance)?,
         identity: Arc::clone(&instance.identity),
     })
 }
 
 impl PreparedHiSimHvNormalChannel {
+    /// Evaluate normal channel, access and impact ionization with an independent
+    /// normalized HV2 drain drift-region voltage drop (unused for HV1).
+    /// # Errors
+    /// Invalid local constitutive state or mismatched context.
+    pub fn evaluate_with_impact(
+        &self,
+        bias: HiSimHvIntrinsicBias,
+        external: HiSimHvExternalBias,
+        drift_voltage: f64,
+        transport: &PreparedHiSimHvTransport,
+    ) -> Result<HiSimHvNormalChannelWithImpactPoint, ModelError> {
+        let channel = self.evaluate_with_access(bias, external, transport)?;
+        let impact = self.impact.evaluate(
+            bias,
+            external,
+            drift_voltage,
+            &channel,
+            &transport.temperature,
+        )?;
+        Ok(HiSimHvNormalChannelWithImpactPoint { channel, impact })
+    }
+
     /// Evaluate intrinsic charge and access-corrected channel current in their
     /// independent physical coordinates, before explicit series/drift branches.
     /// # Errors

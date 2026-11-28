@@ -102,22 +102,10 @@ impl ChannelCorrection {
             if self.punchthrough != 0. {
                 // Fn_SymAdd((Vds-Pds)/2, 0.01): native sixth-order
                 // reciprocal polynomial. Differentiate the complete value.
-                let ratio = (drain - difference) / 0.01;
-                let denominator = 1.
-                    + ratio
-                        * (0.5
-                            + ratio
-                                * (1. / 6.
-                                    + ratio
-                                        * (1. / 24.
-                                            + ratio
-                                                * (1. / 120.
-                                                    + ratio * (1. / 720. + ratio / 5040.)))));
-                let surface_modified = surface + 0.01 / denominator;
+                let surface_modified =
+                    surface + super::smoothing::symmetry_add(drain - difference, 0.01, 0.);
                 let overdrive = positive(1.1 - surface_modified, 0.05) + 1e-25;
-                let power = overdrive.value.powf(self.punchthrough_exponent);
-                let power =
-                    overdrive.map(power, self.punchthrough_exponent * power / overdrive.value);
+                let power = overdrive.positive_pow(self.punchthrough_exponent);
                 let modulation = 1.
                     + drain_modified
                         * (self.drain_factor

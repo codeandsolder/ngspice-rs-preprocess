@@ -62,3 +62,37 @@ pub(super) fn unit_ceiling_power4<const N: usize>(x: Jet<N>) -> Jet<N> {
         x.value.signum() / (1. + fourth * fourth).sqrt().sqrt().sqrt()
     }
 }
+
+/// Native reciprocal sixth-order symmetry offset, with caller-defined floor.
+pub(super) fn symmetry_add<const N: usize>(difference: Jet<N>, voltage: f64, floor: f64) -> Jet<N> {
+    if voltage <= floor {
+        return Jet::constant(floor);
+    }
+    let offset = if difference.value > voltage {
+        // Factor the sixth power out of the denominator, retaining the
+        // derivative without overflowing even without a positive floor.
+        let z = voltage / difference;
+        let z2 = z * z;
+        let z3 = z2 * z;
+        voltage * z3 * z3
+            / (1. / 5040.
+                + z * (1. / 720.
+                    + z * (1. / 120. + z * (1. / 24. + z * (1. / 6. + z * (0.5 + z))))))
+    } else {
+        let ratio = difference / voltage;
+        let denominator = 1.
+            + ratio
+                * (0.5
+                    + ratio
+                        * (1. / 6.
+                            + ratio
+                                * (1. / 24.
+                                    + ratio * (1. / 120. + ratio * (1. / 720. + ratio / 5040.)))));
+        voltage / denominator
+    };
+    if offset.value < floor {
+        Jet::constant(floor)
+    } else {
+        offset
+    }
+}

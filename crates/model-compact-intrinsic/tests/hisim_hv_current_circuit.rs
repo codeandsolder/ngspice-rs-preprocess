@@ -12,6 +12,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 enum Mechanism {
     Access,
     Sti,
+    Impact,
 }
 
 fn card_parameters(
@@ -42,7 +43,41 @@ fn card_parameters(
             _ => Err(ModelError::InvalidPhysicalParameter("native STI card")),
         },
         Mechanism::Access => access_card_parameters(config),
+        Mechanism::Impact => impact_card_parameters(config),
     }
+}
+
+fn impact_card_parameters(config: f64) -> Result<&'static [(&'static str, f64)], ModelError> {
+    Ok(match config {
+        0. => &[
+            ("sub1", 0.1),
+            ("sub2", 12.),
+            ("svgs", 0.5),
+            ("svbs", 0.5),
+            ("svds", 0.9),
+            ("slg", 0.05e-6),
+            ("subld1", 0.),
+            ("ibpc1", 0.),
+        ],
+        1. => &[
+            ("sub1", 0.2),
+            ("sub2", 8.),
+            ("svgs", 0.7),
+            ("svbs", 0.3),
+            ("svds", 0.85),
+            ("slg", 0.1e-6),
+            ("svgsl", 1e-5),
+            ("svgsw", 1e-4),
+            ("svbsl", 1e-5),
+            ("slgl", 1e-5),
+            ("sub1l", 1e-5),
+            ("sub2l", 1e-5),
+            ("subld1", 0.),
+            ("ibpc1", 0.),
+        ],
+        2. => &[("sub1", 0.), ("sub2", 8.), ("subld1", 0.), ("ibpc1", 0.)],
+        _ => return Err(ModelError::InvalidPhysicalParameter("native impact card")),
+    })
 }
 
 fn access_card_parameters(config: f64) -> Result<&'static [(&'static str, f64)], ModelError> {
@@ -95,7 +130,11 @@ fn prepare(
             ParameterValue::Integer(i32::from(matches!(mechanism, Mechanism::Sti))),
         ),
     ];
-    for name in ["coisub", "coadov", "coovlp", "conqs"] {
+    fields.push((
+        "coisub",
+        ParameterValue::Integer(i32::from(matches!(mechanism, Mechanism::Impact))),
+    ));
+    for name in ["coadov", "coovlp", "conqs"] {
         fields.push((name, ParameterValue::Integer(0)));
     }
     let parameters = card_parameters(mechanism, row[7])?;
@@ -169,24 +208,35 @@ fn compare_circuit(fixture: &str, expected_count: usize, mechanism: Mechanism) -
             vds: row[9],
             vbs: row[10],
         };
-        let point = channel
-            .evaluate_with_access(
-                intrinsic,
-                HiSimHvExternalBias {
-                    vgs: intrinsic.vgs,
-                    vds: intrinsic.vds,
-                    vbs: intrinsic.vbs,
-                },
-                &temperature,
-            )?
-            .access;
-        let slope = point.current.electrical_derivative_a_per_v;
-        let actual = [
-            point.current.current_a,
-            slope.inner_vgs + slope.outer_vgs,
-            slope.inner_vds + slope.outer_vds,
-            slope.inner_vbs + slope.outer_vbs,
-        ];
+        let external = HiSimHvExternalBias {
+            vgs: intrinsic.vgs,
+            vds: intrinsic.vds,
+            vbs: intrinsic.vbs,
+        };
+        let actual = if matches!(mechanism, Mechanism::Impact) {
+            let impact = channel
+                .evaluate_with_impact(intrinsic, external, 0., &temperature)?
+                .impact;
+            let point = impact.channel_current_a;
+            [
+                point.value,
+                point.gradient[0] + point.gradient[4],
+                point.gradient[1] + point.gradient[5],
+                point.gradient[2] + point.gradient[6],
+            ]
+        } else {
+            let point = channel
+                .evaluate_with_access(intrinsic, external, &temperature)?
+                .access
+                .current;
+            let slope = point.electrical_derivative_a_per_v;
+            [
+                point.current_a,
+                slope.inner_vgs + slope.outer_vgs,
+                slope.inner_vds + slope.outer_vds,
+                slope.inner_vbs + slope.outer_vbs,
+            ]
+        };
         for (field, value) in actual.into_iter().enumerate() {
             // The converged native current itself is tightly qualified; its
             // independently differenced slopes carry finite-step error.
@@ -376,4 +426,13 @@ fn sti_current_has_independent_temperature_and_bias_gradients() -> TestResult {
         }
     }
     Ok(())
+}
+
+#[test]
+fn native_channel_impact_current_and_tied_terminal_derivatives() -> TestResult {
+    compare_circuit(
+        include_str!("fixtures/hisim-hv-impact-circuit-ngspice47.txt"),
+        1920,
+        Mechanism::Impact,
+    )
 }

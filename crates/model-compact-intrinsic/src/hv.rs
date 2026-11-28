@@ -18,6 +18,7 @@ mod fringing;
 mod gate_tunneling;
 mod gidl;
 mod heat;
+mod impact;
 mod instance;
 mod junction;
 mod junction_current;
@@ -54,7 +55,8 @@ pub use channel_electrostatics::{
 };
 pub use channel_mobility::{
     HiSimHvChannelMobilityCoefficients, HiSimHvChannelMobilityInputs, HiSimHvChannelMobilityPoint,
-    HiSimHvNormalChannelPoint, HiSimHvNormalChannelWithAccessPoint, PreparedHiSimHvNormalChannel,
+    HiSimHvNormalChannelPoint, HiSimHvNormalChannelWithAccessPoint,
+    HiSimHvNormalChannelWithImpactPoint, PreparedHiSimHvNormalChannel,
     prepare_hisim_hv_normal_channel,
 };
 pub use channel_modulation::{
@@ -87,6 +89,7 @@ pub use heat::{
     HiSimHvDrainBias, HiSimHvDrainCurrent, HiSimHvElectricalGradient, HiSimHvGeneratedHeat,
     HiSimHvThermalJacobianRow, evaluate_hisim_hv_generated_heat,
 };
+pub use impact::{HiSimHvImpactPoint, HiSimHvImpactScalar};
 pub use instance::{HiSimHvBinningGeometry, PreparedHiSimHvInstance, prepare_hisim_hv_instance};
 pub use junction::{
     HiSimHvJunctionBias, HiSimHvJunctionCharge, HiSimHvJunctionCharges,

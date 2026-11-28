@@ -66,32 +66,7 @@ fn confined_body(body: Jet, maximum: Jet) -> (Jet, Jet) {
     };
     (value, slope)
 }
-fn symmetry_offset(drain: Jet, slope: Jet, voltage: f64) -> Jet {
-    const FLOOR: f64 = 1e-12;
-    if voltage <= FLOOR {
-        return Jet::constant(FLOOR);
-    }
-    let ratio = slope * drain / voltage;
-    // The highest-order term alone bounds the positive polynomial; this
-    // shortcut avoids overflow at ratios whose offset is already clamped.
-    if ratio.value > 1. && ratio.value.ln() * 6. > (voltage / FLOOR).ln() + 5040_f64.ln() {
-        return Jet::constant(FLOOR);
-    }
-    let denominator = 1.
-        + ratio
-            * (0.5
-                + ratio
-                    * (1. / 6.
-                        + ratio
-                            * (1. / 24.
-                                + ratio * (1. / 120. + ratio * (1. / 720. + ratio / 5040.)))));
-    let offset = voltage / denominator;
-    if offset.value < FLOOR {
-        Jet::constant(FLOOR)
-    } else {
-        offset
-    }
-}
+
 /// Condition normalized intrinsic voltages using the native body clamp and
 /// symmetry polynomial, including the clamp's mixed temperature derivatives.
 /// # Errors
@@ -140,7 +115,7 @@ pub fn evaluate_hisim_hv_bias_conditioning(
     let (body, slope) = confined_body(Jet::coordinate(bias.vbs, 2, 1.), maximum);
     let drain = Jet::coordinate(bias.vds, 1, 1.);
     let gate = Jet::coordinate(bias.vgs, 0, 1.);
-    let offset = symmetry_offset(drain, slope, symmetry_voltage);
+    let offset = super::smoothing::symmetry_add(slope * drain, symmetry_voltage, 1e-12);
     Ok(HiSimHvBiasConditioningPoint {
         confined_body: body.checked("HiSIM-HV confined body")?,
         confinement_slope: slope.checked("HiSIM-HV confinement slope")?,

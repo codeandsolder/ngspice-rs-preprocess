@@ -1069,8 +1069,14 @@ two nearly equal smoothed square roots. The 1,920 native STI circuit points
 include three cards, both polarities and families, multifinger geometry and
 finite-difference gradients; independent local temperature and bias
 derivatives are also tested.
-HV2 depletion-mode transport, explicit series/drift corrections, parasitic
-assembly, noise and full circuit-level qualification remain work.
+Channel and drift impact-ionization components retain independent intrinsic,
+external and HV2 drain-to-prime voltage derivatives (eight coordinates
+including temperature). The channel law is qualified against 1,920 native
+substrate-current points with same-branch finite differences at the HV1 D1
+cutoff. The drift impact branch and impact-induced bulk-potential feedback
+are qualified separately. HV2 depletion-mode transport, explicit series/drift
+resistance, parasitic assembly, noise and full circuit-level qualification
+remain work.
 
 ## Reference test coverage
 
