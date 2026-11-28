@@ -41,6 +41,8 @@ pub enum InputFormat {
     TinaLibrary,
     /// Complete `LTspice` source deck, emitted in native syntax.
     LtspiceDeck,
+    /// Headless `LTspice` ASCII schematic and its symbol/hierarchy graph.
+    LtspiceSchematic,
     /// `LTspice` source library, emitted as include-safe native syntax.
     LtspiceLibrary,
     /// Standalone `PSpice` deck lowered to native SPICE.
@@ -83,6 +85,7 @@ impl InputFormat {
             "tina-deck" => Ok(Self::TinaDeck),
             "tina-library" => Ok(Self::TinaLibrary),
             "ltspice-deck" => Ok(Self::LtspiceDeck),
+            "ltspice-schematic" => Ok(Self::LtspiceSchematic),
             "ltspice-library" => Ok(Self::LtspiceLibrary),
             "pspice-deck" => Ok(Self::PspiceDeck),
             "pspice-library" => Ok(Self::PspiceLibrary),
@@ -398,7 +401,9 @@ fn project_native(
         _ => {
             let dialect = if matches!(
                 format,
-                InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary
+                InputFormat::LtspiceDeck
+                    | InputFormat::LtspiceLibrary
+                    | InputFormat::LtspiceSchematic
             ) {
                 NormalizationDialect::Ltspice
             } else {
@@ -425,6 +430,7 @@ fn native(
         request.format,
         InputFormat::NativeDeck
             | InputFormat::LtspiceDeck
+            | InputFormat::LtspiceSchematic
             | InputFormat::PspiceDeck
             | InputFormat::QspiceDeck
             | InputFormat::TinaDeck
@@ -434,6 +440,24 @@ fn native(
         RootKind::Include
     };
     let origin = root.path.clone();
+    let imported = if request.format == InputFormat::LtspiceSchematic {
+        let deck = model_import_ltspice::import(
+            root,
+            &request.search_paths,
+            session,
+            options.output_bytes,
+        )?;
+        Some((
+            AdmittedSource {
+                path: origin.clone(),
+                bytes: Arc::from(deck.bytes),
+            },
+            deck.origins,
+        ))
+    } else {
+        None
+    };
+    let root = imported.as_ref().map_or(root, |(source, _)| source);
     if matches!(
         request.format,
         InputFormat::TinaDeck | InputFormat::TinaLibrary
@@ -441,7 +465,9 @@ fn native(
         model_normalize_ngspice::tina::validate_plaintext(&root.bytes)?;
     }
     let syntax = match request.format {
-        InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary => LibrarySyntax::Ltspice,
+        InputFormat::LtspiceDeck | InputFormat::LtspiceLibrary | InputFormat::LtspiceSchematic => {
+            LibrarySyntax::Ltspice
+        }
         InputFormat::PspiceDeck
         | InputFormat::PspiceLibrary
         | InputFormat::TinaDeck
@@ -465,12 +491,32 @@ fn native(
     let origins = linked
         .origins
         .into_iter()
-        .map(|mapped| OriginLine {
-            source: mapped.path,
-            line: mapped.line,
-            last_line: mapped.line,
+        .map(|mapped| {
+            if let Some((_, origins)) = &imported
+                && mapped.path == origin
+            {
+                let original = origins
+                    .get(
+                        mapped
+                            .line
+                            .checked_sub(1)
+                            .context("invalid schematic source line")?,
+                    )
+                    .context("missing schematic source origin")?;
+                Ok(OriginLine {
+                    source: original.path.clone(),
+                    line: original.line,
+                    last_line: original.line,
+                })
+            } else {
+                Ok(OriginLine {
+                    source: mapped.path,
+                    line: mapped.line,
+                    last_line: mapped.line,
+                })
+            }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     native_bundle(
         origin,
         request.format,
@@ -556,6 +602,7 @@ fn validate_request(request: &Request) -> Result<()> {
                     | InputFormat::TinaDeck
                     | InputFormat::TinaLibrary
                     | InputFormat::LtspiceDeck
+                    | InputFormat::LtspiceSchematic
                     | InputFormat::LtspiceLibrary
                     | InputFormat::PspiceDeck
                     | InputFormat::PspiceLibrary
@@ -605,6 +652,7 @@ pub fn prepare(
         | InputFormat::TinaDeck
         | InputFormat::TinaLibrary
         | InputFormat::LtspiceDeck
+        | InputFormat::LtspiceSchematic
         | InputFormat::LtspiceLibrary
         | InputFormat::PspiceDeck
         | InputFormat::PspiceLibrary

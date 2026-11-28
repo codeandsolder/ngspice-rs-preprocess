@@ -168,6 +168,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-import-ltspice"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "model-preprocess-command",
+ "tempfile",
+]
+
+[[package]]
 name = "model-kernel-api"
 version = "0.1.0"
 
@@ -281,6 +290,7 @@ name = "ngspice-rs-preprocess"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "model-import-ltspice",
  "model-kernel-diode",
  "model-normalize-ngspice",
  "model-preprocess-command",

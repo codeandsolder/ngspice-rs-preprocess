@@ -15,7 +15,7 @@ use std::{
 
 const USAGE: &str = "\
 Usage: ngspice-rs-preprocess FORMAT INPUT OUTPUT_DIRECTORY [OPTIONS]
-Formats: native-deck, native-library, ltspice-deck, ltspice-library,
+Formats: native-deck, native-library, ltspice-deck, ltspice-library, ltspice-schematic,
          pspice-deck, pspice-library, qspice-deck, qspice-library,
          tina-deck, tina-library, hspice-deck, hspice-library,
          simplis-deck, simetrix-deck,

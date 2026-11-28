@@ -1,0 +1,11 @@
+R1 a1 b1 1k
+R2 a2 b2 2k
+R3 a3 b3 3k
+R4 a4 b4 4k
+R5 a5 b5 5k
+R6 a6 b6 6k
+R7 a7 b7 7k
+R8 a8 b8 8k
+.op
+.backanno
+.end

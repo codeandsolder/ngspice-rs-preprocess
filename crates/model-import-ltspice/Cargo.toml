@@ -1,0 +1,19 @@
+[package]
+name = "model-import-ltspice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Headless LTspice schematic connectivity and source importer"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+model-preprocess-command.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

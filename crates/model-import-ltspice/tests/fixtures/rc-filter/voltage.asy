@@ -1,0 +1,7 @@
+Version 4
+SymbolType CELL
+SYMATTR Prefix V
+PIN 0 16 NONE 0
+PINATTR SpiceOrder 1
+PIN 0 96 NONE 0
+PINATTR SpiceOrder 2
