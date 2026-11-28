@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{DialectContext, OpaqueSource, ScopedStatement};
 
+mod bsim3_junction;
+pub use bsim3_junction::{HspiceBsim3BerkeleyJunctions, HspiceBsim3JunctionInput};
+
 /// Simulator implementation identity. Different charge, temperature and
 /// geometry laws must not share an identity solely because a native
 /// simulator uses the same level number.

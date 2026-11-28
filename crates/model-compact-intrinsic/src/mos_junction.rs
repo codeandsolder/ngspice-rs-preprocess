@@ -12,7 +12,12 @@
 
 use crate::ModelError;
 
+mod berkeley;
 mod temperature;
+pub use berkeley::{
+    Bsim3BerkeleyJunction, Bsim3JunctionModel, Bsim3JunctionOccurrence, Bsim3JunctionRules,
+    Bsim3KneeReference, PreparedBsim3Junction,
+};
 pub use temperature::{
     Bsim3JunctionTemperature, MosDepletionTemperatureCoefficients, mos_resistance_at_temperature,
 };
@@ -222,6 +227,8 @@ impl MosDiffusionGeometry {
 /// Series-resistance law, independent of the diode geometry/current law.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MosSeriesResistanceRule {
+    /// Sheet resistance only (no direct or contact resistance).
+    SheetOnly,
     /// Sheet squares, or the explicit terminal resistance if that term is zero.
     Explicit,
     /// Light diffusion plus the supplied/default number of squares.
@@ -240,7 +247,8 @@ pub struct MosSeriesResistance {
     pub contact_resistance_ohm: f64,
     pub squares: Option<f64>,
     pub default_squares: f64,
-    pub light_diffusion_m: f64,
+    /// Total light diffusion path, including any lateral diffusion (LD + LDIF).
+    pub light_path_m: f64,
 }
 
 impl MosSeriesResistance {
@@ -269,6 +277,9 @@ impl MosSeriesResistance {
             )
         };
         let resistance = match rule {
+            MosSeriesResistanceRule::SheetOnly => {
+                return nonnegative(squares()? * sheet, "MOS sheet resistance");
+            }
             MosSeriesResistanceRule::Explicit => {
                 let sheet_term = squares()? * sheet;
                 if sheet_term > 0. {
@@ -280,7 +291,7 @@ impl MosSeriesResistance {
             MosSeriesResistanceRule::DirectContact => squares()?.mul_add(sheet, terminal),
             MosSeriesResistanceRule::WidthDependent | MosSeriesResistanceRule::AutomaticSquares => {
                 let width = dimensions.diffusion_width()?;
-                let light = nonnegative(self.light_diffusion_m, "light MOS diffusion length")?;
+                let light = nonnegative(self.light_path_m, "light MOS diffusion length")?;
                 let squares = match (rule, explicit) {
                     (MosSeriesResistanceRule::AutomaticSquares, None) => {
                         dimensions.heavy_length()? / width
@@ -521,17 +532,27 @@ impl MosBottomDensity {
     }
 }
 
+/// Explicit choice of the direct saturation-current law when density terms vanish.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MosSaturationFallback {
+    None,
+    /// Only missing/zero geometric measures invoke the direct current.
+    ZeroGeometry(f64),
+    /// A zero weighted saturation current invokes the direct current, even with geometry.
+    ZeroCurrent(f64),
+}
+
 /// Per-device saturation current preparation, after temperature correction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MosJunctionSaturation {
     pub bottom: MosBottomDensity,
     pub sidewall_a_per_m: f64,
-    pub fallback_a: f64,
+    pub fallback: MosSaturationFallback,
 }
 
 impl MosJunctionSaturation {
-    /// Use the explicit per-device saturation current only when both
-    /// geometric contributions are zero. No multiplicity is applied here.
+    /// Weight the bottom and sidewall densities and apply the explicitly
+    /// selected direct-current rule. No multiplicity is applied here.
     ///
     /// # Errors
     /// Invalid geometry, units or nonrepresentable saturation current.
@@ -543,11 +564,20 @@ impl MosJunctionSaturation {
             sidewall.mul_add(perimeter, bottom),
             "MOS junction saturation current",
         )?;
-        if total > 0. {
-            Ok(total)
-        } else {
-            nonnegative(self.fallback_a, "MOS fallback saturation current")
-        }
+        let extent = match geometry.bottom {
+            MosBottomMeasure::AreaM2(value) | MosBottomMeasure::WidthM(value) => value,
+        };
+        let direct = match self.fallback {
+            MosSaturationFallback::None => None,
+            MosSaturationFallback::ZeroGeometry(value) if extent == 0. && perimeter == 0. => {
+                Some(value)
+            }
+            MosSaturationFallback::ZeroCurrent(value) if total == 0. => Some(value),
+            _ => None,
+        };
+        direct.map_or(Ok(total), |value| {
+            nonnegative(value, "MOS direct saturation current")
+        })
     }
 }
 

@@ -12,6 +12,7 @@ description = "SIMPLIS and SIMetrix lexical preprocessing and catalog preparatio
 workspace = true
 
 [dependencies]
+model-compact-intrinsic.workspace = true
 model-kernel-diode.workspace = true
 model-normalize-ngspice.workspace = true
 model-preprocess-command.workspace = true

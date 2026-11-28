@@ -1,9 +1,11 @@
 use model_compact_intrinsic::{
-    Bsim3JunctionTemperature, MosBottomDensity, MosBottomMeasure, MosDepletionComponent,
-    MosDepletionShape, MosDepletionTemperatureCoefficients, MosDiffusionDimensions,
-    MosDiffusionGeometry, MosDiffusionRule, MosDiffusionTerminal, MosJunctionDepletion,
-    MosJunctionSaturation, MosLinearReverseJunction, MosSeriesResistance, MosSeriesResistanceRule,
-    MosSidewallRule, mos_resistance_at_temperature, prepare_mos_diffusion,
+    Bsim3BerkeleyJunction, Bsim3JunctionModel, Bsim3JunctionOccurrence, Bsim3JunctionRules,
+    Bsim3JunctionTemperature, Bsim3KneeReference, MosBottomDensity, MosBottomMeasure,
+    MosDepletionComponent, MosDepletionShape, MosDepletionTemperatureCoefficients,
+    MosDiffusionDimensions, MosDiffusionGeometry, MosDiffusionRule, MosDiffusionTerminal,
+    MosJunctionDepletion, MosJunctionSaturation, MosLinearReverseJunction, MosSaturationFallback,
+    MosSeriesResistance, MosSeriesResistanceRule, MosSidewallRule, PreparedBsim3Junction,
+    mos_resistance_at_temperature, prepare_mos_diffusion,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -142,7 +144,7 @@ fn series_laws_resolve_explicit_zero_and_omitted_squares() -> TestResult {
         contact_resistance_ohm: 3.,
         squares: None,
         default_squares: 2.,
-        light_diffusion_m: 0.5e-6,
+        light_path_m: 0.5e-6,
     };
     near(
         model.prepare(MosSeriesResistanceRule::Explicit, DIMENSIONS)?,
@@ -243,18 +245,21 @@ mod native_oracle {
         contact_resistance_ohm: 3.,
         squares: None,
         default_squares: 1.,
-        light_diffusion_m: 0.5e-6,
+        light_path_m: 0.7e-6,
     };
     const MULTIPLICITY: f64 = 2.;
     const TEMPERATURE: f64 = 300.15;
+    const LIMITING_CURRENT: f64 = 2e-8;
+    const GMIN: f64 = 1e-18;
 
     fn simulate(
         version: &str,
         body_bias: f64,
         temperature_c: f64,
+        ijth: f64,
     ) -> Result<BTreeMap<String, f64>, Box<dyn std::error::Error>> {
         let source = format!(
-            "ACM12 independent geometry witness\n.options gmin=1e-18 tnom=27\n.temp {temperature_c}\nVd d 0 0\nVg g 0 0\nVs s 0 0\nVb b 0 {body_bias}\nM1 d g s b n l=2u w=10u m=2 ad=12p ps=4u nrs=3\n.model n nmos level=49 version={version} acm=12 calcacm=1 wmlt=0.8 xw=1u hdif=2u ldif=0.5u rsh=45 rd=90 rs=90 rdc=3 rsc=3 cj=0.001 cjsw=2e-10 cjswg=3e-10 js=0.1 jsw=2e-8 pb=0.9 pbsw=0.8 pbswg=0.7 mj=0.5 mjsw=0.3 mjswg=0.2 nj=1.2 xti=3 tcj=0.001 tcjsw=0.002 tcjswg=0.003 tpb=0.001 tpbsw=0.0015 tpbswg=0.002\n.control\nset numdgt=17\nop\nprint @m1[capbd] @m1[capbs] @m1[ibd] @m1[ibs] @m1[vbs] @m1[vds] i(vd) i(vs)\nquit\n.endc\n.end\n"
+            "ACM12 independent geometry witness\n.options gmin=1e-18 tnom=27 reltol=1e-10 abstol=1e-20 vntol=1e-12 bypass=0\n.temp {temperature_c}\nVd d 0 0\nVg g 0 0\nVs s 0 0\nVb b 0 {body_bias}\nM1 d g s b n l=2u w=10u m=2 ad=12p ps=4u nrs=3\n.model n nmos level=49 version={version} acm=12 calcacm=1 wmlt=0.8 xw=1u hdif=2u ld=0.2u ldif=0.5u ijth={ijth} rsh=45 rd=90 rs=90 rdc=3 rsc=3 cj=0.001 cjsw=2e-10 cjswg=3e-10 js=0.1 jsw=2e-8 pb=0.9 pbsw=0.8 pbswg=0.7 mj=0.5 mjsw=0.3 mjswg=0.2 nj=1.2 xti=3 tcj=0.001 tcjsw=0.002 tcjswg=0.003 tpb=0.001 tpbsw=0.0015 tpbswg=0.002\n.control\nset numdgt=17\nop\nprint @m1[capbd] @m1[capbs] @m1[ibd] @m1[ibs] @m1[gbd] @m1[gbs] @m1[vbs] @m1[vds] i(vd) i(vs)\nquit\n.endc\n.end\n"
         );
         let work = tempfile::tempdir()?;
         fs::write(work.path().join("probe.cir"), source)?;
@@ -286,75 +291,75 @@ mod native_oracle {
         );
     }
 
-    fn capacitance(
-        geometry: MosDiffusionGeometry,
-        bias: f64,
-        temperature: Bsim3JunctionTemperature,
+    fn prepared(
+        terminal: MosDiffusionTerminal,
+        squares: Option<f64>,
+        temperature_c: f64,
         version: &str,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
-        let nominal = MosJunctionDepletion {
-            bottom: MosBottomDensity::PerSquareMetre(0.001),
-            bottom_shape: MosDepletionShape {
-                potential_v: 0.9,
-                grading: 0.5,
-            },
-            sidewall_f_per_m: 2e-10,
-            sidewall_shape: MosDepletionShape {
-                potential_v: 0.8,
-                grading: 0.3,
-            },
-            gate_edge_f_per_m: 3e-10,
-            gate_edge_shape: MosDepletionShape {
-                potential_v: 0.7,
-                grading: 0.2,
-            },
-            fallback_f: 0.,
-        };
-        let components = temperature
-            .depletion(
-                nominal,
-                [
-                    MosDepletionTemperatureCoefficients {
-                        capacitance_per_k: 0.001,
-                        potential_v_per_k: 0.001,
-                    },
-                    MosDepletionTemperatureCoefficients {
-                        capacitance_per_k: 0.002,
-                        potential_v_per_k: 0.0015,
-                    },
-                    MosDepletionTemperatureCoefficients {
-                        capacitance_per_k: if version == "3.24" { 0.003 } else { 0. },
-                        potential_v_per_k: 0.002,
-                    },
-                ],
-            )?
-            .prepare(
-                geometry,
-                MosSidewallRule::SplitPerimeter,
-                DIMENSIONS.diffusion_width()?,
-            )?;
-        let mut capacitance = 0.;
-        for component in components {
-            capacitance += component.evaluate(bias)?.capacitance_f;
-        }
-        Ok(MULTIPLICITY * capacitance)
-    }
-
-    fn current(
-        geometry: MosDiffusionGeometry,
-        bias: f64,
-        temperature: Bsim3JunctionTemperature,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
-        let saturation = temperature
-            .saturation(MosJunctionSaturation {
+        ijth: f64,
+    ) -> Result<PreparedBsim3Junction, Box<dyn std::error::Error>> {
+        let model = Bsim3JunctionModel {
+            saturation: MosJunctionSaturation {
                 bottom: MosBottomDensity::PerSquareMetre(0.1),
                 sidewall_a_per_m: 2e-8,
-                fallback_a: 1e-14,
-            })?
-            .prepare(geometry)?;
-        Ok(MULTIPLICITY
-            * (saturation * (bias / temperature.emission_thermal_voltage()).exp_m1()
-                + 1e-18 * bias))
+                fallback: MosSaturationFallback::ZeroCurrent(1e-14),
+            },
+            depletion: MosJunctionDepletion {
+                bottom: MosBottomDensity::PerSquareMetre(0.001),
+                bottom_shape: MosDepletionShape {
+                    potential_v: 0.9,
+                    grading: 0.5,
+                },
+                sidewall_f_per_m: 2e-10,
+                sidewall_shape: MosDepletionShape {
+                    potential_v: 0.8,
+                    grading: 0.3,
+                },
+                gate_edge_f_per_m: 3e-10,
+                gate_edge_shape: MosDepletionShape {
+                    potential_v: 0.7,
+                    grading: 0.2,
+                },
+                fallback_f: 0.,
+            },
+            depletion_temperature: [
+                MosDepletionTemperatureCoefficients {
+                    capacitance_per_k: 0.001,
+                    potential_v_per_k: 0.001,
+                },
+                MosDepletionTemperatureCoefficients {
+                    capacitance_per_k: 0.002,
+                    potential_v_per_k: 0.0015,
+                },
+                MosDepletionTemperatureCoefficients {
+                    capacitance_per_k: if version == "3.24" { 0.003 } else { 0. },
+                    potential_v_per_k: 0.002,
+                },
+            ],
+            nominal_temperature_k: TEMPERATURE,
+            emission_coefficient: 1.2,
+            saturation_temperature_exponent: 3.,
+            limiting_current_a: ijth,
+        };
+        Ok(model.prepare(
+            Bsim3JunctionRules {
+                diffusion: MosDiffusionRule::Isolated,
+                sidewall: MosSidewallRule::SplitPerimeter,
+                resistance: MosSeriesResistanceRule::AutomaticSquares,
+                knee_reference: if version == "3.24" {
+                    Bsim3KneeReference::Resolved
+                } else {
+                    Bsim3KneeReference::RawExplicit
+                },
+            },
+            Bsim3JunctionOccurrence {
+                dimensions: DIMENSIONS,
+                terminal,
+                gate_width_m: DIMENSIONS.diffusion_width()?,
+                series: MosSeriesResistance { squares, ..MODEL },
+                operating_temperature_k: temperature_c + 273.15,
+            },
+        )?)
     }
 
     // This witness uses only the native C mode for which the source equations
@@ -362,64 +367,61 @@ mod native_oracle {
     #[test]
     #[ignore = "requires local ngspice 47 binary"]
     fn acm12_mixed_geometry_matches_bsim3_native_junctions() -> TestResult {
-        let drain = prepare_mos_diffusion(
-            MosDiffusionRule::Isolated,
-            DIMENSIONS,
-            MosDiffusionTerminal {
-                area_m2: Some(12e-12),
-                ..MosDiffusionTerminal::default()
-            },
-        )?;
-        let source = prepare_mos_diffusion(
-            MosDiffusionRule::Isolated,
-            DIMENSIONS,
-            MosDiffusionTerminal {
-                perimeter_m: Some(4e-6),
-                ..MosDiffusionTerminal::default()
-            },
-        )?;
-        let drain_r =
-            MODEL.prepare(MosSeriesResistanceRule::AutomaticSquares, DIMENSIONS)? / MULTIPLICITY;
-        let source_r = MosSeriesResistance {
-            squares: Some(3.),
-            ..MODEL
-        }
-        .prepare(MosSeriesResistanceRule::AutomaticSquares, DIMENSIONS)?
-            / MULTIPLICITY;
+        let drain_geometry = MosDiffusionTerminal {
+            area_m2: Some(12e-12),
+            ..MosDiffusionTerminal::default()
+        };
+        let source_geometry = MosDiffusionTerminal {
+            perimeter_m: Some(4e-6),
+            ..MosDiffusionTerminal::default()
+        };
         for version in ["3.24", "3.3.0"] {
             for temperature_c in [0., 27., 85.] {
-                let temperature =
-                    Bsim3JunctionTemperature::new(TEMPERATURE, temperature_c + 273.15, 1.2, 3.)?;
-                for bias in [-0.5, 0., 0.3] {
-                    let output = simulate(version, bias, temperature_c)?;
-                    let vbs = output["@m1[vbs]"];
-                    let vbd = vbs - output["@m1[vds]"];
-                    for (suffix, geometry, voltage, resistance, supply) in [
-                        ("d", drain, vbd, drain_r, "i(vd)"),
-                        ("s", source, vbs, source_r, "i(vs)"),
-                    ] {
-                        reference_close(
-                            "junction capacitance",
-                            output[&format!("@m1[capb{suffix}]")],
-                            capacitance(geometry, voltage, temperature, version)?,
-                            2e-6,
-                            1e-24,
-                        );
-                        reference_close(
-                            "junction current",
-                            output[&format!("@m1[ib{suffix}]")],
-                            current(geometry, voltage, temperature)?,
-                            2e-5,
-                            1e-19,
-                        );
-                        if bias > 0. {
+                for ijth in [0., LIMITING_CURRENT] {
+                    let drain = prepared(drain_geometry, None, temperature_c, version, ijth)?;
+                    let source = prepared(source_geometry, Some(3.), temperature_c, version, ijth)?;
+                    for bias in [-0.5, 0., 0.3, 0.6] {
+                        let output = simulate(version, bias, temperature_c, ijth)?;
+                        let vbs = output["@m1[vbs]"];
+                        let vbd = vbs - output["@m1[vds]"];
+                        for (suffix, prepared, voltage, supply) in
+                            [("d", drain, vbd, "i(vd)"), ("s", source, vbs, "i(vs)")]
+                        {
+                            let point = prepared.evaluate(voltage)?;
                             reference_close(
-                                "series resistance",
-                                (bias - voltage) / output[supply],
-                                resistance,
-                                2e-5,
-                                1e-6,
+                                "junction capacitance",
+                                output[&format!("@m1[capb{suffix}]")],
+                                MULTIPLICITY * point.capacitance_f,
+                                2e-6,
+                                1e-24,
                             );
+                            reference_close(
+                                &format!(
+                                    "junction current: {version} {temperature_c}C {bias}V IJTH={ijth} {suffix} at {voltage}V"
+                                ),
+                                output[&format!("@m1[ib{suffix}]")],
+                                MULTIPLICITY * GMIN.mul_add(voltage, point.current_a),
+                                2e-5,
+                                1e-19,
+                            );
+                            reference_close(
+                                &format!(
+                                    "junction conductance: {version} {temperature_c}C {bias}V IJTH={ijth} {suffix} at {voltage}V"
+                                ),
+                                output[&format!("@m1[gb{suffix}]")],
+                                MULTIPLICITY * (point.conductance_s + GMIN),
+                                2e-5,
+                                1e-20,
+                            );
+                            if bias > 0. {
+                                reference_close(
+                                    "series resistance",
+                                    (bias - voltage) / output[supply],
+                                    prepared.resistance_ohm() / MULTIPLICITY,
+                                    2e-5,
+                                    1e-6,
+                                );
+                            }
                         }
                     }
                 }
@@ -530,7 +532,7 @@ fn junction_densities_preserve_units_and_zero_geometry_fallback() -> TestResult 
     let saturation = MosJunctionSaturation {
         bottom: MosBottomDensity::PerMetre(2e-8),
         sidewall_a_per_m: 3e-8,
-        fallback_a: 1e-14,
+        fallback: MosSaturationFallback::ZeroCurrent(1e-14),
     };
     near(saturation.prepare(width)?, 3e-13);
     near(saturation.prepare(zero)?, 1e-14);
@@ -601,5 +603,79 @@ fn junction_temperature_preparation_clamps_native_capacitance_and_potential() ->
     );
     assert!(mos_resistance_at_temperature(100., -0.02, 300., 400.).is_err());
     assert!(Bsim3JunctionTemperature::new(0., 300., 1., 3.).is_err());
+    Ok(())
+}
+
+#[test]
+fn berkeley_junction_knee_and_derivatives() -> TestResult {
+    let saturation = 1e-12;
+    let thermal = 0.04;
+    let limit = 2e-8;
+    let junction = Bsim3BerkeleyJunction::new(saturation, thermal, limit, saturation)?;
+    let knee = thermal * (limit / saturation).ln_1p();
+    let knee_point = junction.evaluate(knee, &[])?;
+    near(knee_point.current_a, limit);
+    near(knee_point.conductance_s, (saturation + limit) / thermal);
+    let forward = junction.evaluate(knee + 0.2, &[])?;
+    near(
+        forward.current_a,
+        knee_point.conductance_s.mul_add(0.2, limit),
+    );
+    near(forward.conductance_s, knee_point.conductance_s);
+    let reverse = junction.evaluate(-2., &[])?;
+    near(reverse.current_a, -saturation);
+    near(
+        reverse.conductance_s,
+        saturation * (-2. / thermal).exp() / thermal,
+    );
+    for voltage in [-0.5, -0.02, 0., 0.2, knee - 0.01, knee + 0.01, 1.] {
+        let step = 1e-7;
+        let point = junction.evaluate(voltage, &[])?;
+        let before = junction.evaluate(voltage - step, &[])?;
+        let after = junction.evaluate(voltage + step, &[])?;
+        let derivative = (after.current_a - before.current_a) / (2. * step);
+        assert!((derivative - point.conductance_s).abs() <= 2e-5 * point.conductance_s + 1e-20);
+        near(point.charge_c, 0.);
+        near(point.capacitance_f, 0.);
+    }
+    let zero = Bsim3BerkeleyJunction::new(0., thermal, limit, 0.)?;
+    near(zero.evaluate(f64::MAX, &[])?.current_a, 0.);
+    let unlimited = Bsim3BerkeleyJunction::new(1e-300, thermal, 0., 1e-300)?;
+    near(
+        unlimited.evaluate(800. * thermal, &[])?.current_a,
+        (1e-300_f64.ln() + 800.).exp(),
+    );
+    assert!(Bsim3BerkeleyJunction::new(saturation, thermal, -1., saturation).is_err());
+    Ok(())
+}
+
+#[test]
+fn saturation_policy_distinguishes_zero_geometry_from_zero_density() -> TestResult {
+    let present = MosDiffusionGeometry {
+        bottom: MosBottomMeasure::AreaM2(2e-12),
+        perimeter_m: 3e-6,
+    };
+    let absent = MosDiffusionGeometry {
+        bottom: MosBottomMeasure::AreaM2(0.),
+        perimeter_m: 0.,
+    };
+    let coefficients = MosJunctionSaturation {
+        bottom: MosBottomDensity::PerSquareMetre(0.),
+        sidewall_a_per_m: 0.,
+        fallback: MosSaturationFallback::ZeroGeometry(1e-14),
+    };
+    near(coefficients.prepare(present)?, 0.);
+    near(coefficients.prepare(absent)?, 1e-14);
+    let direct = MosJunctionSaturation {
+        fallback: MosSaturationFallback::ZeroCurrent(1e-14),
+        ..coefficients
+    };
+    near(direct.prepare(present)?, 1e-14);
+    near(direct.prepare(absent)?, 1e-14);
+    let no_direct = MosJunctionSaturation {
+        fallback: MosSaturationFallback::None,
+        ..coefficients
+    };
+    near(no_direct.prepare(absent)?, 0.);
     Ok(())
 }

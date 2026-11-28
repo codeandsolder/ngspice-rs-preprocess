@@ -340,3 +340,125 @@ fn hspice_junction_modes_keep_area_selection_separate_from_resistance() -> Resul
     }
     Ok(())
 }
+
+#[test]
+fn hspice_berkeley_junction_binding_separates_geometry_and_series_modes() -> Result<()> {
+    use model_compact_intrinsic::MosDiffusionTerminal;
+    use model_normalize_ngspice::model_card::parse_spice_constant;
+    use model_preprocess_simplis::source_dialect::model_mapping::HspiceBsim3JunctionInput;
+
+    fn close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 2e-13 * expected.abs().max(1e-30),
+            "{actual:e} != {expected:e}"
+        );
+    }
+    let mapping = table(".options HSPICEMODELS=1")?;
+    let input = HspiceBsim3JunctionInput {
+        drawn_width_m: 10e-6,
+        gate_width_m: 8e-6,
+        diffusion: [
+            MosDiffusionTerminal {
+                area_m2: Some(12e-12),
+                perimeter_m: None,
+                shared: true,
+            },
+            MosDiffusionTerminal::default(),
+        ],
+        squares: [None, Some(0.)],
+        default_squares: [2., 2.],
+        operating_temperature_k: 300.15,
+    };
+    for (level, version) in [(49, "3.24"), (53, "3.3")] {
+        for (acm, drain_r, source_r) in
+            [(10, 93., 63.), (11, 100., 0.), (12, 18., 0.), (13, 18., 0.)]
+        {
+            for calcacm in [0, 1] {
+                let lines = statements(&format!(
+                    ".model m NMOS LEVEL={level} VERSION={version} ACM={acm} CALCACM={calcacm} WMLT=0.8 XW=1u HDIF=2u LD=0.2u LDIF=0.5u RD=90 RS=60 RDC=3 RSC=3 RSH=45 TNOM=27 CJSW=2e-10"
+                ));
+                let selection = mapping
+                    .select_card(&lines[0], &[], &WorkBudget::default())?
+                    .context("selection")?;
+                let bound = selection.bind_hspice_bsim3_berkeley_junctions(298.15, 1., |raw| {
+                    Ok(parse_spice_constant(raw)?)
+                })?;
+                let [drain, source] = bound.prepare(input)?;
+                close(drain.resistance_ohm(), drain_r);
+                // Width=9um, light path=0.7um, RS=60 and RSC=3.
+                let source_r = if acm == 10 {
+                    source_r
+                } else {
+                    60. * 0.7 / 9. + 3.
+                };
+                close(source.resistance_ohm(), source_r);
+                let drain_zero = drain.evaluate(0.)?;
+                let source_zero = source.evaluate(0.)?;
+                if acm == 12 && calcacm == 1 {
+                    close(
+                        drain_zero.capacitance_f,
+                        7.68e-12 * 5.79e-4 + 24.4e-6 * 2e-10,
+                    );
+                    close(
+                        source_zero.capacitance_f,
+                        28.8e-12 * 5.79e-4 + 24.4e-6 * 2e-10,
+                    );
+                    close(source.evaluate(0.3)?.current_a, 0.);
+                } else {
+                    close(drain_zero.capacitance_f, 12e-12 * 5.79e-4);
+                    close(source_zero.capacitance_f, 0.);
+                    assert!(source.evaluate(0.3)?.current_a > 0.);
+                }
+                close(drain.evaluate(0.3)?.current_a, 0.);
+                close(drain_zero.charge_c, 0.);
+            }
+        }
+    }
+    let lines = statements(
+        ".model m NMOS LEVEL=53 VERSION=3.3 ACM=10 CJ='local_cj' JS=0 PB=0.8 CJSW=1e-10 CJSWG=3e-10",
+    );
+    let selection = mapping
+        .select_card(&lines[0], &[], &WorkBudget::default())?
+        .context("selection")?;
+    let [drain, _source] = selection
+        .bind_hspice_bsim3_berkeley_junctions(300.15, 1., |raw| {
+            if raw.trim_matches(['\'', '"']) == "local_cj" {
+                Ok(0.002)
+            } else {
+                Ok(parse_spice_constant(raw)?)
+            }
+        })?
+        .prepare(HspiceBsim3JunctionInput {
+            diffusion: [
+                MosDiffusionTerminal {
+                    area_m2: Some(2e-12),
+                    perimeter_m: Some(10e-6),
+                    shared: false,
+                },
+                MosDiffusionTerminal::default(),
+            ],
+            ..input
+        })?;
+    close(
+        drain.evaluate(0.)?.capacitance_f,
+        2e-12 * 0.002 + 2e-6 * 1e-10 + 8e-6 * 3e-10,
+    );
+    for suffix in [
+        "ACM=3",
+        "ACM=10 PB=0.8 PHIB=0.9",
+        "ACM=10 CJSW=1e-10 CJSW=2e-10",
+    ] {
+        let lines = statements(&format!(".model m NMOS LEVEL=53 VERSION=3.3 {suffix}"));
+        let selection = mapping
+            .select_card(&lines[0], &[], &WorkBudget::default())?
+            .context("selection")?;
+        assert!(
+            selection
+                .bind_hspice_bsim3_berkeley_junctions(300.15, 1., |raw| Ok(parse_spice_constant(
+                    raw
+                )?))
+                .is_err()
+        );
+    }
+    Ok(())
+}
