@@ -145,7 +145,7 @@ quit
 fn device_ic_bias_policy_is_phase_specific_and_preserves_signed_occurrences() -> Result<()> {
     use ngspice_rs_preprocess::{
         Cancellation, InputFormat, Options, Request, SourceInput,
-        passive_ic::{Analysis, BiasConstraint, evaluate_expression},
+        passive_ic::{Analysis, BiasConstraint, MissingStorage, evaluate_expression},
         prepare,
     };
 
@@ -159,7 +159,7 @@ fn device_ic_bias_policy_is_phase_specific_and_preserves_signed_occurrences() ->
         };
         let source = format!(
             "Device IC policy\n.model CM CAP(VC1=0.1)\n.model LM IND(IL1=0.2)\n\
-             C1 p n 1n IC=-2\nL1 a b 1m IC=0\nCabsent a b 2n\n\
+             C1 p n 1n IC=-2\nL1 a b 1m IC=0\nCabsent a b 2n\nLabsent p n 2m\n\
              .subckt cell p n params: x=3\nC2 p n CM 1n\n+ IC={{-x}}\n\
              L2 p n LM 1m IC={{x/10}}\n.ends cell\nX1 p n cell x=5\n\
              .options reltol=0.001{flag}\n.tran 1u 1m SKIPBP\n.end\n"
@@ -187,18 +187,22 @@ fn device_ic_bias_policy_is_phase_specific_and_preserves_signed_occurrences() ->
         let policy = bundle
             .initial_conditions
             .context("missing IC declarations")?;
-        assert_eq!(policy.devices.len(), 4);
+        assert_eq!(policy.devices.len(), 6);
         for (name, value, capacitor) in [
-            ("C1", -2., true),
-            ("L1", 0., false),
-            ("C2", -5., true),
-            ("L2", 0.5, false),
+            ("C1", Some(-2.), true),
+            ("L1", Some(0.), false),
+            ("C2", Some(-5.), true),
+            ("L2", Some(0.5), false),
+            ("Cabsent", None, true),
+            ("Labsent", None, false),
         ] {
             let device = policy
                 .devices
                 .iter()
                 .find(|d| d.device.eq_ignore_ascii_case(name))
                 .context("missing device")?;
+            assert_eq!(device.missing_storage, MissingStorage::Zero);
+            assert_eq!(device.target.is_some(), value.is_some());
             for analysis in [
                 Analysis::OperatingPoint,
                 Analysis::Ac,
@@ -215,8 +219,16 @@ fn device_ic_bias_policy_is_phase_specific_and_preserves_signed_occurrences() ->
                 };
                 let defaults = policy.resolve_defaults(evaluate)?;
                 let resolved = device.resolve(analysis, defaults, evaluate)?;
-                assert_eq!(resolved.storage_ic, Some(value));
+                assert_eq!(
+                    resolved.storage_ic,
+                    if matches!(analysis, Analysis::Transient { uic: true }) {
+                        Some(value.unwrap_or_default())
+                    } else {
+                        value
+                    }
+                );
                 let expected = if skip_translation
+                    || value.is_none()
                     || matches!(
                         analysis,
                         Analysis::DcSweep | Analysis::Transient { uic: true }
@@ -224,12 +236,12 @@ fn device_ic_bias_policy_is_phase_specific_and_preserves_signed_occurrences() ->
                     BiasConstraint::None
                 } else if capacitor {
                     BiasConstraint::CapacitorSoft {
-                        voltage: value,
+                        voltage: value.context("missing bias target")?,
                         resistance: 0.002,
                     }
                 } else {
                     BiasConstraint::InductorSoft {
-                        current: value,
+                        current: value.context("missing bias target")?,
                         conductance: 1e-9,
                     }
                 };

@@ -66,7 +66,8 @@ initial coordinates. SKIPBP is normalized to UIC.
 
 Scalar and polynomial C/L use the same typed declaration keyed by emitted
 artifact, lexical definition and device name; IC expressions are evaluated
-per occurrence. Explicit zero and omission differ, and the original IC
-property is not duplicated as a native parser hint. The policy does not
+per occurrence. Explicit zero and omission differ: omitted devices have no bias clamp,
+but skipped-bias startup uses zero rather than native node hints. The original
+IC property is not duplicated as a native parser hint. The policy does not
 create permanent helper components. This device-property contract does not
 define the separate PSpice .IC command's node-pair and inductor references.
