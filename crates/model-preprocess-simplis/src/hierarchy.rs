@@ -105,6 +105,7 @@ impl ParsedLibrary {
     pub fn mapped(
         &self,
         table: &crate::source_dialect::model_mapping::MappingTable,
+        target: crate::source_dialect::PowerTarget,
         limit: usize,
         budget: &WorkBudget,
     ) -> Result<(
@@ -130,6 +131,7 @@ impl ParsedLibrary {
             dialect,
             &mapped.statements,
             clone_scoped_statements(&self.scoped_statements, budget)?,
+            target,
             limit,
             budget,
         )?;
@@ -1026,6 +1028,7 @@ pub fn parse_scoped_library(
         dialect,
         statements,
         clone_scoped_statements(statements, budget)?,
+        crate::source_dialect::PowerTarget::NativeNgspice,
         limit,
         budget,
     )
@@ -1047,6 +1050,7 @@ fn clone_scoped_statements(
 /// Invalid expression or output byte budget exceeded.
 pub fn lower_scoped_statements(
     statements: &[crate::source_dialect::ScopedStatement],
+    target: crate::source_dialect::PowerTarget,
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<Vec<crate::source_dialect::ScopedStatement>> {
@@ -1059,9 +1063,10 @@ pub fn lower_scoped_statements(
             budget.charge(Resource::ScannedBytes, statement.text.len())?;
             let mut statement = statement.clone_with_budget(budget)?;
             if !opaque.consume(&statement.text) {
-                statement.text = crate::source_dialect::lower_statement_with_budget(
+                statement.text = crate::source_dialect::lower_statement_targeted(
                     &statement.text,
                     statement.context,
+                    target,
                     remaining.min(budget.remaining(Resource::EmittedBytes)?),
                     budget,
                 )?;
@@ -1084,6 +1089,7 @@ fn parse_scoped_parts(
     dialect: crate::source_dialect::DialectContext,
     statements: &[crate::source_dialect::ScopedStatement],
     original: Vec<crate::source_dialect::ScopedStatement>,
+    target: crate::source_dialect::PowerTarget,
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<ParsedLibrary> {
@@ -1095,7 +1101,7 @@ fn parse_scoped_parts(
                 .all(|line| source_names.contains(&line.source)),
         "incomplete admitted source graph"
     );
-    let lowered = lower_scoped_statements(statements, limit, budget)?;
+    let lowered = lower_scoped_statements(statements, target, limit, budget)?;
     let resolved = resolve_device_identities(&lowered, budget)?;
     anyhow::ensure!(
         resolved.text.len() <= limit,

@@ -3,8 +3,10 @@
 //! precedence are left to the native expression parser.
 
 use super::group_end;
+mod runtime;
 use anyhow::{Context, Result, bail, ensure};
 use model_preprocess_command::{Resource, WorkBudget};
+pub(super) use runtime::lower as lower_runtime;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {

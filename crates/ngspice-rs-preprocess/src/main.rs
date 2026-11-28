@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use ngspice_rs_preprocess::{
     Cancellation, CommandConfig, ConditioningPolicy, InputFormat, LibraryInput, Options,
-    PreparedBundle, Request, SourceInput, prepare,
+    PowerTarget, PreparedBundle, Request, SourceInput, prepare,
 };
 use serde::Serialize;
 use std::{
@@ -43,6 +43,7 @@ Options:
   --max-work-generated-nodes N
   --max-work-emitted-bytes N  Intermediate and final emission
   --max-work-depth N          Recursive depth (maximum 64)
+  --power-target MODE         native-ngspice (default) or prepared-solver-v1
   --conditioning MODE         private-differentiators (default) or disabled
 The output directory must not already exist.
 ";
@@ -158,6 +159,13 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
                     Duration::from_millis(u64::try_from(numeric(&value)?)?);
             }
             "--max-output-bytes" => options.output_bytes = numeric(&value)?,
+            "--power-target" => {
+                options.power_target = match value.to_str() {
+                    Some("native-ngspice") => PowerTarget::NativeNgspice,
+                    Some("prepared-solver-v1") => PowerTarget::PreparedSolverV1,
+                    _ => bail!("unknown power target {}", value.display()),
+                };
+            }
             "--conditioning" => {
                 options.conditioning = match value.to_str() {
                     Some("private-differentiators") => ConditioningPolicy::PrivateDifferentiators,
@@ -199,6 +207,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Option<Invocation>>
 struct Manifest<'a> {
     version: u32,
     input_format: InputFormat,
+    power_target: PowerTarget,
     origin: String,
     primary: &'a str,
     artifacts: Vec<ManifestArtifact<'a>>,
@@ -225,8 +234,9 @@ struct ManifestArtifact<'a> {
 
 fn manifest(bundle: &PreparedBundle) -> Manifest<'_> {
     Manifest {
-        version: 9,
+        version: 10,
         input_format: bundle.format,
+        power_target: bundle.power_target,
         origin: bundle.origin.to_string_lossy().into_owned(),
         primary: &bundle.primary.filename,
         artifacts: bundle

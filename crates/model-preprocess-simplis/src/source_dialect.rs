@@ -17,6 +17,19 @@ pub use identity::{
     DeviceIdentity, ResolvedDeviceSource, ScopedStatement, resolve_device_identities,
 };
 
+/// Explicit power-expression capability of the consumer. Native output never
+/// relies on solver-specific intrinsics. The prepared target selects the
+/// typed SIMetrix scalar/runtime operations (version 1 of that contract).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PowerTarget {
+    /// Portable native ngspice output, including the existing guarded laws.
+    #[default]
+    NativeNgspice,
+    /// Consumer implements the explicit SIMetrix power intrinsic contract.
+    PreparedSolverV1,
+}
+
 /// Parameter expression and inline-comment language.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -653,6 +666,26 @@ pub(super) fn lower_statement_with_budget(
     limit: usize,
     budget: &WorkBudget,
 ) -> Result<String> {
+    lower_statement_targeted(
+        statement,
+        context,
+        PowerTarget::NativeNgspice,
+        limit,
+        budget,
+    )
+}
+
+/// The prepared target projects source runtime laws before portable guarded
+/// power lowering can erase their operation identity. Static fields retain
+/// their ordinary scalar preparation path; shared function bodies carry the
+/// explicit operation names and are parsed separately in each phase.
+pub(super) fn lower_statement_targeted(
+    statement: &str,
+    context: DialectContext,
+    target: PowerTarget,
+    limit: usize,
+    budget: &WorkBudget,
+) -> Result<String> {
     let trimmed = statement.trim_start();
     let Some(first) = trimmed.split_whitespace().next() else {
         return Ok(statement.to_owned());
@@ -697,6 +730,49 @@ pub(super) fn lower_statement_with_budget(
         };
         (prefix, language)
     };
+    if target == PowerTarget::PreparedSolverV1 && language == SourceLanguage::Simetrix {
+        if upper == ".FUNC" {
+            let start =
+                prefix_end + trimmed[prefix_end..].len() - trimmed[prefix_end..].trim_start().len();
+            let body = trimmed[start..]
+                .strip_prefix('=')
+                .map_or(&trimmed[start..], str::trim_start);
+            let mut output = trimmed[..prefix_end].to_owned();
+            output.push(' ');
+            output.push_str(&runtime_expression(
+                body.trim_start_matches('=').trim(),
+                limit.saturating_sub(output.len()),
+                budget,
+            )?);
+            ensure!(
+                output.len() <= limit,
+                "source power expansion byte budget exceeded"
+            );
+            return Ok(output);
+        }
+        if let Some((start, end)) = runtime_law(trimmed, &upper, budget)? {
+            let mut output = trimmed[..start].to_owned();
+            output.push_str(&runtime_expression(
+                &trimmed[start..end],
+                limit.saturating_sub(output.len()),
+                budget,
+            )?);
+            let setters = rewrite_expression(
+                &trimmed[end..],
+                language,
+                false,
+                limit.saturating_sub(output.len()),
+                false,
+                budget,
+            )?;
+            output.push_str(&setters);
+            ensure!(
+                output.len() <= limit,
+                "source power expansion byte budget exceeded"
+            );
+            return Ok(output);
+        }
+    }
     let mut output = trimmed[..prefix_end].to_owned();
     output.push_str(&rewrite_expression(
         &trimmed[prefix_end..],
@@ -720,6 +796,125 @@ pub(super) fn lower_statement_with_budget(
         output.push_str(&lowered);
     }
     Ok(output)
+}
+
+/// Detect the actual electrical law rather than rewrite the whole device
+/// card (which also contains node names and scalar instance setters).
+fn runtime_law(
+    statement: &str,
+    first: &str,
+    budget: &WorkBudget,
+) -> Result<Option<(usize, usize)>> {
+    let Some(kind) = first.as_bytes().first() else {
+        return Ok(None);
+    };
+    if !matches!(kind, b'B' | b'E' | b'G' | b'F' | b'H' | b'R' | b'C' | b'L') {
+        return Ok(None);
+    }
+    let tail = token_end(statement, 3);
+    let remaining = &statement[tail..];
+    let Some((key, _)) = remaining.split_once('=') else {
+        return Ok(None);
+    };
+    let key = key.trim();
+    let valid = match kind {
+        b'B' | b'E' | b'G' | b'F' | b'H' => {
+            ["V", "I"].iter().any(|name| key.eq_ignore_ascii_case(name))
+        }
+        b'R' => key.eq_ignore_ascii_case("R"),
+        b'C' => key.eq_ignore_ascii_case("C") || key.eq_ignore_ascii_case("Q"),
+        b'L' => key.eq_ignore_ascii_case("L"),
+        _ => false,
+    };
+    if !valid {
+        return Ok(None);
+    }
+    let start = tail
+        + remaining
+            .find('=')
+            .context("missing runtime law assignment")?
+        + 1;
+    let body = &statement[start..];
+    let mut offset = 0;
+    while offset < body.len() {
+        let ch = body[offset..]
+            .chars()
+            .next()
+            .context("runtime expression boundary")?;
+        match ch {
+            '(' | '{' | '[' => offset = group_end(body, offset, budget)? + 1,
+            '\'' | '"' => {
+                offset += body[offset + 1..]
+                    .find(ch)
+                    .context("unterminated runtime law quote")?
+                    + 2;
+            }
+            ch if ch.is_ascii_whitespace() => {
+                let next = body[offset..].trim_start();
+                // Only a known scalar setter delimits an unquoted expression;
+                // equality inside the electrical law stays arithmetic.
+                let key_end = next.bytes().take_while(|byte| symbol_byte(*byte)).count();
+                let name = &next[..key_end];
+                let setter = next[key_end..].trim_start();
+                if [
+                    "M",
+                    "TC1",
+                    "TC2",
+                    "TEMP",
+                    "DTEMP",
+                    "RECIPROCTC",
+                    "IC",
+                    "SCALE",
+                    "NOISE",
+                    "NOISY",
+                ]
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                    && setter.starts_with('=')
+                    && !setter.starts_with("==")
+                {
+                    return Ok(Some((start, start + offset)));
+                }
+                offset += body[offset..].len() - next.len();
+            }
+            _ => offset += ch.len_utf8(),
+        }
+    }
+    Ok(Some((start, statement.len())))
+}
+
+fn runtime_expression(input: &str, limit: usize, budget: &WorkBudget) -> Result<String> {
+    let trimmed = input.trim();
+    // Keep an outer expression delimiter, which carries source-card syntax.
+    let (body, wrapper) =
+        if trimmed.starts_with('{') && group_end(trimmed, 0, budget)? + 1 == trimmed.len() {
+            (&trimmed[1..trimmed.len() - 1], Some(('{', '}')))
+        } else if trimmed.starts_with('\'')
+            && trimmed[1..].find('\'') == Some(trimmed.len().saturating_sub(2))
+        {
+            (&trimmed[1..trimmed.len() - 1], Some(('{', '}')))
+        } else {
+            (trimmed, None)
+        };
+    let lowered = power::lower_runtime(body, limit, budget)?;
+    let lowered = rewrite_expression(
+        &lowered,
+        SourceLanguage::Simetrix,
+        true,
+        limit,
+        false,
+        budget,
+    )?;
+    if let Some((open, close)) = wrapper {
+        budget.charge(Resource::EmittedBytes, lowered.len().saturating_add(2))?;
+        ensure!(
+            lowered.len().saturating_add(2) <= limit,
+            "source power expansion byte budget exceeded"
+        );
+        Ok(format!("{open}{lowered}{close}"))
+    } else {
+        Ok(lowered)
+    }
 }
 
 #[cfg(test)]
