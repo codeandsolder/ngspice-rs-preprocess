@@ -44,7 +44,6 @@ jobs:
     name: Source archive, locked tests and C reference
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
     with:
-      test-impact-mode: none
       command: bash .github/scripts/verify-source.sh
 
   package-qualification:
@@ -52,5 +51,4 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'tag')
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9c14ef2d72423958c56944febc620ec50f01d65a # main
     with:
-      test-impact-mode: none
       command: bash .github/scripts/verify-packages.sh
