@@ -243,6 +243,10 @@ fn charge(
     ([drain, gate, -(drain + gate + bulk), bulk], sat)
 }
 
+pub(super) fn threshold(c: &Bsim2Coefficients, bias: LegacyBsimBias) -> f64 {
+    body(c, Bias::new(bias, c)).threshold.value
+}
+
 /// Evaluate BSIM2's native current and conservative charge (physical xpart
 /// modes 0/1) in polarity-normalized forward orientation.
 ///
@@ -255,15 +259,7 @@ pub fn evaluate_bsim2_intrinsic(
     let LegacyBsimChannel::Bsim2(c) = &instance.channel else {
         return Err(ModelError::WrongModelScope);
     };
-    if ![input.vds, input.vgs, input.vbs]
-        .into_iter()
-        .all(f64::is_finite)
-        || input.vds < 0.
-    {
-        return Err(ModelError::InvalidPhysicalParameter(
-            "normalized BSIM2 bias",
-        ));
-    }
+    super::validate_bias(input)?;
     let b = Bias::new(input, c);
     let s = body(c, b);
     let gate = effective_gate(c, b, s);

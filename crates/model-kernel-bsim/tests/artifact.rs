@@ -8,7 +8,7 @@ use model_kernel_api::{
     Artifact, Binding, Capability, Error, PointBuffer, Prepared,
     noise::{Sink, Source},
 };
-use model_kernel_bsim::{Instance, LegacyBsimKernel, legacy_bsim_artifact};
+use model_kernel_bsim::{Instance, LegacyBsimKernel, SeriesNodes, legacy_bsim_artifact};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -94,6 +94,15 @@ const fn reference() -> Instance {
     }
 }
 
+fn artifact_for(
+    model: Arc<PreparedLegacyBsimModel>,
+    reference: Instance,
+    fingerprint: [u8; 16],
+) -> TestResult<Arc<Artifact<LegacyBsimKernel>>> {
+    let shape = SeriesNodes::resolve(&model, [reference.drain_squares, reference.source_squares])?;
+    Ok(legacy_bsim_artifact(model, shape, fingerprint)?)
+}
+
 fn close(label: &str, actual: f64, expected: f64, rel: f64, absolute: f64) {
     assert!(
         (actual - expected).abs() <= rel.mul_add(expected.abs().max(actual.abs()), absolute),
@@ -128,7 +137,7 @@ fn sample(
 fn structural_candidates_and_polarity_are_transactional() -> TestResult {
     let model = model(false, 52.)?;
     let instance = reference();
-    let artifact = legacy_bsim_artifact(Arc::clone(&model), instance, [1; 16])?;
+    let artifact = artifact_for(Arc::clone(&model), instance, [1; 16])?;
     let desc = artifact.descriptor();
     assert_eq!(desc.charge, Capability::Computed);
     assert_eq!(desc.noise, Capability::Computed);
@@ -161,7 +170,7 @@ fn structural_candidates_and_polarity_are_transactional() -> TestResult {
         artifact.prepare(&updated.slots(), 300.15),
         Err(Error::Unsupported(_))
     ));
-    let one_hidden = legacy_bsim_artifact(Arc::clone(&model), updated, [2; 16])?;
+    let one_hidden = artifact_for(Arc::clone(&model), updated, [2; 16])?;
     assert_eq!(one_hidden.descriptor().equations.len(), 5);
     let again = sample(&artifact, &base, &coordinates)?;
     assert_eq!(first.current, again.current);
@@ -219,11 +228,8 @@ fn complete_nodal_law_has_exact_jacobians_in_both_polarities_and_orientations() 
         for pmos in [false, true] {
             let polarity = if pmos { -1. } else { 1. };
             for sheet in [0., 52.] {
-                let artifact = legacy_bsim_artifact(
-                    family_model(variant, pmos, sheet)?,
-                    reference(),
-                    [3; 16],
-                )?;
+                let artifact =
+                    artifact_for(family_model(variant, pmos, sheet)?, reference(), [3; 16])?;
                 let instance = artifact.prepare(&reference().slots(), 310.)?;
                 for forward in [false, true] {
                     let (drain, source) = if forward { (1.1, 0.1) } else { (0.1, 1.1) };
@@ -261,7 +267,7 @@ impl Sink for Sources {
 
 #[test]
 fn noise_and_parallel_multiplicity_follow_physical_branch_scaling() -> TestResult {
-    let artifact = legacy_bsim_artifact(model(false, 52.)?, reference(), [4; 16])?;
+    let artifact = artifact_for(model(false, 52.)?, reference(), [4; 16])?;
     let coordinates = [1.2, 1.7, 0., -0.3, 1.1, 0.1];
     let single = artifact.prepare(&reference().slots(), 300.)?;
     let mut double = reference();
@@ -319,7 +325,7 @@ fn native_ngspice_operating_points_include_hidden_series_nodes() -> TestResult {
                 gmin: 0.,
                 ..reference()
             };
-            let artifact = legacy_bsim_artifact(
+            let artifact = artifact_for(
                 family_model(variant, pmos != 0., sheet)?,
                 reference,
                 [5; 16],
@@ -358,7 +364,7 @@ fn gmin_is_a_single_consistent_junction_conductance() -> TestResult {
         gmin: 0.,
         ..reference()
     };
-    let artifact = legacy_bsim_artifact(model(false, 0.)?, reference, [6; 16])?;
+    let artifact = artifact_for(model(false, 0.)?, reference, [6; 16])?;
     let baseline = artifact.prepare(&reference.slots(), 300.15)?;
     let gmin = 1e-5;
     let candidate = artifact.prepare(&Instance { gmin, ..reference }.slots(), 300.15)?;
@@ -405,7 +411,7 @@ fn physical_noise_density_from_native_dc_measurements() -> TestResult {
         gmin: 0.,
         ..reference()
     };
-    let artifact = legacy_bsim_artifact(model(false, 0.)?, reference, [7; 16])?;
+    let artifact = artifact_for(model(false, 0.)?, reference, [7; 16])?;
     let prepared = artifact.prepare(&reference.slots(), 300.15)?;
     let coordinates = [1.204_300_731_234_587_5, 1.7, 0.1, -0.3];
     // Independent ngspice 47 DC measurements at a fixed drain voltage
@@ -429,6 +435,190 @@ fn physical_noise_density_from_native_dc_measurements() -> TestResult {
                 _ => return Err("unexpected source".into()),
             };
             close(&name, psd, expected, 1e-5, 1e-36);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn structural_resolution_is_independent_of_channel_preparation() -> TestResult {
+    let model = family_model(ModelVariant::Bsim2, false, 52.)?;
+    let shape = SeriesNodes::resolve(&model, [0., 3.])?;
+    assert_eq!(
+        shape,
+        SeriesNodes {
+            drain: false,
+            source: true
+        }
+    );
+    assert!(SeriesNodes::resolve(&model, [-1., 3.]).is_err());
+    let a = legacy_bsim_artifact(Arc::clone(&model), shape, [8; 16])?;
+    let b = legacy_bsim_artifact(Arc::clone(&model), shape, [8; 16])?;
+    assert_eq!(a.descriptor(), b.descriptor());
+    let mut invalid = reference();
+    invalid.drain_squares = 0.;
+    invalid.length = 0.;
+    assert!(a.prepare(&invalid.slots(), 300.15).is_err());
+    let valid = Instance {
+        length: 10e-6,
+        ..invalid
+    };
+    let prepared = a.prepare(&valid.slots(), 300.15)?;
+    assert_eq!(a.descriptor().equations.len(), 5);
+    sample(&a, &prepared, &[0.5, 1.5, 0., -0.3, 0.02])?;
+    Ok(())
+}
+
+#[test]
+fn trial_policy_is_coherent_for_both_polarities_orientations_and_series_shapes() -> TestResult {
+    use model_kernel_api::trial::{
+        Convergence, ConvergenceInput, TrialInput, TrialOutcome, TrialPhase, TrialSample,
+    };
+    for variant in [ModelVariant::Bsim1, ModelVariant::Bsim2] {
+        for pmos in [false, true] {
+            let sign = if pmos { -1. } else { 1. };
+            let model = family_model(variant, pmos, 52.)?;
+            for squares in [[0., 0.], [1., 0.], [0., 1.], [1., 1.]] {
+                let reference = Instance {
+                    drain_squares: squares[0],
+                    source_squares: squares[1],
+                    ..reference()
+                };
+                let artifact = artifact_for(Arc::clone(&model), reference, [9; 16])?;
+                let prepared = artifact.prepare(&reference.slots(), 300.15)?;
+                let width = artifact.descriptor().equations.len();
+                let drain = if squares[0] > 0. { 4 } else { 0 };
+                let source = if squares[1] > 0. { width - 1 } else { 2 };
+                let mut proposed = vec![0.; width];
+                let mut initialized = vec![0.; width];
+                assert_eq!(
+                    artifact.linearize_trial(
+                        &prepared,
+                        TrialInput {
+                            proposed: &proposed,
+                            phase: TrialPhase::ColdStart
+                        },
+                        &mut initialized
+                    )?,
+                    TrialOutcome::Initialized
+                );
+                close(
+                    "cold-start drain",
+                    initialized[drain] - initialized[source],
+                    0.,
+                    0.,
+                    0.,
+                );
+                close(
+                    "cold-start bulk",
+                    sign * (initialized[3] - initialized[source]),
+                    -1.,
+                    0.,
+                    0.,
+                );
+                sample(&artifact, &prepared, &initialized)?;
+                for reverse in [false, true] {
+                    let mut previous = vec![0.; width];
+                    previous[drain] = sign * if reverse { -0.5 } else { 0.5 };
+                    previous[1] = sign * 1.2;
+                    previous[3] = -sign * 0.7;
+                    proposed.clone_from(&previous);
+                    proposed[drain] = sign * if reverse { 80. } else { -80. };
+                    proposed[1] = sign * 200.;
+                    proposed[3] = sign * 200.;
+                    let old = sample(&artifact, &prepared, &previous)?;
+                    let mut limited = vec![0.; width];
+                    for phase in [
+                        TrialPhase::Newton {
+                            previous: &previous,
+                        },
+                        TrialPhase::Predictor {
+                            accepted: &previous,
+                        },
+                    ] {
+                        assert_eq!(
+                            artifact.linearize_trial(
+                                &prepared,
+                                TrialInput {
+                                    proposed: &proposed,
+                                    phase
+                                },
+                                &mut limited
+                            )?,
+                            TrialOutcome::Limited
+                        );
+                        // A single step fraction controls all intrinsic voltage
+                        // differences. Both junctions remain representable.
+                        let ratio = (limited[drain] - previous[drain])
+                            / (proposed[drain] - previous[drain]);
+                        assert!(ratio > 0. && ratio < 1.);
+                        for row in [1, 3] {
+                            close(
+                                "coherent step",
+                                (limited[row] - previous[row]) / (proposed[row] - previous[row]),
+                                ratio,
+                                1e-12,
+                                1e-15,
+                            );
+                        }
+                        let point = sample(&artifact, &prepared, &limited)?;
+                        let tolerance = vec![1e-12; width];
+                        let previous_sample = TrialSample {
+                            coordinates: &previous,
+                            residual: &old.current,
+                            jacobian: &old.conductance,
+                        };
+                        assert_eq!(
+                            artifact.check_trial_convergence(
+                                &prepared,
+                                ConvergenceInput {
+                                    previous: previous_sample,
+                                    candidate: TrialSample {
+                                        coordinates: &limited,
+                                        residual: &point.current,
+                                        jacobian: &point.conductance
+                                    },
+                                    candidate_outcome: TrialOutcome::Limited,
+                                    relative_tolerance: 1e-6,
+                                    absolute_tolerances: &tolerance,
+                                }
+                            )?,
+                            Convergence::Retry
+                        );
+                        assert_eq!(
+                            artifact.check_trial_convergence(
+                                &prepared,
+                                ConvergenceInput {
+                                    previous: previous_sample,
+                                    candidate: previous_sample,
+                                    candidate_outcome: TrialOutcome::Exact,
+                                    relative_tolerance: 1e-6,
+                                    absolute_tolerances: &tolerance,
+                                }
+                            )?,
+                            Convergence::Satisfied
+                        );
+                    }
+                    // Exact loads are independent of trial policy and no
+                    // failed/limited trial has changed the immutable instance.
+                    assert_eq!(
+                        artifact.linearize_trial(
+                            &prepared,
+                            TrialInput {
+                                proposed: &previous,
+                                phase: TrialPhase::Exact
+                            },
+                            &mut limited
+                        )?,
+                        TrialOutcome::Exact
+                    );
+                    assert_eq!(limited, previous);
+                    assert_eq!(
+                        sample(&artifact, &prepared, &previous)?.current,
+                        old.current
+                    );
+                }
+            }
         }
     }
     Ok(())

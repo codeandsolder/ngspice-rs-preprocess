@@ -5,7 +5,7 @@
 
 use model_kernel_api::{
     Error, Result,
-    trial::limiting::{ExponentialLimit, fetlim, limit_temperature, limvds},
+    trial::limiting::{ExponentialLimit, fetlim, limit_temperature, limvds, restrict_step},
 };
 
 use super::{VdmosInstance, VdmosKernel};
@@ -13,23 +13,6 @@ use crate::{DiodeActivation, Jet, breakdown, junction_potential};
 
 // ngspice 47 VDMOSload uses DEVlimitlog with a 10 K step threshold.
 const THERMAL_STEP: f64 = 10.;
-
-/// Restrict the common electrical step to the interval permitted by one
-/// controlling voltage. This preserves all aliased rows, including the case
-/// where the diode voltage and channel drain voltage are the same difference.
-fn restrict_step(scale: f64, raw: f64, previous: f64, limited: f64) -> f64 {
-    if raw.to_bits() == limited.to_bits() || raw.to_bits() == previous.to_bits() {
-        return scale;
-    }
-    let delta = raw - previous;
-    let allowed = limited - previous;
-    let fraction = if delta.is_finite() && allowed.is_finite() {
-        allowed / delta
-    } else {
-        previous.mul_add(-0.5, limited * 0.5) / previous.mul_add(-0.5, raw * 0.5)
-    };
-    scale.min(fraction.clamp(0., 1.))
-}
 
 fn fet_step(vgs: f64, vds: f64, previous_gate: f64, previous_drain: f64, vto: f64) -> f64 {
     // Select the conducting end from the previous point, then restrict each

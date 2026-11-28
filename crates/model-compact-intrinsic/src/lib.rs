@@ -15,7 +15,7 @@ pub use legacy_bsim::{
     LegacyBsimChannel, LegacyBsimGeometry, LegacyBsimIntrinsicPoint, LegacyBsimJunction,
     LegacyBsimJunctionLaw, LegacyBsimOverlap, PreparedLegacyBsimInstance, PreparedLegacyBsimModel,
     evaluate_bsim1_intrinsic, evaluate_bsim2_intrinsic, evaluate_legacy_bsim_intrinsic,
-    prepare_legacy_bsim_model,
+    legacy_bsim_threshold, prepare_legacy_bsim_model,
 };
 
 pub use hv::{
